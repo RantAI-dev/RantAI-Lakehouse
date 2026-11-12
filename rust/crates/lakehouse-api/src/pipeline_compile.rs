@@ -49,7 +49,8 @@
 //! 4. A `transform` step reads an input or an earlier step, and each of its
 //!    transform strings parses (D2, D4).
 //! 5. A SQL step is one read-only statement (D5, [`check_pipeline_step_sql`]),
-//!    and every table it names is an input or an earlier step (D6).
+//!    and every name it reads is an input or an earlier step, EXACTLY — case
+//!    included, with a qualified `zone.table` refused (D6, R1-B6 / D6a).
 //! 6. The output table is not one of the inputs (D2).
 
 use lakehouse_core::ident::Ident;
@@ -137,9 +138,8 @@ fn valid_name(name: &str) -> bool {
     name.chars().count() <= MAX_NAME_CHARS && !name.starts_with("__") && Ident::new(name).is_ok()
 }
 
-/// Lowercased, for the case-insensitive comparisons D2 requires (names are
-/// unique "without regard to case", and `sql_rewrite`'s own CTE set is
-/// lowercased too).
+/// Lowercased, for the one comparison D2 makes without regard to case:
+/// whether two names collide. Every other comparison is exact (R1-B6 / D6a).
 fn key(name: &str) -> String {
     name.to_ascii_lowercase()
 }
@@ -289,12 +289,14 @@ fn validate(
                         )
                     })?;
                 }
-                let readable = inputs.iter().any(|i| key(&i.name) == key(reads))
-                    || steps[..index].iter().any(|s| key(s.name()) == key(reads));
+                // R1-B6 / D6a: a step names what it reads EXACTLY, case
+                // included — `ClickHouse` matches a `WITH` name by exact case,
+                // so a reference that differs only in case would be looked up
+                // as a real table, unseen by the gate and the rewrite.
+                let readable = inputs.iter().any(|i| i.name == *reads)
+                    || steps[..index].iter().any(|s| s.name() == reads);
                 if !readable {
-                    let later = steps[index + 1..]
-                        .iter()
-                        .any(|s| key(s.name()) == key(reads));
+                    let later = steps[..].iter().skip(index + 1).any(|s| s.name() == reads);
                     return Err(DefinitionError::step(
                         index,
                         if later {
@@ -338,22 +340,21 @@ fn check_step_tables(
         // defence-in-depth branch, refused rather than assumed.
         return Err(DefinitionError::step(index, READS_NOT_INPUT));
     };
-    let locations: Vec<String> = inputs.iter().map(PipelineInput::location).collect();
     for table in tables {
+        // R1-B6 / D6a: a step reads an input by its NAME in the pipeline, so
+        // a qualified `zone.table` is refused even when it names an input —
+        // `ClickHouse` would resolve it as a table in the connection's own
+        // database, which neither the gate nor the rewrite sees.
         if table.contains('.') {
-            if !locations.iter().any(|l| key(l) == key(&table)) {
-                return Err(DefinitionError::step(index, READS_NOT_INPUT));
-            }
-            continue;
+            return Err(DefinitionError::step(index, READS_NOT_INPUT));
         }
-        if inputs.iter().any(|i| key(&i.name) == key(&table))
-            || steps[..index].iter().any(|s| key(s.name()) == key(&table))
+        // Exact, case included: the same reason as `reads` above.
+        if inputs.iter().any(|i| i.name == table)
+            || steps[..index].iter().any(|s| s.name() == table)
         {
             continue;
         }
-        let later = steps[index + 1..]
-            .iter()
-            .any(|s| key(s.name()) == key(&table));
+        let later = steps[index + 1..].iter().any(|s| s.name() == table);
         return Err(DefinitionError::step(
             index,
             if later {
@@ -766,6 +767,43 @@ mod tests {
         )];
         let err = refusal(&one_input(), &steps);
         assert_eq!(err.path(), "steps[0].transforms[1]");
+    }
+
+    #[test]
+    fn a_read_that_differs_only_in_case_is_refused() {
+        // R1-B6 / D6a: an input named `SECRET`; `FROM secret` must not be
+        // taken as that input — ClickHouse would look up `secret` as a table.
+        let inputs = vec![input("SECRET", "silver", "secret")];
+        let steps = vec![sql_step("copied", "SELECT * FROM secret")];
+        let err = refusal(&inputs, &steps);
+        assert_eq!(err.path(), "steps[0]");
+        assert_eq!(err.message(), super::READS_NOT_INPUT);
+    }
+
+    #[test]
+    fn a_transform_step_read_that_differs_only_in_case_is_refused() {
+        let inputs = vec![input("Orders", "silver", "orders")];
+        let steps = vec![transform_step("copied", "orders", &["select(id)"])];
+        let err = refusal(&inputs, &steps);
+        assert_eq!(err.path(), "steps[0]");
+        assert_eq!(err.message(), super::READS_NOT_INPUT);
+    }
+
+    #[test]
+    fn a_qualified_name_in_a_sql_step_is_refused_even_when_it_is_an_input() {
+        // D6a: a step reads an input by its name in the pipeline.
+        let inputs = vec![input("orders", "silver", "orders")];
+        let steps = vec![sql_step("copied", "SELECT * FROM silver.orders")];
+        let err = refusal(&inputs, &steps);
+        assert_eq!(err.path(), "steps[0]");
+        assert_eq!(err.message(), super::READS_NOT_INPUT);
+    }
+
+    #[test]
+    fn up_to_an_input_named_in_another_case_is_refused() {
+        let inputs = vec![input("orders", "silver", "orders")];
+        let err = compile(&inputs, &[], Some("Orders"), Some("icecat_api")).unwrap_err();
+        assert_eq!(err.path(), "upTo");
     }
 
     /// Decision 12: window functions are allowed, and so is every other
