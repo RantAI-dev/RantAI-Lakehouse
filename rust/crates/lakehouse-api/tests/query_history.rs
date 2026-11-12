@@ -1126,6 +1126,34 @@ mod recording {
         assert_eq!(body["canDownload"], json!(false), "{body}");
     }
 
+    /// Review round 1, R4 (`QS-9`, D9): the flag fails closed when the
+    /// settings cannot be read. Without this test, `map_or(true, ..)` in
+    /// place of `is_ok_and` kept every other test green and the console would
+    /// offer Download and "Copy as TSV" whenever the switch is unknown.
+    #[tokio::test]
+    async fn a_run_carries_can_download_false_when_the_settings_cannot_be_read() {
+        let ch = MockServer::start().await;
+        mount_prefetch_ok_and_engine_answer(
+            &ch,
+            200,
+            r#"{"meta":[{"name":"n","type":"UInt8"}],"data":[{"n":1}],"rows":1}"#,
+        )
+        .await;
+        let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+        let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+        // The read fails after the session exists, so what the run meets is
+        // the unreadable settings switch and not a broken sign-in.
+        sqlx::query("ALTER TABLE reporting_settings RENAME TO reporting_settings_gone")
+            .execute(&pool)
+            .await
+            .expect("hide the settings table");
+
+        let (status, body) = post_sql(&router, &cookie, "SELECT 1 AS n").await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["canDownload"], json!(false), "{body}");
+    }
+
     #[tokio::test]
     async fn a_completed_run_records_the_tables_its_statement_names() {
         let ch = MockServer::start().await;
