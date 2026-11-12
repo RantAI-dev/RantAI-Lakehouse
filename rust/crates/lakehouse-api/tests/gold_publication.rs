@@ -1118,8 +1118,8 @@ async fn if_changed_does_not_skip_after_a_failed_run() {
     );
 }
 
-/// QA `LH-DATA-1-06` (#484 review R4, `DATA-56`): a publish that fails before
-/// the export starts still leaves a run, so the card says "Last publish
+/// #484 review R4 (`DATA-56`): a publish that fails before the export starts
+/// still leaves a run, so the card says "Last publish
 /// failed". Here the catalog's token file is missing: the caller is allowed,
 /// the mart exists, and the answer is the fixed sentence of
 /// `token_unavailable_message` — never a path or an io error.

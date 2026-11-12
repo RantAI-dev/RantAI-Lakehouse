@@ -419,8 +419,8 @@ async fn gated_source_table(
 ///
 /// The history table is the card's source of truth, so a publish that fails
 /// has to leave a run there — otherwise a mart whose every publish fails before
-/// the copy starts stays "Up to date" or "Out of date" for ever (QA
-/// `LH-DATA-1-06`). After the caller is authenticated and allowed and the mart
+/// the copy starts stays "Up to date" or "Out of date" for ever (#484 review R4,
+/// `DATA-56`). After the caller is authenticated and allowed and the mart
 /// is shown to be theirs, every failure is recorded: the content fingerprint
 /// read, the `?ifChanged=true` history read, the catalog token file, and the
 /// export itself. A refusal records nothing: `401`/`403`/`503` from
@@ -475,7 +475,7 @@ pub async fn export(
 
     let triggered_by = triggered_by(principal.as_ref().map(|Extension(p)| p));
 
-    // QA `LH-DATA-1-06` (#484 review R4, DATA-56): from here on the caller is
+    // #484 review R4 (DATA-56): from here on the caller is
     // authenticated and allowed and the mart is shown to be theirs, so every
     // failure below is a failed publish and is recorded as one.
     let attempt = Attempt::open(&state, mart_ident.as_str(), &triggered_by).await?;
