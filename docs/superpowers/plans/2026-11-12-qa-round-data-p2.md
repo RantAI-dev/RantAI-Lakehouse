@@ -1522,3 +1522,18 @@ python3 ops/lint/check_bare_iceberg_count.py   OK
 python3 ops/lint/check_intra_package_imports.py OK
 git status           clean
 ```
+
+### Round 2 (planner, 2026-11-12), at `b0f25af2`
+
+Read the round-1 fix commits. R1 to R9 are fixed, one commit each, each new test shown red on
+the wrong change before it was kept. A person's name is resolved only inside the caller's
+tenants (`user_names_in_tenants`); a PostgreSQL connector's load, a Kafka batch and the schema
+commit of a history load now carry the run's label, so the documents say what the code does.
+
+**The developer's MISMATCH on R3 is right.** `service_identity` has no tenant column and a
+service principal has no tenants, so "in the caller's tenant" cannot apply to it. A service
+identity is an identity of the installation, not a person of a tenant: it is shown by its own
+name, as built, and D14 says why.
+
+No open BLOCKER. Still for CI to prove: the upload gate with a 128-character table name (T3)
+and the author on a real table's versions (T8). Merge when CI on #489 is green.
