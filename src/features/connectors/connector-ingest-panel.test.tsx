@@ -56,7 +56,8 @@ function found(options: { discovered?: unknown[] }): Found[] {
 function stubFetch(
   spec: typeof SPEC = SPEC,
   // SRC-11: the run record (`GET .../runs`) and the log of each run by id (`GET .../runs/{id}/log`).
-  history: { runs: unknown[]; logs?: Record<string, unknown> } = { runs: [] },
+  // SRC-39: `maxRuntimeSeconds` is the run limit the API judges runs by (absent in an older answer).
+  history: { runs: unknown[]; logs?: Record<string, unknown>; maxRuntimeSeconds?: number } = { runs: [] },
   // SRC-10: what discovery finds, and how a run of the connector is answered (the default launches run 0123456789abcdef).
   // SRC-11: how Resume is answered (the default lifts the pause).
   options: {
@@ -78,7 +79,7 @@ function stubFetch(
       const scheduleCron = body.scheduleCron ?? null
       return json({ ...spec, ...body, scheduleCron, nextRunAt: scheduleCron ? "2026-10-01T02:00:00Z" : null })
     }
-    if (url.endsWith("/runs")) return json({ runs: history.runs })
+    if (url.endsWith("/runs")) return json({ runs: history.runs, maxRuntimeSeconds: history.maxRuntimeSeconds })
     const log = /\/runs\/([^/]+)\/log(\?format=text)?$/.exec(url)
     if (log) {
       if (log[2]) return new Response("run 0123 (schedule), succeeded\n", { status: 200, headers: { "Content-Type": "text/plain" } })
@@ -1100,6 +1101,20 @@ describe("ConnectorIngestPanel runs from the run record", () => {
     expect(screen.getByText("This run never reported its end. It may have been stopped before it finished.")).toBeDefined()
     expect(screen.queryByText(/is running/)).toBeNull()
     await waitFor(() => expect((screen.getByRole("button", { name: "Run now" }) as HTMLButtonElement).disabled).toBe(false))
+  })
+
+  // SRC-39 (review round 1, R8): the limit is the API's setting, not a copy of six hours here. A
+  // raised limit must keep the page and the API in step, or "Run now" is offered for a run the API
+  // still refuses (that is QA TC-1702 itself).
+  it("keeps a run going for the limit the API sends, not for six hours", async () => {
+    stubFetch({ ...SPEC, sourceObjects: [{ name: "public.orders", target: "northwind_orders" }] }, {
+      maxRuntimeSeconds: 12 * 60 * 60,
+      runs: [record({ runId: "run-long-0001", status: "running", startedAt: new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString(), endedAt: null, durationSeconds: null, endReason: null })],
+    })
+    panel()
+    expect(await screen.findByText(/Run run-long is running/)).toBeDefined()
+    expect(screen.queryByText("No end reported")).toBeNull()
+    await waitFor(() => expect((screen.getByRole("button", { name: "Run now" }) as HTMLButtonElement).disabled).toBe(true))
   })
 
   it("shows a run recorded as running a moment ago as active, with Run now disabled", async () => {

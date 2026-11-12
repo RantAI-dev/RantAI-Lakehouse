@@ -16,7 +16,7 @@ import type {
   ConnectorProbeResult,
   ConnectorRun,
 } from "@/services/contracts/connectors"
-import { runStatusLabel, runStatusTone, scheduleLabel } from "./connector-ingest-panel"
+import { runLimitMillis, runStatusLabel, runStatusTone, scheduleLabel } from "./connector-ingest-panel"
 import { connectionReviewItems } from "./connector-review"
 import { failureStreakLabel } from "./connectors-columns"
 
@@ -81,8 +81,11 @@ export function ConnectorOverview({
   const probes = useService((s) => connectorService.listProbeHistory(id, 1, s), [id])
   const runs = useService((s) => connectorService.listConnectorRuns(id, s), [id])
 
-  const problems = recentProblems(probes.data?.results ?? null, runs.data)
-  const lastRun = runs.data?.[0] ?? null
+  const problems = recentProblems(probes.data?.results ?? null, runs.data?.runs ?? null)
+  const lastRun = runs.data?.runs[0] ?? null
+  // `review round 1, R8`: the API's run limit decides whether the last run is
+  // still going, so this tile and the Runs card agree.
+  const limitMs = runLimitMillis(runs.data?.maxRuntimeSeconds)
   const adapter = spec.data?.adapter ?? null
   const tables = spec.data?.sourceObjects.length ?? 0
 
@@ -179,7 +182,7 @@ export function ConnectorOverview({
           ) : runs.status === "error" ? (
             <span className="text-muted-foreground">Run history could not be loaded</span>
           ) : lastRun ? (
-            <Pill tone={runStatusTone(lastRun)}>{runStatusLabel(lastRun)}</Pill>
+            <Pill tone={runStatusTone(lastRun, limitMs)}>{runStatusLabel(lastRun, limitMs)}</Pill>
           ) : (
             <span className="text-muted-foreground">Never run</span>
           )}

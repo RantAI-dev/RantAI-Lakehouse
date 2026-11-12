@@ -88,10 +88,19 @@ const PAUSED_FOR_ANOTHER_REASON: &str = "This connector is not paused because of
 pub struct RunsResponse {
     /// The connector's newest runs, newest first, at most 50.
     runs: Vec<RunSummary>,
+    /// How long a run of this connector may run, in seconds, before the API
+    /// stops holding the connector for it (`INGEST_RUN_MAX_RUNTIME_SECONDS`,
+    /// `SRC-39`, QA `TC-1702`; `review round 1, R8`). The console shows a run
+    /// whose record still says `running` as going until this limit, and it
+    /// must not keep its own copy of the number: raising the setting would
+    /// otherwise bring the QA symptom back (the page would offer "Run now"
+    /// while the API still answers 409).
+    max_runtime_seconds: u32,
 }
 
 /// `GET /api/connectors/{id}/runs` -- the connector's last 50 runs with
-/// status, trigger, rows, duration and attempts (`SRC-11` decision D7).
+/// status, trigger, rows, duration and attempts (`SRC-11` decision D7), and
+/// the run limit the API judges them by.
 /// Exact for any number of connectors: the rows are the product's own, keyed
 /// by connector, not a search of a shared run list.
 ///
@@ -105,6 +114,7 @@ pub async fn list(
 ) -> ApiResult<ApiJson<RunsResponse>> {
     Ok(ApiJson(RunsResponse {
         runs: connector_run::list_runs(pool(&state)?, &id, RUN_HISTORY_LIMIT).await?,
+        max_runtime_seconds: state.config.ingest_run_max_runtime_seconds,
     }))
 }
 
@@ -940,6 +950,9 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{listed}");
         let run = &listed["runs"][0];
         assert_eq!(listed["runs"].as_array().unwrap().len(), 1);
+        // `review round 1, R8`: the run limit travels with the list, so the
+        // console shows a run as going for as long as the API holds it.
+        assert_eq!(listed["maxRuntimeSeconds"], 21_600);
         assert_eq!(run["runId"], "run-1");
         assert_eq!(run["trigger"], "schedule");
         assert_eq!(run["status"], "succeeded");
