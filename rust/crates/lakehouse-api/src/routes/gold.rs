@@ -54,7 +54,8 @@
 //!
 //! `?ifChanged=true` skips export when the `ClickHouse` content fingerprint
 //! (row count, wrapping 64-bit sum of `cityHash64(*)`, and schema hash)
-//! matches the last successful export. A full scan over a 5,000,000-row mart
+//! matches the last successful export — and never when the mart's newest run
+//! failed (`DATA-49`, QA `LH-DATA-1-01`). A full scan over a 5,000,000-row mart
 //! (`GOLD_EXPORT_MAX_ROWS`) with 4 realistic columns (`UInt64`, `String`, `Float64`,
 //! `DateTime`) measured 187 ms (0.187s) on `ClickHouse` 26.8 running on Linux
 //! `x86_64` (7.9 GB RAM, 6 vCPUs).
@@ -143,11 +144,22 @@ pub struct ExportQuery {
 /// stored fingerprint from a pre-DATA-10 run, no active mart fingerprint)
 /// exports: a stale open-format copy is the worse outcome, so uncertainty fails
 /// toward publishing.
+///
+/// `DATA-49` (QA `LH-DATA-1-01`): `newest_run_failed` is a fourth such doubt and
+/// wins over a matching fingerprint. The comparison is against the last
+/// *successful* run, so after a failure on an unchanged mart every scheduled run
+/// would be skipped and the card would say "Last publish failed" until someone
+/// pressed Publish now — and a run that failed between batches also leaves a
+/// partial newest copy. A failed newest run therefore always publishes.
 fn if_changed_skip_reason(
     current_fp: Option<&str>,
     last_fp: Option<&str>,
     last_exported_ms: Option<i64>,
+    newest_run_failed: bool,
 ) -> Option<String> {
+    if newest_run_failed {
+        return None;
+    }
     let current = current_fp?;
     let last = last_fp?;
     if current.is_empty() || last.is_empty() || current != last {
@@ -171,11 +183,22 @@ fn skipped_body(reason: &str) -> Value {
 /// The freshness reads behind `?ifChanged=true`: `Some(reason)` to skip with,
 /// `None` to export. A failed read is a classified [`ApiError`], not a silent
 /// skip — a scheduler that cannot MEASURE must not treat the mart as quiet.
+///
+/// `DATA-49` (QA `LH-DATA-1-01`): the newest run of any status is read first. A
+/// failed newest run answers `None` without the successful-run read, because a
+/// failure is reason enough to publish (see [`if_changed_skip_reason`]).
 async fn unchanged_since_last_export_reason(
     state: &AppState,
     mart: &str,
     current_fingerprint: Option<&str>,
 ) -> Result<Option<String>, ApiError> {
+    let newest = gold_export_history::last_export_run(&state.clickhouse, mart)
+        .await
+        .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
+    let newest_failed = newest.as_ref().is_some_and(|run| run.status == "failed");
+    if newest_failed {
+        return Ok(None);
+    }
     let last_export = gold_export_history::last_success_export(&state.clickhouse, mart)
         .await
         .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
@@ -185,6 +208,7 @@ async fn unchanged_since_last_export_reason(
         current_fingerprint,
         last_fp,
         last_started_ms,
+        newest_failed,
     ))
 }
 
@@ -373,7 +397,11 @@ async fn gated_source_table(
 /// This is what the scheduler sends so a quiet mart costs reading the
 /// last export history and one fingerprint query. Unknown facts never
 /// skip (see [`if_changed_skip_reason`]); the console's manual trigger
-/// does not send the parameter at all.
+/// does not send the parameter at all. A mart whose newest run FAILED is
+/// never skipped, even when its fingerprint matches the last success: the
+/// card would otherwise say "Last publish failed" until someone pressed
+/// Publish now, and a run that failed between batches leaves a partial
+/// newest copy (`DATA-49`, QA `LH-DATA-1-01`).
 ///
 /// # Single-flight: only one export of a given mart runs at a time
 ///
@@ -923,6 +951,12 @@ async fn publication_body(
         last_export.as_ref().map(|e| e.content_fingerprint.as_str()),
     );
     let last_exported_at = last_export.as_ref().and_then(|e| e.started_at_ms);
+    // `DATA-49` (QA `LH-DATA-1-01`): the newest run of any status, so the card
+    // can say the last publish failed instead of reading "Up to date" through
+    // five failed runs. A failed read here is classified like its neighbours.
+    let newest_run = gold_export_history::last_export_run(&state.clickhouse, mart)
+        .await
+        .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
     // PR #105 removed From<ChError>; classify, never surface ClickHouse text.
     let last_trim = gold_export_history::last_trim(&state.clickhouse, mart)
         .await
@@ -934,9 +968,30 @@ async fn publication_body(
         "lastChangedAt": last_changed_at.and_then(millis_to_rfc3339),
         "lastExportedAt": last_exported_at.and_then(millis_to_rfc3339),
         "changedSinceExport": changed_since_export,
+        "lastFailure": last_failure(newest_run.as_ref()),
         "canEdit": can_edit,
         "trim": last_trim,
     }))
+}
+
+/// The `lastFailure` field of [`publication_body`] (`DATA-49`, QA
+/// `LH-DATA-1-01`): `null` unless the newest run of the mart is `failed`, then
+/// the time it started and the sentence that was stored for it.
+///
+/// `lastExportedAt` and `changedSinceExport` keep describing the last
+/// *successful* publish, so the card can show both facts at once. A row with no
+/// stored reason says so instead of inventing one.
+fn last_failure(newest: Option<&gold_export_history::LastExportRun>) -> Value {
+    let Some(run) = newest.filter(|run| run.status == "failed") else {
+        return Value::Null;
+    };
+    json!({
+        "failedAt": run.started_at_ms.and_then(millis_to_rfc3339),
+        "reason": run
+            .error
+            .clone()
+            .unwrap_or_else(|| "The publish failed. No reason was recorded.".to_owned()),
+    })
 }
 
 /// Borrow the Postgres pool, or fail with a 503. Mirrors
@@ -999,7 +1054,9 @@ pub async fn publications(
 }
 
 /// `GET /api/gold/export/{mart}/publication` — one mart's publication
-/// state: the stored switch plus the two measured freshness facts.
+/// state: the stored switch, the two measured freshness facts, and
+/// `lastFailure` when the mart's newest run failed (`DATA-49`, QA
+/// `LH-DATA-1-01`).
 ///
 /// A mart with no `gold_publication` row is OFF (the default), reported
 /// as `enabled: false, updatedAt: null` — a missing row is a state, not
@@ -1378,6 +1435,7 @@ mod tests {
             Some("10:11129132029957349367:16812361877011020269"),
             Some("10:11129132029957349367:16812361877011020269"),
             Some(1_700_000_000_000),
+            false,
         )
         .expect("matching fingerprint must skip");
         assert!(skip.starts_with("unchanged since "), "{skip}");
@@ -1390,6 +1448,7 @@ mod tests {
                 Some("10:111:222"),
                 Some("10:333:222"),
                 Some(1_700_000_000_000),
+                false,
             )
             .is_none()
         );
@@ -1397,13 +1456,13 @@ mod tests {
 
     #[test]
     fn no_success_row_exports() {
-        assert!(if_changed_skip_reason(Some("10:111:222"), None, None).is_none());
+        assert!(if_changed_skip_reason(Some("10:111:222"), None, None, false).is_none());
     }
 
     #[test]
     fn empty_stored_fingerprint_exports() {
         assert!(
-            if_changed_skip_reason(Some("10:111:222"), Some(""), Some(1_700_000_000_000),)
+            if_changed_skip_reason(Some("10:111:222"), Some(""), Some(1_700_000_000_000), false,)
                 .is_none()
         );
     }
@@ -1411,13 +1470,61 @@ mod tests {
     #[test]
     fn empty_or_missing_current_fingerprint_exports() {
         assert!(
-            if_changed_skip_reason(Some(""), Some("10:111:222"), Some(1_700_000_000_000),)
+            if_changed_skip_reason(Some(""), Some("10:111:222"), Some(1_700_000_000_000), false,)
                 .is_none()
         );
         assert!(
-            if_changed_skip_reason(None, Some("10:111:222"), Some(1_700_000_000_000),).is_none()
+            if_changed_skip_reason(None, Some("10:111:222"), Some(1_700_000_000_000), false)
+                .is_none()
         );
-        assert!(if_changed_skip_reason(None, None, None).is_none());
+        assert!(if_changed_skip_reason(None, None, None, false).is_none());
+    }
+
+    /// QA `LH-DATA-1-01` (`DATA-49`): a failed newest run publishes even when
+    /// the fingerprint matches the last success — otherwise every scheduled run
+    /// would be skipped and the card would stay "Last publish failed".
+    #[test]
+    fn a_failed_newest_run_is_never_skipped_even_when_the_fingerprint_matches() {
+        assert!(
+            if_changed_skip_reason(
+                Some("10:111:222"),
+                Some("10:111:222"),
+                Some(1_700_000_000_000),
+                true,
+            )
+            .is_none(),
+            "a failed newest run is a doubt, and doubt fails toward publishing"
+        );
+    }
+
+    /// The `lastFailure` field is null unless the newest run failed, whatever the
+    /// last successful publish says.
+    #[test]
+    fn last_failure_is_null_when_the_newest_run_succeeded_or_there_is_none() {
+        assert_eq!(last_failure(None), Value::Null);
+        assert_eq!(
+            last_failure(Some(&gold_export_history::LastExportRun {
+                status: "success".to_owned(),
+                started_at_ms: Some(1_700_000_000_000),
+                error: None,
+            })),
+            Value::Null
+        );
+    }
+
+    /// A failed newest run carries the time it started and the stored sentence.
+    #[test]
+    fn last_failure_carries_the_time_and_the_stored_sentence_when_the_newest_run_failed() {
+        let failure = last_failure(Some(&gold_export_history::LastExportRun {
+            status: "failed".to_owned(),
+            started_at_ms: Some(1_700_000_000_000),
+            error: Some("The catalog request failed. Reference: abc".to_owned()),
+        }));
+        assert_eq!(
+            failure["reason"],
+            "The catalog request failed. Reference: abc"
+        );
+        assert_eq!(failure["failedAt"], "2023-11-14T22:13:20Z");
     }
 
     // ── The stored and answered sentence (DATA-49, QA LH-DATA-1-01) ──────

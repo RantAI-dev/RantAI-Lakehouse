@@ -474,6 +474,67 @@ pub async fn last_success_export(
     }))
 }
 
+/// `mart`'s newest export run of ANY status — the mirror of
+/// [`last_success_sql`] without the `status` filter.
+fn last_run_sql(mart: &str) -> String {
+    format!(
+        "SELECT status, error, \
+                toString(toUnixTimestamp64Milli(started_at)) AS started_ms \
+          FROM console.gold_export_run \
+          WHERE mart = {mart} \
+          ORDER BY started_at DESC, finished_at DESC LIMIT 1 FORMAT JSON",
+        mart = SqlLiteral::from(mart),
+    )
+}
+
+/// The newest export run of a mart, whatever its status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastExportRun {
+    /// `"success"` or `"failed"`, as stored.
+    pub status: String,
+    /// Milliseconds since Unix epoch when the run started, or `None` if the
+    /// stored value cannot be parsed.
+    pub started_at_ms: Option<i64>,
+    /// The stored sentence, already through [`public_error`], so a row written
+    /// before `DATA-49` cannot show upstream text here either.
+    pub error: Option<String>,
+}
+
+/// Read `mart`'s newest export run of any status, or `None` if it has never
+/// run (`DATA-49`, QA `LH-DATA-1-01`).
+///
+/// `?ifChanged=true` needs it so a run that failed is never skipped (a failure
+/// on an unchanged mart would otherwise leave every scheduled run skipped), and
+/// the publication body needs it so the card can say the last publish failed.
+///
+/// # Errors
+///
+/// Returns [`ChError`] if the table cannot be ensured or the query fails.
+pub async fn last_export_run(ch: &ChClient, mart: &str) -> Result<Option<LastExportRun>, ChError> {
+    ensure_gold_export_run_table(ch).await?;
+    let rows = ch.rows(&last_run_sql(mart), None).await?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let started_at_ms = row
+        .get("started_ms")
+        .and_then(Value::as_str)
+        .and_then(|ms| ms.parse::<i64>().ok());
+    Ok(Some(LastExportRun {
+        status: row
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        started_at_ms,
+        error: row
+            .get("error")
+            .and_then(Value::as_str)
+            .map(public_error)
+            .map(str::to_owned),
+    }))
+}
+
 /// Unix-millisecond `started_at` of `mart`'s newest `status = 'success'`
 /// run, or `None` when it has never exported successfully. DATA-1's
 /// publication detail route and `?ifChanged=true` both need "when was
@@ -974,5 +1035,21 @@ mod tests {
         // The count and the rewrite share one predicate, so they cannot drift.
         assert!(raw_error_count_sql().contains(&raw_error_predicate()));
         assert!(sql.contains(&raw_error_predicate()));
+    }
+    /// `DATA-49` (QA `LH-DATA-1-01`): the publication body and `?ifChanged=true`
+    /// need the newest run of ANY status, so the statement must not filter on
+    /// `success` the way `last_success_sql` does.
+    #[test]
+    fn last_run_sql_takes_the_newest_row_of_any_status() {
+        let sql = last_run_sql("orders");
+        assert!(sql.contains("FROM console.gold_export_run"), "{sql}");
+        assert!(sql.contains("WHERE mart = 'orders'"), "{sql}");
+        assert!(!sql.contains("status = 'success'"), "{sql}");
+        assert!(
+            sql.contains("ORDER BY started_at DESC, finished_at DESC"),
+            "{sql}"
+        );
+        assert!(sql.contains("LIMIT 1 FORMAT JSON"), "{sql}");
+        assert!(sql.contains("error"), "{sql}");
     }
 }

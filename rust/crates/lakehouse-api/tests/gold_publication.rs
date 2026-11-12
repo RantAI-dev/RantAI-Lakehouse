@@ -952,3 +952,166 @@ async fn stored_upstream_text_is_rewritten_at_rest_and_never_listed() {
         "nothing matches after the rewrite"
     );
 }
+
+/// One history row of any status, for the `DATA-49` tests that need a failed
+/// run beside a successful one.
+async fn seed_run(
+    ch: &ChClient,
+    mart: &str,
+    status: &str,
+    started_ms: i64,
+    content_fingerprint: &str,
+    error: Option<&str>,
+) {
+    gold_export_history::record_export_run(
+        ch,
+        &gold_export_history::NewGoldExportRun {
+            mart,
+            status,
+            rows_exported: if status == "success" { Some(5) } else { None },
+            format_version: if status == "success" { Some(2) } else { None },
+            snapshot_id: None,
+            error,
+            triggered_by: "user:test",
+            content_fingerprint,
+            started_at_ms: started_ms,
+            finished_at_ms: started_ms,
+        },
+    )
+    .await
+    .expect("seed an export history row");
+}
+
+/// QA `LH-DATA-1-01` (`DATA-49`): after a failed publish the publication says so
+/// — with the time and the stored sentence — while `lastExportedAt` still names
+/// the last SUCCESSFUL publish. A later success clears the failure.
+#[tokio::test]
+async fn publication_detail_reports_the_last_failure_until_a_later_run_succeeds() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "failure_status_mart").await;
+    let fingerprint =
+        gold_export_history::mart_content_fingerprint(&ch, "serving", "failure_status_mart")
+            .await
+            .expect("read the fingerprint")
+            .expect("the mart has a fingerprint");
+    seed_run(
+        &ch,
+        "failure_status_mart",
+        "success",
+        unix_ms(-3_600),
+        &fingerprint,
+        None,
+    )
+    .await;
+    seed_run(
+        &ch,
+        "failure_status_mart",
+        "failed",
+        unix_ms(-60),
+        &fingerprint,
+        Some("The catalog request failed. Reference: abc123"),
+    )
+    .await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/failure_status_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["lastFailure"]["reason"], "The catalog request failed. Reference: abc123",
+        "{body}"
+    );
+    assert!(
+        body["lastFailure"]["failedAt"].is_string(),
+        "the failure names when it happened: {body}"
+    );
+    assert!(
+        body["lastExportedAt"].is_string(),
+        "the last successful publish is still reported: {body}"
+    );
+
+    // A later success clears the failure and moves lastExportedAt.
+    seed_run(
+        &ch,
+        "failure_status_mart",
+        "success",
+        unix_ms(0),
+        &fingerprint,
+        None,
+    )
+    .await;
+    let (status, body) = send(
+        &sessions.app.router,
+        "GET",
+        "/api/gold/export/failure_status_mart/publication",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["lastFailure"].is_null(),
+        "a success after the failure clears it: {body}"
+    );
+}
+
+/// QA `LH-DATA-1-01` (`DATA-49`): `?ifChanged=true` must not skip a mart whose
+/// newest run failed, even when its fingerprint matches the last success — the
+/// run has to be attempted again, which in this harness means reaching the
+/// missing token file (503), not answering `skipped`.
+#[tokio::test]
+async fn if_changed_does_not_skip_after_a_failed_run() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "retry_after_failure_mart").await;
+    let fingerprint =
+        gold_export_history::mart_content_fingerprint(&ch, "serving", "retry_after_failure_mart")
+            .await
+            .expect("read the fingerprint")
+            .expect("the mart has a fingerprint");
+    seed_run(
+        &ch,
+        "retry_after_failure_mart",
+        "success",
+        unix_ms(-3_600),
+        &fingerprint,
+        None,
+    )
+    .await;
+    seed_run(
+        &ch,
+        "retry_after_failure_mart",
+        "failed",
+        unix_ms(-60),
+        &fingerprint,
+        Some("The database request failed. Reference: abc123"),
+    )
+    .await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "POST",
+        "/api/gold/export/retry_after_failure_mart?ifChanged=true",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        body.get("skipped").is_none(),
+        "a failed newest run is published again, never skipped: {body}"
+    );
+    assert_eq!(
+        history_row_count(&ch, "retry_after_failure_mart").await,
+        2,
+        "the 503 happens before export_mart, so nothing new was recorded"
+    );
+}
