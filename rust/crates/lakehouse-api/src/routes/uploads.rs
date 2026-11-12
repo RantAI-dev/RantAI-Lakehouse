@@ -1643,6 +1643,7 @@ pub async fn list(
             Some(id) => FolderFilter::In(id),
         },
         text,
+        table: None,
     };
     let rows = uploads::list_filtered(pool, tenant_id, LIST_LIMIT, &filter).await?;
     let mut settler = Settler::new(&state, pool);
