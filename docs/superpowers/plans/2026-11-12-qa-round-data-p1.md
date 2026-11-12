@@ -1199,3 +1199,14 @@ touch); no warning was added and none was suppressed.
   against a deployment; the tests above are the evidence on this branch.
 
 No MISMATCH: every finding's fix was possible as written.
+
+### Round 2 (planner, 2026-11-12), at `8da9eca79`
+
+Read `e8580c465..8da9eca79`. R1, R2 with R3, R5, R6 and R8 are fixed as asked, and each new or
+corrected test was shown red before its fix. `useTableUploads` now ties an answer and a failure
+to the ask that requested it, so a name asked again is `checking` until its own answer; the
+card and the Gold exports page read the publication and the runs again after a failed publish.
+R4 (a failure before the export starts writes no run) goes to the backlog; R7 was withdrawn.
+
+No open BLOCKER. Still for CI to say: the Gold export gate with its decimal columns (T8), and
+the full Rust suite. Merge when CI on #484 is green.
