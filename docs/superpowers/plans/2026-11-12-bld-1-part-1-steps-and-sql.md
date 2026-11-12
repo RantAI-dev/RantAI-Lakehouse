@@ -474,6 +474,167 @@ which pages were opened, in which theme, or *not verified*.
 
 *(the developer appends one entry per slice)*
 
+### Handoff S1 (developer, 2026-11-12)
+
+Branch `feat/bld-1-steps-api`, base `origin/main` at `512f6e37c`.
+
+**Commits**
+
+| Commit | Subject |
+| --- | --- |
+| `a5214a2f5` | feat(pipelines): store a pipeline as inputs and steps (S1-T1) |
+| `f62b05e1d` | feat(pipelines): compile a definition into one statement (S1-T2) |
+| `9e1e35524` | wip: S1-T3 save path (intermediate, kept because sessions die) |
+| `b8338e4e4` | feat(pipelines): check access when a pipeline is saved (S1-T3) |
+| `4bf4b1509` | feat(pipelines): the orchestrator compiles instead of sending SQL (S1-T4) |
+| `5b0a66bec` | feat(pipelines): target lag follows every input (S1-T5) |
+| `5b56c0f28` | feat(dagster): the orchestrator asks the API for the SQL (S1-T6) |
+| `db8b6e529` | feat(ai): the assistant authors inputs and SQL steps (S1-T7) |
+| `a2df5fcd7` | docs(operations): a run gets its SQL from the compile route (S1-T8) |
+| (this commit) | docs(plan): BLD-1 part 1 S1 handoff |
+
+**Migration.** `0137_pipeline_inputs_and_steps.sql`. Checked every remote
+branch first: the highest number any of them holds is `0136`, so 0137 was
+free. It adds `inputs JSONB`, `steps JSONB` and `input_tables TEXT[]` (all
+`NOT NULL DEFAULT`), two `IMMUTABLE` SQL functions (`pipeline_legacy_input`,
+`pipeline_legacy_steps`, plus the name predicate) and one backfill `UPDATE`.
+The functions exist so the store test can compare the migration's answer with
+`pipelines::legacy_definition` instead of restating the rule in SQL.
+
+**Verification, run on the final commit (counts are real).**
+
+```
+cd rust && cargo fmt --check                                  # clean
+cargo-locked clippy -j 2 -p lakehouse-store -p lakehouse-api --all-targets -- -D warnings
+                                                              # clean
+cargo-locked test -j 2 -p lakehouse-store --test pipelines     # 70 passed, 0 failed
+cargo-locked test -j 2 -p lakehouse-api --lib -- pipeline_compile sql_guard transform_grammar
+                                                              # 69 passed, 0 failed
+cargo-locked test -j 2 -p lakehouse-api --test pipeline_compile_route --test route_auth
+                                                              # 20 passed; 90 passed; 0 failed
+python3 ops/lint/check_intra_package_imports.py               # OK
+python3 ops/lint/check_bare_iceberg_count.py                  # R11 guard: none found
+```
+
+Other scoped runs during the slice (each on the commit that needed it):
+`-p lakehouse-api --lib -- pipeline` 284 passed (all create/update/status/
+detail/connector/restore/depends-on route tests); `--lib -- pipeline_lag` 42
+passed; `--test pipeline_definition_save` 10 passed; `--test
+column_lineage_pipeline` 7 passed; `--test table_access` 14; `--test
+pipeline_lag_check` 7; `--test pipeline_lag_page` 6; `--lib --
+create_pipeline_accepts_inputs_and_a_sql_step` 1 passed.
+
+**Python.** `pytest dispar_orchestrate` was run in full after S1-T6: 2511
+passed, 1 skipped, 25 subtests (`/home/shiro/rantai/venv-pr186/bin/python`;
+see "not verified" below). After S1-T7/T8 only Rust and Markdown changed, so
+the re-run was scoped: `test_authored_factory.py` + `test_op_source_metadata.py`
+111 passed, 18 subtests.
+
+**D11: every reader of the single `source` column, and what was done.**
+Found with `grep -n "\.source\b\|p\.source\|source ="` over
+`lakehouse-store` and `lakehouse-api`:
+1. `lag_reader_predicate` (store) — the `p.source = candidate` term became
+   `candidate = ANY (p.input_tables)`.
+2. `upstream_downstream_pipelines_conn` (store) — starts from every input;
+   `source` is the fallback for a row with an empty array.
+3. `find_target_lag_cycle_conn` (store) — the walk starts from every input of
+   each lag pipeline, same fallback.
+4. `pipeline_lag::inputs_of_conn` (API) — parses every input, same fallback.
+5. `Pipeline::source` itself, and the create/update write of the column, are
+   the only others; both are the definition's storage shape (D3) and were not
+   readers of "what does this pipeline read". `pipeline_lag` snapshots
+   (`inputs_of`) feed `InputTable`s, not `source`.
+No fifth reader exists. `Pipeline` gained `input_tables`, `#[serde(skip)]` so
+the wire shape does not change in this release.
+
+**Python tests removed with their code (D14), and the Rust test that
+replaces each**
+- `BuildSelectSqlTest::test_select_rename_cast_filter_dedupe_compose_into_one_statement`
+  → `pipeline_compile::tests::a_transform_step_renders_select_rename_cast_filter_and_dedupe`
+- `BuildSelectSqlTest::test_no_transforms_selects_star_with_no_where_or_order`
+  → `pipeline_compile::tests::one_input_and_no_steps_is_a_plain_copy`
+- `BronzeSourceTest::test_a_bronze_source_is_read_through_the_api_iceberg_query_database`
+  → `pipeline_compile::tests::a_bronze_input_is_read_through_the_catalog_database`
+- `BronzeSourceTest::test_resolve_source_marks_only_bronze_as_an_iceberg_read`
+  → same compiler test, plus `tests/pipeline_compile_route.rs::reads_iceberg_is_true_only_with_a_bronze_input`
+- `BronzeSourceTest::test_a_silver_source_is_read_exactly_as_before`
+  → `pipeline_compile::tests::one_input_and_no_steps_is_a_plain_copy`
+- `BronzeSourceTest::test_this_module_creates_no_catalog_database_of_its_own`
+  → nothing: the module no longer creates a database at all
+- `OpForPipelineTest::test_a_rejected_transform_raises_a_non_retryable_failure_wrapping_transform_error`
+  → `pipeline_compile_route.rs`'s 422 refusal cases (the grammar left Python)
+- `test_authored_transforms.py` (whole file) → `transform_grammar::shared_vectors::the_shared_accept_reject_vectors_match_this_grammar`
+The enforcement tests were kept, renamed `CompileSqlTest`, against the new
+route.
+
+**Existing Rust tests changed because behaviour changed by plan, and why**
+- `tests/pipeline_enforce.rs` → `tests/pipeline_compile_route.rs` (D8).
+- `tests/column_lineage_pipeline.rs`: the noted SQL is now the COMPILED
+  statement, whose inputs are CTEs; the mapper records `partial: true` with
+  the reason "read through the CTE …, which is not traced" instead of an
+  invented source column, and the test now asserts that answer. **See
+  "mismatch" below.**
+- `tests/pipeline_lag_check.rs::unparseable_source_preserves_existing_state`
+  corrupts `input_tables` (D11's column) instead of `source`.
+- route-test fixtures that build a pipeline as a tenantless stand-in principal
+  or as a user whose real roles cannot read the table now meet the save-time
+  gate (D9); they use the seeded Platform Admin (`fajar`), and the test
+  `Config`s name `ICEBERG_QUERY_DB` because D4 compiles a Bronze input
+  through it.
+- `tests/table_access.rs` and the store's `update_input_for` needed no change.
+
+**Mismatch between plan and code (for the planner)**
+
+1. `docs/core/features/pipeline-joins-and-sql.md` still shows decisions 12–18
+   as *(proposed)* with an empty Signed cell, although the brief says they
+   were signed on 2026-11-12. I built to 12 (window functions allowed), 15
+   (20 steps), 16 (20,000 characters) and 18 (nothing reaches the page from
+   this slice); the feature page should be updated.
+2. **DATA-13 lineage degrades for pipelines.** D8 says "same lineage note",
+   and the note is the compiled statement. Because every input is a CTE and
+   the outer select is `SELECT * FROM <last step>`, the lineage mapper can no
+   longer prove which source column a target column came from: it writes
+   `partial: true` with an honest reason instead of the previous exact
+   mapping. The target table/columns are still recorded. Fixing it needs
+   either a CTE-aware mapper or noting the last step's SQL expanded; it is
+   not in this slice's scope and should be a backlog item (BLD-1 follow-up or
+   DATA-13 follow-up) before AC1-style acceptance reads lineage.
+3. The save-time gate (D9) refuses a pipeline saved by a restricted user when
+   the pipeline has no tenant (the gate's `TenantReach::NoTenant`), which is a
+   new refusal for a deployment where a user creates before an admin assigns
+   a tenant. Platform Admins are unaffected. This follows from "exactly as D8
+   does" (D8 answers 409 before the gate) but the plan did not say it.
+4. `validate_per_table_upstream` and the connector rule now read the FIRST
+   input (D12) rather than a `sourceZone` field; no behaviour change for a
+   one-input pipeline, which is every pipeline a connector can have.
+
+**Not verified locally**
+- `ops/g7/g7_pipeline_test.py` (the new two-input SQL-join case) and
+  `ops/g7/bld1_pipeline_author_test.py`: they need the whole stack. Both were
+  `python3 -m py_compile`d and checked by eye; CI job `g3a-dagster` runs them.
+  In the new gate case the two "inputs" are the same Bronze table under two
+  names, because the G7 stack guarantees one loaded Bronze table; the case
+  still exercises two inputs, a join, an aggregate, the compile, the rewrite
+  and the run.
+- The assistant's end-to-end behaviour against a live model; only the schema
+  snapshot test and the tool test above were run.
+- `pytest` under `/home/shiro/rantai/venv-bld3/bin/python`: that venv cannot
+  import the package (`ModuleNotFoundError: fastavro`), so the full suite was
+  run under `venv-pr186/bin/python`, which has the same `dagster 1.13.20` and
+  the missing dependency. CI runs the full suite in the `g3a-dagster` job.
+- `cargo test --workspace` and the full clippy workspace run: not run here
+  (the brief scopes local runs); CI runs them on the draft PR.
+
+**For S2/S3**
+- `pipeline_compile::compile(inputs, steps, Some(upTo), catalog_db)` is the
+  preview's seam; `DefinitionError::path()` gives the `inputs[i]`/`steps[i]`
+  prefix the editor selects an item with.
+- The wire shape S3 can rely on: `AuthoredDefinition` carries `inputs` and
+  `steps` (camelCase, `PipelineStep` internally tagged by `kind`), and keeps
+  `sourceZone`/`sourceTable`/`transforms`.
+- `POST /api/pipelines` and `PUT /api/pipelines/{id}` refuse a body that
+  sends both forms, and a body that sends neither.
+
 ## 7. Review
 
 *(the reviewer appends findings per slice, tagged `BLOCKER` or `SHOULD-FIX`)*
