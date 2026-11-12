@@ -21,7 +21,11 @@
      `pyiceberg` — a real Iceberg REST client, not a hand-rolled request.
      The row count must match what was seeded, a write must be refused
      403, another namespace must be refused 403, and the consumers route
-     must list the tool with one read.
+     must list the tool with one read. The same read also proves DATA-48:
+     the mart carries one decimal column per Parquet storage form
+     (`Decimal(9, 0)` as INT32, `Decimal(12, 2)` as INT64, `Decimal(38,
+     10)` as a fixed-length byte array), and every value pyiceberg reads
+     from the published table equals what ClickHouse holds.
 
 Same `g1-test-runner`/`g3a-test-runner` shape: run inside the compose
 network (`gold-export-test-runner` in `docker-compose.yml`), plain
@@ -40,6 +44,7 @@ Rust unit test (`routes::iceberg_door`'s `rewrite_endpoint`).
 
 from __future__ import annotations
 
+import decimal
 import os
 import random
 import sys
@@ -77,6 +82,31 @@ GOLD_SOURCE_SCHEMA = os.environ.get("GOLD_SOURCE_SCHEMA", "serving")
 GOLD_EXPORT_RUN_TOKEN = os.environ.get("GOLD_EXPORT_RUN_TOKEN", "")
 MART_NAME = os.environ.get("GOLD_MART_NAME", "gold_export_smoke")
 ROW_COUNT = int(os.environ.get("GOLD_EXPORT_ROW_COUNT", "7"))
+# DATA-48 (QA LH-DATA-1-51): one decimal column per Parquet storage form —
+# `Decimal(9, 0)` is written as INT32, `Decimal(12, 2)` as INT64 and
+# `Decimal(38, 10)` as a fixed-length byte array — so the gate proves every
+# form survives the round trip. Row `i` takes entry `i % 7`, and each value
+# is written as decimal text through `toDecimal*`, so no value passes
+# through a float on the way in either.
+DECIMAL_UNITS = ["-999999999", "0", "1", "999999999", "-1", "42", "7"]
+DECIMAL_NET_AMOUNTS = [
+    "-1234567890.12",
+    "0",
+    "0.01",
+    "-0.01",
+    "9999999999.99",
+    "12.50",
+    "-0.50",
+]
+DECIMAL_FEES = [
+    None,
+    "-1234567890123456789012345678.0123456789",
+    "0.0000000001",
+    "9999999999999999999999999999.9999999999",
+    "0",
+    "-0.0000000001",
+    "1",
+]
 # DATA-5 (ADR 0016): the outside tool's service identity. The name
 # carries a random suffix because this test may run more than once
 # against the same deployment (a service identity's name is its natural
@@ -171,7 +201,8 @@ def step_login() -> None:
 
 def step_seed_gold_mart() -> None:
     """A real Gold aggregate mart shape: `region`/`total_sales`/
-    `order_count`/`updated_at` — one MergeTree table, ordinary (non-
+    `order_count`/`updated_at`, plus the three decimal columns of DATA-48
+    (`units`, `net_amount`, `fee`) — one MergeTree table, ordinary (non-
     Iceberg) `ClickHouse`, exactly the kind of `serving.*` table ADR 0010
     is exporting."""
     ch_query(f"CREATE DATABASE IF NOT EXISTS {GOLD_SOURCE_SCHEMA}")
@@ -179,7 +210,9 @@ def step_seed_gold_mart() -> None:
     ch_query(
         f"CREATE TABLE {GOLD_SOURCE_SCHEMA}.`{MART_NAME}` ("
         "region String, total_sales Float64, order_count UInt64, "
-        "updated_at DateTime"
+        "updated_at DateTime, "
+        "units Decimal(9, 0), net_amount Decimal(12, 2), "
+        "fee Nullable(Decimal(38, 10))"
         ") ENGINE = MergeTree ORDER BY region"
     )
     rows = []
@@ -187,10 +220,21 @@ def step_seed_gold_mart() -> None:
         region = f"region-{i}"
         total_sales = round(random.uniform(100.0, 9999.0), 2)
         order_count = random.randint(1, 500)
-        rows.append(f"('{region}', {total_sales}, {order_count}, now())")
+        # The three storage forms, one entry of each list per row. The values
+        # are decimal TEXT converted by ClickHouse, never a Python float.
+        entry = i % len(DECIMAL_UNITS)
+        units = f"toDecimal32('{DECIMAL_UNITS[entry]}', 0)"
+        net_amount = f"toDecimal64('{DECIMAL_NET_AMOUNTS[entry]}', 2)"
+        fee_text = DECIMAL_FEES[entry]
+        fee = "NULL" if fee_text is None else f"toDecimal128('{fee_text}', 10)"
+        rows.append(
+            f"('{region}', {total_sales}, {order_count}, now(), "
+            f"{units}, {net_amount}, {fee})"
+        )
     ch_query(
         f"INSERT INTO {GOLD_SOURCE_SCHEMA}.`{MART_NAME}` "
-        f"(region, total_sales, order_count, updated_at) VALUES {', '.join(rows)}"
+        f"(region, total_sales, order_count, updated_at, units, net_amount, fee) "
+        f"VALUES {', '.join(rows)}"
     )
     # Qualified with a WHERE, per R11 (`ops/lint/check_bare_iceberg_count.py`)
     # — not that this table is Iceberg at all (it's MergeTree, R11 doesn't
@@ -409,22 +453,81 @@ def _outside_catalog(key: str):
     )
 
 
+def _clickhouse_decimal_values() -> dict[str, tuple]:
+    """The mart's three decimal columns as `decimal.Decimal`, keyed by
+    `region`, read as TEXT from `ClickHouse` — a TabSeparated `\\N` is a
+    NULL."""
+    raw = ch_query(
+        f"SELECT region, toString(units), toString(net_amount), toString(fee) "
+        f"FROM {GOLD_SOURCE_SCHEMA}.`{MART_NAME}` ORDER BY region FORMAT TabSeparated"
+    )
+    held: dict[str, tuple] = {}
+    for line in raw.splitlines():
+        if not line:
+            continue
+        region, units, net_amount, fee = line.split("\t")
+        held[region] = (
+            decimal.Decimal(units),
+            decimal.Decimal(net_amount),
+            None if fee == "\\N" else decimal.Decimal(fee),
+        )
+    return held
+
+
 def step_outside_tool_reads_the_published_table(key: str) -> None:
     """The outside tool reads the published table through the door and
     sees exactly the rows that were seeded — the whole point of DATA-5:
     outside reading works, and the rows are the same ones the console
-    exports."""
+    exports.
+
+    DATA-48 (QA `LH-DATA-1-51`): from the SAME one load and one scan (the
+    consumers step counts exactly one read), the three decimal columns are
+    checked too — their Arrow types, and every value against what
+    `ClickHouse` holds. That is the proof the published decimals are exact,
+    in each of the three Parquet storage forms.
+    """
     catalog = _outside_catalog(key)
     table = catalog.load_table(("gold", MART_NAME))
-    rows = table.scan().to_arrow().num_rows
+    published = table.scan().to_arrow()
+    rows = published.num_rows
     if rows != ROW_COUNT:
         raise GoldExportFailure(
             f"the outside tool read {rows} rows through the door, "
             f"expected {ROW_COUNT}"
         )
+
+    for name, expected_type in [
+        ("units", pa.decimal128(9, 0)),
+        ("net_amount", pa.decimal128(12, 2)),
+        ("fee", pa.decimal128(38, 10)),
+    ]:
+        actual_type = published.schema.field(name).type
+        if actual_type != expected_type:
+            raise GoldExportFailure(
+                f"gold.{MART_NAME}.{name} reads back as {actual_type}, "
+                f"expected {expected_type}"
+            )
+
+    by_region = {
+        row["region"]: (row["units"], row["net_amount"], row["fee"])
+        for row in published.to_pylist()
+    }
+    held = _clickhouse_decimal_values()
+    if set(by_region) != set(held):
+        raise GoldExportFailure(
+            "the published regions differ from ClickHouse's: "
+            f"published {sorted(by_region)}, held {sorted(held)}"
+        )
+    for region, held_values in held.items():
+        if by_region[region] != held_values:
+            raise GoldExportFailure(
+                f"gold.{MART_NAME} region {region} reads back as {by_region[region]}, "
+                f"ClickHouse holds {held_values}"
+            )
+
     print(
         f"[gold-export] the outside tool read {rows} rows of gold.{MART_NAME} "
-        "through the door"
+        "through the door, and the three decimal columns match ClickHouse exactly"
     )
 
 

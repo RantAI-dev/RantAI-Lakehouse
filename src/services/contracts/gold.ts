@@ -26,15 +26,20 @@ export type GoldExportResult = {
 /**
  * `GET /api/gold/export/{mart}` response — the Gold Iceberg table read
  * straight back through `iceberg-rust`, independent of whatever the last
- * `POST` claimed. 500s when the table has never been exported; the client
- * classifies that as `ServiceError` for the page to render as "Never
- * exported" rather than a generic error.
+ * `POST` claimed.
+ *
+ * A mart never published answers 200 with `published: false` and every other
+ * fact `null` (`DATA-49`, D11): "no export yet" is a normal state, not an
+ * error, so the console reads it from this field. A failed request is a
+ * failure and is shown as one, never as "Never exported".
  */
 export type GoldReadBack = {
   namespace: string
   table: string
-  formatVersion: number
-  rowsInIceberg: number
+  /** Whether the catalog holds this mart's published table at all. */
+  published: boolean
+  formatVersion: number | null
+  rowsInIceberg: number | null
   snapshotId: Measured
   exportedAt: string | null
 }
@@ -117,6 +122,16 @@ export type GoldTrimSummary = {
   reason: string | null
 }
 
+/**
+ * The mart's newest export run, when it FAILED (`DATA-49`). `failedAt` is when
+ * that run started, RFC 3339, or `null` when it cannot be read; `reason` is the
+ * sentence the API stored for it — the same one the failed response carried.
+ */
+export type GoldPublicationFailure = {
+  failedAt: string | null
+  reason: string
+}
+
 export type GoldPublication = {
   mart: string
   enabled: boolean
@@ -124,6 +139,11 @@ export type GoldPublication = {
   lastChangedAt: string | null
   lastExportedAt: string | null
   changedSinceExport: boolean | null
+  /**
+   * `null` unless the mart's newest run failed, whatever the last successful
+   * publish says (`DATA-49`, `publication_body` in `routes/gold.rs`).
+   */
+  lastFailure: GoldPublicationFailure | null
   canEdit: boolean
   trim?: GoldTrimSummary | null
 }
