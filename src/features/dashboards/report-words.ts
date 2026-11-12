@@ -1,3 +1,4 @@
+import { formatDateTime } from "@/lib/format"
 import type { ReportSchedule, ReportSubscription } from "@/services/contracts/reports"
 
 /** ISO weekdays, Monday first, as the API numbers them (1 to 7). */
@@ -44,6 +45,28 @@ export function describeAttachments(a: ReportSubscription["attachments"]): strin
   if (a.pdf) parts.push("PDF")
   if (a.charts.length) parts.push(`${a.charts.length} chart ${a.charts.length === 1 ? "file" : "files"}`)
   return parts.length ? parts.join(" and ") : "Nothing attached"
+}
+
+/**
+ * Shown on a subscription that is not being sent for want of e-mail (`RPT-2`,
+ * `DEC-18`, QA `LH-RPT-1-06`) — the wording the product decided on for it.
+ */
+export const NOT_SENT_EMAIL = "Not sent: e-mail is not set up on this installation."
+
+/**
+ * Why a subscription is not being sent right now, in one line, or `null` when
+ * the list says nothing of the kind — a cause this build does not know
+ * included, so an older console keeps showing the status line.
+ *
+ * The time is the start of the last attempt that failed for this reason, and it
+ * is left out when there is none or when [`formatDateTime`] cannot read it.
+ */
+export function describeNotSent(s: ReportSubscription): string | null {
+  if (s.notSent?.cause !== "email_not_set_up") return null
+  const at = s.notSent.lastAttemptAt
+  if (typeof at !== "string") return NOT_SENT_EMAIL
+  const when = formatDateTime(at)
+  return when === "—" ? NOT_SENT_EMAIL : `${NOT_SENT_EMAIL} Last attempt: ${when}.`
 }
 
 /** The state of a subscription for the list: paused with its reason, or its last send. */
