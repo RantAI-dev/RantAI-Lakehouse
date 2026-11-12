@@ -32,6 +32,7 @@ import {
   headerRowFromDisplay,
   groupProblem,
   isUploadedTable,
+  keepsNanoseconds,
   mismatchLines,
   planPick,
   rawTableFullName,
@@ -467,6 +468,15 @@ test("planPick does not count a file refused for its own reason toward the total
   assert.match(candidates[0].problem ?? "", /looks like a workbook or an archive/)
   assert.equal(candidates[1].problem, null)
   assert.equal(candidates[2].problem, null)
+})
+
+test("keepsNanoseconds is true only for a nanosecond timestamp label", () => {
+  // `DATA-53`: the label the API gives a Parquet column (`upload_parquet::type_label`).
+  assert.equal(keepsNanoseconds("timestamp (ns)"), true)
+  assert.equal(keepsNanoseconds("timestamp (ns, UTC)"), true)
+  assert.equal(keepsNanoseconds("timestamp (us, UTC)"), false)
+  assert.equal(keepsNanoseconds("int64"), false)
+  assert.equal(keepsNanoseconds(undefined), false)
 })
 
 test("the formats phrase names every format the Accepted fact lists", () => {

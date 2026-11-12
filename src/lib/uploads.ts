@@ -50,6 +50,15 @@ const WORKBOOK_NAME = /\.xlsx?$/i
 export const MAX_FILES = 10
 
 /**
+ * Whether a Parquet column's own type label keeps nanoseconds (`DATA-53`): the API's
+ * `timestamp (ns)`, `timestamp (ns, UTC)` (`upload_parquet::type_label`). The table keeps
+ * microseconds, so the Check step says the digits after the sixth are cut.
+ */
+export function keepsNanoseconds(fileType: string | undefined): boolean {
+  return fileType !== undefined && fileType.trim().startsWith("timestamp (ns")
+}
+
+/**
  * The formats the upload reads, in one phrase (decision 12 of
  * `docs/core/features/upload-file.md`, `DATA-51`, QA `LH-DATA-9-02`): the link
  * on New Connector, the empty state of Uploaded files and the Upload file page

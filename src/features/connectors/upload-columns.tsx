@@ -5,7 +5,7 @@ import { SelectField } from "@/components/patterns/select-field"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { formatNumber } from "@/lib/format"
-import { COLUMN_TYPES, DATE_FORMATS, columnTypeLabel, columnNameProblem } from "@/lib/uploads"
+import { COLUMN_TYPES, DATE_FORMATS, columnTypeLabel, columnNameProblem, keepsNanoseconds } from "@/lib/uploads"
 import type { UploadBadValues, UploadColumnType, UploadDateFormat } from "@/services/contracts/uploads"
 import type { ColumnChoices } from "./use-column-choices"
 import { Refusal, UploadNotice } from "./upload-parts"
@@ -27,10 +27,17 @@ function typeOptions(type: UploadColumnType, guessed: UploadColumnType) {
 export function UploadColumnsEditor({
   choices,
   sampledRows,
+  fileTypes,
 }: {
   readonly choices: ColumnChoices
   /** How many data rows the guess read. */
   readonly sampledRows: number
+  /**
+   * The file's own type label per column, for a Parquet file only (`DATA-53`): what a
+   * column starts with when the file declares it, so the Check step can say what the
+   * table keeps of it.
+   */
+  readonly fileTypes?: readonly (string | undefined)[]
 }) {
   const { columns, fixed } = choices
   return (
@@ -89,6 +96,19 @@ export function UploadColumnsEditor({
                     />
                     {column.type !== column.guessedType && !fixed ? (
                       <p className="mt-1 text-xs text-muted-foreground">Guessed: {columnTypeLabel(column.guessedType)}</p>
+                    ) : null}
+                    {/* `DATA-53` (QA `LH-DATA-9-32`): what the table keeps of the type, which
+                        a person can only see here. Both notes show with the columns fixed too,
+                        because a table's types are what the load will write. */}
+                    {column.type === "decimal" ? (
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        Stored exactly, with up to 38 digits, 9 of them after the point.
+                      </p>
+                    ) : null}
+                    {column.type === "timestamp" && keepsNanoseconds(fileTypes?.[index]) ? (
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        The file keeps nanoseconds. The table keeps microseconds, so digits after the sixth are cut.
+                      </p>
                     ) : null}
                   </td>
                   <td className="space-y-1.5 px-3 py-2">

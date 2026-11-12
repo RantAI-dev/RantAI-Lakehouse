@@ -889,6 +889,59 @@ describe("UploadFilePage, Check step for a Parquet file", () => {
     await waitFor(() => expect(next().disabled).toBe(false))
   })
 
+  it("says under a decimal column what is stored, and under a nanosecond timestamp that it is cut", async () => {
+    // `DATA-53` (QA `LH-DATA-9-32`): one Decimal, and a nanosecond column cut to microseconds;
+    // a microsecond column says nothing, because nothing of it is cut.
+    url.search = "?id=up-1"
+    stubFetch({
+      get: () => upload({ originalFilename: "orders.parquet" }),
+      preview: () =>
+        preview({
+          columns: ["sku", "price", "seen_at", "made_at"],
+          columnSpecs: [
+            { source: "sku", name: "sku", type: "text", guessedType: "text", askDateOrder: false },
+            { source: "price", name: "price", type: "decimal", guessedType: "decimal", askDateOrder: false },
+            {
+              source: "seen_at",
+              name: "seen_at",
+              type: "timestamp",
+              guessedType: "timestamp",
+              askDateOrder: false,
+              dateFormat: "iso",
+              timezone: true,
+            },
+            {
+              source: "made_at",
+              name: "made_at",
+              type: "timestamp",
+              guessedType: "timestamp",
+              askDateOrder: false,
+              dateFormat: "iso",
+              timezone: true,
+            },
+          ],
+          rows: [["a1", "1.50", "2026-10-16T13:30:05.123456789Z", "2026-10-16T13:30:05.123456Z"]],
+          parquet: {
+            columns: [
+              { name: "sku", type: "string" },
+              { name: "price", type: "decimal(10,2)" },
+              { name: "seen_at", type: "timestamp (ns, UTC)" },
+              { name: "made_at", type: "timestamp (us, UTC)" },
+            ],
+            rows: 1,
+          },
+        }),
+    })
+    render(<UploadFilePage lookupDelayMs={0} />)
+    await screen.findByRole("columnheader", { name: /sku/ })
+    expect(screen.getByText("Stored exactly, with up to 38 digits, 9 of them after the point.")).toBeDefined()
+    expect(
+      screen.getByText("The file keeps nanoseconds. The table keeps microseconds, so digits after the sixth are cut.")
+    ).toBeDefined()
+    // One note, for the nanosecond column only.
+    expect(screen.getAllByText(/The file keeps nanoseconds/)).toHaveLength(1)
+  })
+
   it("sends the settings the preview used when Load is pressed (the API ignores them for Parquet), and the review names the format", async () => {
     const started = upload({ status: "ingesting", bronzeTable: "orders", loadMode: "replace" })
     const calls = await openParquet({ ingest: json({ upload: started, runId: "run-1" }) })
@@ -1021,13 +1074,17 @@ describe("UploadFilePage, Table step", () => {
     expect(screen.getByText("Spaces are not allowed: use an underscore.")).toBeDefined()
   })
 
-  it("shows where the data will land, as the Catalog names it, only for a name that passes", async () => {
+  it("shows where the data will land, as the Catalog names it and as Query Studio reads it, only for a name that passes", async () => {
     await openTable([])
     expect(screen.getByText("bronze.stock")).toBeDefined()
+    // `DATA-53` (QA `LH-DATA-9-07`): the name Query Studio reads on the Trino engine.
+    expect(screen.getByTestId("upload-query-name").textContent).toBe("iceberg.bronze.stock")
     fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "stock_b" } })
     expect(screen.getByText("bronze.stock_b")).toBeDefined()
+    expect(screen.getByTestId("upload-query-name").textContent).toBe("iceberg.bronze.stock_b")
     fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "Stock B" } })
     expect(screen.queryByText(/^bronze\./)).toBeNull()
+    expect(screen.queryByTestId("upload-query-name")).toBeNull()
     expect(screen.getByText("Enter a valid name to see it.")).toBeDefined()
     fireEvent.change(screen.getByLabelText("Table name"), { target: { value: "" } })
     expect(screen.getByText("Enter a valid name to see it.")).toBeDefined()
@@ -1455,10 +1512,24 @@ describe("UploadFilePage, after Load", () => {
   it("summarises the file, how it is read and the table by its full name, with one sentence saying what Load does", async () => {
     await review({ get: () => upload(), ingest: json({ upload: started, runId: "run-1" }) })
     const labels = screen.getAllByRole("term").map((term) => term.textContent)
-    expect(labels).toEqual(["Name", "Size", "Uploaded", "Encoding", "Delimiter", "Header row", "Columns", "Table", "sku", "qty", "A value that does not fit"])
+    expect(labels).toEqual([
+      "Name",
+      "Size",
+      "Uploaded",
+      "Encoding",
+      "Delimiter",
+      "Header row",
+      "Columns",
+      "Table",
+      "In Query Studio (Trino)",
+      "sku",
+      "qty",
+      "A value that does not fit",
+    ])
     const value = (label: string) =>
       screen.getAllByRole("term").find((term) => term.textContent === label)?.nextElementSibling?.textContent
     expect(value("Table")).toBe("bronze.stock")
+    expect(value("In Query Studio (Trino)")).toBe("iceberg.bronze.stock")
     expect(value("Columns")).toBe("2")
     const sentence = screen.getByText(/^Load reads/)
     expect(sentence.textContent).toContain("stock.csv")
@@ -1490,6 +1561,9 @@ describe("UploadFilePage, after Load", () => {
     await screen.findByText("Loaded", { selector: "span" })
     expect(screen.getByText("Load finished")).toBeDefined()
     expect(screen.getByText("bronze.stock")).toBeDefined()
+    expect(
+      screen.getByText(/In Query Studio, on the Trino engine, the table is/).textContent
+    ).toBe("In Query Studio, on the Trino engine, the table is iceberg.bronze.stock.")
     expect(screen.getByText("1,234")).toBeDefined()
     expect(screen.getByText("Replace its rows")).toBeDefined()
     expect(screen.getByText("stock.csv")).toBeDefined()
