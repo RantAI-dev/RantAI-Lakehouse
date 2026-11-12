@@ -190,6 +190,22 @@ describe("DataQualityPage: incidents (DATA-14)", () => {
     expect(screen.getByText(/2 open · oldest opened/)).toBeTruthy()
   })
 
+  // QA `LH-DATA-14-03` (`DATA-54`): "stale" is explained where the incident
+  // is read, and only on a stale one.
+  it("says what stale means on a stale incident, and nothing on an open one", async () => {
+    stubApi(["governance:write"], {
+      incidents: [
+        incident({ id: "i1", status: "stale" }),
+        incident({ id: "i2", ruleName: "id_unique", detail: "id_unique — 3 repeated values" }),
+      ],
+    })
+    renderPage()
+    const note =
+      "The check has passed since this incident opened. It stays open until someone resolves it."
+    expect((await screen.findAllByText(note)).length).toBe(1)
+    expect(screen.getByText("stale").getAttribute("title")).toBe(note)
+  })
+
   it("says nothing is wrong when no incident is open", async () => {
     stubApi(["governance:write"])
     renderPage()
