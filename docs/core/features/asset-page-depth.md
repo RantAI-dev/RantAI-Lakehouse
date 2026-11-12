@@ -74,6 +74,7 @@ reported, not quietly lowered.
 - Shown with a table grant: related tables and usage are hidden. A page opened by a grant carries that table's own facts only — no table it is built from or built into, no joined tables, no frequent users or queries, no dependents, and no replacement's id or name — and the page says so rather than drawing empty panels as if nothing existed. *(proposed, not yet signed)*
 - Restore works only for Iceberg tables, only within the retention window.
 - A version's author is shown only where the committer was recorded.
+- A table whose Iceberg table is no longer there shows no row count (`DATA-54`).
 
 ## Spec rows
 
