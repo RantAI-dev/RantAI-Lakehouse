@@ -201,6 +201,24 @@ export const ENGINE_CATEGORY_LABEL: Record<EngineCategory, string> = {
   "telemetry-store": "Telemetry store",
 }
 
+/**
+ * The name of the engine a run or an estimate really used, spelled the way
+ * the tab's engine picker spells it (`ClickHouse`, `Trino`).
+ *
+ * Query Studio's tabs name an engine (`clickhouse`/`trino`), not a storage
+ * tier: since `QS-6` the panel and the result summary say which engine
+ * answered, so a Trino tab no longer reads "Hot analytical store" or a
+ * ClickHouse-only estimate about Trino SQL. The legacy `hot-store` value is
+ * read as `ClickHouse` — that is what it always meant — and any other value
+ * is returned unchanged, because guessing a name would be worse than showing
+ * what the server said.
+ */
+export function queryEngineLabel(engine: string): string {
+  if (engine === "trino") return "Trino"
+  if (engine === "clickhouse" || engine === "hot-store") return "ClickHouse"
+  return engine
+}
+
 /** Alert / severity scale shared by alerts, quality results, and violations. */
 export type Severity = "critical" | "high" | "medium" | "low" | "info"
 

@@ -10,12 +10,35 @@
  * engine, and the browser keeps the active one. The single draft that came
  * before is read as one tab, so the first read after this change finds the
  * query that was there and nothing else.
+ *
+ * Whose draft it is: one person's, in one tenant (`QS-8`, `LH-QS-1-04` F1).
+ * The key is built by [`queryDraftKey`] from the signed-in person and their
+ * active tenant, so the next person on the same browser reads their own tabs
+ * and never this one's. Signing out clears nothing: the entry stays under its
+ * owner's key for their next sign-in on that browser. Before `QS-8` every
+ * person shared one entry ([`LEGACY_QUERY_DRAFT_KEY`]); its owner is unknown,
+ * so it is dropped rather than migrated ([`dropLegacyDraft`]).
  */
 
 import type { QueryEngine, QueryParamDef, QueryParamValue } from "@/services/contracts/queries"
 import { parseDefinitions, parseValues } from "@/lib/query-params"
 
-export const QUERY_DRAFT_KEY = "rantai-lakehouse:query-studio-draft"
+/**
+ * The key every person on a browser shared before `QS-8`. Nothing reads it:
+ * whose tabs it holds cannot be known, so it is removed on the first load
+ * (`dropLegacyDraft`) instead of being handed to whoever signs in next.
+ */
+export const LEGACY_QUERY_DRAFT_KEY = "rantai-lakehouse:query-studio-draft"
+
+/**
+ * The key one person's draft lives under: the person and their active tenant
+ * (`QS-8`, decision 12). `-` stands in for no active tenant, which is a real
+ * state for a person who belongs to none; a person's key never collides with
+ * another person's or another tenant's.
+ */
+export function queryDraftKey(userId: string, tenantId: string | null | undefined): string {
+  return `${LEGACY_QUERY_DRAFT_KEY}:${userId}:${tenantId || "-"}`
+}
 
 /**
  * How many query tabs one browser keeps. A browser that could hold more
@@ -187,25 +210,25 @@ export function parseTabs(raw: string | null): QueryTabs | null {
 }
 
 /**
- * Read the draft. Every access is guarded: storage throws in a private
- * window and is simply absent during server rendering.
+ * Read the tabs stored under `key`. Every access is guarded, like
+ * `parseTabs`: storage throws in a private window and is simply absent
+ * during server rendering.
  */
-export function readDraft(): QueryDraft | null {
+export function readTabs(key: string): QueryTabs | null {
   try {
-    return parseDraft(window.localStorage.getItem(QUERY_DRAFT_KEY))
+    return parseTabs(window.localStorage.getItem(key))
   } catch {
     return null
   }
 }
 
-/** Store the draft, or clear it when there is nothing left to keep. */
-export function writeDraft(draft: QueryDraft): void {
+/**
+ * Store the tabs under `key`, the owner's own entry (`QS-8`). A tab keeps no
+ * result: only what the person wrote.
+ */
+export function writeTabs(key: string, tabs: QueryTabs): void {
   try {
-    if (!draft.sql.trim() && !draft.question.trim()) {
-      window.localStorage.removeItem(QUERY_DRAFT_KEY)
-      return
-    }
-    window.localStorage.setItem(QUERY_DRAFT_KEY, JSON.stringify(draft))
+    window.localStorage.setItem(key, JSON.stringify(tabs))
   } catch {
     // A draft that cannot be saved is a lost convenience, not an error
     // worth interrupting anyone over.
@@ -213,27 +236,18 @@ export function writeDraft(draft: QueryDraft): void {
 }
 
 /**
- * Read the tabs. Every access is guarded, like `readDraft`: storage throws
- * in a private window and is simply absent during server rendering.
+ * Remove the entry every person shared before `QS-8` (`QS-8`, decision 12).
+ *
+ * It is dropped, not migrated: nothing on this browser says whose tabs it
+ * holds, and handing them to whoever signs in next is the bug `QS-8`
+ * answers. Guarded like the reads: a private window has no storage to
+ * remove from.
  */
-export function readTabs(): QueryTabs | null {
+export function dropLegacyDraft(): void {
   try {
-    return parseTabs(window.localStorage.getItem(QUERY_DRAFT_KEY))
+    window.localStorage.removeItem(LEGACY_QUERY_DRAFT_KEY)
   } catch {
-    return null
-  }
-}
-
-/**
- * Store the tabs under the same key the old draft used, so the shape in
- * the browser tells the two apart on the next read.
- */
-export function writeTabs(tabs: QueryTabs): void {
-  try {
-    window.localStorage.setItem(QUERY_DRAFT_KEY, JSON.stringify(tabs))
-  } catch {
-    // A draft that cannot be saved is a lost convenience, not an error
-    // worth interrupting anyone over.
+    // Nothing to clean in a browser that refuses storage.
   }
 }
 
@@ -247,15 +261,18 @@ export function writeTabs(tabs: QueryTabs): void {
  * offered a change of the query it already changed. The tab is written here
  * after the server answers; a draft that cannot be written leaves the
  * editor's button as it was, and nothing else changes.
+ *
+ * `key` is the owner's draft key: the tab belongs to the person who saved.
  */
 export function rememberSavedTab(
+  key: string,
   tabId: string,
   savedId: string,
   level: string | undefined
 ): void {
-  const stored = readTabs()
+  const stored = readTabs(key)
   if (!stored) return
-  writeTabs({
+  writeTabs(key, {
     ...stored,
     tabs: stored.tabs.map((tab) =>
       tab.id === tabId
