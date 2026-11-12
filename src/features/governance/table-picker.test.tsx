@@ -8,7 +8,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { assetService } from "@/services"
 import type { Asset, AssetDetail } from "@/services/contracts/assets"
-import { TablePicker, tableKey, useTableCatalog, useTableColumns } from "./table-picker"
+import { TablePicker, useTableCatalog, useTableColumns } from "./table-picker"
 
 afterEach(() => {
   cleanup()
@@ -18,9 +18,12 @@ afterEach(() => {
 // cmdk scrolls the selected item into view; jsdom/happy-dom has no such method.
 Element.prototype.scrollIntoView = Element.prototype.scrollIntoView ?? (() => {})
 
+// Shaped like the API's list rows: a Silver row's `id` is its table key and
+// its `name` is the display name; a Bronze row's `id` is a registry slug, its
+// table is named by `tableKey`, and its `namespace` is the registry's.
 const ASSETS = [
-  { id: "a-orders", name: "orders", namespace: "silver" },
-  { id: "a-raw", name: "raw_orders", namespace: "bronze" },
+  { id: "silver.orders", name: "Orders", namespace: "silver" },
+  { id: "raw-orders", name: "Raw Orders", namespace: "primer", tableKey: "bronze.raw_orders" },
 ] as unknown as Asset[]
 
 function detailOf(asset: Asset): AssetDetail {
@@ -63,13 +66,29 @@ function ColumnsOf({ id }: { id: string | null }) {
   return <p data-testid="columns">{columns === null ? "none" : columns.join(",")}</p>
 }
 
-describe("tableKey", () => {
-  it("names a table the way every governance form sends it", () => {
-    expect(tableKey({ namespace: "silver", name: "orders" })).toBe("silver.orders")
-  })
-})
-
 describe("TablePicker", () => {
+  // QA `LH-DATA-14-01` F2 (`DATA-54`): the option is the row's table key, not
+  // `namespace.name` — a row's `name` is its display name and a Bronze row's
+  // `namespace` is the registry's, so the pair named no table.
+  it("offers each row's table key, never its display name", async () => {
+    spyOn(assetService, "listAssets").mockResolvedValue([
+      { id: "silver.orders_clean", name: "Orders Clean", namespace: "silver" },
+      {
+        id: "northwind-orders",
+        name: "Northwind Orders",
+        namespace: "primer",
+        tableKey: "bronze.northwind_orders",
+      },
+      { id: "no-table", name: "No Table", namespace: "primer", tableKey: null },
+    ] as unknown as Asset[])
+    render(<CatalogPicker />)
+    fireEvent.click(await screen.findByRole("button", { name: "Table" }))
+    expect((await screen.findAllByRole("option")).map((option) => option.textContent)).toEqual([
+      "bronze.northwind_orders",
+      "silver.orders_clean",
+    ])
+  })
+
   it("offers the catalog's tables as namespace.table and picks one", async () => {
     spyOn(assetService, "listAssets").mockResolvedValue(ASSETS)
     const onChange = mock<(next: string) => void>(() => {})
@@ -120,11 +139,11 @@ describe("TablePicker", () => {
 describe("useTableColumns", () => {
   it("reads the picked table's own schema, and answers none for a table the catalog does not list", async () => {
     spyOn(assetService, "getAsset").mockImplementation(async (id: string) =>
-      id === "a-orders" ? detailOf(ASSETS[0] as Asset) : Promise.reject(new Error("not found"))
+      id === "silver.orders" ? detailOf(ASSETS[0] as Asset) : Promise.reject(new Error("not found"))
     )
     render(
       <>
-        <ColumnsOf id="a-orders" />
+        <ColumnsOf id="silver.orders" />
         <ColumnsOf id={null} />
       </>
     )

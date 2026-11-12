@@ -446,8 +446,16 @@ describe("DataQualityPage: Freshness targets tab (WEB-3 S3-D5)", () => {
     search = new URLSearchParams("tab=freshness")
     stubApi(["governance:write"], {
       catalog: [
-        { id: "a-orders", name: "orders", namespace: "silver" },
-        { id: "a-raw", name: "raw_orders", namespace: "bronze" },
+        // Shaped like the API's list rows (`DATA-54`): a Silver row's `id`
+        // is its table key; a Bronze row's `id` is a registry slug and its
+        // table is named by `tableKey`.
+        { id: "silver.orders", name: "Orders", namespace: "silver" },
+        {
+          id: "raw-orders",
+          name: "Raw Orders",
+          namespace: "primer",
+          tableKey: "bronze.raw_orders",
+        },
       ],
     })
     renderPage()
