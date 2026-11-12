@@ -215,6 +215,9 @@ const INCIDENT = {
 /** What the sample route answers for a `limit`: the rows, or a response of its own (a failure). */
 type SampleAnswer = (limit: number) => Record<string, string | null>[] | Response
 
+/** How many times the incidents read was asked (`DATA-54`). */
+let incidentReads = 0
+
 function stubApi({
   permissions = ["*:*"],
   lineage = GRAPH,
@@ -231,6 +234,7 @@ function stubApi({
   revokeRefusal,
   restore = { restorable: false, reason: "no dropped copy of this table is kept" },
   incidents = [],
+  incidentsAfterRun,
   schedules = [],
   learning = LEARNING,
   roles,
@@ -262,6 +266,8 @@ function stubApi({
   restore?: unknown
   /** The quality incidents `GET /api/governance/quality/incidents` answers. */
   incidents?: unknown[]
+  /** What it answers from the second read on (`DATA-54`): after a run. */
+  incidentsAfterRun?: unknown[]
   /** The quality schedules `GET /api/governance/quality/schedules` answers. */
   schedules?: unknown[]
   /** What `GET /api/governance/quality/learning/{asset}` answers. */
@@ -272,6 +278,7 @@ function stubApi({
   /** The row filter grammar `GET /api/governance/row-filter-grammar` answers; absent means it fails. */
   grammar?: unknown
 } = {}) {
+  incidentReads = 0
   return spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input)
     const method = init?.method ?? "GET"
@@ -304,7 +311,11 @@ function stubApi({
     }
     if (method === "GET" && path.endsWith("/api/governance/tag-keys")) return json(tagKeys)
     // DATA-14: the Quality tab's incidents, schedule and learning state.
-    if (method === "GET" && path.includes("/api/governance/quality/incidents")) return json({ incidents })
+    if (method === "GET" && path.includes("/api/governance/quality/incidents")) {
+      incidentReads += 1
+      const answer = incidentReads > 1 && incidentsAfterRun ? incidentsAfterRun : incidents
+      return json({ incidents: answer })
+    }
     if (method === "GET" && path.endsWith("/api/governance/quality/schedules")) {
       return json({ schedules, defaultIntervalMinutes: 60 })
     }
@@ -708,6 +719,25 @@ describe("Quality tab: incidents, schedule and learning (DATA-14)", () => {
         ["POST", "/api/governance/quality/incidents/inc-1/resolve", { resolution: "Source fixed" }],
       ])
     )
+  })
+
+  // QA `LH-DATA-14-01` F1 (`DATA-54`): the page keeps the tab mounted while
+  // the asset reloads, so the panel has to be told to read again.
+  it("reads the incidents again after the checks ran", async () => {
+    stubApi({ incidents: [], incidentsAfterRun: [INCIDENT] })
+    url.search = "tab=quality"
+    renderTabs({
+      ...BRONZE,
+      qualityChecks: [
+        { id: "q2", name: "orders_uniqueness", dimension: "uniqueness", status: null, lastRun: null, threshold: "id unique", severity: "high", origin: "rule" },
+      ],
+    })
+
+    fireEvent.click(await screen.findByText("Run checks"))
+    expect(
+      await screen.findByText(/3 repeated values in 50 rows \(threshold: id unique\)/)
+    ).toBeTruthy()
+    expect(incidentReads).toBeGreaterThanOrEqual(2)
   })
 
   it("offers no Resolve without governance:write", async () => {

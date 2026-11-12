@@ -172,13 +172,25 @@ function IncidentRow({
  * resolved ones as history. On an asset's Quality tab pass `asset` to list
  * that table's alone.
  */
-export function QualityIncidents({ asset }: { asset?: string }) {
+export function QualityIncidents({
+  asset,
+  reloadKey,
+}: {
+  asset?: string
+  /**
+   * Raise it to read the incidents again — after a rule ran or changed. The
+   * page keeps its content mounted while it reloads
+   * (`keepDataOnReload`), so a change of the view or the table is not the only
+   * thing that must bring a new read (`QA LH-DATA-14-01` F1, `DATA-54`).
+   */
+  reloadKey?: number
+}) {
   const { hasPermission } = useAuth()
   const [view, setView] = React.useState<"open" | "resolved">("open")
   const [resolving, setResolving] = React.useState<QualityIncident | null>(null)
   const state = useService(
     (signal) => governanceService.listQualityIncidents({ status: view, asset }, signal),
-    [view, asset]
+    [view, asset, reloadKey]
   )
   const canResolve = hasPermission("governance:write")
   const groups = state.status === "success" ? groupByTable(state.data) : []

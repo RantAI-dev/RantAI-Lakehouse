@@ -36,6 +36,8 @@ const json = (body: unknown, status = 200) =>
 
 /** The `[method, path, body]` of every write the page sent to the stub. */
 let writesSeen: unknown[][] = []
+/** How many times the stub was asked for the quality incidents (`DATA-54`). */
+let incidentReads = 0
 /** How the stub answers a schedule reset; a test may swap it for a failure. */
 let resetAnswer: () => Response = () => new Response(null, { status: 204 })
 
@@ -60,6 +62,7 @@ function stubApi(
   } = {}
 ) {
   writesSeen = []
+  incidentReads = 0
   let sessionRead: () => void = () => {}
   const done = new Promise<void>((resolve) => {
     sessionRead = resolve
@@ -79,9 +82,14 @@ function stubApi(
         writesSeen.push(["POST", path, JSON.parse(String(init?.body))])
         return json({ ...(incidents[0] as object), status: "resolved", resolution: JSON.parse(String(init?.body)).resolution })
       }
+      incidentReads += 1
       return json({ incidents })
     }
     if (path.includes("/api/governance/quality/") && path.endsWith("/runs")) return json({ runs })
+    // QA `LH-DATA-14-01` F1 (`DATA-54`): a run answers its verdict.
+    if ((init?.method ?? "GET") === "POST" && path.endsWith("/run")) {
+      return json({ id: "r1", status: "failed", value: "70.0% not null" })
+    }
     // WEB-8 D8: the catalog the freshness dialog's table picker reads. When
     // the test gives none the read fails, which is the free-text fallback.
     if (catalog !== undefined && path.startsWith("/api/catalog")) {
@@ -315,6 +323,19 @@ describe("DataQualityPage: running a rule by hand (GOV-10)", () => {
     renderPage()
     fireEvent.click(await screen.findByText("email_filled"))
     expect(await screen.findByRole("button", { name: "Run check" })).toBeTruthy()
+  })
+
+  // QA `LH-DATA-14-01` F1 (`DATA-54`): the incidents panel does not read
+  // again by itself after a run, so the page raises a key for it.
+  it("reads the incidents again after Run check", async () => {
+    stubApi(["governance:write"], { quality: [rule] })
+    renderPage()
+    fireEvent.click(await screen.findByText("email_filled"))
+    await screen.findByRole("button", { name: "Run check" })
+    await waitFor(() => expect(incidentReads).toBeGreaterThan(0))
+    const before = incidentReads
+    fireEvent.click(screen.getByRole("button", { name: "Run check" }))
+    await waitFor(() => expect(incidentReads).toBe(before + 1))
   })
 })
 
