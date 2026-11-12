@@ -364,8 +364,8 @@ fn cell_as_str<'a>(row: &'a Map<String, Value>, name: &str) -> Option<&'a str> {
 ///
 /// 1. An optional leading `-`. Nothing else before the digits (no `+`, no
 ///    spaces).
-/// 2. Digits, then optionally `.` and digits. Nothing else (no exponent, no
-///    separators).
+/// 2. Digits, then optionally `.` and digits — a `.` with nothing after it is
+///    not a number. Nothing else (no exponent, no separators).
 /// 3. The fraction may be shorter than `scale` (`ClickHouse` drops trailing
 ///    zeros by default): pad it on the right with `0`. A longer fraction is an
 ///    error.
@@ -381,6 +381,10 @@ fn decimal_text_to_unscaled(text: &str, precision: u32, scale: u32) -> Result<i1
         None => (false, text),
     };
     let (integer, fraction) = match digits.split_once('.') {
+        // A point with nothing after it is not a decimal number (D14 rule 2: digits,
+        // then optionally `.` and digits) — review round 1 R8; QA `LH-DATA-1-51`.
+        // `12.` used to pass as `12`, which is exact but not a shape ClickHouse prints.
+        Some((_, "")) => return Err(not_a_decimal()),
         Some((integer, fraction)) => (integer, fraction),
         None => (digits, ""),
     };
@@ -1315,6 +1319,14 @@ mod tests {
                 10,
                 -12_345_678_901_234_567_890_123_456_780_123_456_789_i128,
             ),
+            // Review round 1 R8: the largest value a decimal(38, 0) can hold, which
+            // must not be refused as "more than 38 digits".
+            (
+                "99999999999999999999999999999999999999",
+                38,
+                0,
+                10_i128.pow(38) - 1,
+            ),
         ] {
             assert_eq!(
                 decimal_text_to_unscaled(text, precision, scale),
@@ -1335,6 +1347,18 @@ mod tests {
             ("1,5", 12, 2),
             (" 1", 12, 2),
             ("1234567890123", 12, 0),
+            // Review round 1 R8: D14 rule 2 is digits, then optionally `.` AND digits
+            // — a point with nothing after it is not a decimal number, and neither is
+            // any of these shapes.
+            ("12.", 12, 2),
+            ("-", 12, 2),
+            (".", 12, 2),
+            (".5", 12, 2),
+            ("-.5", 12, 2),
+            ("--1", 12, 2),
+            ("1.2.3", 12, 2),
+            // 11 integer digits and 2 fraction digits are 13 for a precision of 12.
+            ("12345678901.5", 12, 2),
         ] {
             assert!(
                 decimal_text_to_unscaled(text, precision, scale).is_err(),
