@@ -198,12 +198,22 @@ What QA and the reviews saw:
   | `gated_source_table` (`:455`) | 404, 422, 503 of the tenant gate | no: the mart is not shown to be the caller's |
   | `mart_exists` (new) fails | classified 422 or 503 | no: nothing is known about the mart, and the engine that failed holds the history |
   | `mart_exists` answers `false` | the route goes on as today | no early failure is recorded for it |
-  | `mart_content_fingerprint` (`:459-465`) fails | classified 422 or 503 | **yes** |
-  | `?ifChanged=true`, the history read (`:472-478`) fails | classified 422 or 503 | **yes, attempted** (D21) |
+  | `mart_content_fingerprint` (`:459-465`) fails | classified 422 or 503 | **yes, when no publish of the mart is in flight** |
+  | `?ifChanged=true`, the history read (`:472-478`) fails | classified 422 or 503 | **yes, when no publish of the mart is in flight** (attempted, D21) |
   | `?ifChanged=true` finds nothing to do (`:479-481`) | 200 `skipped` | no, as today |
   | the per-mart lock is held (`:487-497`) | 409 | no: the publish that holds the lock records its own run, and a row here would be newer than it and hide its result |
   | `read_catalog_token` (`:498`) fails | 503 | **yes** |
   | `export_mart` (`:531`) | any | yes, as today (unchanged) |
+
+  **D19 changes in review round 1 (R3).** The two pre-lock failures (fingerprint read,
+  history read) are recorded only when no publish of that mart is in flight: the write takes
+  the mart's lock (`MartLocks::try_acquire`) and happens only if it is free, holding it for
+  the write. If a publish is running, nothing is written and its error is returned — the
+  same rule and the same reason as the `409` row above, because the running publish's row
+  carries an older `started_at` and a fresher row would hide its result (the card would say
+  "Last publish failed" after a successful publish, and the next scheduled run would export
+  the unchanged mart again). The catalog token read happens with the lock already held, so
+  it records unconditionally.
 
 - **D20. The stored text is #484's conversion and nothing else.** The row's `error` is
   `stored_error(…)`, that is `ApiError::to_string()` of the error the response carries

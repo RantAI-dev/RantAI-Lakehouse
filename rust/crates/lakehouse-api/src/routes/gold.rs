@@ -423,7 +423,11 @@ async fn gated_source_table(
 /// `DATA-56`). After the caller is authenticated and allowed and the mart
 /// is shown to be theirs, every failure is recorded: the content fingerprint
 /// read, the `?ifChanged=true` history read, the catalog token file, and the
-/// export itself. A refusal records nothing: `401`/`403`/`503` from
+/// export itself. A failure of the content fingerprint or the history read, both
+/// of which happen BEFORE the per-mart lock, is recorded only when no publish of
+/// that mart is in flight (review round 1, R3): otherwise its row, newer than the
+/// running publish's, would hide that publish's result — the rule the `409`
+/// follows. A refusal records nothing: `401`/`403`/`503` from
 /// [`check_export_token`], `400` for a mart name that is not an identifier, the
 /// tenant gate's `404`/`422`/`503`, and the `409` of a publish already in
 /// flight (that publish records its own run, and a row for the turned-away call
@@ -727,7 +731,7 @@ impl<'a> Attempt<'a> {
     ) -> Result<lakehouse_core::secret::SecretValue, ApiError> {
         match read_catalog_token(&self.state.config.lakekeeper_gold_export_token_file).await {
             Ok(token) => Ok(token),
-            Err(err) => Err(early_failure(self, fingerprint.unwrap_or(""), err).await),
+            Err(err) => Err(early_failure_under_lock(self, fingerprint.unwrap_or(""), err).await),
         }
     }
 }
@@ -772,9 +776,19 @@ async fn read_content_fingerprint(
 /// run — the fingerprint read, the `?ifChanged=true` history read, and the
 /// catalog token are all inside that boundary. Before it, nothing is recorded:
 /// the token check, the mart name, and the tenant gate all refuse the request
-/// rather than fail it. `attempt.exists` carries the one answer that may not be
-/// recorded: the read of `system.tables` that failed — nothing is known about
-/// the mart then, and the engine that failed holds the history.
+/// rather than fail it. `attempt.exists` is `false` for a name `system.tables`
+/// does not list (D23): such a name goes on as before and no early failure is
+/// recorded for it. A failed read of `system.tables` never gets here
+/// (`Attempt::open` returns it unrecorded).
+///
+/// This is the PRE-LOCK helper, used for the content fingerprint and the
+/// `?ifChanged=true` history read (review round 1, R3): the row is written only
+/// when no publish of this mart is in flight. A publish in flight will write its
+/// own row with an older `started_at`, which a fresher row here would hide — the
+/// card would say "Last publish failed" although that publish succeeded, the
+/// exact harm the `409` avoids by recording nothing. The lock is held across the
+/// write, so the two cannot interleave. The catalog token is read with the lock
+/// already held ([`early_failure_under_lock`]).
 ///
 /// The write is best-effort, like every other history write here: when
 /// `ClickHouse` is what failed, the row cannot be written and the card's own
@@ -785,6 +799,33 @@ async fn early_failure(
     content_fingerprint: &str,
     err: ApiError,
 ) -> ApiError {
+    if let Ok(_guard) = attempt
+        .state
+        .gold_export_locks
+        .try_acquire(attempt.mart)
+        .await
+    {
+        record_early_failure(attempt, content_fingerprint, &err).await;
+    }
+    err
+}
+
+/// [`early_failure`] for the catalog token read, which `export` reaches with the
+/// mart's lock already held: acquiring it again would always fail, so this
+/// records without asking (review round 1, R3). A publish in flight cannot exist
+/// here — this call IS the publish that holds the lock.
+async fn early_failure_under_lock(
+    attempt: &Attempt<'_>,
+    content_fingerprint: &str,
+    err: ApiError,
+) -> ApiError {
+    record_early_failure(attempt, content_fingerprint, &err).await;
+    err
+}
+
+/// The one history write both early-failure helpers share: nothing for a name
+/// `system.tables` does not list (D23), one failed row otherwise.
+async fn record_early_failure(attempt: &Attempt<'_>, content_fingerprint: &str, err: &ApiError) {
     if attempt.exists {
         record_export_history(
             attempt.state,
@@ -793,11 +834,10 @@ async fn early_failure(
             attempt.started_at,
             time::OffsetDateTime::now_utc(),
             content_fingerprint,
-            Err(&err),
+            Err(err),
         )
         .await;
     }
-    err
 }
 
 /// The sentence a failed publish stores, or `None` for a success.
@@ -1899,6 +1939,112 @@ mod tests {
             "the refusal precedes the engine: no fingerprint and no parts read"
         );
         Ok(())
+    }
+
+    /// The `AppState` of a `wiremock` `ClickHouse` stand-in, with no live
+    /// Postgres (the history write needs neither).
+    fn state_with_clickhouse(url: &str) -> AppState {
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
+        env.insert("CH_URL".to_owned(), url.to_owned());
+        AppState::new(Config::from_map(&env).unwrap())
+    }
+
+    /// How many rows the stand-in was asked to insert into the history table —
+    /// the table's own `CREATE`/`ALTER` statements are not counted.
+    async fn history_inserts(server: &wiremock::MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .expect("mock records requests")
+            .iter()
+            .filter(|r| {
+                String::from_utf8_lossy(&r.body).contains("INSERT INTO console.gold_export_run")
+            })
+            .count()
+    }
+
+    /// `DATA-56` D19 (review round 1, R3): with nothing publishing the mart, a
+    /// failure before the per-mart lock leaves one failed run.
+    #[tokio::test]
+    async fn an_early_failure_with_no_publish_in_flight_is_recorded_once() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("Ok.\n"))
+            .mount(&server)
+            .await;
+        let state = state_with_clickhouse(&server.uri());
+        let attempt = Attempt {
+            state: &state,
+            exists: true,
+            mart: "orders_rollup",
+            triggered_by: "user:operator",
+            started_at: time::OffsetDateTime::now_utc(),
+        };
+        let err = early_failure(
+            &attempt,
+            "10:1:2",
+            ApiError::Unavailable("The database is unavailable.".to_owned()),
+        )
+        .await;
+        assert_eq!(
+            err.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the caller's own error is returned unchanged"
+        );
+        assert_eq!(
+            history_inserts(&server).await,
+            1,
+            "a failure before the export, with no publish in flight, is one failed run"
+        );
+    }
+
+    /// `DATA-56` D19 (review round 1, R3): while a publish of the mart is in
+    /// flight, a failure before the per-mart lock writes nothing — its row would
+    /// be newer than the running publish's and hide its result, the harm the
+    /// `409` avoids by recording nothing.
+    #[tokio::test]
+    async fn an_early_failure_while_a_publish_is_in_flight_is_not_recorded() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("Ok.\n"))
+            .mount(&server)
+            .await;
+        let state = state_with_clickhouse(&server.uri());
+        let _in_flight = state
+            .gold_export_locks
+            .try_acquire("orders_rollup")
+            .await
+            .expect("no publish of the mart is running yet");
+        let attempt = Attempt {
+            state: &state,
+            exists: true,
+            mart: "orders_rollup",
+            triggered_by: "user:operator",
+            started_at: time::OffsetDateTime::now_utc(),
+        };
+        let err = early_failure(
+            &attempt,
+            "",
+            ApiError::Unavailable("The database is unavailable.".to_owned()),
+        )
+        .await;
+        assert_eq!(
+            err.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the caller still gets its own error"
+        );
+        assert_eq!(
+            history_inserts(&server).await,
+            0,
+            "the publish in flight records its own run; a row here would hide its result"
+        );
     }
 
     #[tokio::test]
