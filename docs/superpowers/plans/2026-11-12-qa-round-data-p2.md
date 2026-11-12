@@ -1537,3 +1537,50 @@ name, as built, and D14 says why.
 
 No open BLOCKER. Still for CI to prove: the upload gate with a 128-character table name (T3)
 and the author on a real table's versions (T8). Merge when CI on #489 is green.
+
+### CI failure on #489: Dagster loader tests (developer)
+
+CI's `Dagster · loader tests` job failed on `ac308a94`, in `pytest (loader)`
+(`python -m pytest dispar_orchestrate -v -m loader` from `dagster/`), and the log was not
+readable, so the job was reproduced here first: Python 3.11.18 in
+`/home/rismana/rantai/venv-agents-3`, `pip install ./dagster pytest==8.3.4`, exactly what
+the job installs — `dlt` 1.30.0, `pyiceberg` 0.12.0, `dagster` 1.13.20.
+
+**The failing test, as first seen** (one failure, nothing else):
+
+```
+FAILED dispar_orchestrate/test_sink_history.py::test_a_history_refusal_is_recorded_as_a_rejected_run_with_its_fixed_message
+E   TypeError: test_a_history_refusal_is_recorded_as_a_rejected_run_with_its_fixed_message.
+    <locals>.refuse() got an unexpected keyword argument 'author'
+        dispar_orchestrate/ingest_factory.py:778: TypeError
+======== 1 failed, 313 passed, 2227 deselected, 481 warnings in 826.49s (0:13:46) ========
+```
+
+**Cause: the test, not the product** (case (a) of the brief). Review round 1 R2
+(`e369be9c`) made `_run_one_object`'s PostgreSQL branch call
+`run_bronze_ingest(…, author=_run_author(connector_id, run_id))`, and updated every stub of
+that function in `test_ingest_factory.py` but not the `refuse(cfg, plan, gate=None)` stub in
+`test_sink_history.py`. That module is marked `loader`, so the fast job
+(`-m "not loader"`) never reached the new keyword and only the loader job did. The stub now
+takes `author: str = ""` like the real function; its assertion is unchanged, because the
+refusal is raised before any load and what the stub receives is not what this test is about
+— the label actually reaching the sink is asserted by
+`test_run_one_object_routes_a_postgres_driver_sql_connector_through_dlt_pipeline`. No
+product code changed: the run's own author behaviour is correct as the plan decided it
+(`test_snapshot_author.py`, `test_dlt_pipeline.py` and `test_ingest_factory.py` were green
+in the same run).
+
+**Commit:** `0437bf8f` `test(dagster): give the history-refusal stub the author the run now
+passes`, pushed to `fix/qa-round-data-p2`.
+
+**Final checks, on `0437bf8f`** (same venv, from `dagster/`):
+
+```
+python -m pytest dispar_orchestrate -v -m loader
+  ======== 314 passed, 2227 deselected, 481 warnings in 853.45s (0:14:13) ========
+python -m pytest dispar_orchestrate -q -m "not loader"
+  2226 passed, 1 skipped, 314 deselected, 256 warnings in 19.32s
+python3 ops/lint/check_intra_package_imports.py   OK: all intra-package dispar_orchestrate imports resolve
+python3 ops/lint/check_bare_iceberg_count.py      R11 guard: no bare count() against a Bronze Iceberg table found.
+git status                                        clean
+```
