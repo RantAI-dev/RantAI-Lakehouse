@@ -164,12 +164,15 @@ pub enum PolicyEngineError {
 pub fn engine_error_message(err: &PolicyEngineError) -> &'static str {
     match err {
         PolicyEngineError::Unparseable => {
-            "kebijakan tidak dapat dievaluasi: query tidak dapat diproses"
+            "The query could not be read, so access rules could not be checked. Check the SQL \
+             syntax."
         }
-        PolicyEngineError::Store(_) => "kebijakan tidak dapat dievaluasi: kesalahan basis data",
+        PolicyEngineError::Store(_) => {
+            "Access rules could not be checked because of a database error."
+        }
         PolicyEngineError::UnenforceableAuthoredCondition { .. } => {
-            "kebijakan tidak dapat dievaluasi: ada kebijakan aktif dengan kondisi yang tidak \
-             dapat ditegakkan"
+            "Access rules could not be checked because an active policy has a condition that \
+             cannot be enforced."
         }
     }
 }
@@ -817,6 +820,43 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn engine_error_messages_are_distinct_english_sentences() {
+        // QS-13 (D7): the three user-facing texts are English, and each
+        // variant keeps its own sentence so a reader can tell a syntax
+        // problem from a database fault or an unenforceable policy.
+        let unparseable = engine_error_message(&PolicyEngineError::Unparseable);
+        let store = engine_error_message(&PolicyEngineError::Store(
+            lakehouse_store::StoreError::NotFound,
+        ));
+        let unenforceable =
+            engine_error_message(&PolicyEngineError::UnenforceableAuthoredCondition {
+                policy_name: "p".to_owned(),
+            });
+
+        assert_eq!(
+            unparseable,
+            "The query could not be read, so access rules could not be checked. Check the SQL syntax."
+        );
+        assert_eq!(
+            store,
+            "Access rules could not be checked because of a database error."
+        );
+        assert_eq!(
+            unenforceable,
+            "Access rules could not be checked because an active policy has a condition that cannot be enforced."
+        );
+        assert_ne!(unparseable, store);
+        assert_ne!(unparseable, unenforceable);
+        assert_ne!(store, unenforceable);
+        for text in [unparseable, store, unenforceable] {
+            assert!(
+                !text.contains("kebijakan") && !text.contains("tidak"),
+                "{text}"
+            );
+        }
+    }
 
     #[test]
     fn parses_a_well_formed_condition() {
