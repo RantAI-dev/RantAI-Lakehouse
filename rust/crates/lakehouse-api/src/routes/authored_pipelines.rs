@@ -1217,9 +1217,21 @@ fn caller_user_id(principal: &Principal) -> Option<Uuid> {
     }
 }
 
+/// The one sentence a definition refusal is shown with: the item at fault,
+/// then the fixed text that explains it (D7).
+///
+/// BLD-1 part 1 review R1-CI1: the text is this repository's own — built from
+/// `DefinitionError`'s two fields, never from an error's `Display` and never
+/// from a parser, a rewriter or `ClickHouse` — and saying so in ONE function
+/// is what keeps `tests/sec11_guard.rs` (which flags an error's own text in a
+/// response) honest without an allowlist.
+pub(crate) fn definition_message(err: &crate::pipeline_compile::DefinitionError) -> String {
+    format!("{}: {}", err.path(), err.message())
+}
+
 /// BLD-1 part 1 / D2–D6: the compiler's refusal as the route answers it (400).
 pub(crate) fn definition_rejection(err: &crate::pipeline_compile::DefinitionError) -> ApiRejection {
-    ApiError::BadRequest(err.to_string()).into()
+    ApiError::BadRequest(definition_message(err)).into()
 }
 
 /// The catalog database a Bronze input is read through, when configured
@@ -2041,7 +2053,7 @@ pub async fn compile_pipeline(
         None,
         catalog_db(&state),
     )
-    .map_err(|err| ApiError::Unprocessable(err.to_string()))?;
+    .map_err(|err| ApiError::Unprocessable(definition_message(&err)))?;
     // SEC-50: the tenant gate runs BEFORE the policy rewrite, so a statement
     // that reads a table the pipeline's own tenant may not read is refused
     // before the policy's own prefetch asks the engine about that table.
