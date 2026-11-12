@@ -175,6 +175,17 @@ fn run_end(end_time: Option<f64>) -> OffsetDateTime {
         .unwrap_or_else(OffsetDateTime::now_utc)
 }
 
+/// Whether a run ran for its limit or longer (`SRC-39`, QA `TC-1702`). A run
+/// with either time missing was not measured, so it is never called timed
+/// out: the orchestrator's own report is the only thing that may say it
+/// outlived its limit, and a guess here would record a wrong reason.
+fn ran_at_least(start: Option<f64>, end: Option<f64>, limit_seconds: u32) -> bool {
+    match (start, end) {
+        (Some(start), Some(end)) => end - start >= f64::from(limit_seconds),
+        _ => false,
+    }
+}
+
 /// Read the connector a run belongs to from the run's config, and check it
 /// exists.
 pub(super) async fn find_connector(
@@ -437,6 +448,27 @@ pub(super) async fn connector_run_event(
         return Ok(skipped("a paused run loads nothing"));
     }
     let info = confirm_status(state, &req.run_id, outcome).await?;
+    // QA TC-1702 (SRC-39): a run the orchestrator's monitoring failed after it
+    // outlived the limit closes with its own word (`timed_out`, D11), not "a
+    // table failed". `settle_run` below then finds it ended. The count, the
+    // streak and the alerts are unchanged: it is a failed run like any other
+    // (D12, D14).
+    if outcome == Outcome::Failure
+        && ran_at_least(
+            info.start_time,
+            info.end_time,
+            state.config.ingest_run_max_runtime_seconds,
+        )
+    {
+        connector_run::end_timed_out_run(
+            pool,
+            &connector.id,
+            &req.run_id,
+            i64::from(state.config.ingest_run_max_runtime_seconds),
+            run_end(info.end_time),
+        )
+        .await?;
+    }
     // `SRC-11` D7: close the run record from the orchestrator's own final
     // status when its end report never came (a killed run, an orchestrator
     // that could not reach this API). Idempotent, and a no-op for a run with
@@ -1817,5 +1849,70 @@ mod tests {
                 .as_deref(),
             Some("failed")
         );
+    }
+
+    /// QA `TC-1702` (`SRC-39`): the orchestrator's monitoring fails a run
+    /// that outlived its limit; the record closes as `timed_out` and the run
+    /// is counted as a failure, as any other failed run (D11, D12).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_failed_run_that_ran_past_the_limit_closes_its_record_as_timed_out(
+        pool: sqlx::PgPool,
+    ) {
+        use lakehouse_store::connector_run::{RunTrigger, list_runs, start_run};
+        let h = harness(&pool, &[("al-t", "connector_failure", CONNECTOR)]).await;
+        let now = OffsetDateTime::now_utc();
+        start_run(
+            &pool,
+            CONNECTOR,
+            "run-long",
+            RunTrigger::Schedule,
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+        // The orchestrator says it started at 1000.0 and ended 21601 s later.
+        h.knows_run_at("run-long", Some(CONNECTOR), "FAILURE", 1000.0 + 21_601.0)
+            .await;
+        h.failed("run-long").await;
+
+        let runs = list_runs(&pool, CONNECTOR, 50).await.unwrap();
+        assert_eq!(runs[0].status, "failed");
+        assert_eq!(runs[0].end_reason.as_deref(), Some("timed_out"));
+        assert_eq!(streak(&pool).await, ("degraded".to_owned(), 1));
+    }
+
+    /// A failed run inside the limit keeps "a table failed".
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_failed_run_inside_the_limit_still_ends_as_a_failed_table(pool: sqlx::PgPool) {
+        use lakehouse_store::connector_run::{RunTrigger, list_runs, start_run};
+        let h = harness(&pool, &[("al-t", "connector_failure", CONNECTOR)]).await;
+        let now = OffsetDateTime::now_utc();
+        start_run(
+            &pool,
+            CONNECTOR,
+            "run-short",
+            RunTrigger::Schedule,
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+        h.knows_run("run-short", Some(CONNECTOR), "FAILURE").await;
+        h.failed("run-short").await;
+
+        let runs = list_runs(&pool, CONNECTOR, 50).await.unwrap();
+        assert_eq!(runs[0].end_reason.as_deref(), Some("table_failed"));
+    }
+
+    /// A time the orchestrator did not give is never read as "past the
+    /// limit" (fail closed: the run keeps its ordinary end).
+    #[test]
+    fn a_run_with_a_missing_time_is_never_called_timed_out() {
+        assert!(!ran_at_least(None, Some(21_601.0), 21_600));
+        assert!(!ran_at_least(Some(1000.0), None, 21_600));
+        assert!(!ran_at_least(None, None, 21_600));
+        assert!(ran_at_least(Some(1000.0), Some(22_600.0), 21_600));
+        assert!(!ran_at_least(Some(1000.0), Some(22_599.0), 21_600));
     }
 }

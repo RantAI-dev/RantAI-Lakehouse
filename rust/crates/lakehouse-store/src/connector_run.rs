@@ -119,6 +119,8 @@ pub enum EndReason {
     TableFailed,
     /// The connector is paused.
     ConnectorPaused,
+    /// The run outlived its limit and was stopped (`SRC-39`, QA `TC-1702`).
+    TimedOut,
     /// None of the above.
     Other,
 }
@@ -131,6 +133,7 @@ impl EndReason {
             Self::Completed => "completed",
             Self::TableFailed => "table_failed",
             Self::ConnectorPaused => "connector_paused",
+            Self::TimedOut => "timed_out",
             Self::Other => "other",
         }
     }
@@ -140,6 +143,7 @@ impl EndReason {
             Self::Completed => "all tables were processed",
             Self::TableFailed => "a table failed",
             Self::ConnectorPaused => "the connector is paused, nothing was loaded",
+            Self::TimedOut => "the run did not finish in time and was stopped",
             Self::Other => "no further reason is recorded",
         }
     }
@@ -268,6 +272,18 @@ fn clean(text: &str) -> String {
 /// seconds below.
 fn wait_phrase(seconds: i32) -> String {
     if seconds >= 60 && seconds % 60 == 0 {
+        format!("{} min", seconds / 60)
+    } else {
+        format!("{seconds} s")
+    }
+}
+
+/// A run's limit in the words of the log: whole hours (`6 h`), else whole
+/// minutes (`90 min`), else seconds (`45 s`).
+fn limit_phrase(seconds: i64) -> String {
+    if seconds >= 3600 && seconds % 3600 == 0 {
+        format!("{} h", seconds / 3600)
+    } else if seconds >= 60 && seconds % 60 == 0 {
         format!("{} min", seconds / 60)
     } else {
         format!("{seconds} s")
@@ -577,6 +593,28 @@ pub async fn end_run(
     reason: EndReason,
     at: OffsetDateTime,
 ) -> Result<bool, StoreError> {
+    let line = format!("run ended: {}, {}", status.as_str(), reason.phrase());
+    end_run_with_line(pool, connector_id, run_id, status, reason, at, &line).await
+}
+
+/// [`end_run`] with the caller's own last log line: the time limit says how
+/// long the run went (`end_timed_out_run`), every other end keeps the fixed
+/// phrase of its reason.
+///
+/// # Errors
+///
+/// [`StoreError::NotFound`] when the run is unknown or belongs to another
+/// connector, [`StoreError::Validation`] for [`RunStatus::Running`] (that is
+/// not an end), [`StoreError::Database`] otherwise.
+async fn end_run_with_line(
+    pool: &PgPool,
+    connector_id: &str,
+    run_id: &str,
+    status: RunStatus,
+    reason: EndReason,
+    at: OffsetDateTime,
+    line: &str,
+) -> Result<bool, StoreError> {
     if status == RunStatus::Running {
         return Err(StoreError::Validation(
             "a run cannot end as running".to_owned(),
@@ -599,18 +637,48 @@ pub async fn end_run(
         tx.commit().await?;
         return Ok(false);
     }
-    insert_line(
-        &mut tx,
-        run_id,
-        at,
-        "run_ended",
-        None,
-        None,
-        &format!("run ended: {}, {}", status.as_str(), reason.phrase()),
-    )
-    .await?;
+    insert_line(&mut tx, run_id, at, "run_ended", None, None, line).await?;
     tx.commit().await?;
     Ok(true)
+}
+
+/// End a run that outlived its limit as failed with `timed_out`, and say the
+/// limit in its last log line (`SRC-39` decisions D10, D11; QA `TC-1702`).
+///
+/// A run with no record, or one of another connector, is left alone and
+/// answers `false` (nothing is invented, as [`settle_run`]); a run that
+/// already ended keeps its own end and answers `false`.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on a failed statement.
+pub async fn end_timed_out_run(
+    pool: &PgPool,
+    connector_id: &str,
+    run_id: &str,
+    limit_seconds: i64,
+    at: OffsetDateTime,
+) -> Result<bool, StoreError> {
+    let line = format!(
+        "run ended: {}, the run did not finish in {} and was stopped",
+        RunStatus::Failed.as_str(),
+        limit_phrase(limit_seconds)
+    );
+    match end_run_with_line(
+        pool,
+        connector_id,
+        run_id,
+        RunStatus::Failed,
+        EndReason::TimedOut,
+        at,
+        &line,
+    )
+    .await
+    {
+        Ok(ended) => Ok(ended),
+        Err(StoreError::NotFound) => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 /// Settle a run that is still `running` from the orchestrator's own final
