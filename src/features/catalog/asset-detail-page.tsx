@@ -138,7 +138,7 @@ export function AssetDetailPage() {
         }
         description={a.description}
       />
-      <DeprecationNotice asset={a} />
+      <DeprecationNotice asset={a} replacementHidden={a.shownWithTableGrant === true} />
       <MetadataList
         density="compact"
         columns={3}

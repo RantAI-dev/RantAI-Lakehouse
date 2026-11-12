@@ -170,6 +170,33 @@ describe("AssetDetailPage deprecation notice", () => {
     expect(link.getAttribute("title")).toBe("serving.monthly_orders")
   })
 
+  // QA `LH-DATA-12-05` F1 (`DATA-54`): a replacement is optional, so the
+  // notice says when there is none.
+  it("says no replacement is named for a deprecated table without one", async () => {
+    stubApi({ certification: "deprecated", certificationNote: "Old" })
+    renderPage()
+    const notice = await screen.findByRole("note")
+    expect(notice.textContent).toContain("No replacement is named.")
+  })
+
+  it("does not say so when a replacement is named, or when the page is opened with a table grant", async () => {
+    stubApi({
+      certification: "deprecated",
+      certificationNote: "Old",
+      replacementAssetId: "silver.orders_v2",
+    })
+    renderPage()
+    const notice = await screen.findByRole("note")
+    expect(notice.textContent).not.toContain("No replacement is named.")
+    cleanup()
+
+    // A grant hides the replacement rather than there being none.
+    stubApi({ certification: "deprecated", certificationNote: "Old", shownWithTableGrant: true })
+    renderPage()
+    const granted = await screen.findByRole("note")
+    expect(granted.textContent).not.toContain("No replacement is named.")
+  })
+
   it("shows no notice for a certified table or one without a mark", async () => {
     stubApi({ certification: "certified" })
     renderPage()
@@ -193,7 +220,7 @@ describe("AssetDetailPage certification control", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Certification" }))
     fireEvent.click(screen.getByLabelText("Deprecated"))
     fireEvent.change(screen.getByLabelText("Note"), { target: { value: " Superseded " } })
-    fireEvent.change(screen.getByLabelText("Replacement asset id"), {
+    fireEvent.change(screen.getByLabelText("Replacement table id (optional)"), {
       target: { value: "serving.monthly_orders" },
     })
     fireEvent.click(screen.getByRole("button", { name: "Save" }))
@@ -227,10 +254,10 @@ describe("AssetDetailPage certification control", () => {
     renderPage()
     fireEvent.click(await screen.findByRole("button", { name: "Certification" }))
     fireEvent.click(screen.getByLabelText("Deprecated"))
-    fireEvent.change(screen.getByLabelText("Replacement asset id"), { target: { value: "serving.old" } })
+    fireEvent.change(screen.getByLabelText("Replacement table id (optional)"), { target: { value: "serving.old" } })
     fireEvent.click(screen.getByRole("button", { name: "Save" }))
     expect(await screen.findByText("the replacement is itself deprecated")).toBeTruthy()
-    expect(screen.getByLabelText("Replacement asset id")).toBeTruthy()
+    expect(screen.getByLabelText("Replacement table id (optional)")).toBeTruthy()
   })
 })
 
