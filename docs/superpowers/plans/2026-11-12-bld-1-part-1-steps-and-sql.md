@@ -968,3 +968,82 @@ or `readsIceberg`; the handoff is exact about what was not run.
   the gate leave out a bare name that matches any `WITH` name without regard
   to case, in every surface that takes SQL. The planner checks it and adds a
   backlog item.
+
+### S1, round 2 (reviewer, 2026-11-12)
+
+Reviewed the fix round, `85a26c224..b5e22cd42` (14 commits by the developer,
+`main` merged at `64055f47a`), finding by finding.
+
+**Re-run by the reviewer on `b5e22cd42`**, in the developer's worktree, with
+`cargo-locked -j 2`:
+
+```
+cargo fmt --check                                                          # clean
+cargo test -p lakehouse-api --lib -- pipeline_compile sql_guard transform_grammar   # 78 passed
+cargo test -p lakehouse-api --test column_lineage_pipeline                 # 8 passed
+cargo test -p lakehouse-api --test pipeline_compile_route                  # 24 passed
+cargo test -p lakehouse-api --test pipeline_definition_save                # 14 passed
+cargo test -p lakehouse-api --test sec11_guard                             # 4 passed
+cargo test -p lakehouse-api --test table_access                            # 14 passed
+```
+
+The counts equal the handoff's. Not re-run by the reviewer: the store's
+`--test pipelines`, `route_auth`, `upload_routes`, clippy, and the Python
+suite (the handoff's counts stand unchecked). CI's full run on `b5e22cd42`
+had not started when this was written; the last full run that finished was on
+`f215471ba` and failed the two tests that became R1-CI1 and R1-CI2. The G7
+gate has not passed on any commit of this slice yet.
+
+**Closed, read in the code:** R1-B1 (today's shape compiles with no `WITH`;
+the lineage test is `main`'s again; no SQL is noted for other shapes), R1-B2,
+R1-B3 (`legacy_form_over_stored`), R1-B4 (the migration splits at the first
+dot and its backfill is a function the test runs), R1-B5, R1-B7, R1-B8 (the
+four exact assertions are back; the principals are members again, not the
+administrator), R1-B9 (`RunAsChange`), R1-S1 to R1-S6, R1-CI1 (the guard's
+pattern is untouched; one stale allowlist entry is gone), R1-CI2.
+
+**Accepted as reported:** the `Clear` branch of D10a cannot be reached over
+HTTP today, because a restricted service identity has no tenant and
+`in_scope` answers 404 before `update` runs. So the gap R1-B9 named could not
+be used through the API; the rule is in place for the day a service identity
+can have a tenant.
+
+#### BLOCKER
+
+- **R2-B1. D6a is not met for a SQL step: the names are compared after they
+  were lowercased.** `check_step_tables` (`pipeline_compile.rs:372`) takes
+  its names from `sql_rewrite::referenced_tables`, and that collector
+  lowercases every name (`object_name_parts`, `sql_rewrite.rs:4801`) and
+  drops any bare name that equals a `WITH` name of the step, also lowercased
+  (`:541`). So:
+  - input `orders`, step `SELECT * FROM ORDERS`: the collector gives
+    `orders`, which equals the input's name, and the step is accepted.
+    `ClickHouse` does not match `ORDERS` to the `WITH` name `orders` and
+    looks it up as a table. This is the case R1-B6 was about; the test added
+    for it (`a_read_that_differs_only_in_case_is_refused`, input `SECRET`,
+    step `FROM secret`) covers only the other direction.
+  - step `WITH T AS (SELECT 1) SELECT * FROM t`: `t` is dropped as the
+    step's own `WITH` name and never checked.
+  - input `Orders`, step `SELECT * FROM Orders`: refused, although it is
+    exact. A name with a capital letter can never be read by a SQL step.
+
+  Fix: the step check reads the names as written. Parse the step with the
+  parser already used there and walk it with `sqlparser`'s visitor (the
+  `visitor` feature is on for this crate): every table relation in the
+  step, at any depth, is either a one-part name that equals, case included,
+  an input's name, an earlier step's name, or a `WITH` name declared in that
+  same step (also compared as written); or it is refused. A name of more
+  than one part is refused (D6a). A table function is left to the rewrite,
+  as today. `sql_rewrite` itself is not changed in this slice.
+  Tests, each on the compiler: input `orders` with `FROM ORDERS` is refused;
+  input `Orders` with `FROM Orders` is accepted and compiles; a step's own
+  `WITH t` read as `T` is refused and read as `t` is accepted; a name inside
+  a subquery and inside a `JOIN` is checked the same way; the existing D6a
+  tests still pass.
+
+#### Before this can leave draft
+
+- R2-B1 fixed and handed off.
+- `main` merged into the branch again (it is behind).
+- CI's full run green on the head commit, including `g3a-dagster` (the G7
+  case and the author gate), which no local run covers.
