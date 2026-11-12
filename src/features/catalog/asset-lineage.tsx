@@ -18,6 +18,7 @@ import type { LineageGraph } from "@/services/contracts/governance"
 import { LineageMindmap, edgePipeline, mindmapModel } from "./asset-lineage-map"
 import { icebergTableOf, type IcebergTableState } from "./asset-storage"
 import { ColumnLineageCard, MappingList } from "./column-lineage"
+import { TableGrantNote } from "./table-grant-note"
 
 /**
  * What the lineage graph calls this asset: its table key
@@ -308,6 +309,9 @@ export function AssetLineage({
 
   return (
     <div className="flex flex-col gap-2">
+      {/* GOV-11 (review round 1 R2): the API sent no related tables, so the
+          panels below are empty on purpose — say so instead of "none". */}
+      <TableGrantNote asset={a} />
       <div className="flex flex-wrap gap-2">
         <Button
           size="sm"

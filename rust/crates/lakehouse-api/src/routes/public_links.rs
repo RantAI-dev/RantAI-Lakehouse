@@ -450,6 +450,10 @@ async fn record_lock(pool: &PgPool, board_id: &str) -> Result<(), lakehouse_stor
         outcome: "refused".to_owned(),
         resource_kind: Some("dashboard".to_owned()),
         resource_id: Some(board_id.to_owned()),
+        // QA LH-SEC-2-06 (SEC-70, decision D3): a visitor locking a link is
+        // nobody the product signed in, so the row has no principal and names
+        // what caused it.
+        actor_label: Some(lakehouse_store::audit::ACTOR_PUBLIC_LINK.to_owned()),
         ..Default::default()
     };
     lakehouse_store::audit::insert(pool, event)

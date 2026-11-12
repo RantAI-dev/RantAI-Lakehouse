@@ -226,7 +226,10 @@ export function DataQualityPage() {
               </section>
             ) : null}
             <div className="flex flex-wrap gap-2">
-              {selected.evaluable ? (
+              {/* QA LH-DATA-14-04 (GOV-10, DEC-17): running a rule by hand is
+                  a governance action, like editing one — the API takes
+                  `governance:write` for it, so the button follows. */}
+              {selected.evaluable && hasPermission("governance:write") ? (
                 <Button
                   size="sm"
                   onClick={() => void handleRun(selected)}

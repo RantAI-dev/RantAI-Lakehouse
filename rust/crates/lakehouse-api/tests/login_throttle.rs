@@ -46,12 +46,27 @@ fn env_with(max_failures: &str, lockout_secs: &str) -> HashMap<String, String> {
 }
 
 async fn login(app: &axum::Router, email: &str, password: &str) -> axum::http::Response<Body> {
+    login_with_user_agent(app, email, password, None).await
+}
+
+/// [`login`] with the browser the sign-in claims to come from (`ADM-14`):
+/// the header the session records, or none when the request carries none.
+async fn login_with_user_agent(
+    app: &axum::Router,
+    email: &str,
+    password: &str,
+    user_agent: Option<&str>,
+) -> axum::http::Response<Body> {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/auth/login")
+        .header("content-type", "application/json");
+    if let Some(user_agent) = user_agent {
+        request = request.header("user-agent", user_agent);
+    }
     app.clone()
         .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/auth/login")
-                .header("content-type", "application/json")
+            request
                 .body(Body::from(format!(
                     r#"{{"email": "{email}", "password": "{password}"}}"#
                 )))
@@ -203,6 +218,27 @@ async fn the_lock_sets_exactly_one_audit_event_naming_neither_the_email_nor_the_
     .await
     .expect("query audit_event");
     assert_eq!(count, 1, "one lock, one audit event");
+    // QA LH-SEC-2-06 (SEC-70): the event happened before anybody signed in,
+    // so it carries no principal at all and says what caused it in
+    // `actor_label` instead of being handed to the assistant by the list.
+    let (actor_label, principal_kind, principal_id): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT max(actor_label), max(principal_kind), max(principal_id) FROM audit_event \
+         WHERE action = 'auth.login_locked'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query audit_event");
+    assert_eq!(
+        actor_label.as_deref(),
+        Some(lakehouse_store::audit::ACTOR_SIGN_IN_FORM),
+        "the lock names the sign-in form as its cause"
+    );
+    assert_eq!(principal_kind, None, "no principal kind: nobody signed in");
+    assert_eq!(principal_id, None, "no principal id: nobody signed in");
     let resource_id = resource_id.expect("resource_id on the lock event");
     assert_eq!(resource_id.len(), 12, "resource_id is the first 12 hex");
     assert!(
@@ -216,6 +252,80 @@ async fn the_lock_sets_exactly_one_audit_event_naming_neither_the_email_nor_the_
             "audit args must not carry {forbidden}"
         );
     }
+}
+
+/// QA LH-SEC-2-06 (SEC-70), decision D4: the lockout happened before anybody
+/// signed in, so the audit list shows what caused it — the sign-in form, a
+/// service, the system — never the assistant.
+#[tokio::test]
+async fn a_lock_is_listed_in_the_audit_log_as_the_sign_in_forms_and_not_the_assistants() {
+    let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "300")).await;
+    seed_password_identity(&pool).await;
+    // Walk the account into the lock exactly as the audit test above does.
+    for _ in 0..2 {
+        let resp = login(&router, THROTTLED_EMAIL, WRONG_PASSWORD).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let cookie = common::session_cookie_for_seeded_user(&pool, THROTTLED_EMAIL).await;
+    let mut resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/governance/audit")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_str(&body_string(&mut resp).await).expect("audit body is JSON");
+    let entry = body["audit"]
+        .as_array()
+        .expect("audit is an array")
+        .iter()
+        .find(|row| row["action"] == "auth.login_locked")
+        .expect("the lock is listed");
+    assert_eq!(entry["actor"], "Sign-in form");
+    assert_eq!(entry["actorKind"], "service");
+    assert_eq!(entry["source"], "system");
+}
+
+/// QA LH-SEC-5-01 (`ADM-14` decisions D9 and D14): a sign-in records the
+/// browser it came from, records no network address (the API has no trusted
+/// source for one), and creates exactly one session — the six rows QA saw for
+/// one administrator are six sign-ins, not one sign-in that repeats.
+#[tokio::test]
+async fn a_sign_in_records_the_browser_and_creates_exactly_one_session() {
+    let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "300")).await;
+    seed_password_identity(&pool).await;
+
+    let resp = login_with_user_agent(
+        &router,
+        THROTTLED_EMAIL,
+        REAL_PASSWORD,
+        Some("QA-Browser/1.0"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let (count, user_agent, created_ip): (i64, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT count(*), max(s.user_agent), max(s.created_ip) FROM session s \
+         JOIN app_user u ON u.id = s.app_user_id WHERE u.email = $1",
+    )
+    .bind(THROTTLED_EMAIL)
+    .fetch_one(&pool)
+    .await
+    .expect("query session");
+    assert_eq!(count, 1, "one sign-in, one session");
+    assert_eq!(user_agent.as_deref(), Some("QA-Browser/1.0"));
+    assert_eq!(
+        created_ip, None,
+        "the network address is not recorded (ADM-14 D10)"
+    );
 }
 
 #[tokio::test]
