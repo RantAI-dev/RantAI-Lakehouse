@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use common::{
-    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
+    TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_state,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -93,6 +93,9 @@ impl Respond for FakeCh {
 
 struct F {
     app: TestApp,
+    /// The state the router was built from, so a test can drive the runner
+    /// (`RPT-1`'s `tick`) the way the scheduler does.
+    state: lakehouse_api::state::AppState,
     owner: Uuid,
     owner_cookie: String,
     _ch: MockServer,
@@ -119,11 +122,12 @@ async fn fixture(extra_env: &[(&str, &str)]) -> F {
     for (k, v) in extra_env {
         env.insert((*k).to_owned(), (*v).to_owned());
     }
-    let app = spin_up_with_env(&env).await;
+    let (app, state) = spin_up_with_state(&env, |_| {}).await;
     let owner = create_principal_with_permissions(&app.pool, "dashboard:read").await;
     let owner_cookie = session_cookie_for_user(&app.pool, owner).await;
     F {
         app,
+        state,
         owner,
         owner_cookie,
         _ch: ch,
@@ -890,6 +894,13 @@ async fn a_non_owner_administrator_may_only_pause_delete_and_remove_recipients()
 /// QA `LH-RPT-1-06` (`RPT-2`, `DEC-18`): with e-mail not set up, the list says
 /// on the subscription that it is not being sent, and names the last attempt
 /// once there is one — while nothing is counted towards the pause.
+///
+/// The delivery that must not be counted is a SCHEDULED one (review round 1,
+/// R7): `run_subscription` returns before counting for a "Send now" whatever its
+/// reason, so assertions made after only a manual send hold with the
+/// e-mail-not-set-up half of the rule deleted. The scheduled run is driven here
+/// the way the runner loop drives it, with an `EmailSender` built from the
+/// deployment's saved settings.
 #[tokio::test]
 async fn the_list_says_a_subscription_is_not_sent_while_email_is_not_set_up_and_nothing_is_counted()
 {
@@ -929,6 +940,23 @@ async fn the_list_says_a_subscription_is_not_sent_while_email_is_not_set_up_and_
         "Email is not set up on this deployment."
     );
 
+    // R7: the scheduled delivery the counting rule is about. Make the one
+    // subscription due and run the runner once, with the mailer the loop builds.
+    sqlx::query(
+        "UPDATE report_subscription SET next_run_at = now() - interval '1 minute' WHERE id = $1",
+    )
+    .bind(Uuid::parse_str(made["id"].as_str().unwrap()).unwrap())
+    .execute(&f.app.pool)
+    .await
+    .unwrap();
+    let mailer = lakehouse_notify::EmailSender::new(
+        lakehouse_api::runtime_settings::email(&f.state)
+            .await
+            .smtp(),
+    );
+    let taken = lakehouse_api::routes::report_runner::tick(&f.state, &mailer).await;
+    assert_eq!(taken, 1, "the due subscription is claimed and run");
+
     let (_, list) = call(
         &f,
         "GET",
@@ -952,7 +980,7 @@ async fn the_list_says_a_subscription_is_not_sent_while_email_is_not_set_up_and_
     assert_eq!(
         item["consecutiveFailures"],
         json!(0),
-        "DEC-18: a delivery that fails for this reason is not counted"
+        "DEC-18: a scheduled delivery that fails for this reason is not counted"
     );
     assert_eq!(item["paused"], json!(false), "DEC-18: nothing is paused");
 }
