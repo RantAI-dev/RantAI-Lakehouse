@@ -4,7 +4,7 @@ import * as React from "react";
 import { usePathname, useRouter } from "next/navigation";
 import * as authClient from "@/services/clients/auth";
 import type { AuthUser } from "@/services/clients/auth";
-import { readActiveTenantId, writeActiveTenantId } from "@/services/http";
+import { clearActiveTenantId, readActiveTenantId, writeActiveTenantId } from "@/services/http";
 
 /**
  * Route prefixes reachable without a session. Kept in sync with
@@ -45,7 +45,33 @@ export type AuthStatus = "loading" | "authenticated" | "unauthenticated";
 // next to `apiFetch`, which reads them to set `X-Tenant`. Re-exported here so
 // existing importers of this module keep working without a second
 // definition that could drift from the reader.
-export { ACTIVE_TENANT_STORAGE_KEY, readActiveTenantId, writeActiveTenantId } from "@/services/http";
+export {
+  ACTIVE_TENANT_STORAGE_KEY,
+  clearActiveTenantId,
+  readActiveTenantId,
+  writeActiveTenantId,
+} from "@/services/http";
+
+/**
+ * Which tenant the signed-in person acts as (`ADM-15`, #483 review, D4): the
+ * stored one when it is still theirs, otherwise the first they belong to,
+ * otherwise none.
+ *
+ * One function decides, used by `load()` and by the context value, so
+ * `activeTenantId` can never name a tenant the person is not in — the server
+ * answers `404` for such a header (`tenant_scope.rs`). Writing the first
+ * tenant when nothing (or a stale value) is stored goes one step past "ignore
+ * it": with nothing stored the console shows `me.tenants[0]` and sends no
+ * header, while the server takes the first of `principal.tenant_ids`, and the
+ * two lists are not in the same order.
+ */
+export function resolveActiveTenant(
+  stored: string | null,
+  tenants: readonly { id: string }[]
+): string | null {
+  if (stored !== null && tenants.some((t) => t.id === stored)) return stored;
+  return tenants[0]?.id ?? null;
+}
 
 type AuthContextValue = {
   user: AuthUser | null;
@@ -56,11 +82,14 @@ type AuthContextValue = {
   refresh: () => Promise<void>;
   logout: () => Promise<void>;
   /**
-   * The tenant the caller is currently acting as — either the one they
-   * last picked through the navbar's `TenantSwitcher` (persisted in
-   * `localStorage` as `lh_active_tenant`), or, when
-   * nothing is persisted yet, the first tenant they belong to. `null`
-   * when the principal is loaded but belongs to zero tenants.
+   * The tenant the caller is currently acting as — the one they last picked
+   * through the navbar's `TenantSwitcher` (persisted in `localStorage` as
+   * `lh_active_tenant`) when it is still theirs, otherwise the first tenant
+   * they belong to, otherwise `null` (`ADM-15`, #483 review).
+   *
+   * Always one of the signed-in person's own tenants, or `null`: [`load`]
+   * corrects the stored value against `GET /api/auth/me` before the tree
+   * renders, and [`resolveActiveTenant`] is what both read through.
    */
   activeTenantId: string | null;
   /**
@@ -112,19 +141,32 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const [user, setUser] = React.useState<AuthUser | null>(null);
   const [status, setStatus] = React.useState<AuthStatus>("loading");
-  // The locally-persisted active tenant id. Read on mount (after SSR
-  // returns a deterministic `null`); updated by `setActiveTenant` when
-  // the navbar's `TenantSwitcher` picks a tenant. We don't reset it on
-  // `load()` — a reload of `/api/auth/me` is not the moment to forget
-  // the user's choice, and a stale id simply falls back to `tenants[0]`.
+  // The locally-persisted active tenant id, as the last session check resolved
+  // it (`ADM-15`): `null` until `load()` answers, because nothing may be read
+  // or trusted before the session says whose it is. Written by `load()` when
+  // the stored value is corrected, by `setActiveTenant` when the navbar picks
+  // a tenant, and by `logout` when the key is cleared.
   const [storedActiveTenantId, setStoredActiveTenantId] = React.useState<string | null>(null);
 
   const load = React.useCallback(async () => {
     try {
       const me = await authClient.me();
+      // ADM-15 (#483 review, D4): after the session answers, the stored tenant
+      // is one of this person's, or absent — another person's left-over value
+      // is replaced by their first tenant before anything renders. The storage
+      // write comes first: `apiFetch` reads storage on every call, and pages
+      // render the moment `status` flips.
+      const stored = readActiveTenantId();
+      const resolved = resolveActiveTenant(stored, me.tenants);
+      if (resolved === null) clearActiveTenantId();
+      else if (resolved !== stored) writeActiveTenantId(resolved);
+      setStoredActiveTenantId(resolved);
       setUser(me);
       setStatus("authenticated");
     } catch {
+      // D5: a failed session check (no session, or the network) changes
+      // nothing in storage — the person's own choice survives their next
+      // sign-in, and the next person's session check corrects it anyway.
       setUser(null);
       setStatus("unauthenticated");
     }
@@ -133,12 +175,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   React.useEffect(() => {
     void load();
   }, [load]);
-
-  // Pick up the locally-persisted active tenant once we have a window
-  // (SSR has none). Reads only on mount — see the comment above.
-  React.useEffect(() => {
-    setStoredActiveTenantId(readActiveTenantId());
-  }, []);
 
   // Redirect-to-login for protected paths. Skipped entirely on public
   // paths so `/public/dashboard/*` and `/embed/*` stay reachable logged
@@ -151,16 +187,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [status, pathname, router]);
 
   const logout = React.useCallback(async () => {
+    // ADM-15 (#483 review, D5): the key goes before the request, so it is gone
+    // even when that request never returns — otherwise the next person to sign
+    // in on this browser would start in this person's tenant.
+    clearActiveTenantId();
     await authClient.logout();
+    setStoredActiveTenantId(null);
     setUser(null);
     setStatus("unauthenticated");
     router.push("/login");
   }, [router]);
 
-  const setActiveTenant = React.useCallback((id: string) => {
-    writeActiveTenantId(id);
-    setStoredActiveTenantId(id);
-  }, []);
+  const setActiveTenant = React.useCallback(
+    (id: string) => {
+      // ADM-15 (#483 review, D7): a tenant the person is not in is not a
+      // choice. The switcher lists only their own, so this is a guard.
+      if (!user?.tenants.some((t) => t.id === id)) return;
+      writeActiveTenantId(id);
+      setStoredActiveTenantId(id);
+    },
+    [user]
+  );
 
   const value = React.useMemo<AuthContextValue>(
     () => ({
@@ -170,12 +217,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       hasRole: (role) => user?.roles.includes(role) ?? false,
       refresh: load,
       logout,
-      // Prefer the persisted choice; otherwise the first tenant the
-      // principal belongs to (so a fresh login lands somewhere
-      // sensible); otherwise `null` when the principal belongs to zero
-      // tenants. The `null ?? ...` chain naturally handles the three
-      // cases without an explicit `if`/`else`.
-      activeTenantId: storedActiveTenantId ?? user?.tenants[0]?.id ?? null,
+      // One rule for "which tenant": the stored choice when it is still theirs,
+      // else their first, else none — and `null` until the session answered,
+      // so no page can act on a value the person's membership has not
+      // confirmed (`ADM-15`, #483 review).
+      activeTenantId: user ? resolveActiveTenant(storedActiveTenantId, user.tenants) : null,
       setActiveTenant,
     }),
     [user, status, load, logout, storedActiveTenantId, setActiveTenant]

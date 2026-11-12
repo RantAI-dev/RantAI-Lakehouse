@@ -1236,11 +1236,19 @@ pub struct TenantSummary {
     pub slug: String,
 }
 
-/// Load `{id, name, slug}` for exactly `tenant_ids`, in no particular
-/// order. Short-circuits to `Ok(Vec::new())` on an empty input, so a caller
+/// Load `{id, name, slug}` for exactly `tenant_ids`, in ascending id order.
+/// Short-circuits to `Ok(Vec::new())` on an empty input, so a caller
 /// that already knows it has nothing to look up never pays a round trip —
 /// `routes::auth::me` relies on this to keep its service-principal /
 /// `tenant_ids.is_empty()` paths at zero queries.
+///
+/// The order is the point (`#484 review R4`): `routes::auth::me` writes the
+/// first of these as the active tenant when nothing is stored, and a person
+/// with no header is acted for as the first of `principal.tenant_ids`
+/// (`lakehouse-auth`'s `ORDER BY tenant_id`). Ascending id makes the two the
+/// same tenant, so a deploy moves nobody's data and a sign-in starts in the
+/// same tenant every time; without it the row order was whatever the scan
+/// produced.
 ///
 /// Used only by `GET /api/auth/me` to render the caller's own tenant
 /// memberships; the general tenant-listing endpoint is [`list_tenants`],
@@ -1258,7 +1266,7 @@ pub async fn list_tenants_by_ids(
         return Ok(Vec::new());
     }
     let rows: Vec<(Uuid, String, String)> =
-        sqlx::query_as("SELECT id, name, slug FROM tenant WHERE id = ANY($1)")
+        sqlx::query_as("SELECT id, name, slug FROM tenant WHERE id = ANY($1) ORDER BY id")
             .bind(tenant_ids)
             .fetch_all(pool)
             .await?;
@@ -2102,5 +2110,42 @@ mod tests {
     fn a_non_uuid_id_is_not_found_rather_than_a_database_error() {
         let err = parse_id("not-a-uuid").expect_err("must reject a non-UUID id");
         assert!(matches!(err, StoreError::NotFound), "got {err:?}");
+    }
+
+    /// `#484 review R4` (`DATA-56`): the list is ordered by id, so the tenant
+    /// `GET /api/auth/me` writes as the active one is the tenant the server
+    /// already acts for without a header (`ORDER BY tenant_id`). The two rows
+    /// are inserted in the reverse of their id order and the lower id's row is
+    /// updated afterwards, so its heap slot moves last: a sequential scan
+    /// returns it last, and only the `ORDER BY` puts it first.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_tenants_by_ids_returns_them_in_ascending_id_order(pool: sqlx::PgPool) {
+        let lower = Uuid::from_u128(0x1111_1111_1111_4111_8111_0000_00aa_0001);
+        let higher = Uuid::from_u128(0x1111_1111_1111_4111_8111_0000_00aa_0002);
+        for (id, name, slug) in [(higher, "Zeta", "zeta"), (lower, "Acme", "acme")] {
+            sqlx::query(
+                "INSERT INTO tenant (id, name, slug, plan, residency) \
+                 VALUES ($1, $2, $3, 'Enterprise', 'Jakarta (ID)')",
+            )
+            .bind(id)
+            .bind(name)
+            .bind(slug)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("UPDATE tenant SET name = name || ' (renamed)' WHERE id = $1")
+            .bind(lower)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let rows = list_tenants_by_ids(&pool, &[higher, lower]).await.unwrap();
+        let ids: Vec<&str> = rows.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![lower.to_string(), higher.to_string()],
+            "ascending id is the order the console's first tenant depends on"
+        );
     }
 }

@@ -58,11 +58,22 @@ no record of whether it arrived.
 Tools `create_report_subscription`, `list_report_subscriptions`,
 `update_report_subscription`, `delete_report_subscription`. The standard
 request set gains `AI-10-AC1` ("Send this dashboard to me every Monday as a
-PDF."). The AI team reviews this part.
+PDF."). The AI team reviews this part. `list_report_subscriptions` answers a
+`warning` while e-mail is not set up (`RPT-2`).
 
 ## Owner decisions at the phase 4 QA (2026-10-23)
 
 - At send time, a console recipient must still have `dashboard:read` and a role that may download, and must share a tenant with the owner when the owner has tenants; others are skipped and counted (RPT-1 review R8). Confirmed by the owner.
+
+## Owner decision of 2026-11-12 (`DEC-18`)
+
+- On an installation with no e-mail set up, a delivery that fails for that reason is
+  recorded with its reason and is not counted towards the pause; the subscriptions
+  list says e-mail is not set up (`DEC-18`, QA `LH-RPT-1-06`). This is the exception
+  to decision 7's pause after 5 failures in a row.
+- On each subscription the list shows "Not sent: e-mail is not set up on this
+  installation." and, when the last attempt failed for that reason, its time. Changed
+  2026-11-12 (`RPT-2`), *(proposed, not yet signed)*.
 
 ## Acceptance checklist
 
@@ -73,4 +84,11 @@ Run by the product owner on a running console. A step not performed is never a p
 - `RPT-1-AC3` With "skip when empty", no email is sent for an empty result, and the skip is recorded.
 - `RPT-1-AC4` A user who may not download is refused; an outside address on a domain not listed is refused; a failure shows a plain sentence and tells the owner.
 - `RPT-1-AC5` "Send now" delivers a test email and records it.
+- `RPT-1-AC6` With e-mail not set up on the installation, "Send now" and a scheduled
+  run each record a failed send with the reason "Email is not set up on this
+  deployment."; the failures are not counted and the subscription is not paused
+  (`DEC-18`). The subscriptions list shows on that subscription "Not sent: e-mail is
+  not set up on this installation." with the time of the last attempt. Row added
+  2026-11-12 (`RPT-2`) for QA `LH-RPT-1-06`; the words on screen are *(proposed, not
+  yet signed)*.
 - `AI-10-AC1` "Send this dashboard to me every Monday as a PDF." creates a Monday PDF subscription for the person.
