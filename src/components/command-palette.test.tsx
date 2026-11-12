@@ -127,6 +127,23 @@ describe("CommandPalette catalog search", () => {
     expect(await screen.findByText("approximate match")).toBeTruthy()
   })
 
+  // QA `LH-DATA-11-01` F1 and `LH-DATA-11-04` (`DATA-54`): the row shows the
+  // table's physical name, and the matched description as text.
+  it("shows the physical name under the friendly name, and the matched text as text", async () => {
+    stubCatalog({
+      assets: [
+        asset(1, {
+          matchedOn: { field: "description", value: "<b>bold</b> revenue", approximate: false },
+        }),
+      ],
+    })
+    await search("revenue")
+    const row = (await screen.findByText("Table 1")).closest('[cmdk-item=""]') as HTMLElement
+    expect(row.textContent).toContain("silver.t1")
+    expect(screen.getByText('description: "<b>bold</b> revenue"')).toBeTruthy()
+    expect(document.querySelector('[cmdk-item=""] b')).toBeNull()
+  })
+
   it("lists at most eight assets", async () => {
     stubCatalog({ assets: Array.from({ length: 12 }, (_, i) => asset(i + 1)) })
     await search("table")
@@ -394,7 +411,9 @@ describe("CommandPalette catalog order", () => {
     const names = [...document.querySelectorAll('[cmdk-item=""]')]
       .map((el) => el.textContent ?? "")
       .filter((t) => /A long note about rev|Zzz|Revenue/.test(t))
-    expect(names.map((t) => t.replace(/\W+$/, ""))).toEqual([
+    // A row now ends with its table's physical name (`DATA-54`); the order
+    // asserted is the order of the rows.
+    expect(names.map((t) => t.replace(/silver\.t\d+$/, ""))).toEqual([
       "A long note about rev",
       "Zzz",
       "Revenue",

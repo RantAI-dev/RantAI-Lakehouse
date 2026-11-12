@@ -16,7 +16,7 @@ import { isServiceError } from "@/services/errors";
 import type { Asset } from "@/services/contracts/assets";
 import type { ShortcutItem } from "@/services/contracts/dashboards";
 import { itemHref } from "@/lib/dashboard-organise";
-import { ASSET_VALUE_PREFIX, PALETTE_ASSET_RESULT_LIMIT, capPaletteAssetResults, makePaletteFilter, matchedOnLabel } from "@/lib/palette-search";
+import { ASSET_VALUE_PREFIX, PALETTE_ASSET_RESULT_LIMIT, capPaletteAssetResults, makePaletteFilter, paletteAssetLines } from "@/lib/palette-search";
 
 /** Debounce, in ms, before a typed search term reaches `assetService`
  * (WS2 §13). */
@@ -356,18 +356,24 @@ export function CommandPalette() {
             filter must not hide them (DATA-11 F6). */}
         {assetResults.length ? (
           <Command.Group forceMount heading="Catalog assets" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
-            {assetResults.map((a) => (
-              <PaletteItem
-                key={a.id}
-                forceMount
-                icon={Database}
-                label={a.name}
-                badge={<CertificationBadge certification={a.certification} />}
-                detail={matchedOnLabel(a.matchedOn)}
-                value={assetItemValue(a)}
-                onSelect={() => go(`/data/assets/${a.id}`)}
-              />
-            ))}
+            {assetResults.map((a) => {
+              // QA `LH-DATA-11-01` F1 (`DATA-54`): the result names the table
+              // by its physical name under the friendly name.
+              const lines = paletteAssetLines(a);
+              return (
+                <PaletteItem
+                  key={a.id}
+                  forceMount
+                  icon={Database}
+                  label={a.name}
+                  badge={<CertificationBadge certification={a.certification} />}
+                  path={lines.path}
+                  detail={lines.reason}
+                  value={assetItemValue(a)}
+                  onSelect={() => go(`/data/assets/${a.id}`)}
+                />
+              );
+            })}
             {/* QA `LH-DATA-11-02` (`DATA-54`): the box shows eight tables; when
                 more matched, it says so rather than looking complete. */}
             {assetTotal > assetResults.length ? (
@@ -403,12 +409,14 @@ export function CommandPalette() {
 }
 
 function PaletteItem({
-  icon: Icon, label, badge, detail, value, forceMount, onSelect,
+  icon: Icon, label, badge, path, detail, value, forceMount, onSelect,
 }: {
   icon: React.ComponentType<{ className?: string }>;
   label: string;
   /** Shown after the label (a certified / deprecated mark). */
   badge?: React.ReactNode;
+  /** The table's physical name, in monospace, before the reason. */
+  path?: string | null;
   /** A second, smaller line under the label. */
   detail?: string | null;
   value: string;
@@ -428,7 +436,13 @@ function PaletteItem({
           <span className="truncate">{label}</span>
           {badge}
         </span>
-        {detail ? <span className="block truncate text-xs text-muted-foreground">{detail}</span> : null}
+        {path || detail ? (
+          <span className="block truncate text-xs text-muted-foreground">
+            {path ? <span className="font-mono">{path}</span> : null}
+            {path && detail ? " · " : null}
+            {detail ? <span>{detail}</span> : null}
+          </span>
+        ) : null}
       </span>
     </Command.Item>
   );

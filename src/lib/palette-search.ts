@@ -13,6 +13,7 @@
 import { defaultFilter } from "cmdk"
 
 import type { Asset } from "@/services/contracts/assets"
+import { tableKeyOf } from "@/lib/table-key"
 
 /** The palette shows at most this many catalog-asset results per search. */
 export const PALETTE_ASSET_RESULT_LIMIT = 8
@@ -58,15 +59,38 @@ export function matchedOnLabel(matchedOn: Asset["matchedOn"]): string | null {
       // column named id, which is not what it is.
       what = "table id"
       break
+    case "description":
+      // QA `LH-DATA-11-04` (`DATA-54`): the server sends a piece of the
+      // description around the matched word; it is shown as text, never as
+      // HTML.
+      what = value ? `description: "${value}"` : "description"
+      break
     case "columnDescription":
       what = "column description"
       break
     default:
-      // namespace, owner, description; a field a newer server adds is shown
-      // as it came rather than hidden.
+      // namespace, owner; a field a newer server adds is shown as it came
+      // rather than hidden.
       what = field
   }
   return approximate ? `${what} · approximate match` : what
+}
+
+/**
+ * The two lines of a catalog-asset result (`LH-DATA-11-01` F1, `DATA-54`):
+ * the table's physical name (`bronze.orders`, `serving.mart_sales`), and why
+ * it matched. When the reason is the table key itself the key is not printed
+ * twice — the reason is then only "approximate match" when a typo was
+ * forgiven, and nothing otherwise.
+ */
+export function paletteAssetLines(
+  asset: Pick<Asset, "id" | "tableKey" | "matchedOn">,
+): { path: string | null; reason: string | null } {
+  const path = tableKeyOf(asset)
+  if (path !== null && asset.matchedOn?.field === "table") {
+    return { path, reason: asset.matchedOn.approximate ? "approximate match" : null }
+  }
+  return { path, reason: matchedOnLabel(asset.matchedOn) }
 }
 
 /** The `value` prefix of a catalog-asset row in the palette (`command-palette.tsx`). */

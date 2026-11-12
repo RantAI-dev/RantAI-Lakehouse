@@ -1,5 +1,10 @@
 import { describe, expect, it } from "bun:test"
-import { PALETTE_ASSET_RESULT_LIMIT, capPaletteAssetResults, matchedOnLabel } from "./palette-search"
+import {
+  PALETTE_ASSET_RESULT_LIMIT,
+  capPaletteAssetResults,
+  matchedOnLabel,
+  paletteAssetLines,
+} from "./palette-search"
 
 describe("capPaletteAssetResults", () => {
   it("passes through a result set at or under the limit unchanged", () => {
@@ -16,6 +21,39 @@ describe("capPaletteAssetResults", () => {
 
   it("returns an empty array for an empty result set", () => {
     expect(capPaletteAssetResults([])).toEqual([])
+  })
+})
+
+describe("paletteAssetLines", () => {
+  // QA `LH-DATA-11-01` F1 (`DATA-54`): the result shows the table's physical
+  // name, and the reason; a table-key match is not printed twice.
+  it("the lines of a result are its table key and why it matched", () => {
+    expect(
+      paletteAssetLines({
+        id: "raw-orders",
+        tableKey: "bronze.orders",
+        matchedOn: { field: "column", value: "customer_id", approximate: false },
+      }),
+    ).toEqual({ path: "bronze.orders", reason: "column customer_id" })
+    expect(
+      paletteAssetLines({
+        id: "silver.dim_negara",
+        matchedOn: { field: "table", value: "silver.dim_negara", approximate: false },
+      }),
+    ).toEqual({ path: "silver.dim_negara", reason: null })
+    expect(
+      paletteAssetLines({
+        id: "silver.dim_negara",
+        matchedOn: { field: "table", value: "silver.dim_negara", approximate: true },
+      }),
+    ).toEqual({ path: "silver.dim_negara", reason: "approximate match" })
+    // A Bronze row whose registry records no table name has no key.
+    expect(
+      paletteAssetLines({
+        id: "raw-orders",
+        matchedOn: { field: "tag", value: "pii", approximate: false },
+      }),
+    ).toEqual({ path: null, reason: "tag pii" })
   })
 })
 
@@ -47,6 +85,14 @@ describe("matchedOnLabel", () => {
     expect(matchedOnLabel({ field: "id", value: "", approximate: true })).toBe(
       "table id · approximate match",
     )
+  })
+
+  // QA `LH-DATA-11-04` (`DATA-54`): a description match quotes the piece the
+  // server sent.
+  it("quotes the piece of the description the server sent", () => {
+    expect(
+      matchedOnLabel({ field: "description", value: "monthly revenue by region", approximate: false }),
+    ).toBe('description: "monthly revenue by region"')
   })
 
   it("says so when a typo was forgiven", () => {
