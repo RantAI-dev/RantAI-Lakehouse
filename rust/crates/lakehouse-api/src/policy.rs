@@ -386,9 +386,12 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // DATA-14 (F7): a rule's run history; the rule list it belongs to is open to
     // any login, and the history shows what that list shows (a verdict).
     ("GET",  "/api/governance/quality/{id}/runs", Policy::RequiresAuth),
-    // Running a rule reads the table it names, so it takes what reading
-    // that table takes — the same grant as the column profile.
-    ("POST", "/api/governance/quality/{id}/run", Policy::RequiresPermission("query:read")),
+    // Running a rule by hand is a governance action like editing one
+    // (GOV-10, decision DEC-17; QA LH-DATA-14-04 showed a viewer running a
+    // rule at 200). It took `query:read` before. The scheduled and on-load
+    // checks call `quality::evaluate` without this route, so they are not
+    // affected.
+    ("POST", "/api/governance/quality/{id}/run", Policy::RequiresPermission("governance:write")),
     // Rewriting or removing a rule is a governance decision, like setting an SLA.
     ("PUT", "/api/governance/quality/{id}", Policy::RequiresPermission("governance:write")),
     ("DELETE", "/api/governance/quality/{id}", Policy::RequiresPermission("governance:write")),
@@ -1533,6 +1536,18 @@ mod tests {
         assert_eq!(
             policy_for("GET", "/api/governance/{kind}"),
             Some(Policy::RequiresPermission("governance:read"))
+        );
+    }
+
+    /// `GOV-10` decision `DEC-17`: running an authored rule by hand is a
+    /// governance action, not a read of the table it names — QA
+    /// `LH-DATA-14-04` saw a viewer run one at 200 while it took
+    /// `query:read`.
+    #[test]
+    fn running_a_quality_rule_by_hand_needs_governance_write() {
+        assert_eq!(
+            policy_for("POST", "/api/governance/quality/{id}/run"),
+            Some(Policy::RequiresPermission("governance:write"))
         );
     }
 

@@ -2589,7 +2589,47 @@ async fn quality_incident_routes_are_gated_in_both_directions() {
     assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
 }
 
-/// `DATA-14` (F3): any login may read the schedules, and setting one needs
+/// `GOV-10` (`DEC-17`; QA `LH-DATA-14-04`, `TC-1728`): running an authored
+/// rule by hand needs `governance:write`. A principal holding `query:read`
+/// and `governance:read` is refused (403); one holding `governance:write`
+/// alone is past the gate and the unknown rule answers 404; no cookie at all
+/// answers 401.
+#[tokio::test]
+async fn running_a_quality_rule_by_hand_is_gated_in_both_directions() {
+    let TestApp { router, pool } = spin_up().await;
+    let run = "/api/governance/quality/00000000-0000-4000-8000-000000000000/run";
+
+    let viewer = create_principal_with_permissions(&pool, "query:read,governance:read").await;
+    let cookie = session_cookie_for_user(&pool, viewer).await;
+    let refused = request_with_cookie(&router, "POST", run, &cookie).await;
+    assert_eq!(
+        refused.status(),
+        StatusCode::FORBIDDEN,
+        "a viewer may not run a rule by hand"
+    );
+
+    let admin = create_principal_with_permissions(&pool, "governance:write").await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+    let allowed = request_with_cookie(&router, "POST", run, &cookie).await;
+    assert_eq!(
+        allowed.status(),
+        StatusCode::NOT_FOUND,
+        "past the gate, the rule does not exist"
+    );
+
+    let anonymous = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(run)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+}
 /// `governance:write`. A principal without it is refused (403) and nothing is
 /// stored; one with it is past the gate (an empty body then answers 400).
 #[tokio::test]
