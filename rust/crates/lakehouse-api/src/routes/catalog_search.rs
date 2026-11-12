@@ -21,7 +21,8 @@
 //! # How a term is read
 //!
 //! The term is lower-cased and split on whitespace; at most [`MAX_WORDS`]
-//! words are used. Every word must match the asset somewhere, in any order.
+//! words are used, and a word with no letter or digit is dropped before that
+//! cap. Every word must match the asset somewhere, in any order.
 //! A word matches a field when the field contains it (exact) or, for a word
 //! of [`MIN_APPROX_CHARS`] or more characters, when one token of the field
 //! is one edit away from it (approximate; `DATA-11` D3). A typed word with
@@ -35,6 +36,11 @@
 //! its column `customer_id`, and the first word alone (the name) would leave
 //! the reader with no reason. When every word's best field is the name there
 //! is no `matchedOn`: the name is already on screen.
+//!
+//! A typed word with no letter or digit (`_`, `%`, `--`) names nothing: it
+//! is not a filter but punctuation, so it is dropped before the matching. A
+//! term made only of such words therefore finds nothing rather than
+//! everything that holds the character (`LH-DATA-11-05`, `DATA-54`).
 //!
 //! `DATA-32` D1 is the one exception to that last rule. When no field
 //! explains the hit and a word matched the name only approximately (`revnue`
@@ -510,18 +516,32 @@ pub fn search(
     limit: Option<usize>,
 ) -> SearchOutcome {
     let lowered = term.to_lowercase();
-    let words: Vec<Word> = lowered
-        .split_whitespace()
-        .take(MAX_WORDS)
-        .map(Word::new)
-        .collect();
-    if words.is_empty() {
+    // A blank term is not a filter: every asset comes back, in input order
+    // (`DATA-11`).
+    if lowered.split_whitespace().next().is_none() {
         let total = index.assets.len();
         let assets = match limit {
             Some(cap) => index.assets.iter().take(cap).cloned().collect(),
             None => index.assets.clone(),
         };
         return SearchOutcome { assets, total };
+    }
+    // QA `LH-DATA-11-05` (`DATA-54`): a word with no letter or digit
+    // (`_`, `%`, `--`) names nothing, and it used to be found as typed in
+    // every id and column that holds the character; QA-1 decision "special
+    // characters do not match everything". Such a word is dropped, and a
+    // term made only of them finds nothing.
+    let words: Vec<Word> = lowered
+        .split_whitespace()
+        .map(Word::new)
+        .filter(|w| !w.parts.is_empty())
+        .take(MAX_WORDS)
+        .collect();
+    if words.is_empty() {
+        return SearchOutcome {
+            assets: Vec::new(),
+            total: 0,
+        };
     }
 
     // `(score, use, id, position in the index, reason)`: the id is the
@@ -1182,5 +1202,31 @@ mod tests {
         );
         assert_eq!(ids(&outcome.assets), vec!["a", "b"]);
         assert_eq!(outcome.total, 2);
+    }
+
+    // QA `LH-DATA-11-05` (`DATA-54`): `_` used to be looked up as typed in
+    // every id and column that holds an underscore, so it found almost every
+    // table. A word with no letter or digit names nothing and is dropped; a
+    // term made only of such words finds nothing.
+    #[test]
+    fn a_word_with_no_letter_or_digit_is_dropped_and_alone_finds_nothing() {
+        let assets = vec![
+            json!({ "id": "silver.dim_customer", "name": "Dim Customer" }),
+            json!({ "id": "silver.rev_month", "name": "Rev", "description": "50% of revenue" }),
+        ];
+        let columns: ColumnIndex = [(
+            "silver.dim_customer".to_owned(),
+            vec![("customer_id".to_owned(), String::new())],
+        )]
+        .into();
+        let index = index(&assets, &columns);
+        let by = |term: &str| search(&index, &UsageIndex::new(), term, None);
+        for term in ["_", "%", "- _", "."] {
+            let outcome = by(term);
+            assert_eq!(outcome.assets, [] as [serde_json::Value; 0], "{term}");
+            assert_eq!(outcome.total, 0, "{term}");
+        }
+        assert_eq!(ids(&by("rev _").assets), vec!["silver.rev_month"]);
+        assert_eq!(ids(&by("").assets), ids(&assets));
     }
 }
