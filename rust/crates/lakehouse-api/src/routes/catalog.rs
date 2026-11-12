@@ -239,7 +239,7 @@ pub(crate) async fn catalog_tenant_refusal(
 ///
 /// With a non-empty `?q=` it is a search instead (`DATA-11`): the assets
 /// that match every word of the term, ranked by [`super::catalog_search`]
-/// — over name, id, namespace, owner, tags, description and the columns'
+/// — over name, table key, namespace, owner, tags, description and the columns'
 /// names and descriptions — each with `matchedOn`, read from the 30-second
 /// search copy ([`search_snapshot`]) rather than rebuilt per request. When
 /// a column query was cut at its row limit the body also says

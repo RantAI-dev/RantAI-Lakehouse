@@ -81,8 +81,8 @@ const MIN_APPROX_CHARS: usize = 4;
 const SCORE_NAME_WHOLE: u32 = 120;
 /// Exact / approximate weight of a hit in the name.
 const SCORE_NAME: (u32, u32) = (100, 50);
-/// Exact / approximate weight of a hit in the id or the namespace.
-const SCORE_ID_NAMESPACE: (u32, u32) = (80, 40);
+/// Exact / approximate weight of a hit in the table key or the namespace.
+const SCORE_TABLE_NAMESPACE: (u32, u32) = (80, 40);
 /// Exact / approximate weight of a hit in a tag.
 const SCORE_TAG: (u32, u32) = (70, 35);
 /// Exact / approximate weight of a hit in a column name.
@@ -105,7 +105,7 @@ pub type UsageIndex = HashMap<String, u32>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Field {
     Name,
-    Id,
+    Table,
     Namespace,
     Tag,
     Column,
@@ -119,7 +119,7 @@ impl Field {
     const fn weights(self) -> (u32, u32) {
         match self {
             Self::Name => SCORE_NAME,
-            Self::Id | Self::Namespace => SCORE_ID_NAMESPACE,
+            Self::Table | Self::Namespace => SCORE_TABLE_NAMESPACE,
             Self::Tag => SCORE_TAG,
             Self::Column => SCORE_COLUMN,
             Self::Owner => SCORE_OWNER,
@@ -135,7 +135,7 @@ impl Field {
     const fn reported(self) -> Option<&'static str> {
         match self {
             Self::Name => None,
-            Self::Id => Some("id"),
+            Self::Table => Some("table"),
             Self::Namespace => Some("namespace"),
             Self::Tag => Some("tag"),
             Self::Column => Some("column"),
@@ -241,19 +241,36 @@ impl SearchIndex {
 
 /// The candidates of one asset, in the order [`best_hit`] prefers them.
 ///
-/// The order is the one this module has always used: name, id, namespace,
-/// owner, description, the tags, the governed pairs, then the columns
-/// (each name, then its description). Of equal hits the first in this order
-/// stays, so the order is part of the answer.
+/// The order is the one this module has always used: name, table key,
+/// namespace, owner, description, the tags, the governed pairs, then the
+/// columns (each name, then its description). Of equal hits the first in
+/// this order stays, so the order is part of the answer.
 fn candidates(
     asset: &Value,
     columns: &ColumnIndex,
     prepared: &mut PreparedTexts,
 ) -> Vec<Candidate> {
     let mut out = Vec::new();
+    let name = text_of(asset, "name");
+    if !name.is_empty() {
+        out.push(Candidate {
+            field: Field::Name,
+            text: prepare(name, prepared),
+            shown: String::new(),
+        });
+    }
+    // QA `LH-DATA-11-05` (`DATA-54`): the id of a Bronze row is a registry
+    // slug and the id of a Silver or Gold row is its table, so the table key
+    // is what a person types and what the reason line shows. It takes the
+    // place the id had in the order.
+    if let Some(table_key) = super::catalog::asset_table_key(asset) {
+        out.push(Candidate {
+            field: Field::Table,
+            text: prepare(table_key, prepared),
+            shown: table_key.to_owned(),
+        });
+    }
     for (field, key) in [
-        (Field::Name, "name"),
-        (Field::Id, "id"),
         (Field::Namespace, "namespace"),
         (Field::Owner, "owner"),
         (Field::Description, "description"),
@@ -1202,6 +1219,37 @@ mod tests {
         );
         assert_eq!(ids(&outcome.assets), vec!["a", "b"]);
         assert_eq!(outcome.total, 2);
+    }
+
+    // QA `LH-DATA-11-05` (`DATA-54`): the search reads a row's table key, not
+    // its id. A Bronze row's id is a registry slug nobody types, and a
+    // Silver or Gold row's id is its table, so the two agree there.
+    #[test]
+    fn a_table_is_found_by_its_physical_name_and_a_bronze_slug_is_not_searched() {
+        let assets = vec![
+            json!({
+                "id": "zq-registry-slug", "name": "Orders",
+                "tableKey": "bronze.northwind_orders"
+            }),
+            json!({ "id": "silver.dim_negara", "name": "Dim Negara" }),
+        ];
+        assert_eq!(find(&assets, "zq"), [] as [serde_json::Value; 0]);
+        let bronze = find(&assets, "northwind_orders");
+        assert_eq!(ids(&bronze), vec!["zq-registry-slug"]);
+        assert_eq!(
+            bronze[0]["matchedOn"],
+            json!({
+                "field": "table", "value": "bronze.northwind_orders", "approximate": false
+            })
+        );
+        let silver = find(&assets, "silver.dim_negara");
+        assert_eq!(ids(&silver), vec!["silver.dim_negara"]);
+        assert_eq!(
+            silver[0]["matchedOn"],
+            json!({
+                "field": "table", "value": "silver.dim_negara", "approximate": false
+            })
+        );
     }
 
     // QA `LH-DATA-11-05` (`DATA-54`): `_` used to be looked up as typed in
