@@ -1607,8 +1607,9 @@ pub(super) async fn settle_loading_upload(state: &AppState, pool: &PgPool, row: 
 
 /// `GET /api/uploads` — the active tenant's uploads, newest first, at most
 /// [`LIST_LIMIT`]. A caller in no tenant gets an empty list, never another
-/// tenant's. A loading upload is settled first. `folderId=<id>|none` and `q=<text>`
-/// narrow the list before the window is cut (`DATA-35`, [`ListQuery`]).
+/// tenant's. A loading upload is settled first. `folderId=<id>|none`,
+/// `q=<text>` and `table=<name>` narrow the list before the window is cut
+/// (`DATA-35`, `DATA-47`, [`ListQuery`]).
 ///
 /// # Errors
 ///
@@ -1636,6 +1637,13 @@ pub async fn list(
     // so a folder's files and a search are not hidden by newer files elsewhere. With
     // neither, this is the list it always was.
     let text = query.q.as_deref().map(str::trim).filter(|q| !q.is_empty());
+    // `DATA-47` (QA `LH-DATA-35-03`): the Table step asks which uploads loaded into
+    // one table, by its exact raw name. An empty value is no filter, like `q`.
+    let table = query
+        .table
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
     let filter = ListFilter {
         folder: match query.folder_id.as_deref() {
             None | Some("") => FolderFilter::Any,
@@ -1643,7 +1651,7 @@ pub async fn list(
             Some(id) => FolderFilter::In(id),
         },
         text,
-        table: None,
+        table,
     };
     let rows = uploads::list_filtered(pool, tenant_id, LIST_LIMIT, &filter).await?;
     let mut settler = Settler::new(&state, pool);
@@ -1654,7 +1662,7 @@ pub async fn list(
     Ok(ApiJson(views))
 }
 
-/// Query parameters of [`list`] (`DATA-35`, plan AD-5).
+/// Query parameters of [`list`] (`DATA-35`, plan AD-5; `DATA-47`).
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
     /// A folder id, or `none` for the files in no folder; absent: every file.
@@ -1662,6 +1670,8 @@ pub struct ListQuery {
     folder_id: Option<String>,
     /// Text a file name or a table name must contain, case-insensitively.
     q: Option<String>,
+    /// Exactly this raw table name; absent or empty: every table.
+    table: Option<String>,
 }
 
 /// `GET /api/uploads/{id}` — one upload, settled first if it is loading.
