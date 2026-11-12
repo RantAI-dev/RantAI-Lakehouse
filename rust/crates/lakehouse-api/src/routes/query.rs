@@ -1793,7 +1793,8 @@ pub async fn run(
 /// The run of a statement that is already final: every `{{name}}` in it is
 /// filled (or it never had one), and nothing here scans for placeholders.
 ///
-/// [`run`] reaches it after [`substitute_parameters`]. The assistant's
+/// [`run`] fills the placeholders with [`substitute_parameters`], then calls
+/// [`run_statement_with`], which this function wraps. The assistant's
 /// `run_sql` and `run_saved_query` reach it the same way, after their own
 /// guards and their own substitution. It exists so the scanner reads text a
 /// person or the model wrote exactly once per request: a literal printed from
@@ -1803,16 +1804,16 @@ pub async fn run(
 /// The order of the guards, the history records and the errors are those of
 /// [`run`].
 ///
-/// # Errors
-///
-/// The same as [`run`], less the 400s for the request body and the
-/// parameters.
-///
 /// This is the assistant's entry: an engine failure answers the engine's
 /// trimmed diagnosis and a reference, so the model can correct its SQL
 /// (SEC-11, query-author exception, product owner 2026-10-10). The console's
 /// `run` answers a fixed sentence instead (owner 2026-11-12, LH-QS-2-08), see
 /// [`run_statement_with`].
+///
+/// # Errors
+///
+/// The same as [`run`], less the 400s for the request body and the
+/// parameters.
 pub(crate) async fn run_statement(
     state: &AppState,
     principal: Option<&Principal>,
@@ -2094,9 +2095,11 @@ async fn run_statement_with(
 /// `err.to_string()`. A rewrite refusal with a 4xx status is `blocked`; a
 /// rewrite failure with a 5xx status is `failed`.
 ///
-/// A statement the engine refused is `failed`. The response shows the author
-/// the engine's diagnosis, but the row keeps the classified sentence with the
-/// same reference id (`EngineFailure::statement` stores `failure.recorded`).
+/// A statement the engine refused is `failed`. For the console the response
+/// and the row carry the same classified sentence and reference id (owner
+/// 2026-11-12, LH-QS-2-08). For the assistant the response keeps the engine's
+/// trimmed diagnosis, and the row keeps the classified sentence
+/// (`EngineFailure::statement` stores `failure.recorded`).
 /// A fixed failure (the time limit, an outage, a row cap) is `failed` and
 /// stores `response.to_string()`, the same text the response carries. A Stop
 /// is `stopped` and stores the stopped sentence.
@@ -2492,9 +2495,10 @@ fn bytes_to_cost_bucket(estimated_bytes: i64, divisor: f64) -> f64 {
 /// `iceberg_snapshot_id` (`SEC-21`), as [`run`] does. An `EXPLAIN
 /// ESTIMATE` failure (e.g. an unknown column) still answers 200 — the
 /// console shows the estimate panel either way — but `estimatedBytes`/costs
-/// are `null` and the `ClickHouse` message is carried in `error`, rather
-/// than a zeroed estimate that looked identical to "this query reads
-/// nothing".
+/// are `null` and `error` carries the fixed sentence for the failure's cause,
+/// followed by `Reference: <id>` (owner 2026-11-12, LH-QS-2-08), never the
+/// engine's own text. A zeroed estimate would look identical to "this query
+/// reads nothing".
 pub async fn estimate(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -2528,9 +2532,10 @@ pub async fn estimate(
 
     // A failed EXPLAIN is reported, not swallowed. It used to come back as
     // a zeroed estimate, so "this query cannot even be planned" and "this
-    // query reads nothing" looked identical — and ClickHouse's message is
-    // usually the most useful thing on the page (an unknown column, a
-    // missing table) before anyone presses Run.
+    // query reads nothing" looked identical. The error gives the fixed
+    // sentence for the failure's cause and a reference, which tells the author
+    // what to check before pressing Run. The engine's raw text stays in the log
+    // under that reference.
     //
     // Review fix: the estimate explains the statement the run would send, i.e.
     // the one rewritten for the caller's current roles (same function as the
