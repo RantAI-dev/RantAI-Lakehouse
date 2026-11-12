@@ -1971,3 +1971,23 @@ Not verified, and why:
   Only the tail of the first run was kept, so which test it was is *not verified*.
 - `docker compose config` / `up`: nothing under `docker-compose.yml` or `dagster/` changed this
   round, so neither ran.
+
+### Round 2 (planner, 2026-11-12), at `ab0f1d11`
+
+Read the round-1 fix commits. R1 to R12 are fixed, one commit each, each new test shown red on
+the wrong change before it was kept.
+
+- R3, R1: the catalog's tenant gate runs before the table is asked about, on create, on an
+  update that changes the table and through the assistant, and the assistant's draft is
+  checked as the person behind the chat.
+- R2: `tier2_governance_drafts` has a `ClickHouse` stand-in and all its assertions; the other
+  integration files that create a rule were run (`quality_incidents`, `quality_anomalies`,
+  `quality_schedules`, `upstream_errors`).
+- R4: no sentence, changelog entry or plan line names a time for on-load checks.
+
+**Noted, not for this branch:** one full `bun run test` of this round reported one failing
+test that the three runs after it did not, and its name was not kept (the same happened once
+on `fix/qa-round-connectors-p2`). The backlog already holds a console test that fails about
+one run in ten (`REL-24`); if CI shows a console test failing here, read its name first.
+
+No open BLOCKER. `run_rule`'s tenant gate is backlog `GOV-12`. Merge when CI on #493 is green.
