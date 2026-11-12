@@ -174,6 +174,12 @@ What QA saw:
   is shown as stored. If the lookup fails, a warning is logged and everyone but the caller is
   "Unknown user". The UUID is never in `frequentUsers` or `recentQueries`. `usage.users`
   still counts distinct ids.
+  - Review round 1 R1: a name is answered only for a person who **shares a tenant with the
+    caller** (`dashboard_access::user_names_in_tenants`, the "an empty list of tenants narrows
+    nothing" rule and convention of `search_active_users`). The history the usage is built
+    from has no tenant column, so it can hold a person of another tenant — a refused statement
+    is recorded with `owner_id` — and every id of such a person is "Unknown user" in this
+    tenant's usage, never their name.
 - **D15. An upload's versions name who started the load.** The API sends the load's author
   in the run configuration as `author`: the display name of the person who pressed Load (not
   of who sent the file, if they differ), followed by ` (file upload)`. The job puts it in

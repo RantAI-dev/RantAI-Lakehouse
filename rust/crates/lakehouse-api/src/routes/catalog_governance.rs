@@ -668,8 +668,15 @@ async fn asset_ids_of(state: &AppState, keys: &[String]) -> HashMap<String, Stri
 }
 
 /// The display name of every person a history read mentions (`DATA-52`), one read
-/// for all of them (`lakehouse_store::dashboard_access::user_names`). Names that are
-/// blank are left out, so such a person is [`UNKNOWN_USER`].
+/// for all of them (`lakehouse_store::dashboard_access::user_names_in_tenants`).
+/// Names that are blank are left out, so such a person is [`UNKNOWN_USER`], and
+/// so is every id of a person who shares no tenant with the caller.
+///
+/// Review round 1 R1: a name is resolved only for a person who shares a tenant
+/// with the caller. The history the usage is built from has no tenant column,
+/// so it can mention a person of another tenant (a refused statement is
+/// recorded with `owner_id`, `routes/query.rs`), and a member of this tenant
+/// must not be shown that person's name.
 ///
 /// No `Result`: a failed lookup logs a warning and answers names for the caller
 /// only. The names are decoration, and a lookup that fails must not turn the page's
@@ -688,7 +695,9 @@ async fn people_names(
     let mut names: HashMap<uuid::Uuid, String> = if ids.is_empty() {
         HashMap::new()
     } else {
-        match lakehouse_store::dashboard_access::user_names(pg, &ids).await {
+        match lakehouse_store::dashboard_access::user_names_in_tenants(pg, &ids, &caller.tenant_ids)
+            .await
+        {
             Ok(rows) => rows
                 .into_iter()
                 .filter(|(_, name, _)| !name.trim().is_empty())
@@ -2419,5 +2428,117 @@ mod tests {
         assert_eq!(check["status"], "failed");
         assert_eq!(check["lastRun"], "2026-09-30 01:00:00");
         assert_eq!(check["origin"], "observed");
+    }
+
+    /// `people_names` over a real Postgres (review round 1 R1 and R4): the read
+    /// `usage` makes, not a hand-made map.
+    mod names {
+        // Force-links `lakehouse-test-support` so its `#[ctor]` Postgres
+        // testcontainer bootstrap runs for this test binary.
+        use lakehouse_auth::PrincipalId;
+        use lakehouse_test_support as _;
+        use uuid::Uuid;
+
+        use super::*;
+
+        fn principal(id: Uuid, tenants: &[Uuid], name: &str) -> Principal {
+            Principal {
+                id: PrincipalId::User(id),
+                tenant_ids: tenants.to_vec(),
+                display_name: name.to_owned(),
+                permissions: lakehouse_auth::PermissionSet::parse(""),
+                provider: "session".to_owned(),
+                must_change_password: false,
+                role_names: Vec::new(),
+            }
+        }
+
+        async fn person(pool: &PgPool, name: &str) -> Uuid {
+            let clean = name.replace(' ', ".").to_lowercase();
+            sqlx::query_scalar(
+                "INSERT INTO app_user (name, username, email) VALUES ($1, $2, $3) RETURNING id",
+            )
+            .bind(name)
+            .bind(format!("{clean}@example.test"))
+            .bind(format!("{clean}@example.test"))
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        async fn tenant(pool: &PgPool, slug: &str) -> Uuid {
+            sqlx::query_scalar(
+                "INSERT INTO tenant (name, slug, plan, residency) \
+                 VALUES ($1, $1, 'team', 'eu') RETURNING id",
+            )
+            .bind(slug)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        async fn in_tenant(pool: &PgPool, user: Uuid, tenant: Uuid) {
+            sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+                .bind(user)
+                .bind(tenant)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+
+        fn mentioned(id: &str, owner: Uuid) -> HistoryMention {
+            HistoryMention {
+                id: id.to_owned(),
+                sql: "SELECT * FROM silver.orders".to_owned(),
+                user_name: owner.to_string(),
+                owner_id: Some(owner),
+                at: "2026-10-01T08:00:00Z".to_owned(),
+                status: "completed".to_owned(),
+                duration_ms: 10,
+                audit_event_id: None,
+            }
+        }
+
+        /// Review round 1 R1: the name of a person of another tenant is never
+        /// answered, so their row is "Unknown user" and their name is nowhere in
+        /// the usage; the person who shares the caller's tenant is named.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_name_of_another_tenants_person_never_reaches_the_usage(pool: PgPool) {
+            let here = tenant(&pool, "acme").await;
+            let elsewhere = tenant(&pool, "globex").await;
+            let me = person(&pool, "rina").await;
+            let ours = person(&pool, "ann ours").await;
+            let theirs = person(&pool, "bob theirs").await;
+            in_tenant(&pool, me, here).await;
+            in_tenant(&pool, ours, here).await;
+            in_tenant(&pool, theirs, elsewhere).await;
+
+            let mentions = [
+                mentioned("q1", ours),
+                mentioned("q2", theirs),
+                mentioned("q3", theirs),
+            ];
+            let caller = principal(me, &[here], "rina");
+            let names = people_names(&pool, &mentions, &caller).await;
+            assert_eq!(names.get(&ours).map(String::as_str), Some("ann ours"));
+            assert!(!names.contains_key(&theirs));
+
+            let (usage, _) = summarize_usage(
+                &mentions,
+                &tables(&["silver.orders"]),
+                &[],
+                me,
+                false,
+                &names,
+            );
+            assert_eq!(
+                usage["frequentUsers"],
+                json!([
+                    {"name": "Unknown user", "queries": 2},
+                    {"name": "ann ours", "queries": 1}
+                ])
+            );
+            assert!(!usage.to_string().contains("bob theirs"));
+        }
     }
 }
