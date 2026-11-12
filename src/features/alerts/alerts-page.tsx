@@ -10,8 +10,10 @@ import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { useDataTable } from "@/hooks/use-data-table"
 import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { filterDataClientSide } from "@/lib/data-table"
+import { readableErrorMessage } from "@/lib/notify-message"
 import type { QueryKeys } from "@/types/data-table"
 import { getRuleColumns, type Rule } from "@/features/alerts/rules-columns"
+import { useAuth } from "@/features/auth/auth-provider"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { alertRuleService, connectorService, dashboardService } from "@/services"
@@ -81,6 +83,10 @@ export function RunAlertsNotice({ runEventsConfigured }: { readonly runEventsCon
 
 export function AlertsPage() {
   const router = useRouter();
+  // QA TC-1696 (SRC-40 D9): the page "New rule" opens takes `alert:write`
+  // (`nav-config.ts`), and the API refuses the save for anyone else, so the
+  // button is offered only to a person who may use it.
+  const { hasPermission } = useAuth();
   const state = useService((s) => alertRuleService.listRules(s), []);
   // D9: says whether run reports can arrive at all. If it cannot be read, no
   // notice is shown (the rules list reports its own failure).
@@ -155,7 +161,7 @@ export function AlertsPage() {
         rules as unknown as Rule[],
         {
           search: tableUrlState.search,
-          searchFields: [(r) => r.name, (r) => r.mart, (r) => r.measure, (r) => r.target],
+          searchFields: [(r) => r.name, (r) => r.mart, (r) => r.measure, (r) => r.target ?? ""],
           filters: tableUrlState.filters,
           joinOperator: tableUrlState.joinOperator,
         }
@@ -192,9 +198,11 @@ export function AlertsPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <Button size="sm" onClick={() => router.push("/alerts/rules/new")}>
-            <Plus className="size-4" /> New rule
-          </Button>
+          {hasPermission("alert:write") ? (
+            <Button size="sm" onClick={() => router.push("/alerts/rules/new")}>
+              <Plus className="size-4" /> New rule
+            </Button>
+          ) : null}
         </div>
       </div>
 
@@ -202,9 +210,11 @@ export function AlertsPage() {
         runEventsConfigured={runStatus.status === "success" ? runStatus.data.runEventsConfigured : null}
       />
 
+      {/* QA LH-SRC-7-10 (SRC-40 D8): the list's banner says the refusal in
+          words, never the API's code-first text (`permission_denied: alert:write`). */}
       {mutationError ? (
         <div className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-          {mutationError.message}
+          {readableErrorMessage(mutationError.message)}
         </div>
       ) : null}
 

@@ -247,3 +247,41 @@ def test_build_source_never_loads_system_or_local_host_keys():
     src = inspect.getsource(sftp.build_source)
     assert "load_system_host_keys" not in src
     assert "load_host_keys" not in src
+
+
+def test_the_connection_is_given_thirty_seconds_to_be_answered(monkeypatch):
+    """QA TC-1712 (SRC-41 D16): `paramiko.connect` has no timeout of its own,
+    so a silent host was waited for until the operating system gave up. The
+    connect call is handed `CONNECT_TIMEOUT_SECONDS`; removing the key puts
+    back the unbounded wait."""
+    captured = {}
+
+    class _FakeSftp:
+        def open(self, path, mode="r"):
+            return io.BytesIO(b"id,name\n1,a\n")
+
+    class _FakeClient:
+        def set_missing_host_key_policy(self, policy):
+            pass
+
+        def connect(self, **kwargs):
+            captured["connect_kwargs"] = kwargs
+
+        def open_sftp(self):
+            return _FakeSftp()
+
+    monkeypatch.setattr("dispar_orchestrate.adapters.sftp.paramiko.SSHClient", _FakeClient)
+    build_source(
+        {
+            "host": "sftp.invalid",
+            "port": 22,
+            "path": "/export",
+            "auth": {"type": "password"},
+            "hostKeyFingerprint": "SHA256:abc",
+            "fileFormat": "csv",
+        },
+        secrets={"password": "s3cret"},
+        source_objects=[{"name": "orders.csv", "target": "orders"}],
+        resolve_checked=lambda h, p: ResolvedAddress(ip="10.0.0.9", port=p, family=2),
+    )
+    assert captured["connect_kwargs"]["timeout"] == 30

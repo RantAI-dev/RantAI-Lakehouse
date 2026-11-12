@@ -64,7 +64,7 @@
 //!   error reaches a response only as the store's own fixed `database error`.
 //!   The one piece of recorded text a response can carry is a reason
 //!   `file_ingest_job` wrote into `ingest_run`, and only when it is one of the
-//!   eleven the API knows ([`JOB_FAILURE_REASONS`], review findings B6 and C2);
+//!   twelve the API knows ([`JOB_FAILURE_REASONS`], review findings B6 and C2);
 //!   anything else the job recorded is shown as [`LOAD_FAILED`].
 //! * **Fail closed on a table name.** A load may target a table that does not
 //!   exist or one this tenant's uploads claimed; never a connector's table,
@@ -196,7 +196,7 @@ pub(super) const MAX_UPLOAD_BYTES: usize = 50 * 1024 * 1024;
 /// session path already took (found in the measurement of
 /// `docs/plans/DATA-17-RESULT.md`). A bomb is decoded by range and counted,
 /// never held, so the size costs time and not memory. Plan T6.2, item 2.
-pub(super) const MAX_UNPACKED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub(crate) const MAX_UNPACKED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// What `DefaultBodyLimit` allows the `POST /api/uploads` request as a whole:
 /// the cap plus 1 MiB for the multipart framing around the file. Applied to
@@ -340,10 +340,10 @@ const LOAD_FAILED: &str = "The load failed.";
 const RUN_UNKNOWN: &str = "The orchestrator no longer knows this load.";
 
 // The reasons `file_ingest_job` records when a load fails (plan T7). The API
-// shows a recorded reason only when it is one of these eleven (review finding
+// shows a recorded reason only when it is one of these twelve (review finding
 // B6): `ingest_run.error` is free text, so one `str(exc)` in the job would
 // otherwise put exception text, a host or a path into a response. These are
-// the same eleven as `ops/fixtures/upload_load_failure_reasons.json`, which a
+// the same twelve as `ops/fixtures/upload_load_failure_reasons.json`, which a
 // test below reads and which the job's own tests assert its constants against.
 
 const JOB_FILE_UNREADABLE: &str = "The stored file could not be read.";
@@ -362,14 +362,20 @@ const JOB_TOO_MANY_COLUMNS: &str = "The file has more than 1,000 columns.";
 // `DATA-18`: a load told to stop at a value that does not fit its column's type.
 const JOB_BAD_VALUES: &str = "Some values do not fit their column's type.";
 // `DATA-17` slice 4 (decision 2): the decoded bytes of a gzip or zip file passed the cap.
-const JOB_TOO_LARGE_UNPACKED: &str = "The file is larger than the upload limit once unpacked.";
+// No longer raised (`DATA-51` named the number): kept so a load an older job recorded
+// keeps its message, as `JOB_TOO_MANY_ROWS` did.
+const JOB_TOO_LARGE_UNPACKED_UNNAMED: &str =
+    "The file is larger than the upload limit once unpacked.";
 // PR #186 review SHOULD-FIX 1: the column list sent with the load is not the file's (a JSON key that
 // first appears after the rows the preview sampled), so the person is told to look at the preview again.
 const JOB_COLUMNS_NOT_PREVIEWED: &str = "The file's columns are not the ones the preview showed.";
+// `DATA-51` (`LH-DATA-17-13`): the same sentence as the API's own refusal once unpacked,
+// whose number comes from [`MAX_UNPACKED_BYTES`] (`Refusal::TooLargeUnpacked`).
+const JOB_TOO_LARGE_UNPACKED: &str = "The file is larger than the 2 GB limit once unpacked.";
 
 /// Every reason the job may record, in the order of
 /// `ops/fixtures/upload_load_failure_reasons.json`.
-const JOB_FAILURE_REASONS: [&str; 11] = [
+const JOB_FAILURE_REASONS: [&str; 12] = [
     JOB_FILE_UNREADABLE,
     JOB_HEADER_PAST_END,
     JOB_HEADER_NO_COLUMNS,
@@ -379,8 +385,9 @@ const JOB_FAILURE_REASONS: [&str; 11] = [
     JOB_NOT_REGISTERED,
     JOB_TOO_MANY_COLUMNS,
     JOB_BAD_VALUES,
-    JOB_TOO_LARGE_UNPACKED,
+    JOB_TOO_LARGE_UNPACKED_UNNAMED,
     JOB_COLUMNS_NOT_PREVIEWED,
+    JOB_TOO_LARGE_UNPACKED,
 ];
 
 fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
@@ -1042,9 +1049,30 @@ fn classify_head(head: &[u8], filename: &str) -> Result<Accepted, ApiError> {
         Kind::Gzip => GZIP,
         Kind::Avro if named == ByName::Plain(Format::Avro) => return Ok(Accepted::Avro),
         Kind::Avro => AVRO,
-        Kind::OtherBinary => OTHER_BINARY,
+        Kind::OtherBinary => return Err(ApiError::BadRequest(unreadable_as_named(filename))),
     };
     Err(ApiError::BadRequest(message.to_owned()))
+}
+
+/// The sentence for bytes that are neither text nor a kind this API knows, said by what the
+/// file's NAME claims it is (QA `LH-DATA-17-05`, `DATA-51`): a damaged file of a format this
+/// upload reads "could not be opened" as that format, which is a different answer from "this
+/// is not a format this upload reads". Every name has an answer, the last being [`OTHER_BINARY`]
+/// for a name that claims nothing, so the function returns no `Result` and needs no `# Errors`.
+fn unreadable_as_named(filename: &str) -> String {
+    if has_parquet_name(filename) {
+        return upload_parquet::ParquetFileError::Unreadable.to_string();
+    }
+    if has_workbook_name(filename) {
+        return upload_workbook::WorkbookError::Unreadable.to_string();
+    }
+    match upload_formats::by_name(filename) {
+        ByName::Plain(Format::Avro) => NOT_AVRO,
+        ByName::Plain(Format::Json | Format::JsonLines) => return Refusal::JsonInvalid.to_string(),
+        ByName::Gzip(_) | ByName::Zip => NOT_AN_ARCHIVE,
+        ByName::Plain(_) | ByName::Other => OTHER_BINARY,
+    }
+    .to_owned()
 }
 
 /// Text by its first bytes: delimited text, unless its name says JSON, JSON Lines or an
@@ -2703,17 +2731,41 @@ async fn record_audit(pool: &PgPool, event: NewAuditEvent) {
     }
 }
 
+/// Who a load is recorded as in the table's own history (`DATA-52`, QA
+/// `LH-DATA-15-08`): the display name of the person who pressed Load, and
+/// ` (file upload)` after it, so a version written by an upload says how it was
+/// written. A name with nothing usable in it is `file upload` alone rather than a
+/// bare suffix. Control characters go (a name is shown in a table's history) and
+/// the name is cut at [`MAX_STORED_TEXT_CHARS`], like every other stored text of
+/// an upload.
+fn load_author(display_name: &str) -> String {
+    let name: String = display_name
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_STORED_TEXT_CHARS)
+        .collect();
+    let name = name.trim();
+    if name.is_empty() {
+        "file upload".to_owned()
+    } else {
+        format!("{name} (file upload)")
+    }
+}
+
 /// The run config `file_ingest_job` takes: `ops.ingest_uploaded_file.config`
 /// (plan T7). `load_key` is the object the job reads: the upload's own, or the
 /// converted sheet of a workbook ([`converted_key`]). The config schema is
 /// closed, so nothing about the sheet can be added here. `load_keys` lists every
 /// file of the load, the primary first (`DATA-17` slice 5, plan AD5); the
-/// `bronze_table_name` path the `DATA-19` sensor reads does not move.
+/// `bronze_table_name` path the `DATA-19` sensor reads does not move. `author` is
+/// [`load_author`]'s answer for the person who started the load (`DATA-52`); the
+/// job takes it from this change on, so the schema stays closed.
 fn run_config(
     upload_id: &str,
     request: &IngestRequest,
     load_keys: &[String],
     (format, compression): (&str, &str),
+    author: &str,
 ) -> Value {
     let (columns, on_bad_value) = columns::run_config_columns(request.columns.as_ref());
     json!({
@@ -2732,6 +2784,7 @@ fn run_config(
                     "header_row": request.header_row,
                     "columns": columns,
                     "on_bad_value": on_bad_value,
+                    "author": author,
                 }
             }
         }
@@ -2823,12 +2876,13 @@ async fn launch(
     request: &IngestRequest,
     load_keys: &[String],
     kind: (&str, &str),
+    author: &str,
 ) -> Result<String, ApiError> {
     let failure = match state
         .dagster
         .launch_run_with_config(
             FILE_INGEST_JOB,
-            &run_config(&claimed.id, request, load_keys, kind),
+            &run_config(&claimed.id, request, load_keys, kind, author),
         )
         .await
     {
@@ -3293,7 +3347,10 @@ pub async fn ingest(
 
     let claimed = claim_load(pool, &row, &request, folder, converted.as_ref(), limits).await?;
 
-    let run_id = launch(&state, pool, &claimed, &request, &load_keys, kind).await?;
+    // `DATA-52`: the author is the person who pressed Load, taken from the
+    // authenticated principal rather than from anything the request sent.
+    let author = load_author(&principal.display_name);
+    let run_id = launch(&state, pool, &claimed, &request, &load_keys, kind, &author).await?;
     let attached = finish_launch_and_audit(
         pool,
         &principal,
@@ -3615,6 +3672,41 @@ mod tests {
         assert!(check_file(encrypted, "a.csv").is_err());
     }
 
+    /// Bytes that are neither text nor a kind the API knows are answered by what the
+    /// file's name claims: "could not be opened" as that format, never "a format this
+    /// upload does not read" (QA `LH-DATA-17-05`, `DATA-51`).
+    #[test]
+    fn a_binary_file_named_like_an_accepted_format_is_told_it_could_not_be_opened() {
+        // The bytes of the "not text" case above: a NUL byte, so no reader takes it.
+        let binary = b"a,b\0c,d";
+        let refusal = |name: &str| check_file(binary, name).unwrap_err().to_string();
+        let sentences = [
+            (
+                "a.parquet",
+                upload_parquet::ParquetFileError::Unreadable.to_string(),
+            ),
+            (
+                "a.xlsx",
+                upload_workbook::WorkbookError::Unreadable.to_string(),
+            ),
+            ("a.avro", NOT_AVRO.to_owned()),
+            ("a.json", Refusal::JsonInvalid.to_string()),
+            ("a.csv.gz", NOT_AN_ARCHIVE.to_owned()),
+            ("a.zip", NOT_AN_ARCHIVE.to_owned()),
+        ];
+        for (name, sentence) in sentences {
+            assert_eq!(refusal(name), sentence, "{name}");
+            assert!(
+                !sentence.contains("not a file this upload reads"),
+                "{name} must not be answered as a format this upload does not read"
+            );
+        }
+        // A name that claims no format keeps the format-list sentence.
+        for name in ["a.bin", "a.pdf"] {
+            assert_eq!(refusal(name), OTHER_BINARY, "{name}");
+        }
+    }
+
     #[test]
     fn what_a_stored_upload_is_converted_from_follows_its_name_and_its_first_bytes() {
         let zip = b"PK\x03\x04rest";
@@ -3789,6 +3881,30 @@ mod tests {
     fn the_unpacked_cap_is_2_gib_and_is_not_the_cap_of_a_whole_file() {
         assert_eq!(MAX_UNPACKED_BYTES, 2_147_483_648);
         assert_ne!(MAX_UNPACKED_BYTES, u64::try_from(MAX_UPLOAD_BYTES).unwrap());
+    }
+
+    /// `DATA-51` (QA `LH-DATA-17-13`): the refusal once unpacked names the cap, and the
+    /// job's recorded reason for it is that same sentence -- the API shows a recorded
+    /// reason only when it is one of [`JOB_FAILURE_REASONS`], so the two must not drift.
+    #[test]
+    fn the_unpacked_sentences_name_the_unpacked_cap() {
+        assert_eq!(
+            MAX_UNPACKED_BYTES % (1024 * 1024 * 1024),
+            0,
+            "the sentence says a whole number of GB"
+        );
+        let gigabytes = MAX_UNPACKED_BYTES / (1024 * 1024 * 1024);
+        assert_eq!(
+            JOB_TOO_LARGE_UNPACKED,
+            Refusal::TooLargeUnpacked.to_string()
+        );
+        let cap = format!("the {gigabytes} GB limit");
+        for sentence in [
+            JOB_TOO_LARGE_UNPACKED,
+            Refusal::TooLargeUnpacked.to_string().as_str(),
+        ] {
+            assert!(sentence.contains(&cap), "{sentence} must name {cap}");
+        }
     }
 
     #[test]
@@ -4130,7 +4246,13 @@ mod tests {
             "uploads/t/up-3.csv",
         ]
         .map(str::to_owned);
-        let config = run_config("up-1", &request, &keys, ("delimited", "none"));
+        let config = run_config(
+            "up-1",
+            &request,
+            &keys,
+            ("delimited", "none"),
+            "a person (file upload)",
+        );
         let job = &config["ops"]["ingest_uploaded_file"]["config"];
         assert_eq!(job["storage_keys"], json!(keys));
         assert_eq!(job["upload_id"], "up-1");
@@ -4161,6 +4283,7 @@ mod tests {
             &request,
             &["uploads/t/up-1.xlsx.converted.csv".to_owned()],
             ("delimited", "none"),
+            "a person (file upload)",
         );
         let job = &config["ops"]["ingest_uploaded_file"]["config"];
         assert_eq!(job["upload_id"], "up-1");
@@ -4175,6 +4298,40 @@ mod tests {
         assert!(
             job.get("sheet").is_none(),
             "the job's config schema is closed"
+        );
+    }
+
+    /// `DATA-52`: the job is told who started the load, as the API stores it.
+    #[test]
+    fn the_run_config_names_who_started_the_load() {
+        let request = parse_ingest_request(&body(&valid()), None, None).unwrap();
+        let config = run_config(
+            "up-1",
+            &request,
+            &["uploads/t/up-1.csv".to_owned()],
+            ("delimited", "none"),
+            "Rina Wijaya (file upload)",
+        );
+        let job = &config["ops"]["ingest_uploaded_file"]["config"];
+        assert_eq!(job["author"], "Rina Wijaya (file upload)");
+    }
+
+    /// `DATA-52` (QA `LH-DATA-15-08`): a name is shown in a table's history, so it
+    /// carries no control character and no more than a stored text does; and an
+    /// upload with no usable name says how it was written, not " (file upload)".
+    #[test]
+    fn the_author_of_a_load_is_the_name_without_control_characters_or_file_upload_alone() {
+        assert_eq!(load_author("Rina Wijaya"), "Rina Wijaya (file upload)");
+        assert_eq!(load_author("Rina\nWijaya\u{7}"), "RinaWijaya (file upload)");
+        assert_eq!(load_author("  Rina Wijaya  "), "Rina Wijaya (file upload)");
+        for nothing in ["", "   ", "\n\u{7}"] {
+            assert_eq!(load_author(nothing), "file upload", "{nothing:?}");
+        }
+        let long = "x".repeat(300);
+        let author = load_author(&long);
+        assert_eq!(
+            author,
+            format!("{} (file upload)", "x".repeat(MAX_STORED_TEXT_CHARS))
         );
     }
 
@@ -4340,8 +4497,8 @@ mod tests {
     }
 
     /// Review finding B6: a recorded reason reaches a response only when it is
-    /// one of the eleven the API knows (six before finding C2). Each of the
-    /// eleven is kept; text that is near one of them, text with detail added,
+    /// one of the twelve the API knows (six before finding C2). Each of the
+    /// twelve is kept; text that is near one of them, text with detail added,
     /// and exception text are all the fixed `The load failed.`.
     #[test]
     fn a_recorded_reason_is_shown_only_when_it_is_one_the_api_knows() {
@@ -4376,9 +4533,10 @@ mod tests {
         }
     }
 
-    /// Review findings B6 and C2: the eleven reasons the API knows are the
-    /// eleven in the file (Phase 3 slice 3 review BLOCKER 3: `DATA-18` added the ninth;
-    /// `DATA-17` slice 4 the tenth; PR #186 review SHOULD-FIX 1 the eleventh) the job's own tests assert its constants against
+    /// Review findings B6 and C2: the twelve reasons the API knows are the
+    /// twelve in the file (Phase 3 slice 3 review BLOCKER 3: `DATA-18` added the ninth;
+    /// `DATA-17` slice 4 the tenth; PR #186 review SHOULD-FIX 1 the eleventh;
+    /// `DATA-51` the twelfth) the job's own tests assert its constants against
     /// too, in the same order, so the two sides cannot drift apart
     /// unnoticed. Read here from test code only, with `include_str!`, so the
     /// release build of the API depends on nothing outside `rust/`.
@@ -4394,7 +4552,7 @@ mod tests {
         let mut distinct = JOB_FAILURE_REASONS.to_vec();
         distinct.sort_unstable();
         distinct.dedup();
-        assert_eq!(distinct.len(), 11, "eleven different reasons");
+        assert_eq!(distinct.len(), 12, "twelve different reasons");
         assert!(
             !JOB_FAILURE_REASONS.contains(&LOAD_FAILED),
             "the fixed fallback is not one of the job's reasons"

@@ -9,5 +9,6 @@
   "The file has more than 1,000 columns.",
   "Some values do not fit their column's type.",
   "The file is larger than the upload limit once unpacked.",
-  "The file's columns are not the ones the preview showed."
+  "The file's columns are not the ones the preview showed.",
+  "The file is larger than the 2 GB limit once unpacked."
 ]

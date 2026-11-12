@@ -268,6 +268,63 @@ pub async fn user_names(
     .await?)
 }
 
+/// [`user_names`] for the people who share a tenant with the caller: `(id,
+/// name, email)` for each id that is a person in one of `tenant_ids`.
+///
+/// Review round 1 R1 (`DATA-52`): a display name must not cross tenants. The
+/// asset page's usage is built from every tenant's query history (that
+/// history has no tenant column), so an id in it may belong to a person of
+/// another tenant; naming it there would show one tenant's person to a
+/// member of another. An id this read leaves out is "Unknown user" at the
+/// call site, which is what such a row showed before names existed.
+///
+/// `tenant_ids` narrows the list to the people who share one of those
+/// tenants: an empty list means no tenant narrows the list, the same rule
+/// and the same convention as [`crate::report_subscriptions::search_active_users`]
+/// — a deployment that does not use tenants holds an empty list, and so does
+/// a service principal (`Principal::tenant_ids` is empty for one).
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn user_names_in_tenants(
+    pool: &PgPool,
+    ids: &[Uuid],
+    tenant_ids: &[Uuid],
+) -> Result<Vec<(Uuid, String, Option<String>)>, StoreError> {
+    Ok(sqlx::query_as(
+        "SELECT id, name, COALESCE(email, username) AS email FROM app_user \
+         WHERE id = ANY($1) \
+           AND (cardinality($2::uuid[]) = 0 \
+                OR EXISTS (SELECT 1 FROM app_user_tenant ut \
+                           WHERE ut.user_id = app_user.id AND ut.tenant_id = ANY($2::uuid[])))",
+    )
+    .bind(ids)
+    .bind(tenant_ids.to_vec())
+    .fetch_all(pool)
+    .await?)
+}
+
+/// `(id, name)` for each of these service identities that still exists.
+///
+/// Review round 1 R3 (`DATA-52`): a service token that runs a query is recorded
+/// with its `service_identity.id` as `owner_id` (`routes/query.rs`), so a
+/// history the usage is built from can hold one. Without this read such a row
+/// reads "Unknown user", telling the page an existing, named caller no longer
+/// exists and merging the service into the row of deleted people.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn service_names(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<(Uuid, String)>, StoreError> {
+    Ok(
+        sqlx::query_as("SELECT id, name FROM service_identity WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(pool)
+            .await?,
+    )
+}
+
 /// `(id, name)` for each of these roles that still exists.
 ///
 /// # Errors

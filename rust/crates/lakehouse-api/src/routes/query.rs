@@ -1523,7 +1523,13 @@ async fn execute_query_against_engine(
         // named so Stop can end it (`QueryRun::options`). A query the limit
         // or a Stop ended gets a fixed sentence (plan D6), not the engine's
         // text.
-        let options = run.options(limits, limits.studio_rows);
+        // QA `LH-DATA-9-32` (`DATA-53`): every cell of this route is text already, so a
+        // decimal written as text changes no cell's type and keeps its digits, where a
+        // number read into a 64-bit float keeps about fifteen of them.
+        let options = lakehouse_clickhouse::QueryOptions {
+            quote_decimals: true,
+            ..run.options(limits, limits.studio_rows)
+        };
         let result = state
             .clickhouse
             .query_with_options(sql, &options, None)
@@ -3461,6 +3467,8 @@ pub async fn download(
         // No row cap: the download holds the whole result.
         max_result_rows: None,
         query_id: Some(download_query_id(caller.id.uuid(), run_id)),
+        // A download keeps the engine's own formatting (out of scope of `DATA-53`).
+        quote_decimals: false,
     };
     let statement = download_statement(&rewritten);
 
