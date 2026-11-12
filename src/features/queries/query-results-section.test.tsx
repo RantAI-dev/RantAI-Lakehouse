@@ -397,3 +397,37 @@ describe("the banner of a cut result", () => {
     expect(screen.queryAllByText(/Showing the first/)).toHaveLength(0)
   })
 })
+
+// `QS-6` (`LH-QS-2-10`), decision 8 and 13: the summary names the engine that
+// really ran, as the tab's picker spells it, and a Trino run states no
+// ClickHouse workload class.
+describe("the result summary engine", () => {
+  /** The value beside a metadata label, as the person reads it. */
+  function summaryValue(label: string): string {
+    const term = screen.getByText(label)
+    return term.parentElement?.querySelector("dd")?.textContent ?? ""
+  }
+
+  it("names Trino as the engine of a Trino run and shows no workload class for it", () => {
+    renderSection(
+      result({
+        engine: "trino",
+        metrics: {
+          ...result().metrics,
+          engine: null,
+          workloadClass: null,
+        },
+      })
+    )
+
+    expect(summaryValue("Engine")).toBe("Trino")
+    expect(summaryValue("Workload")).toBe("—")
+  })
+
+  it("names ClickHouse as the engine of a ClickHouse run", () => {
+    renderSection(result())
+
+    expect(summaryValue("Engine")).toBe("ClickHouse")
+    expect(summaryValue("Workload")).toBe("Hot analytics")
+  })
+})

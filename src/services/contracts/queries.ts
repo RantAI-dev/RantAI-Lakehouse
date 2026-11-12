@@ -342,14 +342,32 @@ export type QueryPlanStage = {
 }
 
 export type QueryEstimate = {
+  /**
+   * `QS-6` (decision 7): whether the server could estimate this statement at
+   * all. Absent from an older server, which only ever answered a ClickHouse
+   * estimate — so absent reads as supported.
+   */
+  supported?: boolean
+  /** Why there is no estimate, as the server's fixed sentence (`QS-6`). */
+  reason?: string | null
+  /**
+   * `QS-6`: which engine answered. `null`/absent from an older server, whose
+   * estimate always described ClickHouse.
+   */
+  queryEngine?: QueryEngine | string
   /** Null when the query could not be planned — see `error`. */
   estimatedBytes: number | null
   estimatedCostMin: number | null
   estimatedCostMax: number | null
-  /** Why there is no estimate, in ClickHouse's words. */
+  /**
+   * Why there is no estimate: the server's fixed sentence by cause with a
+   * reference id (`QS-6`), never the engine's own text.
+   */
   error?: string | null
-  workloadClass: WorkloadClass
-  engine: EngineCategory
+  /** Null for a Trino statement, which has no ClickHouse workload class. */
+  workloadClass: WorkloadClass | null
+  /** Null for a Trino statement, which has no ClickHouse storage tier. */
+  engine: EngineCategory | null
   /**
    * `EXPLAIN ESTIMATE` doesn't report cache eligibility — null until a
    * real cache-eligibility check exists.
@@ -411,8 +429,10 @@ export type QueryResult = {
     durationMs: number
     scannedBytes: number
     costUnits: number
-    engine: EngineCategory
-    workloadClass: WorkloadClass
+    /** Null for a Trino run, which has no ClickHouse storage tier. */
+    engine: EngineCategory | null
+    /** Null for a Trino run, which has no ClickHouse workload class. */
+    workloadClass: WorkloadClass | null
     /** ClickHouse's response carries no cache-hit flag — not measured. */
     cacheHit: boolean | null
     /** No pushdown computation exists — not measured. */
@@ -629,11 +649,17 @@ export interface QueryService {
    */
   listHistoryPage(filter?: QueryHistoryFilter, signal?: AbortSignal): Promise<QueryHistoryPage>
   /**
-   * `options` carries the `{{name}}` values and definitions (`QS-5`); with
-   * none, the request is the one sent before parameters existed. The
-   * estimate always asks ClickHouse.
+   * `options` carries the `{{name}}` values and definitions (`QS-5`) and the
+   * engine the tab runs on (`QS-6`): with none, the request is the one sent
+   * before parameters existed, and it is a ClickHouse estimate. A `Trino`
+   * statement has no pre-run estimate; the server answers `supported: false`
+   * with the reason and asks no engine.
    */
-  estimate(sql: string, options?: QueryParamInputs, signal?: AbortSignal): Promise<QueryEstimate>
+  estimate(
+    sql: string,
+    options?: QueryParamInputs & { engine?: QueryEngine },
+    signal?: AbortSignal
+  ): Promise<QueryEstimate>
   /**
    * `runId` (`BI-5` plan D5) goes out as `X-Run-Id`, so a Stop can name the
    * run; absent, the server makes one and the run cannot be stopped by id.

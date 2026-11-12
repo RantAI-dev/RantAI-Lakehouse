@@ -10,7 +10,7 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { DeprecationNotice } from "@/features/catalog/asset-certification"
 import type { ActionState } from "@/hooks/use-service"
 import { formatBytes, formatCost } from "@/lib/format"
-import { ENGINE_CATEGORY_LABEL, WORKLOAD_CLASS_LABEL } from "@/lib/status"
+import { queryEngineLabel, WORKLOAD_CLASS_LABEL } from "@/lib/status"
 import type { QueryEstimate, QueryPlanStage } from "@/services/contracts/queries"
 
 function Row({ label, children }: { label: string; children: ReactNode }) {
@@ -136,7 +136,7 @@ export function QueryTransparencyPanel({
   return (
     <SectionCard
       title="Execution transparency"
-      description="Pre-run estimate. Engine categories stay product-neutral."
+      description="Pre-run estimate."
     >
       {/* An empty editor gets no estimate and says so, rather than
           reporting a confident "0 B · 1.00 cu · Fresh · 0 s" about
@@ -165,10 +165,24 @@ export function QueryTransparencyPanel({
           <Skeleton className="h-4 w-5/6" />
         </div>
       ) : null}
+      {/* QA LH-QS-4-08 (QS-6), decision 7: a Trino statement has no pre-run
+          estimate. The server says so in a fixed sentence; the panel names
+          the engine and shows no source and no error, because nothing was
+          sent and nothing was read. */}
+      {state.data?.supported === false && estimatable !== false ? (
+        <div className="space-y-2 text-sm">
+          <p className="text-sm font-medium">No pre-run estimate</p>
+          <p className="text-muted-foreground">{state.data.reason}</p>
+          <dl className="space-y-2">
+            <Row label="Engine">{queryEngineLabel(state.data.queryEngine ?? "")}</Row>
+          </dl>
+        </div>
+      ) : null}
       {/* A query ClickHouse cannot even plan has no estimate — and its
-          reason (unknown column, missing table) is the most useful thing
-          on this panel, so it is shown instead of a row of zeros. */}
-      {state.data?.error && estimatable !== false ? (
+          reason (a fixed sentence by cause since `QS-6`, with a reference
+          id) is the most useful thing on this panel, so it is shown instead
+          of a row of zeros. */}
+      {state.data?.error && state.data.supported !== false && estimatable !== false ? (
         <div className="space-y-1">
           <p className="text-sm font-medium">This query cannot be planned</p>
           <p className="font-mono text-xs leading-relaxed text-muted-foreground">
@@ -176,7 +190,7 @@ export function QueryTransparencyPanel({
           </p>
         </div>
       ) : null}
-      {state.data && !state.data.error && estimatable !== false ? (
+      {state.data && !state.data.error && state.data.supported !== false && estimatable !== false ? (
         <dl
           className={
             state.status === "pending"
@@ -192,8 +206,12 @@ export function QueryTransparencyPanel({
               ? `${formatCost(state.data.estimatedCostMin)}–${formatCost(state.data.estimatedCostMax)}`
               : "—"}
           </Row>
-          <Row label="Workload">{WORKLOAD_CLASS_LABEL[state.data.workloadClass]}</Row>
-          <Row label="Engine">{ENGINE_CATEGORY_LABEL[state.data.engine]}</Row>
+          <Row label="Workload">
+            {state.data.workloadClass ? WORKLOAD_CLASS_LABEL[state.data.workloadClass] : "—"}
+          </Row>
+          <Row label="Engine">
+            {queryEngineLabel(state.data.queryEngine ?? "clickhouse")}
+          </Row>
           <Row label="Cache">
             {/* Null means nobody asked the cache, which is not the same as
                 "not eligible" — saying either would be a guess. */}

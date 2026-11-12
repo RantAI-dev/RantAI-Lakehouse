@@ -332,6 +332,11 @@ export const clickhouseQueryService: QueryService = {
         sql,
         ...(options?.parameters !== undefined && { parameters: options.parameters }),
         ...(options?.definitions !== undefined && { definitions: options.definitions }),
+        // `QS-6` (decision 7): the tab's engine rides along only when it is
+        // not ClickHouse, so a ClickHouse estimate posts exactly the body it
+        // posted before and an older server reads it as it always did.
+        ...(options?.engine !== undefined &&
+          options.engine !== "clickhouse" && { engine: options.engine }),
       },
       signal
     );

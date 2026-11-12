@@ -426,9 +426,21 @@ export function useQueryStudio(draftKey: string | null) {
   const generateAct = useServiceAction((signal, q: string) =>
     queryService.generateSql(q, signal)
   )
-  const estimateAct = useServiceAction((signal, s: string, inputs: QueryParamInputs) =>
-    // SQL with no placeholder asks as it did before `QS-5`: no options at all.
-    queryService.estimate(s, inputs.definitions ? inputs : undefined, signal)
+  const estimateAct = useServiceAction(
+    (signal, s: string, inputs: QueryParamInputs, engine: QueryEngine) =>
+      // `QS-6` (decision 7): a ClickHouse estimate asks what it asked before
+      // `QS-5` and `QS-6` — no options, or the inputs alone; any other engine
+      // is named so the server can answer "no pre-run estimate" instead of
+      // asking ClickHouse about Trino SQL.
+      queryService.estimate(
+        s,
+        engine === "clickhouse"
+          ? inputs.definitions
+            ? inputs
+            : undefined
+          : { engine, ...(inputs.definitions !== undefined ? inputs : {}) },
+        signal
+      )
   )
   // The fields to mark: the ones the last run's refusal named, and the ones
   // the estimate's refusal names. An estimate's mark goes with its error,
@@ -856,9 +868,9 @@ export function useQueryStudio(draftKey: string | null) {
   // `null` inputs mean "skip": the statement has a name with nothing to run
   // with, so no estimate is asked for and the one on screen goes.
   const estimateDebounced = useDebouncedCallback(
-    (next: string, inputs: QueryParamInputs | null) => {
+    (next: string, inputs: QueryParamInputs | null, engine: QueryEngine) => {
       if (inputs === null) resetEstimate()
-      else void runEstimate(next, inputs)
+      else void runEstimate(next, inputs, engine)
     },
     ESTIMATE_DEBOUNCE_MS
   )
@@ -885,8 +897,12 @@ export function useQueryStudio(draftKey: string | null) {
     // A buffer holding only the starter comment has nothing to estimate,
     // and asking anyway put an EXPLAIN ESTIMATE on ClickHouse for every
     // keystroke, including the ones that typed the comment.
-    if (targetText !== null) estimateDebounced(targetText, estimateWaits ? null : estimateInputs)
-  }, [targetText, estimateWaits, estimateInputs, estimateDebounced])
+    if (targetText !== null) {
+      estimateDebounced(targetText, estimateWaits ? null : estimateInputs, engine)
+    }
+    // `engine` is a dependency: the same statement on another engine has a
+    // different answer (`QS-6`, decision 7), so switching the tab asks again.
+  }, [targetText, estimateWaits, estimateInputs, engine, estimateDebounced])
 
   // ── Actions ──────────────────────────────────────────────────────────
   /**
@@ -1514,7 +1530,9 @@ export function useQueryStudio(draftKey: string | null) {
     runQuery,
     runSelectionOrAll,
     reEstimate: () => {
-      if (targetText !== null && !estimateWaits) void runEstimate(targetText, estimateInputs)
+      if (targetText !== null && !estimateWaits) {
+        void runEstimate(targetText, estimateInputs, engine)
+      }
     },
     /**
      * What the Save button on the open tab does: "Save" changes the saved

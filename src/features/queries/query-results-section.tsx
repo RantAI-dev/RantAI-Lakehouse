@@ -15,7 +15,7 @@ import { copyText } from "@/lib/copy-text"
 import { toTsv } from "@/lib/csv"
 import { formatBytes, formatCost, formatDuration, formatNumber } from "@/lib/format"
 import { notifyFailure, notifySuccess } from "@/lib/notify"
-import { ENGINE_CATEGORY_LABEL, WORKLOAD_CLASS_LABEL } from "@/lib/status"
+import { queryEngineLabel, WORKLOAD_CLASS_LABEL } from "@/lib/status"
 import type {
   QueryCell,
   QueryDownloadFormat,
@@ -277,8 +277,16 @@ export function QueryResultsSection(props: QueryResultsSectionProps) {
           { label: "Duration", value: formatDuration(result.metrics.durationMs) },
           { label: "Scanned", value: formatBytes(result.metrics.scannedBytes) },
           { label: "Cost", value: formatCost(result.metrics.costUnits) },
-          { label: "Engine", value: ENGINE_CATEGORY_LABEL[result.metrics.engine] },
-          { label: "Workload", value: WORKLOAD_CLASS_LABEL[result.metrics.workloadClass] },
+          // QA LH-QS-2-10 (QS-6), decision 8: the engine that really ran, as
+          // the tab's picker spells it; a Trino run has no ClickHouse workload
+          // class, so it says "—" rather than a tier it never touched.
+          { label: "Engine", value: queryEngineLabel(result.engine) },
+          {
+            label: "Workload",
+            value: result.metrics.workloadClass
+              ? WORKLOAD_CLASS_LABEL[result.metrics.workloadClass]
+              : "—",
+          },
           {
             label: "Cache",
             // ClickHouse's response carries no cache-hit flag — null

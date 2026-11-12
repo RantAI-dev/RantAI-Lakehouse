@@ -978,6 +978,36 @@ describe("query parameters on the wire (QS-5)", () => {
     })
   })
 
+  it("posts the engine to estimate for a Trino tab and leaves it out for ClickHouse", async () => {
+    const calls = stubFetch(() => json({ estimatedBytes: null }))
+    // QA LH-QS-4-08 (QS-6), decision 7: a ClickHouse estimate posts exactly
+    // what it posted before — the engine is not named for it.
+    await clickhouseQueryService.estimate("SELECT 1", { engine: "clickhouse" })
+    expect(calls[0]!.init.body).toBe('{"sql":"SELECT 1"}')
+
+    const trinoCalls = stubFetch(() => json({ estimatedBytes: null }))
+    await clickhouseQueryService.estimate("SELECT * FROM iceberg.bronze.t", { engine: "trino" })
+    expect(trinoCalls[0]!.url).toBe("/api/query/estimate")
+    expect(JSON.parse(String(trinoCalls[0]!.init.body))).toStrictEqual({
+      sql: "SELECT * FROM iceberg.bronze.t",
+      engine: "trino",
+    })
+
+    // A Trino estimate with parameters carries both.
+    const bothCalls = stubFetch(() => json({ estimatedBytes: null }))
+    await clickhouseQueryService.estimate(SQL, {
+      engine: "trino",
+      parameters: VALUES,
+      definitions: DEFINITIONS,
+    })
+    expect(JSON.parse(String(bothCalls[0]!.init.body))).toStrictEqual({
+      sql: SQL,
+      parameters: VALUES,
+      definitions: DEFINITIONS,
+      engine: "trino",
+    })
+  })
+
   it("stops an estimate through the signal that follows the parameters", async () => {
     const calls = stubFetch(() => json({ estimatedBytes: null }))
     const controller = new AbortController()
