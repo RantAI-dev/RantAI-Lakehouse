@@ -1110,3 +1110,92 @@ No existing assertion was removed.
 - Fix: refuse a present-but-empty fraction (`Some((_, ""))` → the "not a decimal number" error); add the shapes above to the two table tests.
 - Check: `decimal_text_that_is_not_an_exact_decimal_is_refused` gains `"12."`, `"-"`, `"."`, `".5"`, `"--1"`, `"1.2.3"`, `("12345678901.5", 12, 2)`; `decimal_text_becomes_the_exact_unscaled_integer` gains the 38-nines case equal to `10_i128.pow(38) - 1`.
 
+
+### Round 1 fixes (developer)
+
+Built on `e8580c46` (the review), one finding per commit except R2+R3, which the review
+names as one cause. Each push went to `fix/qa-round-data-p1`; no force-push, no PR edit.
+R4 and R7 touched nothing, as the rulings say.
+
+| Finding | Commit | Change |
+|---|---|---|
+| R1 (BLOCKER) | `61cfc641` | `fix(console): read the publication and the runs again after a failed publish` — the card reloads `pub` whatever the result and bumps a `runsKey` in `LastFiveRuns`'s deps; the page bumps a `publicationKey` in `MartPublication`'s deps and reloads `runs` whatever the result. `lastExport.reload()` still only on success. |
+| R2 (BLOCKER) + R3 | `d76fc21f` | `fix(console): an answer to the table check belongs to one ask` — `useTableUploads` stores `{ ask, table, uploads }` / `{ ask, table, error }`, bumps the ask for every request it schedules (the `table === null` gap included), and answers only from the ask of the moment; `retry` is one more ask. |
+| R5 | `c0f76feb` | `test(console): the "not published" tests reach the published check` — test only: the card's publication now has `lastExportedAt` and the read-back a stray snapshot, so only `published: false` closes the rows; the page's read-back carries a stray `snapshotId` and the snapshot cell is asserted "—". |
+| R6 | `e99fea65` | `test(console): wait for the new name's check before asserting no choice` — test only: `await waitFor(() => expect(next().disabled).toBe(false))` after the name change, before the two radio assertions. |
+| R8 | `0861e237` | `fix(api): a decimal text that ends in a point is refused` — `Some((_, ""))` from `split_once('.')` returns the "not a decimal number" error; the two table tests gain the shapes the review listed. |
+
+**Proof: each test failed before its fix** (run against the branch's code, then restored).
+
+- R1, card: `reads the publication again after a failed Publish now and says Last publish
+  failed` — `Expected: "Last publish failed"` / `Received: "Up to date"` (the alert under
+  the button held the reason; the status line did not).
+- R1, page: `reads the publication and the run count again after a failed Export now` —
+  `Expected: "On · Last publish failed"` / `Received: "On · Up to date"`.
+- R2, after a load: `asks again about a name it answered before the load, and says it is
+  checking until the new answer` — `Unable to find an element with the text: /Checking
+  whether an earlier upload created stock/` (the Table step was `known`: no notice, no
+  radios, Next on).
+- R2, retry: `keeps Next off after Check again until the retry answers, even with an
+  earlier answer for the name` — `expect(received).toBe(expected)` / `Expected: true` /
+  `Received: false` on `next().disabled` after "Check again".
+- R3: `uses a successful check of a name it failed on before, without Check again` —
+  `Unable to find role="radio" and name "Replace its rows"` after the API answered 200 for
+  `stock` (the older failure still won).
+- R5, card: with `?.published === true` replaced by `&& lastExport.data`, `shows no
+  last-published rows when the read-back says the table is not there` fails at
+  `expect(screen.queryByText("Last published")).toBeNull()` (`Received: HTMLElement`).
+- R5, page: with `&& lastExport.data.published` dropped from the snapshot cell, `says Never
+  exported, and no snapshot, for a mart the API reports as not published` fails at
+  `expect(cells[4]?.textContent).toBe("—")` (`Expected: "—"` / `Received: "[object
+  Object]"`).
+- R6: with `stock_b` given an ingested upload in the stub, the fixed test fails at
+  `expect(screen.queryByRole("radio", { name: "Replace its rows" })).toBeNull()`
+  (`Received: HTMLInputElement`); the same stub passes with the `waitFor` removed, which is
+  what the test did before.
+- R8: `decimal_text_that_is_not_an_exact_decimal_is_refused` — `"12." at decimal(12, 2)
+  must be refused` (at `gold_export.rs:1354`). The 38-nines case is a pin, not a red test:
+  the reviewer found that shape already correct, and it passed before the change.
+
+**Scoped checks per commit** (all in the foreground, on that commit):
+
+- `61cfc641`: `bun test src/features/catalog/open-format-card.test.tsx
+  src/features/gold/gold-exports-page.test.tsx` → 29 pass; `bun run typecheck` clean;
+  `bun run lint` → 11 problems (0 errors, 11 warnings).
+- `d76fc21f`: `bun test src/features/connectors/upload-file-page.test.tsx` → 96 pass;
+  `bun run typecheck` clean; `bun run lint` → 11 problems (0 errors, 11 warnings).
+- `c0f76feb`: the same two console test files → 29 pass; typecheck clean; lint → 11
+  problems (0 errors, 11 warnings).
+- `e99fea65`: `upload-file-page.test.tsx` → 96 pass; typecheck clean; lint → 11 problems
+  (0 errors, 11 warnings).
+- `0861e237`: `cargo test -p lakehouse-api --lib decimal` → 14 passed; `cargo fmt --check`
+  clean; `cargo clippy -p lakehouse-api --all-targets -- -D warnings` clean.
+
+The 11 lint warnings are the same 11 the branch had before R1 (files this round did not
+touch); no warning was added and none was suppressed.
+
+**Full block, on `0861e237`:**
+
+- `cd rust && cargo fmt --check` → clean; `cargo clippy -p lakehouse-api --all-targets --
+  -D warnings` → `Finished dev profile`, no warning; `cargo test -p lakehouse-api --lib
+  decimal` → `test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 3495 filtered
+  out`.
+- `bun run typecheck` → clean (no diagnostics).
+- `bun run lint` → `✖ 11 problems (0 errors, 11 warnings)`.
+- `bun run test` → `4014 pass`, `1 skip`, `0 fail`, `12101 expect() calls`, `Ran 4015 tests
+  across 380 files. [90.13s]`.
+- `python3 ops/lint/check_bare_iceberg_count.py` → `R11 guard: no bare count() against a
+  Bronze Iceberg table found.` (exit 0); `python3 ops/lint/check_intra_package_imports.py`
+  → `OK: all intra-package dispar_orchestrate imports resolve` (exit 0).
+
+**Not verified, with the reason:**
+
+- The full Rust workspace block (`cargo test --workspace`) was not run: this round's only
+  Rust change is a `lakehouse-api` unit test and one function in it, and the handoff
+  scoped the Rust checks to that crate. CI's `cargo nextest run --workspace` is the first
+  full run.
+- `docker compose --profile '*' config` and a real `up`: no compose file changed.
+- The browser QA cases themselves (`LH-DATA-1-01` row 10, `LH-DATA-35-03`): not replayed
+  against a deployment; the tests above are the evidence on this branch.
+
+No MISMATCH: every finding's fix was possible as written.
