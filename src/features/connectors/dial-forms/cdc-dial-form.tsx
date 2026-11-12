@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import { SelectField } from "@/components/patterns/select-field"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import type { CdcDial, SqlDriver } from "@/services/contracts/connectors"
@@ -70,17 +71,19 @@ export function CdcDialForm({
       {askDriver ? (
         <div className="space-y-1.5 sm:col-span-2">
           <Label htmlFor="cdc-dial-driver">Driver</Label>
-          <select
+          {/* WEB-9 D3: the four drivers this form serves, in the same order. */}
+          <SelectField
             id="cdc-dial-driver"
-            className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+            className="w-full"
             value={dial.driver}
-            onChange={(e) => set("driver", e.target.value as CdcDial["driver"])}
-          >
-            <option value="postgres">PostgreSQL</option>
-            <option value="mysql">MySQL</option>
-            <option value="mssql">SQL Server</option>
-            <option value="oracle">Oracle</option>
-          </select>
+            options={[
+              { value: "postgres", label: "PostgreSQL" },
+              { value: "mysql", label: "MySQL" },
+              { value: "mssql", label: "SQL Server" },
+              { value: "oracle", label: "Oracle" },
+            ]}
+            onValueChange={(next) => set("driver", next as CdcDial["driver"])}
+          />
         </div>
       ) : null}
       <div className="grid gap-3 sm:col-span-2 sm:grid-cols-[minmax(0,1fr)_7rem]">
@@ -127,21 +130,20 @@ export function CdcDialForm({
       </div>
       <div className="space-y-1.5 sm:col-span-2">
         <Label htmlFor="cdc-dial-ssl-mode">TLS mode</Label>
-        <select
+        {/* WEB-9 D3: the adapter's modes, plus a stored mode it no longer
+            lists, kept last and shown as it is. */}
+        <SelectField
           id="cdc-dial-ssl-mode"
-          className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+          className="w-full"
           value={dial.sslMode || DEFAULT_CDC_SSL_MODE}
-          onChange={(e) => set("sslMode", e.target.value)}
-        >
-          {sslModes.map((m) => (
-            <option key={m.value} value={m.value}>
-              {m.label}
-            </option>
-          ))}
-          {dial.sslMode && !sslModes.some((m) => m.value === dial.sslMode) ? (
-            <option value={dial.sslMode}>{dial.sslMode}</option>
-          ) : null}
-        </select>
+          options={[
+            ...sslModes,
+            ...(dial.sslMode && !sslModes.some((m) => m.value === dial.sslMode)
+              ? [{ value: dial.sslMode, label: dial.sslMode }]
+              : []),
+          ]}
+          onValueChange={(next) => set("sslMode", next)}
+        />
         <p className="text-xs text-muted-foreground">
           {isOracle
             ? "Oracle's driver cannot check the server's certificate, so there are only two modes: the connection is encrypted with Oracle's own network encryption, or it is not."

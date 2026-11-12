@@ -16,6 +16,7 @@ mock.module("next/navigation", () => ({
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import { ConnectorCreatePage } from "./connector-create-page"
 
@@ -399,7 +400,8 @@ describe("ConnectorCreatePage", () => {
     fireEvent.click(page.getByRole("button", { name: "Next" }))
     await waitFor(() => page.getByLabelText("Base URL"))
     fireEvent.change(page.getByLabelText("Base URL"), { target: { value: "https://api.example.com" } })
-    fireEvent.change(page.getByLabelText("Auth type"), { target: { value: "oauth2_authorization_code" } })
+    // WEB-9 D5: the auth type is chosen from the combobox by its label.
+    chooseOption(page.getByLabelText("Auth type"), "oauth2_authorization_code")
     fireEvent.change(page.getByLabelText("Client ID"), { target: { value: "app-1" } })
     fireEvent.change(page.getByLabelText("Sign-in URL"), { target: { value: "https://login.example.com/authorize" } })
     fireEvent.change(page.getByLabelText("Token URL"), { target: { value: "https://login.example.com/token" } })

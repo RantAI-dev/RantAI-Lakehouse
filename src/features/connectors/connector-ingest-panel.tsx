@@ -13,6 +13,7 @@ import {
   XIcon,
 } from "lucide-react"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
+import { SelectField } from "@/components/patterns/select-field"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
@@ -853,19 +854,18 @@ function IngestEditor({
       <Label htmlFor="ingest-schedule" className={page ? "sr-only" : "text-xs"}>
         Schedule
       </Label>
-      <select
+      {/* WEB-9 D3: the presets and the custom entry, as before; "Manual only"
+          is a real choice with value "", held by `SelectField`. */}
+      <SelectField
         id="ingest-schedule"
-        className={cn("h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm", page && "max-w-xs")}
+        className={cn("w-full", page && "max-w-xs")}
         value={cronChoice}
-        onChange={(e) => setCronChoice(e.target.value)}
-      >
-        {SCHEDULE_PRESETS.map((p) => (
-          <option key={p.label} value={p.value}>
-            {p.label}
-          </option>
-        ))}
-        <option value="custom">Custom cron…</option>
-      </select>
+        options={[
+          ...SCHEDULE_PRESETS.map((p) => ({ value: p.value, label: p.label })),
+          { value: "custom", label: "Custom cron…" },
+        ]}
+        onValueChange={(next) => setCronChoice(next)}
+      />
       {cronChoice === "custom" ? (
         <Input
           aria-label="Cron expression"
@@ -1023,42 +1023,38 @@ function LoadModeFields({
   // A saved mode this adapter no longer offers still shows, rather than
   // silently reading as another one.
   const offered = modes.includes(selected.loadMode) ? modes : [...modes, selected.loadMode]
-  const fieldClass = "h-7 rounded-lg border border-input bg-transparent px-2 text-xs"
   const note = missingModesNote(modes, changeCapture)
   return (
     <div className="space-y-1">
       <div className="flex flex-wrap items-center gap-1.5">
         <span className="shrink-0 text-xs text-muted-foreground">{changeCapture ? "Keep" : "Each run"}</span>
-        <select
+        {/* WEB-9 D3: the compact trigger keeps the row's h-7, px-2 and text-xs. */}
+        <SelectField
           aria-label={`Load mode for ${selected.name}`}
-          className={fieldClass}
+          size="sm"
+          className="px-2 text-xs"
           value={selected.loadMode}
-          onChange={(e) => onChange({ loadMode: e.target.value as LoadMode })}
-        >
-          {offered.map((mode) => (
-            <option key={mode} value={mode}>
-              {modeLabel(mode, changeCapture)}
-            </option>
-          ))}
-        </select>
+          options={offered.map((mode) => ({ value: mode, label: modeLabel(mode, changeCapture) }))}
+          onValueChange={(next) => onChange({ loadMode: next as LoadMode })}
+        />
         {!changeCapture && (selected.loadMode === "incremental" || selected.loadMode === "incremental_dedup") ? (
           <>
             <span className="shrink-0 text-xs text-muted-foreground">by</span>
             {columns && columns.length > 0 ? (
-              <select
+              <SelectField
                 aria-label={`New-row column for ${selected.name}`}
-                className={`${fieldClass} min-w-0 flex-1 font-mono`}
+                size="sm"
+                className="min-w-0 flex-1 px-2 font-mono text-xs"
                 value={cursor}
+                /* WEB-9 D2: "Pick a column…" was only a prompt, so it is the
+                   placeholder; a saved column the list lacks stays an option. */
+                placeholder="Pick a column…"
                 aria-invalid={problem !== null}
-                onChange={(e) => onChange({ incrementalKey: e.target.value })}
-              >
-                <option value="">Pick a column…</option>
-                {(columns.includes(cursor) || cursor === "" ? columns : [cursor, ...columns]).map((column) => (
-                  <option key={column} value={column}>
-                    {column}
-                  </option>
-                ))}
-              </select>
+                options={(columns.includes(cursor) || cursor === "" ? columns : [cursor, ...columns]).map(
+                  (column) => ({ value: column, label: column })
+                )}
+                onValueChange={(next) => onChange({ incrementalKey: next })}
+              />
             ) : (
               <Input
                 aria-label={`New-row column for ${selected.name}`}

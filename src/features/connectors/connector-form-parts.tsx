@@ -8,6 +8,7 @@
 
 import * as React from "react"
 import { PencilIcon } from "lucide-react"
+import { SelectField } from "@/components/patterns/select-field"
 import { Button } from "@/components/ui/button"
 import { Label } from "@/components/ui/label"
 import { CdcDialForm } from "@/features/connectors/dial-forms/cdc-dial-form"
@@ -569,26 +570,27 @@ export function TenantField({
   const tenants = user?.tenants ?? []
   return (
     <Field label="Tenant" htmlFor="connector-tenant">
+      {/* WEB-9 D2/D2a: "Unassigned" is a real choice, so it stays an option
+          with value ""; a stored tenant the person's own list lacks shows the
+          placeholder instead of the first tenant as if it were chosen. */}
       {tenants.length === 0 ? (
         <p className="text-xs text-destructive">
           Your account belongs to no tenant, so a connector you create would not appear in any connector
           list. Ask an administrator to add you to a tenant.
         </p>
       ) : (
-        <select
+        <SelectField
           id="connector-tenant"
-          className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+          className="w-full"
           value={value}
+          placeholder="Pick a tenant"
           disabled={disabled}
-          onChange={(e) => onChange(e.target.value)}
-        >
-          {value === "" ? <option value="">Unassigned</option> : null}
-          {tenants.map((t) => (
-            <option key={t.id} value={t.id}>
-              {t.name}
-            </option>
-          ))}
-        </select>
+          options={[
+            ...(value === "" ? [{ value: "", label: "Unassigned" }] : []),
+            ...tenants.map((t) => ({ value: t.id, label: t.name })),
+          ]}
+          onValueChange={(next) => onChange(next)}
+        />
       )}
       {hint ? <p className="text-xs text-muted-foreground">{hint}</p> : null}
     </Field>
