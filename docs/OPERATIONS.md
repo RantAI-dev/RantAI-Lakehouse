@@ -2469,16 +2469,25 @@ filters every other surface gets. The answer is
 when an input is Bronze, and the orchestrator attaches
 `allow_database_iceberg = 1` to every statement that reads it.
 
-A 409 means no retry can help (no author, an author who is no longer
-active, or a pipeline with no tenant); a 422 means the stored definition no
-longer compiles or the rewrite refused it, and the message names the input
-or step at fault (`steps[1]: ...`). The same checks run when the pipeline is
-**saved** and when it is **restored**, so a definition that could never run
-is refused where a person can fix it.
+The answer says which of these it is, and the orchestrator treats all three
+as final (no retry):
 
-`ICEBERG_QUERY_DB` must be set on `lakehouse-api` as well as on the
-orchestrator: compiling a Bronze input names the catalog database through
-it, and a deployment without it refuses a Bronze pipeline when it is saved.
+| Status | Meaning | Message |
+| --- | --- | --- |
+| 409 | no author, an author who is no longer active, or a pipeline with no tenant | a fixed sentence saying which |
+| 404 | a table whose roles do not include it (`GOV-7`) — the same answer Query Studio gives | the SEC-20 sentence |
+| 422 | the stored definition no longer compiles, or the rewrite refused it | starts with `inputs[i]: ` or `steps[i]: ` — the item at fault — then fixed text |
+
+A 422 is also what a **save** or a **restore** answers for the same reasons,
+with the same `inputs[i]`/`steps[i]` prefix, so a definition that could never
+run is refused where a person can fix it. An outage at save keeps its own
+status (a 503 or 500), never a 422.
+
+`ICEBERG_QUERY_DB` must be set on `lakehouse-api`: compiling a Bronze input
+names the catalog database through it, and a deployment without it refuses a
+Bronze pipeline when it is saved. The orchestrator (`dagster-code-location`)
+no longer needs the variable — it runs the statement the API returns and
+attaches `allow_database_iceberg` from the answer's `readsIceberg`.
 
 ### Authored pipelines with no tenant (`SEC-50`)
 

@@ -6,8 +6,8 @@ row. At code-load time this module reads `GET /api/pipelines/runnable`
 (every `ready` or `paused` authored pipeline, with its definition, across
 all tenants) and builds, per pipeline:
 
-* an `authored__<id>` job that reads its source, applies its `transforms`,
-  and writes its target (item E3, below);
+* an `authored__<id>` job that asks the API for the statement its stored
+  definition compiles to, runs it, and writes its target (item E3, below);
 * an `authored__<id>_schedule` when the pipeline's schedule is a five-field
   cron. `default_status` is RUNNING for a `ready` pipeline and STOPPED for a
   `paused` one: the schedule the author set is meant to fire, and one that
@@ -131,22 +131,15 @@ def _env(name: str, default: str) -> str:
 class AuthoredPipelineConfig:
     api_url: str
     run_token: str
-    # BLD-1 / D5: the API's own `DataLakeCatalog` database. A Bronze
-    # source is read through THIS one, not through a database private to
-    # this module, because the API's policy rewriter only recognises a
-    # governed table under the database it reads it from -- named any
-    # other way, `SELECT * FROM <other-db>.`bronze.t`` reaches ClickHouse
-    # unmasked. Defaults to the compose default; `lakehouse-api` and
-    # `clickhouse-iceberg-init` read the same variable, so one `.env`
-    # value moves all three together.
-    iceberg_query_db: str = "icecat_api"
+    # BLD-1 part 1 / D14: there is no catalog-database setting here any more.
+    # The API owns `ICEBERG_QUERY_DB` — it compiles a Bronze input through it
+    # and answers `readsIceberg`, which is all this module needs.
 
     @classmethod
     def from_env(cls) -> "AuthoredPipelineConfig":
         return cls(
             api_url=_env("LAKEHOUSE_API_URL", "http://lakehouse-api:8080"),
             run_token=_env("PIPELINE_RUN_TOKEN", ""),
-            iceberg_query_db=_env("ICEBERG_QUERY_DB", "icecat_api"),
         )
 
 
@@ -290,15 +283,14 @@ def _dagster_safe_name(raw: str) -> str:
 
 
 def _is_safe_ch_identifier(name: str) -> bool:
-    """Defense in depth for a zone/table name pulled out of a stored
+    """Defense in depth for a name pulled out of a stored
     `pipeline_definition` row before it is interpolated into a ClickHouse
-    statement -- the same non-trust-by-default posture
-    `authored_transforms.py` takes for a transform string, applied here to
-    the four identifier fields this module itself builds SQL from
-    (`source_zone`/`source_table`/`target_zone`/`target_table` are
-    validated server-side at `POST /api/pipelines` time, but this op
-    re-checks rather than assuming that validation can never be bypassed by
-    a future/older API version)."""
+    statement — the three fields this module still formats itself (`the
+    source zone`, which the connector rule reads, and `target_zone`/
+    `target_table`). They are validated server-side at `POST /api/pipelines`
+    time, but this op re-checks rather than assuming that validation can
+    never be bypassed by a future/older API version. The source table is not
+    here: it is a `SELECT` the API compiled (BLD-1 part 1 / D14)."""
     return bool(name) and not name[0].isdigit() and all(c.isascii() and (c.isalnum() or c == "_") for c in name)
 
 
@@ -334,30 +326,34 @@ def _reading(reads_iceberg: bool, statement: str) -> str:
     return f"{statement} SETTINGS {ICEBERG_READ_SETTINGS}"
 
 
-# The API's answer to "I will not run this SELECT for you, and running it
-# again will not change my mind": 409 when the pipeline has no author to
-# read as (BLD-1 / D2) or that author is gone, 422 when the SQL touches a
-# governed table through a construct the policy engine will not rewrite.
-# Both carry a FIXED message (`policy_engine::enforcement_error_message` /
-# D2's own string), which is why `_compiled_sql` can put it in an op
-# failure without leaking anything: there is no upstream text in it to
-# leak.
-_ENFORCE_REFUSAL_STATUSES = (409, 422)
+# The API's answer to "I will not compile or run this for you, and asking
+# again will not change my mind":
+#   409 the pipeline has no author to read as (BLD-1 / D2), that author is
+#       gone, or it belongs to no tenant;
+#   404 a table the author's roles do not include (`GOV-7`; the run route
+#       answers the same 404 Query Studio does, and review R1-S2 made it a
+#       refusal here — it used to be retried);
+#   422 the stored definition does not compile, or the rewrite refused it.
+# Each carries a FIXED message written in this repository
+# (`policy_engine::enforcement_error_message`, D2's own string, the
+# definition's `steps[i]: ...`), which is why `_compiled_sql` can put it in
+# an op failure without leaking anything: there is no upstream text in it.
+_ENFORCE_REFUSAL_STATUSES = (404, 409, 422)
 
 # Fallback when the API refuses but its body carries no `error` string. A
 # fixed message of our own, never the raw body: an unexpected body is
 # exactly the case where its text is least trustworthy.
 _ENFORCE_REFUSAL_FALLBACK = (
-    "the lakehouse API refused to enforce this pipeline's query; "
+    "the lakehouse API refused to compile this pipeline's query; "
     "see the API logs for the reason"
 )
 
-# Fixed text for a 2xx whose body is not the `{ "sql": "..." }` shape the
-# route documents. Retrying the identical request cannot repair a response
+# Fixed text for a 2xx whose body is not the `{ "sql": ..., "readsIceberg":
+# ... }` shape the route documents. Retrying the identical request cannot repair a response
 # shape, so this is a refusal rather than a transient failure -- but it is
 # OURS, not the API's, and it says nothing about what came back.
 _ENFORCE_BAD_BODY = (
-    "the lakehouse API returned an unreadable enforcement response for "
+    "the lakehouse API returned an unreadable compile response for "
     "this pipeline's query"
 )
 
@@ -581,13 +577,12 @@ def _op_for_pipeline(pipeline: dict[str, Any]) -> Any:
         ),
     )
     def _run(context) -> dict[str, Any]:
-        # PART D boundary: config-shaped failures raised by the
-        # transform-grammar port (`TransformError`, a `ValueError`
-        # subclass) and by this module's own authored-pipeline guard
-        # (`AuthoredJobError`, a `RuntimeError` subclass) are wrapped in
-        # `Failure(allow_retries=False)` here so `DEFAULT_RETRY_POLICY`
-        # does not burn 60s on a config that will not change between
-        # attempts. `SchemaDriftError` from `bronze_catalog.py` does
+        # PART D boundary: config-shaped failures raised by this module's
+        # own authored-pipeline guard (`AuthoredJobError`, a `RuntimeError`
+        # subclass) are wrapped in `Failure(allow_retries=False)` here so
+        # `DEFAULT_RETRY_POLICY` does not burn 60s on a config that will not
+        # change between attempts. The transform grammar is the API's now
+        # (BLD-1 part 1 / D14), so there is no `TransformError` to catch. `SchemaDriftError` from `bronze_catalog.py` does
         # NOT reach this body (the `_ensure_target_table` path uses
         # `_ch_exec` directly, not `_assert_or_create_all`), so it is
         # not in the wrap tuple -- a SchemaDriftError raised elsewhere

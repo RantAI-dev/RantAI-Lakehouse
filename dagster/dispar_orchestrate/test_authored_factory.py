@@ -193,24 +193,17 @@ class BuildAuthoredJobsTest(unittest.TestCase):
 
 
 class BronzeSourceTest(unittest.TestCase):
-    """BLD-1 / D5 (was BLD-3 / D1 + D2): a `bronze` source is Iceberg in
-    Lakekeeper, not a ClickHouse database, so it is read through a
-    `DataLakeCatalog` database as ``<db>.`bronze.<table>` ``, and every
-    statement that reads that database carries
-    `SETTINGS allow_database_iceberg = 1`.
-
-    WHICH database changed in D5, and these tests pin the new answer: it is
-    the API's own `ICEBERG_QUERY_DB`, because the API's policy rewriter
-    only recognises a governed table under that name, and a pipeline that
-    read Bronze through a private database was therefore never rewritten
-    at all. This module no longer creates a catalog database either — the
-    `clickhouse-iceberg-init` compose service owns that one — so the
-    "ensured before the first read" assertion BLD-3 made is replaced by
-    "this module creates none".
+    """BLD-1 part 1 / D14 (was BLD-1 / D5): a `bronze` source is Iceberg in
+    Lakekeeper, not a ClickHouse database, and the API compiles the read
+    through its own catalog database, answering `readsIceberg`. This module
+    only turns that flag into `SETTINGS allow_database_iceberg = 1` on every
+    statement that reads the source — it no longer names a database, creates
+    one, or reads `ICEBERG_QUERY_DB` (which is why the tests below set it
+    nowhere).
 
     No network and no ClickHouse: `_ch_exec`/`_ch_query_json` are
-    monkeypatched exactly as `OpForPipelineTest` does, and the enforcement
-    call is stubbed by `_enforce_passthrough`. Calls are recorded in order.
+    monkeypatched exactly as `OpForPipelineTest` does, and the compile call
+    is stubbed by `_compile_passthrough`. Calls are recorded in order.
     """
 
     def _run_op(self, **definition_overrides: object) -> tuple[dict[str, Any], list[tuple[str, str]]]:
@@ -230,8 +223,6 @@ class BronzeSourceTest(unittest.TestCase):
             authored_factory.ClickHouseTarget,
             "from_env",
             return_value=ClickHouseTarget("http://ch", "default", ""),
-        ), mock.patch.dict(
-            os.environ, {"ICEBERG_QUERY_DB": "icecat_api"}, clear=False,
         ), _compile_passthrough():
             result = run_fn(build_op_context())
         return result, calls
@@ -289,6 +280,21 @@ class BronzeSourceTest(unittest.TestCase):
             self.assertTrue(
                 statement.endswith("SETTINGS allow_database_iceberg = 1"),
                 f"statement does not carry the Iceberg read setting: {statement}",
+            )
+
+    def test_no_statement_carries_the_read_setting_when_the_api_says_silver(
+        self,
+    ) -> None:
+        """R1-S3 (and D14): with `readsIceberg` false, not one statement the
+        op sends carries `allow_database_iceberg` — the setting is for a
+        catalog-database read only, and a stray one would be a silent
+        assumption about where the query reads from."""
+        _, calls = self._run_op(sourceZone="silver", sourceTable="orders")
+        for statement in self._statements(calls):
+            self.assertNotIn(
+                "allow_database_iceberg",
+                statement,
+                f"a non-Iceberg run carries the read setting: {statement}",
             )
 
     def test_a_bronze_source_with_a_silver_target_is_still_executed(self) -> None:
@@ -357,7 +363,15 @@ class CompileSqlTest(unittest.TestCase):
         self.assertEqual(len(reads), 3, f"expected CREATE, staging CREATE and INSERT: {reads}")
         for statement in reads:
             self.assertIn(self.ENFORCED, statement, f"op ran its own SQL: {statement}")
-            self.assertNotIn("SELECT id, name FROM", statement, f"unmasked SQL reached ClickHouse: {statement}")
+            # R1-S3: "the unmasked original appears nowhere" could not fail any
+            # more — nothing in this module builds SQL. What can fail, and is
+            # what matters, is that the API's text is the ONLY projection that
+            # reaches the engine: each statement reads the source once.
+            self.assertEqual(
+                statement.count("FROM silver.`orders`"),
+                1,
+                f"one read of the source per statement: {statement}",
+            )
 
     def test_the_enforcement_call_is_authenticated_and_addressed_to_the_pipeline(self) -> None:
         """The route is the orchestrator-only one, so the run token goes
