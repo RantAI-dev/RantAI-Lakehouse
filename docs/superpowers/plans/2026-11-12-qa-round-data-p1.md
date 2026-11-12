@@ -1034,3 +1034,79 @@ integration test does fail at the catalog (500, `The catalog request failed.`)
 rather than earlier.
 
 ## 6. Review
+
+### Round 1 (planner, 2026-11-12), at `9e349555d`
+
+Read against the plan and `AGENTS.md`; nothing was run for this review, CI on the draft pull
+request (#484) runs the suites. 2 BLOCKERs (R1, R2) and 4 SHOULD-FIX to do (R3, R5, R6, R8).
+No existing assertion was removed.
+
+**Planner's rulings.**
+- **R4: not in this branch.** The plan defined "Last publish failed" from stored runs (D9), and
+  the QA case's failures happened inside the export, which are stored. A failure before the
+  export starts (an unreadable catalog token, the fingerprint read) writes no run; recording
+  those is a new backlog item, filed by the planner. The developer changes nothing for R4.
+- **R7: withdrawn.** Each integration test binary also runs the one test in
+  `tests/common/tls_proxy.rs`, so 8 and 18 are the real counts (7 + 1 and 17 + 1). The
+  developer changes nothing for R7.
+
+### R1. BLOCKER: After a failed "Publish now" the card keeps the status it had before, so it still says "Up to date" (acceptance row 10 is not met without a page reload).
+
+- Where: `src/features/catalog/open-format-card.tsx:323-330`; same shape in `src/features/gold/gold-exports-page.tsx:149-156` (and `MartPublication`, `:29-42`, is never re-read).
+- What happens: the handler is `exportNow.run().then((result) => { if (result) { lastExport.reload(); pub.reload() } })`. `useServiceAction.run` returns `null` on failure (`src/hooks/use-service.ts:119-124`), so after a failed publish neither `pub` nor the run list is read again. State: a mart that reads "Up to date"; the operator lowers the row limit and presses "Publish now" (row 10 of `docs/core/features/gold-publish-per-mart.md:112`). Result: the alert under the button shows the reason, but `Status:` still reads "Up to date" and no "Failed … / Last successful publish …" lines appear, although the API now answers `lastFailure`. "Last publish failed" appears only after the page is loaded again. The plan (T13) names row 10 as the row T5 and T10 make true. On the Gold exports page the "On · Up to date" label and the run count are likewise stale after a failed "Export now".
+- Fix: in both handlers re-read after the action settles, whatever the result: `pub.reload()` (card) and the publication label and `runs` (page) on failure as well as success; keep `lastExport.reload()` for success. The card's `LastFiveRuns` holds its own `useService` keyed on `mart` only, so it also needs a reload trigger (a counter in its deps, bumped by the same handler). Cite `QA LH-DATA-1-01 (DATA-49)` at the site.
+- Check: in `open-format-card.test.tsx`: the publication mock answers `lastFailure: null` on the first read and a failure on the second; `POST /api/gold/export/mart_a` answers 422 `{ error: "mart … exceeding GOLD_EXPORT_MAX_ROWS …" }`; click "Publish now"; `waitFor` `publication-status` to be "Last publish failed" and `publication-failure` to hold the reason. Fails on this branch (status stays "Up to date").
+
+### R2. BLOCKER: `useTableUploads` keeps an old answer for the same name, so after "Upload another file" (or "Check again") the lookup reads `known` while a new request is still running, and Next/Load are on with Replace and no choice shown.
+
+- Where: `src/features/connectors/use-table-uploads.ts:37-38`, `:42`, `:59-66`, `:71-74`; reached through `reset` in `src/features/connectors/upload-file-page.tsx:149-164` and `changeStep` `:166-178`.
+- What happens: `answer` is only ever overwritten by the next successful answer; nothing clears it when a new request starts or when `table` becomes `null`. The state is derived as `answer.table === table → known`.
+  1. `stock.csv` → suggested table `stock`, a new table: the lookup answers `[]` (`known`, no choice, Replace). Load; "Load finished".
+  2. "Upload another file" (`reset`, same `UploadWizard` instance) and pick next week's `stock.csv`: `tableName` is `stock` again. The hook starts a new request, but the state is `known` at once from the kept `[]`, which predates the load. Until the new answer arrives there is no "Checking…" line, Next (Table step) and Load (Review step) are enabled, `offersMode` is false and `effectiveMode` is `replace`. A slow or hanging lookup therefore loads with Replace without asking — the QA case `LH-DATA-35-03` itself.
+  3. Fail-open on retry: if that second request fails, the page shows the error (failure wins). Press "Check again": `setFailure(null)` makes the state `known` from the kept `[]` immediately, so Load is enabled for as long as the retry is in flight (and stays enabled if the retry never returns). D4 says a failed lookup never falls back to Replace.
+  The same kept answer is used when a typed name is changed and changed back before the other name was answered; that case is only seconds stale.
+- Fix: an answer and a failure must belong to one ask, not to a name. Key them by a request counter (increment in the effect each time a request is scheduled; store `{ ask, table, uploads }` / `{ ask, table, error }`; the state is `known`/`error` only when `ask` is the current one), or clear both at the start of the effect and when `table` is `null`. Either way a newly scheduled request means `checking` until it answers.
+- Check: `upload-file-page.test.tsx`, Table step block: `tableUploads` answers `[]` on the first call and a promise the test resolves on the second; load `stock.csv` to "Load finished", click "Upload another file", pick `stock.csv` again, go to the Table step: expect "Checking whether an earlier upload created stock…" and `next().disabled === true`; resolve with an ingested upload and expect the two radios. A second test: second call answers 503, third is held; after "Check again" Next stays disabled until the third answers. Both fail on this branch.
+
+### R3. SHOULD-FIX: A failed lookup for a name outlives a later successful lookup of the same name; the page stays on "Could not check…" until "Check again" is pressed.
+
+- Where: `src/features/connectors/use-table-uploads.ts:47` (`.then` sets only `answer`), `:62-63` (failure is tested first), `:71-74` (the only place `failure` is cleared).
+- What happens: lookup for `stock` answers 503 (`failure = { table: "stock" }`). The person edits the name to `stockx` and back to `stock`; the effect asks again and the API answers 200. `setAnswer` runs, but `failure.table === table` still holds, so the state is `error`: the old sentence and the old API message stay on screen and Next/Load stay off although the check succeeded. (Fail closed, so no data risk; it is a wrong message and a dead end until the button is found.)
+- Fix: same change as R2 (one ask owns the result). At minimum `setFailure(null)` in the `.then`.
+- Check: Table step test: `tableUploads("stock")` answers 503 once and then an ingested upload; after the alert, change the field to `stockx` and back to `stock`; `waitFor` the radios and no `role="alert"` without clicking "Check again".
+
+### R4. NO CHANGE IN THIS BRANCH (plan gap, planner's ruling below): a publish that fails before `export_mart` writes no history row, so the card never says "Last publish failed" for it.
+
+- Where: `rust/crates/lakehouse-api/src/routes/gold.rs:455-498` (every `?` before `:531`), `:558-567` (the only `record_export_history` call). The branch's own test states it: `tests/gold_publication.rs` `if_changed_does_not_skip_after_a_failed_run`, "the 503 happens before export_mart, so nothing new was recorded".
+- What happens: an unreadable `LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE` (503), a ClickHouse failure on the fingerprint or the history read (422/503), or the route-level tenant gate refusal returns before a row is written. A scheduler whose every run fails that way leaves `lastFailure: null`; the card reads "Up to date" or "Out of date" through any number of failed runs, which is the symptom `LH-DATA-1-01` reported, for this class of failure. D9 defines the state from stored rows only, so the developer built what the plan says.
+- Fix: planner to decide: either record a failed row for failures after authentication and mart validation (classified sentence, as T3), or list this under "Out of scope" with a backlog item. Not for the developer to improvise.
+- Check: `gold_publication.rs`: `POST /api/gold/export/<mart>` with no token file answers 503; then `GET …/publication` has `lastFailure.reason` starting with the 503's sentence.
+
+### R5. SHOULD-FIX: The card test for `published: false` never reaches the new condition; it passes with the `published` check removed, and passed before the change.
+
+- Where: `src/features/catalog/open-format-card.test.tsx:239-268`; condition under test `src/features/catalog/open-format-card.tsx:199`.
+- What happens: the test's publication has `lastExportedAt: null`, so `hasHistory` is false and `showHistory` is false before `lastExport.data?.published` is read. Deleting `?.published === true` (or reverting to the old `&& lastExport.data`) leaves the test green. The T11 commit body counts it among the tests that "fail before"; it does not. `gold-exports-page.test.tsx` "says Never exported for a mart the API reports as not published" is the same kind: the old page also printed "Never exported" for a body with `exportedAt: null`.
+- Fix: give the publication a `lastExportedAt` (history says a publish succeeded) and the read-back `published: false` (the catalog no longer has the table); assert no "Last published" and no "Snapshot" row and no "Could not be read". For the page, assert the snapshot cell is "—" for a `published: false` body that carries a stray `snapshotId`.
+- Check: the rewritten card test fails when `?.published === true` is replaced by `&& lastExport.data`.
+
+### R6. SHOULD-FIX: An existing Table step test now asserts "no choice for a new name" while the lookup is still `checking`, so the assertion is always true.
+
+- Where: `src/features/connectors/upload-file-page.test.tsx:1039-1049` ("offers Replace or Add only for a table an earlier upload loaded").
+- What happens: after `fireEvent.change(…, "stock_b")` the two `queryByRole("radio", …)).toBeNull()` lines run synchronously. With the new hook the state is `checking` at that moment, which hides the radios whatever the API will answer; the test would pass if the lookup for `stock_b` returned an ingested upload. The test text was not edited, but its second half no longer proves what it did (rule 2 in effect; T9 asked for a `waitFor` wherever a test acts right after typing a name).
+- Fix: `await waitFor(() => expect(next().disabled).toBe(false))` after the change, then the two assertions.
+- Check: with `tableUploads: () => [ingested upload of the asked table]` the fixed test fails; today's does not.
+
+### R7. WITHDRAWN: Two counts in the handoff do not match the test files on the final commit (rule 7).
+
+- Where: `docs/superpowers/plans/2026-11-12-qa-round-data-p1.md:981-982`.
+- What happens: the handoff quotes `--test upload_folder_routes -> 8 passed` and `--test gold_publication -> 18 passed`. On `148de9525` and `9e349555d` the files hold 7 and 17 test functions (`grep -c '^#\[tokio::test'`; 6 + 1 new and 13 + 4 new; `tests/common/mod.rs` defines none; no macro-generated tests). The other counts I could check agree with the code: `upload_folders` 15, `lakehouse-iceberg --lib` 35, `sec11_guard` 4, `route_auth` 89.
+- Fix: re-run the two commands on the final commit and quote the output lines as printed, or mark them *not verified*.
+- Check: the CI log of the PR for the two test binaries.
+
+### R8. SHOULD-FIX: The decimal parser accepts a text that ends in a point (`"12."`), which D14 rule 2 excludes, and the refusal test leaves the nearby shapes untested.
+
+- Where: `rust/crates/lakehouse-api/src/gold_export.rs:383-392` (an empty `fraction` after `split_once('.')` passes `all(is_ascii_digit)`); test list at `:1328-1345`.
+- What happens: `decimal_text_to_unscaled("12.", 12, 2)` returns `Ok(1200)`; D14 says digits, then optionally `.` *and digits*, nothing else. The value is exact, and ClickHouse does not print this form, so no data is wrong; it is a stated rule not enforced. Untested though handled correctly by the code as read: `"-"`, `"."`, `".5"`, `"-.5"`, `"--1"`, `"1.2.3"`, a value whose integer and fraction digits together exceed the precision (`"12345678901.5"` at `(12, 2)`), and the largest positive 38-digit value (`"99999999999999999999999999999999999999"` at `(38, 0)`).
+- Fix: refuse a present-but-empty fraction (`Some((_, ""))` → the "not a decimal number" error); add the shapes above to the two table tests.
+- Check: `decimal_text_that_is_not_an_exact_decimal_is_refused` gains `"12."`, `"-"`, `"."`, `".5"`, `"--1"`, `"1.2.3"`, `("12345678901.5", 12, 2)`; `decimal_text_becomes_the_exact_unscaled_integer` gains the 38-nines case equal to `10_i128.pow(38) - 1`.
+
