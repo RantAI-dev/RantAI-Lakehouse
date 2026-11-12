@@ -66,7 +66,8 @@ import { withPreviewDef } from "@/lib/preview-spec";
 import { suggestChartTitle } from "@/lib/chart-title";
 import { guessCoordinateColumns, pointLimit } from "@/lib/geo-points";
 import {
-  GRAIN_LABELS, columnKindOfType, grainChoices, isGrain, isTruncation, limitAfterGrainPick, limitHasEffect, type ColumnKind, type Grain,
+  BREAKDOWN_GRAINS, GRAIN_LABELS, breakdownGrainChoices, columnKindOfType, grainChoices, isGrain, isTruncation, limitAfterGrainPick,
+  limitHasEffect, takesBreakdownGrain, type ColumnKind, type Grain,
 } from "@/lib/time-grain";
 import { cn } from "@/lib/utils";
 import { MapPicker } from "./map-picker";
@@ -610,6 +611,12 @@ export function ChartBuilder({
     setLon((l) => l || guessed.lon || "");
   }, [isPoints, fields, coordinateColumns]);
   const canBreakdown = kind === "bar" || kind === "hbar" || kind === "line" || kind === "area" || needsBreakdown || isGantt;
+  // `BI-46` (QA `LH-BI-6-01`): a date or timestamp breakdown on a bar, hbar,
+  // line or area chart can be grouped by a period, and on those charts the
+  // limit keeps the N breakdown values with the largest total.
+  const breakdownKind = breakdown ? fields?.kinds?.[breakdown] : undefined;
+  const breakdownGrainOptions = React.useMemo(() => breakdownGrainChoices(kind, breakdownKind), [kind, breakdownKind]);
+  const capsBreakdown = !!breakdown && takesBreakdownGrain(kind);
   // BI-10: a number column can be the dimension or the breakdown when it is put in bins; a table does
   // that per grouping, a pivot on its first number row or column field.
   const onSqlSource = choice?.kind === "sql" || source === NEW_SQL_CHOICE;
@@ -618,7 +625,7 @@ export function ChartBuilder({
     kind, rowsMode, grained: !!(grain && grainOptions.includes(grain)), breakdown: canBreakdown && !!breakdown,
     other: shape.other, steps: shape.steps.length, layers: layers.length,
     multiGrouped: isGroupedTable && shape.groupings.length > 1,
-    limitHasEffect: limitHasEffect(grain, isCalendar ? "none" : order),
+    limitHasEffect: limitHasEffect(grain, isCalendar ? "none" : order, capsBreakdown),
     hasSource: !!choice || source === NEW_SQL_CHOICE,
   });
   const binKind = takesBin(kind, rowsMode) && !isGroupedTable && !isPivot && rules.bins;
@@ -644,7 +651,13 @@ export function ChartBuilder({
   }
   function pickBreakdown(column: string) {
     setBreakdown(column);
-    setShape((d) => ({ ...d, breakdownBin: binKind && column && isNumber(column) ? d.breakdownBin ?? startingBin : null }));
+    const pickedKind = column ? fields?.kinds?.[column] : undefined;
+    setShape((d) => ({
+      ...d,
+      breakdownBin: binKind && column && isNumber(column) ? d.breakdownBin ?? startingBin : null,
+      // `BI-46`: a period only cuts a date or timestamp; another column drops it.
+      breakdownGrain: pickedKind === "date" || pickedKind === "datetime" ? d.breakdownGrain : "",
+    }));
   }
   const pivotNumberField = isPivot ? [...tableDraft.pivotRows, ...tableDraft.pivotColumns].find((c) => isNumber(c)) : undefined;
   const mLabels = isSingle ? ["Measure"] : MEASURE_LABELS[kind] ?? ["Measure (Y)"];
@@ -1260,10 +1273,31 @@ export function ChartBuilder({
     </div>
   ) : null;
 
+  // `BI-46` (plan D20): the period a date or timestamp breakdown is grouped by.
+  const breakdownGrainPicker = breakdownGrainOptions.length > 0 ? (
+    <div className="grid gap-1.5">
+      <Label>Group the breakdown by</Label>
+      <Select
+        value={shape.breakdownGrain || NO_GRAIN} items={GRAIN_ITEMS}
+        onValueChange={(v) => setShape((d) => ({
+          ...d,
+          breakdownGrain: v && v !== NO_GRAIN && (BREAKDOWN_GRAINS as readonly string[]).includes(v) ? (v as Grain) : "",
+        }))}
+      >
+        <SelectTrigger className="w-full" aria-label="Group the breakdown by"><SelectValue /></SelectTrigger>
+        <SelectContent>
+          <SelectItem value={NO_GRAIN}>No grouping</SelectItem>
+          {breakdownGrainOptions.map((g) => <SelectItem key={g} value={g}>{GRAIN_LABELS[g]}</SelectItem>)}
+        </SelectContent>
+      </Select>
+    </div>
+  ) : null;
+
   // Phase 2 QA R15: which conditional controls the dimension and the breakdown bring (they sit in a row below the fields).
   const binDimension = !isGroupedTable && !!binKind && isNumber(dimension);
   const dimensionExtras = !isGroupedTable && (!!grainPicker || binDimension);
-  const breakdownExtras = canBreakdown && !!binKind && !!breakdown && isNumber(breakdown);
+  const breakdownBinPicker = canBreakdown && !!binKind && !!breakdown && isNumber(breakdown);
+  const breakdownExtras = !!breakdownGrainPicker || breakdownBinPicker;
 
   const formFields = (
     // Phase 2 QA R14, the cause of the sideways scroll: a grid with no column template has one `auto`
@@ -1492,8 +1526,11 @@ export function ChartBuilder({
                   ) : null}
                   {breakdownExtras ? (
                     <div className="grid content-start gap-3 sm:col-start-2">
-                      <BinPicker label="Group the breakdown in" value={shape.breakdownBin} sqlSource={onSqlSource} aria="Group the breakdown in bins"
-                        onChange={(breakdownBin) => setShape((d) => ({ ...d, breakdownBin }))} />
+                      {breakdownGrainPicker}
+                      {breakdownBinPicker ? (
+                        <BinPicker label="Group the breakdown in" value={shape.breakdownBin} sqlSource={onSqlSource} aria="Group the breakdown in bins"
+                          onChange={(breakdownBin) => setShape((d) => ({ ...d, breakdownBin }))} />
+                      ) : null}
                     </div>
                   ) : null}
                 </div>
@@ -1599,7 +1636,9 @@ export function ChartBuilder({
                   </div>
                 )}
                 {rules.limit ? <div className="grid gap-1.5">
-                  <Label>{grain ? "Buckets (max 1000, latest kept)" : isCalendar ? "Days (max 366)" : "Limit (Top N)"}</Label>
+                  <Label>{capsBreakdown
+                    ? (grain ? "Breakdown values (Top N)" : "Limit (Top N, dimension and breakdown)")
+                    : grain ? "Buckets (max 1000, latest kept)" : isCalendar ? "Days (max 366)" : "Limit (Top N)"}</Label>
                   {limitParamName ? null : (
                     <Input type="number" min={1} max={maxLimit} value={limit} onChange={(e) => { setLimitTouched(true); setLimit(Math.max(1, Math.min(maxLimit, Number(e.target.value) || 20))); }} />
                   )}

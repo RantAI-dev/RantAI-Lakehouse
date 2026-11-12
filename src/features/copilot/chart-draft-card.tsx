@@ -7,6 +7,7 @@ import { ChartColumn, PencilRuler } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import type { ChartDef } from "@/features/dashboards/chart-builder";
+import { BREAKDOWN_GRAINS, isGrain } from "@/lib/time-grain";
 import { chartNewHref, writeChartDraft, type ChartDraftStep } from "@/features/dashboards/chart-page";
 import { ReportingProvider } from "@/features/dashboards/reporting-context";
 import { TileBody } from "@/features/dashboards/tile-body";
@@ -98,8 +99,8 @@ export function chartDefFromArgs(args: Record<string, unknown>): ChartDef {
     bin: args.bin && typeof args.bin === "object" ? (args.bin as BinDef) : undefined,
     breakdownBin: args.breakdownBin && typeof args.breakdownBin === "object" ? (args.breakdownBin as BinDef) : undefined,
     // BI-46: the period a date breakdown is grouped by travels to the builder
-    // as the model sent it, beside the bin.
-    breakdownGrain: typeof args.breakdownGrain === "string" ? args.breakdownGrain : undefined,
+    // as the model sent it, beside the bin; one of the five the server takes.
+    breakdownGrain: isGrain(args.breakdownGrain) && BREAKDOWN_GRAINS.includes(args.breakdownGrain) ? args.breakdownGrain : undefined,
     grid: args.grid && typeof args.grid === "object" ? (args.grid as GridDef) : undefined,
     // BI-13: the chart's other questions, and how its own series is drawn, travel to the builder as the model sent them.
     layers: Array.isArray(args.layers) ? (args.layers as LayerDef[]) : undefined,

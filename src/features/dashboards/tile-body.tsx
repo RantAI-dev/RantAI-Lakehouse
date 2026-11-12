@@ -25,7 +25,7 @@ import { formatAxisValue, formatValue, withMetricFormats } from "@/lib/value-for
 import { styleOption, seriesColumns } from "./style-option";
 import type { ColumnSetting, TableDefFields } from "@/lib/table-types";
 import type { FilterDef } from "@/services/clients/bi-store";
-import { bucketLabel, calendarFirstDay, isGrain } from "@/lib/time-grain";
+import { bucketLabel, calendarFirstDay, isGrain, labelSeriesBuckets } from "@/lib/time-grain";
 import { binsOfTile, relabelBins } from "@/lib/chart-bins";
 import { labelOtherRows, tileMeasureLabels, visibleColumns, withResolvedSlots, type ShapeDefFields } from "@/lib/chart-shape";
 import type { Rows } from "./tile-dialogs";
@@ -194,7 +194,11 @@ function TileBodyOf({
     const rawRows = cell.rows;
     const grain = isGrain(cell.grain) ? cell.grain : null;
     const grained = grain ? rawRows.map((r) => ({ ...r, [spec.x]: bucketLabel(grain, r[spec.x]) })) : rawRows;
-    const bucketed = relabelBins(grained, bins);
+    // `BI-46`: the buckets of a grained breakdown are labelled like the axis,
+    // so the legend and the tooltip read "Mar 2026", not the raw date.
+    const seriesGrain = def && isGrain(def.breakdownGrain) ? def.breakdownGrain : null;
+    const withSeries = seriesGrain && spec.series ? labelSeriesBuckets(grained, spec.series, seriesGrain) : grained;
+    const bucketed = relabelBins(withSeries, bins);
     // BI-6: the computed "Other" group is drawn last and is never a value to
     // click; a real value that is also called "Other" stays apart from it.
     const { rows, otherLabels } = labelOtherRows(bucketed, spec.x);

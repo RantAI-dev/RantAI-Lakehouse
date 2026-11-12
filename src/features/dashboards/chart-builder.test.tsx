@@ -630,3 +630,59 @@ describe("ChartBuilder and a parameter slot (QA LH-BI-6-01)", () => {
     expect(screen.queryByRole("option", { name: /\{ukuran\}/ })).toBeNull()
   })
 })
+
+// `BI-46` (QA `LH-BI-6-01`): a date breakdown can be grouped by a period, and
+// the limit says what it counts when the chart has a breakdown.
+describe("ChartBuilder breakdown grain and limit label (QA LH-BI-6-01)", () => {
+  /** Adds a date column the base stub does not have. */
+  function withDateColumn() {
+    const inner = global.fetch
+    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      const res = await inner(input, init)
+      if (url.includes("/api/dashboard/fields") && url.includes("mart=")) {
+        const body = (await res.json()) as Record<string, unknown>
+        return new Response(JSON.stringify({
+          ...body,
+          dimensions: [...(body.dimensions as string[]), "d"],
+          kinds: { d: "date" },
+          columns: [...(body.columns as { name: string; type: string }[]), { name: "d", type: "Date" }],
+        }), { status: 200, headers: { "Content-Type": "application/json" } })
+      }
+      return res
+    }) as unknown as typeof fetch
+  }
+
+  /** A base-ui Select choice: open, focus the option, click it (as format-section does). */
+  function choose(trigger: HTMLElement, option: string) {
+    fireEvent.click(trigger)
+    const target = screen.getByRole("option", { name: option })
+    fireEvent.focus(target)
+    fireEvent.click(target)
+  }
+
+  it("choosing a date breakdown offers its grain and the preview request carries it", async () => {
+    withDateColumn()
+    renderBuilder({ ...barDef })
+    await screen.findByLabelText("Aggregation of visitors")
+    const breakdownField = document.querySelector('[data-slot="breakdown-field"]') as HTMLElement
+    choose(breakdownField.querySelector('[role="combobox"]') as HTMLElement, "d")
+    const groupBy = await screen.findByLabelText("Group the breakdown by")
+    choose(groupBy, "Month")
+    await waitFor(() => expect(bodies.some((b) => b.breakdownGrain === "month")).toBe(true))
+  })
+
+  it("the limit label names the breakdown when the chart has one", async () => {
+    renderBuilder({ ...barDef, breakdown: "category" })
+    await screen.findByLabelText("Aggregation of visitors")
+    fireEvent.click(screen.getByRole("button", { name: /Sort and filter/ }))
+    expect(await screen.findByText("Limit (Top N, dimension and breakdown)")).toBeTruthy()
+    cleanup()
+    // A grain on a date dimension makes the limit the breakdown's alone.
+    withDateColumn()
+    renderBuilder({ ...barDef, dimension: "d", breakdown: "category", grain: "month" })
+    await screen.findByLabelText("Aggregation of visitors")
+    fireEvent.click(screen.getByRole("button", { name: /Sort and filter/ }))
+    expect(await screen.findByText("Breakdown values (Top N)")).toBeTruthy()
+  })
+})

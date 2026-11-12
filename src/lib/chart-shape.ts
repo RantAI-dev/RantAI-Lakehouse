@@ -2,6 +2,7 @@ import type { FilterDef } from "@/services/clients/bi-store"
 import { type BinDef, type BinDraft, type GridDef, binDraftFromDef, binPayload, binProblem, gridChoiceOf, gridPayload } from "./chart-bins"
 import { type JoinDef, type JoinDraft, columnSource, displayColumn, displayColumnFull, joinDraftsFromDef, joinProblems, joinsPayload } from "./chart-joins"
 import type { LayerDef } from "./chart-layers"
+import { BREAKDOWN_GRAINS, isGrain, takesBreakdownGrain, type Grain } from "./time-grain"
 
 /**
  * The chart builder's own data fields (`BI-6`): a measure with its own
@@ -83,9 +84,9 @@ export type ShapeDefFields = {
   /**
    * The period a date or timestamp `breakdown` is grouped by (`BI-46`): day,
    * week, month, quarter or year, for bar, hbar, line and area; never with a
-   * bin. The builder offers it in T13; the assistant's draft carries it now.
+   * bin.
    */
-  breakdownGrain?: string
+  breakdownGrain?: Grain
   /** A point map grouped by grid cell (BI-10). */
   grid?: GridDef
   /** More questions drawn on the same chart (BI-13), and how its own series is drawn. */
@@ -274,11 +275,13 @@ export type ShapeDraft = {
   /** BI-10: the bin of the dimension (or of a pivot's number field), of the breakdown, and the map grid ("none", "auto", "0.01" ...). */
   bin: BinDraft | null
   breakdownBin: BinDraft | null
+  /** `BI-46`: the period the breakdown is grouped by; empty for none. */
+  breakdownGrain: Grain | ""
   grid: string
 }
 
 export function emptyShapeDraft(): ShapeDraft {
-  return { filters: [], sortChoice: "order:desc", other: false, groupings: [], steps: [], joins: [], bin: null, breakdownBin: null, grid: "none" }
+  return { filters: [], sortChoice: "order:desc", other: false, groupings: [], steps: [], joins: [], bin: null, breakdownBin: null, breakdownGrain: "", grid: "none" }
 }
 
 /** A saved definition as a draft; anything absent keeps its default. */
@@ -293,6 +296,8 @@ export function shapeDraftFromDef(def: (ShapeDefFields & { order?: string }) | u
     joins: joinDraftsFromDef(def.joins),
     bin: binDraftFromDef(def.bin),
     breakdownBin: binDraftFromDef(def.breakdownBin),
+    // `BI-46`: a saved period reads back as one; anything else is no grouping.
+    breakdownGrain: isGrain(def.breakdownGrain) && BREAKDOWN_GRAINS.includes(def.breakdownGrain) ? def.breakdownGrain : "",
     grid: gridChoiceOf(def.grid),
   }
 }
@@ -347,6 +352,9 @@ export function shapePayload(d: ShapeDraft, ctx: ShapeContext): Record<string, u
     const grid = gridPayload(d.grid)
     if (grid) out.grid = grid
   }
+  // `BI-46`: a period for the breakdown, only where the server takes one — a
+  // series breakdown on a bar, hbar, line or area chart.
+  if (ctx.breakdown && takesBreakdownGrain(ctx.kind) && d.breakdownGrain) out.breakdownGrain = d.breakdownGrain
   return out
 }
 
