@@ -47,6 +47,7 @@ once a first release is tagged.
 
 ### Fixed
 
+- Dropdowns are readable in the dark theme and look the same everywhere (backlog `WEB-9`). 61 native `<select>` elements in 34 files opened a white list with near-white text, because the page never told the browser its theme. The console now sets `color-scheme` per theme, every dropdown is one component (`SelectField`, on the design system's `Select`), and lint refuses a new native select. What each dropdown offers and does is unchanged. Known limit: a list opened inside a dashboard fixed to the light theme is drawn in the console's dark colours (`WEB-10`).
 - An answer to a question written in Latin script no longer keeps Chinese, Japanese or Korean text. The assistant is asked once to rewrite such an answer (backlog `AI-17`).
 - A short question in Indonesian, such as "Berapa total kunjungan?", now gets its answer in Indonesian: one Indonesian word with no English word is read as Indonesian, where before two were required (backlog `AI-17`).
 - The assistant can still ask which reading a word has after it has only looked up which metrics or tables exist; a question comes too late only after it has queried data (`run_sql`, `query_metric`, `run_saved_query`), because a turn may ask only before it runs a query (backlog `AI-17`).
