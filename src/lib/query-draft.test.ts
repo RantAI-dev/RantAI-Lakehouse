@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert"
 import { test } from "node:test"
-import { parseDraft, parseTabs, readTabs, writeTabs } from "./query-draft"
-import type { QueryTabs } from "./query-draft"
+import { parseDraft, parseTabs, readTabs, rememberSavedTab, writeTabs } from "./query-draft"
+import type { QueryTab, QueryTabs } from "./query-draft"
 
 test("parseDraft mengembalikan null untuk isi yang tidak terpakai", () => {
   assert.equal(parseDraft(null), null)
@@ -195,7 +195,7 @@ test("parseTabs mengembalikan null untuk isi yang bukan salah satu bentuk", () =
   assert.equal(parseTabs(JSON.stringify({ tabs: [] })), null)
 })
 
-const PARAMETER_TAB = {
+const PARAMETER_TAB: QueryTab = {
   id: "a",
   name: "Orders",
   sql: "SELECT * FROM t WHERE region = {{region}} AND day = {{day}}",
@@ -266,6 +266,64 @@ test("writeTabs stores the definitions and the values, and readTabs gets them ba
     writeTabs(tabs)
     assert.deepEqual(readTabs(), tabs)
   } finally {
+    window.localStorage.clear()
+  }
+})
+
+// `WEB-7` D5: the save moved to its own page, so the tab is told afterwards
+// which query a save produced, instead of the editor updating it in place.
+test("rememberSavedTab points the tab that saved at the query it produced", () => {
+  window.localStorage.clear()
+  try {
+    writeTabs({
+      tabs: [
+        { ...PARAMETER_TAB, id: "a" },
+        { ...PARAMETER_TAB, id: "b", savedId: "q1", level: "view" },
+      ],
+      activeId: "a",
+      question: "",
+      tab: "sql",
+    })
+    rememberSavedTab("a", "q2", "edit")
+    const saved = readTabs()
+    assert.equal(saved?.tabs[0]?.savedId, "q2")
+    assert.equal(saved?.tabs[0]?.level, "edit")
+    // The tab that saved is the one that changes; another tab keeps its own.
+    assert.equal(saved?.tabs[1]?.savedId, "q1")
+    assert.equal(saved?.tabs[1]?.level, "view")
+  } finally {
+    window.localStorage.clear()
+  }
+})
+
+test("rememberSavedTab changes nothing when the tab is not in the draft", () => {
+  window.localStorage.clear()
+  try {
+    writeTabs({ tabs: [PARAMETER_TAB], activeId: "a", question: "", tab: "sql" })
+    rememberSavedTab("gone", "q2", "edit")
+    assert.deepEqual(readTabs()?.tabs, [PARAMETER_TAB])
+  } finally {
+    window.localStorage.clear()
+  }
+})
+
+test("rememberSavedTab writes nothing when the browser refuses storage", () => {
+  window.localStorage.clear()
+  const original = globalThis.localStorage.setItem
+  try {
+    Object.defineProperty(window.localStorage, "setItem", {
+      configurable: true,
+      value: () => {
+        throw new Error("blocked")
+      },
+    })
+    // It must not throw: a refused write leaves the editor's button as it was.
+    rememberSavedTab("a", "q2", "edit")
+  } finally {
+    Object.defineProperty(window.localStorage, "setItem", {
+      configurable: true,
+      value: original,
+    })
     window.localStorage.clear()
   }
 })

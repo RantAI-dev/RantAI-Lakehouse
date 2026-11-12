@@ -532,6 +532,7 @@ pub struct NamespacesQuery {
 /// unavailable.
 pub async fn namespaces(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(query): Query<NamespacesQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     validate_warehouse(&state, query.warehouse.as_deref())?;
@@ -542,6 +543,8 @@ pub async fn namespaces(
     .await
     .map_err(|err| classify_catalog_access_error(err, "namespace"))?;
     let names: Vec<String> = idents.iter().map(NamespaceIdent::to_url_string).collect();
+    // GOV-7 D6: which tables a role may read is Postgres's answer, asked once.
+    let access = crate::routes::catalog::table_access_for(&state, &principal).await?;
 
     // One client, fetched ONCE, shared by every fan-out item below: each
     // item calls `rest::list_table_idents` directly on it, never through
@@ -552,19 +555,39 @@ pub async fn namespaces(
     let client = lakehouse_catalog::client(&state)
         .await
         .map_err(|err| classify_catalog_access_error(err, "namespace"))?;
+    // `GOV-7` D6: the count is of the tables this caller may read, and a
+    // namespace with none of them is not listed at all — a hidden table does
+    // not appear anywhere. A lookup that failed leaves the caller unable to
+    // prove the namespace holds anything visible, so it goes too.
     let table_counts = bounded::run_with_budget(names.clone(), Duration::from_secs(2), 8, {
+        let access = access.clone();
         move |name: String| {
+            let access = access.clone();
             let client = client.clone();
             async move {
                 let ns = NamespaceIdent::from_strs([name.as_str()]).ok()?;
-                rest::list_table_idents(&client, &ns)
-                    .await
-                    .ok()
-                    .map(|idents| idents.len())
+                let idents = rest::list_table_idents(&client, &ns).await.ok()?;
+                let visible = idents
+                    .iter()
+                    .filter(|ident| access.allows(&name, ident.name()))
+                    .count();
+                (visible > 0).then_some(visible)
             }
         }
     })
     .await;
+    // A namespace whose tables all failed to load keeps its row with a
+    // `null` count for an unrestricted caller (the honest "could not tell");
+    // for a narrowed one it goes, because nothing proves it holds a visible
+    // table (fail closed).
+    let names: Vec<String> = if access.is_all() {
+        names
+    } else {
+        names
+            .into_iter()
+            .filter(|name| table_counts.contains_key(name))
+            .collect()
+    };
 
     Ok(ApiJson(namespaces_body(&names, &table_counts)))
 }
@@ -585,6 +608,7 @@ pub struct TablesQuery {
 /// `namespace` does not exist, 503 if the catalog cannot be reached.
 pub async fn tables(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(query): Query<TablesQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     validate_warehouse(&state, query.warehouse.as_deref())?;
@@ -605,6 +629,12 @@ pub async fn tables(
     .await
     .map_err(|err| classify_catalog_access_error(err, "namespace"))?;
 
+    // GOV-7 D6: a table the caller's roles hide is not listed.
+    let access = crate::routes::catalog::table_access_for(&state, &principal).await?;
+    let idents: Vec<_> = idents
+        .into_iter()
+        .filter(|ident| access.allows(&namespace, ident.name()))
+        .collect();
     let names: Vec<String> = idents.iter().map(|ident| ident.name().to_owned()).collect();
     // One client, fetched ONCE, shared by every fan-out item below — see
     // `namespaces`' matching comment for why a per-item call must not go
@@ -632,10 +662,14 @@ pub async fn tables(
 /// not exist, 503 if the catalog cannot be reached.
 pub async fn table_detail(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path((ns, table)): Path<(String, String)>,
 ) -> ApiResult<ApiJson<Value>> {
     validate_ident(&ns, "ns")?;
     validate_ident(&table, "table")?;
+    // GOV-7 D6: a hidden table answers the same 404 an unknown one answers.
+    let access = crate::routes::catalog::table_access_for(&state, &principal).await?;
+    crate::routes::catalog::ensure_key_readable_with(&access, &format!("{ns}.{table}"))?;
     let namespace = NamespaceIdent::from_strs([ns.as_str()])
         .map_err(|_| ApiError::BadRequest("ns is invalid".to_owned()))?;
     let ident = TableIdent::new(namespace, table);
@@ -1676,10 +1710,26 @@ mod tests {
 
             let state = state_pointed_at(&server).await;
 
-            let body = namespaces(State(state), Query(NamespacesQuery { warehouse: None }))
-                .await
-                .expect("namespaces succeeds even though one item fails")
-                .0;
+            // An unrestricted principal: this test is about the shared
+            // Lookup (a failed item keeps its row with a null count), not about
+            // `GOV-7`'s per-caller filter.
+            let principal = Principal {
+                id: lakehouse_auth::PrincipalId::User(uuid::Uuid::from_u128(7)),
+                tenant_ids: Vec::new(),
+                display_name: "Test Admin".to_owned(),
+                permissions: lakehouse_auth::PermissionSet::parse("*:*"),
+                provider: "session".to_owned(),
+                must_change_password: false,
+                role_names: Vec::new(),
+            };
+            let body = namespaces(
+                State(state),
+                Extension(principal),
+                Query(NamespacesQuery { warehouse: None }),
+            )
+            .await
+            .expect("namespaces succeeds even though one item fails")
+            .0;
 
             assert_eq!(body["namespaces"][0]["name"], json!("bronze"));
             assert_eq!(body["namespaces"][0]["tableCount"], json!(1));

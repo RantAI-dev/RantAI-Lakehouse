@@ -6,14 +6,14 @@
 | Backlog | `GOV-7` |
 | Kind | Feature |
 | Spec | `docs/core/specs/gov-7.md` |
-| Status | Planned |
+| Status | In Acceptance |
 | Priority | P1 |
 | Owner | In the base |
 | Acceptor | In the base |
 | Plan | `docs/superpowers/plans/2026-11-09-gov-7-table-access-per-role.md` |
 | Started | 2026-11-09 |
-| Shipped | |
-| Evidence | |
+| Shipped | 2026-11-11 |
+| Evidence | PR #459 (rule, enforcement, routes), PR #468 (console, docs) |
 
 ## Problem
 
@@ -54,6 +54,11 @@ The assistant's data map, SQL and metric answers follow the rule. Changing a rol
 - A temporary access grant gives a permission, not a table.
 - Dagster's own builds and quality checks run as the system and are not narrowed.
 - Narrowing the Dashboard Viewer role also narrows every embed and public link.
+- A scheduled agent run has no person behind it and is not narrowed either (`SEC-68`).
+- Names are compared without regard to case, as masks are. Two tables that differ only by case share one grant.
+- The check costs one database read per governed request: about 3.4 ms at the median and 4.6 to 5.1 ms at p95, measured in an unoptimised test build on a shared machine (plan, S1 handoff, T5). A release build is not measured.
+- A Bronze table is granted by its registry table name under the schema `bronze`. A Bronze dataset whose registry records no table name cannot be named by a grant, so it stays hidden from a narrowed role's catalog and search.
+- Saving a role writes its tables only when they were changed on the page. The two are separate requests; if the second fails the page says the role was saved and its tables were not.
 
 ## Acceptance checklist
 

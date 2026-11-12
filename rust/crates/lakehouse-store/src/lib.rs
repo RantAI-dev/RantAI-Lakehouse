@@ -77,6 +77,7 @@ pub mod schema_diff;
 pub mod semantic;
 pub mod sessions;
 pub mod sign_in_settings;
+pub mod sso_settings;
 pub mod storage;
 pub mod upload_folders;
 pub mod uploads;

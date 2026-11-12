@@ -82,6 +82,7 @@ Each commented block in `.env.example` ends by pointing here:
 | `OIDC_PROVIDER_NAME` | Short label combined with `oidc:` to form `Principal::provider` / `auth_identity.provider` | `default` | No | commented |
 | `OIDC_JWKS_URL` | Explicit JWKS endpoint override. Unset means the `jwks_uri` from `{OIDC_ISSUER}/.well-known/openid-configuration` (`SEC-38`) | discovery | No | commented |
 | `OIDC_JIT_PROVISIONING` | `"true"` to auto-create an `app_user` for a validating token with no linked identity yet | `false` | No | commented |
+| `OIDC_TRUST_EMAIL` | `"true"` joins an existing account by email even when the token does not carry `email_verified: true` (`SEC-65`). Off by default; only for a provider that never sends the claim | `false` | No | commented |
 | `OIDC_ROLE_MAP` | `"group1=Role One,group2=Role Two"` — maps an IdP group/role claim to a local role name | empty | No | commented |
 | `OIDC_GROUPS_CLAIM` | Which token claim carries the caller's groups/roles | `groups` | No | commented |
 | `OIDC_CLOCK_SKEW_SECONDS` | Clock-skew tolerance for `exp`/`nbf` validation. Invalid values fall back to the default | `60` | No | no |

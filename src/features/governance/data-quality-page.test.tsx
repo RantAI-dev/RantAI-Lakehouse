@@ -47,7 +47,16 @@ function stubApi(
     runs = [],
     schedules = [],
     targets = [],
-  }: { quality?: unknown[]; incidents?: unknown[]; runs?: unknown[]; schedules?: unknown[]; targets?: unknown[] } = {}
+    catalog,
+  }: {
+    quality?: unknown[]
+    incidents?: unknown[]
+    runs?: unknown[]
+    schedules?: unknown[]
+    targets?: unknown[]
+    /** WEB-8 D8: the catalog's tables, for the freshness dialog's picker. */
+    catalog?: unknown[]
+  } = {}
 ) {
   writesSeen = []
   let sessionRead: () => void = () => {}
@@ -72,6 +81,11 @@ function stubApi(
       return json({ incidents })
     }
     if (path.includes("/api/governance/quality/") && path.endsWith("/runs")) return json({ runs })
+    // WEB-8 D8: the catalog the freshness dialog's table picker reads. When
+    // the test gives none the read fails, which is the free-text fallback.
+    if (catalog !== undefined && path.startsWith("/api/catalog")) {
+      return json({ assets: catalog, namespaces: [] })
+    }
     // WEB-3 S3-D5: the Schedules and Freshness targets tabs.
     if (path.includes("/api/governance/quality/schedules/")) {
       // S3a-D3: Reset is a DELETE with no body, answered 204.
@@ -116,7 +130,10 @@ describe("DataQualityPage: adding a rule", () => {
   it("shows the button with governance:write", async () => {
     stubApi(["governance:write"])
     renderPage()
-    expect(await screen.findByRole("button", { name: "Add Quality Rule" })).toBeTruthy()
+    // WEB-7 T3: the form is its own page.
+    expect(
+      (await screen.findByRole("button", { name: "Add Quality Rule" })).getAttribute("href")
+    ).toBe("/governance/data-quality/rules/new")
   })
 
   it("hides the button without governance:write", async () => {
@@ -384,6 +401,36 @@ describe("DataQualityPage: Freshness targets tab (WEB-3 S3-D5)", () => {
     expect((screen.getByLabelText("New data at least every") as HTMLInputElement).value).toBe("1")
     expect((screen.getByLabelText("Unit") as HTMLSelectElement).value).toBe("days")
     expect(screen.getByRole("button", { name: "Remove target" })).toBeTruthy()
+  })
+
+  it("picks the table to add a target for from the catalog (WEB-8 D8)", async () => {
+    search = new URLSearchParams("tab=freshness")
+    stubApi(["governance:write"], {
+      catalog: [
+        { id: "a-orders", name: "orders", namespace: "silver" },
+        { id: "a-raw", name: "raw_orders", namespace: "bronze" },
+      ],
+    })
+    renderPage()
+    fireEvent.click(await screen.findByRole("button", { name: "Add target" }))
+    // The table is a combobox over the catalog's tables, shown as
+    // namespace.table — the key the SLA stores.
+    fireEvent.click(await screen.findByRole("button", { name: "Table" }))
+    const list = await screen.findByRole("listbox")
+    expect(within(list).getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "bronze.raw_orders",
+      "silver.orders",
+    ])
+    fireEvent.click(within(list).getByText("silver.orders"))
+    fireEvent.change(screen.getByLabelText("New data at least every"), { target: { value: "6" } })
+    fireEvent.change(screen.getByLabelText("Unit"), { target: { value: "hours" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save target" }))
+    await waitFor(() => expect(writesSeen.length).toBe(1))
+    expect(writesSeen[0]).toEqual([
+      "PUT",
+      "/api/governance/sla",
+      { tableName: "silver.orders", expectedIntervalMinutes: 360 },
+    ])
   })
 
   it("offers no Add, Edit or Remove without governance:write", async () => {

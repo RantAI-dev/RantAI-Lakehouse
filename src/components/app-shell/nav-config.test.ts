@@ -127,6 +127,40 @@ describe("ADM-13 D7: nav-config access map and drift tests", () => {
       )
     })
 
+    it("gates the WEB-7 form pages with the permission their submit route needs", () => {
+      const reader = (p: string) => p === "identity:read" || p === "catalog:read"
+      const identityWriter = (p: string) => p === "identity:write"
+      const governanceWriter = (p: string) => p === "governance:write"
+      const queryReader = (p: string) => p === "query:read"
+      const sqlAuthor = (p: string) => p === "dashboard:sql"
+
+      // A reader who may open the list cannot reach the form ...
+      expect(canOpen("/admin/users/invite", reader)).toBe(false)
+      expect(canOpen("/admin/roles/new", reader)).toBe(false)
+      expect(canOpen("/admin/roles/r1/edit", reader)).toBe(false)
+      expect(canOpen("/admin/tenants/new", reader)).toBe(false)
+      expect(canOpen("/admin/service-identities/new", reader)).toBe(false)
+      expect(canOpen("/admin/settings/tag-keys/new", reader)).toBe(false)
+      expect(canOpen("/admin/settings/tag-keys/data_domain/edit", reader)).toBe(false)
+      expect(canOpen("/governance/data-quality/rules/new", reader)).toBe(false)
+      // ... and a writer can, on the permission the API route takes.
+      expect(canOpen("/admin/users/invite", identityWriter)).toBe(true)
+      expect(canOpen("/admin/roles/new", identityWriter)).toBe(true)
+      expect(canOpen("/admin/roles/r1/edit", identityWriter)).toBe(true)
+      expect(canOpen("/admin/tenants/new", identityWriter)).toBe(true)
+      expect(canOpen("/admin/service-identities/new", identityWriter)).toBe(true)
+      expect(canOpen("/admin/settings/tag-keys/new", governanceWriter)).toBe(true)
+      expect(canOpen("/admin/settings/tag-keys/data_domain/edit", governanceWriter)).toBe(true)
+      expect(canOpen("/governance/data-quality/rules/new", governanceWriter)).toBe(true)
+
+      // WEB-7 T5: saving a query is `query:read` (POST /api/query/saved), and
+      // saving an SQL source is `dashboard:sql` (POST /api/dashboard/sources).
+      expect(canOpen("/query-studio/save", queryReader)).toBe(true)
+      expect(canOpen("/query-studio/save", sqlAuthor)).toBe(false)
+      expect(canOpen("/query-studio/save-source", sqlAuthor)).toBe(true)
+      expect(canOpen("/query-studio/save-source", queryReader)).toBe(false)
+    })
+
     it("supports any-of permission checks", () => {
       const hasAlertWrite = (p: string) => p === "alert:write"
       const hasAlertRead = (p: string) => p === "alert:read"

@@ -61,7 +61,7 @@
 //! are `app_user_username_lower_key` (unique on `lower(username)`) and the
 //! `app_user_username_format` CHECK (`0132_usernames.sql`).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use sqlx::{Postgres, Transaction};
 use time::OffsetDateTime;
@@ -1109,6 +1109,110 @@ pub async fn update_role(
         return Err(StoreError::NotFound);
     }
     get_role(pool, id).await
+}
+
+// ── Table access (`GOV-7`) ──────────────────────────────────────────────
+
+/// One table (or whole schema, with `table` `"*"`) a role may read.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, sqlx::FromRow)]
+pub struct TableGrant {
+    /// The schema name.
+    pub schema: String,
+    /// The table name, or `"*"` for the whole schema.
+    pub table: String,
+}
+
+/// A role's read scope (`GOV-7` D3): `'all'`, or `'listed'` with the tables
+/// and schemas its grants name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoleTableAccess {
+    /// `role.read_scope`: `'all'` or `'listed'`.
+    pub scope: String,
+    /// The granted tables and schemas, sorted, for `'listed'` roles.
+    pub grants: Vec<TableGrant>,
+}
+
+/// A role's table access. The grants are sorted, so the same role answers
+/// the same body every time.
+///
+/// # Errors
+///
+/// [`StoreError::NotFound`] if no role has that id (or `id` is not a UUID);
+/// [`StoreError::Database`] on any other failure.
+pub async fn get_role_table_access(pool: &PgPool, id: &str) -> Result<RoleTableAccess, StoreError> {
+    let role_id = parse_id(id)?;
+    let scope: Option<String> = sqlx::query_scalar("SELECT read_scope FROM role WHERE id = $1")
+        .bind(role_id)
+        .fetch_optional(pool)
+        .await?;
+    let Some(scope) = scope else {
+        return Err(StoreError::NotFound);
+    };
+    let grants: Vec<(String, String)> = sqlx::query_as(
+        "SELECT schema_name, table_name FROM role_read_grant WHERE role_id = $1          ORDER BY schema_name, table_name",
+    )
+    .bind(role_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(RoleTableAccess {
+        scope,
+        grants: grants
+            .into_iter()
+            .map(|(schema, table)| TableGrant { schema, table })
+            .collect(),
+    })
+}
+
+/// Replace a role's scope and grants in ONE transaction (`GOV-7` D7): the
+/// scope and the rows that give it meaning are one unit of work, so a reader
+/// never sees a `'listed'` role with the previous scope's grants (or the
+/// other way round).
+///
+/// A scope of `'all'` stores no grants: keeping stale rows for a role that
+/// reads everything would silently resurrect them the next time somebody
+/// narrows it.
+///
+/// # Errors
+///
+/// [`StoreError::NotFound`] if no role has that id (or `id` is not a UUID);
+/// [`StoreError::Database`] on any other failure, including a duplicate
+/// grant (the caller deduplicates first).
+pub async fn set_role_table_access(
+    pool: &PgPool,
+    id: &str,
+    scope: &str,
+    grants: &[TableGrant],
+    created_by: Option<Uuid>,
+) -> Result<RoleTableAccess, StoreError> {
+    let role_id = parse_id(id)?;
+    let mut tx = pool.begin().await?;
+    let affected = sqlx::query("UPDATE role SET read_scope = $2, updated_at = now() WHERE id = $1")
+        .bind(role_id)
+        .bind(scope)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if affected == 0 {
+        return Err(StoreError::NotFound);
+    }
+    sqlx::query("DELETE FROM role_read_grant WHERE role_id = $1")
+        .bind(role_id)
+        .execute(&mut *tx)
+        .await?;
+    for grant in grants {
+        sqlx::query(
+            "INSERT INTO role_read_grant (role_id, schema_name, table_name, created_by)              VALUES ($1, $2, $3, $4)",
+        )
+        .bind(role_id)
+        .bind(&grant.schema)
+        .bind(&grant.table)
+        .bind(created_by)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    get_role_table_access(pool, id).await
 }
 
 // ── Tenant ──────────────────────────────────────────────────────────────

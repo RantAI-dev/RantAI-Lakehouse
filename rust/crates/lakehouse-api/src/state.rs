@@ -8,8 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use lakehouse_auth::openfga::LakekeeperAdminClient;
 use lakehouse_auth::throttle::ThrottlePolicy;
 use lakehouse_auth::{
-    LocalPasswordAuthenticator, OidcAuthenticator, OidcConfig, Secret, ServiceTokenAuthenticator,
-    SessionAuthenticator,
+    LocalPasswordAuthenticator, Secret, ServiceTokenAuthenticator, SessionAuthenticator,
 };
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::secret::{
@@ -53,13 +52,6 @@ pub struct AuthState {
     pub session: Arc<SessionAuthenticator>,
     /// Verifies the opaque `Authorization: Bearer` service token.
     pub service: Arc<ServiceTokenAuthenticator>,
-    /// Verifies a `JWT` `Authorization: Bearer` id token against a
-    /// configured `OIDC` provider's `JWKS` (Task 3.5). `None` when
-    /// `OIDC_ISSUER`/`OIDC_CLIENT_ID` are not both set — see
-    /// [`AppState::new`]. When `None`, `crate::auth`'s bearer dispatch
-    /// simply never tries the `OIDC` path, which is exactly what "OIDC
-    /// unconfigured behaves like today" requires.
-    pub oidc: Option<Arc<OidcAuthenticator>>,
 }
 
 /// State shared across all route handlers.
@@ -86,6 +78,10 @@ pub struct AppState {
     /// `RwLock` over an `Arc`, so a reader takes the client out and never
     /// holds the lock across a model call.
     pub llm: Arc<RwLock<Arc<crate::runtime_settings::AssistantClient>>>,
+    /// Swappable `OIDC` authenticator (`ADM-12` plan D4): a save in the console
+    /// takes effect on the next sign-in with no restart. Cached beside its
+    /// effective settings and cleared on save.
+    pub oidc: Arc<RwLock<Option<crate::runtime_settings::SwappableOidc>>>,
     /// Phase 2 OLTP pool (`lakehouse-store`).
     ///
     /// `Option`, not a bare `Arc<PgPool>`: `lakehouse_store::connect_lazy`
@@ -272,6 +268,10 @@ pub struct AppState {
             lakehouse_store::assistant_settings::AssistantSettings,
         >,
     >,
+    /// The 30-second memo of the saved SSO settings (`ADM-12` plan D1/D3),
+    /// so a request does not read Postgres per check. The SSO `PUT` clears it
+    /// on this process. Shared across clones.
+    pub sso_settings_cache: Arc<crate::runtime_settings::SsoSettingsCache>,
     /// How often each caller may ask for a test email (`ADM-7` plan D10).
     /// Shared across clones.
     pub email_test_limiter: Arc<crate::runtime_settings::TestEmailLimiter>,
@@ -282,6 +282,17 @@ pub struct AppState {
     /// so a service build has no way to swap the policy.
     #[cfg(test)]
     pub webhook_sender_override: Option<lakehouse_notify::WebhookSender>,
+    /// Test seam for the console-set SSO connection's HTTP client
+    /// (`ADM-12` review round 1, B1): a sign-in test has to reach a mock
+    /// provider at an `https://` address, and nothing in a deployment can
+    /// tell `reqwest` to trust a certificate minted for one test (the
+    /// `rustls` client trusts `webpki` roots only). The test supplies a
+    /// client that trusts its own CA; the `https://` and `resolve_checked`
+    /// address checks still run on every URL, and the pins are the only
+    /// thing this replaces. Compiled only for this crate's tests, so a
+    /// service build has no way to set it.
+    #[cfg(test)]
+    pub sso_http_override: Option<reqwest::Client>,
 }
 
 /// PDFs made at once per API process (`BI-1` D5). Chromium is heavy, and the
@@ -650,40 +661,10 @@ pub(crate) fn connector_allowed_patterns(manager: Option<SecretManagerKind>) -> 
 
 /// Translate [`Config`]'s flat `oidc_*` env-derived fields into
 /// [`lakehouse_auth::OidcConfig`], or `None` if `OIDC` is not configured.
-///
-/// `OIDC` is considered configured only when BOTH `OIDC_ISSUER` and
-/// `OIDC_CLIENT_ID` are set — see [`Config::oidc_issuer`]'s doc comment.
-/// This is the one place that decision is made; every other piece of this
-/// module and `crate::auth` just reacts to [`AuthState::oidc`] being
-/// present or absent.
-///
-/// `SEC-38`: an operator-set `OIDC_JWKS_URL` is passed through unchanged
-/// and no discovery request is ever made; when it is unset the key set's
-/// address comes from the provider's discovery document
-/// (`{issuer}/.well-known/openid-configuration`), read lazily on the first
-/// key lookup, so an unreachable provider never stops the API from
-/// starting.
-fn oidc_config(config: &Config) -> Option<OidcConfig> {
-    let issuer = config.oidc_issuer.as_ref()?;
-    let client_id = config.oidc_client_id.as_ref()?;
-    let mut oidc = match config.oidc_jwks_url.clone() {
-        Some(jwks_url) => OidcConfig::new(
-            issuer.clone(),
-            client_id.clone(),
-            config.oidc_provider_name.clone(),
-            jwks_url,
-        ),
-        None => OidcConfig::with_discovery(
-            issuer.clone(),
-            client_id.clone(),
-            config.oidc_provider_name.clone(),
-        ),
-    };
-    oidc.jit_provisioning = config.oidc_jit_provisioning;
-    oidc.role_map.clone_from(&config.oidc_role_map);
-    oidc.groups_claim.clone_from(&config.oidc_groups_claim);
-    oidc.clock_skew_seconds = config.oidc_clock_skew_seconds;
-    Some(oidc)
+#[cfg(test)]
+pub(crate) fn oidc_config(config: &Config) -> Option<lakehouse_auth::OidcConfig> {
+    let sso = crate::runtime_settings::resolve_sso(config, None, None);
+    sso.is_configured().then(|| sso.to_oidc_config())
 }
 
 /// The Phase 2 Postgres pool, or `None` when there is nothing to connect to.
@@ -773,8 +754,6 @@ impl AppState {
             local: Arc::new(LocalPasswordAuthenticator::new((**pool).clone())),
             session: Arc::new(SessionAuthenticator::new((**pool).clone())),
             service: Arc::new(ServiceTokenAuthenticator::new((**pool).clone())),
-            oidc: oidc_config(&config)
-                .map(|oidc_config| Arc::new(OidcAuthenticator::new(oidc_config, (**pool).clone()))),
         });
         // `TrinoConfig::new` supplies the documented `max_rows`/`paging_cap`
         // defaults; only `base_url` and `max_rows` are overridden from
@@ -843,6 +822,12 @@ impl AppState {
             &config,
             connector_secret_store.keyring().ok(),
         );
+        // `ADM-12` D4/D10: the SSO runtime is built on the first request
+        // that needs it, by `runtime_settings::sso_runtime`, because the
+        // checks it makes (the issuer's address, the provider's discovery
+        // document) need the resolved config and the pool this constructor
+        // is still assembling.
+        let initial_oidc: Option<crate::runtime_settings::SwappableOidc> = None;
         let upload_receive = ReceiveLimiter::new(
             config.upload_max_concurrent_per_user,
             config.upload_max_concurrent,
@@ -868,6 +853,7 @@ impl AppState {
             clickhouse,
             dagster: Arc::new(dagster),
             llm: Arc::new(RwLock::new(llm)),
+            oidc: Arc::new(RwLock::new(initial_oidc)),
             pg,
             db_ready: Arc::new(AtomicBool::new(false)),
             connector_secret_resolver: connector_secret_resolver(
@@ -901,9 +887,12 @@ impl AppState {
             email_settings_cache: crate::runtime_settings::email_cache(),
             sign_in_settings_cache: crate::runtime_settings::sign_in_cache(),
             assistant_settings_cache: crate::runtime_settings::assistant_cache(),
+            sso_settings_cache: crate::runtime_settings::sso_cache(),
             email_test_limiter: Arc::new(crate::runtime_settings::TestEmailLimiter::new()),
             #[cfg(test)]
             webhook_sender_override: None,
+            #[cfg(test)]
+            sso_http_override: None,
         }
     }
 
@@ -917,6 +906,21 @@ impl AppState {
             return sender.clone();
         }
         crate::webhook_guard::sender(&self.config)
+    }
+
+    /// The HTTP client a console-set SSO connection dials through
+    /// (`ADM-12` review round 1, B1): the test override when one is set, else
+    /// `None`, and the runtime builds its own pinned client. Compiled out
+    /// of every non-test build with the field it reads.
+    #[must_use]
+    pub fn sso_http_client(&self) -> Option<reqwest::Client> {
+        #[cfg(test)]
+        if let Some(client) = &self.sso_http_override {
+            return Some(client.clone());
+        }
+        #[cfg(not(test))]
+        let _ = self;
+        None
     }
 
     /// Whether `GET /health` should report the application database as

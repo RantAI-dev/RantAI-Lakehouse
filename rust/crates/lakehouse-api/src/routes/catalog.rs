@@ -287,18 +287,41 @@ pub async fn list(
         Ok(limit) => limit,
         Err(err) => return ApiRejection(err).into_response(),
     };
+    // GOV-7 D6: the SHARED snapshot is read first and filtered per caller
+    // after it, never cached narrowed.
+    let access = match table_access_for(&state, &principal).await {
+        Ok(access) => access,
+        Err(err) => return ApiRejection(err).into_response(),
+    };
     if let Some(term) = params.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
         return match search_snapshot(&state).await {
             Ok(snapshot) => {
-                let outcome = catalog_search::search(&snapshot.index, &snapshot.usage, term, limit);
+                // A narrowed caller's count must be of the tables it may see,
+                // so it searches the whole ranked list and counts after the
+                // filter; an unrestricted caller keeps the limit in the index.
+                let search_limit = if access.is_all() { limit } else { None };
+                let outcome =
+                    catalog_search::search(&snapshot.index, &snapshot.usage, term, search_limit);
+                let mut assets = outcome.assets;
+                retain_visible(&access, &mut assets);
                 let mut body = json!({
-                    "assets": outcome.assets,
-                    "namespaces": snapshot.namespaces,
+                    "assets": assets,
+                    "namespaces": build_namespaces(&assets),
                 });
                 // `DATA-41` D3: the count of every match, so a caller that
                 // asked for a few of them still knows how many there are.
-                if limit.is_some() {
-                    body["total"] = json!(outcome.total);
+                // An unrestricted caller's count is the search's own (the
+                // index applied the limit after ranking); a narrowed one's is
+                // the visible matches it filtered above.
+                if let Some(limit) = limit {
+                    let total = if access.is_all() {
+                        outcome.total
+                    } else {
+                        assets.len()
+                    };
+                    assets.truncate(limit);
+                    body["assets"] = json!(assets);
+                    body["total"] = json!(total);
                 }
                 if snapshot.column_search_partial {
                     body["columnSearch"] = json!("partial");
@@ -312,16 +335,19 @@ pub async fn list(
         Ok((mut body, _bronze_pairs)) => {
             // `DATA-41` D3: the same limit on the live registry, and the
             // same count of what it held.
+            let mut assets = body
+                .get("assets")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            retain_visible(&access, &mut assets);
             if let Some(limit) = limit {
-                let total = body
-                    .get("assets")
-                    .and_then(Value::as_array)
-                    .map_or(0, Vec::len);
-                if let Some(assets) = body.get_mut("assets").and_then(Value::as_array_mut) {
-                    assets.truncate(limit);
-                }
+                let total = assets.len();
+                assets.truncate(limit);
                 body["total"] = json!(total);
             }
+            body["namespaces"] = json!(build_namespaces(&assets));
+            body["assets"] = json!(assets);
             (StatusCode::OK, ApiJson(body)).into_response()
         }
         Err(err) => list_unavailable(err),
@@ -492,6 +518,11 @@ pub async fn query(
     // same order as keeping the matches and sorting them would
     // (`apply_sort` is a total order, `id` included), and it lets the
     // filters run over the rows the route already owns.
+    //
+    // `GOV-7` D6: the shared snapshot's rows are filtered per caller here,
+    // before anything is counted or paged, so a hidden table is never in the
+    // answer or its `totalItems`.
+    retain_visible(&table_access_for(&state, &principal).await?, &mut filtered);
     order_results(&mut filtered, term.is_some(), &sort);
     // `DATA-41` D6: with no filters the rows are not copied at all.
     catalog_query::apply_filters(&mut filtered, &filters, join);
@@ -866,6 +897,7 @@ fn assemble_bronze_rows(
             let updated_at = str_col(c, "updated_at");
             let mut row = bronze_catalog_row(
                 slug,
+                str_col(c, "table_name"),
                 str_col(c, "title"),
                 sekunder,
                 owner,
@@ -1454,8 +1486,23 @@ async fn enrich_bronze_assets(
 /// row builder and filled in afterward by `list`'s Iceberg enrichment when
 /// the row's `table_name` names a real Bronze Iceberg table; `health` is
 /// not measured at all — see the module comment above.
+///
+/// `table_key` is the registry's `table_name` as the rule addresses it:
+/// `bronze.<table_name>`, the same key [`bronze_asset_detail_body`] emits,
+/// and `null` when the registry records no table name. `GOV-7` D9: without
+/// it this row's `id` (a registry slug with no dot) names no table, so
+/// [`asset_table_key`] found no key and every narrowed role lost the row
+/// from its lists whatever it was granted (`GOV-7` S2 review 1 B2).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the list-row twin of `bronze_detail_body`, which carries the \
+              same allow for the same reason: every argument is a distinct \
+              already-fetched registry value with no natural grouping, so a \
+              wrapper struct would just move the same fields one level up"
+)]
 fn bronze_catalog_row(
     slug: &str,
+    table_name: &str,
     title: &str,
     sekunder: bool,
     owner: &str,
@@ -1484,6 +1531,10 @@ fn bronze_catalog_row(
         "lastUpdated": last_updated,
         "health": "unknown",
         "residency": TENANT_RESIDENCY.as_str(),
+        // The key the rule and the other reads address this dataset by. It
+        // is the registry's own table name, never the slug: the slug is the
+        // dataset's identity, the table key is what a grant names.
+        "tableKey": bronze_table_key(table_name).map_or(Value::Null, Value::String),
     })
 }
 
@@ -1725,10 +1776,30 @@ pub async fn detail(
         )
             .into_response());
     }
+    // GOV-7 D6: a hidden asset answers the SAME 404 an unknown id answers
+    // (D2), before its columns or rows are read.
+    let access = table_access_for(&state, &principal).await?;
     if id.starts_with("silver.") || id.starts_with("serving.") {
+        if !access.allows_key(&id) {
+            return Err(asset_not_found().into());
+        }
         return clickhouse_asset_detail(&state, &principal, &headers, &id).await;
     }
-    bronze_asset_detail(&state, &principal, &headers, &id).await
+    // A Bronze id is a registry slug; the body names the table it serves
+    // (`tableKey`), so the registry answers the question, not a guess.
+    match bronze_asset_detail_body(&state, &principal, &headers, &id).await {
+        Ok(Some(body)) if asset_visible(&access, &body) => {
+            Ok((StatusCode::OK, ApiJson(body)).into_response())
+        }
+        Ok(_) => Err(not_found()),
+        // `catch (e) { return NextResponse.json({ error: String(e) }, {
+        // status: 503 }); }` in `catalog/[id]/route.ts`.
+        Err(err) => Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            ApiJson(json!({ "error": upstream_message(err) })),
+        )
+            .into_response()),
+    }
 }
 
 /// The permission reading an asset's rows needs — the same one
@@ -2327,6 +2398,12 @@ pub async fn sample(
         .unwrap_or(DETAIL_SAMPLE_ROWS)
         .clamp(1, SAMPLE_MAX_ROWS);
     let source = super::catalog_profile::resolve_source(&state, &id).await?;
+    // GOV-7 D6: the asset's own table is hidden from this principal, so the
+    // sample does not exist for it either (the same 404 as an unknown id).
+    if let Some(source) = source.as_ref() {
+        let access = table_access_for(&state, &principal).await?;
+        ensure_key_readable_with(&access, &source.policy_key)?;
+    }
     let (rows, _) = governed_sample(&state, &principal, &headers, source.as_ref(), limit).await;
     Ok(ApiJson(json!({ "rows": rows, "limit": limit })))
 }
@@ -2582,25 +2659,6 @@ async fn clickhouse_asset_detail(
     mark_schema_versions(ch, &mut body, &key).await;
     mark_annotation_and_history(state, &mut body, id, &[key]).await;
     Ok((StatusCode::OK, ApiJson(body)).into_response())
-}
-
-async fn bronze_asset_detail(
-    state: &AppState,
-    principal: &Principal,
-    headers: &HeaderMap,
-    id: &str,
-) -> ApiResult<Response> {
-    match bronze_asset_detail_body(state, principal, headers, id).await {
-        Ok(Some(body)) => Ok((StatusCode::OK, ApiJson(body)).into_response()),
-        Ok(None) => Err(not_found()),
-        // `catch (e) { return NextResponse.json({ error: String(e) }, {
-        // status: 503 }); }` in `catalog/[id]/route.ts`.
-        Err(err) => Ok((
-            StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": upstream_message(err) })),
-        )
-            .into_response()),
-    }
 }
 
 #[allow(
@@ -3106,7 +3164,7 @@ fn bronze_detail_body(
         "tableName": if table_name.is_empty() { Value::Null } else { json!(table_name) },
         // The key the lineage graph, policies and quality rules name this
         // dataset by: its Bronze table, not the registry slug in `id`.
-        "tableKey": if table_name.is_empty() { Value::Null } else { json!(format!("bronze.{table_name}")) },
+        "tableKey": bronze_table_key(table_name).map_or(Value::Null, Value::String),
         "_meta": {
             "frekuensi": frekuensi,
             "satuan": satuan,
@@ -3116,7 +3174,118 @@ fn bronze_detail_body(
 }
 
 fn not_found() -> ApiRejection {
-    ApiError::NotFound("Asset not found".to_owned()).into()
+    asset_not_found().into()
+}
+
+/// `GOV-7` D2/D6: an asset a role's table access hides answers the SAME 404
+/// an unknown id answers, so the refusal is not an oracle.
+fn asset_not_found() -> ApiError {
+    ApiError::NotFound("Asset not found".to_owned())
+}
+
+/// The principal's table access for a catalog read (`GOV-7` D6). A store that
+/// cannot answer refuses the read through `StoreError`'s classified mapping
+/// rather than answering "everything is visible".
+pub(crate) async fn table_access_for(
+    state: &AppState,
+    principal: &Principal,
+) -> Result<crate::table_access::TableAccess, ApiError> {
+    Ok(crate::table_access::for_roles(state.pg.as_deref(), &principal.role_names).await?)
+}
+
+/// The canonical `schema.table` key a catalog row or detail body names, or
+/// `None` when it names none: a Bronze row carries `tableKey` — the
+/// registry's `table_name` as `bronze.<table_name>`, `null` when the
+/// registry records none — and a Silver/Gold row's `id` IS its table key
+/// (`silver.<name>`/`serving.<name>`). `GOV-7` D9: the list row carries the
+/// key too, so the rule finds a Bronze row that a grant covers.
+pub(crate) fn asset_table_key(asset: &Value) -> Option<&str> {
+    if let Some(key) = asset
+        .get("tableKey")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+    {
+        return Some(key);
+    }
+    asset
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| id.contains('.'))
+}
+
+/// The canonical key a Bronze dataset's table is addressed by, or `None`
+/// when the registry records no table name. One definition for the three
+/// places that build it — [`bronze_catalog_row`], [`bronze_detail_body`] and
+/// [`ensure_asset_readable`] — so the literal cannot drift between them and
+/// stays out of the list row, where it made the R11 text guard read a
+/// `count(` of `system.parts` as a count of a Bronze table (`GOV-7` S2, CI
+/// on #468).
+fn bronze_table_key(table_name: &str) -> Option<String> {
+    (!table_name.is_empty()).then(|| format!("bronze.{table_name}"))
+}
+
+/// Whether `asset` may be listed for a principal holding `access`. An asset
+/// whose table cannot be named is hidden from a narrowed principal: nothing
+/// proves the grant covers it (fail closed, `GOV-7` D6).
+pub(crate) fn asset_visible(access: &crate::table_access::TableAccess, asset: &Value) -> bool {
+    if access.is_all() {
+        return true;
+    }
+    asset_table_key(asset).is_some_and(|key| access.allows_key(key))
+}
+
+/// `GOV-7` D6: drop every asset of `assets` the principal's roles hide, in
+/// place. Callers pass the SHARED snapshot's rows, never a cached per-person
+/// answer.
+pub(crate) fn retain_visible(access: &crate::table_access::TableAccess, assets: &mut Vec<Value>) {
+    if access.is_all() {
+        return;
+    }
+    assets.retain(|asset| asset_visible(access, asset));
+}
+
+/// `GOV-7` D6: the 404 a hidden asset answers, for the `/api/catalog/{id}/…`
+/// reads that do not assemble the asset themselves. A Silver/Gold id names
+/// its own key; a Bronze id names a slug, whose table the registry knows
+/// (`catalog_profile::bronze_table_name`).
+pub(crate) async fn ensure_asset_readable(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+) -> Result<(), ApiError> {
+    let access = table_access_for(state, principal).await?;
+    if access.is_all() {
+        return Ok(());
+    }
+    let key = if id.starts_with("silver.") || id.starts_with("serving.") {
+        id.to_owned()
+    } else {
+        let table_name = super::catalog_profile::bronze_table_name(state, id).await?;
+        match bronze_table_key(&table_name) {
+            Some(key) => key,
+            // An empty registry name keeps the key this site has always built
+            // (`bronze.`) rather than refusing outright: a role granted the
+            // whole `bronze` schema still reads it and a narrower one still
+            // gets the same 404, so the outcome does not change (`GOV-7` S2,
+            // CI on #468).
+            None => "bronze.".to_owned(),
+        }
+    };
+    ensure_key_readable_with(&access, &key)
+}
+
+/// [`ensure_asset_readable`] over an already canonical `"schema.table"` key
+/// (the one a resolved `ReadSource` carries).
+pub(crate) fn ensure_key_readable_with(
+    access: &crate::table_access::TableAccess,
+    key: &str,
+) -> Result<(), ApiError> {
+    if access.allows_key(key) {
+        Ok(())
+    } else {
+        Err(asset_not_found())
+    }
 }
 
 // WS2 §13 — GET/PUT /api/catalog/{id}/annotation. See the module doc above
@@ -3317,6 +3486,9 @@ pub async fn get_annotation(
         return Err(ApiError::PermissionDenied(reason.to_owned()).into());
     }
     validate_annotation_id(&id)?;
+    // GOV-7 D6: a hidden asset's annotation answers the same 404 as an
+    // unknown id, before any row is read.
+    ensure_asset_readable(&state, &principal, &id).await?;
     ensure_asset_exists(&state, &id).await?;
     let pool = annotation_pool(&state)?;
     let row = lakehouse_store::annotation::get_annotation(pool, &id).await?;
@@ -4153,6 +4325,7 @@ mod tests {
     fn catalog_rows_never_invent_size_freshness_or_health() {
         let bronze = bronze_catalog_row(
             "slug-1",
+            "slug-1",
             "Title",
             false,
             "owner",
@@ -4747,6 +4920,7 @@ mod tests {
 
     fn bronze_row_with_id(slug: &str) -> Value {
         bronze_catalog_row(
+            slug,
             slug,
             "Title",
             false,
@@ -8162,6 +8336,7 @@ mod tests {
                     let updated_at = str_col(c, "updated_at");
                     let mut row = bronze_catalog_row(
                         slug,
+                        str_col(c, "table_name"),
                         str_col(c, "title"),
                         sekunder,
                         owner.as_str(),

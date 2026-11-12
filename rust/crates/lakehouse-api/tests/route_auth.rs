@@ -294,6 +294,54 @@ async fn a_seeded_analyst_is_denied_the_four_hardened_permission_families() {
     }
 }
 
+/// `GOV-7` D7: a role's table access is read with `identity:read` and changed
+/// with `identity:write` — both directions, with real principals. A holder of
+/// the read alone may look, never change; a holder of the write alone may
+/// change, never look; a seeded Analyst (neither) is refused both.
+#[tokio::test]
+async fn the_role_table_access_routes_split_read_from_write() {
+    let TestApp { router, pool } = spin_up().await;
+    let role = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO role (id, name, permissions) VALUES ($1, 'Gov7 Route Role', 'query:read')",
+    )
+    .bind(role)
+    .execute(&pool)
+    .await
+    .expect("insert the role the route addresses");
+    let path = format!("/api/identity/roles/{role}/table-access");
+
+    let reader = create_principal_with_permissions(&pool, "identity:read").await;
+    let writer = create_principal_with_permissions(&pool, "identity:write").await;
+    let reader_cookie = session_cookie_for_user(&pool, reader).await;
+    let writer_cookie = session_cookie_for_user(&pool, writer).await;
+    let analyst = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    for (method, cookie, expect_forbidden) in [
+        ("GET", &reader_cookie, false),
+        ("PUT", &reader_cookie, true),
+        ("PUT", &writer_cookie, false),
+        ("GET", &writer_cookie, true),
+        ("GET", &analyst, true),
+        ("PUT", &analyst, true),
+    ] {
+        let resp = request_with_cookie(&router, method, &path, cookie).await;
+        let status = resp.status();
+        if expect_forbidden {
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{method} {path}: this principal must be denied"
+            );
+        } else {
+            assert!(
+                !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN),
+                "{method} {path}: this principal must pass the auth gate, got {status}"
+            );
+        }
+    }
+}
+
 /// `BI-19` part C (C3): `/api/alerts` is "signed in" at the router, because a
 /// person who can view a chart may alert on it for themselves; the handler asks
 /// for `alert:write` for everything else. Both directions, with real principals:
@@ -727,6 +775,13 @@ async fn the_sign_in_and_assistant_settings_routes_are_refused_without_settings_
         ("GET", "/api/settings/assistant"),
         ("PUT", "/api/settings/assistant"),
         ("POST", "/api/settings/assistant/test"),
+        ("GET", "/api/settings/sso"),
+        ("PUT", "/api/settings/sso"),
+        ("POST", "/api/settings/sso/test"),
+        (
+            "GET",
+            "/api/settings/sso/test/00000000-0000-0000-0000-000000000001",
+        ),
     ] {
         let resp = request_with_cookie(&router, method, path, &analyst).await;
         assert_eq!(
@@ -749,11 +804,54 @@ async fn a_platform_admin_is_not_refused_the_sign_in_and_assistant_settings_rout
         ("GET", "/api/settings/assistant"),
         ("PUT", "/api/settings/assistant"),
         ("POST", "/api/settings/assistant/test"),
+        ("GET", "/api/settings/sso"),
+        ("PUT", "/api/settings/sso"),
+        ("POST", "/api/settings/sso/test"),
+        (
+            "GET",
+            "/api/settings/sso/test/00000000-0000-0000-0000-000000000001",
+        ),
     ] {
         let resp = request_with_cookie(&router, method, path, &admin).await;
         assert_ne!(resp.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
         assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{method} {path}");
     }
+}
+
+/// `ADM-12` plan D5: a caller with `settings:write` alone (not `*:*`) may
+/// read `GET /api/settings/sso` (which reports `canEdit = false`), but is
+/// refused with 403 on `PUT /api/settings/sso`, `POST /api/settings/sso/test`,
+/// and `GET /api/settings/sso/test/{id}` — role mapping can grant Platform Admin.
+#[tokio::test]
+async fn sso_settings_write_alone_is_denied_put_and_test() {
+    let TestApp { router, pool } = spin_up().await;
+    let user_id = create_principal_with_permissions(&pool, "settings:write").await;
+    let cookie = session_cookie_for_user(&pool, user_id).await;
+
+    // GET /api/settings/sso succeeds and reports canEdit: false.
+    let get_resp = request_with_cookie(&router, "GET", "/api/settings/sso", &cookie).await;
+    assert_eq!(get_resp.status(), StatusCode::OK);
+    let bytes = to_bytes(get_resp.into_body(), 64 * 1024).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["canEdit"], false);
+
+    // PUT /api/settings/sso is forbidden (403).
+    let put_resp = request_with_cookie(&router, "PUT", "/api/settings/sso", &cookie).await;
+    assert_eq!(put_resp.status(), StatusCode::FORBIDDEN);
+
+    // POST /api/settings/sso/test is forbidden (403).
+    let test_resp = request_with_cookie(&router, "POST", "/api/settings/sso/test", &cookie).await;
+    assert_eq!(test_resp.status(), StatusCode::FORBIDDEN);
+
+    // GET /api/settings/sso/test/{id} is forbidden (403).
+    let test_get_resp = request_with_cookie(
+        &router,
+        "GET",
+        "/api/settings/sso/test/00000000-0000-0000-0000-000000000001",
+        &cookie,
+    )
+    .await;
+    assert_eq!(test_get_resp.status(), StatusCode::FORBIDDEN);
 }
 
 /// `DATA-12` D1: `PUT /api/catalog/{id}/certification` needs
@@ -1711,6 +1809,59 @@ async fn governance_write_only_principal_may_put_but_not_get_sla() {
         put_resp.status(),
         StatusCode::UNAUTHORIZED,
         "a valid session must never be treated as unauthenticated"
+    );
+}
+
+/// `WEB-8` S2 T8 (D8): `GET /api/governance/row-filter-grammar` needs
+/// `policy:read` and nothing less, asserted both ways: no session is 401, a
+/// principal with another permission is 403, and a `policy:read` holder gets
+/// past the gate with the grammar's two lists.
+#[tokio::test]
+async fn row_filter_grammar_route_needs_policy_read_both_ways() {
+    let TestApp { router, pool } = spin_up().await;
+    let uri = "/api/governance/row-filter-grammar";
+
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "GET" && *p == uri)
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("policy:read")),
+    );
+
+    let none = request_with_cookie(&router, "GET", uri, "").await;
+    assert_eq!(none.status(), StatusCode::UNAUTHORIZED);
+
+    let analyst = create_principal_with_permissions(&pool, "query:read").await;
+    let analyst_cookie = session_cookie_for_user(&pool, analyst).await;
+    let refused = request_with_cookie(&router, "GET", uri, &analyst_cookie).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+
+    let reader = create_principal_with_permissions(&pool, "policy:read").await;
+    let reader_cookie = session_cookie_for_user(&pool, reader).await;
+    let allowed = request_with_cookie(&router, "GET", uri, &reader_cookie).await;
+    assert_eq!(allowed.status(), StatusCode::OK);
+    let body = to_bytes(allowed.into_body(), usize::MAX)
+        .await
+        .expect("the grammar body reads");
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("the body is JSON");
+    assert!(
+        body["functions"]
+            .as_array()
+            .is_some_and(|functions| !functions.is_empty()),
+        "the route answers its functions: {body}"
+    );
+    assert!(
+        body["operators"]
+            .as_array()
+            .is_some_and(|operators| !operators.is_empty()),
+        "the route answers its operators: {body}"
+    );
+    assert!(
+        body["forms"]
+            .as_array()
+            .is_some_and(|forms| !forms.is_empty()),
+        "the route answers its forms: {body}"
     );
 }
 

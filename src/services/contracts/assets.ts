@@ -111,6 +111,18 @@ export type Asset = {
    * hit, so `value` is `""` and `approximate` is true.
    */
   matchedOn?: { field: string; value: string; approximate: boolean }
+  /**
+   * The `<schema>.<table>` key the lineage graph, policies and quality rules
+   * name this asset by. A Bronze list row carries `bronze.<table_name>` —
+   * the registry's own table name beside the `id` slug — or `null` when the
+   * registry records no table name (`GOV-7` D9, `bronze_catalog_row`). A
+   * Silver or Gold list row carries none: its `id` already is its key, and
+   * its builder emits no `tableKey` (`silver_catalog_row`,
+   * `gold_catalog_row`). The detail body of every asset carries it
+   * (`clickhouse_detail_body`, `bronze_detail_body`). Absent from an older
+   * API build; fall back to `id` then.
+   */
+  tableKey?: string | null
 }
 
 /**
@@ -297,14 +309,6 @@ export type AssetDetail = Asset & {
    * clearing an annotated field falls back to.
    */
   registry?: { owner: string | null; description: string | null }
-  /**
-   * The `<namespace>.<table>` key the lineage graph, policies and quality
-   * rules name this asset by — `bronze.orders` for a Bronze dataset whose
-   * `id` is the registry slug, the id itself for `silver.*`/`serving.*`.
-   * `null` when the registry recorded no table, absent from an older API
-   * build; fall back to `id` then.
-   */
-  tableKey?: string | null
   /**
    * The classification rules in force for this asset — the asset's own
    * first, then one per classified column — each removable by its id. An

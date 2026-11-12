@@ -42,7 +42,8 @@ import { STOPPED_SENTENCE } from "@/lib/query-limits";
 import { apiFetch } from "@/services/http";
 import { useAutoRefresh } from "./auto-refresh";
 import { BoardSwitcher } from "./board-switcher";
-import { ChartBuilder, type ChartDef } from "./chart-builder";
+import type { ChartDef } from "./chart-builder";
+import { chartEditHref, chartNewHref } from "./chart-page";
 import { fmtInt } from "./chart-option";
 import { DashboardActionsMenu, EditLayoutButton, NewChartButton, RenameDashboardDialog } from "./dashboard-actions";
 import { chartWriteItems } from "./tile-write-items";
@@ -222,7 +223,6 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const pValues = React.useMemo(() => readParamsParam(pParam), [pParam]);
   const [paramsOpen, setParamsOpen] = React.useState(false);
   const [savingDefault, setSavingDefault] = React.useState(false);
-  const [editing, setEditing] = React.useState<{ id: string; def: ChartDef } | null>(null);
   // Tile delete is one click away, so it asks first.
   const [removing, setRemoving] = React.useState<{ id: string; title: string } | null>(null);
   const [removeBusy, setRemoveBusy] = React.useState(false);
@@ -267,7 +267,6 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const reloadShortcuts = shortcuts.reload;
   const isFavourite = shortcuts.status === "success" && shortcuts.data.favourites.some((f) => f.kind === "board" && f.id === board);
   React.useEffect(() => { void dashboardService.touchRecent("board", board).catch(() => undefined); }, [board]);
-  const [newChartOpen, setNewChartOpen] = React.useState(false);
   const [fullscreen, setFullscreen] = React.useState(false);
   // Auto-refresh starts from the board's saved interval; a viewer's change is
   // this session's only (null = follow the saved one) and is never written
@@ -853,19 +852,10 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       setError(e instanceof Error ? e.message : String(e));
     }
   };
-  // A chart made while another tab is open lands on that tab, not on the first.
-  const loadAndPlace = async () => {
-    const known = new Set(chartIds);
-    const json = await load();
-    if (!json || !canWrite || tabs.length < 2 || !selTab || selTab === tabs[0].id) return;
-    const added = (json.charts ?? []).filter((c) => !known.has(c.id) && !(c.id in (json.layout ?? {})));
-    if (added.length === 0) return;
-    const onTab = tilesOnTab(tabs, json.layout ?? {}, (json.charts ?? []).map((c) => c.id), selTab);
-    let y = onTab.reduce((m, id) => Math.max(m, (json.layout?.[id]?.y ?? 0) + (json.layout?.[id]?.h ?? 0)), 0);
-    const next: LayoutMap = { ...(json.layout ?? {}) };
-    for (const c of added) { next[c.id] = { x: 0, y, w: c.span === 2 ? 12 : 6, h: 6, tab: selTab }; y += 6; }
-    try { await putBoard({ layout: next }); await load(); } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
-  };
+  // `WEB-7` D6: a chart is built on its own page now, and saving it returns
+  // to `/dashboards/<id>`, which reloads the board. The chart with no stored
+  // box is drawn where the board draws such charts (the tab as shown), so
+  // the old in-place placement on the open tab is gone with the dialog.
 
   // Tell Copilot what is on this dashboard — the built-in one included.
   const {
@@ -1070,7 +1060,9 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     const downloadKind = downloadMenuKind({ own, hasRows: hasRows(cell) && cell.rows.length > 0 }, canDownload);
     const write = chartWriteItems({
       canWrite, own, hasDef: Boolean(spec.def),
-      onEdit: () => setEditing({ id: spec.id, def: spec.def as ChartDef }),
+      // `WEB-7` D6: editing a chart is its own page, carrying the parameter
+      // values the dashboard shows so its preview matches this one.
+      onEdit: () => router.push(chartEditHref(board, spec.id, data?.appliedParams)),
       onDelete: () => setRemoving({ id: spec.id, title: spec.title }),
     });
     const menu: TileMenuItem[] = [
@@ -1269,7 +1261,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
                 <SlidersHorizontal className="size-4" /> Parameters
               </Button>
             ) : null}
-            <NewChartButton canWrite={canWrite} onClick={() => setNewChartOpen(true)} />
+            <NewChartButton canWrite={canWrite} onClick={() => router.push(chartNewHref(board, data?.appliedParams))} />
           </span>
         }
       />
@@ -1338,7 +1330,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
             </EmptyDescription>
           </EmptyHeader>
           <EmptyContent className="flex-row justify-center gap-2">
-            <NewChartButton canWrite={canWrite} onClick={() => setNewChartOpen(true)} />
+            <NewChartButton canWrite={canWrite} onClick={() => router.push(chartNewHref(board, data?.appliedParams))} />
             <Button
               size="sm"
               variant="outline"
@@ -1433,16 +1425,6 @@ export function DashboardPage({ boardId }: { boardId: string }) {
           onToggleShown={(name, on) => void toggleShownParam(name, on)}
           onChanged={() => void load()}
         />
-      ) : null}
-      {editing ? (
-        <ChartBuilder hideTrigger open={!!editing} onOpenChange={(o) => { if (!o) setEditing(null); }}
-          editId={editing.id} initial={editing.def} board={board} boards={boards} paramValues={data?.appliedParams}
-          onSaved={() => { setEditing(null); void load(); }} />
-      ) : null}
-      {newChartOpen ? (
-        <ChartBuilder hideTrigger open onOpenChange={setNewChartOpen}
-          board={board} boards={boards} paramValues={data?.appliedParams}
-          onSaved={() => { setNewChartOpen(false); void loadAndPlace(); }} />
       ) : null}
 
       {drill ? (

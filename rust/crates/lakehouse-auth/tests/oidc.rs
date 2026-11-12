@@ -120,6 +120,10 @@ struct Claims<'a> {
     name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     preferred_username: Option<&'a str>,
+    /// The provider's `email_verified` claim (`SEC-65`). `None` is a token
+    /// that did not carry it — the same as `Some(false)` for the link rule.
+    #[serde(rename = "email_verified", skip_serializing_if = "Option::is_none")]
+    email_verified: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     groups: Option<Vec<&'a str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -142,6 +146,9 @@ impl<'a> Claims<'a> {
             email: None,
             name: None,
             preferred_username: None,
+            // `SEC-65` D1: a token that carries no `email_verified` claim
+            // never joins an existing account by email.
+            email_verified: None,
             groups: None,
             nonce: None,
             claim_names: None,
@@ -166,6 +173,18 @@ fn authenticator(server: &MockServer, pool: PgPool, ttl: Duration, jit: bool) ->
     let mut config = OidcConfig::new(ISSUER, CLIENT_ID, "test", jwks_url.clone());
     config.jit_provisioning = jit;
     let jwks = JwksClient::with_ttl(jwks_url, ttl);
+    OidcAuthenticator::with_jwks_client(config, jwks, pool)
+}
+
+/// The same as [`authenticator`] with JIT on, but with this connection
+/// marked as trusting its provider's emails (`SEC-65` D3): the tokens these
+/// tests mint need no `email_verified` claim to join an account.
+fn trusted_authenticator(server: &MockServer, pool: PgPool) -> OidcAuthenticator {
+    let jwks_url = format!("{}/jwks", server.uri());
+    let mut config = OidcConfig::new(ISSUER, CLIENT_ID, "test", jwks_url.clone());
+    config.jit_provisioning = true;
+    config.trust_email = true;
+    let jwks = JwksClient::with_ttl(jwks_url, Duration::from_secs(300));
     OidcAuthenticator::with_jwks_client(config, jwks, pool)
 }
 
@@ -521,6 +540,9 @@ async fn an_unknown_subject_is_provisioned_and_linked_when_jit_is_on(
 
     let mut claims = Claims::valid("brand-new-subject");
     claims.email = Some("new.person@example.com");
+    // `SEC-65` D1: an address is stored only when the provider confirmed it
+    // (or the connection trusts its emails) — so this test says so.
+    claims.email_verified = Some(true);
     claims.name = Some("New Person");
     let token = sign(&claims, &key, Algorithm::RS256);
     let principal = auth
@@ -553,12 +575,14 @@ async fn jit_links_to_an_existing_user_with_the_same_email(pool: PgPool) -> sqlx
     let server = MockServer::start().await;
     let key = TestKey::generate("kid-1");
     mount_jwks(&server, &[&key]).await;
-    let auth = authenticator(&server, pool, Duration::from_secs(300), true);
+    let auth = authenticator(&server, pool.clone(), Duration::from_secs(300), true);
 
     // Rina Wijaya (seeded, `0002_seed_identity.sql`) already has a `local`
     // identity under rina@meridian.example.
     let mut claims = Claims::valid("rina-oidc-subject");
     claims.email = Some("rina@meridian.example");
+    // `SEC-65` D1/AC1: a confirmed email joins the existing account.
+    claims.email_verified = Some(true);
     let token = sign(&claims, &key, Algorithm::RS256);
     let principal = auth
         .authenticate(&Credential::Bearer(Secret::new(token)))
@@ -566,6 +590,213 @@ async fn jit_links_to_an_existing_user_with_the_same_email(pool: PgPool) -> sqlx
         .unwrap();
 
     let rina_id = uuid::Uuid::parse_str(RINA).unwrap();
+    assert_eq!(principal.id.uuid(), rina_id);
+
+    // One account: the join links her existing account, it never creates a
+    // second one with the same address.
+    let accounts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM app_user WHERE lower(email) = 'rina@meridian.example'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(accounts, 1, "a join never creates a second account");
+    let identities: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM auth_identity WHERE app_user_id = $1 AND provider = 'oidc:test'",
+    )
+    .bind(rina_id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        identities, 1,
+        "the provider identity is linked to her account"
+    );
+    Ok(())
+}
+
+// ── `SEC-65`: the email must be confirmed before it joins an account ─────
+
+/// `SEC-65` D1/D2/AC2: an active account holds the address, and the token
+/// does not confirm it (`email_verified: false`, and separately the claim
+/// missing) — the sign-in is refused, no identity is written, and the
+/// existing account is not touched. The refusal is audited with the
+/// provider label and the subject, never the email.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unconfirmed_email_is_refused_for_an_existing_account(pool: PgPool) -> sqlx::Result<()> {
+    let server = MockServer::start().await;
+    let key = TestKey::generate("kid-1");
+    mount_jwks(&server, &[&key]).await;
+    let auth = authenticator(&server, pool.clone(), Duration::from_secs(300), true);
+
+    // Rina Wijaya (seeded, `0002_seed_identity.sql`) is an active account
+    // with a `local` identity under this address.
+    let before: (String, Option<String>, String) =
+        sqlx::query_as("SELECT name, email, status FROM app_user WHERE lower(email) = $1")
+            .bind("rina@meridian.example")
+            .fetch_one(&pool)
+            .await?;
+
+    // `false` and a missing claim are the same thing: not confirmed.
+    for (subject, verified) in [
+        ("unconfirmed-rina-false", Some(false)),
+        ("unconfirmed-rina-absent", None),
+    ] {
+        let mut claims = Claims::valid(subject);
+        claims.email = Some("rina@meridian.example");
+        claims.email_verified = verified;
+        let token = sign(&claims, &key, Algorithm::RS256);
+        let err = auth
+            .authenticate(&Credential::Bearer(Secret::new(token)))
+            .await
+            .expect_err("an unconfirmed email must not join an existing account");
+        assert!(
+            matches!(err, AuthError::EmailNotVerified),
+            "expected EmailNotVerified for verified={verified:?}, got {err:?}"
+        );
+
+        // Nothing was linked: the subject has no `auth_identity` row.
+        let identities: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM auth_identity WHERE provider = 'oidc:test' \
+             AND external_subject = $1",
+        )
+        .bind(subject)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(identities, 0, "no identity row for {subject}");
+
+        // The audit row holds the provider and the subject, never the email.
+        let audit: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM audit_event WHERE action = 'auth.oidc.link_refused' \
+             AND outcome = 'refused' AND args->>'provider' = 'oidc:test' \
+             AND args->>'subject' = $1",
+        )
+        .bind(subject)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(audit.0, 1, "one refusal row for {subject}");
+    }
+
+    // The account's row is unchanged, and no second account appeared.
+    let after: (String, Option<String>, String) =
+        sqlx::query_as("SELECT name, email, status FROM app_user WHERE lower(email) = $1")
+            .bind("rina@meridian.example")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(before, after, "the existing account was not changed");
+    let accounts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM app_user WHERE lower(email) = 'rina@meridian.example'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(accounts, 1);
+
+    let with_email: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_event WHERE args::text LIKE '%rina@meridian.example%'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(with_email, 0, "the audit row never carries the email");
+    Ok(())
+}
+
+/// `SEC-65` D3/AC3: a connection that trusts its provider's emails joins an
+/// unconfirmed address to the existing account, exactly as a confirmed one
+/// does.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_trusted_connection_joins_an_unconfirmed_email(pool: PgPool) -> sqlx::Result<()> {
+    let server = MockServer::start().await;
+    let key = TestKey::generate("kid-1");
+    mount_jwks(&server, &[&key]).await;
+    let auth = trusted_authenticator(&server, pool.clone());
+
+    let mut claims = Claims::valid("trusted-rina-subject");
+    claims.email = Some("rina@meridian.example");
+    // No `email_verified`: the trust switch is what allows the join.
+    let token = sign(&claims, &key, Algorithm::RS256);
+    let principal = auth
+        .authenticate(&Credential::Bearer(Secret::new(token)))
+        .await
+        .expect("a trusted connection joins on the email");
+    assert_eq!(
+        principal.id.uuid(),
+        uuid::Uuid::parse_str(RINA).unwrap(),
+        "joined to the existing account"
+    );
+    Ok(())
+}
+
+/// `SEC-65` D4/AC4: an unconfirmed email that no account has creates a new
+/// account WITHOUT the email, and the username falls back as it does today
+/// when there is no email at all (`sub@provider` here).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unconfirmed_email_with_no_account_creates_one_without_the_email(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let server = MockServer::start().await;
+    let key = TestKey::generate("kid-1");
+    mount_jwks(&server, &[&key]).await;
+    let auth = authenticator(&server, pool.clone(), Duration::from_secs(300), true);
+
+    let mut claims = Claims::valid("unconfirmed-new-subject");
+    claims.email = Some("unconfirmed-new@example.com");
+    claims.email_verified = Some(false);
+    let token = sign(&claims, &key, Algorithm::RS256);
+    let principal = auth
+        .authenticate(&Credential::Bearer(Secret::new(token)))
+        .await
+        .expect("an unconfirmed email with no account still provisions");
+
+    let (username, email, name): (String, Option<String>, String) =
+        sqlx::query_as("SELECT username, email, name FROM app_user WHERE id = $1")
+            .bind(principal.id.uuid())
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(email, None, "the unconfirmed address is not stored");
+    assert_eq!(
+        username, "unconfirmed-new-subject@test",
+        "the username falls back to sub@provider when the email is not used"
+    );
+    assert_ne!(
+        name, "unconfirmed-new@example.com",
+        "nor is it the display name"
+    );
+    let holders: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM app_user WHERE lower(email) = 'unconfirmed-new@example.com'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(holders, 0);
+    Ok(())
+}
+
+/// `SEC-65` D5/AC5: a person already joined is found by
+/// `(provider, external_subject)` before `provision_user` runs, so they sign
+/// in even when the provider sends no `email_verified` claim.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_subject_already_joined_signs_in_without_an_email_verified_claim(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let server = MockServer::start().await;
+    let key = TestKey::generate("kid-1");
+    mount_jwks(&server, &[&key]).await;
+    let auth = authenticator(&server, pool.clone(), Duration::from_secs(300), true);
+
+    let rina_id = uuid::Uuid::parse_str(RINA).unwrap();
+    sqlx::query(
+        "INSERT INTO auth_identity (provider, external_subject, app_user_id, password_hash) \
+         VALUES ('oidc:test', 'joined-before-sec-65', $1, NULL)",
+    )
+    .bind(rina_id)
+    .execute(&pool)
+    .await?;
+
+    let mut claims = Claims::valid("joined-before-sec-65");
+    claims.email = Some("rina@meridian.example");
+    claims.email_verified = None;
+    let token = sign(&claims, &key, Algorithm::RS256);
+    let principal = auth
+        .authenticate(&Credential::Bearer(Secret::new(token)))
+        .await
+        .expect("an existing join is unchanged by SEC-65");
     assert_eq!(principal.id.uuid(), rina_id);
     Ok(())
 }
@@ -624,40 +855,56 @@ async fn a_deactivated_user_is_not_re_provisioned_by_jit(pool: PgPool) -> sqlx::
     mount_jwks(&server, &[&key]).await;
     let auth = authenticator(&server, pool.clone(), Duration::from_secs(300), true);
 
-    sqlx::query(
-        "INSERT INTO app_user (id, name, username, email, status) \
-         VALUES ($1, 'Switched Off', 'switched-off-jit', 'switched-off-jit@meridian.example', 'inactive')",
-    )
-    .bind(uuid::Uuid::new_v4())
-    .execute(&pool)
-    .await?;
+    // `SEC-65` D2: the deactivated-account refusal comes FIRST and answers
+    // exactly as it did before this task, whether the email was confirmed
+    // or not — so the new refusal can never say "this account exists but is
+    // switched off" by answering differently for a confirmed address.
+    for (ordinal, verified) in [None, Some(true), Some(false)].into_iter().enumerate() {
+        let username = format!("switched-off-jit-{ordinal}");
+        let email = format!("{username}@meridian.example");
+        sqlx::query(
+            "INSERT INTO app_user (id, name, username, email, status) \
+             VALUES ($1, 'Switched Off', $2, $3, 'inactive')",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(&username)
+        .bind(&email)
+        .execute(&pool)
+        .await?;
 
-    let mut claims = Claims::valid("brand-new-subject-for-a-deactivated-account");
-    claims.email = Some("switched-off-jit@meridian.example");
-    let token = sign(&claims, &key, Algorithm::RS256);
-    let err = auth
-        .authenticate(&Credential::Bearer(Secret::new(token)))
-        .await
-        .unwrap_err();
-    assert!(matches!(err, AuthError::InvalidCredentials));
+        let subject = format!("brand-new-subject-for-a-deactivated-account-{ordinal}");
+        let mut claims = Claims::valid(&subject);
+        claims.email = Some(email.as_str());
+        claims.email_verified = verified;
+        let token = sign(&claims, &key, Algorithm::RS256);
+        let err = auth
+            .authenticate(&Credential::Bearer(Secret::new(token)))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AuthError::InvalidCredentials),
+            "a deactivated account answers InvalidCredentials for verified={verified:?}, \
+             not {err:?}"
+        );
 
-    // No second account was created, and the deactivated one was neither
-    // re-activated nor linked to.
-    let users: Vec<(String, String)> =
-        sqlx::query_as("SELECT email, status FROM app_user WHERE email = $1")
-            .bind("switched-off-jit@meridian.example")
-            .fetch_all(&pool)
-            .await?;
-    assert_eq!(users.len(), 1, "no second account: {users:?}");
-    assert_eq!(users[0].1, "inactive");
-    let identities: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM auth_identity WHERE app_user_id IN \
-         (SELECT id FROM app_user WHERE email = $1)",
-    )
-    .bind("switched-off-jit@meridian.example")
-    .fetch_one(&pool)
-    .await?;
-    assert_eq!(identities, 0, "no identity was linked to the account");
+        // No second account was created, and the deactivated one was neither
+        // re-activated nor linked to.
+        let users: Vec<(String, String)> =
+            sqlx::query_as("SELECT email, status FROM app_user WHERE email = $1")
+                .bind(&email)
+                .fetch_all(&pool)
+                .await?;
+        assert_eq!(users.len(), 1, "no second account: {users:?}");
+        assert_eq!(users[0].1, "inactive");
+        let identities: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM auth_identity WHERE app_user_id IN \
+             (SELECT id FROM app_user WHERE email = $1)",
+        )
+        .bind(&email)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(identities, 0, "no identity was linked to the account");
+    }
     Ok(())
 }
 
@@ -907,6 +1154,75 @@ async fn authenticate_with_nonce_reports_a_group_overage_and_maps_no_role(
 // configuration` — the address this change reads when `OIDC_JWKS_URL` is
 // unset. The token's `iss` is the same server URI, because the configured
 // issuer must still match the token exactly.
+
+/// `ADM-12` D10: the same cached read returns the two endpoints a browser
+/// sign-in needs, whichever key-set address the config names. The key set
+/// here is explicit, so the only request is the discovery read.
+#[tokio::test]
+async fn discovery_endpoints_returns_the_authorize_and_token_addresses() {
+    let server = MockServer::start().await;
+    let issuer = server.uri();
+    Mock::given(method("GET"))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/authorize"),
+            "token_endpoint": format!("{issuer}/token"),
+            "jwks_uri": format!("{issuer}/jwks"),
+        })))
+        .mount(&server)
+        .await;
+    let config = OidcConfig::new(issuer.clone(), CLIENT_ID, "test", format!("{issuer}/jwks"));
+    let auth = OidcAuthenticator::with_jwks_client(
+        config,
+        JwksClient::new(format!("{issuer}/jwks")),
+        lazy_pool(),
+    );
+
+    let endpoints = auth
+        .discovery_endpoints()
+        .await
+        .expect("a document naming all three endpoints");
+    assert_eq!(
+        endpoints.authorization_endpoint,
+        format!("{issuer}/authorize")
+    );
+    assert_eq!(endpoints.token_endpoint, format!("{issuer}/token"));
+    assert_eq!(endpoints.jwks_uri, format!("{issuer}/jwks"));
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "one discovery read, no key-set fetch: {requests:?}"
+    );
+}
+
+/// `ADM-12` D10: a thin document (one naming only the key set) is refused
+/// when the sign-in endpoints are asked for, and still serves the
+/// bearer-token path that needs no more than the key set (`SEC-38`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_document_with_no_sign_in_endpoints_is_refused_only_where_they_are_needed(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let server = MockServer::start().await;
+    let key = TestKey::generate("kid-1");
+    let issuer = server.uri();
+    mount_jwks_at(&server, "/keys", &[&key]).await;
+    mount_discovery(&server, &issuer, &format!("{issuer}/keys")).await;
+
+    let auth = discovering_authenticator(&issuer, pool, Duration::from_secs(300), true);
+    let err = auth.discovery_endpoints().await.unwrap_err();
+    assert!(matches!(err, AuthError::InvalidCredentials));
+
+    let mut claims = Claims::valid("user-1");
+    claims.iss = &issuer;
+    let token = sign(&claims, &key, Algorithm::RS256);
+    auth.authenticate(&Credential::Bearer(Secret::new(token)))
+        .await
+        .expect("a thin discovery document must not break the bearer-token path");
+    Ok(())
+}
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_token_verifies_when_the_key_sets_address_comes_from_discovery(

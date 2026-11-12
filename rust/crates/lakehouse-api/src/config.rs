@@ -559,17 +559,16 @@ pub struct Config {
     /// This application's client id as registered with the `OIDC`
     /// provider. `None` when unset.
     pub oidc_client_id: Option<String>,
-    /// `OIDC` client secret. `None` when unset. Reserved for a future
-    /// authorization-code exchange (a login-UI concern, out of this task's
-    /// scope) — `lakehouse_auth::oidc::OidcAuthenticator` verifies already-
-    /// issued bearer tokens against the provider's public JWKS and needs no
-    /// shared secret to do that, so this field is parsed (and kept out of
-    /// `Debug`) but not currently read by anything.
+    /// `OIDC` client secret. `None` when unset. Sent during authorization-code
+    /// exchange at `routes/auth.rs` (`oidc_callback`) when configured. Kept
+    /// out of `Debug`.
     pub oidc_client_secret: Option<String>,
     /// A short, operator-chosen label for the configured provider (e.g.
     /// `"okta"`, `"entra"`). Combined with `"oidc:"` to form
     /// `auth_identity.provider`. Default `"default"`.
     pub oidc_provider_name: String,
+    /// Whether `OIDC_PROVIDER_NAME` was set and non-empty in the environment.
+    pub oidc_provider_name_from_env: bool,
     /// Explicit override for the JWKS endpoint URL. `None` when unset, in
     /// which case `SEC-38` applies: the address is the `jwks_uri` from the
     /// provider's discovery document
@@ -585,14 +584,28 @@ pub struct Config {
     /// for why the default matters. `true` only when `OIDC_JIT_PROVISIONING`
     /// is exactly `"true"`.
     pub oidc_jit_provisioning: bool,
+    /// Whether `OIDC_JIT_PROVISIONING` was set and non-empty in the environment.
+    pub oidc_jit_provisioning_from_env: bool,
+    /// Whether this provider's emails are trusted even when the token does
+    /// not carry `email_verified: true` (`SEC-65` D3). Default `false` —
+    /// the safe value the task establishes. `true` only when
+    /// `OIDC_TRUST_EMAIL` is exactly `"true"` (`AGENTS.md`: booleans from
+    /// the environment are parsed that way).
+    pub oidc_trust_email: bool,
+    /// Whether `OIDC_TRUST_EMAIL` was set and non-empty in the environment.
+    pub oidc_trust_email_from_env: bool,
     /// Maps an `OIDC` group/role claim value to a local `role.name`, parsed
     /// from `OIDC_ROLE_MAP` (e.g.
     /// `"lakehouse-admins=Platform Admin,analysts=Analyst"`). Empty when
     /// unset. See [`parse_role_map`].
     pub oidc_role_map: HashMap<String, String>,
+    /// Whether `OIDC_ROLE_MAP` was set and non-empty in the environment.
+    pub oidc_role_map_from_env: bool,
     /// Which claim in an `OIDC` token carries the caller's groups/roles.
     /// Default `"groups"`.
     pub oidc_groups_claim: String,
+    /// Whether `OIDC_GROUPS_CLAIM` was set and non-empty in the environment.
+    pub oidc_groups_claim_from_env: bool,
     /// Clock-skew tolerance (seconds) `OIDC` token validation applies to
     /// `exp`/`nbf`. Default `60`. An unparseable value falls back to the
     /// default (like [`Self::smtp_port`], not load-bearing enough to fail
@@ -1217,10 +1230,25 @@ impl std::fmt::Debug for Config {
                 &self.oidc_client_secret.as_ref().map(|_| REDACTED),
             )
             .field("oidc_provider_name", &self.oidc_provider_name)
+            .field(
+                "oidc_provider_name_from_env",
+                &self.oidc_provider_name_from_env,
+            )
             .field("oidc_jwks_url", &self.oidc_jwks_url)
             .field("oidc_jit_provisioning", &self.oidc_jit_provisioning)
+            .field(
+                "oidc_jit_provisioning_from_env",
+                &self.oidc_jit_provisioning_from_env,
+            )
+            .field("oidc_trust_email", &self.oidc_trust_email)
+            .field("oidc_trust_email_from_env", &self.oidc_trust_email_from_env)
             .field("oidc_role_map", &self.oidc_role_map)
+            .field("oidc_role_map_from_env", &self.oidc_role_map_from_env)
             .field("oidc_groups_claim", &self.oidc_groups_claim)
+            .field(
+                "oidc_groups_claim_from_env",
+                &self.oidc_groups_claim_from_env,
+            )
             .field(
                 "connector_probe_allow_internal_hosts",
                 &self.connector_probe_allow_internal_hosts,
@@ -1791,13 +1819,21 @@ impl Config {
             oidc_issuer: truthy(env, "OIDC_ISSUER"),
             oidc_client_id: truthy(env, "OIDC_CLIENT_ID"),
             oidc_client_secret: truthy(env, "OIDC_CLIENT_SECRET"),
-            oidc_provider_name: or_default(env, "OIDC_PROVIDER_NAME", "default"),
+            oidc_provider_name: truthy(env, "OIDC_PROVIDER_NAME")
+                .unwrap_or_else(|| "default".to_owned()),
+            oidc_provider_name_from_env: truthy(env, "OIDC_PROVIDER_NAME").is_some(),
             oidc_jwks_url: truthy(env, "OIDC_JWKS_URL"),
             oidc_jit_provisioning: env
                 .get("OIDC_JIT_PROVISIONING")
                 .is_some_and(|v| v == "true"),
+            oidc_jit_provisioning_from_env: truthy(env, "OIDC_JIT_PROVISIONING").is_some(),
+            oidc_trust_email: env.get("OIDC_TRUST_EMAIL").is_some_and(|v| v == "true"),
+            oidc_trust_email_from_env: truthy(env, "OIDC_TRUST_EMAIL").is_some(),
             oidc_role_map: parse_role_map(env.get("OIDC_ROLE_MAP").map_or("", String::as_str)),
-            oidc_groups_claim: or_default(env, "OIDC_GROUPS_CLAIM", "groups"),
+            oidc_role_map_from_env: truthy(env, "OIDC_ROLE_MAP").is_some(),
+            oidc_groups_claim: truthy(env, "OIDC_GROUPS_CLAIM")
+                .unwrap_or_else(|| "groups".to_owned()),
+            oidc_groups_claim_from_env: truthy(env, "OIDC_GROUPS_CLAIM").is_some(),
             connector_probe_allow_internal_hosts: env
                 .get("CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS")
                 .is_some_and(|v| v == "true"),

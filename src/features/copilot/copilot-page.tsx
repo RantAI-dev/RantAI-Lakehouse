@@ -169,7 +169,7 @@ export function CopilotPage() {
             ) : (
               <ChatMessages
                 messages={c.messages} onEdit={c.editAndResend} onDelete={c.deleteMessage} onDismissError={c.clearError} busy={c.busy} error={c.error} onRetry={c.retry}
-                onConfirmTool={c.confirmTool} onCancelTool={c.cancelTool} onCompleteTool={c.completeToolStep} confirmingKey={c.confirmingKey}
+                onConfirmTool={c.confirmTool} onCancelTool={c.cancelTool} confirmingKey={c.confirmingKey}
                 onAnswerAsk={c.answerAskOption} askNotice={c.askNotice}
               />
             )}

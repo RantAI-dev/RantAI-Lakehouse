@@ -137,6 +137,12 @@ pub enum GoldExportError {
     /// any data is written to Iceberg at all.
     #[error("Gold export refused by the policy engine: {0}")]
     PolicyRefused(String),
+    /// `GOV-7` D5: the export reads a table the owner's roles do not
+    /// include. Carried as the answer itself, so the route returns the tenant
+    /// gate's own 404 and sentence (`D2`) instead of folding it into the 422
+    /// above.
+    #[error("{0}")]
+    PolicyTableRefused(ApiError),
     /// `SEC-50`: the tenant gate refused the export before it read
     /// anything. The gate's own error travels as it is, so the caller
     /// sees the status the gate would have answered — a fixed sentence,
@@ -519,10 +525,21 @@ pub(crate) async fn export_batch_sql(
         obligations,
     )
     .await
+    // GOV-7 D5: a table the owner's roles do not include answers the tenant
+    // gate's own 404 through the one mapping every caller uses; every other
+    // refusal keeps this variant's 422 with the fixed sentence.
     .map_err(|err| {
-        GoldExportError::PolicyRefused(
-            crate::policy_engine::enforcement_error_message(&err).to_owned(),
-        )
+        if matches!(
+            err,
+            crate::policy_engine::EnforcementError::TableNotReadable(_)
+                | crate::policy_engine::EnforcementError::Unresolvable
+        ) {
+            GoldExportError::PolicyTableRefused(crate::routes::support::enforcement_refusal(
+                &batch_sql, &err,
+            ))
+        } else {
+            GoldExportError::PolicyRefused(crate::policy_engine::enforcement_error_message(&err))
+        }
     })
 }
 

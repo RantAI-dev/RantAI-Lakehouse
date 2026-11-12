@@ -159,9 +159,7 @@ async fn check_and_rewrite(
         obligations,
     )
     .await
-    .map_err(|err| {
-        ApiError::Unprocessable(crate::policy_engine::enforcement_error_message(&err).to_owned())
-    })?;
+    .map_err(|err| crate::routes::support::enforcement_refusal(&normalized, &err))?;
     Ok((normalized, rewritten))
 }
 

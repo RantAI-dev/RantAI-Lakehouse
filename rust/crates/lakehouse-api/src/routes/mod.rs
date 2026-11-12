@@ -675,6 +675,13 @@ fn governance_static_router() -> Router<AppState> {
             "/api/governance/ingest-runs",
             get(governance::ingest_runs),
         )
+        // WEB-8 S2 T8 (D8): the row filter grammar the console's help line
+        // names, read from the validator's own constants. Static, ahead of
+        // the `{kind}` capture like `lineage`, `policies` and `sla`.
+        .route(
+            "/api/governance/row-filter-grammar",
+            get(governance::row_filter_grammar),
+        )
         .route(
             "/api/governance/policies",
             get(governance::list_policies).post(governance::create_policy_route),
@@ -1166,6 +1173,13 @@ fn identity_router() -> Router<AppState> {
         .route(
             "/api/identity/roles/{id}",
             axum::routing::put(identity::update_role).delete(identity::delete_role),
+        )
+        // GOV-7 D7: what a role may read, per schema and table. Reading the
+        // console's role form needs `identity:read`; changing it is the same
+        // privilege bundle `PUT /api/identity/roles/{id}` edits.
+        .route(
+            "/api/identity/roles/{id}/table-access",
+            get(identity::get_role_table_access).put(identity::put_role_table_access),
         )
         .route(
             "/api/identity/tenants",
@@ -1703,6 +1717,16 @@ pub fn router(state: AppState) -> Router {
             "/api/settings/assistant/test",
             axum::routing::post(settings::post_assistant_test),
         )
+        // The deployment's SSO / OIDC settings (`ADM-12`). See `routes::settings`.
+        .route(
+            "/api/settings/sso",
+            get(settings::get_sso).put(settings::put_sso),
+        )
+        .route(
+            "/api/settings/sso/test",
+            axum::routing::post(settings::post_sso_test),
+        )
+        .route("/api/settings/sso/test/{id}", get(settings::get_sso_test))
         // Time and row limits of charts and Query Studio (`BI-5`); see
         // `routes::query_limits`.
         // Stop (`BI-5`): ends the caller's own queries of one run.

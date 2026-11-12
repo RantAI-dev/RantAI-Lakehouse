@@ -95,6 +95,9 @@ impl From<GoldExportError> for ApiError {
             // own fixed, non-leaking text (`export_batch_sql` never wraps
             // the raw Postgres/sqlparser error), matching AGENTS.md rule 4.
             | GoldExportError::PolicyRefused(_) => Self::Unprocessable(err.to_string()),
+            // GOV-7 D5: a table the owner may not read travels as the answer
+            // itself — the tenant gate's own 404 and sentence (D2).
+            GoldExportError::PolicyTableRefused(refusal) => refusal,
             // SEC-50: the tenant gate's own error travels as it is, so
             // the caller sees the status the gate would have answered
             // (its fixed sentence, never an upstream text).

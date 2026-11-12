@@ -1,62 +1,114 @@
 "use client"
 
 import * as React from "react"
+import Link from "next/link"
+import { useRouter } from "next/navigation"
 import { PlusIcon } from "lucide-react"
 import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
 import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
-import { CreateSheet } from "@/components/patterns/create-sheet"
 import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useDataTable } from "@/hooks/use-data-table"
 import { filterDataClientSide } from "@/lib/data-table"
 import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { useService, useServiceAction } from "@/hooks/use-service"
-import { notifySuccess, withNotify } from "@/lib/notify"
-import { identityService } from "@/services"
+import { notifySuccess } from "@/lib/notify"
+import { identityService, type RoleTableAccess } from "@/services"
 import type { Role } from "@/services/contracts/identity"
-import { getRoleColumns } from "./roles-columns"
-import { PermissionPicker } from "./permission-picker"
+import { getRoleColumns, type RoleRow } from "./roles-columns"
+import { tableAccessSummary } from "./role-table-access"
+
+/**
+ * Each role's read access, one read per role (`GOV-7` S2). The roles list
+ * endpoint does not carry `read_scope`, and the API is not widened for the
+ * console, so this is N requests for N roles on a page an administrator
+ * opens by hand. One role's failure is a `null` entry — its row says "—" —
+ * rather than failing the whole list.
+ */
+async function loadRoleTableAccesses(
+  ids: readonly string[],
+  signal: AbortSignal
+): Promise<Record<string, RoleTableAccess | null>> {
+  const entries = await Promise.all(
+    ids.map(async (id): Promise<[string, RoleTableAccess | null]> => {
+      try {
+        return [id, await identityService.getRoleTableAccess(id, signal)]
+      } catch {
+        return [id, null]
+      }
+    })
+  )
+  return Object.fromEntries(entries)
+}
+
+/**
+ * The summary column's empty map, kept as one object so a render while the
+ * reads are in flight does not rebuild the rows.
+ */
+const EMPTY_ACCESS: Record<string, RoleTableAccess | null> = {}
 
 /**
  * Roles (`WEB-3` S3-D8, was "Teams & Roles"): create, edit and delete a
- * role, each with `identity:write`. Deleting a role people still hold, or
- * a built-in role, is refused by the API with a 409 whose sentence the
- * dialog shows as it is (S3a-D2).
+ * role, each with `identity:write`. Creating and editing are their own
+ * pages (`WEB-7` D2); deleting stays a confirmation on this list. Deleting
+ * a role people still hold, or a built-in role, is refused by the API with
+ * a 409 whose sentence the dialog shows as it is (S3a-D2).
  */
 export function RolesPage() {
   const { hasPermission } = useAuth()
   const canWrite = hasPermission("identity:write")
+  const router = useRouter()
   const state = useService((s) => identityService.listRoles(s), [])
-  const [createOpen, setCreateOpen] = React.useState(false)
-  const [name, setName] = React.useState("")
-  const [permissions, setPermissions] = React.useState("")
-  const [description, setDescription] = React.useState("")
-  const create = useServiceAction(
-    withNotify(
-      { success: "Role created", error: "Failed to create role" },
-      (signal, input: Parameters<typeof identityService.createRole>[0]) =>
-        identityService.createRole(input, signal)
-    )
-  )
-
-  const [editing, setEditing] = React.useState<Role | null>(null)
   const [deleting, setDeleting] = React.useState<Role | null>(null)
 
+  // The summary column's values. Keyed by the ids the list returned, so a
+  // refresh does not read a role that left the list.
+  const roleIds = (state.data ?? []).map((role) => role.id)
+  const roleIdsKey = roleIds.join(",")
+  const tableAccessState = useService(
+    (signal) => loadRoleTableAccesses(roleIdsKey ? roleIdsKey.split(",") : [], signal),
+    [roleIdsKey]
+  )
+  const accessLoaded = tableAccessState.status === "success"
+  const accessById: Record<string, RoleTableAccess | null> = accessLoaded
+    ? tableAccessState.data
+    : EMPTY_ACCESS
+
+  // The rows the table renders, with the summary worked out here. `columns`
+  // stays the same object while the summaries arrive: a rebuild would
+  // remount every cell, closing a row's open menu under the reader.
+  const rows = React.useMemo<RoleRow[]>(
+    () =>
+      (state.data ?? []).map((role) => {
+        const access = accessById[role.id] ?? null
+        return {
+          ...role,
+          tables: tableAccessSummary(access, role.permissions),
+          tablesFailed: accessLoaded && access === null,
+        }
+      }),
+    [state.data, accessById, accessLoaded]
+  )
+
   const columns = React.useMemo(
-    () => (canWrite ? getRoleColumns({ onEdit: setEditing, onDelete: setDeleting }) : getRoleColumns()),
-    [canWrite]
+    () =>
+      canWrite
+        ? getRoleColumns({
+            onEdit: (role) => router.push(`/admin/roles/${encodeURIComponent(role.id)}/edit`),
+            onDelete: setDeleting,
+          })
+        : getRoleColumns(),
+    [canWrite, router]
   )
 
   const tableUrlState = useTableUrlState()
   const filteredData = React.useMemo(
     () =>
-      filterDataClientSide(state.data ?? [], {
+      filterDataClientSide(rows, {
         search: tableUrlState.search,
         searchFields: [
           (r) => r.name,
@@ -66,7 +118,7 @@ export function RolesPage() {
         filters: tableUrlState.filters,
         joinOperator: tableUrlState.joinOperator,
       }),
-    [state.data, tableUrlState.search, tableUrlState.filters, tableUrlState.joinOperator]
+    [rows, tableUrlState.search, tableUrlState.filters, tableUrlState.joinOperator]
   )
 
   const { table } = useDataTable({
@@ -84,25 +136,6 @@ export function RolesPage() {
     getRowId: (row) => row.id,
   })
 
-  function resetForm() {
-    setName("")
-    setPermissions("")
-    setDescription("")
-  }
-
-  async function handleCreate() {
-    const result = await create.run({
-      name: name.trim(),
-      permissions: permissions.trim(),
-      description: description.trim(),
-    })
-    if (result) {
-      setCreateOpen(false)
-      resetForm()
-      state.reload()
-    }
-  }
-
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
@@ -111,7 +144,7 @@ export function RolesPage() {
         actions={
           <Button
             size="sm"
-            onClick={() => setCreateOpen(true)}
+            render={<Link href="/admin/roles/new" />}
             disabled={!canWrite}
             title={canWrite ? undefined : "You don't have permission to create roles."}
           >
@@ -136,16 +169,6 @@ export function RolesPage() {
           </div>
         </div>
       ) : null}
-      {editing ? (
-        <EditRoleSheet
-          role={editing}
-          onClose={() => setEditing(null)}
-          onSaved={() => {
-            setEditing(null)
-            state.reload()
-          }}
-        />
-      ) : null}
       {deleting ? (
         <DeleteRoleDialog
           role={deleting}
@@ -156,141 +179,7 @@ export function RolesPage() {
           }}
         />
       ) : null}
-      <CreateSheet
-        open={createOpen}
-        onOpenChange={(open) => {
-          setCreateOpen(open)
-          if (!open) resetForm()
-        }}
-        title="Create Role"
-        description="Define a role template with permissions."
-        canSubmit={Boolean(name.trim() && permissions.trim() && description.trim())}
-        submitting={create.status === "pending"}
-        onSubmit={handleCreate}
-      >
-        <RoleFields
-          idPrefix="role"
-          name={name}
-          permissions={permissions}
-          description={description}
-          onName={setName}
-          onPermissions={setPermissions}
-          onDescription={setDescription}
-        />
-      </CreateSheet>
     </div>
-  )
-}
-
-/** The three fields a role has, shared by Create and Edit. */
-function RoleFields({
-  idPrefix,
-  name,
-  permissions,
-  description,
-  onName,
-  onPermissions,
-  onDescription,
-}: {
-  idPrefix: string
-  name: string
-  permissions: string
-  description: string
-  onName: (v: string) => void
-  onPermissions: (v: string) => void
-  onDescription: (v: string) => void
-}) {
-  return (
-    <>
-      <div className="space-y-1.5">
-        <Label htmlFor={`${idPrefix}-name`}>Name</Label>
-        <Input id={`${idPrefix}-name`} value={name} onChange={(e) => onName(e.target.value)} />
-      </div>
-      <div className="space-y-1.5">
-        <Label htmlFor={`${idPrefix}-perms`}>Permissions</Label>
-        <PermissionPicker
-          id={`${idPrefix}-perms`}
-          value={permissions}
-          onChange={onPermissions}
-        />
-      </div>
-      <div className="space-y-1.5">
-        <Label htmlFor={`${idPrefix}-desc`}>Description</Label>
-        <Input
-          id={`${idPrefix}-desc`}
-          value={description}
-          onChange={(e) => onDescription(e.target.value)}
-        />
-      </div>
-    </>
-  )
-}
-
-/**
- * Edit one role (`PUT /api/identity/roles/{id}`). Access rules name roles
- * by name, so the API refuses a rename while one of them names this role
- * (`WEB-3` review R2); a changed name says that before saving, rather than
- * letting the save come back a 409 the person did not expect. A new
- * description or permission list is unaffected.
- */
-function EditRoleSheet({
-  role,
-  onClose,
-  onSaved,
-}: {
-  role: Role
-  onClose: () => void
-  onSaved: () => void
-}) {
-  const [name, setName] = React.useState(role.name)
-  const [permissions, setPermissions] = React.useState(role.permissions)
-  const [description, setDescription] = React.useState(role.description)
-  const update = useServiceAction(
-    withNotify(
-      { success: "Role saved", error: "Failed to save role" },
-      (signal, input: Parameters<typeof identityService.updateRole>[1]) =>
-        identityService.updateRole(role.id, input, signal)
-    )
-  )
-  const renamed = name.trim() !== role.name
-
-  async function handleSave() {
-    const saved = await update.run({
-      name: name.trim(),
-      permissions: permissions.trim(),
-      description: description.trim(),
-    })
-    if (saved) onSaved()
-  }
-
-  return (
-    <CreateSheet
-      open
-      onOpenChange={(open) => (open ? undefined : onClose())}
-      title="Edit Role"
-      description={`Change ${role.name}.`}
-      submitLabel="Save"
-      canSubmit={Boolean(name.trim() && permissions.trim() && description.trim())}
-      submitting={update.status === "pending"}
-      error={update.status === "error" ? update.error.message : null}
-      onSubmit={handleSave}
-    >
-      <RoleFields
-        idPrefix="edit-role"
-        name={name}
-        permissions={permissions}
-        description={description}
-        onName={setName}
-        onPermissions={setPermissions}
-        onDescription={setDescription}
-      />
-      {renamed && name.trim() ? (
-        <p className="text-sm text-muted-foreground">
-          Access rules name roles by name. A rename is refused while an access rule names{" "}
-          {role.name}; change those rules first, or keep the name.
-        </p>
-      ) : null}
-    </CreateSheet>
   )
 }
 

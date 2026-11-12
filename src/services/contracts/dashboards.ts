@@ -93,6 +93,34 @@ export type DashboardService = {
    * `dashboard:write`.
    */
   deleteChart(id: string, signal?: AbortSignal): Promise<void>
+  /**
+   * Save a chart from the builder's own high-level input
+   * (`POST /api/dashboard/specs`), or change the stored chart `input.id`
+   * names when `edit` is set (`PUT`). `WEB-7` D6 moved the builder's own
+   * `fetch` here. Needs edit on the dashboard it lands on, or
+   * `dashboard:write`; the server's refusal arrives as the error's message.
+   */
+  saveChart(input: Record<string, unknown>, edit: boolean, signal?: AbortSignal): Promise<void>
+  /**
+   * The marts a chart or an alert rule can be built on
+   * (`GET /api/dashboard/fields`), by name. `WEB-7` D7 moved the alerts
+   * page's own `fetch` here; only the names are returned, which is all the
+   * rule form's picker needs.
+   */
+  listMarts(signal?: AbortSignal): Promise<{ name: string }[]>
+  /**
+   * The measures of the mart `mart` (`GET /api/dashboard/fields?mart=`) — the
+   * columns an alert rule may watch. `WEB-7` D7.
+   */
+  listMartMeasures(mart: string, signal?: AbortSignal): Promise<string[]>
+  /**
+   * One stored chart's saved definition and the dashboard it sits on, read
+   * from the chart list the console already calls
+   * (`GET /api/dashboard/specs`), or `null` when nothing the caller may see
+   * has that id. `WEB-7` D6: the Edit chart page loads the chart by id, so a
+   * reload works.
+   */
+  getChart(id: string, signal?: AbortSignal): Promise<StoredChart | null>
 
   listSqlSources(signal?: AbortSignal): Promise<SqlSource[]>
   createSqlSource(input: SaveSqlSourceInput, signal?: AbortSignal): Promise<SqlSource>
@@ -321,6 +349,21 @@ export type FilterMode = "locked" | "editable" | "hidden"
 
 /** A chart of a dashboard, for the embed chart picker. */
 export type BoardChart = { id: string; title: string }
+
+/**
+ * One stored chart, as `GET /api/dashboard/specs` answers it (`WEB-7` D6).
+ *
+ * `def` is the definition the builder wrote, kept as loose JSON because the
+ * contract cannot import the builder's own type (`features/dashboards`);
+ * the page hands it back to the builder that wrote it.
+ */
+export type StoredChart = {
+  id: string
+  title: string
+  /** The dashboard it sits on. */
+  board: string
+  def: Record<string, unknown>
+}
 
 /**
  * A dashboard's public link (`BI-19` part A), from `GET`/`PUT

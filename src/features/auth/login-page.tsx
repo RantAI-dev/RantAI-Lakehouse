@@ -21,6 +21,7 @@ import { toServiceError } from "@/services/errors";
 import { useAuth } from "./auth-provider";
 import { ChangePasswordStep } from "./change-password-step";
 import { LoginHero } from "./login-hero";
+import { SsoNotice } from "./sso-notice";
 
 /**
  * Whether an SSO button should render at all.
@@ -219,6 +220,14 @@ export function LoginPage() {
 
         <div className="flex flex-1 items-center justify-center py-12">
           <div className="w-full max-w-[352px]">
+            {/* `SEC-65` D2: a callback refused because the provider did
+                not confirm the email redirects here with
+                `ssoNotice=email_not_verified`, so the sentence the person
+                needs is on the page they land on. `useSearchParams` needs
+                the boundary. */}
+            <React.Suspense fallback={null}>
+              <SsoNotice />
+            </React.Suspense>
             <h1 className="text-3xl leading-[1.2] font-semibold tracking-[-0.02em] text-foreground">
               Sign in to Rantai Lake
             </h1>

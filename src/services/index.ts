@@ -37,6 +37,12 @@ import * as authClient from "./clients/auth"
 // has been deleted.
 export const overviewService = clickhouseOverviewService
 export const assetService = clickhouseAssetService
+/**
+ * The catalog's list-row shape (`GOV-7` S2). The contract owns it, and it is
+ * exported here so a feature imports it from `@/services` rather than from
+ * the contract module (`GOV-7 S2 review 2 R2-S1`).
+ */
+export type { Asset } from "./contracts/assets"
 // Pipelines is now fully real — list/get/runs/trigger from Dagster,
 // create/generate from Postgres + LLM, cancel/retry/pause/resume are
 // real Dagster mutations. mock/pipelines.ts has been deleted.
@@ -53,6 +59,12 @@ export const agentService = postgresAgentService
 // Governance is now fully real — reads from ClickHouse/Dagster,
 // policies + create*Rule from Postgres. mock/governance.ts has been deleted.
 export const governanceService = clickhouseGovernanceService
+/**
+ * The row filter grammar the server's validator accepts (`WEB-8` S2 D8).
+ * The contract owns the shape, and it is exported here so a feature imports
+ * it from `@/services`.
+ */
+export type { RowFilterGrammar } from "./contracts/governance"
 // Ops is real — the service list from ClickHouse+Dagster. WEB-3 slice 1
 // removed the observability and workloads reads with their pages; the
 // backend routes stay registered (WEB-4 retires them).
@@ -73,7 +85,10 @@ export type {
   Permission,
   ResetPasswordResponse,
   Role,
+  RoleTableAccess,
+  RoleTableGrant,
   ServiceIdentity,
+  SetRoleTableAccessInput,
   SetUserRolesInput,
   Tenant,
   User,
@@ -179,6 +194,18 @@ export type {
   AssistantSettingsInput,
   AssistantTestResult,
 } from "./contracts/settings"
+/**
+ * The deployment's SSO / OIDC settings (`ADM-12`): issuer, client ID, secret,
+ * provider name, groups claim, role map rows and JIT provisioning, each with
+ * its source, and test sign-in shapes.
+ */
+export type {
+  RoleMapRow,
+  SsoSettings,
+  SsoSettingsInput,
+  SsoTestResult,
+  SsoTestStartResult,
+} from "./contracts/settings"
 // The words a user defined for the chat (`PUT /api/ai/terms`), stored when
 // they pick an answer to a question the chat asked. No mock ever existed.
 export const chatTermService = chatTermClientService
@@ -211,12 +238,15 @@ export type { ServerHealth } from "./contracts/version"
 // off the API process. Sessions page lists and revokes
 // live browser sessions via `GET /api/auth/sessions` and
 // `DELETE /api/auth/sessions/{id}`. Only `providers`,
-// `listSessions`, and `deleteSession` are registered — the other auth
-// methods (login/logout/me/change-password) stay imported directly by
-// `AuthProvider` and the login/change-password pages; see
+// `listSessions`, `deleteSession` and `passwordRules` are registered — the
+// other auth methods (login/logout/me/change-password) stay imported
+// directly by `AuthProvider` and the login/change-password pages; see
 // `services/clients/auth.ts`'s module doc comment for why the split.
 export const authService = {
   providers: authClient.providers,
   listSessions: authClient.listSessions,
   deleteSession: authClient.deleteSession,
+  // WEB-7: the invite form is its own page, and it states the lengths the
+  // server enforces; registering the read keeps the page on `@/services`.
+  passwordRules: authClient.passwordRules,
 }

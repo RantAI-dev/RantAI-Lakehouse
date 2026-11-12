@@ -7,14 +7,11 @@ import * as React from "react";
 import { useTheme } from "next-themes";
 import {
   CalendarDays, ChartBar, ChartCandlestick, ChartColumn, ChartLine, ChartPie, ChevronDown, ChevronRight, Code, Flame, Gauge, Workflow,
-  Map, MapPin, PanelLeftClose, PanelLeftOpen, Pencil, Plus, ScatterChart, Search, SlidersHorizontal, Table2, Type, type LucideIcon,
+  Map, MapPin, PanelLeftClose, PanelLeftOpen, Pencil, ScatterChart, Search, SlidersHorizontal, Table2, Type, type LucideIcon,
   ChartNoAxesColumn, ChartNoAxesGantt, Globe, Image as ImageIcon, Target,
 } from "lucide-react";
-import {
-  Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
-  DialogFooter, DialogTrigger, DialogClose,
-} from "@/components/ui/dialog";
 import { EmptyState } from "@/components/patterns/page-states";
+import { FormPage } from "@/components/patterns/form-page";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -343,31 +340,36 @@ function measureRowsOf(def: ChartDef): MeasureRow[] {
 }
 
 /**
- * Chart builder — the MANUAL path (Tableau-style). Used in two modes:
- *  - CREATE (has its own "New chart" trigger),
- *  - EDIT (controlled by the parent: `open`, `initial` carries id+def).
- * Writes to the SAME artifact as the chat path (console.bi_chart).
+ * Chart builder — the MANUAL path (Tableau-style), as a page (`WEB-7` D6).
+ *
+ * It used to be a dialog opened over the dashboard and over a chat draft.
+ * It is now the body of `/dashboards/[id]/charts/new` and
+ * `.../[chartId]/edit`, inside `FormPage`: the chart-type sidebar, the form
+ * and the live preview in the page's column, with Cancel and Save in its
+ * footer. The small contextual dialogs it opens (parameters, formulas, value
+ * groups, hierarchies) stay dialogs, because they are about one field.
+ *
+ * Saving writes the same artifact as the chat path (console.bi_chart) and
+ * hands the payload to `onSaved`, which the page answers by going back to
+ * the dashboard; the dashboard reloads, which is what used to be done by
+ * re-fetching in place.
  */
 export function ChartBuilder({
-  onSaved, board = "default", boards = [], initial, editId, paramValues,
-  open: openProp, onOpenChange, hideTrigger,
+  onSaved, onCancel, backHref = "/dashboards", board = "default", boards = [], initial, editId, paramValues,
 }: {
-  /** Receives the definition that was saved. */
+  /** Receives the definition that was saved; the page leaves for the dashboard with it. */
   onSaved: (saved: ChartDef) => void;
+  /** Cancel; the page goes back to where it came from. */
+  onCancel: () => void;
+  /** The back link and a successful save's destination. */
+  backHref?: string;
   board?: string;
   boards?: BoardOpt[];
   initial?: ChartDef;
   editId?: string;
   /** The parameter values the dashboard shows now; the preview is drawn with them (BI-11). */
   paramValues?: Record<string, ParamValue>;
-  open?: boolean;
-  onOpenChange?: (o: boolean) => void;
-  hideTrigger?: boolean;
 }) {
-  const controlled = openProp !== undefined;
-  const [openState, setOpenState] = React.useState(false);
-  const open = controlled ? openProp! : openState;
-  const setOpen = (o: boolean) => { onOpenChange?.(o); if (!controlled) setOpenState(o); };
 
   const [marts, setMarts] = React.useState<Mart[]>([]);
   const [sqlSources, setSqlSources] = React.useState<SqlSource[]>([]);
@@ -709,16 +711,15 @@ export function ChartBuilder({
   // The tables of a chart being edited (or a base table just picked) are learned once.
   const joinMarts = [...new Set([baseMart, ...shape.joins.map((j) => j.mart)].filter(Boolean))].join(",");
   React.useEffect(() => {
-    if (!open) return;
     for (const mart of joinMarts.split(",").filter(Boolean)) {
       if (!joinInfo[mart]) void learnTable(mart, baseMart);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `joinInfo` and `learnTable` only cache what `joinMarts` names
-  }, [open, joinMarts]);
+  }, [joinMarts]);
   // The pickers list the flat relation's columns, so they follow the joins that are complete.
   const joinsKey = JSON.stringify(joinsPayload(shape.joins).joins ?? []);
   React.useEffect(() => {
-    if (!open || !baseMart || joinsSeen.current === joinsKey) return;
+    if (!baseMart || joinsSeen.current === joinsKey) return;
     joinsSeen.current = joinsKey;
     void loadFields(source).then((f) => {
       setDimension((v) => keepIfOffered(v, f.dimensions));
@@ -726,7 +727,7 @@ export function ChartBuilder({
       setBreakdown((v) => keepIfOffered(v, f.dimensions));
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps -- reload only when the complete joins change
-  }, [open, joinsKey]);
+  }, [joinsKey]);
   // BI-13: questions can be added to a bar, line, area or combo chart; they are matched on its
   // dimension, so a breakdown, "Other", steps or bins on the chart are refused with the questions.
   const layersApply = takesLayers(kind) && !rowsMode && layers.length > 0;
@@ -807,10 +808,11 @@ export function ChartBuilder({
     return f;
   }
 
-  // On open: load the marts, and prefill from initial — EDIT, or a draft
-  // (e.g. from Copilot) whose kind is already chosen.
+  // On mount: load the marts, and prefill from initial — EDIT, or a draft
+  // (e.g. from Copilot) whose kind is already chosen. The page mounts this
+  // only once it holds the board, the chart and any draft, so `initial` is
+  // settled by then (`WEB-7` D6).
   React.useEffect(() => {
-    if (!open) return;
     draft.cancel();
     void apiFetch("/api/dashboard/fields").then((r) => r.json()).then((j) => setMarts(j.marts ?? [])).catch(() => setMarts([]));
     // A viewer without the list (or with the API down) still gets marts.
@@ -876,17 +878,7 @@ export function ChartBuilder({
       setMoreOpen(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
-
-  function reset() {
-    setTitle(""); setSource(""); setKind("hbar"); setKindQuery(""); setDimension("");
-    setMeasureRows([{ column: "", aggregate: "" }]); setBreakdown(""); setMapId(""); setLat(""); setLon("");
-    setAggregate("sum"); setSpan(1);
-    setCaption(""); setTarget(""); setText(""); setShape(emptyShapeDraft()); setLimit(20); setLimitTouched(false); setLimitParamName(""); setRefLines([]); setStyle({}); setTypeDraft(emptyTypeDraft()); setFormatOpen(false); setLayers([]); setOwnDraw(""); setOwnAxis("");
-    setTargetBoard(board); setClick(undefined); setMoreOpen(false); setActive(1); setGrain(""); setTableDraft(emptyTableDraft()); setFields(null); setError(null); setPreview(null); setPreviewError(null);
-    draft.cancel();
-    joinsSeen.current = "[]";
-  }
+  }, []);
 
   // User changes the data source → reset the column selections and reload.
   function onSourceChange(value: string) {
@@ -1122,7 +1114,6 @@ export function ChartBuilder({
     layers: JSON.stringify(layersApply ? { layers, ownDraw, ownAxis } : null),
   });
   React.useEffect(() => {
-    if (!open) return;
     if (isText) {
       setPreview(text.trim() ? {
         spec: { id: "preview", title: title || "Chart preview", kind: "text", mart: "", x: "", y: "", source: "ui", text },
@@ -1175,7 +1166,7 @@ export function ChartBuilder({
     // BI-9 review fix (BLOCKER) R3: `previewInputsKey` holds every field that affects the
     // generated SQL or render spec, `grain` included (lib/preview-key.ts).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, previewInputsKey, heldPreview, previewSql]);
+  }, [previewInputsKey, heldPreview, previewSql]);
 
   async function save() {
     setError(null);
@@ -1219,13 +1210,9 @@ export function ChartBuilder({
         }
       }
       try {
-        const res = await apiFetch("/api/dashboard/specs", {
-          method: isEdit ? "PUT" : "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-        const json = await res.json();
-        if (!res.ok) throw new Error(json?.error ?? "Failed to save chart");
+        // `WEB-7` D6: the write goes through the dashboard service, so no
+        // feature file calls `/api/dashboard/specs` by hand.
+        await dashboardService.saveChart(payload, isEdit);
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
         if (!savedSource) { setError(message); return; }
@@ -1238,8 +1225,6 @@ export function ChartBuilder({
         setError(`The SQL source “${savedSource.title}” was ${sourceVerb}, but the chart was not saved: ${message}. The builder now uses that source, so saving again will not create it twice.`);
         return;
       }
-      setOpen(false);
-      if (!isEdit) reset();
       onSaved(payload as ChartDef);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -1776,21 +1761,30 @@ export function ChartBuilder({
   );
 
   return (
-    <Dialog open={open} onOpenChange={(o) => { setOpen(o); if (!o && !isEdit) reset(); }}>
-      {hideTrigger ? null : (
-        <DialogTrigger render={<Button variant="outline" size="sm" />}>
-          <Plus className="size-4" /> New chart
-        </DialogTrigger>
-      )}
-      <DialogContent className="h-[min(90vh,52rem)] overflow-hidden p-0 sm:max-w-6xl">
-        {/*
-          Chart types live in a sidebar next to the form (like a settings
-          dialog) instead of a separate gallery step: switching type keeps
-          everything else filled in and the live preview follows at once.
-          The dialog has a fixed height so the actions stay at the bottom
-          edge whatever the form's length.
-        */}
-        <div className={cn("grid h-full min-h-0", listOpen ? "grid-rows-[auto_minmax(0,1fr)] md:grid-cols-[14rem_minmax(0,1fr)] md:grid-rows-1" : "grid-rows-[minmax(0,1fr)]")}>
+    <FormPage
+      title={isEdit ? "Edit chart" : "New chart"}
+      description={`${KIND_DESCRIPTIONS[kind]} Review live data before adding it to the dashboard.`}
+      backHref={backHref}
+      backLabel="Back to dashboard"
+      submitLabel={isEdit ? "Save changes" : "Create chart"}
+      submittingLabel={isEdit ? "Saving…" : "Creating…"}
+      // The SQL source of a new chart must be run once before the chart can be
+      // saved over it; until then the builder says so (`draft.runBlocker`).
+      canSubmit={!busy && !(sqlActive && !!draft.runBlocker)}
+      submitting={busy}
+      error={error}
+      onSubmit={() => void save()}
+      onCancel={onCancel}
+      className="max-w-6xl"
+    >
+      {/*
+        Chart types live in a sidebar next to the form (like a settings page)
+        instead of a separate gallery step: switching type keeps everything
+        else filled in and the live preview follows at once. The grid has a
+        fixed minimum height so the form and the preview scroll inside their
+        own columns and the page's footer stays under them.
+      */}
+      <div className={cn("grid min-h-[32rem] overflow-hidden rounded-xl border border-border", listOpen ? "grid-rows-[auto_minmax(0,1fr)] md:grid-cols-[14rem_minmax(0,1fr)] md:grid-rows-1" : "grid-rows-[minmax(0,1fr)]")}>
           {listOpen ? (
           <nav aria-label="Chart type" className="flex min-h-0 flex-col border-b border-border bg-muted/30 md:border-r md:border-b-0">
             <div className="flex items-center gap-1 p-2 md:p-3 md:pb-2">
@@ -1806,23 +1800,16 @@ export function ChartBuilder({
           ) : null}
 
           <div className="flex min-h-0 flex-col">
-            <div className="px-5 pt-5 pb-4">
-              <DialogHeader>
-                <DialogTitle className="flex items-center gap-1.5 text-base">
-                  <span className="text-muted-foreground">{isEdit ? "Edit chart" : "New chart"}</span>
-                  {/* Phase 2 QA R20: the chevron only when the kind follows it (folded, the kind is on the menu button). */}
-                  {listOpen ? (
-                    <>
-                      <ChevronRight className="size-4 text-muted-foreground" aria-hidden />
-                      <span>{KIND_LABELS[kind]}</span>
-                    </>
-                  ) : null}
-                </DialogTitle>
-                <DialogDescription className="sr-only">{KIND_DESCRIPTIONS[kind]}. Review live data before adding it to the dashboard.</DialogDescription>
-              </DialogHeader>
-              {listOpen ? null : (
+            <div className="flex min-h-11 items-center border-b border-border px-5 py-2">
+              {/* Phase 2 QA R20: with the list open the kind is named here; folded, it is on the menu button. */}
+              {listOpen ? (
+                <span data-slot="chart-kind" className="flex items-center gap-1.5 text-sm text-muted-foreground">
+                  <ChevronRight className="size-4" aria-hidden />
+                  {KIND_LABELS[kind]}
+                </span>
+              ) : (
                 // Phase 2 QA R9: with the list folded, the type is changed from here, and the search stays.
-                <div className="mt-2 flex items-center gap-1.5">
+                <div className="flex items-center gap-1.5">
                   {/*
                     Phase 2 QA R17: a popover of the base-ui family the dialog is made of, so it nests in the
                     dialog's layer stack: an outside press and Escape close only the popover, and focus
@@ -1874,15 +1861,10 @@ export function ChartBuilder({
               </div>
             )}
 
-            {/* Error sits beside the button that caused it, not at the end of a long form. */}
-            <DialogFooter className="items-center border-t border-border px-5 py-3">
-              {error ? <p role="alert" className="text-sm text-destructive sm:mr-auto">{error}</p> : null}
-              {!error && sqlActive && draft.blocker ? <p className="text-sm text-muted-foreground sm:mr-auto">{draft.blocker}</p> : null}
-              <DialogClose render={<Button variant="ghost" size="sm" />}>Cancel</DialogClose>
-              <Button size="sm" onClick={() => void save()} disabled={busy || (sqlActive && !!draft.runBlocker)}>
-                {busy ? "Saving…" : isEdit ? "Save changes" : "Create chart"}
-              </Button>
-            </DialogFooter>
+            {/* Why the chart cannot be saved yet; the API's own error is FormPage's. */}
+            {!error && sqlActive && draft.blocker ? (
+              <p className="border-t border-border px-5 py-2 text-sm text-muted-foreground">{draft.blocker}</p>
+            ) : null}
           </div>
         </div>
         {fields?.columns && choice ? (
@@ -1931,7 +1913,6 @@ export function ChartBuilder({
             />
           </>
         ) : null}
-      </DialogContent>
-    </Dialog>
+    </FormPage>
   );
 }

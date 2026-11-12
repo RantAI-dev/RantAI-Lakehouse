@@ -109,7 +109,6 @@ export function CopilotDock() {
                 error={c.error} onRetry={c.retry}
                 onConfirmTool={c.confirmTool}
                 onCancelTool={c.cancelTool}
-                onCompleteTool={c.completeToolStep}
                 confirmingKey={c.confirmingKey}
                 onAnswerAsk={c.answerAskOption} askNotice={c.askNotice}
               />
