@@ -1,6 +1,8 @@
 import { describe, expect, it } from "bun:test"
+import { readFileSync } from "node:fs"
 import {
   PALETTE_ASSET_RESULT_LIMIT,
+  PALETTE_SEARCH_MAX_CHARS,
   capPaletteAssetResults,
   makePaletteFilter,
   matchedOnLabel,
@@ -22,6 +24,19 @@ describe("capPaletteAssetResults", () => {
 
   it("returns an empty array for an empty result set", () => {
     expect(capPaletteAssetResults([])).toEqual([])
+  })
+})
+
+describe("PALETTE_SEARCH_MAX_CHARS", () => {
+  // QA `LH-DATA-11-15` F2 (`DATA-54`): the box and the dashboard search must
+  // refuse the same length. The Rust file is read, the way
+  // `capabilities.test.ts` reads its fixture.
+  it("the box's limit is the dashboard search's", () => {
+    const rust = readFileSync(
+      `${process.cwd()}/rust/crates/lakehouse-bi/src/search.rs`,
+      "utf8",
+    )
+    expect(rust).toContain(`pub const MAX_QUERY_CHARS: usize = ${PALETTE_SEARCH_MAX_CHARS};`)
   })
 })
 

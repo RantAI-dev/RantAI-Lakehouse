@@ -19,6 +19,15 @@ import { tableKeyOf } from "@/lib/table-key"
 export const PALETTE_ASSET_RESULT_LIMIT = 8
 
 /**
+ * The longest text the box takes: the dashboard search's own limit
+ * (`lakehouse_bi::search::MAX_QUERY_CHARS`). The server refuses a longer text
+ * with 400, so the box stops the typing at the same number and says what to do
+ * when an older answer is still refused (`QA LH-DATA-11-15` F2, `DATA-54`).
+ * `palette-search.test.ts` fails when the two numbers differ.
+ */
+export const PALETTE_SEARCH_MAX_CHARS = 100
+
+/**
  * Truncates `results` to at most `PALETTE_ASSET_RESULT_LIMIT` entries,
  * preserving order (the server's own relevance/registry order).
  */

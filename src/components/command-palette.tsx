@@ -16,7 +16,14 @@ import { isServiceError } from "@/services/errors";
 import type { Asset } from "@/services/contracts/assets";
 import type { ShortcutItem } from "@/services/contracts/dashboards";
 import { itemHref } from "@/lib/dashboard-organise";
-import { ASSET_VALUE_PREFIX, PALETTE_ASSET_RESULT_LIMIT, capPaletteAssetResults, makePaletteFilter, paletteAssetLines } from "@/lib/palette-search";
+import {
+  ASSET_VALUE_PREFIX,
+  PALETTE_ASSET_RESULT_LIMIT,
+  PALETTE_SEARCH_MAX_CHARS,
+  capPaletteAssetResults,
+  makePaletteFilter,
+  paletteAssetLines,
+} from "@/lib/palette-search";
 
 /** Debounce, in ms, before a typed search term reaches `assetService`
  * (WS2 §13). */
@@ -82,7 +89,10 @@ export function CommandPalette() {
   const [dashHits, setDashHits] = React.useState<ShortcutItem[]>([]);
   const [dashFavourites, setDashFavourites] = React.useState<ShortcutItem[]>([]);
   const [dashRecent, setDashRecent] = React.useState<ShortcutItem[]>([]);
-  const [dashFailed, setDashFailed] = React.useState(false);
+  // QA `LH-DATA-11-15` F2 (`DATA-54`): the line to show when the dashboard
+  // search answered with a failure; null when it answered. A refusal of the
+  // text is not an outage.
+  const [dashFailed, setDashFailed] = React.useState<string | null>(null);
   // BI-18 part C review fix (SHOULD-FIX) R12: the two server searches are
   // answering. "No results." is only said once both have answered and every
   // group, local and server, is empty; until then it says "Searching…".
@@ -162,7 +172,7 @@ export function CommandPalette() {
       setDashFavourites([]);
       setDashRecent([]);
       setDashPending(false);
-      setDashFailed(false);
+      setDashFailed(null);
       return;
     }
     let cancelled = false;
@@ -175,7 +185,7 @@ export function CommandPalette() {
       work
         .then((found) => {
           if (cancelled) return;
-          setDashFailed(false);
+          setDashFailed(null);
           setDashHits(found.hits.slice(0, 8));
           setDashFavourites(found.favourites.slice(0, 5));
           // A favourite is not listed again under Recent (as on the dashboard list).
@@ -188,7 +198,15 @@ export function CommandPalette() {
           setDashHits([]);
           setDashFavourites([]);
           setDashRecent([]);
-          setDashFailed(!(isServiceError(err) && err.code === "permission_denied"));
+          setDashFailed(
+            isServiceError(err)
+              ? err.code === "permission_denied"
+                ? null
+                : err.code === "invalid_request"
+                  ? `Shorten the search: dashboards and charts are searched with at most ${PALETTE_SEARCH_MAX_CHARS} characters.`
+                  : "Dashboard search is unavailable"
+              : "Dashboard search is unavailable"
+          );
           setDashPending(false);
         });
     }, CATALOG_SEARCH_DEBOUNCE_MS);
@@ -258,6 +276,7 @@ export function CommandPalette() {
           className="h-11 w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
           value={search}
           onValueChange={setSearch}
+          maxLength={PALETTE_SEARCH_MAX_CHARS}
         />
         <kbd className="hidden rounded border border-border px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground sm:block">esc</kbd>
       </div>
@@ -280,7 +299,7 @@ export function CommandPalette() {
         ) : null}
         {dashFailed && search.trim() ? (
           <div role="alert" className="px-3 py-2 text-sm text-muted-foreground">
-            Dashboard search is unavailable
+            {dashFailed}
           </div>
         ) : null}
 

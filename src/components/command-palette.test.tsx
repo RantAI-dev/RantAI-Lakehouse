@@ -350,6 +350,50 @@ describe("CommandPalette dashboards and charts", () => {
   })
 })
 
+describe("CommandPalette search length", () => {
+  // QA `LH-DATA-11-15` F2 (`DATA-54`): the dashboard search refuses a text
+  // over 100 characters with 400; the box says to shorten it rather than
+  // calling the search unavailable.
+  it("says to shorten the search when the dashboard search refuses the text", async () => {
+    global.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes("/api/auth/me")) return authResponse()
+      requested.push(url)
+      const body = url.includes("/api/dashboard/search")
+        ? { error: "Search text can be at most 100 characters." }
+        : { assets: [] }
+      return new Response(JSON.stringify(body), {
+        status: url.includes("/api/dashboard/search") ? 400 : 200,
+        headers: { "Content-Type": "application/json" },
+      })
+    }) as unknown as typeof fetch
+    render(
+      <AuthProvider>
+        <CommandPalette />
+      </AuthProvider>
+    )
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true })
+    const input = await screen.findByPlaceholderText(/Search pages/)
+    // A value set by code is not cut by `maxLength`; the refusal is still
+    // reachable, as an older page or a shorter box can be.
+    fireEvent.change(input, { target: { value: "x".repeat(120) } })
+    expect(await screen.findByText(/^Shorten the search/)).toBeTruthy()
+    expect(screen.queryByText("Dashboard search is unavailable")).toBeNull()
+  })
+
+  it("the search box takes at most 100 characters", async () => {
+    stubCatalog({ assets: [] })
+    render(
+      <AuthProvider>
+        <CommandPalette />
+      </AuthProvider>
+    )
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true })
+    const input = (await screen.findByPlaceholderText(/Search pages/)) as HTMLInputElement
+    expect(input.maxLength).toBe(100)
+  })
+})
+
 describe("CommandPalette empty state and recents (BI-18 part C review fix R12)", () => {
   function stubWith(handler: (url: string) => Promise<Response> | Response) {
     global.fetch = mock(async (input: RequestInfo | URL) => {
