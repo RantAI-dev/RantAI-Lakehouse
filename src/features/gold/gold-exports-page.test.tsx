@@ -53,6 +53,7 @@ function mockApi(consumers?: unknown): void {
         lastChangedAt: "2026-10-02T03:30:00Z",
         lastExportedAt: null,
         changedSinceExport: null,
+        lastFailure: null,
         canEdit: true,
       })
     }
@@ -63,9 +64,18 @@ function mockApi(consumers?: unknown): void {
       return jsonResponse({ mart: "sales", runs: [] })
     }
     if (url.includes("/api/gold/export/sales")) {
-      // The mart has never been exported: read_back 500s, same as the
-      // real route when the Iceberg table does not exist yet.
-      return jsonResponse({ error: "table not found" }, 500)
+      // The mart has never been published: the route answers 200 with
+      // `published: false` and every fact null (DATA-49, D11). The API changed,
+      // not the assertion.
+      return jsonResponse({
+        namespace: "gold",
+        table: "sales",
+        published: false,
+        formatVersion: null,
+        rowsInIceberg: null,
+        snapshotId: null,
+        exportedAt: null,
+      })
     }
     throw new Error(`unexpected fetch: ${url}`)
   }) as unknown as typeof fetch
@@ -88,6 +98,49 @@ describe("GoldExportsPage", () => {
       "Outside reading is not set up: OUTSIDE_S3_ENDPOINT is not set.",
     )
     expect(refusal.textContent).toBe("Not measured")
+  })
+
+  // QA LH-DATA-1-01 (DATA-49): the route answers 200 with `published: false` for
+  // a mart never published, and that is what the cell reads.
+  it("says Never exported for a mart the API reports as not published", async () => {
+    mockApi()
+    render(<GoldExportsPage />)
+    await waitFor(() => expect(screen.getByText("Never exported")).toBeDefined())
+  })
+
+  it("shows a dash, not Never exported, when the read-back fails", async () => {
+    const original = global.fetch
+    global.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString()
+      if (url.includes("/api/dashboard/fields")) {
+        return jsonResponse({ marts: [{ name: "sales", rows: 42 }] })
+      }
+      if (url.includes("/publication")) {
+        return jsonResponse({
+          mart: "sales",
+          enabled: false,
+          updatedAt: null,
+          lastChangedAt: null,
+          lastExportedAt: null,
+          changedSinceExport: null,
+          lastFailure: null,
+          canEdit: true,
+        })
+      }
+      if (url.includes("/consumers")) return jsonResponse(consumersRefusalBody)
+      if (url.includes("/api/gold/exports")) return jsonResponse({ mart: "sales", runs: [] })
+      if (url.includes("/api/gold/export/sales")) {
+        return jsonResponse({ error: "The catalog request failed. Reference: abc123" }, 500)
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    }) as unknown as typeof fetch
+    expect(original).toBeDefined()
+
+    render(<GoldExportsPage />)
+    await waitFor(() => expect(screen.getByText("sales")).toBeDefined())
+    await waitFor(() => expect(screen.queryByText("Never exported")).toBeNull())
+    const dashes = screen.getAllByText("—")
+    expect(dashes.some((dash) => dash.className.includes("text-destructive"))).toBe(true)
   })
 
   it("counts the tools that read the mart and names each one in the cell's tooltip", async () => {

@@ -61,6 +61,7 @@ const publicationBody: Record<string, unknown> = {
 const readBackBody = {
   namespace: "gold",
   table: "mart_a",
+  published: true,
   formatVersion: 2,
   rowsInIceberg: 42,
   snapshotId: { value: 12345, measured: true },
@@ -231,6 +232,63 @@ describe("OpenFormatCard", () => {
 
     render(<OpenFormatCard assetId="serving.mart_a" />)
     await waitFor(() => expect(screen.getByText("Never published")).toBeDefined())
+  })
+
+  // QA LH-DATA-1-01 (DATA-49): a mart never published answers `published: false`,
+  // and the card shows no last-published rows for it — there is nothing to name.
+  it("shows no last-published rows for a mart the API reports as not published", async () => {
+    mockApi((url) => {
+      if (url.includes("/publication")) {
+        return jsonResponse({
+          ...publicationBody,
+          lastExportedAt: null,
+          changedSinceExport: null,
+        })
+      }
+      if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
+        return jsonResponse({
+          namespace: "gold",
+          table: "mart_a",
+          published: false,
+          formatVersion: null,
+          rowsInIceberg: null,
+          snapshotId: null,
+          exportedAt: null,
+        })
+      }
+      if (url.includes("/api/gold/exports")) {
+        return jsonResponse(emptyRunsBody)
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() => expect(screen.getByText("Never published")).toBeDefined())
+    expect(screen.queryByText("Last published")).toBeNull()
+    expect(screen.queryByText("Snapshot")).toBeNull()
+  })
+
+  // A failed read-back is a failure, not "never published": the row says the copy
+  // could not be read, with the API's sentence as its tooltip.
+  it("says the published copy could not be read when the read-back fails", async () => {
+    mockApi((url) => {
+      if (url.includes("/publication")) {
+        return jsonResponse({ ...publicationBody })
+      }
+      if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
+        return jsonResponse({ error: "The catalog request failed. Reference: abc123" }, 500)
+      }
+      if (url.includes("/api/gold/exports")) {
+        return jsonResponse(emptyRunsBody)
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    const cell = await screen.findByText("Could not be read")
+    expect(cell.className).toContain("text-destructive")
+    expect(cell.getAttribute("title")).toBe("The catalog request failed. Reference: abc123")
+    expect(screen.queryByText("Never published")).toBeNull()
   })
 
   it("disables the switch when canEdit is false and shows an explanation", async () => {

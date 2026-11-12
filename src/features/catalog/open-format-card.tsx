@@ -143,13 +143,13 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
   // console read a 401 as an expired session. So nothing is requested until
   // the publication says this person may; the card still shows its state.
   const mayReadHistory = pub.status === "success" && pub.data.canEdit
+  // QA LH-DATA-1-01 (DATA-49): a mart never published answers 200 with
+  // `published: false`, so nothing is caught here — a failure is a failure and
+  // the row below says it could not be read, instead of passing as "never
+  // published".
   const lastExport = useService<GoldReadBack | null>(async (signal) => {
     if (!mayReadHistory) return null
-    try {
-      return await goldService.getLastExport(mart, signal)
-    } catch {
-      return null
-    }
+    return await goldService.getLastExport(mart, signal)
   }, [mart, mayReadHistory])
   const readers = useService<GoldConsumers>(
     (signal) => goldService.getConsumers(mart, signal),
@@ -178,7 +178,7 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
   // PR slice D review D-B3: always show the freshness line and,
   // when a publish exists, the last published time and snapshot,
   // whether the switch is on or off.
-  const showHistory = hasHistory && lastExport.status === "success" && lastExport.data
+  const showHistory = hasHistory && lastExport.status === "success" && lastExport.data?.published === true
 
   return (
     <SectionCard
@@ -252,13 +252,24 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
           <dd className="col-span-2">
             <ReadersValue state={readers} />
           </dd>
-          {showHistory && (
+          {showHistory && lastExport.data && (
             <>
               <dt className="text-muted-foreground">Last published</dt>
-              <dd className="col-span-2">{lastExport.data!.exportedAt ? formatDateTime(lastExport.data!.exportedAt) : "—"}</dd>
+              <dd className="col-span-2">{lastExport.data.exportedAt ? formatDateTime(lastExport.data.exportedAt) : "—"}</dd>
               <dt className="text-muted-foreground">Snapshot</dt>
               <dd className="col-span-2 font-mono text-xs">
-                {fmtMeasured(lastExport.data!.snapshotId, (v) => String(v))}
+                {fmtMeasured(lastExport.data.snapshotId, (v) => String(v))}
+              </dd>
+            </>
+          )}
+          {/* QA LH-DATA-1-01 (DATA-49): the read-back failed, so the copy's time
+              and snapshot cannot be shown — say that, rather than leaving the rows
+              out and looking like a mart nobody published. */}
+          {hasHistory && lastExport.status === "error" && (
+            <>
+              <dt className="text-muted-foreground">Last published</dt>
+              <dd className="col-span-2 text-destructive" title={lastExport.error.message}>
+                Could not be read
               </dd>
             </>
           )}

@@ -78,19 +78,18 @@ function ConsumersCell({ data }: { data: GoldConsumers }) {
 /**
  * One mart's row: publish state, last export (read straight back from
  * Iceberg), export history count, the count of outside tools that read
- * it, and an "Export now" trigger. Each sub-fetch is independent —
- * `getLastExport` 404/500s for a mart that has never been exported
- * (`read_back` has no table to read yet), and that is rendered as "Never
- * exported" here, not as a page-level error.
+ * it, and an "Export now" trigger. Each sub-fetch is independent.
+ *
+ * A mart never published answers 200 with `published: false` (`DATA-49`,
+ * D11), so that is read from the answer and shown as "Never exported". A
+ * failed request is a failure: the cell shows a dash like its neighbours,
+ * never "Never exported" (`QA LH-DATA-1-01`).
  */
 function MartRow({ mart }: { mart: GoldMart }) {
-  const lastExport = useService<GoldReadBack | null>(async (signal) => {
-    try {
-      return await goldService.getLastExport(mart.name, signal)
-    } catch {
-      return null
-    }
-  }, [mart.name])
+  const lastExport = useService<GoldReadBack>(
+    (signal) => goldService.getLastExport(mart.name, signal),
+    [mart.name]
+  )
   const runs = useService<GoldExportRun[]>(
     (signal) => goldService.listExportRuns(mart.name, signal),
     [mart.name]
@@ -111,14 +110,16 @@ function MartRow({ mart }: { mart: GoldMart }) {
       <TableCell>
         {lastExport.status === "loading" ? (
           <span className="text-muted-foreground">…</span>
-        ) : lastExport.data?.exportedAt ? (
-          formatDateTime(lastExport.data.exportedAt)
-        ) : (
+        ) : lastExport.status === "error" ? (
+          <span className="text-destructive">—</span>
+        ) : !lastExport.data.published || !lastExport.data.exportedAt ? (
           <span className="text-muted-foreground">Never exported</span>
+        ) : (
+          formatDateTime(lastExport.data.exportedAt)
         )}
       </TableCell>
       <TableCell className="font-mono text-xs">
-        {lastExport.status === "success" && lastExport.data
+        {lastExport.status === "success" && lastExport.data.published
           ? fmtMeasured(lastExport.data.snapshotId)
           : "—"}
       </TableCell>
