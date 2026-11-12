@@ -56,6 +56,16 @@ export function ruleKindLabel(type: string): string {
 }
 
 /**
+ * What the Delivery cell says: the address when the API returned it, else
+ * "Webhook" or "E-mail" from the channel (`DEC-16`, QA `LH-SRC-7-04`,
+ * `SRC-42`). A hidden rule holds exactly one target, so no count is shown.
+ */
+export function deliveryLabel(rule: AlertRule): string {
+  if (rule.targetHidden === true) return rule.channel === "email" ? "E-mail" : "Webhook"
+  return rule.target ?? ""
+}
+
+/**
  * Whether a rule is a chart alert (`BI-19` part C): the "Alert me..." dialog
  * saves `type: "alert"` with a `chart` id and a `condition`, and no mart.
  * BI-19 owner QA 2026-10-28, QA-9: the list used to read it as a column rule.
@@ -267,7 +277,7 @@ export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
             ) : (
               <Webhook className="size-3.5 text-muted-foreground" />
             )}
-            <span className="max-w-50 truncate">{r.target}</span>
+            <span className="max-w-50 truncate">{deliveryLabel(r)}</span>
           </span>
         )
       },
@@ -283,6 +293,9 @@ export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
             <Switch
               checked={r.enabled}
               onCheckedChange={() => onToggle(r)}
+              // DEC-16 (QA LH-SRC-7-04, SRC-42): the API refuses the change for
+              // this caller, so the switch says so instead of offering it.
+              disabled={r.targetHidden === true}
               aria-label={`Toggle rule ${r.name}`}
             />
             <span className="text-xs text-muted-foreground">
@@ -302,6 +315,9 @@ export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
       header: () => <span className="sr-only">Actions</span>,
       cell: ({ row }) => {
         const r = row.original
+        // DEC-16 (QA LH-SRC-7-04, SRC-42): testing, editing and deleting are
+        // all refused by the API for a rule this caller may not manage.
+        if (r.targetHidden === true) return null
 
         return (
           <div className="flex items-center justify-end gap-1">

@@ -141,7 +141,7 @@ export function alertRuleSaveInput(f: AlertRule): SaveAlertRuleInput {
       name: f.name.trim(),
       type: f.type,
       channel: f.channel,
-      target: f.target.trim(),
+      target: (f.target ?? "").trim(),
       enabled: f.enabled,
       ...(f.severity ? { severity: f.severity } : {}),
       asset: (f.asset ?? "").trim(),
@@ -152,7 +152,7 @@ export function alertRuleSaveInput(f: AlertRule): SaveAlertRuleInput {
       name: f.name.trim(),
       type: f.type,
       channel: f.channel,
-      target: f.target.trim(),
+      target: (f.target ?? "").trim(),
       enabled: f.enabled,
       pipeline: f.pipeline?.trim() || "*",
       ...(f.severity ? { severity: f.severity } : {}),
@@ -163,7 +163,7 @@ export function alertRuleSaveInput(f: AlertRule): SaveAlertRuleInput {
     name: f.name.trim(),
     type: f.type,
     channel: f.channel,
-    target: f.target.trim(),
+    target: (f.target ?? "").trim(),
     enabled: f.enabled,
     ...(f.severity ? { severity: f.severity } : {}),
     ...(f.type === "upload_failure" ? {} : { connector: f.connector ?? "" }),
@@ -477,6 +477,22 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
         />
       )
     }
+    // DEC-16 (QA LH-SRC-7-04, SRC-42): the API sends a rule without its target
+    // to a caller who may not manage it, and refuses every change from that
+    // caller; the form would offer a Save that cannot work.
+    if (rule.targetHidden === true) {
+      return (
+        <EmptyState
+          title="You cannot change this rule"
+          description="Seeing where a rule sends, or changing it, needs the alert:write permission."
+          action={
+            <Button variant="outline" size="sm" render={<Link href={backHref} />}>
+              Back to Alerts
+            </Button>
+          }
+        />
+      )
+    }
   }
 
   const targetPlaceholder =
@@ -503,7 +519,7 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
   async function save() {
     setFormErr(null)
     if (!f.name.trim()) { setFormErr("Name required."); return }
-    if (!f.target.trim()) { setFormErr("Webhook URL / email required."); return }
+    if (!(f.target ?? "").trim()) { setFormErr("Webhook URL / email required."); return }
     if (f.type === "alert" && isMetricRule(f) && !f.metric) { setFormErr("Pick a metric."); return }
     if (alertRuleFormFields(f.type, canSeeAllTenants).connector && !f.connector) {
       setFormErr("Choose a connector.")
@@ -687,7 +703,7 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
               {f.channel === "email" ? "Recipient email" : "Webhook URL"}
             </Label>
             <Input
-              value={f.target}
+              value={f.target ?? ""}
               onChange={(e) => setF((prev) => ({ ...prev, target: e.target.value }))}
               placeholder={targetPlaceholder}
             />

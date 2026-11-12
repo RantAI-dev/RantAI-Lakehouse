@@ -371,3 +371,45 @@ describe("the legacy-owner note (BI-39 D4)", () => {
     expect(legacyOwnerNote(null)).toBeNull()
   })
 })
+
+// DEC-16 (QA LH-SRC-7-04, SRC-42): a caller who may not manage a rule sees
+// where it sends, not the address. The API sends the rule without `target`
+// and with `targetHidden: true`.
+describe("a rule whose target is hidden (DEC-16)", () => {
+  const base = {
+    id: "r1", name: "Orders failed", type: "connector_failure", agg: "sum", op: ">",
+    threshold: 0, enabled: true, connector: "*",
+  } as unknown as AlertRule
+  const cols = getRuleColumns({
+    onEdit: () => {}, onToggle: () => {}, onRun: () => {}, onDelete: () => {}, busy: false, boards: [], connectors: [],
+  })
+  const cell = (id: string, rule: AlertRule) => {
+    const col = cols.find((c) => c.id === id)
+    const render_ = col?.cell as (ctx: unknown) => React.ReactNode
+    return render_({ row: { original: rule } })
+  }
+
+  it("says Webhook for a hidden webhook rule, disables its switch and shows no actions", () => {
+    const hidden = { ...base, channel: "webhook", targetHidden: true } as AlertRule
+    render(<div>{cell("delivery", hidden)}{cell("enabled", hidden)}{cell("actions", hidden)}</div>)
+    expect(screen.getByText("Webhook")).toBeTruthy()
+    // base-ui renders the switch as a span: `aria-disabled` is its disabled state.
+    expect(screen.getByRole("switch").getAttribute("aria-disabled")).toBe("true")
+    expect(screen.queryByRole("button", { name: "Test run now" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "More rule actions" })).toBeNull()
+  })
+
+  it("says E-mail for a hidden e-mail rule", () => {
+    const hidden = { ...base, channel: "email", targetHidden: true } as AlertRule
+    render(<div>{cell("delivery", hidden)}</div>)
+    expect(screen.getByText("E-mail")).toBeTruthy()
+  })
+
+  it("shows the address, an enabled switch and the actions when the target is returned", () => {
+    const shown = { ...base, channel: "webhook", target: "https://hooks.example.com/t" } as AlertRule
+    render(<div>{cell("delivery", shown)}{cell("enabled", shown)}{cell("actions", shown)}</div>)
+    expect(screen.getByText("https://hooks.example.com/t")).toBeTruthy()
+    expect(screen.getByRole("switch").getAttribute("aria-disabled")).toBeNull()
+    expect(screen.getByRole("button", { name: "Test run now" })).toBeTruthy()
+  })
+})
