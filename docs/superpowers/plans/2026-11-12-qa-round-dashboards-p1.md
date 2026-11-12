@@ -1135,3 +1135,228 @@ month grain (T9, T13) and its top 10 provinces (T8); `LH-BI-6-06`'s answer
 should now say the breakdown's N (T10); `LH-BI-6-40` has Duplicate (T12).
 
 ## 6. Review
+
+### Round 1 (planner, 2026-11-12), at `3580fe67`
+
+Read against the plan and `AGENTS.md`; nothing was run for this review, CI on the draft pull
+request (#486) runs the suites. 2 BLOCKERs (R1, R2) and 8 SHOULD-FIX. No existing test was
+weakened. The `sec11_guard.rs` entry of `bb94af7e0` is accepted: the `Gated` failure carries
+only sentences written in this repository (the tenant gate's and the classified store
+sentences), and the entry matches the one line `support.rs:640`.
+
+**Planner's rulings** (where a ruling and a finding's "Fix" differ, the ruling holds).
+
+- **R1.** As the finding says. The NULL-safe form is proven on a real `ClickHouse` by an
+  integration test, and the module comment cites that test.
+- **R2 is the planner's error in T14's text**, copied faithfully. The row is split in three:
+  (a) "Top N of the breakdown; a time grain keeps every period": `Accepted by the owner,
+  2026-11-12 (BI-46)`; (b) "a dimension without a grain keeps its own top N, counted over the
+  rows of the kept breakdown values": *(proposed, not yet signed)*; (c) "a date breakdown can
+  be grouped by day, week, month, quarter or year": *(proposed, not yet signed)*. Correct T14's
+  text in this plan the same way.
+- **R3 (changes D7).** `/api/ai/tool` joins the limit-bearing routes with limit + 15 s, with
+  its row in the doc table of `routes/mod.rs`.
+- **Developer's note 4 (changes D12's wording, not the code).** With no grain, the dimension's
+  top N is ranked over the rows of the kept breakdown values, as built: ranked over all rows,
+  a kept bar could have no row among the kept series. Say so in D12 of this plan and in row
+  (b) above. Also keep one `key_dir` (the new method), not two.
+- **R4 to R10.** As the findings say.
+
+### R1. BLOCKER: the breakdown cap drops every row whose breakdown value is NULL, on every bar, hbar, line and area chart with a breakdown, including charts with fewer than N values.
+
+- Where: `rust/crates/lakehouse-bi/src/builder/ranked.rs:207-224` (`breakdown_cap`, the
+  clause `{breakdown} IN (SELECT {breakdown} FROM … GROUP BY {breakdown} ORDER BY … LIMIT N)`),
+  pushed onto `where_clauses` at `:232-238`; reached from `builder.rs:2713` and `:3042`.
+- What happens: `ClickHouse` evaluates `NULL IN (<set>)` as false unless
+  `transform_null_in = 1`, and nothing in the repository sets it (grep: no hit). The
+  subquery does return the NULL group (and gives it one of the N places when its total is
+  large enough), but the outer `IN` then rejects the NULL rows. Example: mart with
+  `cat` = `a`, `b`, NULL, a bar chart `dimension kab, breakdown cat, limit 20`. Before:
+  three series (`a`, `b`, and the empty one). After: two series; the NULL rows' measure
+  is gone from the chart, with no message. With `limit 2` and NULL the largest group the
+  chart shows one series, not two. The same happens to a `breakdownGrain` bucket of a NULL
+  date, and to a left-joined breakdown column: `Relation::Joined` runs with
+  `join_use_nulls = 1` (`builder.rs:457`), so unmatched rows are NULL by design, and
+  `ColumnKind::from_clickhouse_type` (`filters.rs:487-489`) shows `Nullable` mart columns
+  are expected. D12 says "with no breakdown nothing changes" and that only values outside
+  the top N are left out; a chart saved before this branch loses rows it showed (D14 makes
+  the rule reach it on the next read). The dimension's old guard has the same weakness for
+  a NULL *dimension*; that is older code, the breakdown loss is new.
+- Fix: make the cap NULL-safe in `breakdown_cap`, without a statement-level `SETTINGS`
+  (it would collide with `SQL_SOURCE_SETTINGS` / `with_run_settings`). For example compare
+  a non-null key on both sides:
+  `(isNull({b}), ifNull(toString({b}), '')) IN (SELECT isNull({b}), ifNull(toString({b}), '') FROM … GROUP BY {b} ORDER BY {rank} DESC, {b} LIMIT N)`
+  (`other_sql` already uses `ifNull(toString({dimension}), '') AS __k` for the same
+  reason, `ranked.rs:252`). Prove the chosen form on a real `ClickHouse` and write the
+  measurement where the module comment cites it.
+- Check: a `builder.rs` test pinning the NULL-safe clause, and one integration test against
+  a real `ClickHouse` (a table with a `Nullable(String)` breakdown holding NULL rows):
+  `limit 20` returns the NULL series; `limit 1` with NULL the largest total returns the
+  NULL series and nothing else.
+
+### R2. BLOCKER: the feature page says the owner accepted wording the plan itself marks as the planner's choice and an open question.
+
+- Where: `docs/core/features/chart-builder-questions.md:51` (row 7, "Signed" cell
+  `Accepted by the owner, 2026-11-12`). The developer copied it from the plan's own text,
+  `docs/superpowers/plans/2026-11-12-qa-round-dashboards-p1.md:701`.
+- What happens: one "Signed" cell covers three statements. Only the first (the limit keeps
+  the N breakdown values with the largest total; a time grain keeps every period) is what
+  D12 records as accepted on 2026-11-12. "A dimension without one keeps its own top N as
+  before" is, in D12's words, "Planner's choice … Open question 1", and the row's own
+  "Source" cell says "the rule for a dimension without a grain is the planner's". "A date
+  breakdown can be grouped by day, week, month, quarter or year" is D13, which carries no
+  acceptance at all. The cell therefore reports a sign-off that has not happened
+  (AGENTS.md principle 2, and step 0 of the loop: the owner signs the decisions).
+- Fix: split the row, or word the cell so each part says what it is, e.g.
+  `Top N of the breakdown and every period beside a time grain: accepted by the owner, 2026-11-12. The dimension without a grain, and the grain on a date breakdown: planner default — owner to confirm at QA (open question 1).`
+  Correct the plan's T14 text the same way so the two agree.
+- Check: read the cell against D12, D13 and "Open questions for the owner" 1.
+
+### R3. SHOULD-FIX: the assistant's confirmed save runs behind a fixed 60-second route deadline, so at the default limit it still ends in "request timeout" and the limit sentence of D5 can never be returned.
+
+- Where: `rust/crates/lakehouse-api/src/routes/mod.rs:277-283` (`limit_bearing` holds the
+  three console routes only); `routes/ai/mod.rs:1595` on (`tool_call`, which awaits
+  `tools::run_tool` in the request task); `mod.rs:197` (`DEFAULT_REQUEST_TIMEOUT` = 60 s).
+- What happens: `create_chart`, `update_chart`, `format_chart` and `move_chart` are drafted
+  in `/api/ai/chat` and executed by the Confirm button through `POST /api/ai/tool`. That
+  path is not limit-bearing, so its deadline is 60 s from the start of the request. With
+  the install's default limit (60 s) the engine answers `TIMEOUT_EXCEEDED` at 60 s after
+  the *query* started, which is always after the route deadline: the person gets the
+  middleware's "request timeout", the symptom of `LH-BI-5-01`, and `failure_as_tool_reply`'s
+  `{ "error": <sentence>, "limit": … }` is never delivered. It only works for limits well
+  under 60 s. This is a gap in the plan (D7 names three routes; section 4 speaks only of
+  `/api/ai/chat`), not a departure by the developer, but T5's stated result is not reachable
+  at the default setting.
+- Fix (planner decides): add `/api/ai/tool` to `limit_bearing` (limit + 15 s) with the row
+  in the doc table, or write the limitation into section 4 and the feature page.
+- Check: extend `limit_bearing_routes_follow_the_longest_configured_limit` with
+  `/api/ai/tool`; and one test that a `tool_call` of `create_chart` whose statement answers
+  code 159 returns the sentence.
+
+### R4. SHOULD-FIX: the assistant's digest, and the builder's limit label, say the breakdown is cut to N on a chart whose measure is a table calculation, where the builder applies no cap at all.
+
+- Where: `rust/crates/lakehouse-api/src/routes/ai/tools/dashboards.rs:113-135`
+  (`limit_digest` decides by `def.caps_breakdown()` alone);
+  `rust/crates/lakehouse-bi/src/builder/ranked.rs:212-214` (`breakdown_cap` returns `None`
+  for a table calculation); `builder/staged.rs:84-89`, `:183-187` (with a grain the rank
+  cut is removed too); `src/features/dashboards/chart-builder.tsx:619`, `:1639-1641`.
+- What happens: line chart, `tanggal` by month, breakdown `provinsi`, measure a running
+  total, `limit: 10`. The statement keeps every month and every province (D12 says so).
+  The tool result's `definition` reads `limit: 10 (the 10 provinsi values with the largest
+  total; every month bucket of tanggal is kept)`, and the prompt tells the model to
+  describe the chart only by that line: the answer says "top 10 provinces" over a chart
+  that draws all of them. That is `LH-BI-6-06` again, for this case. The function's
+  comment "the sentence and the statement cannot disagree" is not true here (rule 1). In
+  the console the field is labelled "Breakdown values (Top N)" and does nothing. The plan's
+  T10.2 wording produces this; D12 and D15 together do not want it.
+- Fix: let the digest know whether a cap was built. The save has the built statement:
+  pass a flag from the caller (for example whether `spec.spec.sql` holds the cap, or a
+  `lakehouse_bi` helper beside `caps_breakdown` that takes the resolved measures), and
+  when no cap was built write the existing `; the breakdown is not limited`. In the
+  builder, keep today's label when the measure is a table calculation.
+- Check: a digest test for a table-calculation measure with a breakdown (with and without
+  a grain) that expects `the breakdown is not limited`.
+
+### R5. SHOULD-FIX: two new tests pass without exercising what their names claim.
+
+- Where: `rust/crates/lakehouse-bi/src/builder.rs:4554-4563`
+  (`a_heatmap_keeps_its_statement_and_its_second_column_is_not_capped`);
+  `rust/crates/lakehouse-bi/src/store.rs:8015-8026`
+  (`a_chart_without_a_breakdown_is_saved_with_the_statement_it_always_had`).
+- What happens: the heatmap test calls `sql_with_filters_report` with no filter on a spec
+  made by `stored_spec`, whose statement is the literal `"SELECT 1"` (`builder.rs:3266`).
+  A heatmap is not rebuilt without a filter (`rebuilds`, `builder.rs:1696-1707`), so
+  `got.sql` is `"SELECT 1"` and `!got.sql.contains("IN (SELECT cat")` is true whatever the
+  builder does. It would still pass if a heatmap were capped on every rebuilt read. The
+  store test asserts only that the statement does not contain `IN (SELECT cat` for a chart
+  that has no `cat` breakdown; it compares nothing with "the statement it always had".
+- Fix: heatmap: pass a dashboard filter (so the statement is rebuilt) and `assert_eq!` the
+  whole statement with the one `main` builds; add sankey and sunburst the same way, since
+  D12 names all three. Store: `assert_eq!` the exact statement.
+- Check: with `caps_breakdown()` temporarily returning true for a heatmap, the heatmap
+  test must fail.
+
+### R6. SHOULD-FIX: Duplicate reports "The chart was not duplicated" after the chart was created, does not reload, and a pending layout save can take the copy's place away.
+
+- Where: `src/features/dashboards/dashboard-page.tsx:675-683` (`duplicateChart`), `:659-666`
+  (`persistLayout` and its 600 ms timer).
+- What happens: (a) `saveChart` succeeds, `saveBoardLayout` fails (network, 403 on the
+  layout, a concurrent change). The `catch` shows "The chart was not duplicated" and
+  `load()` is skipped, yet the chart exists on the server, placed by `place_new_chart`.
+  The page still shows the old board; choosing Duplicate again makes a second copy.
+  (b) In layout editing, a drag within 600 ms before Duplicate leaves `saveTimer` armed;
+  it fires after the awaited save with the layout captured before the copy existed and
+  overwrites it, so the copy loses its box and is drawn at the bottom of the tab (D18 not
+  met for that case).
+- Fix: clear `saveTimer` at the start of `duplicateChart`; give the layout save its own
+  `try`: when it fails, still `await load()` and say what is true (the copy was made and
+  sits at the bottom), or delete the copy and say it was not made.
+- Check: in `dashboard-page-role.test.tsx`, the `PUT` answers 500: the page reloads, the
+  toast does not say "not duplicated", and a second POST is not needed to see the copy.
+
+### R7. SHOULD-FIX: choosing a time grain sets the new "Breakdown values (Top N)" to 1000.
+
+- Where: `src/features/dashboards/chart-builder.tsx:595-600` (`pickGrain` calls
+  `limitAfterGrainPick` whatever the breakdown); `src/lib/time-grain.ts:233-235`.
+- What happens: `limitAfterGrainPick` raises an untouched limit of 20 to
+  `MAX_GRAIN_LIMIT` (1000) when a truncation grain is picked, because 20 used to mean
+  "the latest 20 buckets". On a chart with a breakdown the limit now counts breakdown
+  values, so a person who builds "per month, by province" and leaves the limit alone gets
+  "Breakdown values (Top N): 1000", which is no cap, and every bucket times every value
+  is returned until the chart row limit cuts it.
+- Fix: pass `capsBreakdown` to `limitAfterGrainPick` (keep the default 20 when it is
+  true), and apply the same rule when a breakdown is added to a chart that already has a
+  grain and an untouched 1000.
+- Check: `time-grain.test.ts`: with a breakdown the untouched limit stays 20 after a month
+  grain is picked; `chart-builder.test.tsx`: the preview request carries `limit: 20`.
+
+### R8. SHOULD-FIX: the YAML export leaves `breakdownGrain` out, so an exported chart is not the chart that was saved.
+
+- Where: `rust/crates/lakehouse-api/src/routes/dashboard.rs:5188-5211`
+  (`push_shape_fields`, the fixed list `NAMES` holds `breakdownBin` and twelve others, not
+  `breakdownGrain`); used by `chart_def_fields` for `GET /api/dashboard/export`.
+- What happens: a chart with `breakdown: tanggal, breakdownGrain: month` is written with
+  `breakdown: tanggal` only: the file describes a chart with one series per day. The plan
+  did not name this file; the field was added beside `breakdownBin` everywhere else.
+- Fix: add `"breakdownGrain"` after `"breakdownBin"` (the array becomes 14 long).
+- Check: extend the binned case of the test at `dashboard.rs:5670-5675` with a chart that
+  has `breakdownGrain` and assert the key is exported.
+
+### R9. SHOULD-FIX: the model is never told what `breakdownGrain` is for.
+
+- Where: `rust/crates/lakehouse-api/src/routes/ai/registry.rs:335-336` (the description is
+  written in `with_shape_properties`), `:597` on (`KEPT_CHART_DESCRIPTIONS` has no entry
+  for it), `:744-748` (every other description is stripped);
+  `tests/fixtures/tool_schemas.json:1214-1223` (type and enum, no description);
+  `routes/ai/prompt.rs:514` (the prompt does not mention the field).
+- What happens: the developer's note 5 says a description in `with_shape_properties` never
+  reaches the model and moved the `limit` sentence for that reason, but left the
+  `breakdownGrain` description there, where it is dead text. The model sees a name and
+  five values; "a date or timestamp breakdown; bar, hbar, line and area only; not with a
+  bin" reaches it only as a refusal after a wrong call. D15 asks that the assistant can
+  use the feature.
+- Fix: add `("/function/parameters/properties/breakdownGrain", "…")` to
+  `KEPT_CHART_DESCRIPTIONS` (or one clause in the prompt line), regenerate the fixture,
+  and remove the stripped description or say at the site that it is stripped.
+- Check: `create_chart_keeps_the_descriptions_the_build_suffix_does_not_state` covers a
+  new kept entry; `tool_schemas_snapshot_is_byte_identical` after the writer ran.
+
+### R10. SHOULD-FIX: T7 wrote second copies of three existing guards, and the new table-access check on `mart=` and `joins=` has no test.
+
+- Where: `rust/crates/lakehouse-api/src/routes/dashboard.rs:4670-4674` (source lookup and
+  visibility, a copy of `dashboard_sources::visible_source`, `dashboard_sources.rs:228-238`,
+  which is `pub(crate)`); `:4581-4586` (`parse_value_joins`) beside the same parse in
+  `joined_fields_body` (`:2381-2382`); `:4399-4407` (the `table_access_for` loop) beside
+  `:2385-2389`. `joins` is also parsed twice per request (`:4401` and `:4678`).
+- What happens: the handoff's note 3 says "one place that parses `joins`"; there are two,
+  and `/fields` and `/values` can now drift apart on which tables they refuse (rule 4).
+  The four `values_enforcement` tests call `values_for_roles`, below the handler, so the
+  lines that answer a hidden mart or a hidden joined table with the unknown-mart 404 can
+  be deleted with every test green.
+- Fix: call `visible_source`; move the joins parse and the table-access loop into one
+  function used by `joined_fields_body` and `values`; pass the parsed joins down instead
+  of the raw text.
+- Check: in `tests/dashboard_access_routes.rs`: a person with `dashboard:read` whose roles
+  hide `serving.mart_x` gets 404 for `values?column=…&mart=mart_x`, and 404 for a visible
+  mart joined to the hidden one.
+
