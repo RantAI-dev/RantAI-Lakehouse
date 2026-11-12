@@ -1435,3 +1435,90 @@ existing test was weakened.
   (they say *proposed, not yet signed*).
 - Check: read the two rows; no test.
 
+### Round 1 fixes (developer)
+
+Branch `fix/qa-round-data-p2`, off `8f1a9b05` (the review). Merge of `origin/main` into the
+branch: `a54a4e79` (clean, `docs/core/BACKLOG.md` only). One finding per commit, each pushed.
+
+| Finding | Commit | Change |
+| --- | --- | --- |
+| R1 BLOCKER | `dcc337a6` | `people_names` reads names through the new `dashboard_access::user_names_in_tenants`, so a name is answered only for a person in one of `caller.tenant_ids`; D14 and the feature page say the rule. |
+| R2 BLOCKER | `e369be9c` | Option (a): `run_bronze_ingest` takes `author` and puts it in its `SinkConfig` (the PostgreSQL branch passes `_run_author`), the Kafka micro-batch passes its connector's label, and `history.ensure_columns` commits inside `iceberg_stream.snapshot_properties_for`. |
+| R3 | `42f89238` | `people_names` makes one more read (`dashboard_access::service_names`) for the ids the people read left out, so a service identity is shown by its own name and not merged with deleted people. |
+| R4 | `8518713e` | A database test goes through `usage` itself over `query_history` rows (named person, caller, blank name, id with no row, and a closed pool). |
+| R5 | `117bcff8` | `cutsNanosecondDigits` shows the nanosecond sentence under any Timestamp column whose previewed values hold a fraction of seven to nine digits, or whose file type is `timestamp (ns…)`; D17, D23 and the feature bullet say exactly when. |
+| R6 | `aeaa4ceb` | The `quote_decimals` block is gone from `query_stream_with_options` and `byte_stream` (the field comment is true again), and `write_one_snapshot`'s docstring names its two callers. |
+| R7 | `3d6fa508` | Both cut-list sentences interpolate `UPLOAD_LIST_LIMIT`; the test builds its sentences and row counts from the same import. |
+| R8 | `068d69de` | The first test of `test_sink_long_table_name.py` makes `Schema(PIPELINE_PREFIX + "a" * 50)` and keeps the helper assertion. |
+| R9 | `3255a20c` | A full stop before the sentence appended to decision cells 5 and 10 of `upload-column-types.md`. |
+
+**Proof** (the temporary wrong change the finding's Check names, and the failure it produced):
+
+- R1 — `catalog_governance::tests::names::a_name_of_another_tenants_person_never_reaches_the_usage`;
+  calling `user_names` again (no tenant condition):
+  `assertion failed: !names.contains_key(&theirs)`.
+- R2 — `test_run_bronze_ingest_hands_the_runs_label_to_the_sink`; dropping `author=` at
+  `dlt_pipeline.py`'s `SinkConfig`: `AssertionError: assert ['', ''] == ['connector
+  conn-x, run 9z8y', '']`. `test_every_snapshot_of_a_first_history_load_names_the_run`;
+  removing the `snapshot_properties_for` wrap in `ensure_columns`: `AssertionError: assert
+  {None, 'conne...-x, run 9z8y'} == {'connector conn-x, run 9z8y'}` (extra item `None`:
+  the create commit of the load had no author). `test_a_stream_batch_records_the_runs_author_on_its_commits`
+  pins the Kafka label.
+- R3 — `catalog_governance::tests::names::a_service_identity_is_shown_by_its_own_name`;
+  removing the second read: `assertion `left == right` failed: left: None, right:
+  Some("svc-reporting")`.
+- R4 — `catalog_governance::tests::names::the_asset_usage_names_people_through_the_read_not_a_hand_made_map`;
+  removing the blank-name filter: the array held `{"name": "", "queries": 1}` plus a separate
+  `Unknown user` row; passing `HashMap::new()` at the `usage` call site: `[{"name": "Unknown
+  user", "queries": 4}]` where three rows were expected.
+- R5 — `says under a CSV column set to Timestamp that a seven-digit fraction loses its last
+  digits`; restricting the condition to `keepsNanoseconds(...)`: `Unable to find an element
+  with the text: The file keeps nanoseconds. …` for a CSV value of `…05.1234567`.
+  `cutsNanosecondDigits` also pins the seven-to-nine window (ten digits or more do not fit and
+  the Check step lists them).
+- R6 — `query_with_options_asks_for_quoted_decimals_only_when_told`; putting the block back in
+  `query_stream_with_options`: `request 2:
+  output_format_json_quote_decimals=1&cancel_http_readonly_queries_on_client_close=1`.
+- R7 — `says the list is cut when a hundred files came back, and not for ninety-nine`;
+  `UPLOAD_LIST_LIMIT = 99` with "100" typed in the component: `Expected: "Showing the newest 99
+  files; search to find older ones." Received: "Showing the newest 100 files; search to find
+  older ones."`.
+- R8 — `test_dlt_refuses_a_schema_named_after_a_pipeline_of_more_than_64_characters`; making
+  `Schema(... "a" * 51)` in the accepted call: `InvalidSchemaName` raised by `dlt.Schema`.
+- R9 — read the two rows; no test.
+
+**Not verified / notes**
+
+- `MISMATCH: R3 (parenthetical "in the caller's tenant like R1")` — `service_identity` has no
+  tenant column (`migrations/0001_init.sql:118-133`), and
+  `lakehouse-auth/src/service_token.rs` reports `tenant_ids: Vec::new()` for every service
+  principal. Applying the R1 tenant rule there would answer "Unknown user" for every service,
+  contradicting the ruling's first clause, so the second read has no tenant to narrow by; D14
+  says that and why. The rest of R3 is built as ruled.
+- `cargo test --workspace` was **not** run, per the brief (CI runs the full suite). The scoped
+  Rust commands below are the only Rust tests run.
+
+**Final checks, on `3255a20c`** (`CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-1`,
+`CARGO_BUILD_JOBS=6`; Python in `/home/rismana/rantai/venv-agents-1`):
+
+```
+cd rust && cargo fmt --check
+  clean (no output)
+cargo clippy -p lakehouse-api -p lakehouse-store -p lakehouse-iceberg --all-targets -- -D warnings
+  Finished `dev` profile [unoptimized + debuginfo] target(s) in 32.61s (no warnings)
+cargo test -p lakehouse-store --test dashboard_access
+  test result: ok. 10 passed; 0 failed
+cargo test -p lakehouse-api --lib catalog_governance
+  test result: ok. 38 passed; 0 failed (3492 filtered out)
+cargo test -p lakehouse-clickhouse --lib
+  test result: ok. 42 passed; 0 failed
+python -m pytest dispar_orchestrate/test_dlt_pipeline.py test_ingest_factory.py \
+  test_snapshot_author.py test_sink_long_table_name.py test_iceberg_snapshot.py -q
+  118 passed in 16.36s
+bun run typecheck    clean
+bun run lint         11 problems (0 errors, 11 warnings) — the existing warnings, none new
+bun run test         4052 pass, 0 fail; Ran 4053 tests across 380 files [79.32s]
+python3 ops/lint/check_bare_iceberg_count.py   OK
+python3 ops/lint/check_intra_package_imports.py OK
+git status           clean
+```
