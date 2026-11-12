@@ -73,9 +73,36 @@ async fn add(pool: &PgPool, id: &str, tenant_id: Uuid, filename: &str) -> Upload
 }
 
 async fn show(pool: &PgPool, t: Uuid, folder: FolderFilter<'_>, text: Option<&str>) -> Vec<String> {
-    let rows = list_filtered(pool, t, 100, &ListFilter { folder, text })
-        .await
-        .unwrap();
+    let rows = list_filtered(
+        pool,
+        t,
+        100,
+        &ListFilter {
+            folder,
+            text,
+            table: None,
+        },
+    )
+    .await
+    .unwrap();
+    rows.into_iter().map(|u| u.id).collect()
+}
+
+/// The same listing narrowed to one table's uploads by its exact name, and cut
+/// to `limit` rows.
+async fn show_table(pool: &PgPool, t: Uuid, limit: i64, table: Option<&str>) -> Vec<String> {
+    let rows = list_filtered(
+        pool,
+        t,
+        limit,
+        &ListFilter {
+            folder: FolderFilter::Any,
+            text: None,
+            table,
+        },
+    )
+    .await
+    .unwrap();
     rows.into_iter().map(|u| u.id).collect()
 }
 
@@ -432,11 +459,65 @@ async fn the_listing_can_be_narrowed_by_folder_and_by_text(pool: PgPool) -> sqlx
         &ListFilter {
             folder: FolderFilter::In("uf-a"),
             text: None,
+            table: None,
         },
     )
     .await
     .unwrap();
     assert!(foreign.is_empty());
+    Ok(())
+}
+
+/// QA `LH-DATA-35-03` (`DATA-47`): the Table step asks which of this tenant's
+/// uploads loaded into the named table. The filter is an exact match on the raw
+/// table name — `stock` must not bring `stock_2026`, `_` is not a wildcard and
+/// the case must match — and it narrows the rows before the newest-first window
+/// is cut, so an older table's upload survives a newer table's traffic.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_list_narrows_to_one_tables_uploads_by_its_exact_name_before_the_window_is_cut(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let t = tenant(&pool, "folders-table-filter").await;
+    let other = tenant(&pool, "folders-table-filter-other").await;
+    for id in ["up-1", "up-2", "up-3", "up-5", "up-6"] {
+        add(&pool, id, t, "f.csv").await;
+    }
+    add(&pool, "up-4", other, "f.csv").await;
+    for (id, table) in [
+        ("up-1", "stock"),
+        ("up-2", "stock_2026"),
+        ("up-3", "stoxk"),
+        ("up-4", "stock"),
+    ] {
+        sqlx::query("UPDATE file_upload SET bronze_table = $1 WHERE id = $2")
+            .bind(table)
+            .bind(id)
+            .execute(&pool)
+            .await?;
+    }
+
+    assert_eq!(show_table(&pool, t, 100, Some("stock")).await, ["up-1"]);
+    assert_eq!(
+        show_table(&pool, t, 100, Some("sto_k")).await,
+        Vec::<String>::new(),
+        "`_` is an ordinary character, not the ILIKE wildcard"
+    );
+    assert_eq!(
+        show_table(&pool, t, 100, Some("STOCK")).await,
+        Vec::<String>::new(),
+        "the raw name's case must match"
+    );
+    assert_eq!(show_table(&pool, other, 100, Some("stock")).await, ["up-4"]);
+    assert_eq!(
+        show_table(&pool, t, 1, None).await,
+        ["up-6"],
+        "the unfiltered window is the newest upload"
+    );
+    assert_eq!(
+        show_table(&pool, t, 1, Some("stock")).await,
+        ["up-1"],
+        "the filter narrows before the window, so the old table is still found"
+    );
     Ok(())
 }
 

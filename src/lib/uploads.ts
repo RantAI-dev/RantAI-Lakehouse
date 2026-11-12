@@ -216,9 +216,11 @@ export function headerRowFromDisplay(text: string): number | null {
  * (replace its rows, or add to them); a name nobody has loaded into is a new
  * table.
  *
- * The API has no read for who owns a name, so this goes by the list. A table
- * whose upload was later deleted is still the tenant's and loads, but cannot
- * be seen from here, so no choice is offered for it and the load replaces.
+ * `uploads` is the named table's own uploads, asked from the API by that exact
+ * name (`GET /api/uploads?table=`, `DATA-47`), newest first — so an upload into
+ * an older table is found however old it is. A table whose upload rows were
+ * later deleted is still the tenant's and loads, but cannot be seen from here,
+ * so no choice is offered for it and the load replaces.
  */
 export function isUploadedTable(name: string, uploads: readonly Upload[]): boolean {
   return uploads.some((upload) => upload.status === "ingested" && upload.bronzeTable === name)
