@@ -22,26 +22,26 @@ pipeline the freedom to write it.
 
 A pipeline is inputs, an ordered list of named steps, and one output table.
 A step is one `SELECT` or a form. The assistant builds the same pipelines
-from a request in plain language. The decisions, signed and proposed, are on
+from a request in plain language. The decisions are on
 the [feature page](../features/pipeline-joins-and-sql.md).
 
 ## Target specs
 
 "Today" is `main` at `657c2502`, read from the code, not tested. A target is
-either a competitor's documented behaviour (named under Benchmark), a
-decision on the feature page, or marked *(proposed)*: the planner's number,
-which the product owner confirms or changes on the feature page.
+either a competitor's documented behaviour (named under Benchmark) or a
+decision on the feature page. The product owner signed every number below on
+2026-11-12.
 
 | Capability | Today | Target | Part |
 | --- | --- | --- | --- |
 | Inputs per pipeline | 1 table | Up to 5 tables from Bronze, Silver or Gold, each with a name | 1 |
-| Steps | A list of up to five kinds of operation on the one table | An ordered list of up to 20 *(proposed)* named steps; a step reads inputs and earlier steps by name | 1 |
-| SQL step | None | One `SELECT` (with `WITH`) of up to 20,000 characters *(proposed)*. Anything else (DDL, `INSERT`, `SYSTEM`, table functions, `SETTINGS`, `FORMAT`, a second statement) is refused when saved. Window functions are allowed *(proposed)* | 1 |
+| Steps | A list of up to five kinds of operation on the one table | An ordered list of up to 20 named steps; a step reads inputs and earlier steps by name | 1 |
+| SQL step | None | One `SELECT` (with `WITH`) of up to 20,000 characters. Anything else (DDL, `INSERT`, `SYSTEM`, table functions, `SETTINGS`, `FORMAT`, a second statement) is refused when saved. Window functions are allowed | 1 |
 | What a step may read | The one source table | Only the pipeline's inputs and earlier steps. A table that is not an input is refused, naming the step | 1 |
 | Check when saved | The five operations are parsed. Access is not checked | The whole pipeline is compiled and put through the access rewrite for the person it reads as. A refusal fails the save and names the step | 1 |
 | Read as the author | When run, the statement is rewritten for the author's roles (PR #173) | The same, for the compiled statement of all steps | 1 |
 | Where the statement is built | In the orchestrator (Python), from the five operations | In the API only. The orchestrator asks the API for the statement and runs it | 1 |
-| Preview | None | First 100 rows of any input or step, as the person looking, within 30 seconds *(proposed)* | 1 |
+| Preview | None | First 100 rows of any input or step, as the person looking, within 30 seconds | 1 |
 | Existing pipelines | One table and five operations | Open in the editor as one input and one form step; run as before | 1 |
 | Target lag with several inputs | Follows the one source table | Follows every input | 1 |
 | The pipeline as text | The stored definition is shown as JSON, read-only | A text form that can be copied and used to make a pipeline | 1 |
@@ -104,5 +104,5 @@ that part of the plan and the diff.
 
 ## Before anyone builds it
 
-The feature page holds the decisions; every *(proposed)* one is signed by
-the product owner before the part that needs it is built (`AGENTS.md`).
+The feature page holds the decisions. Decisions 1 to 18 are signed; parts 2
+and 3 add theirs, signed before each is built (`AGENTS.md`).

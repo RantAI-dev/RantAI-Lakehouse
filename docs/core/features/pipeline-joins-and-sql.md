@@ -105,13 +105,13 @@ reviews that part.
 | 9 | Order between pipelines | Derived from the inputs; the user does not name pipelines to wait for | Product owner, 2026-11-12 |
 | 10 | The pipeline as text | A text form of the whole pipeline, in part 1 | Product owner, 2026-11-12 |
 | 11 | Publishing a step as a table | Later (part 3) | Product owner, 2026-11-12 |
-| 12 | Window functions in a SQL step *(proposed)* | Allowed. It is still one `SELECT` through the same access rewrite. Replaces "no window functions" of 2026-10-14 | |
-| 13 | Who a preview reads as *(proposed)* | The person looking, never the author, so an editor sees no row the author can see and they cannot | |
-| 14 | Who the pipeline reads as after someone else edits it *(proposed)* | When someone other than the author changes the inputs or the steps, the pipeline reads as that person from then on. Closes `SEC-71` | |
-| 15 | Steps per pipeline *(proposed)* | 20 | |
-| 16 | Length of a SQL step *(proposed)* | 20,000 characters, the limit a dashboard's SQL source has | |
-| 17 | Time limit of a preview *(proposed)* | 30 seconds | |
-| 18 | Kind and incremental column *(proposed)* | Removed from the page. Nothing reads them today; every run rebuilds the output (`BLD-12`) | |
+| 12 | Window functions in a SQL step | Allowed. It is still one `SELECT` through the same access rewrite. Replaces "no window functions" of 2026-10-14 | Product owner, 2026-11-12 |
+| 13 | Who a preview reads as | The person looking, never the author, so an editor sees no row the author can see and they cannot | Product owner, 2026-11-12 |
+| 14 | Who the pipeline reads as after someone else edits it | When someone other than the author changes the inputs or the steps, the pipeline reads as that person from then on. Closes `SEC-71` | Product owner, 2026-11-12 |
+| 15 | Steps per pipeline | 20 | Product owner, 2026-11-12 |
+| 16 | Length of a SQL step | 20,000 characters, the limit a dashboard's SQL source has | Product owner, 2026-11-12 |
+| 17 | Time limit of a preview | 30 seconds | Product owner, 2026-11-12 |
+| 18 | Kind and incremental column | Removed from the page. Nothing reads them today; every run rebuilds the output (`BLD-12`) | Product owner, 2026-11-12 |
 
 ## Limits to tell a customer
 

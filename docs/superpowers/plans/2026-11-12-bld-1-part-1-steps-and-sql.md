@@ -10,9 +10,9 @@ page: `docs/core/features/pipeline-joins-and-sql.md` (decisions 1 to 18).
 
 | Slice | Branch | What | Waits for |
 | --- | --- | --- | --- |
-| S1 | `feat/bld-1-steps-api` | Definition, compiler, save check, run route, orchestrator, target lag inputs, assistant schema | Decisions 12, 14, 15, 16 signed |
-| S2 | `feat/bld-1-steps-preview` | Preview route | S1 merged; decisions 13, 17 signed |
-| S3 | `feat/bld-1-steps-console` | The editor, the read view, the contracts | S1 merged (S2's contract is in section 3); decision 18 signed |
+| S1 | `feat/bld-1-steps-api` | Definition, compiler, save check, run route, orchestrator, target lag inputs, assistant schema | Nothing: decisions 12 to 18 were signed by the product owner on 2026-11-12 |
+| S2 | `feat/bld-1-steps-preview` | Preview route | S1 merged |
+| S3 | `feat/bld-1-steps-console` | The editor, the read view, the contracts | S1 merged (S2's contract is in section 3) |
 
 The pipeline as text (feature page capability 8, decision 10) is the last
 slice of part 1. Its plan is written after S3 merges, because every anchor it
@@ -213,8 +213,9 @@ Findings on `main`, each handled below or in the backlog:
   `validate_connector_source` (`authored_pipelines.rs:549`) as today.
   `ingest_job` and `file_ingest_job` in `dependsOn` are accepted when the
   first input is Bronze (`validate_per_table_upstream`, `:594`), and watch
-  the first input, as today. `DEC-22` (whether a re-upload also runs the
-  pipelines further down) is open and is not changed here.
+  the first input, as today. `DEC-22` was decided on 2026-11-12 (a
+  re-upload also runs the pipelines further down); `BLD-14` builds that on
+  D11's order after this part lands, not here.
 
 - **D13. Storage.** Migration `0137_pipeline_inputs_and_steps.sql` (the next
   free number when the PR is opened; check every open branch first). Adds
