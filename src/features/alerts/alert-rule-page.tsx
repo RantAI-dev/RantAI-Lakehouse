@@ -25,6 +25,7 @@ import {
   type SaveAlertRuleInput,
 } from "@/services/contracts/alerts"
 import { isLoadAlertKind, isQualityAlertKind, ruleKindLabel } from "./rules-columns"
+import { readableErrorMessage } from "@/lib/notify-message"
 import { TablePicker, useTableCatalog } from "@/features/governance/table-picker"
 import type { Metric } from "@/services/contracts/metrics"
 
@@ -434,7 +435,9 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
     try {
       setFields(await dashboardService.listMartMeasures(mart))
     } catch (e) {
-      setFieldsError(e instanceof Error ? e.message : "Fields could not be loaded")
+      setFieldsError(
+        e instanceof Error ? readableErrorMessage(e.message) : "Fields could not be loaded"
+      )
       setFields([])
     }
   }
@@ -503,17 +506,28 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
     connectorList.status === "success"
       ? connectorList.data.map((c) => ({ id: c.id, name: c.name }))
       : []
+  // QA LH-SRC-7-10 (SRC-40): `GET /api/connectors` takes `connector:manage`, so
+  // a person with `alert:write` and without it saw the API's raw refusal
+  // (`permission_denied: connector:manage`). That one gets a sentence that says
+  // what the person can do; every other error goes through the shared
+  // translation, so no text that starts with one of the API's codes is shown.
   const connectorsError =
-    connectorList.status === "error" ? connectorList.error.message : null
+    connectorList.status === "error"
+      ? connectorList.error.code === "permission_denied"
+        ? "You do not have permission to choose a connector for this rule."
+        : readableErrorMessage(connectorList.error.message)
+      : null
   const marts = martsState.status === "success" ? martsState.data.map((m) => m.name) : []
-  const martsError = martsState.status === "error" ? martsState.error.message : null
+  const martsError =
+    martsState.status === "error" ? readableErrorMessage(martsState.error.message) : null
   const boards =
     boardsState.status === "success"
       ? boardsState.data
           .filter((b) => b.id !== "default")
           .map((b) => ({ id: b.id, name: b.name }))
       : []
-  const boardsError = boardsState.status === "error" ? boardsState.error.message : null
+  const boardsError =
+    boardsState.status === "error" ? readableErrorMessage(boardsState.error.message) : null
   const metrics = metricsState.status === "success" ? metricsState.data : []
 
   async function save() {
@@ -545,7 +559,9 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
       // field to fill in.
       canSubmit
       submitting={saveAction.status === "pending"}
-      error={formErr ?? saveAction.error?.message ?? null}
+      error={
+        formErr ?? (saveAction.error ? readableErrorMessage(saveAction.error.message) : null)
+      }
       onSubmit={() => void save()}
       onCancel={() => router.push(backHref)}
       className="max-w-xl"

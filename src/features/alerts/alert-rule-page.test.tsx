@@ -38,6 +38,7 @@ mock.module("@/features/auth/auth-provider", () => ({
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { alertRuleService, assetService, connectorService, dashboardService, metricService } from "@/services"
+import { ServiceError } from "@/services/errors"
 import type { AlertRule } from "@/services/contracts/alerts"
 import { AlertRulePage } from "./alert-rule-page"
 
@@ -289,5 +290,53 @@ describe("the table pickers on the alert rule page (WEB-8 D8)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Create" }))
     await waitFor(() => expect(create).toHaveBeenCalledTimes(1))
     expect(create.mock.calls[0]?.[0]).toMatchObject({ type: "freshness", mart: "bronze.raw_orders" })
+  })
+})
+
+// QA LH-SRC-7-10 (SRC-40 D8): the form and its reads say a refusal in words,
+// never the API's own `permission_denied: connector:manage` text.
+describe("a refusal on the alert rule page (LH-SRC-7-10)", () => {
+  async function chooseType(label: string) {
+    fireEvent.click(screen.getByRole("combobox", { name: "Type" }))
+    pickOption(await screen.findByRole("option", { name: label }))
+  }
+
+  it("says in words that the connector cannot be chosen, not the API's code", async () => {
+    stubReads()
+    // `GET /api/connectors` takes `connector:manage`; the form only needs
+    // `alert:write`.
+    spyOn(connectorService, "listConnectors").mockRejectedValue(
+      new ServiceError("permission_denied", "permission_denied: connector:manage", 403)
+    )
+    render(<AlertRulePage />)
+    fireEvent.change(await screen.findByPlaceholderText("e.g. Foreign visitors dropped"), {
+      target: { value: "Load" },
+    })
+    await chooseType("Connector run failed")
+
+    expect(
+      await screen.findByText("You do not have permission to choose a connector for this rule.")
+    ).toBeTruthy()
+    expect(document.body.textContent).not.toMatch(/permission_denied/)
+  })
+
+  it("shows the shared sentence when the save is refused", async () => {
+    stubReads()
+    spyOn(alertRuleService, "createRule").mockRejectedValue(
+      new ServiceError("permission_denied", "permission_denied: alert:write", 403)
+    )
+    render(<AlertRulePage />)
+    fireEvent.change(await screen.findByPlaceholderText("e.g. Foreign visitors dropped"), {
+      target: { value: "Visitors in Bali" },
+    })
+    fireEvent.change(screen.getByPlaceholderText("https://hooks.slack.com/services/…"), {
+      target: { value: "https://hooks.example.com/x" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Create" }))
+
+    expect(
+      await screen.findByText("This account does not have permission. Ask a workspace admin.")
+    ).toBeTruthy()
+    expect(document.body.textContent).not.toMatch(/permission_denied/)
   })
 })

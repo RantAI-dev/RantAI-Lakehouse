@@ -10,6 +10,7 @@ import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { useDataTable } from "@/hooks/use-data-table"
 import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { filterDataClientSide } from "@/lib/data-table"
+import { readableErrorMessage } from "@/lib/notify-message"
 import type { QueryKeys } from "@/types/data-table"
 import { getRuleColumns, type Rule } from "@/features/alerts/rules-columns"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
@@ -204,7 +205,7 @@ export function AlertsPage() {
 
       {mutationError ? (
         <div className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-          {mutationError.message}
+          {readableErrorMessage(mutationError.message)}
         </div>
       ) : null}
 
