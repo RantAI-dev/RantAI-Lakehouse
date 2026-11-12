@@ -693,6 +693,130 @@ route.
 - `POST /api/pipelines` and `PUT /api/pipelines/{id}` refuse a body that
   sends both forms, and a body that sends neither.
 
+### Handoff S1, fix round 1 (developer, 2026-11-12)
+
+Branch `feat/bld-1-steps-api` (base `origin/main` as of `1a30be00a`'s merge;
+`main` merged again at `64055f47a`). One line per finding:
+
+- **R1-B1 / D4a, D4b** — `52d1ecc9c`. Today's shape (one input, no step or one
+  `transform` step reading it) compiles with NO `WITH` to exactly the text
+  `_build_select_sql` gave on `main`; `up_to` follows the same rule. Every
+  other definition keeps the `WITH`, and the route notes no SQL for column
+  lineage for it (D4b). `tests/column_lineage_pipeline.rs` is `origin/main`'s
+  file again, retargeted to `.../compile`: the exact `price_f` walk and the
+  three pairs are back; a new test pins that a SQL-step pipeline writes no
+  column row. The G7 gate's exact-mapping assertion (`:650`) holds again.
+- **R1-B2** — `ecd8abb22` (in the wip, final in `6536878b1`'s round).
+  `tests/table_access.rs`'s GOV-7 case posts to `.../compile` with the hidden
+  table as the pipeline's input; it still proves the 404 and the SEC-20
+  sentence.
+- **R1-B3 / D3a** — `aea0e2eac`. Today's form on `PUT` is accepted only for a
+  stored definition of today's shape, keeping that input's and step's names;
+  anything else is 409 `LEGACY_FORM_CANNOT_EDIT`. Two tests: a 409 that
+  changes nothing over a two-input SQL-step pipeline, and a save that keeps
+  `orders_named`/`my_step` and does not move the author.
+- **R1-B4** — `361678213`. The migration splits `source` at the FIRST dot
+  (`pipeline_legacy_zone`/`pipeline_legacy_table`), picks the step name
+  without regard to case, and the backfill is a function the test runs over
+  rows it inserts. Fixtures: no dot, two dots, an unusable name,
+  `Transformed`.
+- **R1-B5** — `ccd35aabb`. `StoreError::CorruptDefinition` (422); decode
+  failures propagate from `get_definition`; `PipelineDefinitionSnapshot` is
+  `TryFrom`, so a write never records an empty snapshot; both writes use `?`.
+  Two tests: an undecodable `steps` is refused; a refused delete writes no
+  snapshot and leaves the row.
+- **R1-B6 / D6a** — `439bf7a5f`. `reads`, bare names in a SQL step and `upTo`
+  match exactly (case included); a qualified `zone.table` in a step is
+  refused as not-an-input; uniqueness stays case-insensitive. Four tests.
+- **R1-B7 / D11a** — `f215471ba`. `routes/lineage.rs` draws one edge per
+  input; `_pipeline_sources` gives the lag sensor every input; the "no
+  `input_tables`" fallback is ONE store rule (`input_tables_of` /
+  `input_tables_or_source`) used by all four readers and those two. Tests: a
+  two-input pipeline has both edges; a lag pipeline is watched at its second
+  input.
+- **R1-B8** — `ecd8abb22`/`6536878b1`. `pipeline_compile_route.rs`'s fixtures
+  are today's shape again, so the four statements are exact `assert_eq!`
+  again; "an author with no obligation gets no mask" is asserted; the
+  `!sql.contains(SQL)` line can fail again; the two SQL-step cases are
+  additional tests that pin the whole answer and the mask's presence/absence.
+  In `routes/pipelines.rs`, the 7 non-save call sites are back on
+  `fixture_member_principal`; the save-path fixtures now use a restricted
+  member who MAY read the table (their tenant claims it with
+  `uploads::claim_table`), and the two that create a pipeline with NO tenant
+  use `fixture_admin_no_tenant_principal` (a real seeded `*:*` author) —
+  a restricted caller cannot create a tenantless pipeline (D9).
+- **R1-B9 / D10a** — `f34f325ef`. `RunAsChange` (`Keep`/`Clear`/`Set`) on
+  `UpdatePipelineInput`; a service identity that changes the definition clears
+  `run_as` unless it holds `*:*`; the audit entry records the change. Tests:
+  the rule, the store clear, a service-created pipeline has no author, and an
+  editor who may not read an input is refused with `inputs[i]`.
+  **Not reachable through HTTP today**: a restricted service identity has no
+  tenant, so `in_scope` (`authored_pipelines.rs`, rule 7) answers 404 before
+  `update` runs. The `Clear` branch is unit- and store-tested, not
+  route-tested.
+- **R1-S1** — `d42b7bc02`. Only the gate's own refusals are a 422 at save; an
+  outage keeps its status (`EnforcementRefusal::into_api_error`).
+- **R1-S2** — `1cba5c09e`. 404 (GOV-7) joins the refused statuses, so the
+  orchestrator does not retry it or report its address. `OPERATIONS.md` lists
+  409/404/422, which carry `inputs[i]`/`steps[i]`, and that the orchestrator
+  no longer needs `ICEBERG_QUERY_DB`.
+- **R1-S3** — `1cba5c09e`. The old-flow comments and the transform-grammar
+  references are gone from `authored_factory.py`, `AuthoredPipelineConfig` no
+  longer reads `iceberg_query_db`, `backup_job.py` no longer cites the deleted
+  module, the vacuous assertion is replaced by one that can fail, and the lost
+  test is back (no `allow_database_iceberg` when `readsIceberg` is false).
+- **R1-S4** — `6536878b1`. `inputs_of` returns both inputs; an old snapshot
+  restores through the route; an unsafe zone; the `--` comment and both
+  `up_to` cases pin the whole text; a `transform`-step pipeline through the
+  compile route; an uncompilable stored definition is 422 naming `steps[0]`.
+- **R1-S5 / R1-S6** — `e40e5de21`. The G7 direct query is the same self-join
+  with `SETTINGS allow_database_iceberg = 1`; the doc above `MAX_INPUTS` says
+  what the constant is; the tool test's input zone is `silver`, which the
+  tool's schema lists.
+- **R1-CI1** — `efa1039e1`. `definition_message(&DefinitionError)` builds the
+  sentence from `path()` and `message()`; both response sites use it, so no
+  response line calls `.to_string()` on an error. The guard's stale
+  `pipelines.rs` allowlist entry (the loop moved to `authored_pipelines.rs` in
+  S1-T3) is removed; the pattern was not loosened.
+- **R1-CI2** — `0ed866cc6`. `ICEBERG_QUERY_DB` is gone from
+  `tests/common/mod.rs`; `pipeline_compile_route.rs` and
+  `column_lineage_pipeline.rs` set it in their own overrides.
+
+**Verification, on the final commit (real counts).**
+
+```
+cd rust && cargo fmt --check                                  # clean
+cargo-locked clippy -j 2 -p lakehouse-store -p lakehouse-api --all-targets -- -D warnings
+                                                              # clean
+cargo-locked test -j 2 -p lakehouse-store --test pipelines     # 74 passed
+cargo-locked test -j 2 -p lakehouse-api --lib -- pipeline_compile sql_guard transform_grammar
+                                                              # 78 passed
+cargo-locked test -j 2 -p lakehouse-api --test pipeline_compile_route --test route_auth
+                                                              # 24 + 94 passed
+cargo-locked test -j 2 -p lakehouse-api --test table_access --test column_lineage_pipeline \
+  --test pipeline_definition_save --test pipeline_lag_check   # 14, 8, 14, 7 passed
+cargo-locked test -j 2 -p lakehouse-api --test sec11_guard    # 4 passed
+cargo-locked test -j 2 -p lakehouse-api --test upload_routes  # 175 passed
+cargo-locked test -j 2 -p lakehouse-api --test quality_anomalies --test quality_on_load \
+  --test pipeline_lag_page                                    # 6, 5, 16 passed
+python3 ops/lint/check_intra_package_imports.py               # OK
+python3 ops/lint/check_bare_iceberg_count.py                  # none found
+(cd dagster && /home/shiro/rantai/venv-pr186/bin/python -m pytest dispar_orchestrate -q)
+                                                              # 2514 passed, 1 skipped, 25 subtests
+```
+
+Other scoped runs: `--lib -- pipeline` 294 passed; `--lib -- lineage` 61;
+`--lib -- pipeline_lag` 42; `--test pipeline_definition_save` 14;
+`test_authored_factory.py` 102.
+
+**Not verified locally**
+- `ops/g7/g7_pipeline_test.py` (the R1-S5 fix) and
+  `ops/g7/bld1_pipeline_author_test.py`: `py_compile`d only; they need the
+  stack. CI job `g3a-dagster` runs them.
+- The `pytest` run used `/home/shiro/rantai/venv-pr186/bin/python` again:
+  `venv-bld3` cannot import the package (`fastavro` is missing there).
+- `cargo test --workspace` / full workspace clippy: not run here; CI runs them.
+
 ## 7. Review
 
 
