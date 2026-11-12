@@ -52,7 +52,7 @@ const DEFAULT_TYPES = [
 
 /** Routes every fetch the wizard issues; records them in order. */
 function stubFetch(
-  extra: (url: string, method: string) => Response | null = () => null,
+  extra: (url: string, method: string) => Response | Promise<Response | null> | null = () => null,
   types: unknown[] = DEFAULT_TYPES
 ): Call[] {
   const calls: Call[] = []
@@ -62,7 +62,7 @@ function stubFetch(
     calls.push({ url, method, body: init?.body ? JSON.parse(init.body as string) : undefined })
     if (url.includes("/api/auth/me")) return json(ME)
     if (url.endsWith("/api/connectors/types")) return json(types)
-    const handled = extra(url, method)
+    const handled = await extra(url, method)
     if (handled) return handled
     throw new Error(`unexpected fetch: ${method} ${url}`)
   }) as unknown as typeof fetch
@@ -580,5 +580,83 @@ describe("the connection settings are checked before the connector exists (LH-SR
     expect(page.queryByText("Connector created")).toBeNull()
     expect(calls.some((c) => c.url.includes("/ingest-spec"))).toBe(false)
     expect(calls.some((c) => c.url.includes("/test"))).toBe(false)
+  })
+})
+
+// QA LH-SRC-6-39/LH-SRC-6-54 (SRC-41 D14): the created screen used to mount the
+// ingest panel at once, and the panel reads `GET .../ingest-spec` only once.
+// When that read won the race with the `PUT`, the card said "This connector has
+// no connection settings saved yet" and stayed that way.
+describe("the created screen waits for the save (LH-SRC-6-39)", () => {
+  it("does not read the connection settings before the save has answered", async () => {
+    const held: { release: () => void } = { release: () => {} }
+    const saved = new Promise<void>((resolve) => {
+      held.release = resolve
+    })
+    const calls = stubFetch(async (url, method) => {
+      if (url.endsWith("/api/connectors") && method === "POST") {
+        return json(
+          {
+            id: "conn-orders-k3x9",
+            name: "orders",
+            type: "PostgreSQL",
+            direction: "source",
+            health: "unknown",
+            environment: "production",
+            tenant: "Acme Co",
+            lastTestAt: null,
+            lastActivityAt: null,
+            lastRunSuccessAt: null,
+            lastRunFailureAt: null,
+            failureStreak: 0,
+            schemaChangePolicy: "apply_non_breaking",
+            pausedReason: null,
+            pausedAt: null,
+            capabilities: [],
+            owner: "Current user",
+            credential: { primary: "file:/run/secrets/x_password", secondary: null },
+            credentialStored: true,
+          },
+          201
+        )
+      }
+      if (url.includes("/ingest-spec") && method === "PUT") {
+        // Held until the test lets it answer.
+        await saved
+        return json({ adapter: "sql", ingestMode: "batch", dial: {}, sourceObjects: [], scheduleCron: null })
+      }
+      if (url.includes("/ingest-spec") && method === "GET") {
+        return json({ adapter: "sql", ingestMode: "batch", dial: {}, sourceObjects: [], scheduleCron: null })
+      }
+      if (url.includes("/test")) {
+        return json({ ok: true, supported: true, latencyMs: 12, message: "ok", testedAt: "2026-01-01T00:00:00.000Z" })
+      }
+      if (url.endsWith("/runs")) return json({ runs: [] })
+      return null
+    })
+    const page = renderPage()
+    await waitFor(() =>
+      expect(page.getByRole("radio", { name: /PostgreSQL/ }).getAttribute("aria-checked")).toBe("true")
+    )
+    fireEvent.change(page.getByLabelText("Name"), { target: { value: "orders" } })
+    fireEvent.click(page.getByRole("button", { name: "Next" }))
+    fireEvent.change(page.getByLabelText("Password"), { target: { value: "s3cret-pass" } })
+    fireEvent.click(page.getByRole("button", { name: "Next" }))
+    await waitFor(() => page.getByLabelText("Residency"))
+    fireEvent.change(page.getByLabelText("Residency"), { target: { value: "in-region" } })
+    fireEvent.click(page.getByRole("button", { name: "Next" }))
+    fireEvent.click(page.getByRole("button", { name: "Create connector" }))
+
+    // While the PUT is held: the card says it is saving, and nothing has read
+    // the settings yet.
+    await waitFor(() => expect(page.getByText("Saving the connection settings…")).toBeDefined())
+    expect(calls.filter((c) => c.url.includes("/ingest-spec") && c.method === "GET")).toEqual([])
+    expect(page.queryByText(/has no connection settings saved yet/)).toBeNull()
+
+    held.release()
+    await waitFor(() => expect(page.getByText(/Connection test passed/)).toBeDefined())
+    // Only now is the panel mounted, and it reads the settings it was saved with.
+    expect(calls.some((c) => c.url.includes("/ingest-spec") && c.method === "GET")).toBe(true)
+    expect(page.queryByText(/has no connection settings saved yet/)).toBeNull()
   })
 })

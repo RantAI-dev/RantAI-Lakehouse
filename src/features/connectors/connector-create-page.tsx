@@ -31,6 +31,7 @@ import {
 } from "./connector-form-parts"
 import { DIRECTION_LABEL } from "./connectors-columns"
 import { saasAccountProblem, saasVendorForType } from "@/lib/connectors/saas-vendors"
+import { readableErrorMessage } from "@/lib/notify-message"
 import { connectionReviewItems } from "./connector-review"
 import { ScopeFields } from "./connector-scope-fields"
 import { ConnectorIngestPanel } from "./connector-ingest-panel"
@@ -284,6 +285,18 @@ export function ConnectorCreatePage() {
   // the tables to ingest and run them, instead of redirecting past any of
   // it.
   if (createdId) {
+    // QA LH-SRC-6-39/LH-SRC-6-54 (SRC-41 D14): the created screen mounted the
+    // ingest panel at once, and that panel reads `GET .../ingest-spec` once and
+    // never again. When the read answered before the `PUT` that stores the
+    // settings landed, the card said "This connector has no connection
+    // settings saved yet" and stayed that way — a race, which is why it was
+    // intermittent. So the panels mount only once the save has answered, and
+    // the card says what it is waiting for until then.
+    const settingsSaved = saveSpec.status === "success"
+    const settingsPending =
+      saveSpec.status === "idle" ||
+      saveSpec.status === "pending" ||
+      setCredentialAfterCreate.status === "pending"
     return (
       <div className="flex flex-col gap-4">
         <PageHeader
@@ -304,7 +317,7 @@ export function ConnectorCreatePage() {
               <div className="space-y-1.5">
                 <p className="text-sm text-destructive">
                   The connection test was not run: the connection settings could not be saved.
-                  {saveSpec.status === "error" ? ` ${saveSpec.error.message}` : ""}
+                  {saveSpec.status === "error" ? ` ${readableErrorMessage(saveSpec.error.message)}` : ""}
                 </p>
                 <p className="text-xs text-muted-foreground">
                   Correct them from{" "}
@@ -314,6 +327,8 @@ export function ConnectorCreatePage() {
                   , then run the test again.
                 </p>
               </div>
+            ) : settingsPending ? (
+              <p className="text-sm text-muted-foreground">Saving the connection settings…</p>
             ) : test.status === "pending" ? (
               <p className="text-sm text-muted-foreground">Testing connection…</p>
             ) : test.status === "error" ? (
@@ -346,7 +361,7 @@ export function ConnectorCreatePage() {
                 type="button"
                 size="sm"
                 variant="outline"
-                disabled={test.status === "pending"}
+                disabled={test.status === "pending" || settingsPending}
                 onClick={() => {
                   setTestSkipped(false)
                   test.run(createdId)
@@ -358,9 +373,11 @@ export function ConnectorCreatePage() {
           </div>
         </SectionCard>
 
-        {signInConnector && !testSkipped ? <ConnectorOAuthPanel connectorId={createdId} /> : null}
+        {signInConnector && !testSkipped && settingsSaved ? (
+          <ConnectorOAuthPanel connectorId={createdId} />
+        ) : null}
 
-        {!testSkipped ? (
+        {!testSkipped && settingsSaved ? (
           <SectionCard title="What to ingest" description="Pick the tables this connector copies into Bronze, then run it.">
             <ConnectorIngestPanel connectorId={createdId} connectorName={name.trim()} />
           </SectionCard>
