@@ -1105,7 +1105,7 @@ fn update_input_from_body(
     first: &lakehouse_store::pipelines::PipelineInput,
     body: &UpdateBody,
     connector_change: ConnectorChange,
-    run_as: Option<Uuid>,
+    run_as: lakehouse_store::pipelines::RunAsChange,
 ) -> UpdatePipelineInput {
     UpdatePipelineInput {
         kind: body.kind.clone(),
@@ -1503,20 +1503,46 @@ pub(crate) async fn compile_and_save_check(
     Ok(compiled)
 }
 
-/// BLD-1 part 1 / D10 (`SEC-71`): the author a write stores when the caller
-/// changed what the pipeline READS.
+/// The author the pipeline has AFTER this write, for the save-time check
+/// (D9): `Set` is that person, `Clear` is nobody, `Keep` is the stored one.
+fn effective_run_as(
+    change: lakehouse_store::pipelines::RunAsChange,
+    current: Option<Uuid>,
+) -> Option<Uuid> {
+    match change {
+        lakehouse_store::pipelines::RunAsChange::Set(user_id) => Some(user_id),
+        lakehouse_store::pipelines::RunAsChange::Clear => None,
+        lakehouse_store::pipelines::RunAsChange::Keep => current,
+    }
+}
+
+/// BLD-1 part 1 / D10 (`SEC-71`) and D10a: what an edit does to the author.
 ///
-/// `Some(caller)` when the caller is a person, is not already the author, and
-/// the inputs or steps differ from the stored ones — reading as someone else
-/// after their edit is how an editor would see rows they may not see.
-/// `None` leaves the stored author alone, which is what an edit of the
-/// schedule, the description or the retries asks for.
+/// - the inputs or steps did not change: `Keep` — an edit of the schedule, the
+///   description or the retries asks for nothing else;
+/// - a person who is not already the author changed them: `Set` that person,
+///   because reading as someone else after their edit is how an editor would
+///   see rows they may not see;
+/// - an identity that cannot be read as changed them (a service identity):
+///   `Clear`, unless it holds the unrestricted (`*:*`) grant, which D10a
+///   leaves alone. The pipeline then does not run until an administrator
+///   assigns who it reads as.
 pub(crate) fn author_after_edit(
     current: Option<Uuid>,
     caller: Option<Uuid>,
+    caller_is_unrestricted: bool,
     reads_changed: bool,
-) -> Option<Uuid> {
-    caller.filter(|user_id| Some(*user_id) != current && reads_changed)
+) -> lakehouse_store::pipelines::RunAsChange {
+    use lakehouse_store::pipelines::RunAsChange;
+    if !reads_changed {
+        return RunAsChange::Keep;
+    }
+    match caller {
+        Some(user_id) if Some(user_id) != current => RunAsChange::Set(user_id),
+        Some(_) => RunAsChange::Keep,
+        None if caller_is_unrestricted => RunAsChange::Keep,
+        None => RunAsChange::Clear,
+    }
 }
 
 /// BLD-1 part 1 / D12 + BLD-9 decision 7: a connector names the one Bronze
@@ -2247,13 +2273,18 @@ pub async fn update(
     // inputs nor the steps leaves the author alone.
     let inputs_changed = stored.inputs != form.inputs || stored.steps != form.steps;
     let caller = caller_user_id(&principal);
-    let new_run_as = author_after_edit(current.run_as, caller, inputs_changed);
+    let new_run_as = author_after_edit(
+        current.run_as,
+        caller,
+        crate::routes::catalog::is_unrestricted(&principal),
+        inputs_changed,
+    );
     // BLD-1 part 1 / D2–D6 and D9: compiled, gated and rewritten as the
     // person the pipeline will read as after this edit.
     compile_and_save_check(
         &state,
         current.tenant_id,
-        new_run_as.or(current.run_as),
+        effective_run_as(new_run_as, current.run_as),
         &form.inputs,
         &form.steps,
         (&body.target_zone, &body.target_table),
@@ -2265,13 +2296,13 @@ pub async fn update(
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
     // D10: the audit entry of an edit records the author it moved from and
     // to, because that is a change of who the output is written as.
-    let audit_args = if new_run_as.is_some() {
+    let audit_args = if matches!(new_run_as, lakehouse_store::pipelines::RunAsChange::Keep) {
+        Value::Null
+    } else {
         json!({
             "runAsBefore": current.run_as,
             "runAsAfter": updated.run_as,
         })
-    } else {
-        Value::Null
     };
     record_pipeline_audit(&state, &principal, "pipeline.update", &id, audit_args).await;
     // A draft has no job; only a runnable pipeline's job has to be rebuilt.
@@ -2483,13 +2514,18 @@ pub async fn restore_version(
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
     let inputs_changed = stored.inputs != restored_inputs || stored.steps != restored_steps;
     let caller = caller_user_id(&principal);
-    let new_run_as = author_after_edit(current.run_as, caller, inputs_changed);
+    let new_run_as = author_after_edit(
+        current.run_as,
+        caller,
+        crate::routes::catalog::is_unrestricted(&principal),
+        inputs_changed,
+    );
     // BLD-1 part 1 / D2–D6 and D9: the same compile, gate and rewrite
     // `create` and `update` run.
     compile_and_save_check(
         &state,
         current.tenant_id,
-        new_run_as.or(current.run_as),
+        effective_run_as(new_run_as, current.run_as),
         &restored_inputs,
         &restored_steps,
         (&snapshot.target_zone, &snapshot.target_table),
@@ -2676,6 +2712,47 @@ fn unavailable() -> Response {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    /// BLD-1 part 1 review R1-B9 / D10a: who an edit makes the author.
+    ///
+    /// A person who is not the author and changes what the pipeline reads
+    /// becomes the author; the author itself and an edit that changes nothing
+    /// leave it alone; an identity that cannot be read as clears it unless it
+    /// holds `*:*`.
+    #[test]
+    fn the_author_after_an_edit_follows_d10_and_d10a() {
+        use lakehouse_store::pipelines::RunAsChange;
+
+        let author = Uuid::from_u128(7);
+        let editor = Uuid::from_u128(9);
+        assert_eq!(
+            super::author_after_edit(Some(author), Some(editor), false, true),
+            RunAsChange::Set(editor),
+        );
+        assert_eq!(
+            super::author_after_edit(Some(author), Some(editor), false, false),
+            RunAsChange::Keep,
+            "an edit that changes neither the inputs nor the steps leaves the author",
+        );
+        assert_eq!(
+            super::author_after_edit(Some(author), Some(author), false, true),
+            RunAsChange::Keep,
+        );
+        assert_eq!(
+            super::author_after_edit(Some(author), None, false, true),
+            RunAsChange::Clear,
+            "a restricted service identity cannot be read as",
+        );
+        assert_eq!(
+            super::author_after_edit(Some(author), None, true, true),
+            RunAsChange::Keep,
+            "an unrestricted identity leaves the author as it is (D10a)",
+        );
+        assert_eq!(
+            super::author_after_edit(Some(author), None, false, false),
+            RunAsChange::Keep,
+        );
+    }
 
     use std::collections::HashMap;
 
@@ -4682,7 +4759,7 @@ mod tests {
             let pre_refusal = UpdatePipelineInput {
                 inputs: Vec::new(),
                 steps: Vec::new(),
-                run_as: None,
+                run_as: pipelines::RunAsChange::Keep,
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
                 source_table: "s".to_owned(),
@@ -4741,7 +4818,7 @@ mod tests {
             let pre_refusal = UpdatePipelineInput {
                 inputs: Vec::new(),
                 steps: Vec::new(),
-                run_as: None,
+                run_as: pipelines::RunAsChange::Keep,
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
                 source_table: "s".to_owned(),

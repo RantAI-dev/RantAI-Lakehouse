@@ -1436,14 +1436,34 @@ pub struct UpdatePipelineInput {
     /// (`validate_connector_source`), so this function never stores a
     /// connector the run would refuse.
     pub connector_id: ConnectorChange,
-    /// BLD-1 part 1 / D10 (`SEC-71`): the `app_user` this pipeline reads as
-    /// after the edit, or `None` to leave the stored author alone.
-    ///
-    /// The route sets it to the caller only when the caller is a person, is
-    /// not already the author, and the inputs or steps differ from the stored
-    /// ones — an edit of the schedule, the description or the retries changes
-    /// nothing about what the pipeline reads, so it does not move the author.
-    pub run_as: Option<Uuid>,
+    /// BLD-1 part 1 / D10 and D10a (`SEC-71`): what this write does to the
+    /// author. The route decides — `Set` when a person other than the author
+    /// changed what the pipeline reads, `Clear` when a service identity did,
+    /// `Keep` when the definition did not change.
+    pub run_as: RunAsChange,
+}
+
+/// What a write asks to do with `pipeline_definition.run_as` — the author a
+/// pipeline reads as (BLD-1 part 1 review R1-B9 / D10a).
+///
+/// Three states, for the same reason [`ConnectorChange`] has three: "leave
+/// the stored author alone", "clear it" and "set it" are three different
+/// writes, and `Option<Option<Uuid>>` says it in a shape the compiler's own
+/// lints refuse (`clippy::option_option`). It is not on the wire: the route
+/// decides, from who is calling and whether the definition changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RunAsChange {
+    /// The definition did not change, or the caller is already the author:
+    /// leave `run_as` as it is.
+    #[default]
+    Keep,
+    /// The caller changed what the pipeline reads and cannot be read as (a
+    /// service identity): clear it, so the pipeline does not run until an
+    /// administrator assigns an author.
+    Clear,
+    /// The caller changed what the pipeline reads and is a person: read as
+    /// them from now on.
+    Set(Uuid),
 }
 
 /// What a `PUT /api/pipelines/{id}` asked to do with a pipeline's connector
@@ -1570,7 +1590,7 @@ owner = COALESCE($10, owner), max_retries = COALESCE($11, max_retries), \
          depends_on = COALESCE($12, depends_on), \
          connector_id = CASE WHEN $13 THEN $14 ELSE connector_id END, \
          inputs = $15, steps = $16, input_tables = $17, \
-         run_as = COALESCE($18, run_as) \
+         run_as = CASE WHEN $18 THEN $19 ELSE run_as END \
          WHERE id = $1 RETURNING {FULL_PIPELINE_COLUMNS}"
     );
     // BLD-9 / decision 7: `connector_id` cannot use the `COALESCE` shape
@@ -1609,10 +1629,15 @@ owner = COALESCE($10, owner), max_retries = COALESCE($11, max_retries), \
         .bind(&inputs_json)
         .bind(&steps_json)
         .bind(&columns.input_tables)
-        // BLD-1 part 1 / D10 (`SEC-71`): `None` leaves the stored author
-        // alone; the route passes the caller only when their edit actually
-        // changed the inputs or the steps.
-        .bind(input.run_as)
+        // BLD-1 part 1 / D10 and D10a (`SEC-71`): a `Keep` binds the flag
+        // false and leaves the column alone; `Clear` binds a typed NULL and
+        // `Set` the caller, so the three states stay three writes (the same
+        // shape `connector_id` uses above).
+        .bind(!matches!(input.run_as, RunAsChange::Keep))
+        .bind(match input.run_as {
+            RunAsChange::Set(user_id) => Some(user_id),
+            RunAsChange::Keep | RunAsChange::Clear => None,
+        })
         .fetch_optional(&mut *tx)
         .await?;
     let Some(row) = row else {

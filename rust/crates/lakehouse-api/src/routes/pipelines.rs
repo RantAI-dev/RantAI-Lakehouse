@@ -7875,6 +7875,43 @@ mod tests {
             AppState::new(config)
         }
 
+        /// R1-B9: a service identity can create a pipeline, and it has no
+        /// author — a service has no `app_user` row to read as, and "the
+        /// service account reads everything" is what `run_as` exists to stop
+        /// (D2). The pipeline does not run until an admin assigns one.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_with_a_service_identity_stores_no_author(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let (status, ApiJson(created)) = create(
+                State(state),
+                Extension(fixture_service_principal()),
+                HeaderMap::new(),
+                Bytes::from(
+                    serde_json::to_vec(&json!({
+                        "name": format!("service-created-{}", uuid::Uuid::new_v4()),
+                        "kind": "batch",
+                        "sourceZone": "silver",
+                        "sourceTable": "orders",
+                        "transforms": [],
+                        "targetZone": "silver",
+                        "targetTable": "service_created_out",
+                        "schedule": "manual",
+                    }))
+                    .expect("serialize"),
+                ),
+            )
+            .await
+            .expect("a service identity may create a pipeline");
+
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(created.run_as, None);
+            let stored = pipelines::get_pipeline(&pool, &created.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row exists");
+            assert_eq!(stored.run_as, None);
+        }
+
         fn status_body(status: &str) -> Bytes {
             Bytes::from(serde_json::to_vec(&json!({ "status": status })).expect("serialize"))
         }

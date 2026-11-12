@@ -722,3 +722,79 @@ async fn a_today_s_form_edit_keeps_the_stored_names_and_the_author() {
         "the definition did not change, so the author must not move"
     );
 }
+
+/// R1-B9 (D9 + D10): someone other than the author changes what the pipeline
+/// reads, and the save is checked as THEM — so a table they may not read is
+/// refused, naming the input, instead of the edit being accepted and the
+/// pipeline continuing to read as its old author (`SEC-71`).
+#[tokio::test]
+async fn an_editors_change_is_refused_when_they_may_not_read_an_input() {
+    let (router, pool, _ch) = app().await;
+    let admin = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let (status, created) = send(
+        &router,
+        request(
+            "POST",
+            "/api/pipelines",
+            &admin,
+            Some(GROUP_TENANT),
+            Some(new_body("save-editor-refused")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().unwrap().to_owned();
+
+    // A Data Engineer who may build pipelines and read only `finance.orders`
+    // (a table this pipeline does not read).
+    let editor = create_principal_with_permissions(&pool, "pipeline:write, query:read").await;
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(editor)
+        .bind(Uuid::parse_str(GROUP_TENANT).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let role: Uuid = sqlx::query_scalar("SELECT role_id FROM app_user_role WHERE user_id = $1")
+        .bind(editor)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE role SET read_scope = 'listed' WHERE id = $1")
+        .bind(role)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO role_read_grant (role_id, schema_name, table_name) \
+         VALUES ($1, 'finance', 'orders')",
+    )
+    .bind(role)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let cookie = session_cookie_for_user(&pool, editor).await;
+
+    // The editor changes the steps; the inputs (`silver.orders`,
+    // `silver.customers`) are tables they may not read.
+    let mut body = new_body("save-editor-refused");
+    body["steps"] = json!([
+        {"name": "joined", "kind": "sql", "sql": "SELECT o.id FROM orders AS o"},
+    ]);
+    let (status, refused) = send(
+        &router,
+        request(
+            "PUT",
+            &format!("/api/pipelines/{id}"),
+            &cookie,
+            Some(GROUP_TENANT),
+            Some(body),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    let message = refused["error"].as_str().unwrap_or_default();
+    assert!(
+        message.starts_with("inputs["),
+        "the refusal must name the input they may not read: {message}"
+    );
+}

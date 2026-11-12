@@ -180,13 +180,13 @@ async fn update_replaces_depends_on_wholesale(pool: PgPool) -> sqlx::Result<()> 
         &pipelines::UpdatePipelineInput {
             inputs: Vec::new(),
             steps: Vec::new(),
-            run_as: None,
+            run_as: pipelines::RunAsChange::Keep,
             depends_on: Some(vec!["pl-new-1".to_owned(), "pl-new-2".to_owned()]),
             connector_id: pipelines::ConnectorChange::Keep,
             ..pipelines::UpdatePipelineInput {
                 inputs: Vec::new(),
                 steps: Vec::new(),
-                run_as: None,
+                run_as: pipelines::RunAsChange::Keep,
                 kind: input().kind,
                 source_zone: input().source_zone,
                 source_table: input().source_table,
@@ -523,7 +523,7 @@ async fn update_replaces_the_definition_and_keeps_the_status(pool: PgPool) -> sq
         &pipelines::UpdatePipelineInput {
             inputs: Vec::new(),
             steps: Vec::new(),
-            run_as: None,
+            run_as: pipelines::RunAsChange::Keep,
             kind: "batch".to_owned(),
             source_zone: "silver".to_owned(),
             source_table: "events".to_owned(),
@@ -563,7 +563,7 @@ async fn update_replaces_the_definition_and_keeps_the_status(pool: PgPool) -> sq
         &pipelines::UpdatePipelineInput {
             inputs: Vec::new(),
             steps: Vec::new(),
-            run_as: None,
+            run_as: pipelines::RunAsChange::Keep,
             kind: "batch".to_owned(),
             source_zone: "a".to_owned(),
             source_table: "b".to_owned(),
@@ -726,7 +726,7 @@ async fn update_pipeline_keeps_max_retries_when_absent_and_overwrites_when_prese
     let mut update = pipelines::UpdatePipelineInput {
         inputs: Vec::new(),
         steps: Vec::new(),
-        run_as: None,
+        run_as: pipelines::RunAsChange::Keep,
         max_retries: None,
         ..update_input_for(&created)
     };
@@ -788,7 +788,7 @@ fn update_input_for(p: &pipelines::Pipeline) -> pipelines::UpdatePipelineInput {
     pipelines::UpdatePipelineInput {
         inputs: Vec::new(),
         steps: Vec::new(),
-        run_as: None,
+        run_as: pipelines::RunAsChange::Keep,
         kind: "batch".to_owned(),
         source_zone: "a".to_owned(),
         source_table: "b".to_owned(),
@@ -1036,7 +1036,7 @@ async fn create_pipeline_writes_one_created_version_in_the_same_transaction(
         &UpdatePipelineInput {
             inputs: Vec::new(),
             steps: Vec::new(),
-            run_as: None,
+            run_as: pipelines::RunAsChange::Keep,
             kind: "batch".to_owned(),
             source_zone: "silver".to_owned(),
             source_table: "events".to_owned(),
@@ -1068,7 +1068,7 @@ async fn create_pipeline_writes_one_created_version_in_the_same_transaction(
         &UpdatePipelineInput {
             inputs: Vec::new(),
             steps: Vec::new(),
-            run_as: None,
+            run_as: pipelines::RunAsChange::Keep,
             kind: created_snapshot.kind.clone(),
             source_zone: created_snapshot.source_zone.clone(),
             source_table: created_snapshot.source_table.clone(),
@@ -1146,7 +1146,7 @@ async fn restore_pipeline_writes_exactly_one_restored_version(pool: PgPool) -> s
         &UpdatePipelineInput {
             inputs: Vec::new(),
             steps: Vec::new(),
-            run_as: None,
+            run_as: pipelines::RunAsChange::Keep,
             kind: "batch".to_owned(),
             source_zone: "silver".to_owned(),
             source_table: "events".to_owned(),
@@ -1186,7 +1186,7 @@ async fn restore_pipeline_writes_exactly_one_restored_version(pool: PgPool) -> s
         &UpdatePipelineInput {
             inputs: Vec::new(),
             steps: Vec::new(),
-            run_as: None,
+            run_as: pipelines::RunAsChange::Keep,
             kind: snap.kind,
             source_zone: snap.source_zone,
             source_table: snap.source_table,
@@ -1255,7 +1255,7 @@ async fn update_pipeline_writes_one_updated_version_with_post_write_state(
         &UpdatePipelineInput {
             inputs: Vec::new(),
             steps: Vec::new(),
-            run_as: None,
+            run_as: pipelines::RunAsChange::Keep,
             kind: "batch".to_owned(),
             source_zone: "silver".to_owned(),
             source_table: "events".to_owned(),
@@ -1356,7 +1356,7 @@ async fn failed_update_writes_no_version_row(pool: PgPool) -> sqlx::Result<()> {
         &UpdatePipelineInput {
             inputs: Vec::new(),
             steps: Vec::new(),
-            run_as: None,
+            run_as: pipelines::RunAsChange::Keep,
             kind: "batch".to_owned(),
             source_zone: "silver".to_owned(),
             source_table: "events".to_owned(),
@@ -1408,7 +1408,7 @@ async fn list_definition_versions_is_newest_first_without_snapshots(
         &UpdatePipelineInput {
             inputs: Vec::new(),
             steps: Vec::new(),
-            run_as: None,
+            run_as: pipelines::RunAsChange::Keep,
             kind: created.kind.clone(),
             source_zone: "silver".to_owned(),
             source_table: created_def.source_table.clone(),
@@ -1434,7 +1434,7 @@ async fn list_definition_versions_is_newest_first_without_snapshots(
         &UpdatePipelineInput {
             inputs: Vec::new(),
             steps: Vec::new(),
-            run_as: None,
+            run_as: pipelines::RunAsChange::Keep,
             kind: created.kind.clone(),
             source_zone: "gold".to_owned(),
             source_table: created_def.source_table.clone(),
@@ -1561,7 +1561,7 @@ async fn snapshot_round_trips_through_create_update_and_restore(pool: PgPool) ->
         &UpdatePipelineInput {
             inputs: Vec::new(),
             steps: Vec::new(),
-            run_as: None,
+            run_as: pipelines::RunAsChange::Keep,
             kind: "batch".to_owned(),
             source_zone: "silver".to_owned(),
             source_table: "events".to_owned(),
@@ -1594,7 +1594,7 @@ async fn snapshot_round_trips_through_create_update_and_restore(pool: PgPool) ->
         &UpdatePipelineInput {
             inputs: Vec::new(),
             steps: Vec::new(),
-            run_as: None,
+            run_as: pipelines::RunAsChange::Keep,
             kind: snap.kind.clone(),
             source_zone: snap.source_zone.clone(),
             source_table: snap.source_table.clone(),
@@ -3080,7 +3080,7 @@ async fn update_pipeline_refuses_target_lag_cycle(pool: PgPool) -> sqlx::Result<
     let update_input = pipelines::UpdatePipelineInput {
         inputs: Vec::new(),
         steps: Vec::new(),
-        run_as: None,
+        run_as: pipelines::RunAsChange::Keep,
         kind: p1.kind,
         source_zone: "silver".to_owned(),
         source_table: "p2".to_owned(),
@@ -3670,7 +3670,7 @@ async fn an_update_carrying_inputs_and_steps_rewrites_every_legacy_column(
     let mut update = pipelines::UpdatePipelineInput {
         inputs: Vec::new(),
         steps: Vec::new(),
-        run_as: None,
+        run_as: pipelines::RunAsChange::Keep,
         ..update_input_for(&created)
     };
     update.inputs = vec![
@@ -3929,6 +3929,43 @@ async fn an_undecodable_definition_writes_no_snapshot(pool: PgPool) -> sqlx::Res
     assert_eq!(
         versions.0, 0,
         "no snapshot may be written for a corrupt row"
+    );
+    Ok(())
+}
+
+/// R1-B9 / D10a: a write that clears the author really clears the column, in
+/// the same transaction as the definition — the state a pipeline is in after a
+/// service identity changed what it reads, and it does not run until an
+/// administrator assigns one (D2).
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_can_clear_the_author(pool: PgPool) -> sqlx::Result<()> {
+    let author = seed_user(&pool, "clear-author@test.invalid").await;
+    let mut create = input();
+    create.run_as = Some(author);
+    let created = pipelines::create_pipeline(&pool, &create, None)
+        .await
+        .expect("create should succeed");
+    assert_eq!(created.run_as, Some(author));
+
+    let mut update = pipelines::UpdatePipelineInput {
+        inputs: Vec::new(),
+        steps: Vec::new(),
+        run_as: pipelines::RunAsChange::Clear,
+        ..update_input_for(&created)
+    };
+    update.transforms = vec!["select(id)".to_owned()];
+    let updated = pipelines::update_pipeline(&pool, &created.id, &update, None)
+        .await
+        .expect("update should succeed")
+        .expect("the pipeline exists");
+    assert_eq!(updated.run_as, None, "the author is cleared");
+    assert_eq!(
+        pipelines::get_pipeline(&pool, &created.id)
+            .await
+            .expect("get_pipeline")
+            .expect("the row exists")
+            .run_as,
+        None,
     );
     Ok(())
 }
