@@ -65,12 +65,17 @@ What QA and the reviews saw:
 
   Writing the first tenant when nothing is stored goes one step past D3, on purpose. With
   nothing stored the console shows `me.tenants[0]` and sends no header, and the server then
-  takes the first of `principal.tenant_ids`. Those two lists are not in the same order:
-  `tenant_ids` is read `ORDER BY tenant_id`
-  (`rust/crates/lakehouse-auth/src/repository.rs:141-142`), `me.tenants` comes from
-  `list_tenants_by_ids`, which has no `ORDER BY`
-  (`rust/crates/lakehouse-store/src/identity.rs:1260-1264`). Once sign-out clears the key
-  (D3), every sign-in would start in that state. Writing the tenant the console shows makes
+  takes the first of `principal.tenant_ids`. Those two lists are in the same order, and on
+  purpose: `tenant_ids` is read `ORDER BY tenant_id`
+  (`rust/crates/lakehouse-auth/src/repository.rs:141-142`) and `me.tenants` comes from
+  `list_tenants_by_ids`, which reads `ORDER BY id`
+  (`rust/crates/lakehouse-store/src/identity.rs`, added in review round 1, R4), both
+  ascending id. Without that order the tenant written at deploy could be another of the
+  person's own — their lists, connectors and query tabs would move with it, with no action
+  on their part — and a rename could change which row comes first, so the same person could
+  start in a different tenant on different days; a `sqlx::test` in `lakehouse-store` holds
+  the order. Once sign-out clears the key (D3), every sign-in would start in that state.
+  Writing the tenant the console shows makes
   the header say it, so the console and the server agree. It widens nobody's reach: the
   server already resolves a person with tenants to one of their own
   (`rust/crates/lakehouse-api/src/tenant_scope.rs:76-90`), and "no tenant at all" is kept
@@ -758,10 +763,10 @@ the assertion.
 
 ## 4. Out of scope
 
-- **The order of `tenants` in `GET /api/auth/me`** (`list_tenants_by_ids` has no `ORDER
-  BY`, D4). After T7 the console sends the tenant it shows, so the two orders no longer
-  have to agree. A browser whose storage cannot be written (private browsing) still sends
-  no header and shows `me.tenants[0]`; that case is as it is today.
+- **A browser whose storage cannot be written** (private browsing): it still sends no
+  header and shows `me.tenants[0]`. Since review round 1, R4 that is the tenant the server
+  defaults to as well (`list_tenants_by_ids` reads `ORDER BY id`), so it is as it is today
+  and not a mismatch.
 - **Clearing the stored tenant when a session expires** (D5), **two tabs signed in as two
   people**, and **a tenant list that comes back empty because its read failed**
   (`routes/auth.rs:376-381` answers an empty list then; T7 removes the stored choice, which
