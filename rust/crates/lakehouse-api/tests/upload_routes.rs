@@ -5617,6 +5617,39 @@ async fn a_binary_that_is_not_a_supported_file_is_refused_at_completion_and_remo
     assert_eq!(stack.row_count(&id).await, 0);
 }
 
+/// A file named like a format this upload reads, whose bytes do not open as that format,
+/// is refused as a file that could not be opened -- not as a format this upload does not
+/// read (QA `LH-DATA-17-05`, `DATA-51`). A damaged Parquet file is the case QA sent.
+#[tokio::test]
+async fn a_damaged_parquet_file_is_refused_at_completion_as_a_file_that_could_not_be_opened() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    // The bytes of the "not text" case above: a NUL byte, so no reader takes it.
+    let bytes: Vec<u8> = (0..3000_u32)
+        .map(|n| u8::try_from(n % 251).unwrap())
+        .collect();
+    let id = stack.session(&bayu, "data.parquet", bytes.len()).await;
+    stack.put_part(&bayu, &id, "1", &bytes).await;
+
+    let reply = stack.complete(&bayu, &id).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
+    let expected = lakehouse_api::upload_parquet::ParquetFileError::Unreadable.to_string();
+    assert_eq!(reply.json["error"], expected.as_str(), "{}", reply.text);
+    assert!(
+        !reply.json["error"]
+            .as_str()
+            .unwrap()
+            .contains("not a file this upload reads"),
+        "{}",
+        reply.text
+    );
+    assert!(
+        stack.bucket.keys().is_empty(),
+        "the refused file was removed"
+    );
+    assert_eq!(stack.row_count(&id).await, 0);
+}
+
 /// A workbook and a Parquet file complete with their facts, as they do through
 /// `POST /api/uploads`.
 #[tokio::test]

@@ -1042,9 +1042,30 @@ fn classify_head(head: &[u8], filename: &str) -> Result<Accepted, ApiError> {
         Kind::Gzip => GZIP,
         Kind::Avro if named == ByName::Plain(Format::Avro) => return Ok(Accepted::Avro),
         Kind::Avro => AVRO,
-        Kind::OtherBinary => OTHER_BINARY,
+        Kind::OtherBinary => return Err(ApiError::BadRequest(unreadable_as_named(filename))),
     };
     Err(ApiError::BadRequest(message.to_owned()))
+}
+
+/// The sentence for bytes that are neither text nor a kind this API knows, said by what the
+/// file's NAME claims it is (QA `LH-DATA-17-05`, `DATA-51`): a damaged file of a format this
+/// upload reads "could not be opened" as that format, which is a different answer from "this
+/// is not a format this upload reads". Every name has an answer, the last being [`OTHER_BINARY`]
+/// for a name that claims nothing, so the function returns no `Result` and needs no `# Errors`.
+fn unreadable_as_named(filename: &str) -> String {
+    if has_parquet_name(filename) {
+        return upload_parquet::ParquetFileError::Unreadable.to_string();
+    }
+    if has_workbook_name(filename) {
+        return upload_workbook::WorkbookError::Unreadable.to_string();
+    }
+    match upload_formats::by_name(filename) {
+        ByName::Plain(Format::Avro) => NOT_AVRO,
+        ByName::Plain(Format::Json | Format::JsonLines) => return Refusal::JsonInvalid.to_string(),
+        ByName::Gzip(_) | ByName::Zip => NOT_AN_ARCHIVE,
+        ByName::Plain(_) | ByName::Other => OTHER_BINARY,
+    }
+    .to_owned()
 }
 
 /// Text by its first bytes: delimited text, unless its name says JSON, JSON Lines or an
@@ -3613,6 +3634,41 @@ mod tests {
             Accepted::Parquet
         );
         assert!(check_file(encrypted, "a.csv").is_err());
+    }
+
+    /// Bytes that are neither text nor a kind the API knows are answered by what the
+    /// file's name claims: "could not be opened" as that format, never "a format this
+    /// upload does not read" (QA `LH-DATA-17-05`, `DATA-51`).
+    #[test]
+    fn a_binary_file_named_like_an_accepted_format_is_told_it_could_not_be_opened() {
+        // The bytes of the "not text" case above: a NUL byte, so no reader takes it.
+        let binary = b"a,b\0c,d";
+        let refusal = |name: &str| check_file(binary, name).unwrap_err().to_string();
+        let sentences = [
+            (
+                "a.parquet",
+                upload_parquet::ParquetFileError::Unreadable.to_string(),
+            ),
+            (
+                "a.xlsx",
+                upload_workbook::WorkbookError::Unreadable.to_string(),
+            ),
+            ("a.avro", NOT_AVRO.to_owned()),
+            ("a.json", Refusal::JsonInvalid.to_string()),
+            ("a.csv.gz", NOT_AN_ARCHIVE.to_owned()),
+            ("a.zip", NOT_AN_ARCHIVE.to_owned()),
+        ];
+        for (name, sentence) in sentences {
+            assert_eq!(refusal(name), sentence, "{name}");
+            assert!(
+                !sentence.contains("not a file this upload reads"),
+                "{name} must not be answered as a format this upload does not read"
+            );
+        }
+        // A name that claims no format keeps the format-list sentence.
+        for name in ["a.bin", "a.pdf"] {
+            assert_eq!(refusal(name), OTHER_BINARY, "{name}");
+        }
     }
 
     #[test]
