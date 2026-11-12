@@ -77,7 +77,7 @@ use iceberg::spec::{NestedField, PrimitiveType, Type};
 use lakehouse_clickhouse::{ChClient, ChColumn, ChError};
 use lakehouse_core::ApiError;
 use lakehouse_core::secret::SecretValue;
-use lakehouse_iceberg::{GoldTable, IcebergClient, IcebergClientConfig, IcebergError, gold};
+use lakehouse_iceberg::{IcebergClient, IcebergClientConfig, IcebergError, gold};
 use serde_json::{Map, Value};
 use thiserror::Error;
 use time::Date;
@@ -947,27 +947,33 @@ pub struct GoldReadBack {
 /// currently visible — used by `routes::gold::read_back` to prove the
 /// export round trip without exposing the Gold data itself over the API.
 ///
+/// `Ok(None)` means the catalog says the table does not exist — a mart never
+/// published, which is a state and not an error (`DATA-49`, QA
+/// `LH-DATA-1-01`).
+///
 /// # Errors
 ///
-/// Returns [`GoldExportError::Iceberg`] if the table does not exist or the
-/// read fails.
+/// Returns [`GoldExportError::Iceberg`] if the catalog refuses or fails the
+/// call for any other reason, or if the read fails.
 pub async fn read_back_row_count(
     iceberg_config: &IcebergClientConfig,
     mart_name: &str,
-) -> Result<GoldReadBack, GoldExportError> {
+) -> Result<Option<GoldReadBack>, GoldExportError> {
     let client = IcebergClient::connect(iceberg_config).await?;
-    let table: GoldTable = client.load_gold_table(mart_name).await?;
+    let Some(table) = client.load_gold_table_if_exists(mart_name).await? else {
+        return Ok(None);
+    };
     let format_version = table.format_version() as u8;
     let snapshot_id = table.current_snapshot_id();
     let exported_at_ms = table.current_snapshot_timestamp_ms();
     let batches = table.read_all().await?;
     let rows = batches.iter().map(RecordBatch::num_rows).sum();
-    Ok(GoldReadBack {
+    Ok(Some(GoldReadBack {
         format_version,
         rows,
         snapshot_id,
         exported_at_ms,
-    })
+    }))
 }
 
 /// Builds an [`IcebergClientConfig`] for the Gold export path from

@@ -654,12 +654,16 @@ fn millis_to_rfc3339(ms: i64) -> Option<String> {
 /// whatever the last `POST` claimed. This is the round-trip proof; it
 /// does not touch `ClickHouse` at all.
 ///
+/// A mart the catalog does not have answers `200` with `published: false`
+/// and every other fact `null` ([`read_back_body`]) — never published is a
+/// state, not an error (`DATA-49`, QA `LH-DATA-1-01`).
+///
 /// # Errors
 ///
 /// Returns 401/503 from [`check_export_token`] (same guard as `POST` —
 /// this still reveals row counts, not public data), 503 if the Lakekeeper
-/// token cannot be read, or 500 if the table does not exist yet or the
-/// Iceberg read fails.
+/// token cannot be read, or 500 if the catalog refuses or fails the call
+/// for any reason other than "table not found", or the Iceberg read fails.
 pub async fn read_back(
     State(state): State<AppState>,
     Path(mart): Path<String>,
@@ -689,14 +693,41 @@ pub async fn read_back(
         .await
         .map_err(ApiError::from)?;
 
-    Ok(ApiJson(json!({
-        "namespace": lakehouse_iceberg::gold::GOLD_NAMESPACE,
-        "table": mart_ident.as_str(),
-        "formatVersion": readback.format_version,
-        "rowsInIceberg": readback.rows,
-        "snapshotId": readback.snapshot_id,
-        "exportedAt": readback.exported_at_ms.and_then(millis_to_rfc3339),
-    })))
+    Ok(ApiJson(read_back_body(
+        mart_ident.as_str(),
+        readback.as_ref(),
+    )))
+}
+
+/// The body of `GET /api/gold/export/{mart}` and the assistant's
+/// `get_gold_export` tool, in one place so the two cannot drift (`DATA-49`,
+/// QA `LH-DATA-1-01`).
+///
+/// A mart never published answers `200` with `published: false` and every
+/// other fact `null`, never an error and never an invented number: the
+/// console treats "no export" as a normal state, and a 404 would make it a
+/// failed request in the browser for something that is not an error.
+pub(crate) fn read_back_body(mart: &str, readback: Option<&gold_export::GoldReadBack>) -> Value {
+    match readback {
+        None => json!({
+            "namespace": lakehouse_iceberg::gold::GOLD_NAMESPACE,
+            "table": mart,
+            "published": false,
+            "formatVersion": Value::Null,
+            "rowsInIceberg": Value::Null,
+            "snapshotId": Value::Null,
+            "exportedAt": Value::Null,
+        }),
+        Some(readback) => json!({
+            "namespace": lakehouse_iceberg::gold::GOLD_NAMESPACE,
+            "table": mart,
+            "published": true,
+            "formatVersion": readback.format_version,
+            "rowsInIceberg": readback.rows,
+            "snapshotId": readback.snapshot_id,
+            "exportedAt": readback.exported_at_ms.and_then(millis_to_rfc3339),
+        }),
+    }
 }
 
 /// Query parameters for `GET /api/gold/exports`.
@@ -1525,6 +1556,38 @@ mod tests {
             "The catalog request failed. Reference: abc"
         );
         assert_eq!(failure["failedAt"], "2023-11-14T22:13:20Z");
+    }
+
+    // ── The read-back body (DATA-49, QA LH-DATA-1-01) ─────────────────────
+
+    /// A mart the catalog does not have is "not published": every other fact is
+    /// null, so the card invents neither a row count nor a time.
+    #[test]
+    fn the_read_back_of_a_mart_never_published_says_so_and_invents_no_number() {
+        let body = read_back_body("never_published", None);
+        assert_eq!(body["published"], Value::Bool(false));
+        assert_eq!(body["table"], "never_published");
+        assert_eq!(body["namespace"], lakehouse_iceberg::gold::GOLD_NAMESPACE);
+        for field in ["formatVersion", "rowsInIceberg", "snapshotId", "exportedAt"] {
+            assert!(body[field].is_null(), "{field} must be null: {body}");
+        }
+    }
+
+    /// A published mart keeps today's fields and says it is published.
+    #[test]
+    fn the_read_back_of_a_published_mart_keeps_its_fields_and_says_published() {
+        let readback = gold_export::GoldReadBack {
+            format_version: 2,
+            rows: 5,
+            snapshot_id: Some(42),
+            exported_at_ms: Some(1_700_000_000_000),
+        };
+        let body = read_back_body("orders_rollup", Some(&readback));
+        assert_eq!(body["published"], Value::Bool(true));
+        assert_eq!(body["formatVersion"], 2);
+        assert_eq!(body["rowsInIceberg"], 5);
+        assert_eq!(body["snapshotId"], 42);
+        assert_eq!(body["exportedAt"], "2023-11-14T22:13:20Z");
     }
 
     // ── The stored and answered sentence (DATA-49, QA LH-DATA-1-01) ──────
