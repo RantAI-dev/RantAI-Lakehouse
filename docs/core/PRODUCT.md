@@ -367,7 +367,7 @@ an order in its roadmap phase.
 | Data | Fix and test every connector (`SRC-6`, `SRC-9`), failure alerts and schema changes (`SRC-7`, `SRC-8`), then the catalog (`DATA-11` to `DATA-16`) and upload depth (`DATA-17` to `DATA-19`) | Make what we advertise work before adding more |
 | Query Studio | Its security fixes (`SEC-19` to `SEC-21`), then editor, results, saved queries and history (`QS-1` to `QS-4`) | Every SQL user expects these |
 | Security and platform | `SEC-12`, `SEC-16` to `SEC-18`, single sign-on (`SEC-3`), audit coverage (`GOV-1`), row filters (`VER-1`), table cleanup (`OPS-1`), usage view (`OPS-8`) | Found in every evaluation |
-| Pipelines | Joins and aggregations in the builder (`BLD-1`) | Today these need SQL written outside the builder |
+| Pipelines | Pipelines built from steps: SQL steps first, then joins and aggregations as forms (`BLD-1`) | Today a pipeline reads one table and has five operations; anything else needs SQL written outside the builder |
 
 ### Later
 
