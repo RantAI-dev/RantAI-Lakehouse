@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { EditorView } from "@codemirror/view"
 import * as React from "react"
 import * as notify from "@/lib/notify"
+import { LEGACY_QUERY_DRAFT_KEY, queryDraftKey, type QueryTabs } from "@/lib/query-draft"
 import { assetService, lakehouseService, queryService } from "@/services"
 import { ServiceError } from "@/services/errors"
 import type { LakehouseTableDetail } from "@/services/contracts/lakehouse"
@@ -72,7 +73,7 @@ function mountWith(sql: string) {
   spyOn(queryService, "listSaved").mockResolvedValue([])
   spyOn(queryService, "listHistory").mockResolvedValue([])
   spyOn(assetService, "listAssets").mockResolvedValue([])
-  const hook = renderHook(() => useQueryStudio())
+  const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
   act(() => hook.result.current.setSql(sql))
   return hook
 }
@@ -87,7 +88,7 @@ describe("useQueryStudio saved-query link", () => {
     const getSaved = spyOn(queryService, "getSaved").mockResolvedValue(SAVED)
     visit("/query-studio?saved=q1")
 
-    const hook = renderHook(() => useQueryStudio())
+    const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
 
     await waitFor(() => expect(getSaved).toHaveBeenCalledTimes(1))
     expect(getSaved.mock.calls[0]?.[0]).toBe("q1")
@@ -109,7 +110,7 @@ describe("useQueryStudio saved-query link", () => {
     )
     visit("/query-studio?saved=q1")
 
-    const hook = renderHook(() => useQueryStudio())
+    const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
 
     await waitFor(() => expect(hook.result.current.savedLinkError).not.toBeNull())
     expect(hook.result.current.savedLinkError).toBe("This query is not available to you.")
@@ -126,7 +127,7 @@ describe("useQueryStudio saved-query link", () => {
     spyOn(assetService, "listAssets").mockResolvedValue([])
     const getSaved = spyOn(queryService, "getSaved").mockResolvedValue(SAVED)
 
-    const hook = renderHook(() => useQueryStudio())
+    const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
 
     await waitFor(() => expect(hook.result.current.tabs.length).toBe(1))
     expect(getSaved).not.toHaveBeenCalled()
@@ -143,7 +144,7 @@ describe("useQueryStudio saved-query link", () => {
 
     // StrictMode runs every effect twice: the link is read once, and the
     // query it names opens in one tab, not two.
-    const hook = renderHook(() => useQueryStudio(), {
+    const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)), {
       wrapper: ({ children }) =>
         React.createElement(React.StrictMode, null, children),
     })
@@ -264,7 +265,7 @@ describe("useQueryStudio columns", () => {
       schema: [{ name: "amount", dataType: "Int64" }],
     } as never)
 
-    const hook = renderHook(() => useQueryStudio())
+    const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
     await waitFor(() => expect(hook.result.current.tables.length).toBe(1))
     act(() =>
       hook.result.current.setSql("SELECT * FROM silver.orders a JOIN silver.orders b")
@@ -328,7 +329,7 @@ describe("useQueryStudio Bronze tables", () => {
         ? () => Promise.reject(options.tableError)
         : () => Promise.resolve(ICEBERG_TABLE)
     spyOn(lakehouseService, "getTableDetail").mockImplementation(tableAnswer)
-    return renderHook(() => useQueryStudio())
+    return renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
   }
 
   it("names the table by its Trino name on a Trino tab, and answers to it by any spelling", async () => {
@@ -565,7 +566,9 @@ describe("useQueryStudio parameters", () => {
     const hook = mountWith("SELECT {{region}}")
     act(() => hook.result.current.setParameterValue("region", "EU"))
     await waitFor(() => {
-      const stored = JSON.parse(window.localStorage.getItem("rantai-lakehouse:query-studio-draft") ?? "{}")
+      const stored = JSON.parse(
+        window.localStorage.getItem(queryDraftKey("u1", null)) ?? "{}"
+      )
       expect(stored.tabs?.[0]?.values).toEqual({ region: "EU" })
       expect(stored.tabs?.[0]?.parameters).toEqual([{ name: "region", type: "text" }])
     })
@@ -911,7 +914,7 @@ describe("useQueryStudio parameter requests", () => {
       parameters: definitions,
     })
     visit("/query-studio?saved=q1")
-    const hook = renderHook(() => useQueryStudio())
+    const hook = renderHook(() => useQueryStudio(queryDraftKey("u1", null)))
     await waitFor(() => expect(hook.result.current.tabs[0]?.savedId).toBe("q1"))
 
     expect(hook.result.current.tabs[0]?.parameters).toEqual(definitions)
@@ -945,5 +948,103 @@ describe("useQueryStudio parameter requests", () => {
     act(() => result.current.loadSql("SELECT {{old}} + 1"))
 
     expect(result.current.tabs[0]?.values).toEqual({ old: "x" })
+  })
+})
+
+// `QS-8` (`LH-QS-1-04` F1): the draft belongs to one person in one tenant.
+// The key is the person and their active tenant (`queryDraftKey`), never one
+// entry for the browser, and one hook instance has one owner for its life.
+describe("useQueryStudio draft owner", () => {
+  /** The key of the person these tests write as, and of somebody else. */
+  const MINE = queryDraftKey("u1", null)
+  const THEIRS = queryDraftKey("u2", null)
+
+  /** Stubs the lists the hook asks for, so nothing reaches the network. */
+  function stubLists() {
+    spyOn(queryService, "listSaved").mockResolvedValue([])
+    spyOn(queryService, "listHistory").mockResolvedValue([])
+    spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
+    spyOn(assetService, "listAssets").mockResolvedValue([])
+  }
+
+  /** One stored tab, the way the browser keeps it. */
+  function storedTabs(sql: string): QueryTabs {
+    return {
+      tabs: [
+        {
+          id: "tab-1",
+          name: "Query 1",
+          sql,
+          engine: "clickhouse",
+          parameters: [],
+          values: {},
+        },
+      ],
+      activeId: "tab-1",
+      question: "",
+      tab: "sql",
+    }
+  }
+
+  it("does not show a draft stored under another person's key", async () => {
+    stubLists()
+    window.localStorage.setItem(THEIRS, JSON.stringify(storedTabs("SELECT 'theirs'")))
+    const hook = renderHook(() => useQueryStudio(MINE))
+
+    await waitFor(() => expect(hook.result.current.sql).not.toBe("SELECT 'theirs'"))
+    expect(hook.result.current.tabs.length).toBe(1)
+    expect(hook.result.current.tabs[0]?.sql).not.toBe("SELECT 'theirs'")
+  })
+
+  it("writes the draft under its owner's key and nothing under the old shared key", async () => {
+    stubLists()
+    const hook = renderHook(() => useQueryStudio(MINE))
+
+    act(() => hook.result.current.setSql("SELECT 'mine'"))
+
+    await waitFor(
+      () => {
+        const raw = window.localStorage.getItem(MINE)
+        expect(JSON.parse(raw ?? "{}").tabs?.[0]?.sql).toBe("SELECT 'mine'")
+      },
+      { timeout: 2000 }
+    )
+    expect(window.localStorage.getItem(LEGACY_QUERY_DRAFT_KEY)).toBeNull()
+  })
+
+  it("reads and writes nothing while the owner is not known", async () => {
+    stubLists()
+    const hook = renderHook(() => useQueryStudio(null))
+
+    act(() => hook.result.current.setSql("SELECT 1"))
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 600))
+    })
+    expect(window.localStorage.length).toBe(0)
+  })
+
+  it("keeps writing under its first owner when the key it is given changes", async () => {
+    stubLists()
+    const hook = renderHook(({ key }: { key: string }) => useQueryStudio(key), {
+      initialProps: { key: MINE },
+    })
+
+    act(() => hook.result.current.setSql("SELECT 'mine'"))
+    await waitFor(() => expect(window.localStorage.getItem(MINE)).not.toBeNull(), {
+      timeout: 2000,
+    })
+
+    hook.rerender({ key: THEIRS })
+    act(() => hook.result.current.setSql("SELECT 'mine', 2"))
+
+    await waitFor(
+      () => {
+        const raw = window.localStorage.getItem(MINE)
+        expect(JSON.parse(raw ?? "{}").tabs?.[0]?.sql).toBe("SELECT 'mine', 2")
+      },
+      { timeout: 2000 }
+    )
+    expect(window.localStorage.getItem(THEIRS)).toBeNull()
   })
 })

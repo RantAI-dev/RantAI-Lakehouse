@@ -40,7 +40,7 @@ mock.module("@/features/auth/auth-provider", () => ({
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { chooseOption } from "@/components/patterns/select-field.testing"
-import { readTabs, writeTabs } from "@/lib/query-draft"
+import { queryDraftKey, readTabs, writeTabs } from "@/lib/query-draft"
 import { queryService } from "@/services"
 import type {
   QueryFolder,
@@ -266,7 +266,7 @@ describe("the save query page has no draft", () => {
 
   it("points the editor's tab at the query the save made, so it says Save next time", async () => {
     spyOn(queryService, "listFolders").mockResolvedValue(FOLDERS)
-    writeTabs({
+    writeTabs(queryDraftKey("u1", null), {
       tabs: [
         {
           id: "tab-1",
@@ -291,7 +291,7 @@ describe("the save query page has no draft", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Save as new" }))
 
     await waitFor(() => expect(pushed).toEqual(["/query-studio"]))
-    const tab = readTabs()?.tabs[0]
+    const tab = readTabs(queryDraftKey("u1", null))?.tabs[0]
     expect(tab?.savedId).toBe("q2")
     expect(tab?.level).toBe("edit")
     // The statement itself is untouched: the editor keeps its text.

@@ -13,6 +13,7 @@ import { ServiceError } from "@/services/errors"
 import type { LakehouseTableDetail } from "@/services/contracts/lakehouse"
 import { SchemaBrowser } from "./schema-browser"
 import { SqlPanel } from "./sql-panel"
+import { queryDraftKey } from "@/lib/query-draft"
 import { useQueryStudio } from "./use-query-studio"
 
 afterEach(() => {
@@ -83,7 +84,7 @@ const ICEBERG_TABLE = {
 
 /** The page's two halves that matter here: the editor with its toolbar, and the browser. */
 function Harness() {
-  const studio = useQueryStudio()
+  const studio = useQueryStudio(queryDraftKey("u1", null))
   return (
     <>
       <SqlPanel studio={studio} onSave={() => {}} />
