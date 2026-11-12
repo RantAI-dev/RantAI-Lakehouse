@@ -66,7 +66,7 @@ import { withPreviewDef } from "@/lib/preview-spec";
 import { suggestChartTitle } from "@/lib/chart-title";
 import { guessCoordinateColumns, pointLimit } from "@/lib/geo-points";
 import {
-  BREAKDOWN_GRAINS, GRAIN_LABELS, breakdownGrainChoices, columnKindOfType, grainChoices, isGrain, isTruncation, limitAfterGrainPick,
+  BREAKDOWN_GRAINS, GRAIN_LABELS, breakdownGrainChoices, columnKindOfType, grainChoices, isGrain, isTruncation, limitAfterBreakdownPick, limitAfterGrainPick,
   limitHasEffect, takesBreakdownGrain, type ColumnKind, type Grain,
 } from "@/lib/time-grain";
 import { cn } from "@/lib/utils";
@@ -596,7 +596,9 @@ export function ChartBuilder({
     // A grouped chart reads best in date order; the editor can still change it.
     if (next && !grain && shape.sortChoice === "order:desc") setSortChoice("order:none");
     // BI-9 review fix (SHOULD-FIX) R2: a day-grained chart should not open at 20 days.
-    setLimit((l) => limitAfterGrainPick(next, l, limitTouched));
+    // `BI-46` review round 1, R7: beside a breakdown the limit counts breakdown
+    // values, so the untouched 20 stays 20.
+    setLimit((l) => limitAfterGrainPick(next, l, limitTouched, capsBreakdown));
     setGrain(next);
   }
   // Latitude and longitude can be any column the source returns (numbers are
@@ -657,6 +659,11 @@ export function ChartBuilder({
   function pickBreakdown(column: string) {
     setBreakdown(column);
     const pickedKind = column ? fields?.kinds?.[column] : undefined;
+    // `BI-46` review round 1, R7: from here the limit counts breakdown values,
+    // so an untouched grained maximum (1000) that a grain pick left behind goes
+    // back to the default 20. A limit the person set is kept.
+    const capsAfterPick = !!column && takesBreakdownGrain(kind) && !(fields?.calculated ?? []).some((f) => f.level === "table" && f.name === measure);
+    if (capsAfterPick) setLimit((l) => limitAfterBreakdownPick(l, limitTouched));
     setShape((d) => ({
       ...d,
       breakdownBin: binKind && column && isNumber(column) ? d.breakdownBin ?? startingBin : null,

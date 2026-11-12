@@ -229,9 +229,24 @@ export const DEFAULT_LIMIT = 20
  * BI-9 review fix (SHOULD-FIX) R2: the limit after a grain is chosen. A
  * truncation left at the untouched default would show 20 days and a cut-off
  * mark, so it starts at the grained maximum; a limit the person set is kept.
+ *
+ * `BI-46` review round 1, R7: beside a breakdown the limit counts breakdown
+ * values, not buckets, so `capsBreakdown` keeps the untouched default at 20 —
+ * raising it to the grained maximum would be no cap at all.
  */
-export function limitAfterGrainPick(next: Grain | "", current: number, touched: boolean): number {
+export function limitAfterGrainPick(next: Grain | "", current: number, touched: boolean, capsBreakdown = false): number {
+  if (capsBreakdown) return current
   return next && isTruncation(next) && !touched && current === DEFAULT_LIMIT ? MAX_GRAIN_LIMIT : current
+}
+
+/**
+ * `BI-46` review round 1, R7: the limit after a breakdown is added. A chart
+ * that already carried a grain may hold the grained maximum from an untouched
+ * default; once the limit counts breakdown values that is no cap, so it goes
+ * back to the default. A limit the person set is kept.
+ */
+export function limitAfterBreakdownPick(current: number, touched: boolean): number {
+  return !touched && current === MAX_GRAIN_LIMIT ? DEFAULT_LIMIT : current
 }
 
 /**

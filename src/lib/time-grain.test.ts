@@ -13,6 +13,7 @@ import {
   columnKindOfType,
   grainChoices,
   grainFits,
+  limitAfterBreakdownPick,
   limitAfterGrainPick,
   limitHasEffect,
   switchChoices,
@@ -131,6 +132,19 @@ test("choosing a truncation lifts an untouched limit to the grained maximum and 
   assert.equal(limitAfterGrainPick("month", 50, false), 50)
   assert.equal(limitAfterGrainPick("hour_of_day", 20, false), 20, "a part never needs more")
   assert.equal(limitAfterGrainPick("", 20, false), 20)
+})
+
+// `BI-46` review round 1, R7: beside a breakdown the limit counts breakdown
+// values, not buckets, so a grain pick must not lift the untouched default to
+// the grained maximum — and adding a breakdown to a grained chart takes an
+// untouched 1000 back to the default.
+test("a breakdown keeps the untouched limit at the default whatever grain is picked", () => {
+  assert.equal(limitAfterGrainPick("month", 20, false, true), 20, "the limit counts breakdown values")
+  assert.equal(limitAfterGrainPick("month", 1000, false, true), 1000, "a saved value stays as it is")
+  assert.equal(limitAfterBreakdownPick(1000, false), 20, "a grain pick's 1000 becomes the default")
+  assert.equal(limitAfterBreakdownPick(1000, true), 1000, "the person set it")
+  assert.equal(limitAfterBreakdownPick(20, false), 20)
+  assert.equal(limitAfterBreakdownPick(50, false), 50)
 })
 
 test("the limit field is hidden for a part ordered by bucket and shown otherwise", () => {

@@ -707,6 +707,31 @@ describe("ChartBuilder breakdown grain and limit label (QA LH-BI-6-01)", () => {
     }) as unknown as typeof fetch
   }
 
+  // `BI-46` review round 1, R7: beside a breakdown the limit counts breakdown
+  // values, so a grain pick keeps the untouched 20 instead of lifting it to the
+  // grained maximum, which the preview request would carry as no cap at all.
+  // A NEW chart: an edited one opens with its saved limit already "touched".
+  it("a grain pick beside a breakdown keeps the untouched limit at twenty", async () => {
+    withDateColumn()
+    renderBuilder()
+    fireEvent.click(await screen.findByRole("combobox", { name: /pick a mart/i }).catch(() => screen.getByText(/pick a mart/)))
+    fireEvent.click(await screen.findByRole("option", { name: /mart_visits/ }))
+    fireEvent.click(await screen.findByRole("button", { name: /What to show/ }))
+    const dimensionField = document.querySelector("[data-slot=dimension-field]") as HTMLElement
+    choose(dimensionField.querySelector('[role="combobox"]') as HTMLElement, "d")
+    // The pickers' lists close after a choice; wait for it so the next list is
+    // the only one with its options.
+    await waitFor(() => expect(screen.queryAllByRole("option")).toHaveLength(0))
+    const breakdownField = document.querySelector('[data-slot="breakdown-field"]') as HTMLElement
+    choose(breakdownField.querySelector('[role="combobox"]') as HTMLElement, "category")
+    await waitFor(() => expect(screen.queryAllByRole("option")).toHaveLength(0))
+    choose(await screen.findByLabelText("Measure (Y)"), "visitors")
+    await waitFor(() => expect(screen.queryAllByRole("option")).toHaveLength(0))
+    choose(await screen.findByLabelText("Group by"), "Month")
+    await waitFor(() => expect(bodies.some((b) => b.grain === "month" && b.limit === 20)).toBe(true))
+    expect(bodies.some((b) => b.grain === "month" && b.limit === 1000)).toBe(false)
+  })
+
   // `BI-46` review round 1, R4: the server builds no breakdown cap for a table
   // calculation, so the field must not be labelled as one.
   it("a table-calculation measure keeps the limit label the chart always had", async () => {
