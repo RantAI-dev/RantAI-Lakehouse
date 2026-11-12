@@ -959,4 +959,176 @@ None of these blocks the build; each has a planned default.
 
 ## 5. Handoff
 
+Developer: opencode-go/deepseek-v4.1-flash. Branch `fix/qa-round-connectors-p2`, off
+`5e316b426` (the head of `fix/qa-round-connectors-p1`, PR #485). Pushed after every commit;
+no force-push, no pull request opened.
+
+**Migration number: `0139_alert_rule_delivery.sql`.** `0138` belongs to the other slice of this
+round (#487), and `origin/main`'s highest was `0136` when the file was created and when the
+handoff was written, so `0139` is free and nothing is renumbered.
+
+### Commits
+
+| Commit | Title |
+| --- | --- |
+| `dd4406aa` | `fix(alerts): a table for a rule's latest delivery (TC-1695; SRC-40)` |
+| `fa7b4213` | `fix(alerts): record a "run succeeded" alert on its rule and list it (TC-1695; SRC-40)` |
+| `22e2c9e8` | `test(alerts): pin that a caller without alert:write cannot delete a rule (TC-1696; SRC-40)` |
+| `c8e26f70` | `fix(connectors): check the connection settings before the connector exists (LH-SRC-3-11; SRC-41)` |
+| `7c8499d1` | `fix(connectors): give up on a silent object store after 30 seconds (TC-1712; SRC-41)` |
+| `fc29551b` | `fix(connectors): a MariaDB connector's test names MariaDB (LH-SRC-6-19; SRC-41)` |
+| `f8256a6b` | `fix(sftp): give a silent host thirty seconds to answer (TC-1712; SRC-41)` |
+| `7fd152a5` | `feat(alerts): the Rules list shows when a success rule last sent (TC-1695; SRC-40)` |
+| `05a9c7fc` | `fix(alerts): the rule form and the list say a refusal in words (LH-SRC-7-10; SRC-40)` |
+| `287e407f` | `fix(alerts): "New rule" and the switch only for a person who may use them (TC-1696; SRC-40)` |
+| `3fe29f86` | `feat(connectors): the wizard sends the settings with the create and checks a business-app account (LH-SRC-3-11; SRC-41)` |
+| `e79604b6` | `fix(connectors): the created screen waits for the save (LH-SRC-6-39, LH-SRC-6-54, LH-SRC-6-16; SRC-41)` |
+| `91e7e534` | `fix(connectors): the Credential fact says None for a connection that reads no credential (LH-SRC-6-39; SRC-41)` |
+| `5aa44d5c` | `feat(connectors): the Runs card says the status follows the orchestrator's report (LH-SRC-6-16; SRC-41)` |
+| `b2ba9e7c` | `fix(connectors): "1 file found" (LH-SRC-6-50, LH-SRC-6-55; SRC-41)` |
+| `94b77f70` | `fix(connectors): the New Connector page shows a refusal instead of the form (LH-SRC-3-08; SRC-41)` |
+| `784b90c3` | `fix(alerts): the D8 sentence matches the refusal this client really reports (LH-SRC-7-10; SRC-40)` |
+| `9b020210` | `docs(features): the QA round's decisions and limits for alerts and connectors (SRC-40, SRC-41)` |
+| `151cfa1e` | `test(connectors): the column-choice helper waits for the singular count (LH-SRC-6-50; SRC-41)` |
+
+Tasks ran in plan order (T1 … T17), T17 as `9b020210`; `784b90c3` and `151cfa1e` are two
+follow-ups the checks below turned up (see "MISMATCH / deviations").
+
+### Tests added, and the failure each had before the fix
+
+- T1 `rust/crates/lakehouse-store/tests/alert_delivery.rs`: `a_rule_never_delivered_to_has_no_row`,
+  `the_latest_attempt_replaces_the_one_before_it`, `an_older_attempt_never_replaces_a_newer_one`,
+  `a_deleted_rules_row_is_gone`, `the_table_refuses_a_reason_on_a_delivered_row`. Before the fix
+  (source stashed, test kept): `error[E0432]: unresolved import
+  lakehouse_store::alert_delivery … could not find alert_delivery in lakehouse_store`.
+- T2 `routes/load_alerts.rs`: `a_success_alert_is_recorded_as_the_rules_last_delivery_and_opens_no_incident`
+  (before the fix, `else` branch removed: `panicked …: the delivered success is recorded`),
+  `a_success_alert_whose_webhook_answers_an_error_is_recorded_as_not_delivered`,
+  `a_failed_run_still_opens_an_incident_and_records_no_last_delivery`.
+  `tests/alert_targets_hidden.rs`: `the_rule_list_and_the_assistants_list_carry_a_rules_last_delivery`,
+  `a_rule_never_delivered_to_has_no_last_delivery_key`.
+- T3 `tests/alert_targets_hidden.rs`: `a_caller_without_alert_write_cannot_delete_a_rule` — a pin,
+  it passed on the code before it by design (the plan says so).
+- T4 `ingest_spec.rs`: `a_refused_saas_account_names_the_field_once` — before the fix:
+  `assertion left == right failed: left: "account: account is not in the form this vendor uses"`.
+  `tests/connector_create_checks.rs`: `a_business_app_account_that_is_refused_creates_nothing_and_the_refusal_names_the_field`
+  (before the fix: `left: 201 right: 400`, with the created connector body in the message),
+  `a_database_at_an_internal_address_creates_nothing`, `good_connection_settings_create_the_connector`,
+  `a_create_without_connection_settings_still_creates_the_connector`,
+  `saving_refused_connection_settings_answers_the_same_sentence`.
+- T5 `connector_listing.rs`: `a_bucket_that_never_answers_a_listing_ends_as_a_timeout_at_the_first_answer_limit`
+  (before the fix, timer removed: `panicked …: the first-answer limit ends the listing: Elapsed(())`),
+  `a_bucket_that_never_answers_a_preview_ends_as_a_timeout_at_the_first_answer_limit`.
+- T6 `connector_probe.rs`: `a_mariadb_connectors_failed_test_names_mariadb_and_a_mysql_connectors_names_mysql`
+  (before the fix: `panicked …: MySQL connection failed: connection refused`),
+  `the_label_is_one_of_two_constants`.
+- T7 `test_adapters_sftp.py`: `test_the_connection_is_given_thirty_seconds_to_be_answered`
+  (before the fix: `E  KeyError: 'timeout'`).
+- T8 `alerts-page.test.tsx`: `shows when a success rule last sent, under its delivery`,
+  `says a success alert was not delivered, with the reason` (both failed with the second line
+  removed), `shows no second line for a rule with no recorded delivery`.
+- T9 `alert-rule-page.test.tsx`: `says in words that the connector cannot be chosen, not the API's code`
+  (before the fix: the raw `permission_denied: connector:manage` was rendered),
+  `shows the shared sentence when the save is refused`.
+- T10 `alerts-page-test-run.test.tsx`: `offers New rule only to a person with alert:write` (before
+  the fix the button was rendered for `alert:read` alone); `alerts-page.test.tsx`'s hidden-rule
+  test renamed to `says Webhook for a hidden webhook rule, shows its state without a switch and
+  shows no actions`, now asserting `queryByRole("switch")` is null and "Active" is text (D9).
+- T11 `saas-vendors.test.ts`: `accepts the account each vendor's own form takes`,
+  `refuses what no vendor's form takes`, `refuses each vendor's near misses` (they cannot compile
+  before `saasAccountProblem` exists).
+  `connector-create-page.test.tsx`: `keeps Next disabled and says why for an account the vendor
+  cannot have` (before the fix: Next was enabled and no sentence was shown),
+  `sends the connection settings with the create request`,
+  `shows the API's refusal and stays on the form when the create is refused`.
+- T12 `connector-create-page.test.tsx`: `does not read the connection settings before the save has
+  answered` (before the fix the `GET .../ingest-spec` went out while the `PUT` was held).
+- T13 `connector-detail-page.test.tsx`: `says None for a connector that authenticates with none`
+  (before the fix the fact read "Stored by lakehouse, encrypted"); the existing fact assertion now
+  `waitFor`s (the page gained a loading state, the expected text is unchanged).
+- T14 `connector-ingest-panel.test.tsx`: `says the status follows the orchestrator's report once an
+  attempt has ended` (before the fix: no sentence).
+- T15 `table-finder.test.tsx`: `says one file found and two files found` (before the fix:
+  "1 files found").
+- T16 `connector-create-page.test.tsx`: `shows the missing permission and no form when the types are
+  refused`, `offers Retry and no form when the types cannot be loaded` (before the fix: the form
+  was there).
+
+### Commands run, with their counts
+
+Every command was run in the foreground, from the checkout, with
+`CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-4 CARGO_BUILD_JOBS=6`.
+
+Per commit (the scoped lines of section 3), all on the final code:
+
+- `cargo fmt --check` → no diff.
+- `cargo clippy -p lakehouse-store -p lakehouse-api --all-targets -- -D warnings` → `Finished` (no
+  warning). T1 and T4 also ran `-p lakehouse-store` alone, clean.
+- `cargo test -p lakehouse-store --test alert_delivery` → 5 passed.
+- `cargo test -p lakehouse-store --lib a_refused_saas_account_names_the_field_once` → 1 passed
+  (319 filtered).
+- `cargo test -p lakehouse-api --lib a_success_alert` → 2 passed; `… a_failed_run_still_opens_an_incident_and_records_no_last_delivery`
+  → 1 passed; `… a_bucket_that_never_answers` → 2 passed; `… a_mariadb_connectors_failed_test`
+  → 1 passed; `… the_label_is_one_of_two_constants` → 1 passed; `… connector_listing` → 21 passed
+  (T5, the whole module, to prove the existing cases stayed green).
+- `cargo test -p lakehouse-api --test alert_targets_hidden` → 10 passed;
+  `--test connector_create_checks` → 6 passed; `--test sec11_guard` → 4 passed;
+  `--test connector_s3_preview` → 5 passed.
+- `(cd dagster && …/venv-agents-4/bin/python -m pytest dispar_orchestrate/test_adapters_sftp.py -q)`
+  → 9 passed. The full `pytest dispar_orchestrate -q` → **2544 passed, 1 skipped, 41 subtests
+  passed in 838.60s** (venv `/home/rismana/rantai/venv-agents-4`).
+- `bun install --frozen-lockfile` → "Checked 779 installs across 753 packages (no changes)".
+- `bun run typecheck` → clean. `bun run lint` → 0 errors, 11 warnings, all pre-existing (the rule
+  forbids adding any; none was added).
+- `bun run test` (the whole console) → **4068 pass, 1 skip, 0 fail, 4069 tests across 380 files**.
+  (A first run showed 7 failures in `connector-ingest-panel.test.tsx` — the "1 tables found"
+  helper, fixed in `151cfa1e` — and one flaky `schema-browser.test.tsx` failure that passed alone
+  and in the rerun.)
+- `python3 ops/lint/check_bare_iceberg_count.py` → `R11 guard: no bare count() against a Bronze
+  Iceberg table found.`
+- `python3 ops/lint/check_intra_package_imports.py` → `OK: all intra-package dispar_orchestrate
+  imports resolve`.
+- `git status` → clean; nothing generated staged.
+- `docker ps` before the first Rust test and after the last: 32 containers both times (31
+  `clickhouse/clickhouse-server:26.8`, 1 `postgres:16-alpine`); nothing was left behind.
+
+### Not verified
+
+- **`cargo test --workspace` / the full Rust suite**: not run, per this plan's section 3 and the
+  developer brief; CI on the pull request (x86_64) is the final word.
+- `rust/crates/lakehouse-api/tests/route_auth.rs`: not run. No route was added and no route's
+  policy changed (`POLICY_TABLE` untouched), so nothing there is affected.
+- A passed MariaDB test's sentence (`Connected via MariaDB and ran SELECT 1.`): it needs a real
+  server; only the failed and timed-out sentences are covered by a unit test (T6).
+- The real timing of a silent object store and of a silent SFTP host: both are proved with a
+  stand-in and an argument (300 ms bounds in T5, the `timeout` keyword in T7), not against a real
+  silent endpoint.
+- Every screen in a browser: not run; the console is covered by the component tests above only.
+- D16's and D17's unmeasured times (QA's 3 min 40 s for a REST preview, the five to six minutes
+  for the run status): unchanged, as the plan says.
+- `docker compose config`: nothing in `docker-compose.yml` changed.
+
+### MISMATCH / deviations
+
+- **MISMATCH (handled, `784b90c3`):** the plan's D8/T9 predicate, `connectorList.error.code ===
+  "permission_denied"`, never matches this client. `src/services/clients/connectors.ts::getJson`
+  maps every non-404 4xx — a 403 included — to `invalid_request` and keeps `status`, so the D8
+  sentence was dead code in the browser. The predicate is now
+  `code === "permission_denied" || status === 403`, the pattern `src/lib/home-cards.ts::cardRead`
+  already uses, and the test rejects with the shape the client produces
+  (`invalid_request`, status 403). No sentence or scope changed. T16 uses the same predicate
+  (`94b77f70`).
+- **T15 collateral (`151cfa1e`):** seven existing tests in `connector-ingest-panel.test.tsx` waited
+  for "1 tables found", the line D18 changed. They now wait for "1 table found". The decision
+  changed; the assertion followed it and nothing was loosened (rule 2).
+- **T5:** the plan's `peek` snippet compiled as written (`Pin::new(&mut stream).peek()`), so no
+  alternative form was needed.
+- **T4:** the create body in the plan was accepted as written; no field had to be corrected.
+- **T7:** the new test is at the end of `test_adapters_sftp.py` rather than inside the pinned-host-key
+  block; it uses the same fake client shape.
+- **T12:** the `testSkipped` branch keeps its own wording; its save error text now also goes through
+  `readableErrorMessage` (the plan's `:293`).
+- The migration is `0139`, not `0138` (see above); the migration numbering on `origin/main` was
+  `0136` throughout.
+
 ## 6. Review
