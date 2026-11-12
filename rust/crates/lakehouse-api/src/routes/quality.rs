@@ -991,6 +991,14 @@ pub(crate) async fn ensure_rule_table(
     if !matches!(zone.as_str(), "silver" | "serving" | "bronze") {
         return Err(refused());
     }
+    // Review round 1 R7: a name that is not a plain identifier can never be a
+    // table the rule reads (both `resolve` and `catalog_source`'s readers
+    // need an `Ident` too), so it is refused here. Left to the checks below, a
+    // `bronze.` name no catalog can even be asked about read "Try again." for
+    // ever, where the same name under `silver.` was refused.
+    if Ident::new(table).is_err() {
+        return Err(refused());
+    }
     // The catalog's tenant rule first (PR review round 1 R3, `DATA-54`): a
     // caller the catalog refuses is answered the same way for every table,
     // so the table check below cannot say which tables exist through it.

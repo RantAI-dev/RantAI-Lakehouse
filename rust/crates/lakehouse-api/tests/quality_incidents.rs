@@ -67,6 +67,10 @@ async fn app() -> (axum::Router, PgPool, MockServer) {
         "CATALOG_TENANT_ID".to_owned(),
         common::CATALOG_TENANT.to_owned(),
     );
+    // A Bronze rule's table is asked of the Iceberg query database, so the
+    // deployment has one here; the stand-in's empty answer reads as "no such
+    // table" (review round 1 R7).
+    overrides.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
     let TestApp { router, pool } = spin_up_with_env(&overrides).await;
     (router, pool, ch)
 }
@@ -519,7 +523,9 @@ async fn a_rule_for_a_table_that_is_not_there_is_refused_and_nothing_is_stored()
     .await;
     assert_eq!(code, StatusCode::CREATED, "{created}");
 
-    for asset in ["orders", "lake.orders"] {
+    // Review round 1 R7: a name that is not a plain identifier is refused like
+    // any other not-table, and not left as a 503 that no retry can fix.
+    for asset in ["orders", "lake.orders", "bronze.orders-2024", "bronze."] {
         let (code, refused) = call(
             &router,
             &cookie,
@@ -537,6 +543,45 @@ async fn a_rule_for_a_table_that_is_not_there_is_refused_and_nothing_is_stored()
             "{asset}: {refused}"
         );
     }
+}
+
+/// `DATA-54`, D17's other half (review round 1 R7): a table the engine did not
+/// answer about is a 503 that says so — a check that cannot be made is not a
+/// refusal — and nothing is stored.
+#[tokio::test]
+async fn a_table_that_cannot_be_checked_is_a_503_not_a_refusal() {
+    let (router, pool, ch) = app().await;
+    let cookie = admin(&pool).await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("system.columns"))
+        .and(body_string_contains("broken_table"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("Code: 999. DB::Exception"))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+
+    let (code, body) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(json!({
+            "name": "d17_unchecked", "asset": "silver.broken_table", "dimension": "volume",
+            "threshold": "rows >= 1", "severity": "high",
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(
+        body["error"], "The table could not be checked. Try again.",
+        "a check that could not be made says so, in a fixed sentence"
+    );
+    let (stored,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM quality_rule WHERE name = 'd17_unchecked'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, 0, "a rule that could not be checked is not stored");
 }
 
 /// QA `LH-DATA-14-01` F2 (`DATA-54`): a table the author's roles hide is
