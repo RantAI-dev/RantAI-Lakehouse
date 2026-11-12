@@ -607,3 +607,64 @@ async fn a_grant_of_another_permission_does_not_open_the_page() {
     );
     assert_eq!(body["error"], json!("permission_denied: catalog:read"));
 }
+
+/// Narrow every role `user` holds to exactly `grants` (`GOV-7` D4's shape,
+/// as `tests/table_access.rs` sets a role's table access up): the role stops
+/// being unrestricted and reads only the named tables.
+async fn narrow_to(pool: &PgPool, user: Uuid, grants: &[(&str, &str)]) {
+    let roles: Vec<Uuid> =
+        sqlx::query_scalar("SELECT role_id FROM app_user_role WHERE user_id = $1")
+            .bind(user)
+            .fetch_all(pool)
+            .await
+            .expect("the person's roles");
+    assert!(!roles.is_empty(), "the person must hold a role to narrow");
+    for role in roles {
+        sqlx::query("UPDATE role SET read_scope = 'listed' WHERE id = $1")
+            .bind(role)
+            .execute(pool)
+            .await
+            .expect("narrow the role");
+        sqlx::query("DELETE FROM role_read_grant WHERE role_id = $1")
+            .bind(role)
+            .execute(pool)
+            .await
+            .expect("clear the grants");
+        for (schema, table) in grants {
+            sqlx::query(
+                "INSERT INTO role_read_grant (role_id, schema_name, table_name) VALUES ($1, $2, $3)",
+            )
+            .bind(role)
+            .bind(schema)
+            .bind(table)
+            .execute(pool)
+            .await
+            .expect("grant the table");
+        }
+    }
+}
+
+/// `GOV-11` (`DEC-20`) and `GOV-7`: a grant gives a permission, not a table.
+/// A person admitted by a grant from `silver.orders` whose roles are narrowed
+/// to another table gets the same 404 an unknown id answers — not 403, which
+/// would say the grant was refused, and not 200/503, which would mean the
+/// table's columns and rows were read.
+///
+/// Review round 1 R3: `detail` runs `table_access_for` after the admission
+/// for every reader. Nothing but that order keeps this true, and nothing
+/// else asserted it before.
+#[tokio::test]
+async fn a_grant_does_not_open_a_table_the_persons_roles_hide() {
+    let (router, pool, _admin_cookie, admin, grantee) = query_reader_harness().await;
+    grant_direct(&pool, admin, ASSET, grantee, "query:read").await;
+    narrow_to(&pool, grantee, &[("silver", "customers")]).await;
+    let cookie = session_cookie_for_user(&pool, grantee).await;
+
+    let (status, body) = read_asset(&router, ASSET, &cookie).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a hidden table stays hidden from a grant-holder: {body}"
+    );
+    assert_eq!(body["error"], json!("Asset not found"));
+}
