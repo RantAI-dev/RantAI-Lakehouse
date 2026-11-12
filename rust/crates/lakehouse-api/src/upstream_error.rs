@@ -1339,7 +1339,10 @@ mod tests {
             log.contains("DB::Exception"),
             "the engine's text is in the log: {log}"
         );
-        assert_eq!(log.matches("upstream request failed").count(), 1, "{log}");
+        let occurrences = log
+            .match_indices("upstream request failed")
+            .fold(0_usize, |n, _| n + 1);
+        assert_eq!(occurrences, 1, "{log}");
     }
 
     #[test]
