@@ -536,9 +536,11 @@ services:
       # garbage does too. The run's `dagster/max_runtime` tag is the same
       # number, read by the code location below. Not a credential.
       INGEST_RUN_MAX_RUNTIME_SECONDS: ${INGEST_RUN_MAX_RUNTIME_SECONDS:-}
-      # SRC-39 (QA TC-1702): how long a queued connector run may take to start
-      # before the API stops holding the connector, in seconds. Unset or empty
-      # keeps the code's default, 600 (ten minutes); it must equal
+      # SRC-39 (QA TC-1702): how long a connector run the orchestrator has
+      # taken off its queue may take to start before the API stops holding the
+      # connector, in seconds. A run still waiting in the queue is judged by
+      # the run limit above instead (review round 1, R1). Unset or empty keeps
+      # the code's default, 600 (ten minutes); it must equal
       # `start_timeout_seconds` in `dagster/dagster.yaml`. Not a credential.
       INGEST_RUN_START_TIMEOUT_SECONDS: ${INGEST_RUN_START_TIMEOUT_SECONDS:-}
       # SRC-12 decision 4 (ADR 0002 addendum 5): the key managed connector

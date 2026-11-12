@@ -3829,10 +3829,16 @@ pub async fn ingest_run(
 /// console's disabled button covers.
 ///
 /// QA `TC-1702` (`SRC-39`): a run that never finishes used to hold this 409
-/// for days. A run past its start or run limit plus a grace no longer holds
-/// the connector: it is cancelled in the orchestrator (or recorded as
-/// `timed_out` for a run that was going) and the launch goes on (D10). The
-/// grace lets the orchestrator's own run monitoring act first.
+/// for days. A run the orchestrator launched and did not start, past the
+/// start limit, and a run going past the run limit, each plus a grace, no
+/// longer hold the connector: such a run is cancelled in the orchestrator (or
+/// recorded as `timed_out` for a run that was going) and the launch goes on
+/// (D10). The grace lets the orchestrator's own run monitoring act first.
+///
+/// `review round 1, R1`: a run still waiting in the orchestrator's queue is
+/// not judged by the start limit, because the monitoring never ends a queued
+/// run; it holds the connector until it has waited longer than a run may run.
+/// A `STARTING` run holds the connector and is left to the monitoring.
 ///
 /// # Errors
 ///
@@ -4141,13 +4147,17 @@ const CONNECTOR_RUN_HISTORY: usize = 20;
 /// connector for it (`SRC-39`, QA `TC-1702`, D10). The orchestrator's run
 /// monitoring polls every 60 seconds, so five minutes is its turn to end the
 /// run first; the route only steps in when that did not happen, because a
-/// cancel from here is the less clean of the two.
+/// cancel from here is the less clean of the two. A run still waiting in the
+/// queue is the exception: the monitoring never ends one, so it is judged by
+/// the run limit instead of the start limit (`review round 1, R1`).
 const OVERDUE_GRACE_SECONDS: f64 = 300.0;
 
 /// Why a run no longer holds its connector's lock (`SRC-39`, QA `TC-1702`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Overdue {
-    /// A queued or starting run that never started, past the start limit.
+    /// A run that never started: one the orchestrator launched and did not
+    /// start, past the start limit, or one still waiting in its queue past the
+    /// run limit (`review round 1, R1`).
     NeverStarted,
     /// A running run past the run limit.
     RanTooLong,
@@ -4177,9 +4187,25 @@ impl RunAgeLimits {
 /// (`SRC-39`, QA `TC-1702`, D10), judged by the orchestrator's own status
 /// word and its own times. A missing time, and every other status, is `None`:
 /// a run nobody measured keeps the 409 (fail closed).
+///
+/// The start limit does not cover a run still waiting in the queue
+/// (`review round 1, R1`): the orchestrator queues every run, and its run
+/// monitoring reads only `NOT_STARTED`, `STARTING`, `STARTED` and `CANCELING`
+/// (`dagster/_daemon/monitoring/run_monitoring.py`), so nothing there ever
+/// ends a `QUEUED` run. Judging one by the start limit would have "Run now"
+/// cancel a healthy run that is merely waiting behind other runs.
 fn overdue(run: &DgConfiguredRun, now_unix: f64, limits: &RunAgeLimits) -> Option<Overdue> {
     match run.status.as_str() {
-        "QUEUED" | "NOT_STARTED" | "STARTING" => run
+        // `review round 1, R1`: a run may wait in the queue longer than a run
+        // may run. Until then it holds the connector (the 409 stays).
+        "QUEUED" => run
+            .creation_time
+            .filter(|created| now_unix - created > limits.running_seconds)
+            .map(|_| Overdue::NeverStarted),
+        // A run the orchestrator took off the queue and did not start. Its
+        // monitoring fails it `start_timeout_seconds` after the launch, so the
+        // grace lets that happen first.
+        "NOT_STARTED" => run
             .creation_time
             .filter(|created| now_unix - created > limits.start_seconds)
             .map(|_| Overdue::NeverStarted),
@@ -4187,6 +4213,13 @@ fn overdue(run: &DgConfiguredRun, now_unix: f64, limits: &RunAgeLimits) -> Optio
             .start_time
             .filter(|started| now_unix - started > limits.running_seconds)
             .map(|_| Overdue::RanTooLong),
+        // `review round 1, R1`: a `STARTING` run is never overdue here. This
+        // route measures it from `creationTime` and the orchestrator from the
+        // launch time (`monitor_starting_run`), so a run that waited in the
+        // queue and was taken a second ago would look overdue; the monitoring
+        // ends it after the start limit, so the 409 stays. Every other status
+        // is one nobody measured (`CANCELING`, a finished run), and it keeps
+        // the 409 too (fail closed).
         _ => None,
     }
 }
@@ -4292,20 +4325,55 @@ mod tests {
         assert_eq!(overdue(&young, now, &limits), None);
     }
 
-    /// A queued or starting run past the start limit is overdue even though
-    /// it never started; one inside the limit is not.
+    /// A launched run that never started is overdue after the start limit;
+    /// one inside the limit is not.
     #[test]
     fn a_run_that_never_started_is_overdue_after_the_start_limit() {
         let limits = limits();
         let now = 1_800_000_000.0;
-        for status in ["QUEUED", "NOT_STARTED", "STARTING"] {
-            let mut run = dg_run("run-q", status, "conn-a");
-            run.start_time = None;
-            run.creation_time = Some(now - limits.start_seconds - 1.0);
-            assert_eq!(overdue(&run, now, &limits), Some(Overdue::NeverStarted));
-            run.creation_time = Some(now - 60.0);
-            assert_eq!(overdue(&run, now, &limits), None, "{status}");
-        }
+        let mut run = dg_run("run-ns", "NOT_STARTED", "conn-a");
+        run.start_time = None;
+        run.creation_time = Some(now - limits.start_seconds - 1.0);
+        assert_eq!(overdue(&run, now, &limits), Some(Overdue::NeverStarted));
+        run.creation_time = Some(now - 60.0);
+        assert_eq!(overdue(&run, now, &limits), None);
+    }
+
+    /// `review round 1, R1` (QA `TC-1702`): the orchestrator queues every run
+    /// and its monitoring never ends a queued one, so a run that has waited in
+    /// the queue for longer than the start limit is not overdue. Before the
+    /// fix the route cancelled it, which "Run now" turned into a lost run.
+    #[test]
+    fn a_queued_run_is_not_overdue_after_the_start_limit() {
+        let limits = limits();
+        let now = 1_800_000_000.0;
+        let mut run = dg_run("run-q", "QUEUED", "conn-a");
+        run.start_time = None;
+        run.creation_time = Some(now - limits.start_seconds - 1.0);
+        assert_eq!(
+            overdue(&run, now, &limits),
+            None,
+            "a queued run inside the run limit still holds the connector"
+        );
+        // A run may wait in the queue longer than a run may run; past that it
+        // is overdue, as the last resort for a queue that never moves.
+        run.creation_time = Some(now - limits.running_seconds - 1.0);
+        assert_eq!(overdue(&run, now, &limits), Some(Overdue::NeverStarted));
+    }
+
+    /// `review round 1, R1`: a `STARTING` run is measured by the orchestrator
+    /// from its launch, not by its creation time, so this route never calls it
+    /// overdue — the monitoring ends it after the start limit.
+    #[test]
+    fn a_starting_run_is_not_judged_by_when_it_was_created() {
+        let limits = limits();
+        let now = 1_800_000_000.0;
+        let mut run = dg_run("run-s", "STARTING", "conn-a");
+        run.start_time = None;
+        run.creation_time = Some(now - 20.0 * 60.0);
+        assert_eq!(overdue(&run, now, &limits), None);
+        run.creation_time = Some(now - limits.running_seconds - 1.0);
+        assert_eq!(overdue(&run, now, &limits), None);
     }
 
     /// Fail closed: a run whose time the orchestrator did not give is never

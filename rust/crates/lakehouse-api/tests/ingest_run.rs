@@ -763,6 +763,54 @@ async fn an_orchestrator_that_refuses_the_cancel_does_not_keep_the_connector_loc
     );
 }
 
+/// `review round 1, R1` (QA `TC-1702`): the orchestrator queues every run and
+/// its monitoring never ends a queued one, so a run waiting in the queue for
+/// 20 minutes still holds the connector: the 409 stays and nothing is
+/// cancelled. Before the fix the route cancelled it, and "Run now" replaced a
+/// healthy queued run without a word.
+#[tokio::test]
+async fn a_queued_run_still_holds_the_connector_after_the_start_limit() {
+    let server = MockServer::start().await;
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as f64;
+    mount_recent_runs(
+        &server,
+        json!([ingest_run_created_at(
+            "conn-ingest-queued-long",
+            "run-waiting",
+            "QUEUED",
+            now - 20.0 * 60.0,
+            None
+        )]),
+    )
+    .await;
+    // No `terminateRun` mock: a cancel would reach `spin_up`'s dead upstream
+    // and turn the answer into a 503, so this test also proves none is sent.
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("launchRun"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "launchRun": { "__typename": "LaunchRunSuccess", "run": { "runId": "never" } } }
+        })))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+    seed_sql_connector(&app.pool, "conn-ingest-queued-long").await;
+
+    let (status, answer) = post_run(&app, &cookie, "conn-ingest-queued-long", None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert!(
+        answer["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("already queued"),
+        "{answer}"
+    );
+    assert_eq!(cancel_requests(&server).await, [] as [String; 0]);
+}
+
 /// Another connector's run does not block this one.
 #[tokio::test]
 async fn ingest_run_is_not_blocked_by_another_connectors_run() {

@@ -83,7 +83,7 @@ others are beyond the spec. The planner's recommendation is the Default.
 | 12 | Beyond the spec: a column that appears at the source later. | It follows the connector's schema-change policy, as today: loaded when the policy applies it, waiting when the policy asks first. It is never left out silently. || 2026-10-14 |
 | 13 | Beyond the spec: a paused connector must not load. Today a run that was already queued, or one started from the orchestrator's own screen, still loads a paused connector (`SRC-18`, first half). | Closed here: the orchestrator checks the pause before it loads and ends the run as "paused", loading nothing. Without it, pausing after 30 failures does not stop every load. || 2026-10-14 |
 | 14 | Beyond the spec: where the gate steps run. The SQL connector gate job takes 18m52s to 19m54s against a 20-minute target (`SRC-9` decision 1). | The gate steps of this item run in a new parallel job, so no existing job grows. || 2026-10-14 |
-| 15 | Beyond the spec: a run that never finishes (`SRC-39`, QA `TC-1702`). | A run that has not started after 10 minutes, or is still running after 6 hours *(proposed)*, is stopped and recorded as failed; the connector can run again. The 6 hours are a setting. | |
+| 15 | Beyond the spec: a run that never finishes (`SRC-39`, QA `TC-1702`). | A run that was launched and has not started after 10 minutes, or is still running after 6 hours *(proposed)*, is stopped and recorded as failed; the connector can run again. A run still waiting in the orchestrator's queue is not stopped by the 10 minutes, because nothing there ends a queued run: it is stopped once it has waited longer than a run may run, 6 hours. The 6 hours are a setting. | *(proposed, not yet signed)* |
 
 ## Limits to tell a customer
 

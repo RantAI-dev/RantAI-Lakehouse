@@ -240,7 +240,7 @@ waits.
 | `CONNECTOR_AUTO_DISABLE_AFTER` | Failed runs in a row after which the API pauses a connector and raises the "connector disabled" alert once (`SRC-11`) | `30` | No | no |
 | `INGEST_RETRY_DELAYS_SECONDS` | Wait before each retry of a failing table, in seconds (one to three numbers), read by `dagster-code-location` | `60,300,900` | No | no |
 | `INGEST_RUN_MAX_RUNTIME_SECONDS` | How long a connector run may run before it is stopped and recorded as failed (`SRC-39`), read by `lakehouse-api` and `dagster-code-location` | `21600` | No | no |
-| `INGEST_RUN_START_TIMEOUT_SECONDS` | How long the API waits for a queued connector run to start before it stops holding the connector (`SRC-39`); must equal `start_timeout_seconds` in `dagster/dagster.yaml` | `600` | No | no |
+| `INGEST_RUN_START_TIMEOUT_SECONDS` | How long a connector run the orchestrator has taken off its queue may take to start before the API stops holding the connector (`SRC-39`); a run still waiting in the queue is judged by the run limit above; must equal `start_timeout_seconds` in `dagster/dagster.yaml` | `600` | No | no |
 
 ### Secret managers and OAuth for connectors
 

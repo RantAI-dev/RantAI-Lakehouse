@@ -156,8 +156,11 @@ No route is added or changed in its policy, so `POLICY_TABLE` and
   run; its record still says failed with `timed_out`.
 - **D13. A run that never started gets no row in the history.** The record begins with the
   run's own start report (`SRC-11` decision 7), and nothing is invented for a run that sent
-  none (`settle_run`, `connector_run.rs:616-643`). It is counted as a failed run and alerted
-  by D8's path. See Open questions.
+  none (`settle_run`, `connector_run.rs:616-643`). A run the orchestrator's monitoring fails is
+  counted as a failed run and alerted by D8's path. A run still waiting in the queue is not
+  failed by that monitoring (`review round 1, R1`): it is cancelled by the run route only after
+  it has waited longer than a run may run, is not counted, and gets no row either (D12's rule
+  for a run this route cancels). See Open questions.
 - **D14. Relation to `SRC-18` and `SRC-32`.** `SRC-18` (open: a paused connector still loads
   when a run is launched from the orchestrator; the schema-observation routes' permission) is
   not touched: the pause check (`connectors.rs:3835-3839`) still answers before the new age

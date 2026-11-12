@@ -1138,12 +1138,15 @@ pub struct Config {
     /// same number through the `dagster/max_runtime` tag. Zero, negative, or
     /// unparseable values keep the default.
     pub ingest_run_max_runtime_seconds: u32,
-    /// How long a queued connector run may take to start before the API stops
-    /// holding the connector for it (`SRC-39`, QA `TC-1702`):
-    /// `INGEST_RUN_START_TIMEOUT_SECONDS`, default 600 (ten minutes). It MUST
-    /// equal `start_timeout_seconds` in `dagster/dagster.yaml`: whoever
-    /// changes one changes both. Zero, negative, or unparseable values keep
-    /// the default.
+    /// How long a connector run the orchestrator has taken off its queue may
+    /// take to start before the API stops holding the connector for it
+    /// (`SRC-39`, QA `TC-1702`): `INGEST_RUN_START_TIMEOUT_SECONDS`, default
+    /// 600 (ten minutes). A run still waiting in the orchestrator's queue is
+    /// judged by [`Config::ingest_run_max_runtime_seconds`] instead
+    /// (`review round 1, R1`): its run monitoring never ends a queued run.
+    /// It MUST equal `start_timeout_seconds` in `dagster/dagster.yaml`:
+    /// whoever changes one changes both. Zero, negative, or unparseable
+    /// values keep the default.
     pub ingest_run_start_timeout_seconds: u32,
 }
 
