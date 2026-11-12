@@ -4106,6 +4106,7 @@ mod tests {
             status: status.to_owned(),
             start_time: Some(1_790_670_111.0),
             end_time: (status == "SUCCESS").then_some(1_790_670_153.0),
+            creation_time: Some(1_790_670_111.0),
             run_config: json!({ "ops": { "run_ingest": { "config": { "connector_id": connector } } } }),
         }
     }
