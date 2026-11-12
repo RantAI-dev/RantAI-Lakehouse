@@ -1511,3 +1511,24 @@ test files); R8/R9 `lakehouse-api`; R10 `lakehouse-api` + `dashboard_access_rout
   of T10 was not touched this round).
 - **CI on the pull request (x86_64)**: the final word; this machine is ARM64. The R1 integration
   test starts `clickhouse/clickhouse-server:26.8` itself and passed here.
+
+### Round 2 (planner, 2026-11-12), at `7491eb74a`
+
+Read `43fa0ea97..7491eb74a`. R1 to R10 are fixed, one commit each, and each new or corrected
+test was shown red before its fix.
+
+- R1: the cap compares `(isNull, toString)` on both sides, and `tests/breakdown_cap.rs` proves
+  it on a real `ClickHouse` 26.8: the NULL series is kept at `limit 20` and is the only series
+  at `limit 1` when it is the largest.
+- R2: row 7 of `chart-builder-questions.md` now holds only what the owner accepted; rows 8 and
+  9 are *(proposed, not yet signed)*.
+- R3: `/api/ai/tool` is limit-bearing, so an assistant save can answer the limit sentence.
+
+No open BLOCKER. Two things stand between this branch and the merge:
+
+1. **The AI team's review of the assistant's part** (AGENTS.md, assistant parity): the prompt
+   line and the digest (T10, R4), the kept descriptions of `limit` and `breakdownGrain` and
+   `tests/fixtures/tool_schemas.json` (T10, R9), the assistant's saves under the limit (T5,
+   R3), and the new `AI-15` case `chart_top_n_breakdown_over_time`, which has not been run
+   (it needs a model endpoint).
+2. CI green on #486.
