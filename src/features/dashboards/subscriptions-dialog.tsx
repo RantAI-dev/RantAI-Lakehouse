@@ -19,7 +19,7 @@ import type {
 } from "@/services/contracts/reports";
 import type { FilterDef } from "@/services/clients/bi-store";
 import type { ReadState } from "./chart-download";
-import { clock, describeAttachments, describeSchedule, describeStatus, WEEKDAYS } from "./report-words";
+import { clock, describeAttachments, describeNotSent, describeSchedule, describeStatus, WEEKDAYS } from "./report-words";
 
 /**
  * What a report is made as (feature decision 1). Shown above the recipient list
@@ -164,6 +164,12 @@ function SubscriptionRow({
     }
   }
   const people = s.recipients.map((r) => r.name ?? r.email ?? "").filter(Boolean);
+  // QA LH-RPT-1-06 (RPT-2, DEC-18): while e-mail is not set up, a failure for
+  // that reason is not counted and does not pause anything, so the status line
+  // would read "Failed. …" and say nothing about it being the installation's
+  // state. The "Not sent" line stands in its place; a paused subscription keeps
+  // its own line under it.
+  const notSent = describeNotSent(s);
   return (
     <li className="flex flex-col gap-1 rounded-lg border p-3 text-sm">
       <div className="font-medium">{describeSchedule(s.schedule, s.timeZone)}</div>
@@ -171,7 +177,10 @@ function SubscriptionRow({
         {describeAttachments(s.attachments)} · to {people.length > 3 ? `${people.slice(0, 3).join(", ")} and ${people.length - 3} more` : people.join(", ")}
         {s.skipWhenEmpty ? " · skipped when every chart is empty" : ""}
       </div>
-      <div className="text-xs">{describeStatus(s)}</div>
+      {notSent !== null ? (
+        <p className="text-xs font-medium text-amber-700 dark:text-amber-400">{notSent}</p>
+      ) : null}
+      {notSent === null || s.paused ? <div className="text-xs">{describeStatus(s)}</div> : null}
       {sending ? (
         <p role="status" className="flex items-center gap-1.5 text-xs text-muted-foreground">
           <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />Sending…

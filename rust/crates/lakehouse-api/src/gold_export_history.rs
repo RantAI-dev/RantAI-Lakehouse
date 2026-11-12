@@ -16,12 +16,16 @@
 //! kind of single owner `lakehouse-bi::store` uses for its own
 //! `console.*` tables: an idempotent Rust-side `ensure_*` function.
 //!
-//! One row per call to `POST /api/gold/export/{mart}`, success or failure,
-//! written by `routes::gold::export` itself right after
-//! `gold_export::export_mart` returns — this captures BOTH trigger sources
-//! (the console's "Export now" button and the Dagster schedule) through
-//! the one HTTP handler both call, rather than recording only
-//! Dagster-triggered runs.
+//! At most one row per call to `POST /api/gold/export/{mart}`: none for a
+//! refusal, a skip under `?ifChanged=true` or a `409`; one for the export's
+//! outcome; one for a failure before the export on a mart `system.tables` lists
+//! (written by `routes::gold::export` itself right after
+//! `gold_export::export_mart` returns, or as soon as such a step fails —
+//! `DATA-56`, #484 review R4; the exact list is that route's "What is
+//! recorded" section). That captures BOTH trigger
+//! sources (the console's "Export now" button and the Dagster schedule)
+//! through the one HTTP handler both call, and it captures the publishes that
+//! fail before the copy starts, which used to leave no trace at all.
 //!
 //! # Copy retention and trim history (DATA-2)
 //!
@@ -248,9 +252,10 @@ pub async fn rewrite_raw_errors(ch: &ChClient) -> Result<u64, ChError> {
 }
 
 /// One export attempt to record — always both an id (the caller mints a
-/// UUID) and the outcome, never a partial row: `routes::gold::export`
-/// calls this exactly once per call, after `export_mart` has already
-/// returned `Ok` or `Err`.
+/// UUID) and the outcome, never a partial row: `routes::gold::export` calls
+/// this at most once per call, either after `export_mart` has already
+/// returned `Ok` or `Err`, or when a step before the export failed on a mart
+/// known to exist (`DATA-56`, #484 review R4).
 pub struct NewGoldExportRun<'a> {
     /// The Gold mart's identifier (already validated by the caller's
     /// `Ident`), unquoted.
