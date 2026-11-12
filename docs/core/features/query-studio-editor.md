@@ -72,11 +72,12 @@ and the last result) keeps working, and follows the active query tab.
 | 6 | ⌘/Ctrl+Enter runs the selection when there is one, and otherwise the whole tab (Run all). Today it runs the whole buffer | Selection, else all | Owner, 2026-10-23 |
 | 7 | Format keeps this repository's small formatter and adds two settings, kept in this browser: keyword case (upper, lower, as typed) and indent (none, 2 or 4 spaces). Indent puts each clause's body on the line after its keyword, indented by that width; none is today's output. No new dependency | Upper case, no indent (today's output) | Owner, 2026-10-23; indent default corrected by the planner the same day, because today's formatter does not indent and a 2-space default would change everyone's output |
 | 8 | Find and replace, comment toggling, bracket matching and folding come from the editor component already installed; the work is to check each one and add the shortcut list | none | Owner, 2026-10-23 |
-| 9 | The schema browser sits beside the editor and can be closed; it lists only the tables the catalog shows this user. A Bronze entry is insertable on a `Trino` tab only once its `Iceberg` table is proven to exist, through the same table-detail read the catalog page makes (`lakehouseService.getTableDetail` on the `bronze` namespace); the read is made once, for the entry the person opens, and kept for the session. When the read has finished and found no table, the entry is disabled and its reason is "No readable table for this asset yet."; while the read is still running, the entry stays disabled with the name-unknown reason it already shows. | Open on wide screens, closed on narrow ones | Owner, 2026-10-23; changed: Owner, 2026-11-09 |
+| 9 | The schema browser sits beside the editor and can be closed; it lists only the tables the catalog shows this user. A Bronze entry is insertable on a `Trino` tab only once its `Iceberg` table is proven to exist, through the same table-detail read the catalog page makes (`lakehouseService.getTableDetail` on the `bronze` namespace); on a Trino tab the read is made once per Bronze asset when the asset list loads, at most four reads at a time, and kept for the session, so a proven row inserts without being expanded. When the read has finished and found no table, the entry is disabled, shows no columns, and its reason is "No readable table for this asset yet."; while the read is still running, the entry stays disabled with the name-unknown reason it already shows. | Open on wide screens, closed on narrow ones | Owner, 2026-10-23; changed: Owner, 2026-11-09; changed: Planner's choice, 2026-11-12 |
 | 10 | The Natural language and SQL tabs stay. Query tabs live inside the SQL tab | none | Owner, 2026-10-23 |
 | 11 | No on/off switch. This is the editor itself, and every part degrades on its own: without column data the editor still runs SQL | none | Owner, 2026-10-23 |
 | 12 | Explain, Fix with AI, Estimate, Save query and Save as SQL source work on one statement: the selection when there is one, else the whole tab when it holds one statement. With several statements and no selection they are disabled, and the button's title says to select one statement. A saved query or SQL source with several statements would fail where it is run later (the server runs one statement per request) | none | Planner's choice, 2026-10-23 |
 | 13 | Fix with AI is offered on a failed statement's result tab and proposes a fix for that statement; Accept replaces that statement's text in the editor and nothing else | none | Planner's choice, 2026-10-23 |
+| 14 | On a Trino tab, Estimate sends no request. The panel says "No pre-run estimate for Trino queries." in place of every other state, because the estimate route explains ClickHouse statements only. A Trino `EXPLAIN` route is not built | none | Planner's choice, 2026-11-12 |
 
 ## Limits to tell a customer
 
@@ -86,9 +87,11 @@ and the last result) keeps working, and follows the active query tab.
   undone (the editor runs read-only statements, so nothing was written).
 - Autocomplete and the schema browser know only the tables the catalog shows
   you. A table you can query but the catalog does not list gets no column
-  suggestions. A Bronze table's SQL name is known once its detail is loaded:
-  expand it in the schema browser, or write its `namespace.name` in the
-  statement. A name only Trino serves is offered on a Trino tab only.
+  suggestions. A Bronze table's SQL name is known once its table is proven to
+  exist. On a Trino tab that check runs when the asset list loads; expanding
+  the table, or writing its `namespace.name` in the statement, reads it too.
+  A name only Trino serves is offered on a Trino tab only.
+- On a Trino tab, Estimate makes no estimate. Only ClickHouse statements get one.
 - Run all takes at most 20 statements, and a browser keeps at most 20 tabs.
 
 ## Acceptance checklist
