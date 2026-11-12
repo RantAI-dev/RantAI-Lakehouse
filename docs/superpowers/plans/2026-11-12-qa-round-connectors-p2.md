@@ -1083,7 +1083,15 @@ Per commit (the scoped lines of section 3), all on the final code:
 - `bun run test` (the whole console) → **4068 pass, 1 skip, 0 fail, 4069 tests across 380 files**.
   (A first run showed 7 failures in `connector-ingest-panel.test.tsx` — the "1 tables found"
   helper, fixed in `151cfa1e` — and one flaky `schema-browser.test.tsx` failure that passed alone
-  and in the rerun.)
+  and in the rerun. The seven, re-measured on `ddf38bf0` by putting the helper's old text back and
+  running `bun test src/features/connectors/connector-ingest-panel.test.tsx` (**85 pass, 7 fail**):
+  "lists the columns discovery found, ticked, and saves an unticked one as excluded"; "shows a
+  saved exclusion unticked, lets it be ticked again, and then saves none"; "locks the key columns
+  of a deduplicating table and the cursor column, ticked, with the reason"; "never sends a key or
+  cursor column as excluded, even if it was unticked before the mode needed it"; and "is offered
+  for the mysql driver too", "… for the mssql driver too", "… for the oracle driver too". The last
+  three are one `it.each(["mysql", "mssql", "oracle"])`, which is why five `openColumns()` call
+  sites are seven tests.)
 - `python3 ops/lint/check_bare_iceberg_count.py` → `R11 guard: no bare count() against a Bronze
   Iceberg table found.`
 - `python3 ops/lint/check_intra_package_imports.py` → `OK: all intra-package dispar_orchestrate
@@ -1120,7 +1128,12 @@ Per commit (the scoped lines of section 3), all on the final code:
   (`94b77f70`).
 - **T15 collateral (`151cfa1e`):** seven existing tests in `connector-ingest-panel.test.tsx` waited
   for "1 tables found", the line D18 changed. They now wait for "1 table found". The decision
-  changed; the assertion followed it and nothing was loosened (rule 2).
+  changed; the assertion followed it and nothing was loosened (rule 2). The number is measured, not
+  counted by eye (review round 1, R3): `openColumns` has five call sites, and the fifth is
+  `it.each(["mysql", "mssql", "oracle"])`, so the run fails seven tests — the four above it plus
+  the three drivers. With the old text put back, `bun test
+  src/features/connectors/connector-ingest-panel.test.tsx` prints **85 pass, 7 fail**, and the
+  seven names are the ones quoted in "Commands run".
 - **T5:** the plan's `peek` snippet compiled as written (`Pin::new(&mut stream).peek()`), so no
   alternative form was needed.
 - **T4:** the create body in the plan was accepted as written; no field had to be corrected.
