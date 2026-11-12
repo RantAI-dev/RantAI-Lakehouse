@@ -248,6 +248,10 @@ def _headers(cfg: IngestFactoryConfig) -> dict[str, str]:
 # (`docs/plans/DATA-17-RESULT.md`, `docs/plans/SRC-11-RESULT.md`).
 RUN_LIMIT_ENV = "INGEST_RUN_MAX_RUNTIME_SECONDS"
 DEFAULT_RUN_LIMIT_SECONDS = 21_600
+# The largest value the API can read (`u32::MAX`): both services must read the
+# setting by the same rule, or one lets a run go for a day while the other
+# cancels it at six hours (`review round 1, R9`).
+MAX_RUN_LIMIT_SECONDS = 4_294_967_295
 
 
 @dataclass(frozen=True)
@@ -268,11 +272,13 @@ class RunLimitSettings:
         raw = _env(RUN_LIMIT_ENV, "")
         if not raw:
             return cls()
-        try:
-            seconds = int(raw)
-        except ValueError:
-            seconds = 0
-        if seconds < 1:
+        # `review round 1, R9`: the API's rule (`parse_run_limit`,
+        # `lakehouse-api/src/config.rs`), so both services read one setting the
+        # same way: surrounding spaces trimmed (`_env` does it), ASCII digits
+        # only, a value from 1 to `u32::MAX`. `int()` alone would take
+        # "86_400" and 4294967296, which the API rejects.
+        seconds = int(raw) if raw.isascii() and raw.isdigit() else 0
+        if not 1 <= seconds <= MAX_RUN_LIMIT_SECONDS:
             # The value is the operator's own setting, but a malformed one is
             # not worth echoing into a log line the whole team reads.
             logger.warning(

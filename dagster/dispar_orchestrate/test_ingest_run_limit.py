@@ -42,9 +42,15 @@ def test_the_run_limit_comes_from_the_setting(monkeypatch) -> None:
     monkeypatch.setenv(f.RUN_LIMIT_ENV, "900")
     assert f.RunLimitSettings.from_env().max_runtime_seconds == 900
     assert f._ingest_job_tags() == {TAG: "900"}
+    # `review round 1, R9`: the API trims the same value, so both read 900.
+    monkeypatch.setenv(f.RUN_LIMIT_ENV, " 900 ")
+    assert f.RunLimitSettings.from_env().max_runtime_seconds == 900
 
 
-@pytest.mark.parametrize("bad", ["abc", "0", "-5", "1.5", "  "])
+# `review round 1, R9`: "86_400" is what `int()` takes and the API rejects, and
+# 4294967296 is one above `u32::MAX`: reading either here and falling back
+# there would have the API cancel a run the orchestrator still believes in.
+@pytest.mark.parametrize("bad", ["abc", "0", "-5", "1.5", "  ", "86_400", "4294967296", "+900"])
 def test_a_run_limit_that_cannot_be_read_falls_back_to_six_hours(monkeypatch, caplog, bad) -> None:
     monkeypatch.setenv(f.RUN_LIMIT_ENV, bad)
     with caplog.at_level(logging.WARNING, logger=f.logger.name):
