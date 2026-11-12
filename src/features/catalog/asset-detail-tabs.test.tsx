@@ -25,7 +25,7 @@ import { toast } from "sonner"
 import { chooseOption } from "@/components/patterns/select-field.testing"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import { NO_READABLE_TABLE } from "@/lib/asset-query"
-import { formatDate } from "@/lib/format"
+import { formatDate, formatDateTime } from "@/lib/format"
 import { assetService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
 import { AssetDetailTabs } from "./asset-detail-tabs"
@@ -215,6 +215,9 @@ const INCIDENT = {
 /** What the sample route answers for a `limit`: the rows, or a response of its own (a failure). */
 type SampleAnswer = (limit: number) => Record<string, string | null>[] | Response
 
+/** How many times the incidents read was asked (`DATA-54`). */
+let incidentReads = 0
+
 function stubApi({
   permissions = ["*:*"],
   lineage = GRAPH,
@@ -231,6 +234,7 @@ function stubApi({
   revokeRefusal,
   restore = { restorable: false, reason: "no dropped copy of this table is kept" },
   incidents = [],
+  incidentsAfterRun,
   schedules = [],
   learning = LEARNING,
   roles,
@@ -262,6 +266,8 @@ function stubApi({
   restore?: unknown
   /** The quality incidents `GET /api/governance/quality/incidents` answers. */
   incidents?: unknown[]
+  /** What it answers from the second read on (`DATA-54`): after a run. */
+  incidentsAfterRun?: unknown[]
   /** The quality schedules `GET /api/governance/quality/schedules` answers. */
   schedules?: unknown[]
   /** What `GET /api/governance/quality/learning/{asset}` answers. */
@@ -272,6 +278,7 @@ function stubApi({
   /** The row filter grammar `GET /api/governance/row-filter-grammar` answers; absent means it fails. */
   grammar?: unknown
 } = {}) {
+  incidentReads = 0
   return spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input)
     const method = init?.method ?? "GET"
@@ -304,7 +311,11 @@ function stubApi({
     }
     if (method === "GET" && path.endsWith("/api/governance/tag-keys")) return json(tagKeys)
     // DATA-14: the Quality tab's incidents, schedule and learning state.
-    if (method === "GET" && path.includes("/api/governance/quality/incidents")) return json({ incidents })
+    if (method === "GET" && path.includes("/api/governance/quality/incidents")) {
+      incidentReads += 1
+      const answer = incidentReads > 1 && incidentsAfterRun ? incidentsAfterRun : incidents
+      return json({ incidents: answer })
+    }
     if (method === "GET" && path.endsWith("/api/governance/quality/schedules")) {
       return json({ schedules, defaultIntervalMinutes: 60 })
     }
@@ -710,6 +721,25 @@ describe("Quality tab: incidents, schedule and learning (DATA-14)", () => {
     )
   })
 
+  // QA `LH-DATA-14-01` F1 (`DATA-54`): the page keeps the tab mounted while
+  // the asset reloads, so the panel has to be told to read again.
+  it("reads the incidents again after the checks ran", async () => {
+    stubApi({ incidents: [], incidentsAfterRun: [INCIDENT] })
+    url.search = "tab=quality"
+    renderTabs({
+      ...BRONZE,
+      qualityChecks: [
+        { id: "q2", name: "orders_uniqueness", dimension: "uniqueness", status: null, lastRun: null, threshold: "id unique", severity: "high", origin: "rule" },
+      ],
+    })
+
+    fireEvent.click(await screen.findByText("Run checks"))
+    expect(
+      await screen.findByText(/3 repeated values in 50 rows \(threshold: id unique\)/)
+    ).toBeTruthy()
+    expect(incidentReads).toBeGreaterThanOrEqual(2)
+  })
+
   it("offers no Resolve without governance:write", async () => {
     stubApi({ permissions: ["catalog:read", "query:read"], incidents: [INCIDENT] })
     url.search = "tab=quality"
@@ -855,6 +885,22 @@ describe("Activity tab: usage and history", () => {
     const history = screen.getByText("Change history").closest("[data-slot=card]") as HTMLElement
     expect(within(history).getByText("Rina")).toBeTruthy()
     expect(within(history).getByText("Edited description, owner")).toBeTruthy()
+  })
+
+  // QA `LH-DATA-12-01` F2 (`DATA-54`): "just now" alone says nothing; the
+  // date and time are on hover.
+  it("shows a change's date and time on hover", async () => {
+    stubApi()
+    url.search = "tab=activity"
+    renderTabs({
+      ...BRONZE,
+      changeHistory: [
+        { id: "audit-1", at: "2026-06-12T09:41:00Z", actor: "Rina", summary: "Edited description" },
+      ],
+    })
+    const history = (await screen.findByText("Change history")).closest("[data-slot=card]") as HTMLElement
+    const at = within(history).getByTitle(formatDateTime("2026-06-12T09:41:00Z"))
+    expect(at.className).toContain("ml-auto")
   })
 
   it("lists frequent users, frequent queries without values, joined tables and column popularity over 30 days", () => {

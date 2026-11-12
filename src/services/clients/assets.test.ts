@@ -93,3 +93,17 @@ describe("clickhouseAssetService.getAsset", () => {
     expect(err.code).toBe("unavailable")
   })
 })
+
+describe("clickhouseAssetService.searchAssets", () => {
+  // QA `LH-DATA-11-02` (`DATA-54`): the box shows eight of the matches and
+  // needs the total the server already counts (`DATA-41` D3).
+  it("asks for the limit and answers the total", async () => {
+    const calls = stubFetch(() => json({ assets: [{ id: "silver.orders" }], total: 23 }))
+    const found = await clickhouseAssetService.searchAssets("orders", 8)
+    expect(calls[0]?.url).toBe("/api/catalog?q=orders&limit=8")
+    expect(found.total).toBe(23)
+
+    stubFetch(() => json({ assets: [{ id: "silver.a" }, { id: "silver.b" }] }))
+    expect((await clickhouseAssetService.searchAssets("orders", 8)).total).toBe(2)
+  })
+})

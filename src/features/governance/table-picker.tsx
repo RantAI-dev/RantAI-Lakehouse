@@ -17,28 +17,26 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useService } from "@/hooks/use-service"
+import { tableKeyOf } from "@/lib/table-key"
 import { assetService } from "@/services"
-import type { Asset, AssetDetail } from "@/services/contracts/assets"
+import type { AssetDetail } from "@/services/contracts/assets"
 
 /**
  * The table picker the governance forms share (`WEB-8` D8, spec
- * `web-8.md`): a combobox over the catalog's assets, showing each one as
- * `namespace.table` — the key a quality rule, a freshness target and an
- * alert rule all send — with the columns of the picked table read from its
- * own detail.
+ * `web-8.md`): a combobox over the catalog's assets, showing each one as the
+ * row's table key (`bronze.<table>`, `silver.<table>`, `serving.<table>`) —
+ * the name a quality rule, a freshness target and an alert rule all send —
+ * with the columns of the picked table read from its own detail.
  *
- * It never invents a table: the options are `assetService.listAssets`. When
- * that read fails the field goes back to the free text it was, with the
- * sentence saying so, rather than an empty list that would read as "this
- * deployment has no tables". A table the record already names that the
- * catalog does not list is offered as its own marked entry, so opening the
- * picker cannot drop it.
+ * It never invents a table: the options are `assetService.listAssets`, read
+ * through `tableKeyOf`. A row's `name` is its display name and a Bronze
+ * row's `namespace` is the registry's, so `namespace.name` named no table
+ * (QA `LH-DATA-14-01` F2, `DATA-54`). When that read fails the field goes
+ * back to the free text it was, with the sentence saying so, rather than an
+ * empty list that would read as "this deployment has no tables". A table the
+ * record already names that the catalog does not list is offered as its own
+ * marked entry, so opening the picker cannot drop it.
  */
-
-/** How every form here names a table: `namespace.table`. */
-export function tableKey(asset: Pick<Asset, "namespace" | "name">): string {
-  return `${asset.namespace}.${asset.name}`
-}
 
 export type TableCatalog = {
   /** Every table the catalog lists, sorted; `null` while it is loading or when it could not be read. */
@@ -53,16 +51,28 @@ export type TableCatalog = {
 export function useTableCatalog(): TableCatalog {
   const state = useService((signal) => assetService.listAssets({}, signal), [])
   const assets = state.status === "success" ? state.data : null
+  // QA `LH-DATA-14-01` F2 (`DATA-54`): the option is the row's table key. A
+  // row's `name` is its display name and a Bronze row's `namespace` is the
+  // registry's, so the pair named no table. A row the registry gives no table
+  // name has no key and is not offered.
   const choices = React.useMemo(
-    () => (assets === null ? null : Array.from(new Set(assets.map(tableKey))).sort()),
+    () =>
+      assets === null
+        ? null
+        : Array.from(
+            new Set(assets.map(tableKeyOf).filter((key): key is string => key !== null))
+          ).sort(),
     [assets]
   )
+  // Review round 1 R11: the fallback names the shape the server accepts. A
+  // Bronze row's namespace is the registry's, so `namespace.table` named no
+  // table and is answered 400 (QA `LH-DATA-14-01` F2, `DATA-54`).
   const note =
     state.status === "error"
-      ? "Could not read the catalog's tables; type the table as namespace.table."
+      ? "Could not read the catalog's tables; type the table as silver.<table>, serving.<table> or bronze.<table>."
       : null
   const idOf = React.useCallback(
-    (table: string) => assets?.find((asset) => tableKey(asset) === table)?.id ?? null,
+    (table: string) => assets?.find((asset) => tableKeyOf(asset) === table)?.id ?? null,
     [assets]
   )
   return { choices, note, idOf }

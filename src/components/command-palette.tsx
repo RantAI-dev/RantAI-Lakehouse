@@ -16,7 +16,14 @@ import { isServiceError } from "@/services/errors";
 import type { Asset } from "@/services/contracts/assets";
 import type { ShortcutItem } from "@/services/contracts/dashboards";
 import { itemHref } from "@/lib/dashboard-organise";
-import { ASSET_VALUE_PREFIX, PALETTE_ASSET_RESULT_LIMIT, capPaletteAssetResults, makePaletteFilter, matchedOnLabel } from "@/lib/palette-search";
+import {
+  ASSET_VALUE_PREFIX,
+  PALETTE_ASSET_RESULT_LIMIT,
+  PALETTE_SEARCH_MAX_CHARS,
+  capPaletteAssetResults,
+  makePaletteFilter,
+  paletteAssetLines,
+} from "@/lib/palette-search";
 
 /** Debounce, in ms, before a typed search term reaches `assetService`
  * (WS2 §13). */
@@ -68,6 +75,10 @@ export function CommandPalette() {
   const [recents, setRecents] = React.useState<Recent[]>([]);
   const [search, setSearch] = React.useState("");
   const [assetResults, setAssetResults] = React.useState<Asset[]>([]);
+  // How many tables matched in all (`DATA-41` D3, `DATA-54`). 0 when there is
+  // no term, on a failed search and without `catalog:read`: there is nothing
+  // more to say then.
+  const [assetTotal, setAssetTotal] = React.useState(0);
   // A failed search is said out loud (principle 2); an empty list would
   // read as "nothing matches".
   // The line to show for it: a refusal, a `supported: false` reason, or the
@@ -78,7 +89,10 @@ export function CommandPalette() {
   const [dashHits, setDashHits] = React.useState<ShortcutItem[]>([]);
   const [dashFavourites, setDashFavourites] = React.useState<ShortcutItem[]>([]);
   const [dashRecent, setDashRecent] = React.useState<ShortcutItem[]>([]);
-  const [dashFailed, setDashFailed] = React.useState(false);
+  // QA `LH-DATA-11-15` F2 (`DATA-54`): the line to show when the dashboard
+  // search answered with a failure; null when it answered. A refusal of the
+  // text is not an outage.
+  const [dashFailed, setDashFailed] = React.useState<string | null>(null);
   // BI-18 part C review fix (SHOULD-FIX) R12: the two server searches are
   // answering. "No results." is only said once both have answered and every
   // group, local and server, is empty; until then it says "Searching…".
@@ -109,6 +123,7 @@ export function CommandPalette() {
     const term = search.trim();
     if (!term || !hasPermission("catalog:read")) {
       setAssetResults([]);
+      setAssetTotal(0);
       setSearchFailed(null);
       setAssetsPending(false);
       return;
@@ -121,16 +136,18 @@ export function CommandPalette() {
         // `DATA-41` D3: the server is asked for what the box shows, so a
         // catalog of ten thousand tables is not sent to throw all but
         // eight away. `capPaletteAssetResults` stays as the second guard.
-        .listAssets({ search: term, limit: PALETTE_ASSET_RESULT_LIMIT }, controller.signal)
-        .then((assets) => {
+        .searchAssets(term, PALETTE_ASSET_RESULT_LIMIT, controller.signal)
+        .then(({ assets, total }) => {
           if (cancelled) return;
           setSearchFailed(null);
           setAssetResults(capPaletteAssetResults(assets));
+          setAssetTotal(total);
           setAssetsPending(false);
         })
         .catch((err: unknown) => {
           if (cancelled) return;
           setAssetResults([]);
+          setAssetTotal(0);
           setSearchFailed(failureLine(err));
           setAssetsPending(false);
         });
@@ -155,7 +172,7 @@ export function CommandPalette() {
       setDashFavourites([]);
       setDashRecent([]);
       setDashPending(false);
-      setDashFailed(false);
+      setDashFailed(null);
       return;
     }
     let cancelled = false;
@@ -168,7 +185,7 @@ export function CommandPalette() {
       work
         .then((found) => {
           if (cancelled) return;
-          setDashFailed(false);
+          setDashFailed(null);
           setDashHits(found.hits.slice(0, 8));
           setDashFavourites(found.favourites.slice(0, 5));
           // A favourite is not listed again under Recent (as on the dashboard list).
@@ -181,7 +198,15 @@ export function CommandPalette() {
           setDashHits([]);
           setDashFavourites([]);
           setDashRecent([]);
-          setDashFailed(!(isServiceError(err) && err.code === "permission_denied"));
+          setDashFailed(
+            isServiceError(err)
+              ? err.code === "permission_denied"
+                ? null
+                : err.code === "invalid_request"
+                  ? `Shorten the search: dashboards and charts are searched with at most ${PALETTE_SEARCH_MAX_CHARS} characters.`
+                  : "Dashboard search is unavailable"
+              : "Dashboard search is unavailable"
+          );
           setDashPending(false);
         });
     }, CATALOG_SEARCH_DEBOUNCE_MS);
@@ -251,6 +276,7 @@ export function CommandPalette() {
           className="h-11 w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
           value={search}
           onValueChange={setSearch}
+          maxLength={PALETTE_SEARCH_MAX_CHARS}
         />
         <kbd className="hidden rounded border border-border px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground sm:block">esc</kbd>
       </div>
@@ -273,7 +299,7 @@ export function CommandPalette() {
         ) : null}
         {dashFailed && search.trim() ? (
           <div role="alert" className="px-3 py-2 text-sm text-muted-foreground">
-            Dashboard search is unavailable
+            {dashFailed}
           </div>
         ) : null}
 
@@ -349,18 +375,31 @@ export function CommandPalette() {
             filter must not hide them (DATA-11 F6). */}
         {assetResults.length ? (
           <Command.Group forceMount heading="Catalog assets" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
-            {assetResults.map((a) => (
-              <PaletteItem
-                key={a.id}
-                forceMount
-                icon={Database}
-                label={a.name}
-                badge={<CertificationBadge certification={a.certification} />}
-                detail={matchedOnLabel(a.matchedOn)}
-                value={assetItemValue(a)}
-                onSelect={() => go(`/data/assets/${a.id}`)}
-              />
-            ))}
+            {assetResults.map((a) => {
+              // QA `LH-DATA-11-01` F1 (`DATA-54`): the result names the table
+              // by its physical name under the friendly name.
+              const lines = paletteAssetLines(a);
+              return (
+                <PaletteItem
+                  key={a.id}
+                  forceMount
+                  icon={Database}
+                  label={a.name}
+                  badge={<CertificationBadge certification={a.certification} />}
+                  path={lines.path}
+                  detail={lines.reason}
+                  value={assetItemValue(a)}
+                  onSelect={() => go(`/data/assets/${a.id}`)}
+                />
+              );
+            })}
+            {/* QA `LH-DATA-11-02` (`DATA-54`): the box shows eight tables; when
+                more matched, it says so rather than looking complete. */}
+            {assetTotal > assetResults.length ? (
+              <div className="px-2.5 py-1.5 text-xs text-muted-foreground">
+                Showing {assetResults.length} of {assetTotal}: refine the search
+              </div>
+            ) : null}
             <PaletteItem
               forceMount
               icon={Search}
@@ -389,12 +428,14 @@ export function CommandPalette() {
 }
 
 function PaletteItem({
-  icon: Icon, label, badge, detail, value, forceMount, onSelect,
+  icon: Icon, label, badge, path, detail, value, forceMount, onSelect,
 }: {
   icon: React.ComponentType<{ className?: string }>;
   label: string;
   /** Shown after the label (a certified / deprecated mark). */
   badge?: React.ReactNode;
+  /** The table's physical name, in monospace, before the reason. */
+  path?: string | null;
   /** A second, smaller line under the label. */
   detail?: string | null;
   value: string;
@@ -414,7 +455,13 @@ function PaletteItem({
           <span className="truncate">{label}</span>
           {badge}
         </span>
-        {detail ? <span className="block truncate text-xs text-muted-foreground">{detail}</span> : null}
+        {path || detail ? (
+          <span className="block truncate text-xs text-muted-foreground">
+            {path ? <span className="font-mono">{path}</span> : null}
+            {path && detail ? " · " : null}
+            {detail ? <span>{detail}</span> : null}
+          </span>
+        ) : null}
       </span>
     </Command.Item>
   );

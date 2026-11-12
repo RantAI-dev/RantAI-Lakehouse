@@ -50,7 +50,7 @@ async function loadCatalog(
   q: string | undefined,
   limit: number | undefined,
   signal?: AbortSignal,
-): Promise<{ assets: Asset[]; namespaces: CatalogNamespace[] }> {
+): Promise<{ assets: Asset[]; namespaces: CatalogNamespace[]; total?: number }> {
   const params = new URLSearchParams();
   if (q) params.set("q", q);
   if (limit !== undefined) params.set("limit", String(limit));
@@ -84,6 +84,12 @@ export const clickhouseAssetService: AssetService = {
         return false;
       return true;
     });
+  },
+  async searchAssets(term, limit, signal) {
+    const { assets, total } = await loadCatalog(term.trim(), limit, signal);
+    // `DATA-41` D3: the server counts every match; a server that answers no
+    // count is read as "all of them", which is what its answer holds.
+    return { assets, total: typeof total === "number" ? total : assets.length };
   },
   async listAssetsPage(query, signal) {
     // Only non-empty params are sent: the backend applies its own
