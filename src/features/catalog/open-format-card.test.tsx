@@ -464,7 +464,7 @@ describe("OpenFormatCard", () => {
     await waitFor(() => expect(screen.getByText("ClickHouse connection refused (111)")).toBeDefined())
   })
 
-  it("shows Copies kept and oldest timestamp when trim succeeded", async () => {
+  it("shows Copies kept at last trim with when it was counted and the oldest copy", async () => {
     mockApi((url) => {
       if (url.includes("/publication")) {
         return jsonResponse({
@@ -488,8 +488,39 @@ describe("OpenFormatCard", () => {
     })
 
     render(<OpenFormatCard assetId="serving.mart_a" />)
-    await waitFor(() => expect(screen.getByText("Copies kept")).toBeDefined())
-    expect(screen.getByText(/7 \(oldest/)).toBeDefined()
+    // The label changes by D17 (DATA-49): the number is the last trim's, and a
+    // publish after it is not counted, so the row says when it was counted.
+    await waitFor(() => expect(screen.getByText("Copies kept at last trim")).toBeDefined())
+    expect(screen.getByText(/^7 \(counted .+; oldest .+\)$/)).toBeDefined()
+  })
+
+  it("does not show a counted time when the trim recorded none", async () => {
+    mockApi((url) => {
+      if (url.includes("/publication")) {
+        return jsonResponse({
+          ...publicationBody,
+          trim: {
+            status: "success",
+            copiesKept: 3,
+            oldestKeptExportedAt: null,
+            finishedAt: "",
+            reason: null,
+          },
+        })
+      }
+      if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
+        return mockReadBack()
+      }
+      if (url.includes("/api/gold/exports")) {
+        return jsonResponse(emptyRunsBody)
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() => expect(screen.getByText("Copies kept at last trim")).toBeDefined())
+    const value = screen.getByText("Copies kept at last trim").nextElementSibling?.textContent
+    expect(value).toBe("3")
   })
 
   it("shows failed trim reason and never trimmed when trim failed", async () => {
@@ -517,7 +548,7 @@ describe("OpenFormatCard", () => {
 
     render(<OpenFormatCard assetId="serving.mart_a" />)
     await waitFor(() => expect(screen.getByText("Trim failed: delete_failed")).toBeDefined())
-    expect(screen.queryByText("Copies kept")).toBeNull()
+    expect(screen.queryByText("Copies kept at last trim")).toBeNull()
     expect(screen.queryByText(/\btrimmed\b/i)).toBeNull()
   })
 
@@ -542,7 +573,7 @@ describe("OpenFormatCard", () => {
     await waitFor(() =>
       expect(screen.getByTestId("publication-status").textContent).toBe("Up to date"),
     )
-    expect(screen.queryByText("Copies kept")).toBeNull()
+    expect(screen.queryByText("Copies kept at last trim")).toBeNull()
     expect(screen.queryByText(/\btrimmed\b/i)).toBeNull()
   })
 

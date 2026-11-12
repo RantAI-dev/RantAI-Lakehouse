@@ -26,6 +26,7 @@ import type {
   GoldExportRun,
   GoldPublication,
   GoldReadBack,
+  GoldTrimSummary,
 } from "@/services/contracts/gold"
 
 function trimmedMart(assetId: string): string {
@@ -72,6 +73,23 @@ function LastFiveRuns({ mart }: { mart: string }) {
       </TableBody>
     </Table>
   )
+}
+
+/**
+ * The detail after the copy count (`DATA-49`, D17): when the last trim counted
+ * it, and the oldest copy that trim kept.
+ *
+ * The number is the trim's, and no trim follows a manual publish (the Dagster
+ * `trim_gold_mart` op is the only writer of `console.gold_trim_run`), so a
+ * publish after the trim is not in it. Saying when it was counted is what keeps
+ * the number honest; the card must not pass it off as a live count.
+ */
+function copiesKeptDetail(trim: GoldTrimSummary): string {
+  const parts = [
+    trim.finishedAt !== "" ? `counted ${formatDateTime(trim.finishedAt)}` : null,
+    trim.oldestKeptExportedAt ? `oldest ${formatDateTime(trim.oldestKeptExportedAt)}` : null,
+  ].filter((part): part is string => part !== null)
+  return parts.length > 0 ? ` (${parts.join("; ")})` : ""
 }
 
 const stateLabelClass = (label: string): string => {
@@ -275,10 +293,10 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
           )}
           {p.trim && (p.trim.status === "success" || p.trim.status === "nothing_to_trim") && p.trim.copiesKept !== null && (
             <>
-              <dt className="text-muted-foreground">Copies kept</dt>
+              <dt className="text-muted-foreground">Copies kept at last trim</dt>
               <dd className="col-span-2">
                 {p.trim.copiesKept}
-                {p.trim.oldestKeptExportedAt ? ` (oldest ${formatDateTime(p.trim.oldestKeptExportedAt)})` : ""}
+                {copiesKeptDetail(p.trim)}
               </dd>
             </>
           )}
