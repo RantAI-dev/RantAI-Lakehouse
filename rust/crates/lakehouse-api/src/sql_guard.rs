@@ -74,11 +74,13 @@ use crate::sql_rewrite::Engine;
 /// from the request.
 #[must_use]
 pub fn is_read_only(sql: &str, engine: Engine) -> bool {
-    // A `$`-run no measured rule reads (`SpanKind::Uncertain`) is a shape
-    // the engine's reading of is unknown; the engine refuses every one the
-    // measurements cover with `SYNTAX_ERROR` (code 62, 2026-11-10). Fail
-    // closed (AGENTS.md principle 3): the whole statement is refused
-    // before any word in it is read.
+    // A `$`-run no measured rule reads, or a Unicode quote on `ClickHouse`
+    // (`SpanKind::Uncertain`), is a shape the lexer cannot follow. The
+    // engine refuses every `$` shape the measurements cover with
+    // `SYNTAX_ERROR` (code 62, 2026-11-10), and reads `‘ … ’` as a literal
+    // that this lexer would misplace (`#452` review SHOULD-FIX,
+    // 2026-11-12). Fail closed (AGENTS.md principle 3): the whole
+    // statement is refused before any word in it is read.
     if lex(engine, sql)
         .iter()
         .any(|span| span.kind == SpanKind::Uncertain)
@@ -106,8 +108,10 @@ pub fn is_read_only(sql: &str, engine: Engine) -> bool {
 /// cannot run. And the tail of a heredoc that is never closed: the engine
 /// reads that tail as code (`ClickHouse` opens a heredoc only when the
 /// closing delimiter is found again in the text), so a denied keyword in
-/// it is a keyword the engine would run. And a `$`-run no measured rule
-/// reads ([`SpanKind::Uncertain`]): [`is_read_only`] refuses the whole
+/// it is a keyword the engine would run. And an uncertain span
+/// ([`SpanKind::Uncertain`]): a `$`-run no measured rule reads, or on
+/// `ClickHouse` a Unicode quote outside a quoted run, a comment or a heredoc.
+/// [`is_read_only`] refuses the whole
 /// statement when one is present, so keeping it as it stands here cannot
 /// make a statement pass. The guard reads all three as they stand.
 #[must_use]
@@ -588,6 +592,41 @@ mod engine_aware_rules {
     fn a_dollar_no_measured_rule_reads_is_refused() {
         assert!(!is_read_only("SELECT $'$x$'$", Engine::ClickHouse));
         assert!(!is_read_only("SELECT $é$x$é$", Engine::ClickHouse));
+    }
+
+    /// The `#452` review SHOULD-FIX: measured on
+    /// `clickhouse/clickhouse-server:26.8` (2026-11-12), `‘ … ’` is a string
+    /// literal and `“ … ”` a quoted identifier, so the `'` inside them opens
+    /// no string and the `DROP` behind it is code the engine runs. The
+    /// lexer cannot follow them, so the whole statement is refused on
+    /// `ClickHouse`. `Trino` reads them as ordinary text (`sqlparser` fails
+    /// them later), so its verdict stays what it was.
+    #[test]
+    fn a_unicode_quote_hides_no_write_on_clickhouse() {
+        let sql = "SELECT \u{2018} ' \u{2019}; DROP TABLE t; SELECT \u{2018} ' \u{2019}";
+        assert!(!is_read_only(sql, Engine::ClickHouse), "{sql}");
+        assert!(is_read_only(sql, Engine::Trino), "{sql}");
+        let identifier = "SELECT \u{201C} ' \u{201D}; DROP TABLE t; SELECT \u{201C} ' \u{201D}";
+        assert!(
+            !is_read_only(identifier, Engine::ClickHouse),
+            "{identifier}"
+        );
+    }
+
+    /// Inside an ASCII literal, a quoted identifier or a comment the four
+    /// characters are data, so a statement that only holds them there stays
+    /// read-only on both engines.
+    #[test]
+    fn a_unicode_quote_inside_another_span_leaves_the_verdict_alone() {
+        for sql in [
+            "SELECT '\u{2018}'",
+            "SELECT \"\u{2019}\" FROM t",
+            "SELECT 1 -- \u{2018}",
+            "SELECT 1 /* \u{201C} */",
+        ] {
+            assert!(is_read_only(sql, Engine::ClickHouse), "{sql}");
+            assert!(is_read_only(sql, Engine::Trino), "{sql}");
+        }
     }
 
     /// The measured shapes that keep their verdicts: `SELECT $1$x$1$` runs

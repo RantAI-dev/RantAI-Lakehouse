@@ -360,6 +360,88 @@ describe("SchemaBrowser", () => {
     expect(row.getAttribute("title") ?? "").toContain("SQL name")
   })
 
+  // LH-QS-4-08: a Bronze row is proven when the list
+  // loads, and its columns follow the row.
+  it("offers a Bronze table's Trino name on a Trino tab without expanding it", async () => {
+    visitTrinoTab()
+    const { getAsset, getTableDetail } = stubServices()
+    getAsset.mockImplementation((async (id: string) =>
+      id === "demo_orders" ? bronzeDetail() : { schema: [] }) as never)
+    const { container } = render(<Harness />)
+    const view = editorView(container)
+    setBuffer(view, "SELECT * FROM ", "SELECT * FROM ".length)
+
+    fireEvent.click(await screen.findByRole("button", { name: "Insert iceberg.bronze.orders" }))
+
+    expect(view.state.doc.toString()).toBe("SELECT * FROM iceberg.bronze.orders")
+    expect(getTableDetail).toHaveBeenCalledTimes(1)
+    await act(async () => {})
+  })
+
+  it("disables a Bronze table's column buttons on a Trino tab while its Iceberg table is being proven", async () => {
+    visitTrinoTab()
+    const { getAsset, getTableDetail } = stubServices()
+    getAsset.mockResolvedValue(bronzeDetail())
+    // The read that proves the table is there never comes back.
+    getTableDetail.mockReturnValue(new Promise<never>(() => {}))
+    const { container } = render(<Harness />)
+    const view = editorView(container)
+    setBuffer(view, "SELECT * FROM ", "SELECT * FROM ".length)
+
+    fireEvent.click(await screen.findByRole("button", { name: "Columns of Demo Orders" }))
+
+    const column = await screen.findByRole("button", { name: "Insert column oid" })
+    expect((column as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(column)
+    expect(view.state.doc.toString()).toBe("SELECT * FROM ")
+  })
+
+  it("lets a proven Bronze table's column be inserted on a Trino tab", async () => {
+    visitTrinoTab()
+    const { getAsset } = stubServices()
+    getAsset.mockResolvedValue(bronzeDetail())
+    const { container } = render(<Harness />)
+    const view = editorView(container)
+    setBuffer(view, "SELECT ", "SELECT ".length)
+
+    fireEvent.click(await screen.findByRole("button", { name: "Columns of Demo Orders" }))
+    const column = await screen.findByRole("button", { name: "Insert column oid" })
+    await waitFor(() => expect((column as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(column)
+
+    expect(view.state.doc.toString()).toBe("SELECT oid")
+    await act(async () => {})
+  })
+
+  it("shows the no-table sentence and no columns for a Bronze table whose Iceberg table is not there", async () => {
+    visitTrinoTab()
+    const { getAsset, getTableDetail } = stubServices()
+    getAsset.mockResolvedValue(bronzeDetail())
+    getTableDetail.mockRejectedValue(new ServiceError("not_found", "table not found", 404))
+    render(<Harness />)
+
+    fireEvent.click(await screen.findByRole("button", { name: "Columns of Demo Orders" }))
+
+    expect(await screen.findByText(NO_READABLE_TABLE)).toBeTruthy()
+    expect(screen.queryByRole("button", { name: "Insert column oid" })).toBeNull()
+    expect(screen.queryByText("oid")).toBeNull()
+  })
+
+  it("keeps a Bronze table's columns insertable on a ClickHouse tab, and reads no Iceberg table for the list", async () => {
+    const { getAsset, getTableDetail } = stubServices()
+    getAsset.mockResolvedValue(bronzeDetail())
+    render(<Harness />)
+
+    await screen.findByRole("button", { name: "Demo Orders" })
+    await act(async () => {})
+    expect(getTableDetail).toHaveBeenCalledTimes(0)
+    expect(getAsset).toHaveBeenCalledTimes(0)
+
+    fireEvent.click(screen.getByRole("button", { name: "Columns of Demo Orders" }))
+    const column = await screen.findByRole("button", { name: "Insert column oid" })
+    expect((column as HTMLButtonElement).disabled).toBe(false)
+  })
+
   it("shows the catalog's reason when a table's columns were refused, and retries on request", async () => {
     const { getAsset } = stubServices()
     getAsset.mockResolvedValueOnce({

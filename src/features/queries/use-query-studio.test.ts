@@ -392,6 +392,228 @@ describe("useQueryStudio Bronze tables", () => {
   })
 })
 
+// LH-QS-4-08: the server's estimate is ClickHouse's `EXPLAIN
+// ESTIMATE` and a Trino statement is not valid there, so a Trino tab never asks.
+describe("useQueryStudio estimate by engine", () => {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+  const ESTIMATE = { estimatedBytes: null } as never
+
+  it("never asks for an estimate on a Trino tab, and says it has none", async () => {
+    visit("/query-studio?sql=SELECT%201&engine=trino")
+    const estimate = spyOn(queryService, "estimate").mockResolvedValue(ESTIMATE)
+    const { result } = mountWith("SELECT 1")
+
+    await sleep(700)
+    act(() => result.current.setSql("SELECT 2"))
+    await sleep(700)
+
+    expect(result.current.engine).toBe("trino")
+    expect(estimate).toHaveBeenCalledTimes(0)
+    expect(result.current.estimateSupported).toBe(false)
+  })
+
+  it("does not ask for an estimate from the Estimate button on a Trino tab", async () => {
+    visit("/query-studio?sql=SELECT%201&engine=trino")
+    const estimate = spyOn(queryService, "estimate").mockResolvedValue(ESTIMATE)
+    const { result } = mountWith("SELECT 1")
+
+    act(() => result.current.reEstimate())
+    await sleep(50)
+
+    expect(estimate).toHaveBeenCalledTimes(0)
+  })
+
+  it("still estimates on a ClickHouse tab", async () => {
+    const estimate = spyOn(queryService, "estimate").mockResolvedValue(ESTIMATE)
+    const { result } = mountWith("SELECT 1")
+
+    await waitFor(() => expect(estimate).toHaveBeenCalledTimes(1))
+    expect(result.current.estimateSupported).toBe(true)
+  })
+
+  it("leaves no stale estimate behind when the tab goes ClickHouse, Trino, ClickHouse", async () => {
+    const estimate = spyOn(queryService, "estimate").mockResolvedValue(ESTIMATE)
+    const { result } = mountWith("SELECT 1")
+    await waitFor(() => expect(result.current.estimateAct.status).toBe("success"))
+
+    act(() => result.current.setEngine("trino"))
+    // The estimate a ClickHouse statement got is gone the moment the engine
+    // changes, not after the debounce.
+    expect(result.current.estimateSupported).toBe(false)
+    expect(result.current.estimateAct.status).toBe("idle")
+    expect(result.current.estimateAct.data).toBeNull()
+    await sleep(700)
+    expect(estimate).toHaveBeenCalledTimes(1)
+
+    act(() => result.current.setEngine("clickhouse"))
+    expect(result.current.estimateSupported).toBe(true)
+    await waitFor(() => expect(estimate).toHaveBeenCalledTimes(2))
+  })
+
+  it("drops an estimate still being asked for when the tab goes to Trino", async () => {
+    // The ClickHouse ask is pending when the engine changes: its answer
+    // must not reach the Trino tab.
+    let answer: (value: never) => void = () => {}
+    const estimate = spyOn(queryService, "estimate").mockImplementation(
+      () => new Promise((resolve) => (answer = resolve as (value: never) => void))
+    )
+    const { result } = mountWith("SELECT 1")
+    await waitFor(() => expect(estimate).toHaveBeenCalledTimes(1))
+
+    act(() => result.current.setEngine("trino"))
+    await act(async () => {
+      answer(ESTIMATE)
+    })
+
+    expect(result.current.estimateAct.status).toBe("idle")
+    expect(result.current.estimateAct.data).toBeNull()
+  })
+})
+
+// LH-QS-4-08: the Bronze rows of the list are proven
+// when it loads on a Trino tab, a bounded number at a time.
+describe("useQueryStudio Bronze proof on list load", () => {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+  const ICEBERG_TABLE = { schema: [] } as unknown as LakehouseTableDetail
+
+  /** A Bronze asset as the list sends it: a registry slug id, no SQL name. */
+  const bronze = (n: number) => ({
+    id: `demo_t${n}`,
+    name: `Demo ${n}`,
+    namespace: "bronze",
+    layer: "raw",
+  })
+
+  /** The detail of the Bronze table `demo_t<n>`. */
+  const detailOf = (id: string) => ({
+    schema: [{ name: "oid", dataType: "String" }],
+    layer: "raw",
+    type: "iceberg-table",
+    tableName: id.replace("demo_", ""),
+    namespace: "bronze",
+    name: id,
+    queryTarget: { engine: "clickhouse", table: `icecat_api.\`bronze.${id}\`` },
+  })
+
+  function mountList(assets: unknown[], options: { tableError?: ServiceError } = {}) {
+    spyOn(queryService, "listSaved").mockResolvedValue([])
+    spyOn(queryService, "listHistory").mockResolvedValue([])
+    spyOn(queryService, "estimate").mockRejectedValue(new ServiceError("unavailable", "no estimate"))
+    spyOn(assetService, "listAssets").mockResolvedValue(assets as never)
+    const getAsset = spyOn(assetService, "getAsset").mockImplementation(
+      (async (id: string) => detailOf(id)) as never
+    )
+    const getTableDetail = spyOn(lakehouseService, "getTableDetail").mockImplementation(() =>
+      options.tableError ? Promise.reject(options.tableError) : Promise.resolve(ICEBERG_TABLE)
+    )
+    return { hook: renderHook(() => useQueryStudio()), getAsset, getTableDetail }
+  }
+
+  it("proves each Bronze row once when the list loads, so it has a reference without being expanded", async () => {
+    visit("/query-studio?sql=SELECT%201&engine=trino")
+    const { hook, getAsset, getTableDetail } = mountList([
+      { id: "silver.orders", name: "Orders", namespace: "silver", layer: "silver" },
+      bronze(1),
+      bronze(2),
+    ])
+
+    await waitFor(() => {
+      const refs = hook.result.current.tables.map((table) => table.reference)
+      expect(refs).toEqual(["silver.orders", "iceberg.bronze.t1", "iceberg.bronze.t2"])
+    })
+    expect(getAsset.mock.calls.map((call) => call[0]).sort()).toEqual(["demo_t1", "demo_t2"])
+    expect(getTableDetail).toHaveBeenCalledTimes(2)
+
+    // Whatever happens next to the buffer, the cache answers: no second read.
+    act(() => hook.result.current.setSql("SELECT 2"))
+    act(() => hook.result.current.loadColumns("demo_t1"))
+    await sleep(100)
+    expect(getAsset).toHaveBeenCalledTimes(2)
+    expect(getTableDetail).toHaveBeenCalledTimes(2)
+  })
+
+  it("completes the columns after an alias on a Bronze table written by its Trino name, once the row is proven (QS-4-AC8)", async () => {
+    visit("/query-studio?sql=SELECT%201&engine=trino")
+    const { hook } = mountList([bronze(1)])
+    const sql = "SELECT b. FROM iceberg.bronze.t1 b"
+    act(() => hook.result.current.setSql(sql))
+    await waitFor(() => expect(hook.result.current.tables[0]?.reference).toBe("iceberg.bronze.t1"))
+    await waitFor(() => expect(hook.result.current.columns["demo_t1"]?.status).toBe("ready"))
+
+    const context = {
+      state: { doc: { toString: () => sql } },
+      pos: sql.indexOf("b.") + 2,
+    } as unknown as Parameters<typeof hook.result.current.completionSource>[0]
+    const answer = hook.result.current.completionSource(context) as unknown as {
+      options: { label: string }[]
+    }
+    expect(answer.options.map((option) => option.label)).toEqual(["oid"])
+  })
+
+  it("reads no Bronze table for the list on a ClickHouse tab, and reads them when the tab goes to Trino", async () => {
+    const { hook, getAsset, getTableDetail } = mountList([bronze(1)])
+    await waitFor(() => expect(hook.result.current.tables.length).toBe(1))
+    await sleep(100)
+    expect(getAsset).toHaveBeenCalledTimes(0)
+    expect(getTableDetail).toHaveBeenCalledTimes(0)
+
+    act(() => hook.result.current.setEngine("trino"))
+
+    await waitFor(() => expect(hook.result.current.tables[0]?.reference).toBe("iceberg.bronze.t1"))
+    expect(getTableDetail).toHaveBeenCalledTimes(1)
+  })
+
+  it("does not read a Bronze table again on a keystroke after its proof failed", async () => {
+    visit("/query-studio?sql=SELECT%201&engine=trino")
+    const { hook, getTableDetail } = mountList([bronze(1)], {
+      tableError: new ServiceError("unavailable", "warehouse down", 503),
+    })
+
+    await waitFor(() => expect(hook.result.current.proofs["demo_t1"]?.status).toBe("failed"))
+    act(() => hook.result.current.setSql("SELECT 2"))
+    act(() => hook.result.current.setSql("SELECT 3"))
+    await sleep(100)
+
+    expect(getTableDetail).toHaveBeenCalledTimes(1)
+  })
+
+  it("keeps the number of reads in flight small for a long list, and proves every row in the end", async () => {
+    visit("/query-studio?sql=SELECT%201&engine=trino")
+    const rows = Array.from({ length: 12 }, (_, i) => bronze(i + 1))
+    const { hook, getAsset } = mountList(rows)
+    // Each detail read waits until the test lets it through.
+    const gates: (() => void)[] = []
+    let inFlight = 0
+    let peak = 0
+    getAsset.mockImplementation((async (id: string) => {
+      inFlight += 1
+      peak = Math.max(peak, inFlight)
+      await new Promise<void>((resolve) => gates.push(resolve))
+      inFlight -= 1
+      return detailOf(id)
+    }) as never)
+
+    await waitFor(() => expect(gates.length).toBeGreaterThan(0))
+    await sleep(50)
+    // Nothing is let through yet, so the reads started are all that were allowed to start.
+    expect(gates.length).toBeLessThan(rows.length)
+    expect(gates.length).toBeLessThanOrEqual(4)
+
+    for (let round = 0; round < 40 && getAsset.mock.calls.length < rows.length; round += 1) {
+      while (gates.length) gates.shift()?.()
+      await sleep(10)
+    }
+    while (gates.length) gates.shift()?.()
+
+    await waitFor(() =>
+      expect(hook.result.current.tables.every((table) => table.reference !== "")).toBe(true)
+    )
+    expect(peak).toBeLessThanOrEqual(4)
+    expect(getAsset).toHaveBeenCalledTimes(rows.length)
+  })
+})
+
 describe("useQueryStudio statements", () => {
   it("runs every statement of the tab, one request each, in the order written", async () => {
     const run = spyOn(queryService, "run").mockResolvedValue(RESULT as never)
@@ -815,6 +1037,18 @@ describe("useQueryStudio parameter requests", () => {
       definitions: [{ name: "region", type: "text" }],
     })
     expect(result.current.estimatable).toBe(true)
+  })
+
+  it("names the first parameter the estimate waits for (QS-5-AC14)", async () => {
+    spyOn(queryService, "estimate").mockResolvedValue(ESTIMATE)
+    const { result } = mountWith("SELECT {{region}}, {{since}}")
+    expect(result.current.estimateWaitsFor).toBe("region")
+
+    act(() => result.current.setParameterValue("region", "EU"))
+    expect(result.current.estimateWaitsFor).toBe("since")
+
+    act(() => result.current.setParameterValue("since", "2026-11-01"))
+    expect(result.current.estimateWaitsFor).toBeNull()
   })
 
   it("does not skip the estimate for a name that has a default", async () => {
