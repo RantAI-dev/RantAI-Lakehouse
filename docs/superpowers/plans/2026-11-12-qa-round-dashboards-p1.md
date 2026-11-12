@@ -857,4 +857,281 @@ predicted: `Unprocessable("The SQL source failed to run. Reference:
 0bad014c25")` where the limit's sentence was expected, and the recorded
 row-read request had no `max_execution_time` URL setting.
 
+### Commits
+
+Branch `fix/qa-round-dashboards-p1`, base `f1eee247`, pushed after every
+commit except T1 (pushed with T3, plan D1).
+
+| # | Commit | Title |
+| --- | --- | --- |
+| T1 | `32171820` | test(dashboard): reproduce the SQL source preview row read without the limit (LH-BI-5-01; BI-45 T1) |
+| T2 | `19bc8862` | refactor(dashboard): one place sends a statement under the caller's limits (BI-45 T2) |
+| T3 | `62bf50a2` | fix(dashboard): the SQL source preview's row read runs under the limit (LH-BI-5-01; BI-45 T3) |
+| T4 | `f608c76f` | fix(dashboard): saving a chart runs its statement under the limit (LH-BI-5-01; BI-45 T4) |
+| T5 | `fd3181df` | fix(ai): the assistant's chart saves run under the caller's limit (BI-45 T5) |
+| T5 fix | `bb94af7e` | test(api): the tool reply's gate sentence is on the SEC-11 allowlist (BI-45 T5) |
+| T6 | `afced570` | fix(dashboard): the save and preview routes wait for the limit (LH-BI-5-01; BI-45 T6) |
+| T7 | `52282a68` | fix(dashboard): a filter's value list reads the chart's own mart or SQL source (LH-BI-6-01; BI-47 T7) |
+| T8 | `44992fde` | feat(bi): the limit keeps the top breakdown values (LH-BI-6-01; BI-46 T8) |
+| T9 | `b79797b8` | feat(bi): a date breakdown can be grouped by a grain (LH-BI-6-01; BI-46 T9) |
+| T10 | `a96fd266` | feat(ai): the digest and the prompt say what the limit counts (LH-BI-6-06; BI-46 T10) |
+| T11 | `1033a81e` | fix(console): a chart filter lists its own source's values and hides parameter slots (LH-BI-6-01; BI-47 T11) |
+| T12 | `4c5e5e8c` | feat(console): a chart tile can be duplicated (LH-BI-6-40; BI-48 T12) |
+| T13 | `12869049` | feat(console): the builder groups a date breakdown by a grain and says what the limit counts (LH-BI-6-01; BI-46 T13) |
+| T14 | `c2f4365e` | docs(features): the new rules for charts and limits (BI-45, BI-46, BI-47 T14) |
+
+### Commands run, with their counts
+
+Build settings on this machine (section 3a): `CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-3
+CARGO_BUILD_JOBS=6`, `cargo` (no `cargo-locked`), `bun install --frozen-lockfile`
+once (678 packages).
+
+Rust, per task:
+
+- T1, before the fix: `cargo test -p lakehouse-api --lib
+  the_row_read_of_a_sql_source_preview_carries_the_callers_time_limit_and_says_the_limit_sentence`
+  — **0 passed, 1 failed**: `Unprocessable("The SQL source failed to run. Reference: 0bad014c25")`.
+- T2: `cargo test -p lakehouse-api --lib
+  a_statement_run_under_limits_sends_the_time_limit_and_says_the_limit_sentence_when_the_engine_stops_it`
+  — 1 passed, 0 failed. The four tests the task names, one at a time
+  (`a_tile_the_time_limit_or_a_stop_ended_says_so_without_the_engines_text`,
+  `a_tile_query_sends_its_limits_and_its_id_as_url_settings`,
+  `a_point_map_and_a_pivot_read_past_the_chart_row_limit_and_a_bar_does_not`,
+  `a_tile_of_a_stopped_run_sends_no_query`) — 1 passed each, unchanged.
+- T3: `cargo test -p lakehouse-api --lib preview_tests` — 9 passed, 0 failed
+  (T1's test now green, the new
+  `a_chart_is_not_run_when_the_row_read_of_its_sql_source_hit_the_time_limit`,
+  and the seven unchanged).
+- T4: `cargo test -p lakehouse-api --lib limited_run` — 4 passed, 0 failed,
+  then 5 with T5.
+- T5: `cargo test -p lakehouse-api --lib limited_run` — 5 passed, 0 failed;
+  `cargo test -p lakehouse-api --lib routes::ai::tools` — 258 passed, 0
+  failed.
+- T6: `cargo test -p lakehouse-api --lib
+  limit_bearing_routes_follow_the_longest_configured_limit` — 1 passed, 0
+  failed after the new expectations; the same test with only its new lines in
+  place and the code unchanged — **0 passed, 1 failed** (`/api/dashboard/specs`:
+  60 s where 315 s was expected). `cargo test -p lakehouse-api --lib
+  routes::tests` — 9 passed, 0 failed.
+- T7: `cargo test -p lakehouse-api --lib values_enforcement` — 7 passed, 0
+  failed; with the new branch switched off, 4 failed and the 3 existing stayed
+  green (the reproduction). `cargo test -p lakehouse-api --lib
+  routes::dashboard` — 209 passed, 0 failed, 3 ignored. `cargo test -p
+  lakehouse-api --test dashboard_access_routes` — 37 passed, 0 failed, and
+  with the `dashboard:read` check disabled the new case failed (0 passed, 1
+  failed).
+- T8: `cargo test -p lakehouse-bi --lib` — 628 passed, 0 failed, 4 ignored
+  after the rule change, 630 after `build` was split (to stay under clippy's
+  100-line limit); with the cap switched off, five of the named tests failed.
+- T9: `cargo test -p lakehouse-bi --lib` — 634 passed, 0 failed, 4 ignored;
+  with the rebuild branch off, the two builder tests failed and the two shape
+  tests name a field that did not exist.
+- T10: `cargo test -p lakehouse-api --lib a_definition_digest` — 13 passed, 0
+  failed; `the_build_prompt_says_what_a_limit_counts_and_four_rules_for_what_the_model_states`
+  — 1 passed; `create_chart_and_update_chart_take_the_chart_builder_fields` — 1
+  passed; `tool_schemas_snapshot_is_byte_identical` — 1 passed;
+  `write_tool_schema_fixture -- --ignored` — 1 passed (the fixture
+  regenerated); `cargo test -p lakehouse-api --lib registry` — 71 passed, 0
+  failed, 1 ignored; `cargo test -p lakehouse-api --lib routes::ai::` — 592
+  passed, 0 failed, 1 ignored.
+- T5 fix: `cargo test -p lakehouse-api --test sec11_guard` — 4 passed, 0
+  failed (it failed once, before the allowlist entry: see "Found by the
+  workspace run" below).
+
+Rust, the whole suite (once, before the handoff, on the final commit):
+
+- `cd rust && cargo fmt --check` — clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` —
+  clean (1 m 20 s, no warning).
+- `cargo test --workspace` — **198 test binaries, 7,369 passed, 0 failed, 35
+  ignored**, exit 0.
+
+TypeScript:
+
+- `bun install --frozen-lockfile` — 678 packages.
+- `bun run typecheck` — clean.
+- `bun run lint` — 0 errors, 11 warnings. The warnings are all in files this
+  slice did not touch (e.g. `src/services/http.ts`); they were not compared
+  with `main`.
+- `bun test src/features/dashboards src/lib` — 1,913 passed, 0 failed, 1
+  skipped (208 files).
+- `bun run test` — 4,017 passed, 0 failed, 1 skipped (382 files).
+
+Other:
+
+- `python3 ops/lint/check_intra_package_imports.py` — OK.
+- `python3 ops/lint/check_bare_iceberg_count.py` — OK (R11).
+- `python3 -m json.tool ops/ai_eval/dashboard_cases.json` — valid.
+- `git status` before every commit and before this handoff — only the files
+  of the commit, nothing generated.
+
+### Tests added, by name
+
+- `dashboard_sources::preview_tests`: `the_row_read_of_a_sql_source_preview_carries_the_callers_time_limit_and_says_the_limit_sentence`,
+  `a_chart_is_not_run_when_the_row_read_of_its_sql_source_hit_the_time_limit`.
+- `support::limited_run`: `a_statement_run_under_limits_sends_the_time_limit_and_says_the_limit_sentence_when_the_engine_stops_it`,
+  `a_chart_whose_statement_hits_the_time_limit_is_not_saved_and_the_failure_is_the_limit_sentence`,
+  `a_chart_whose_statement_runs_is_saved_after_one_limited_run`,
+  `a_limit_failure_becomes_a_422_with_the_sentence_and_an_engine_failure_keeps_the_callers_mapping`,
+  `a_tool_reply_for_a_save_the_limit_ended_is_the_sentence_with_its_limit`.
+- `routes::dashboard::values_enforcement`: `the_values_of_a_charts_own_mart_are_read_from_that_mart_and_no_other`,
+  `the_values_of_a_charts_sql_source_are_read_from_that_source`,
+  `a_masked_viewer_gets_the_masked_values_of_the_charts_own_mart`,
+  `a_column_the_charts_own_relation_does_not_have_gives_an_empty_list`.
+- `tests/dashboard_access_routes.rs`: `a_person_without_dashboard_read_cannot_name_a_mart_for_a_value_list`.
+- `builder::tests`: `a_breakdown_beside_a_time_grain_keeps_every_bucket_and_the_top_breakdown_values`
+  (replaces `a_breakdown_keeps_the_latest_buckets_and_orders_by_bucket_then_series`),
+  `a_breakdown_without_a_grain_keeps_the_top_dimension_values_and_the_top_breakdown_values`,
+  `a_dashboard_filter_narrows_the_rows_the_breakdown_values_are_ranked_over`,
+  `a_heatmap_keeps_its_statement_and_its_second_column_is_not_capped`,
+  `a_date_part_with_a_breakdown_caps_the_breakdown_at_the_charts_own_limit`,
+  `a_date_breakdown_grouped_by_month_is_bucketed_under_the_chart_and_capped_by_bucket`,
+  `a_grain_on_the_dimension_and_on_the_breakdown_nest_one_bucket_each`.
+- `store::tests`: `a_bar_chart_with_a_breakdown_is_saved_with_the_capped_statement`,
+  `a_chart_without_a_breakdown_is_saved_with_the_statement_it_always_had`.
+- `shape::tests`: `a_breakdown_grain_is_refused_without_a_breakdown_on_a_text_column_on_a_pie_and_beside_a_bin`,
+  `a_breakdown_grain_reads_back_as_it_was_saved`.
+- `dashboards::tests`: `a_definition_digest_says_a_limit_beside_a_breakdown_counts_the_breakdown`.
+- `src/features/dashboards/filters/use-filter-values.test.tsx` (new file): the
+  five cases of T11.
+- `src/features/dashboards/tile-write-items.test.tsx` (new file): the three
+  cases of T12.
+- `src/lib/dashboard-tabs.test.ts`: the four `placeCopyBelow` cases.
+- `src/lib/time-grain.test.ts`: `a date breakdown on a line chart is offered day to year`,
+  `a text breakdown and a pie are offered none`,
+  `the limit has an effect beside a breakdown even on a date part`,
+  `series buckets are labelled like the axis`.
+- `src/lib/chart-shape.test.ts`: `the payload carries the breakdown grain only with a breakdown on a bar, hbar, line or area`,
+  `a saved breakdown grain reads back into the draft`.
+- Existing tests extended: `chart-shape-section.test.tsx` (the `source` prop, and
+  "reads the value list of a chart filter from the mart it was given and names
+  no board"), `chart-builder.test.tsx` ("a parameter slot is offered as a
+  dimension and not as a filter column", "choosing a date breakdown offers its
+  grain and the preview request carries it", "the limit label names the
+  breakdown when the chart has one"),
+  `value-group-dialog.test.tsx` (the list names the dialog's source),
+  `dashboard-page-role.test.tsx` (Duplicate), `clients/dashboards.test.ts`
+  (the id `saveChart` answers), `dashboard-actions.test.tsx` (the menu now
+  reads "Edit chart, Duplicate").
+
+### Existing tests whose expectation changed (rule 2: the rule changed)
+
+T8: `a_breakdown_keeps_the_latest_buckets_and_orders_by_bucket_then_series`
+(replaced by the new rule's test),
+`a_breakdown_sorted_by_a_measure_keeps_and_shows_the_dimensions_in_that_order`,
+`a_chart_filter_and_a_dashboard_filter_on_one_column_both_apply` (4 occurrence
+of the two predicates, not 2: the cap adds a subquery) and
+`charts_saved_before_bi_6_build_the_statement_they_always_did` (a chart with a
+breakdown is rebuilt now, which is D14). Every other `lakehouse-bi` test stayed
+byte-identical. No test, lint, allowlist or threshold was weakened anywhere
+else.
+
+### Found by the workspace run
+
+`SEC-11`'s `no_route_builds_a_response_from_an_upstream_errors_text` failed on
+`support::failure_as_tool_reply`'s `Gated` line, which puts the tenant gate's
+own fixed sentence (SEC-20's 404 or D6's 422, written in this repository) in a
+tool reply — the same text `run_spec_sql` shows in a tile, whose line is
+allowed for the same reason. `bb94af7e` adds the allowlist entry with that
+reason; nothing else in the guard changed. It passes on `main` because the
+line did not exist there.
+
+### Not verified, and why
+
+- **The `AI-15` request set (T10)**: *not verified*; it needs a model
+  endpoint. The AI team runs `chart_top_n_breakdown_over_time` and the rest.
+- **`chart_top_n_breakdown_over_time` itself**: *not verified*; same reason.
+- **Nothing was proven in a browser**: the owner runs `LH-BI-5-01`,
+  `LH-BI-6-01`, `LH-BI-6-06` and `LH-BI-6-40` on staging after the merge.
+- **`docker compose config` / a real `up`**: not run; no compose file changed.
+- **Dagster tests, `pytest dispar_orchestrate`**: not run; nothing under
+  `dagster/` or `ops/*.py` changed (only `ops/ai_eval/dashboard_cases.json`,
+  validated as JSON).
+- **`gitleaks`**: not run; no secret, hostname or credential was added.
+- **CI on the pull request (x86_64)**: the final word; this machine is ARM64.
+
+### Notes for the reviewer (not MISMATCH: no anchor or signature differed)
+
+No MISMATCH. Deviations inside a task, each for a check that has to stay
+green, all stated in the commit that holds them:
+
+1. **T2**: `run_statement_limited` has no caller until T3, and
+   `cargo clippy -D warnings` failed on dead code. T2 carries
+   `#[cfg_attr(not(test), expect(dead_code, reason = "first caller is T3 of this slice (BI-45)"))]`,
+   which T3 removes. T2 and T3 are pushed together (D1).
+2. **T2, T4, T5 tests** live in a new `support::limited_run` module (a plain
+   `#[tokio::test]`/`#[test]` module, wiremock only, no Postgres) rather than
+   inside `run_spec_sql_enforcement`; its module doc says why.
+3. **T7**: the relation builder is `value_relation(ValueOwner, ..)` and the
+   chart's-own branch is `own_value_selects`, which calls it — two functions
+   instead of one, because `values_with_limit` passed clippy's 100-line limit
+   otherwise. There is still exactly one place that builds a value list's
+   relation, and one place that parses `joins`.
+4. **T8**: `build` was split into `breakdown_statement` + `key_dir` (over the
+   100-line limit). The "keep every bucket" reading is gated on
+   `cap_breakdown && grain.is_some()` in `build`, `ranked_sql` and `staged`:
+   that is the heading of plan step 4 ("when `cap_breakdown` is true **and**
+   the builder has a grain") and its "without a grain … byte for byte" clause,
+   and it is what keeps the no-grain test of D12 true. In the plain breakdown
+   statement the cap clause also appears inside the kept-groups subquery, a
+   consequence of pushing the cap onto `where_clauses` (plan step 3).
+5. **T10**: `limit_digest` is a separate function (line limit). The `limit`
+   sentence of `create_chart` lives in `KEPT_CHART_DESCRIPTIONS`, not in
+   `with_shape_properties`: every other description there is stripped before
+   that table restores the kept ones, so a change there would never reach the
+   model. The fixture diff is three hunks, all in `create_chart` and
+   `update_chart`. `breakdownGrain` was declared in `ShapeDefFields` here (type
+   only) so the console line of T10 compiles; T13 uses it.
+6. **T11**: a picker with no source chosen yet (`segments-dialog`,
+   `metric-dialog` before a source is picked) passes `{ unsaved: true }` through
+   `ownSourceOf`: no request and no list, which fails closed; with no source
+   there are no columns, so no filter can be opened.
+7. **T12**: `dashboard-actions.test.tsx`'s menu case now also expects
+   "Duplicate" (same menu, same conditions).
+
+### Assistant changes for the AI team to review
+
+- **The prompt line** (`rust/crates/lakehouse-api/src/routes/ai/prompt.rs`,
+  `SYSTEM_BUILD_SUFFIX`), replacing the old two sentences: *"A chart's
+  `limit` on a bar, hbar, line or area chart with a breakdown keeps the N
+  breakdown values with the largest total; a time grain on the dimension then
+  keeps every period, and a dimension without a grain keeps its own top N as
+  well. Without a breakdown, `limit` counts values of the dimension, and with a
+  time grain ordered by that date it keeps the latest periods. For "top N of Y
+  over time" use the date as the dimension with a grain, Y as the breakdown and
+  limit N."*
+- **The digest** (`definition_digest` / `limit_digest` in
+  `routes/ai/tools/dashboards.rs`): with a breakdown and a grain, `limit: 10
+  (the 10 provinsi values with the largest total; every month bucket of
+  tanggal is kept)`; without one, `limit: 10 kab values, and the 10 kawasan
+  values with the largest total`; a heatmap keeps `; the breakdown is not
+  limited`; a `breakdownGrain` is listed as `breakdown grain: month` after
+  `grain`. `annotate_saved_grain` now reads `keeps_latest_buckets`, so the
+  tile's surplus-bucket marker follows the builder.
+- **The tool schema** (`routes/ai/registry.rs`): `create_chart`'s `limit`
+  description gains "on a bar, hbar, line or area chart with a breakdown it
+  keeps that many breakdown values, the ones with the largest total", and
+  `create_chart`/`update_chart` take `breakdownGrain` (enum day, week, month,
+  quarter, year; not with a bin). **The fixture
+  `tests/fixtures/tool_schemas.json` changed**: three hunks, `create_chart`'s
+  `limit` and `breakdownGrain`, and `update_chart`'s `breakdownGrain` (type
+  only there, descriptions are stripped). Regenerated with
+  `write_tool_schema_fixture`; `tool_schemas_snapshot_is_byte_identical`
+  passes.
+- **The page context is unchanged**: it sends the chart's definition, which may
+  now hold `breakdownGrain`.
+- **The draft card** (`src/features/copilot/chart-draft-card.tsx`) carries
+  `breakdownGrain` into the draft's definition when it is one of the five.
+- **The `AI-15` case**: `chart_top_n_breakdown_over_time` in
+  `ops/ai_eval/dashboard_cases.json` (line chart, month grain, `kawasan`
+  breakdown, limit 3), *not run here*.
+
+### Handoff of the QA cases
+
+The four QA cases are unchanged by this slice's tests alone: the acceptance
+checks stay the owner's, on staging, after the merge. `LH-BI-5-01` reports the
+limit's sentence at last (T3, T6); `LH-BI-6-01` has its 3-value list (T11), its
+month grain (T9, T13) and its top 10 provinces (T8); `LH-BI-6-06`'s answer
+should now say the breakdown's N (T10); `LH-BI-6-40` has Duplicate (T12).
+
 ## 6. Review
