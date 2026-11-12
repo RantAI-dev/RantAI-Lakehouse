@@ -162,7 +162,9 @@ pub struct QueryOptions {
     /// TEXT, with every digit, instead of a number, which this client reads as a 64-bit
     /// float and so keeps about fifteen digits of (`DATA-53`, QA `LH-DATA-9-32`). Read by
     /// [`ChClient::query_with_options`] only: a caller whose cells are text anyway asks
-    /// for it; a chart's numbers are not changed. Default `false`.
+    /// for it; a chart's numbers are not changed. Review round 1 R6: the row stream and the
+    /// byte stream do not send it, so a tile and a download receive what they did before
+    /// (`D20`). Default `false`.
     pub quote_decimals: bool,
 }
 
@@ -588,9 +590,6 @@ impl ChClient {
         if let Some(id) = &options.query_id {
             settings.push(("query_id", id.clone()));
         }
-        if options.quote_decimals {
-            settings.push(("output_format_json_quote_decimals", "1".to_owned()));
-        }
         settings.push((
             "cancel_http_readonly_queries_on_client_close",
             "1".to_owned(),
@@ -673,9 +672,6 @@ impl ChClient {
         }
         if let Some(id) = &options.query_id {
             settings.push(("query_id", id.clone()));
-        }
-        if options.quote_decimals {
-            settings.push(("output_format_json_quote_decimals", "1".to_owned()));
         }
         settings.push((
             "cancel_http_readonly_queries_on_client_close",
@@ -1442,10 +1438,22 @@ mod tests {
     #[tokio::test]
     async fn query_with_options_asks_for_quoted_decimals_only_when_told() {
         let server = MockServer::start().await;
+        // The row stream reads two header lines; the other calls take the JSON answer.
+        Mock::given(method("POST"))
+            .and(body_string_contains(
+                "FORMAT JSONCompactEachRowWithNamesAndTypes",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("[\"d\"]\n[\"Decimal(38, 9)\"]\n"),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 r#"{"meta":[{"name":"d","type":"Decimal(38, 9)"}],"data":[{"d":"1.5"}],"rows":1}"#,
             ))
+            .with_priority(2)
             .mount(&server)
             .await;
         let client = client(&server.uri());
@@ -1466,6 +1474,18 @@ mod tests {
             .await
             .unwrap();
 
+        // Review round 1 R6: the option is `query_with_options`'s only (`D20` keeps a
+        // tile's numbers and a download's bytes as they are), so a stream asked for it
+        // does not send the setting.
+        client
+            .query_stream_with_options("SELECT 1", std::time::Duration::from_secs(5), &quoted)
+            .await
+            .unwrap();
+        client
+            .byte_stream("SELECT 1 FORMAT Parquet", &quoted)
+            .await
+            .unwrap();
+
         let requests = server.received_requests().await.unwrap();
         let queries: Vec<String> = requests
             .iter()
@@ -1476,11 +1496,12 @@ mod tests {
             "{}",
             queries[0]
         );
-        assert!(
-            !queries[1].contains("output_format_json_quote_decimals"),
-            "{}",
-            queries[1]
-        );
+        for (index, query) in queries.iter().enumerate().skip(1) {
+            assert!(
+                !query.contains("output_format_json_quote_decimals"),
+                "request {index}: {query}"
+            );
+        }
     }
 
     #[test]
