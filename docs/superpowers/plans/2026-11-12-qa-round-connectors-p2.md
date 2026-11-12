@@ -1307,3 +1307,22 @@ exercised.
 **Not verified.** `cargo test --workspace` (CI runs it, and rule "Keep build time down" scopes the
 developer's run). The `WriteHigh` approval flow that would execute `delete_alert_rule` after
 approval. The name of the one test that failed in the first full `bun run test` (above).
+
+### Round 2 (planner, 2026-11-12), at `7160e137`
+
+Read the round-1 fix commits. R1 to R5 are fixed, one commit each, each new test shown red on
+the wrong change before it was kept. The branch has `fix/qa-round-connectors-p1` merged in;
+the migrations are `0137` (#485), `0138` (#487) and this branch's `0139`.
+
+- **R3: the developer's count was right.** Five call sites of the helper are seven tests,
+  because one is `it.each` over three drivers; the finding's doubt is withdrawn.
+- **The developer's MISMATCH on R2(b) is accepted.** The assistant's `delete_alert_rule` needs
+  a human approval and does not reach `forget_state` in a tool test; the clean-up is held
+  through the route's `DELETE` and through the assistant's `update_alert_rule`.
+
+**Noted, not for this branch:** the first full `bun run test` of this round had one failing
+test that did not fail in two reruns, and its name was not kept. If CI shows a console test
+failing on this pull request, read its name before re-running.
+
+No open BLOCKER. This pull request builds on #485 and merges after it. Merge when #485 is in
+`main` and CI on #490 is green.
