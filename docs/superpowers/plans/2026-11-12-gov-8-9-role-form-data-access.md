@@ -143,4 +143,74 @@ No Rust changes, so no cargo command at all. CI runs the rest on the draft PR.
 
 ## 5. Handoff (developer appends below)
 
+### Handoff (developer, 2026-11-12)
+
+**Commits** (branch `feat/gov-8-9-role-form-data-access`, pushed after each)
+
+- `979d8504d` feat(admin): a new role sets its tables too (GOV-8)
+- `d9f15a173` feat(admin): Edit role lists the masks and row filters on it (GOV-9)
+- `62b755423` docs(ops): creating a role also sets its tables, and where its rules show (GOV-8, GOV-9)
+
+**What changed**
+
+- T1: `RoleCreatePage` holds a `TableAccessDraft` starting at
+  `{ scope: "all", grants: [] }`, renders `RoleTableAccessSection`, creates the
+  role first and writes its tables second only when `tableAccessChanged` says
+  the draft differs from that start. A `*:*` permission disables the section
+  with Edit role's sentence and sends no table-access write. A failed table
+  write goes to `/admin/roles/<id>/edit?tables=unsaved`; `RoleEditForm` shows
+  the D3 notice while that value is present. `RoleFields`' doc comment now
+  says the section is on both pages.
+- T2: new `src/features/admin/role-access-rules.tsx`
+  (`RoleAccessRulesSection`, prop `roleName`) rendered below the tables
+  section. It maps `governanceService.listPolicies` with `accessRule`, keeps a
+  rule only when `ruleClause` is non-null and its `roles` holds `roleName`
+  exactly, and shows `AccessRuleTable`, `does`, `PolicyStatusPill`. No second
+  parser of `conditions`.
+- T3: `docs/OPERATIONS.md`, the `GOV-7` role-limits section, says Create role
+  offers the section, what an unsaved table write means (D3), and where a
+  role's masks and row filters are shown and where they are changed.
+
+**Commands run, with counts**
+
+| When | Command | Result |
+| --- | --- | --- |
+| T1 commit | `bun test src/features/admin/role-form-page.test.tsx` | 21 passed, 0 failed |
+| T1 commit | `bun run typecheck` | clean |
+| T1 commit | `bun run lint` | 0 errors, 11 warnings (all pre-existing, none in the files touched) |
+| T2 commit | `bun test src/features/admin/role-form-page.test.tsx` | 27 passed, 0 failed |
+| T2 commit | `bun run typecheck` | clean |
+| T2 commit | `bun run lint` | 0 errors, 11 warnings (same pre-existing set) |
+| T3 commit | `bun run typecheck` / `bun run lint` | clean / 0 errors, 11 warnings |
+| final commit | `bun run test` | 3985 passed, 1 skipped, 0 failed, 11962 expect() calls, 379 files, 139.48s |
+| final commit | `python3 ops/lint/check_bare_iceberg_count.py` | "R11 guard: no bare count() ... found." |
+| final commit | `python3 ops/lint/check_intra_package_imports.py` | "OK: all intra-package dispar_orchestrate imports resolve" |
+
+T3 touched no test file, so no `bun test` ran on that commit. The known
+flaky `ADM-9` (`REL-24`) test did not fail, so the suite was run once.
+
+**Not verified**
+
+- No real browser or `next dev` check of the new UI; the evidence is the jsdom
+  tests above.
+- No cargo command of any kind (no Rust touched). No compose change (not
+  touched), so no `docker compose up`.
+
+**Notes for the reviewer**
+
+- `src/app/(admin)/admin/roles/[id]/edit/page.tsx` gained a `Suspense`
+  boundary: T1 makes the form read `?tables=`, and `useSearchParams` needs
+  one in the App Router.
+- Plan mismatch, worked around in a test only: the permission picker offers
+  no way to grant `*:*` from its normal view — the full-access checkbox only
+  appears once the value already holds `*:*` (`permission-picker.tsx`). T1
+  test 3 therefore names `*:*` in the stubbed `/api/identity/permissions`
+  catalog to reach that state, with a comment saying so. The product behavior
+  follows D2; no product code was added to enable granting `*:*`.
+- `role-form-page.test.tsx`'s `next/navigation` mock now returns a mutable
+  `search` set (so the D3 notice can be toggled), and `stubApi` gained
+  `permissions`, `mePermissions`, `policies`, `policiesStatus` and a
+  module-level `requests` record. No existing test was weakened or deleted.
+
+
 ## 6. Review (planner)
