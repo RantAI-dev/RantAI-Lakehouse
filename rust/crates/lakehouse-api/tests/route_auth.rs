@@ -2653,6 +2653,8 @@ async fn running_a_quality_rule_by_hand_is_gated_in_both_directions() {
         .expect("router never fails a request outright");
     assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
 }
+
+/// `DATA-14` (F3): any login may read the schedules, and setting one needs
 /// `governance:write`. A principal without it is refused (403) and nothing is
 /// stored; one with it is past the gate (an empty body then answers 400).
 #[tokio::test]
