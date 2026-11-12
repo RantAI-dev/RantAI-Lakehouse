@@ -390,3 +390,63 @@ async fn an_unknown_status_is_refused_by_the_check(pool: PgPool) -> sqlx::Result
     );
     Ok(())
 }
+
+// Review round 1 R9 (`DATA-54`): the statement decides whether anything
+// changed, so two saves of the same mark at the same time write one row, one
+// history entry, and keep the first person and time.
+#[sqlx::test(migrations = "../../migrations")]
+async fn setting_the_mark_that_is_already_set_writes_no_row(pool: PgPool) -> sqlx::Result<()> {
+    assert!(
+        set_certification(&pool, &mark("deprecated", Some("Superseded"), None))
+            .await
+            .expect("set"),
+        "the first save writes a row"
+    );
+    let before = get_annotation(&pool, "silver.mart_orders")
+        .await
+        .expect("query")
+        .expect("row present");
+    let before_updated: time::OffsetDateTime =
+        sqlx::query_scalar("SELECT updated_at FROM asset_annotation WHERE asset_id = $1")
+            .bind("silver.mart_orders")
+            .fetch_one(&pool)
+            .await
+            .expect("updated_at");
+
+    let same = CertificationInput {
+        certified_by: "Someone Else".to_owned(),
+        ..mark("deprecated", Some("Superseded"), None)
+    };
+    assert!(
+        !set_certification(&pool, &same).await.expect("set"),
+        "a save carrying what is stored writes no row"
+    );
+    let after = get_annotation(&pool, "silver.mart_orders")
+        .await
+        .expect("query")
+        .expect("row present");
+    assert_eq!(
+        after.certified_by.as_deref(),
+        Some("Ada Lovelace"),
+        "who set the mark stays the first one"
+    );
+    assert_eq!(after.certified_at, before.certified_at);
+    let after_updated: time::OffsetDateTime =
+        sqlx::query_scalar("SELECT updated_at FROM asset_annotation WHERE asset_id = $1")
+            .bind("silver.mart_orders")
+            .fetch_one(&pool)
+            .await
+            .expect("updated_at");
+    assert_eq!(
+        after_updated, before_updated,
+        "an unchanged save is no write"
+    );
+
+    assert!(
+        set_certification(&pool, &mark("deprecated", Some("Replaced"), None))
+            .await
+            .expect("set"),
+        "a different note is a write"
+    );
+    Ok(())
+}

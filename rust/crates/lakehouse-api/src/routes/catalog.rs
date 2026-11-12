@@ -4048,18 +4048,9 @@ pub async fn put_certification(
         }
     }
     let before_row = lakehouse_store::annotation::get_annotation(pool, &id).await?;
-    // QA LH-DATA-12-05 F2 (DATA-54): a save that changes nothing writes nothing: no row
-    // write (who set the mark and when stay), no dropped search copy, no history entry.
-    if let (Some(status), Some(row)) = (change.status, before_row.as_ref())
-        && row.certification.as_deref() == Some(status)
-        && row.certification_note == change.note
-        && row.replacement_asset_id == change.replacement_asset_id
-    {
-        return Ok(ApiJson(json!({ "ok": true })));
-    }
     let before = before_row.and_then(|r| r.certification);
     let (action, args) = if let Some(status) = change.status {
-        lakehouse_store::annotation::set_certification(
+        let wrote = lakehouse_store::annotation::set_certification(
             pool,
             &lakehouse_store::annotation::CertificationInput {
                 asset_id: id.clone(),
@@ -4074,6 +4065,11 @@ pub async fn put_certification(
             },
         )
         .await?;
+        // Review round 1 R9: the write decides; a save carrying what is stored
+        // records nothing (two such saves pass the read above at once).
+        if !wrote {
+            return Ok(ApiJson(json!({ "ok": true })));
+        }
         if status == "deprecated" {
             (
                 Some("catalog.deprecate"),

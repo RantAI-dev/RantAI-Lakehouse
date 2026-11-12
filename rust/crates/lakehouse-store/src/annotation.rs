@@ -193,6 +193,12 @@ pub async fn list_all(pool: &PgPool) -> Result<Vec<AnnotationRow>, StoreError> {
 /// (that statement never names the mark columns either, so neither
 /// direction overwrites the other). `certified_at` is the database clock.
 ///
+/// The comparison is the statement's own (`review round 1 R9`, `DATA-54`):
+/// a row carrying the same status, note and replacement is not written at
+/// all, so two saves of the same mark at the same time write one row, one
+/// history entry and keep the first person and time. The answer says whether
+/// a row was written.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the statement fails, including when
@@ -201,8 +207,8 @@ pub async fn list_all(pool: &PgPool) -> Result<Vec<AnnotationRow>, StoreError> {
 pub async fn set_certification(
     pool: &PgPool,
     input: &CertificationInput,
-) -> Result<(), StoreError> {
-    sqlx::query(
+) -> Result<bool, StoreError> {
+    let written = sqlx::query(
         "INSERT INTO asset_annotation \
          (asset_id, certification, certification_note, replacement_asset_id, \
           certified_by, certified_at, updated_at) \
@@ -213,7 +219,11 @@ pub async fn set_certification(
            replacement_asset_id = EXCLUDED.replacement_asset_id, \
            certified_by = EXCLUDED.certified_by, \
            certified_at = EXCLUDED.certified_at, \
-           updated_at = now()",
+           updated_at = now() \
+         WHERE (asset_annotation.certification, asset_annotation.certification_note, \
+                asset_annotation.replacement_asset_id) \
+           IS DISTINCT FROM (EXCLUDED.certification, EXCLUDED.certification_note, \
+                             EXCLUDED.replacement_asset_id)",
     )
     .bind(&input.asset_id)
     .bind(&input.status)
@@ -222,7 +232,7 @@ pub async fn set_certification(
     .bind(&input.certified_by)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(written.rows_affected() == 1)
 }
 
 /// Remove one asset's mark (all five columns), leaving its details alone.
