@@ -4034,9 +4034,17 @@ mod tests {
     /// so `creationTime` is the only time the route can judge it by.
     #[tokio::test]
     async fn list_runs_for_job_with_config_returns_when_each_run_was_created() {
+        use wiremock::matchers::body_string_contains;
+
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/graphql"))
+            // `review round 1, R5`: the field is pinned on the QUERY, not on
+            // the answer. Without this the fixtures still carried
+            // `creationTime` while the query no longer asked for it, and the
+            // never-started path of the run route would switch itself off
+            // unnoticed.
+            .and(body_string_contains("creationTime"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": { "runsOrError": { "__typename": "Runs", "results": [
                     { "runId": "r1", "status": "STARTED", "startTime": null,
