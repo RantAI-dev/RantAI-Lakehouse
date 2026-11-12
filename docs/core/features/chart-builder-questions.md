@@ -48,11 +48,14 @@ Part 2:
 | 4 | Up to three steps in all (the summary and two more) | Planner default | Owner to confirm at QA |
 | 5 | The builder shows up to 2,000 result rows | Spec | Owner to confirm at QA |
 | 6 | A click on "Other" offers no drill-down; a click on any other value lists the rows with the chart's own filters applied | Planner default | Owner to confirm at QA |
+| 7 | On a bar, hbar, line or area chart with a breakdown, the limit keeps the N breakdown values with the largest total of the measure over the chart's filtered rows; the others are left out. A dimension with a time grain keeps every period; a dimension without one keeps its own top N as before. A date breakdown can be grouped by day, week, month, quarter or year | Owner, QA round 2026-11-12 (`BI-46`); the rule for a dimension without a grain is the planner's | Accepted by the owner, 2026-11-12 |
 
 ## Limits to tell a customer
 
 - A second step works on the summarised result, so it can use only the columns and measures of the step before it.
 - A chart with steps or an "Other" group is rebuilt from its definition on every read; it cannot be edited as SQL.
+- A chart with a time grain and a breakdown shows every period (up to the chart row limit); to keep only recent periods, add a relative date filter to the chart.
+- The value list of a chart filter reads the chart's own table or SQL source only; while a SQL source is new or edited and not saved, no list is offered.
 
 ## Acceptance checklist
 
