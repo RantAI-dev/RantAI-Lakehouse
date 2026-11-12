@@ -97,3 +97,13 @@ def test_a_history_load_records_the_author_on_its_appended_and_updating_commits(
     authors: list[Any] = _authors(lab, "h")
     assert "connector conn-x, run 9z8y" in authors
     assert authors[-1] == "connector conn-x, run 9z8y"
+
+
+def test_every_snapshot_of_a_first_history_load_names_the_run(lab: Lab) -> None:
+    # `DATA-52`, review round 1 R2: creating the table (and adding a column) is a
+    # commit of the load too (`history.ensure_columns`), and it carried no author.
+    config = dataclasses.replace(lab.config, author="connector conn-x, run 9z8y")
+
+    load_via_sink([{"id": 1, "v": "a"}], "h", config, LoadPlan(mode="history", key=("id",)))
+
+    assert set(_authors(lab, "h")) == {"connector conn-x, run 9z8y"}
