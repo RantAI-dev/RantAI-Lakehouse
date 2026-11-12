@@ -1076,3 +1076,55 @@ rewrite and before any engine call; the Bronze listing goes through the `GOV-7` 
 (`lh_active_tenant`) is not cleared on sign-out and not checked against the next person's
 tenants (`auth-provider.tsx:178`), so the next person can start in a tenant that is not
 theirs until they pick one.
+
+### Round 1 fixes (developer)
+
+Branch `fix/qa-round-query-studio-p1`, base of the round `71bf4a9b`, on top of the handoff
+commit `2d277521`. T1 and T2 stay held (section 0); nothing of either was built. Every commit
+was pushed after its own scoped checks; no force-push, no pull request opened or edited.
+
+| # | Commit | What changed |
+|---|---|---|
+| R1 | `fff1df34` | The contract doc and the panel comment say the server's `error` is today the engine's trimmed diagnosis (`SEC-11` decision 4), not T1's held fixed sentence; the panel test is renamed to what it checks and given an engine-style string. |
+| R2 | `237a89b2` | The estimate effect resets the estimate when the engine it last asked for differs, so no engine's answer is drawn under the other engine's label; the engine test asserts `estimateAct.data === null` right after `setEngine("trino")`. |
+| R3 | `1bc7ab8b` | The failed-listing test waits for `listTables` and the settled rejection, then asserts `proofs["demo_orders"]` is `undefined` before the entry's own read proves it. |
+| R4 | `7db4bad8` | New `tests/query_history.rs` test hides `reporting_settings` after the session exists and asserts 200 with `canDownload: false`. |
+| R5 | `ccacc851` | The unknown-owner test seeds `LEGACY_QUERY_DRAFT_KEY`, asserts the hook does not open it, and that it is still there and alone after the draft write settles. |
+| R6 | `7b435fc0` | Both Trino estimate tests count the unfiltered `received_requests()` for ClickHouse and Trino instead of `received()`, which hides `system.*`. |
+| R7 | `53e84b7d` | Section 5's `--test query_history` line now says 28 passed (see the MISMATCH note below). |
+| R8 | `064f8f90` | The four rewritten decision rows say "changed 2026-11-12 (`QS-…`), *(proposed, not yet signed)*" instead of naming the owner. |
+
+Proofs:
+
+- R1 — `grep -n "fixed sentence" src/services/contracts/queries.ts src/features/queries/query-transparency-panel.tsx src/features/queries/query-transparency-panel.test.tsx` prints only `queries.ts:351` (the `reason` doc) and `query-transparency-panel.tsx:169` (the Trino branch), as the Check asked. `bun test src/features/queries/query-transparency-panel.test.tsx` — 7 passed.
+- R2 — `bun test src/features/queries/use-query-studio.test.ts`, with the reset removed from the effect: 1 failed, `useQueryStudio estimate engine > asks for the estimate again, with the engine, when the tab's engine changes to Trino`, `Received:` the ClickHouse object where `null` was asserted (60 passed, 1 failed). Restored: 61 passed, 0 failed.
+- R3 — with `if (bronzeListing.status === "error") return new Set()` added above the `null` return: 1 failed, `useQueryStudio Bronze tables > falls back to the entry's own read when the Bronze listing fails` (60 passed, 1 failed). Restored: 61 passed, 0 failed.
+- R4 — with `is_ok_and` replaced by `map_or(true, ..)`: `a_run_carries_can_download_false_when_the_settings_cannot_be_read` failed, `left: Bool(true) right: Bool(false)`, the body carrying `"canDownload":true`. Restored: 1 passed.
+- R5 — with `dropLegacyDraft()` moved above the `ownKey === null` return: 1 failed, `useQueryStudio draft owner > reads and writes nothing while the owner is not known`, `Received: null` where the legacy entry was asserted present (60 passed, 1 failed). Restored: 61 passed, 0 failed.
+- R6 — the finding's Check names no wrong change, so one was made to prove the assertion sees what `received()` hid: an `EXPLAIN ESTIMATE SELECT 1 FROM system.tables` sent to ClickHouse before the Trino early return. `an_estimate_of_a_trino_statement_says_there_is_none_and_asks_no_engine` then failed on `ClickHouse was asked nothing` (1 failed). Restored: 1 passed; `an_estimate_of_a_trino_write_is_refused_with_the_runs_sentence` 1 passed.
+- R7 — `cd rust && cargo test -p lakehouse-api --test query_history` → `28 passed; 0 failed`, `test result: ok`. See the MISMATCH.
+- R8 — `grep -n "changed: Owner, 2026-11-12" docs/core/features/query-*.md` returns nothing; each of the four cells now ends `changed 2026-11-12 (`QS-7`/`QS-8`/`QS-9`), *(proposed, not yet signed)*`.
+
+**MISMATCH: R7's premise.** The handoff's 27 was right for its binary: `--test query_history`
+also runs `common::tls_proxy::tests::the_proxy_terminates_tls_with_the_certificate_it_advertises`,
+so at `2d277521` the run was 26 tests in `tests/query_history.rs` plus that one = 27. The count
+is still corrected, because this round adds R4's test and the final commit's run is 28. What
+the planner should read as wrong is the premise ("the quoted count cannot come from this
+file"), not the earlier number.
+
+Verification on the final commit (`064f8f90`, after the R7 and R8 doc commits; both touch no
+code, so the Rust caches are that of `7b435fc0`):
+
+- `cd rust && cargo fmt --check` — passes.
+- `cargo clippy -p lakehouse-api --all-targets -- -D warnings` — passes, `Finished dev profile`, 0 warnings.
+- `cargo test -p lakehouse-api --test query_history` — 28 passed, 0 failed, 0 ignored.
+- `bun run typecheck` — passes, no output.
+- `bun run lint` — 0 errors, 11 warnings, all pre-existing (`src/services/http.ts` and the rest of the list the handoff named).
+- `bun run test` — 4019 passed, 1 skipped, 0 failed, 12100 `expect()` calls across 380 files, exit 0. The count is the handoff's because this round extends existing tests rather than adding one.
+- `python3 ops/lint/check_bare_iceberg_count.py` — "R11 guard: no bare count() against a Bronze Iceberg table found."
+- `python3 ops/lint/check_intra_package_imports.py` — "OK: all intra-package dispar_orchestrate imports resolve".
+- `git status` — clean before this commit.
+
+Not verified: a full `cargo test --workspace` (no crate outside `lakehouse-api` was touched, and
+the reviewer re-runs the block before merge), `docker compose` (no compose change) and the
+Python suite (no Python change).
