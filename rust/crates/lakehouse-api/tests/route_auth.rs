@@ -4325,3 +4325,48 @@ async fn overview_alerts_refuses_dashboard_read_principal() {
     assert_ne!(allowed.status(), StatusCode::FORBIDDEN);
     assert_ne!(allowed.status(), StatusCode::UNAUTHORIZED);
 }
+
+/// BLD-1 part 1 / D8: the run route that replaced `.../enforce` is in
+/// `POLICY_TABLE` as `pipeline:read`, the old path is gone from the table, and
+/// the gate answers both ways: no session is 401, `query:read` alone is 403,
+/// and `pipeline:read` gets past authentication (the handler then refuses a
+/// caller who is neither a service identity nor a Platform Admin).
+#[tokio::test]
+async fn the_pipeline_compile_route_authorization_is_asserted_both_ways() {
+    let TestApp { router, pool } = spin_up().await;
+    let uri = "/api/pipelines/runnable/pl-test/compile";
+
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "POST" && *p == "/api/pipelines/runnable/{id}/compile")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("pipeline:read")),
+    );
+    assert!(
+        !POLICY_TABLE
+            .iter()
+            .any(|(_, path, _)| *path == "/api/pipelines/runnable/{id}/enforce"),
+        "the enforce route is gone in BLD-1 part 1 (D8); `tests/route_walk.rs` \
+         would otherwise still find it registered"
+    );
+
+    // The handler refuses anyone who is neither a service identity nor a
+    // Platform Admin (D8's caller rule), so the principal that gets past the
+    // permission floor is the seeded admin; the floor itself is what the two
+    // refusals above this line prove.
+    let reader_cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let refused_user = common::create_principal_with_permissions(&pool, "query:read").await;
+    let refused = common::session_cookie_for_user(&pool, refused_user).await;
+
+    let none = request_with_cookie(&router, "POST", uri, "").await;
+    assert_eq!(none.status(), StatusCode::UNAUTHORIZED);
+    let denied = request_with_cookie(&router, "POST", uri, &refused).await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let through = request_with_cookie(&router, "POST", uri, &reader_cookie).await;
+    assert!(
+        through.status() != StatusCode::UNAUTHORIZED && through.status() != StatusCode::FORBIDDEN,
+        "a Platform Admin must get past the gate, got {}",
+        through.status()
+    );
+}

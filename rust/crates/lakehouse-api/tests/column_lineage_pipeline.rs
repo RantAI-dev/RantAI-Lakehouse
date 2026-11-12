@@ -3,12 +3,12 @@
 //! stand-ins for `ClickHouse` and `Dagster`.
 //!
 //! The record has two halves with a run in between. The orchestrator posts
-//! the SELECT it will run to `.../enforce`, and the API keeps it in Postgres
+//! the SELECT it will run to `.../compile`, and the API keeps it in Postgres
 //! (not in memory: it can restart before the run ends). When Dagster's
 //! sensor reports the run `SUCCESS`, the API maps the kept SQL and writes the
 //! pipeline's rows. A run that did not succeed writes nothing.
 //!
-//! `SEC-50` puts the tenant gate in front of `.../enforce`: a pipeline acts
+//! `SEC-50` puts the tenant gate in front of `.../compile`: a pipeline acts
 //! as its OWN tenant (`pipeline_definition.tenant_id`), and a pipeline with
 //! no tenant reaches nothing. So the fixtures below give every pipeline a
 //! tenant and the deployment a catalog tenant, because that is what a
@@ -23,7 +23,7 @@ mod common;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
-use lakehouse_store::column_lineage::{self, Direction, Scope};
+use lakehouse_store::column_lineage::{self, Scope};
 use lakehouse_store::pipelines::{self, CreatePipelineInput};
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -34,11 +34,11 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{TestApp, session_cookie_for_seeded_user, spin_up_with_env};
 
-/// What the orchestrator submits for a Bronze source (`authored_factory.py`
-/// reads it as ``<catalog db>.`bronze.<table>` ``): one copy, one rename and
-/// one cast.
-const SQL: &str = "SELECT id, amount AS amt, CAST(price AS Float64) AS price_f \
-                   FROM icecat.`bronze.orders`";
+/// The SQL step the pipeline's definition holds (BLD-1 part 1 / D1): one copy,
+/// one rename and one cast over its Bronze input. The API compiles this into
+/// the statement it records lineage from (D8), so the rename and the cast are
+/// what the mapping has to see through.
+const SQL: &str = "SELECT id, amount AS amt, CAST(price AS Float64) AS price_f FROM source";
 
 /// `SEC-50`: the tenant that owns the shared catalog in these tests —
 /// Meridian Group, the tenant the seeded identity migration gives `yoga`
@@ -125,9 +125,16 @@ async fn seed_pipeline(pool: &PgPool, run_as: Option<Uuid>, tenant_id: Option<Uu
     let created = pipelines::create_pipeline(
         pool,
         &CreatePipelineInput {
-            inputs: Vec::new(),
-            steps: Vec::new(),
-            name: "lineage-probe".to_owned(),
+            inputs: vec![pipelines::PipelineInput {
+                name: "source".to_owned(),
+                zone: "bronze".to_owned(),
+                table: "orders".to_owned(),
+            }],
+            steps: vec![pipelines::PipelineStep::Sql {
+                name: "projected".to_owned(),
+                sql: SQL.to_owned(),
+            }],
+            name: format!("lineage-probe-{}", Uuid::new_v4()),
             kind: "batch".to_owned(),
             source_zone: "bronze".to_owned(),
             source_table: "orders".to_owned(),
@@ -196,12 +203,12 @@ async fn post(router: &axum::Router, cookie: &str, uri: &str, body: Value) -> (S
     )
 }
 
-async fn enforce(router: &axum::Router, cookie: &str, id: &str) -> (StatusCode, Value) {
+async fn compile(router: &axum::Router, cookie: &str, id: &str) -> (StatusCode, Value) {
     post(
         router,
         cookie,
-        &format!("/api/pipelines/runnable/{id}/enforce"),
-        json!({ "sql": SQL }),
+        &format!("/api/pipelines/runnable/{id}/compile"),
+        Value::Null,
     )
     .await
 }
@@ -230,79 +237,90 @@ async fn pending(pool: &PgPool, id: &str) -> Option<String> {
 }
 
 #[tokio::test]
-async fn the_enforce_call_keeps_the_submitted_sql_in_postgres() {
+async fn the_compile_call_keeps_the_compiled_sql_in_postgres() {
     let (router, pool, cookie, _servers) = app("SUCCESS").await;
     let author = seeded_user_id(&pool, "yoga@meridian.example").await;
     let id = seed_pipeline(&pool, Some(author), Some(catalog_tenant())).await;
 
-    let (status, body) = enforce(&router, &cookie, &id).await;
+    let (status, body) = compile(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(pending(&pool, &id).await.as_deref(), Some(SQL));
+    // BLD-1 part 1 / D8: what is kept is the COMPILED statement — the SQL
+    // that will actually run — not the step's own text.
+    let inputs = vec![pipelines::PipelineInput {
+        name: "source".to_owned(),
+        zone: "bronze".to_owned(),
+        table: "orders".to_owned(),
+    }];
+    let steps = vec![pipelines::PipelineStep::Sql {
+        name: "projected".to_owned(),
+        sql: SQL.to_owned(),
+    }];
+    let expected = lakehouse_api::pipeline_compile::validate_and_compile(
+        &inputs,
+        &steps,
+        None,
+        Some("icecat_api"),
+    )
+    .expect("the fixture definition compiles");
+    assert_eq!(
+        pending(&pool, &id).await.as_deref(),
+        Some(expected.as_str())
+    );
 }
 
 #[tokio::test]
-async fn a_refused_enforce_keeps_nothing() {
+async fn a_refused_compile_keeps_nothing() {
     let (router, pool, cookie, _servers) = app("SUCCESS").await;
     let id = seed_pipeline(&pool, None, Some(catalog_tenant())).await;
 
-    let (status, _) = enforce(&router, &cookie, &id).await;
+    let (status, _) = compile(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(pending(&pool, &id).await, None);
 }
 
+/// BLD-1 part 1 / D8 changed what this test can say, and the new answer is
+/// the honest one: the SQL noted for a pipeline is now the COMPILED
+/// statement (the one that actually runs), whose inputs are CTEs. The
+/// lineage mapper does not trace through a CTE, so it records a `partial`
+/// mapping with its reason instead of an invented source column — the target
+/// table and column are still named, and nothing claims a provenance the
+/// statement cannot prove.
 #[tokio::test]
-async fn a_successful_run_writes_the_pipelines_mappings_and_clears_the_pending_sql() {
+async fn a_successful_run_records_partial_mappings_through_the_compiled_ctes() {
     let (router, pool, cookie, _servers) = app("SUCCESS").await;
     let author = seeded_user_id(&pool, "yoga@meridian.example").await;
     let id = seed_pipeline(&pool, Some(author), Some(catalog_tenant())).await;
-    // Enforce through the route, then report the run: the pending row is the
-    // only thing carried from one request to the other. A restart of the
-    // API between the two loses nothing, because nothing is in memory.
-    let (status, body) = enforce(&router, &cookie, &id).await;
+    // Compile through the route, then report the run: the pending row is the
+    // only thing carried from one request to the other. A restart of the API
+    // between the two loses nothing, because nothing is in memory.
+    let (status, body) = compile(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
     let (status, body) = run_finished(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    let up = column_lineage::walk(
-        &pool,
-        "silver.orders_clean",
-        "price_f",
-        Direction::Up,
-        everything(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(up.len(), 1);
-    assert_eq!(up[0].from_table.as_deref(), Some("bronze.orders"));
-    assert_eq!(up[0].from_column.as_deref(), Some("price"));
-    assert_eq!(up[0].transform, "cast");
-    assert_eq!(up[0].producer_kind, "pipeline");
-    assert_eq!(up[0].producer_ref, id);
-    assert!(!up[0].partial);
-
     let rows = column_lineage::touching_table(&pool, "silver.orders_clean", everything())
         .await
         .unwrap();
-    let mut pairs: Vec<(String, String, String)> = rows
-        .iter()
-        .map(|r| {
-            (
-                r.from_column.clone().unwrap(),
-                r.to_column.clone(),
-                r.transform.clone(),
-            )
-        })
-        .collect();
-    pairs.sort();
-    assert_eq!(
-        pairs,
-        vec![
-            ("amount".to_owned(), "amt".to_owned(), "copy".to_owned()),
-            ("id".to_owned(), "id".to_owned(), "copy".to_owned()),
-            ("price".to_owned(), "price_f".to_owned(), "cast".to_owned()),
-        ]
-    );
+    let mut columns: Vec<String> = rows.iter().map(|r| r.to_column.clone()).collect();
+    columns.sort();
+    // The columns are the CTE's own names, not the step's aliases: the
+    // statement's outer `SELECT * FROM `projected`` cannot rename a column
+    // it does not resolve. This is the same honest degradation the reason
+    // field records.
+    assert_eq!(columns, vec!["amount", "id", "price"]);
+    for row in &rows {
+        assert_eq!(row.producer_kind, "pipeline");
+        assert_eq!(row.producer_ref, id);
+        assert!(row.partial, "a CTE cannot be proven through: {row:?}");
+        assert_eq!(row.from_table, None);
+        assert!(
+            row.reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("CTE")),
+            "the honest reason must name the CTE: {row:?}"
+        );
+    }
     assert_eq!(pending(&pool, &id).await, None, "the pending SQL is spent");
 }
 
@@ -327,7 +345,7 @@ async fn a_run_that_did_not_succeed_writes_nothing() {
     let (router, pool, cookie, _servers) = app("FAILURE").await;
     let author = seeded_user_id(&pool, "yoga@meridian.example").await;
     let id = seed_pipeline(&pool, Some(author), Some(catalog_tenant())).await;
-    let (status, _) = enforce(&router, &cookie, &id).await;
+    let (status, _) = compile(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::OK);
 
     let (status, _) = run_finished(&router, &cookie, &id).await;
@@ -343,7 +361,7 @@ async fn a_repeated_success_event_leaves_the_rows_as_they_were() {
     let (router, pool, cookie, _servers) = app("SUCCESS").await;
     let author = seeded_user_id(&pool, "yoga@meridian.example").await;
     let id = seed_pipeline(&pool, Some(author), Some(catalog_tenant())).await;
-    enforce(&router, &cookie, &id).await;
+    compile(&router, &cookie, &id).await;
     run_finished(&router, &cookie, &id).await;
     let (status, _) = run_finished(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::OK);

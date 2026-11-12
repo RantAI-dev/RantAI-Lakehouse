@@ -550,7 +550,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // this route reveals how a governed table rewrites for any pipeline in
     // any tenant, so it cannot be reachable by someone who merely holds
     // `pipeline:read`.
-    ("POST", "/api/pipelines/runnable/{id}/enforce",   Policy::RequiresPermission("pipeline:read")),
+    ("POST", "/api/pipelines/runnable/{id}/compile",   Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/source",             Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/runs",              Policy::RequiresPermission("pipeline:read")),
     // Plan 1c (R2, day-1): runs × steps matrix for the recovery UI.

@@ -34,8 +34,8 @@
 //! the same rule the shared catalog applies). Anyone else reading it would
 //! see other tenants' pipelines.
 //!
-//! [`enforce_pipeline_sql`] is under the same rule for a stronger reason:
-//! it answers with the rewrite a pipeline's author is allowed to run, so
+//! [`compile_pipeline`] is under the same rule for a stronger reason: it
+//! answers with the rewrite a pipeline's author is allowed to run, so
 //! reaching it as an ordinary reader would expose both another tenant's
 //! governed schema and the fact of its obligations.
 //!
@@ -1142,7 +1142,7 @@ pub(crate) enum PipelineActor {
 }
 
 /// Load the principal a pipeline reads as — the body of what
-/// [`enforce_pipeline_sql`] did inline before BLD-1 part 1 (D9 asks the save
+/// [`compile_pipeline`] did inline before BLD-1 part 1 (D9 asks the save
 /// path and the run route to share it rather than keep two copies).
 ///
 /// # Errors
@@ -1787,14 +1787,6 @@ pub const NO_AUTHOR_REASON: &str =
 /// final and what to do about it.
 pub const NO_TENANT_REASON: &str = "This pipeline belongs to no tenant. An administrator assigns one with PUT /api/pipelines/{id}/tenant.";
 
-/// `POST /api/pipelines/runnable/{id}/enforce` body.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EnforceBody {
-    /// The `SELECT` the op wants to run.
-    sql: String,
-}
-
 /// `SEC-50` R2: a tenant-gate refusal on this route answers **422**, not
 /// 404.
 ///
@@ -1831,147 +1823,127 @@ fn gate_refusal_as_unprocessable(err: ApiError) -> ApiError {
     }
 }
 
-/// `POST /api/pipelines/runnable/{id}/enforce` — rewrite `sql` as the
-/// pipeline's author, so the orchestrator runs what its author is allowed
-/// to read (BLD-1 / D3).
+/// `POST /api/pipelines/runnable/{id}/compile` — the one statement the
+/// orchestrator runs for this pipeline, compiled from its stored definition
+/// and rewritten as its author (BLD-1 part 1 / D4, D8).
 ///
-/// # Why the API does the rewriting and not the orchestrator
+/// # Why the API compiles and rewrites, and not the orchestrator
 ///
-/// The masking and row-filter rewrite lives in one place
-/// ([`crate::policy_engine::rewrite_sql_for_roles`], the same function
-/// Query Studio, dashboards, embeds, alerts and the Gold export go
-/// through), and it decides what a principal may read from Postgres
-/// policies. A second implementation inside the Dagster code location would
-/// be a second answer to the same question, free to drift, and would have
-/// to be given the run token's own privileges to read the policies at all.
-/// So the orchestrator asks, and runs what comes back.
+/// The compiler ([`crate::pipeline_compile`]) and the masking and row-filter
+/// rewrite ([`crate::policy_engine::rewrite_sql_for_roles`], the same function
+/// Query Studio, dashboards, embeds, alerts and the Gold export go through)
+/// must answer identically at save time (D9), at preview time (S2) and at run
+/// time (D8). A second implementation inside the `Dagster` code location would
+/// be a second answer to the same question, free to drift, and would have to
+/// be given the run token's own privileges to read the policies at all. So
+/// the orchestrator asks, and runs what comes back — it no longer sends SQL.
 ///
-/// The principal is the pipeline's AUTHOR
-/// (`pipeline_definition.run_as`), resolved through the same
-/// [`lakehouse_auth::repository::load_principal_for_user`] a session
-/// principal is built from — so a pipeline's reads are governed by the
-/// author's real roles and tenant list, live, not by a copy taken when the
-/// pipeline was created. A user who loses a role loses it here too, on the
-/// next run.
+/// The principal is the pipeline's AUTHOR (`pipeline_definition.run_as`),
+/// resolved through the same `load_principal_for_user` a session principal is
+/// built from, so a pipeline's reads are governed by the author's real roles
+/// and tenant list, live, not by a copy taken when the pipeline was created.
 ///
 /// # Which tenant the statement acts as (`SEC-50`)
 ///
 /// The pipeline's OWN tenant (`pipeline_definition.tenant_id`), not the
-/// caller's: the caller is the orchestrator, which has no tenant of its
-/// own. The tenant is applied exactly as if the author had sent it in an
-/// `X-Tenant` header, so an author who left that tenant is refused, and a
-/// pipeline with no tenant at all reaches nothing. A pipeline in tenant B
-/// may not read tenant A's uploaded table, which is the one path in this
-/// service that can name a `bronze.*` table.
-///
-/// `SEC-50` R1: an author who holds the unrestricted (`"*:*"`) grant
-/// passes this gate whatever the pipeline's own tenant is — including a
-/// pipeline with no tenant at all, and a tenant the author does not
-/// belong to. That is `SEC-20`'s own signed rule ("a principal holding
-/// `*:*` passes"), and it is safe here for the same reason it is safe in
-/// Query Studio: an unrestricted principal already reads every table
-/// there, so a pipeline running as that principal reaches no more than
-/// the principal itself reaches. The check is made before the tenant is
-/// looked at, in [`crate::routes::query::GateActor::AsTenant`]'s own arm.
+/// caller's: the caller is the orchestrator, which has no tenant of its own. A
+/// pipeline with no tenant at all reaches nothing, unless its author holds the
+/// unrestricted (`*:*`) grant, which is `SEC-20`'s own rule (R1).
 ///
 /// # Who may call it
 ///
-/// The same rule as [`runnable`]: a service identity or a Platform Admin,
-/// nobody else. Anyone who could reach it could ask the API to reveal how
-/// any tenant's governed table rewrites, for any pipeline, without holding
-/// that pipeline's tenant.
+/// A service identity or a Platform Admin, nobody else: anyone else could ask
+/// the API to reveal how any tenant's governed table rewrites, for any
+/// pipeline, without holding that pipeline's tenant.
 ///
 /// # Errors
 ///
 /// 403 for anyone but a service identity or a Platform Admin; 404 for an
-/// unknown pipeline id (the route reads the pipeline by id alone, so it
-/// 404s only an id that does not exist); 409 with [`NO_AUTHOR_REASON`]
-/// when the pipeline has no author or its author is deactivated; 409 with
-/// [`NO_TENANT_REASON`] when the pipeline belongs to no tenant and its
-/// author is not unrestricted (`SEC-50` R3); 422 with the tenant gate's
-/// fixed sentence when the statement reads a table the pipeline's tenant
-/// may not read, and 422 when the author is not a member of that tenant
-/// (`SEC-50` R2 — the gate's sentence, with this route's status, see
-/// [`gate_refusal_as_unprocessable`]); 422 with
+/// unknown pipeline id; 409 with [`NO_AUTHOR_REASON`] when the pipeline has no
+/// author or its author is deactivated, and with [`NO_TENANT_REASON`] when the
+/// pipeline belongs to no tenant and its author is not unrestricted (SEC-50
+/// R3); 422 with a fixed sentence naming the input or step at fault when the
+/// stored definition no longer compiles (D7), with the tenant gate's fixed
+/// sentence, or with
 /// [`crate::policy_engine::enforcement_error_message`] when the rewrite is
-/// refused; 400 for a malformed body; 503 if no pool is configured or
-/// Postgres is unreachable; 500 on any other database failure. No error
-/// body ever carries the rewriter's, the policy engine's, `ClickHouse`'s or
-/// the database driver's text (`AGENTS.md` rule 4): an upstream failure
-/// answers the fixed `upstream_error` message and a reference id, and the
-/// driver's own text goes to the log under that reference (BLD-1 review
-/// BLOCKER 1).
-pub async fn enforce_pipeline_sql(
+/// refused; 503 if no pool is configured or Postgres is unreachable; 500 on
+/// any other database failure. No error body ever carries the parser's, the
+/// rewriter's, `ClickHouse`'s or the database driver's text (AGENTS.md rule
+/// 4).
+pub async fn compile_pipeline(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
-    body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     if !matches!(principal.id, PrincipalId::Service(_))
         && !crate::routes::catalog::is_unrestricted(&principal)
     {
         return Err(ApiError::PermissionDenied(
-            "only the orchestrator's service identity enforces a pipeline's queries".to_owned(),
+            "only the orchestrator's service identity compiles a pipeline's queries".to_owned(),
         )
         .into());
     }
-    let EnforceBody { sql } = crate::routes::pipelines::parse_body(&body)?;
     let pool = crate::routes::pipelines::pool(&state)?;
     let pipeline = pipelines::get_pipeline(pool, &id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
-
     // D2, fail closed: no author, or an author who cannot log in any more.
     // Both refuse rather than run the query unrewritten, and neither is
-    // retryable from the orchestrator's side -- what changes the answer is
-    // an administrator assigning an author, not another attempt.
+    // retryable from the orchestrator's side -- what changes the answer is an
+    // administrator assigning an author, not another attempt.
     //
     // BLD-1 part 1 / D9: this is the same resolution the save path runs
     // (`pipeline_actor`), so "who reads" has one implementation.
     let PipelineActor::Author(author) = pipeline_actor(pool, pipeline.run_as).await? else {
         return Err(ApiError::Conflict(NO_AUTHOR_REASON.to_owned()).into());
     };
-
-    // SEC-50 R3: a pipeline that belongs to NO tenant is refused with its
-    // own sentence, BEFORE the gate. The gate's table sentence would
-    // blame a table for a pipeline that was never assigned a tenant, and
-    // it would say nothing about the one thing that can be fixed; a 409
-    // is final for the orchestrator, so the operator is told what to do.
-    //
-    // An author holding the unrestricted (`*:*`) grant is exempt (R1):
-    // such an author reads every table anyway, so a pipeline of that
-    // author is not refused for a tenant it never had. This is what
-    // keeps the G7 harness's bootstrap-admin pipelines runnable.
+    // SEC-50 R3: a pipeline in NO tenant is refused with its own sentence
+    // before the gate, because the gate's table sentence would blame a table
+    // for a pipeline that was never assigned a tenant. An unrestricted author
+    // is exempt (R1), which keeps the G7 harness's admin pipelines runnable.
     if pipeline.tenant_id.is_none() && !crate::routes::catalog::is_unrestricted(&author) {
         return Err(ApiError::Conflict(NO_TENANT_REASON.to_owned()).into());
     }
-
-    // SEC-50: the tenant gate runs BEFORE the policy rewrite, so a
-    // statement that reads a table the pipeline's own tenant may not read
-    // is refused before the policy's own prefetch asks the engine about
-    // that table, and before the statement reaches the engine at all. The
-    // pipeline acts as its OWN tenant (`pipeline_definition.tenant_id`),
-    // applied as if the author had sent it in `X-Tenant`: the caller is the
-    // orchestrator, which has no tenant of its own.
+    let definition = pipelines::get_definition(pool, &id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
+    // D4: the stored definition becomes one statement. A definition stored
+    // before the compiler existed (or edited around it) is refused here with
+    // the item at fault named, never with a parser's text (D7).
+    let compiled = crate::pipeline_compile::validate_and_compile(
+        &definition.inputs,
+        &definition.steps,
+        None,
+        catalog_db(&state),
+    )
+    .map_err(|err| ApiError::Unprocessable(err.to_string()))?;
+    // SEC-50: the tenant gate runs BEFORE the policy rewrite, so a statement
+    // that reads a table the pipeline's own tenant may not read is refused
+    // before the policy's own prefetch asks the engine about that table.
     //
     // R2: a gate refusal here answers 422, not 404 — see
-    // `gate_refusal_as_unprocessable` for why this route's status differs
-    // from Query Studio's. GOV-7 D5: a table the author's roles do not
-    // include answers the tenant gate's own 404 here too.
-    let rewritten = check_and_rewrite(&state, &author, pipeline.tenant_id, &sql)
+    // `gate_refusal_as_unprocessable`. GOV-7 D5: a table the author's roles do
+    // not include answers the tenant gate's own 404, as it does for
+    // every other surface.
+    let rewritten = check_and_rewrite(&state, &author, pipeline.tenant_id, &compiled)
         .await
         .map_err(|refusal| match refusal {
             EnforcementRefusal::Gate(err) => gate_refusal_as_unprocessable(err),
             EnforcementRefusal::Rewrite(err) => {
-                crate::routes::support::enforcement_refusal(&sql, &err)
+                crate::routes::support::enforcement_refusal(&compiled, &err)
             }
         })?;
-    // DATA-13 (F2): the API sees the run's real SELECT only here. Keep the SQL
-    // as the orchestrator submitted it, not `rewritten` (masking wraps the
-    // source in subqueries, which would make every column partial); the
-    // mapping is written when the run is reported successful.
-    super::lineage::columns::note_pipeline_sql(pool, &id, &sql).await;
-    Ok(ApiJson(json!({ "sql": rewritten })))
+    // DATA-13 (F2): the API sees the run's real SELECT only here. Keep the
+    // COMPILED SQL (not `rewritten`: masking wraps the source in subqueries,
+    // which would make every column partial); the mapping is written when the
+    // run is reported successful.
+    super::lineage::columns::note_pipeline_sql(pool, &id, &compiled).await;
+    Ok(ApiJson(json!({
+        "sql": rewritten,
+        // D8: whether any input is Bronze decides `allow_database_iceberg` on
+        // the statements the orchestrator runs.
+        "readsIceberg": definition.inputs.iter().any(|input| input.zone == "bronze"),
+    })))
 }
 
 /// `PUT /api/pipelines/{id}` body: an authored pipeline's editable fields.
