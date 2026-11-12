@@ -628,6 +628,22 @@ pub(crate) async fn insert_chart_checked(
         .map_err(SpecRunFailure::Clickhouse)
 }
 
+/// [`SpecRunFailure`] as an assistant tool's reply (`BI-45`, plan D5): the
+/// tile's own answer { "error": <sentence>, "limit": {..} } for a limit or a
+/// Stop, so the model can say the limit; a refused rewrite or the gate's own
+/// answer as `{ "error": <sentence> }`; an engine failure through
+/// [`upstream_error::report_ch`] under a reference id, never its text.
+pub(crate) fn failure_as_tool_reply(failure: SpecRunFailure) -> Value {
+    match failure {
+        SpecRunFailure::Tile(answer) => answer,
+        SpecRunFailure::Refused(message) => json!({ "error": message }),
+        SpecRunFailure::Gated(err) => json!({ "error": err.to_string() }),
+        SpecRunFailure::Clickhouse(err) => {
+            upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()
+        }
+    }
+}
+
 /// Run `fut` (one tile's queries) with the rows its kind may read (`BI-5`
 /// review B1): a `pointmap` or `geoheat` reads up to the administrator's map
 /// limit, a `pivot` up to the cap its own statement carries (its `LIMIT`, one
@@ -1702,6 +1718,52 @@ mod limited_run {
                     if message.starts_with("The database request failed.")
             ),
             "{err:?}"
+        );
+    }
+
+    /// `BI-45` plan D5 (`LH-BI-5-01`): an assistant's save that the limit
+    /// ended answers the tile's own sentence with its `limit`, so the model
+    /// can say it; a refused rewrite and the gate keep their sentence; an
+    /// engine failure is the fixed reply under a reference id and never the
+    /// engine's text.
+    #[test]
+    fn a_tool_reply_for_a_save_the_limit_ended_is_the_sentence_with_its_limit() {
+        let tile = json!({
+            "error": "This chart stopped after 60 seconds, the limit for this install.",
+            "limit": {"kind": "time", "value": 60, "source": {"kind": "install"}},
+        });
+        assert_eq!(
+            failure_as_tool_reply(SpecRunFailure::Tile(tile.clone())),
+            tile,
+            "the tile's answer comes back as it is"
+        );
+        assert_eq!(
+            failure_as_tool_reply(SpecRunFailure::Refused(
+                "The query limits could not be read.".to_owned()
+            )),
+            json!({ "error": "The query limits could not be read." })
+        );
+        assert_eq!(
+            failure_as_tool_reply(SpecRunFailure::Gated(lakehouse_core::ApiError::NotFound(
+                "Gold mart 'x' not found in serving.".to_owned()
+            ))),
+            json!({ "error": "Gold mart 'x' not found in serving." })
+        );
+        let reply = failure_as_tool_reply(SpecRunFailure::Clickhouse(ChError::Server(
+            "Code: 62. DB::Exception: planted-marker".to_owned(),
+        )));
+        assert!(
+            reply["error"]
+                .as_str()
+                .is_some_and(|e| !e.contains("planted-marker")),
+            "the engine's text reached the tool's reply: {reply}"
+        );
+        assert!(
+            reply["error"]
+                .as_str()
+                .is_some_and(|e| !e.contains("planted-marker"))
+                && reply["errorId"].as_str().is_some_and(|id| id.len() == 10),
+            "the engine's text reached the tool's reply: {reply}"
         );
     }
 }

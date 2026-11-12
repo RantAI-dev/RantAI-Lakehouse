@@ -17,7 +17,7 @@ use super::look::{FORMAT_FIELDS, check_layers_name_a_source, wrong_field};
 use crate::routes::dashboard_organise::{
     Gate, drop_tile, place_new_chart, require_chart_board, require_editable_chart, snapshot_as,
 };
-use crate::routes::support::is_numeric_type;
+use crate::routes::support::{failure_as_tool_reply, insert_chart_checked, is_numeric_type};
 use crate::upstream_error;
 
 /// The tool's error for a refused dashboard or chart: the route's own
@@ -592,7 +592,10 @@ pub(super) async fn create_chart(
         Err(reply) => return reply,
     };
     match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", id, time).await {
-        Ok(spec) => match store::insert_chart(ch, &spec).await {
+        // QA `LH-BI-5-01` (`BI-45`, plan D5): the save runs its statement
+        // under the caller's limit; a limit that ends it is the tile's answer
+        // with its `limit`, so the model can say it.
+        Ok(spec) => match insert_chart_checked(ch, &spec).await {
             Ok(()) => {
                 place_new_chart(ch, &spec.board, &spec.spec.id).await;
                 snapshot_as(ch, &spec.board, principal).await;
@@ -608,7 +611,7 @@ pub(super) async fn create_chart(
                 "note": "Chart tersimpan & langsung tampil di halaman Dashboards.",
                 })
             }
-            Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
+            Err(failure) => failure_as_tool_reply(failure),
         },
         Err(err) => upstream_error::bi(&upstream_error::DATABASE, &err).to_json(),
     }
@@ -814,7 +817,7 @@ pub(super) async fn update_chart(
             {
                 return upstream_error::bi(&upstream_error::DATABASE, &err).to_json();
             }
-            match store::insert_chart(ch, &spec).await {
+            match insert_chart_checked(ch, &spec).await {
                 Ok(()) => {
                     if old_board != spec.board {
                         snapshot_as(ch, &old_board, principal).await;
@@ -843,7 +846,7 @@ pub(super) async fn update_chart(
                     }
                     reply
                 }
-                Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
+                Err(failure) => failure_as_tool_reply(failure),
             }
         }
         Err(err) => upstream_error::bi(&upstream_error::DATABASE, &err).to_json(),
