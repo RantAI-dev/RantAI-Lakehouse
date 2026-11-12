@@ -175,6 +175,42 @@ def test_a_cycle_in_the_cause_chain_ends_the_walk() -> None:
     assert e.classify(cyclic).error_class == e.OTHER
 
 
+def _cause_chain(outer: BaseException, inner: BaseException, links: int) -> BaseException:
+    """`links` `RuntimeError`s above `inner`, each wrapping the next by
+    `__cause__` (what `raise ... from` records)."""
+    current = inner
+    for _ in range(links):
+        wrapper = RuntimeError("pipeline step failed")
+        wrapper.__cause__ = current
+        current = wrapper
+    return current
+
+
+def test_a_failure_five_wrappers_deep_is_still_found() -> None:
+    # QA LH-SRC-6-53 (SRC-38): the object-storage error arrives under `dlt`'s
+    # wrappers, four exceptions below the outermost one.
+    chained = _cause_chain(RuntimeError("outer"), ConnectionRefusedError(), links=4)
+    assert e.classify(chained) == e.Classified(e.UNREACHABLE, retried=True)
+
+
+def test_a_failure_under_implicit_context_is_found_three_links_deep() -> None:
+    # `__context__` only: no `raise ... from`, so no explicit cause at all.
+    inner = ConnectionRefusedError()
+    middle = RuntimeError("pipeline step failed")
+    middle.__context__ = inner
+    outer = RuntimeError("outer")
+    outer.__context__ = middle
+    assert e.classify(outer).error_class == e.UNREACHABLE
+
+
+def test_the_walk_stops_after_sixteen_exceptions() -> None:
+    sixteenth = _cause_chain(RuntimeError("outer"), ConnectionRefusedError(), links=15)
+    assert e.classify(sixteenth).error_class == e.UNREACHABLE
+    # One more wrapper puts the connection failure past the bound.
+    seventeenth = _cause_chain(RuntimeError("outer"), ConnectionRefusedError(), links=16)
+    assert e.classify(seventeenth).error_class == e.OTHER
+
+
 def test_nothing_of_a_message_is_in_the_verdict() -> None:
     verdict = e.classify(_driver_error("pymysql")(1045, "Access denied for user 'secret_user'@'10.1.2.3'"))
     assert "secret_user" not in repr(verdict) and "10.1.2.3" not in repr(verdict)

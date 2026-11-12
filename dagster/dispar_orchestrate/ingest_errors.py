@@ -157,22 +157,28 @@ class Classified:
 
 
 # Bounded walk: SQLAlchemy's `.orig`, `raise ... from`, implicit contexts and
-# `dlt`'s `.exception` are chains of a few links; the bound only guards
-# against a cycle.
-_MAX_CAUSE_DEPTH = 8
+# `dlt`'s `.exception` are chains of a few links; the bound guards against a
+# cycle and against a pathological chain. It counts EXCEPTIONS yielded, not
+# queue pops: every exception pushes four entries (`.orig`, `.exception`,
+# `__cause__`, `__context__`), most of them `None` or a repeat, so counting
+# pops read a `raise ... from` chain only three exceptions deep and the
+# object-storage error of QA `LH-SRC-6-53` (`SRC-38`) sat past the cut.
+# `seen` ends a cycle; each exception adds at most four entries, so the walk
+# ends after at most 64 pops.
+_MAX_CAUSE_DEPTH = 16
 
 
 def _chain(exc: BaseException) -> Iterator[BaseException]:
     """`exc` and what it wraps, outermost first, each once."""
     seen: set[int] = set()
     pending: list[BaseException | None] = [exc]
-    for _ in range(_MAX_CAUSE_DEPTH):
-        if not pending:
-            return
+    yielded = 0
+    while pending and yielded < _MAX_CAUSE_DEPTH:
         current = pending.pop(0)
         if current is None or id(current) in seen:
             continue
         seen.add(id(current))
+        yielded += 1
         yield current
         inner = getattr(current, "exception", None)
         pending.extend(
