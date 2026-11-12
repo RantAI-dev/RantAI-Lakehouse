@@ -74,6 +74,8 @@ reported, not quietly lowered.
 - Shown with a table grant: related tables and usage are hidden. A page opened by a grant carries that table's own facts only — no table it is built from or built into, no joined tables, no frequent users or queries, no dependents, and no replacement's id or name — and the page says so rather than drawing empty panels as if nothing existed. *(proposed, not yet signed)*
 - Restore works only for Iceberg tables, only within the retention window.
 - A version's author is shown only where the committer was recorded.
+- A version written by a file upload names the person who started the load, as "<name> (file upload)", with the name they had then; a version written by a connector's replace or append names the connector's run. A merge load and every version written before 2026-11-12 say "unknown" (`DATA-52`).
+- Frequent users are shown by name. A person who no longer exists is "Unknown user", and all such people share one row. A person of another tenant is "Unknown user" too: a name is only shown to someone who shares a tenant with that person. A caller with a service token is shown by the service identity's own name, in its own row.
 
 ## Spec rows
 
@@ -83,7 +85,7 @@ reported, not quietly lowered.
 | Usage: 30 days | **Met in code** |
 | Access: grant and revoke from the asset | **Met in code** |
 | Restore: dropped table within 7 days | **Partly met** (soft delete on every warehouse and undrop route built; only drops after soft-delete profile applied; Bronze Iceberg only) |
-| History: version time, operation and author | **Partly met** (author is read and shown; versions written through dlt say "unknown") |
+| History: version time, operation and author | **Partly met** (author is read and shown; a merge load, and versions written before 2026-11-12, say "unknown") |
 
 ## Acceptance checklist
 

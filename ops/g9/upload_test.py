@@ -116,6 +116,16 @@ is `DATA-19`
     limit and the CHILD is the one that ends. The API is still there: the
     list of the uploads answers 200.
 
+12. A table name of the full 128 characters (`DATA-50`, `LH-DATA-9-37`): one
+    file loads into it with `replace` and again with `append`, and the table
+    holds both loads' rows. QA found the load failing at 52 characters while
+    the page and the API accept 128: `dlt` names the pipeline
+    `bronze_ingest_<table>` and refuses a schema name past 64 characters,
+    which is a table name past 50. The count is read through
+    `POST /api/query/run`, under a `WHERE` (R11), so the catalog server and the
+    query engine are proven to take the name too. Every version of the table
+    names the person who started the loads (`DATA-52`).
+
 Exit code 0 and `[g9] PASS` when every step holds; otherwise `[g9] FAILED:
 <reason>` on stderr and exit code 1.
 
@@ -981,7 +991,8 @@ NEW_FORMATS = [
     ("orders.csv.gz", {"format": "delimited", "compression": "gzip"}, "dialect"),
     ("three.zip", {"format": "delimited", "compression": "zip"}, "dialect"),
 ]
-UNPACKED_SENTENCE = "The file is larger than the upload limit once unpacked."
+# `DATA-51` (`LH-DATA-17-13`): the sentence names the cap the file passed.
+UNPACKED_SENTENCE = "The file is larger than the 2 GB limit once unpacked."
 
 
 def step_new_formats(api, base_table: str, state: dict) -> None:
@@ -1184,6 +1195,60 @@ def step_several_files(api, base_table: str, state: dict) -> None:
     left = count_rows(api, table)
     if left != len(SEVERAL_ROWS):
         raise G9Failure(f"deleting the uploads should keep the table's {len(SEVERAL_ROWS)} rows, it holds {left}")
+
+
+# DATA-50 (LH-DATA-9-37): the full 128 characters the page and the API accept for a table
+# name. QA found 52 failing: `dlt` names a table's pipeline `bronze_ingest_<table>`, fourteen
+# characters longer, and refuses a schema name past 64 -- a table name past 50.
+LONG_TABLE_NAME_LENGTH = 128
+
+
+def step_long_table_name(api, state: dict) -> None:
+    """One file loads with `replace` and again with `append` into a table named the full 128
+    characters, and the table holds both loads' rows (DATA-50, LH-DATA-9-37)."""
+    table = (f"g9_long_{secrets.token_hex(4)}_" + "x" * LONG_TABLE_NAME_LENGTH)[:LONG_TABLE_NAME_LENGTH]
+    if len(table) != LONG_TABLE_NAME_LENGTH:
+        raise G9Failure(f"the table name should be {LONG_TABLE_NAME_LENGTH} characters, it is {len(table)}")
+    upload_id = _upload_one(api, "long_name.csv", "id,name\n1,a\n2,b\n", state)
+    body = {"bronzeTable": table, "mode": "replace", "encoding": "utf-8", "delimiter": ",", "headerRow": 0}
+    for mode, this_load, total in (("replace", 2, 2), ("append", 2, 4)):
+        _expect(
+            api.post(f"{API_URL}/api/uploads/{upload_id}/ingest", json={**body, "mode": mode}, timeout=60),
+            200,
+            f"POST .../ingest into a {LONG_TABLE_NAME_LENGTH}-character name ({mode})",
+        )
+        settled = _settle(api, upload_id, f"the {mode} into a long table name")
+        if settled.get("status") != "ingested" or settled.get("rows") != this_load:
+            raise G9Failure(
+                f"the {mode} into a {LONG_TABLE_NAME_LENGTH}-character table should load {this_load} rows, "
+                f"it is {settled.get('status')!r}: {settled.get('error')!r}"
+            )
+        counted: list[int] = []
+
+        def holds() -> bool:
+            counted.append(count_rows(api, table))
+            return counted[-1] == total
+
+        try:
+            _wait_for(f"{QUERY_DB}.`bronze.{table}` holds {total} rows", holds, VISIBLE_TIMEOUT_S, retry_failures=True)
+        except G9Failure as exc:
+            raise G9Failure(f"{exc}; the last count was {counted[-1] if counted else 'never read'}") from exc
+
+    # `DATA-52` (`LH-DATA-15-08`): a version written by an upload names the person who
+    # started it, so no snapshot of this table says "unknown".
+    detail = _expect(
+        api.get(f"{API_URL}/api/lakehouse/tables/bronze/{table}", timeout=60),
+        200,
+        "GET /api/lakehouse/tables/bronze/{table}",
+    ).json()
+    snapshots = detail.get("snapshots") or []
+    if not snapshots:
+        raise G9Failure(f"the table {table} should have snapshots after two loads, it has none: {detail}")
+    unnamed = [s for s in snapshots if not str(s.get("author") or "").endswith(" (file upload)")]
+    if unnamed:
+        raise G9Failure(f"every version of {table} should name who started the load, these do not: {unnamed}")
+    _delete_upload(api, upload_id, state)
+    print(f"[g9] long name: {table} holds 4 rows after a replace and an append, its versions name the uploader")
 
 
 def step_create_pipeline_over_uploaded_table(api, requests, table: str, silver_table: str) -> str:
@@ -1631,6 +1696,7 @@ def main() -> int:
         step_typed_columns(api, table, state)
         step_new_formats(api, table, state)
         step_several_files(api, table, state)
+        step_long_table_name(api, state)
         step_folders(api, table, state)
         step_feeds_a_pipeline(api, requests, table, upload_id, using, expected, state)
     except (G9Failure, requests.RequestException) as exc:

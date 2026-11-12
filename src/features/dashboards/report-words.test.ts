@@ -1,6 +1,15 @@
 import { describe, expect, it } from "bun:test"
 import type { ReportSubscription } from "@/services/contracts/reports"
-import { clock, describeAttachments, describeSchedule, describeStatus, ordinal } from "./report-words"
+import { formatDateTime } from "@/lib/format"
+import {
+  clock,
+  describeAttachments,
+  describeNotSent,
+  describeSchedule,
+  describeStatus,
+  NOT_SENT_EMAIL,
+  ordinal,
+} from "./report-words"
 
 describe("describeSchedule", () => {
   it("puts every kind in words with its time zone", () => {
@@ -37,5 +46,23 @@ describe("describeAttachments and describeStatus", () => {
     expect(describeStatus({ ...base, paused: true, pausedReason: "Paused after 5 failed sends in a row." })).toBe("Paused. Paused after 5 failed sends in a row.")
     expect(describeStatus({ ...base, lastDelivery: { id: "d", startedAt: "", finishedAt: "", status: "failed", origin: "schedule", recipientCount: 0, reason: "The PDF took too long to make." } })).toBe("Failed. The PDF took too long to make.")
     expect(describeStatus({ ...base, lastDelivery: { id: "d", startedAt: "", finishedAt: "", status: "sent", origin: "manual", recipientCount: 2, reason: null } })).toBe("Sent")
+  })
+})
+
+describe("describeNotSent", () => {
+  // RFC 3339, the shape the API writes for `lastAttemptAt`.
+  const lastAttemptAt = "2026-11-12T04:15:00Z"
+  const notSent = { cause: "email_not_set_up", lastAttemptAt }
+
+  it("describeNotSent says the cause, and the time when there was an attempt", () => {
+    expect(NOT_SENT_EMAIL).toBe("Not sent: e-mail is not set up on this installation.")
+    expect(describeNotSent({ ...base, notSent })).toBe(`${NOT_SENT_EMAIL} Last attempt: ${formatDateTime(lastAttemptAt)}.`)
+    expect(describeNotSent({ ...base, notSent: { cause: "email_not_set_up", lastAttemptAt: null } })).toBe(NOT_SENT_EMAIL)
+  })
+
+  it("describeNotSent says nothing for a subscription that can be sent or for a cause it does not know", () => {
+    expect(describeNotSent(base)).toBeNull()
+    expect(describeNotSent({ ...base, notSent: null })).toBeNull()
+    expect(describeNotSent({ ...base, notSent: { cause: "something_new", lastAttemptAt } })).toBeNull()
   })
 })

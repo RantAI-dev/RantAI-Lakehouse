@@ -13,7 +13,7 @@ import { Label } from "@/components/ui/label"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { levelAtLeast } from "@/lib/access-level"
-import { rememberSavedTab } from "@/lib/query-draft"
+import { queryDraftKey, rememberSavedTab } from "@/lib/query-draft"
 import { sqlSummary } from "@/lib/sql-text"
 import { queryService } from "@/services"
 import type { QueryFolder, SaveQueryInput, SavedQuery } from "@/services/contracts/queries"
@@ -88,7 +88,7 @@ function NoDraft() {
 function SaveQueryForm({ draft }: { draft: SaveQueryDraft }) {
   const router = useRouter()
   const backHref = "/query-studio"
-  const { user } = useAuth()
+  const { user, activeTenantId } = useAuth()
   const [title, setTitle] = React.useState("")
   const [tags, setTags] = React.useState("")
   const [folder, setFolder] = React.useState(PERSONAL_SPACE)
@@ -180,7 +180,9 @@ function SaveQueryForm({ draft }: { draft: SaveQueryDraft }) {
     if (!saved) return
     // The editor is unmounted while this page saves, so it is told afterwards
     // which query the save produced: the tab keeps its "Save" button.
-    rememberSavedTab(draft.tabId, saved.id, saved.level)
+    // The tab lives in one person's draft (`QS-8`), so only a signed-in
+    // caller has one to point at the query just saved.
+    if (user) rememberSavedTab(queryDraftKey(user.id, activeTenantId), draft.tabId, saved.id, saved.level)
     clearSaveQueryDraft()
     router.push(backHref)
   }

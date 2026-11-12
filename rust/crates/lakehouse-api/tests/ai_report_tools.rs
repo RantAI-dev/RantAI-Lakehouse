@@ -622,3 +622,27 @@ async fn the_assistant_can_pause_a_report_whose_domain_is_no_longer_allowed() {
     assert_eq!(resumed["outcome"], "executed", "{resumed}");
     assert!(!all(&f.app.pool).await[0].paused);
 }
+
+/// `RPT-2` (`DEC-18`, QA `LH-RPT-1-06`, assistant parity): with no mail server,
+/// listing a report through the assistant carries the same `warning` `create`
+/// gives — the person learns nothing is being sent, in the one sentence the
+/// product owns.
+#[tokio::test]
+async fn listing_reports_warns_while_email_is_not_set_up() {
+    let f = fixture().await;
+    let mut args = monday_pdf();
+    args["confirmed"] = json!(true);
+    tool(&f, "create_report_subscription", args).await;
+
+    let listed = tool(&f, "list_report_subscriptions", json!({})).await;
+    assert_eq!(
+        listed["result"]["warning"],
+        "Email is not set up on this deployment, so nothing is sent until it is.",
+        "{listed}"
+    );
+    assert_eq!(
+        listed["result"]["items"].as_array().unwrap().len(),
+        1,
+        "the subscriptions are still listed: {listed}"
+    );
+}

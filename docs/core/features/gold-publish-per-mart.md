@@ -78,6 +78,13 @@ that changes who can read the data.
   alter copies already published.
 - Automatic publishing needs the operator to set the export run token.
   Without it, only "Publish now" works.
+- A publish that fails before the copy starts (for example, the catalog's credentials
+  cannot be read) is recorded as a failed publish with its reason, also for an
+  automatic publish. A request that is turned away is not a publish and is not
+  recorded: no permission, a table of another organisation, or another publish of the
+  same table still running. If the database that keeps the publish history is itself
+  down, nothing can be recorded. Changed 2026-11-12 (`DATA-56`), *(proposed, not yet
+  signed)*.
 
 ## How an outside tool reads a published table
 

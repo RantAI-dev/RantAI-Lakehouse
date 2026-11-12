@@ -1465,9 +1465,12 @@ fn validate_saas_dial_post_parse(adapter: &str, dial: &SaasDial) -> Result<(), I
     let Some(vendor) = crate::saas_vendors::vendor(&dial.vendor) else {
         return Err(refuse("vendor is not one this build offers"));
     };
+    // QA LH-SRC-3-11 (SRC-41): `InvalidAccount`'s own text already names
+    // the field ("account is not in the form this vendor uses"); prefixing it
+    // again doubled the word in the refusal the console showed.
     vendor
         .validate_account(&dial.account)
-        .map_err(|err| refuse(&format!("account: {err}")))?;
+        .map_err(|err| refuse(&err.to_string()))?;
     match &dial.auth {
         SaasAuth::Oauth2AuthorizationCode { client_id } => {
             if client_id.trim().is_empty()
@@ -4770,6 +4773,21 @@ mod saas_dial_tests {
                 "{account}"
             );
         }
+    }
+
+    #[test]
+    fn a_refused_saas_account_names_the_field_once() {
+        // QA LH-SRC-3-11 (SRC-41): the refusal read "account: account is not
+        // in the form this vendor uses"; `InvalidAccount` already names the
+        // field, so it is carried as it is.
+        let err = Dial::parse("saas", &dial("dynamics365", "127.0.0.1", &oauth())).unwrap_err();
+        let IngestSpecError::InvalidDial { source, .. } = err else {
+            panic!("expected InvalidDial, got {err:?}");
+        };
+        assert_eq!(
+            source.to_string(),
+            "account is not in the form this vendor uses"
+        );
     }
 
     #[test]

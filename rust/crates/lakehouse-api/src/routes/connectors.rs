@@ -39,7 +39,7 @@ use lakehouse_store::connector_probe_result::{self, ConnectorProbeResult};
 use lakehouse_store::connector_run;
 use lakehouse_store::connector_type::{self, ConnectorType};
 use lakehouse_store::connectors::{self, ConnectorDetail, ConnectorDialInfo, CreateConnectorInput};
-use lakehouse_store::ingest_spec::{Dial, RestAuth, SqlDriver};
+use lakehouse_store::ingest_spec::{Dial, IngestSpecError, RestAuth, SqlDriver};
 use lakehouse_store::schema_change::{self, SchemaChangePolicy};
 use lakehouse_store::uploads;
 use serde::{Deserialize, Serialize};
@@ -597,6 +597,58 @@ impl SecretInput {
     }
 }
 
+/// What a refused `dial` answers (`SRC-41` D12).
+///
+/// `InvalidDial`'s `source` is a fixed sentence written in this repository —
+/// one of `ingest_spec.rs`'s (`account is not in the form this vendor uses`,
+/// `host must be a hostname`, …) or serde's field text about the caller's own
+/// `dial` (``missing field `host` ``). Nothing has been dialled when it is
+/// produced, so it holds no text from a source and no resolved address. It can
+/// repeat a value the caller typed in the same request (a host that is not a
+/// hostname), exactly as `resolve_checked`'s refusal does (`SEC-15`); that is
+/// not changed here.
+fn dial_refusal(err: &IngestSpecError) -> ApiError {
+    match err {
+        IngestSpecError::UnknownAdapter { .. } => ApiError::BadRequest(
+            "The connection settings name a connector type this build does not know.".to_owned(),
+        ),
+        IngestSpecError::InvalidDial { source, .. } => {
+            ApiError::BadRequest(format!("The connection settings are not valid: {source}"))
+        }
+    }
+}
+
+/// Check the `connection` a console create sends, before any row exists
+/// (`SRC-41` D11): the same three checks the save runs, in the same order —
+/// `Dial::parse`, then the OAuth addresses, then the address check — so a
+/// refusal is a 400 and no connector is created. The settings themselves are
+/// still stored by the second call, which checks again.
+///
+/// # Errors
+///
+/// 400 from [`dial_refusal`] for a dial that does not parse or validate, and
+/// the fixed texts of [`check_oauth_addresses`] and [`check_dial_ssrf`] for an
+/// address the product will not dial.
+async fn check_new_connection(
+    state: &AppState,
+    connection: &NewConnectionBody,
+) -> Result<(), ApiError> {
+    let dial =
+        Dial::parse(&connection.adapter, &connection.dial).map_err(|err| dial_refusal(&err))?;
+    check_oauth_addresses(
+        &dial,
+        &state.config.connector_internal_hosts(),
+        state.config.oauth_settings(),
+    )
+    .await?;
+    check_dial_ssrf(
+        &dial,
+        &state.config.connector_internal_hosts(),
+        state.config.oauth_settings(),
+    )
+    .await
+}
+
 /// `credential.values` on `POST /api/connectors`: one value per slot the
 /// connector declares. `deny_unknown_fields` so a misspelled slot is an
 /// error, not a silently unset credential.
@@ -636,6 +688,24 @@ pub struct CreateConnectorBody {
     capabilities: Vec<String>,
     #[serde(default)]
     owner: Option<String>,
+    /// The connection settings the console sends with the create, so they are
+    /// checked before the row exists (`SRC-41` D11). Absent for the assistant
+    /// (`create_connector` offers no such field), whose calls are unchanged.
+    #[serde(default)]
+    connection: Option<NewConnectionBody>,
+}
+
+/// `connection` of `POST /api/connectors`: what the second call
+/// (`PUT .../ingest-spec`) would store, sent early so a refused dial creates
+/// nothing. Checked by [`check_new_connection`]; nothing is stored from here.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewConnectionBody {
+    /// The adapter the `dial` is parsed as (`sql`, `saas`, …).
+    adapter: String,
+    /// The dial itself, the same object `PUT .../ingest-spec` takes.
+    #[serde(default)]
+    dial: Value,
 }
 
 /// The `POST /api/connectors` response: the created
@@ -761,10 +831,12 @@ pub(super) fn connector_audit_event(
 /// # Errors
 ///
 /// 401 if no principal is present (see above); 400 on a malformed body, a
-/// blank required field, an unrecognized `direction`, or a body that still
+/// blank required field, an unrecognized `direction`, a body that still
 /// names `secretRef`/`secretRefSecondary` (see
 /// [`reject_legacy_secret_ref_fields`] — ADR 0002 Addendum 3 removed both
-/// fields); 409 if the name is taken; 503/500 as above.
+/// fields), or a `connection` the product refuses (a dial that does not parse
+/// or validate, or an address it will not dial: `SRC-41` D11) — and in that
+/// last case nothing is created; 409 if the name is taken; 503/500 as above.
 pub async fn create(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
@@ -782,6 +854,12 @@ pub async fn create(
             "direction must be one of {VALID_DIRECTIONS:?}, got {direction:?}"
         ))
         .into());
+    }
+    // QA LH-SRC-3-11 (SRC-41 D11): the console sends the connection settings
+    // with the create, so a refused dial creates nothing. The save that stores
+    // them checks again.
+    if let Some(connection) = &body.connection {
+        check_new_connection(&state, connection).await?;
     }
     let source = body.credential.source;
     check_create_credential(&state, &body.credential)?;
@@ -3469,8 +3547,7 @@ async fn save_ingest_spec(
     // authoritative-for-persistence) `Dial::parse` call: this handler
     // needs the typed `Dial` itself to extract a host for
     // `check_dial_ssrf`, which `set_ingest_spec` never returns.
-    let dial = Dial::parse(&body.adapter, &body.dial)
-        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    let dial = Dial::parse(&body.adapter, &body.dial).map_err(|err| dial_refusal(&err))?;
     // `SRC-4` slice 6 (S10-c): an Oracle change-capture connector's tables are
     // typed by hand, so each is checked as SCHEMA.TABLE in Oracle's spelling.
     lakehouse_store::ingest_spec::validate_oracle_change_capture_tables(
@@ -4666,6 +4743,7 @@ mod tests {
             residency: String::new(),
             capabilities: vec![],
             owner: None,
+            connection: None,
         };
         assert!(!VALID_DIRECTIONS.contains(&body.direction.as_str()));
     }

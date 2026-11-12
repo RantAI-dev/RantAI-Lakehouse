@@ -27,9 +27,11 @@ Decimal: at most 29 digits before the point and 9 after (`decimal(38, 9)`); `1,2
 and `1e3` do not fit. Boolean: `true`/`false`, `yes`/`no`, `y`/`n`, `t`/`f` in any
 case, and `1`/`0`. Date: ISO `YYYY-MM-DD`, or day-first / month-first with `/`, `-` or
 `.` (one kind in a value, a four-digit year), as the column's reading says. Timestamp:
-a date, `T` or a space, `HH:MM[:SS[.f]]` with a fraction of at most six digits, and a
+a date, `T` or a space, `HH:MM[:SS[.f]]` with a fraction of one to nine digits, and a
 zone (`Z`, `+HH:MM`, `+HHMM`) exactly when the column holds instants, which are stored
-in UTC. Float: the syntax of a floating-point number, `NaN` and `inf` included.
+in UTC. A fraction longer than six digits is CUT to six, not rounded: the table keeps
+microseconds (`DATA-53`, QA `LH-DATA-9-32`), and the guess of the preview still wants
+at most six. Float: the syntax of a floating-point number, `NaN` and `inf` included.
 """
 
 from __future__ import annotations
@@ -148,7 +150,7 @@ _DECIMAL = r"^[+-]?([0-9]+|[0-9]*\.[0-9]{1,9})$"
 _FLOAT = r"^[+-]?(([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?|[iI][nN][fF]([iI][nN][iI][tT][yY])?|[nN][aA][nN])$"
 _ISO_DATE = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
 _TIMESTAMP = (
-    r"^(?P<date>[^T ]+)[T ][ ]*(?P<h>[0-9]{2}):(?P<m>[0-9]{2})(?::(?P<s>[0-9]{2})(?:\.(?P<f>[0-9]{1,6}))?)?"
+    r"^(?P<date>[^T ]+)[T ][ ]*(?P<h>[0-9]{2}):(?P<m>[0-9]{2})(?::(?P<s>[0-9]{2})(?:\.(?P<f>[0-9]{1,9}))?)?"
     r"(?P<z>Z|[+-][0-9]{2}:?[0-9]{2})?$"
 )
 _TRUE = pa.array(["true", "yes", "y", "t", "1"])
@@ -207,7 +209,11 @@ def _timestamps(text: pa.Array, spec: ColumnSpec) -> pa.Array:
     # Read back as itself, as for a date (the parse rolls 31 April over to 1 May, 24:00 to the next day).
     real = pc.and_(pc.equal(pc.utf8_slice_codeunits(pc.strftime(local, format="%Y-%m-%dT%H:%M:%S"), 0, 19), stamp), pc.invert(pc.starts_with(iso, "0000")))
     local = _null_where_not(local, pc.fill_null(real, False)).cast(pa.int64())
-    fraction = pc.utf8_rpad(pc.coalesce(optional("f"), pa.scalar("")), 6, "0")
+    # `DATA-53`: a fraction of up to nine digits (a nanosecond Parquet column) is cut
+    # after the sixth, never rounded: `pa.timestamp("us")` holds microseconds.
+    fraction = pc.utf8_rpad(
+        pc.utf8_slice_codeunits(pc.coalesce(optional("f"), pa.scalar("")), 0, 6), 6, "0"
+    )
     micros = pc.cast(fraction, pa.int64())
     zone = optional("z")
     has_zone = pc.invert(pc.is_null(zone))

@@ -1,7 +1,19 @@
 import { strict as assert } from "node:assert"
 import { test } from "node:test"
-import { parseDraft, parseTabs, readTabs, rememberSavedTab, writeTabs } from "./query-draft"
+import {
+  dropLegacyDraft,
+  LEGACY_QUERY_DRAFT_KEY,
+  parseDraft,
+  parseTabs,
+  queryDraftKey,
+  readTabs,
+  rememberSavedTab,
+  writeTabs,
+} from "./query-draft"
 import type { QueryTab, QueryTabs } from "./query-draft"
+
+/** The key of the person these tests write as: `u1`, no active tenant. */
+const KEY = queryDraftKey("u1", null)
 
 test("parseDraft mengembalikan null untuk isi yang tidak terpakai", () => {
   assert.equal(parseDraft(null), null)
@@ -263,8 +275,8 @@ test("writeTabs stores the definitions and the values, and readTabs gets them ba
       question: "",
       tab: "sql",
     } as QueryTabs
-    writeTabs(tabs)
-    assert.deepEqual(readTabs(), tabs)
+    writeTabs(KEY, tabs)
+    assert.deepEqual(readTabs(KEY), tabs)
   } finally {
     window.localStorage.clear()
   }
@@ -275,7 +287,7 @@ test("writeTabs stores the definitions and the values, and readTabs gets them ba
 test("rememberSavedTab points the tab that saved at the query it produced", () => {
   window.localStorage.clear()
   try {
-    writeTabs({
+    writeTabs(KEY, {
       tabs: [
         { ...PARAMETER_TAB, id: "a" },
         { ...PARAMETER_TAB, id: "b", savedId: "q1", level: "view" },
@@ -284,8 +296,8 @@ test("rememberSavedTab points the tab that saved at the query it produced", () =
       question: "",
       tab: "sql",
     })
-    rememberSavedTab("a", "q2", "edit")
-    const saved = readTabs()
+    rememberSavedTab(KEY, "a", "q2", "edit")
+    const saved = readTabs(KEY)
     assert.equal(saved?.tabs[0]?.savedId, "q2")
     assert.equal(saved?.tabs[0]?.level, "edit")
     // The tab that saved is the one that changes; another tab keeps its own.
@@ -299,9 +311,9 @@ test("rememberSavedTab points the tab that saved at the query it produced", () =
 test("rememberSavedTab changes nothing when the tab is not in the draft", () => {
   window.localStorage.clear()
   try {
-    writeTabs({ tabs: [PARAMETER_TAB], activeId: "a", question: "", tab: "sql" })
-    rememberSavedTab("gone", "q2", "edit")
-    assert.deepEqual(readTabs()?.tabs, [PARAMETER_TAB])
+    writeTabs(KEY, { tabs: [PARAMETER_TAB], activeId: "a", question: "", tab: "sql" })
+    rememberSavedTab(KEY, "gone", "q2", "edit")
+    assert.deepEqual(readTabs(KEY)?.tabs, [PARAMETER_TAB])
   } finally {
     window.localStorage.clear()
   }
@@ -318,12 +330,76 @@ test("rememberSavedTab writes nothing when the browser refuses storage", () => {
       },
     })
     // It must not throw: a refused write leaves the editor's button as it was.
-    rememberSavedTab("a", "q2", "edit")
+    rememberSavedTab(KEY, "a", "q2", "edit")
   } finally {
     Object.defineProperty(window.localStorage, "setItem", {
       configurable: true,
       value: original,
     })
+    window.localStorage.clear()
+  }
+})
+
+// `QS-8` (`LH-QS-1-04` F1): the draft belongs to one person in one tenant.
+
+test("queryDraftKey gives each person and each tenant a key of their own, never the old shared key", () => {
+  const first = queryDraftKey("u1", "t1")
+  const second = queryDraftKey("u2", "t1")
+  const otherTenant = queryDraftKey("u1", "t2")
+  const noTenant = queryDraftKey("u1", null)
+
+  assert.equal(first, `${LEGACY_QUERY_DRAFT_KEY}:u1:t1`)
+  assert.equal(new Set([first, second, otherTenant, noTenant]).size, 4)
+  assert.notEqual(noTenant, LEGACY_QUERY_DRAFT_KEY)
+  assert.equal(queryDraftKey("u1", undefined), noTenant)
+  assert.equal(queryDraftKey("u1", ""), noTenant)
+})
+
+test("readTabs reads only the tabs stored under the key it is given", () => {
+  window.localStorage.clear()
+  try {
+    const mine = {
+      tabs: [{ ...PARAMETER_TAB, id: "mine", sql: "SELECT 'mine'" }],
+      activeId: "mine",
+      question: "",
+      tab: "sql",
+    } as QueryTabs
+    const theirs = {
+      tabs: [{ ...PARAMETER_TAB, id: "theirs", sql: "SELECT 'theirs'" }],
+      activeId: "theirs",
+      question: "",
+      tab: "sql",
+    } as QueryTabs
+    writeTabs(KEY, mine)
+    writeTabs(queryDraftKey("u2", null), theirs)
+    // The old shared entry holds tabs too; it is not one of the keys read.
+    window.localStorage.setItem(
+      LEGACY_QUERY_DRAFT_KEY,
+      JSON.stringify({ ...theirs, tabs: [{ ...theirs.tabs[0], sql: "SELECT 'shared'" }] })
+    )
+
+    assert.deepEqual(readTabs(KEY), mine)
+    assert.deepEqual(readTabs(queryDraftKey("u2", null)), theirs)
+    assert.equal(readTabs(queryDraftKey("u3", null)), null)
+  } finally {
+    window.localStorage.clear()
+  }
+})
+
+test("dropLegacyDraft removes the entry under the old shared key and leaves a person's own draft", () => {
+  window.localStorage.clear()
+  try {
+    const mine = { tabs: [PARAMETER_TAB], activeId: "a", question: "", tab: "sql" } as QueryTabs
+    writeTabs(KEY, mine)
+    window.localStorage.setItem(LEGACY_QUERY_DRAFT_KEY, JSON.stringify(mine))
+
+    dropLegacyDraft()
+
+    assert.equal(window.localStorage.getItem(LEGACY_QUERY_DRAFT_KEY), null)
+    assert.deepEqual(readTabs(KEY), mine)
+    // A second call is harmless: the entry it removes is already gone.
+    dropLegacyDraft()
+  } finally {
     window.localStorage.clear()
   }
 })

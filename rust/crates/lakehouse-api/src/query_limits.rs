@@ -383,6 +383,9 @@ impl QueryRun {
             max_execution_time: Some(limits.timeout),
             max_result_rows: Some(u64::from(rows) + 1),
             query_id: Some(self.next_query_id()),
+            // A tile's numbers are numbers: the decimal quoting of `DATA-53` is the
+            // query route's, whose cells are text already.
+            quote_decimals: false,
         }
     }
 }

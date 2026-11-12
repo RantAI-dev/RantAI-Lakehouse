@@ -268,6 +268,11 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     ),
     (
         "connectors.rs",
+        "The connection settings are not valid: {source}",
+        "IngestSpecError::InvalidDial's source: a fixed sentence of ingest_spec.rs or serde's field text about the caller's own dial; nothing is dialled before it, so it holds no upstream text and no resolved address (it can repeat a host the caller typed)",
+    ),
+    (
+        "connectors.rs",
         "\"dial: {err}\"",
         "IngestSpecError never echoes the dial's values (ingest_spec module doc)",
     ),

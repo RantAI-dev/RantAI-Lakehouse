@@ -49,6 +49,66 @@ const WORKBOOK_NAME = /\.xlsx?$/i
 /** The most files one upload takes (decision 5 of `docs/core/features/upload-big-files-and-more-formats.md`). */
 export const MAX_FILES = 10
 
+/**
+ * Whether a Parquet column's own type label keeps nanoseconds (`DATA-53`): the API's
+ * `timestamp (ns)`, `timestamp (ns, UTC)` (`upload_parquet::type_label`). The table keeps
+ * microseconds, so the Check step says the digits after the sixth are cut.
+ */
+export function keepsNanoseconds(fileType: string | undefined): boolean {
+  return fileType !== undefined && fileType.trim().startsWith("timestamp (ns")
+}
+
+/** The digits after the first point of `value`, or 0 when it has none. */
+function fractionDigits(value: string): number {
+  const point = value.indexOf(".")
+  if (point < 0) return 0
+  let digits = 0
+  for (let i = point + 1; i < value.length && value[i] >= "0" && value[i] <= "9"; i += 1) digits += 1
+  return digits
+}
+
+/**
+ * Whether a Timestamp column's load loses digits of a fraction (`DATA-53` decision 17, review
+ * round 1 R5): the file's own type keeps nanoseconds, or one of the sampled values holds a
+ * fraction longer than six digits — and no longer than the nine a Timestamp column takes, since
+ * ten or more do not fit it at all and the Check step lists that value instead.
+ *
+ * The table keeps microseconds, so the digits after the sixth are cut, not rounded. A value like
+ * `2026-10-16T13:30:05.1234567` is stored as `…05.123456`: the person chose Timestamp for a
+ * column the guess called Text, or the table's own column is a timestamp, and nothing else on
+ * the Check step says what happened to the seventh digit.
+ */
+export function cutsNanosecondDigits(
+  rows: readonly (readonly string[])[],
+  index: number,
+  fileType?: string,
+): boolean {
+  if (keepsNanoseconds(fileType)) return true
+  return rows.some((row) => {
+    const digits = fractionDigits(row[index] ?? "")
+    return digits >= 7 && digits <= 9
+  })
+}
+
+/**
+ * The formats the upload reads, in one phrase (decision 12 of
+ * `docs/core/features/upload-file.md`, `DATA-51`, QA `LH-DATA-9-02`): the link
+ * on New Connector, the empty state of Uploaded files and the Upload file page
+ * all read it, so they cannot name different lists. A format added to the API
+ * is added here and nowhere else in the console.
+ */
+export const ACCEPTED_FORMATS = "CSV, TSV, JSON, JSON Lines, Avro, Excel or Parquet"
+
+/** The same formats with the file names a person picks, for the Accepted fact: decision 12 again. */
+export const ACCEPTED_FILES = "CSV, TSV, JSON, JSON Lines, Avro, .xls, .xlsx, .parquet, .gz and .zip"
+
+/**
+ * The most files `GET /api/uploads` returns (the API's `LIST_LIMIT`,
+ * `routes/uploads.rs`): the list has no paging, so a full answer is a cut one
+ * (`DATA-51`, QA `LH-DATA-35-10`).
+ */
+export const UPLOAD_LIST_LIMIT = 100
+
 /** The longest raw table name the API accepts (its `MAX_TABLE_NAME_CHARS`). */
 export const MAX_TABLE_NAME_CHARS = 128
 
@@ -300,11 +360,12 @@ export function fileProblem(name: string, sizeBytes: number): string | null {
  * - The list holds at most [`MAX_FILES`]; the first files of a pick are kept
  *   (decision 5) and `dropped` counts the rest.
  * - A file with a problem of its own ([`fileProblem`]) is listed with it.
- * - The 2 GB limit counts all the files of one upload together (decision 2):
- *   a file that would take the sum over it is listed with a sentence saying
- *   so and is not sent, so a person never waits for files the load would
- *   refuse. `existing` is what the list holds already (a refused file does not
- *   count: it is not sent).
+ * - The 2 GB limit counts all the files of one upload together (decision 2)
+ *   and is checked BEFORE any file of the pick is sent (`DATA-51`, QA
+ *   `LH-DATA-17-04`): when the files listed plus this pick's own files pass
+ *   it, every one of those files is refused with a sentence naming the total
+ *   and the limit, so none of them is handed to the queue. `existing` is what
+ *   the list holds already (a refused file does not count: it is not sent).
  */
 export function planPick(
   existing: readonly { readonly size: number; readonly state: string }[],
@@ -312,18 +373,20 @@ export function planPick(
 ): { candidates: Candidate[]; dropped: number } {
   const room = Math.max(0, MAX_FILES - existing.length)
   const taken = picked.slice(0, room)
-  let total = existing.filter((f) => f.state !== "refused").reduce((sum, f) => sum + f.size, 0)
-  const candidates = taken.map((file): Candidate => {
-    const own = fileProblem(file.name, file.size)
-    if (own !== null) return { file, problem: own }
-    if (total + file.size > MAX_SESSION_BYTES) {
-      return {
-        file,
-        problem: `${file.name} would bring the files to ${formatBytes(total + file.size)}, over the 2 GB limit for one upload (all its files together). Remove a file, then choose this one again.`,
-      }
-    }
-    total += file.size
-    return { file, problem: null }
+  const listed = existing.filter((f) => f.state !== "refused").reduce((sum, f) => sum + f.size, 0)
+  const own = taken.map((file) => fileProblem(file.name, file.size))
+  // A file with a problem of its own is not sent, so it adds nothing to the total.
+  const chosen = taken.reduce((sum, file, index) => (own[index] === null ? sum + file.size : sum), 0)
+  const count = own.filter((problem) => problem === null).length
+  const total = listed + chosen
+  const overTheLimit = (file: File): string =>
+    count === 1
+      ? // One file too many keeps the sentence it always had.
+        `${file.name} would bring the files to ${formatBytes(total)}, over the 2 GB limit for one upload (all its files together). Remove a file, then choose this one again.`
+      : `The ${count} files chosen would bring the upload to ${formatBytes(total)}, over the 2 GB limit for one upload (all its files together). None of them was sent. Choose fewer or smaller files.`
+  const candidates = taken.map((file, index): Candidate => {
+    if (own[index] !== null) return { file, problem: own[index] }
+    return { file, problem: total > MAX_SESSION_BYTES ? overTheLimit(file) : null }
   })
   return { candidates, dropped: picked.length - taken.length }
 }
