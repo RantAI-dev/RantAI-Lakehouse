@@ -37,6 +37,8 @@ type Seen = { url: string; method: string; tenant: string | null }
 
 let seen: Seen[] = []
 let sessionAnswer: () => Response;
+/** A sign-out answer the test holds back, so "before the request answers" is observable. */
+let logoutAnswer: Promise<void> | null = null;
 
 function person(tenants: { id: string; name: string; slug: string }[]): Response {
   return new Response(
@@ -101,6 +103,7 @@ describe("AuthProvider and the stored tenant (ADM-15)", () => {
     seen = []
     localStorage.clear()
     sessionAnswer = () => person(A)
+    logoutAnswer = null
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url =
         typeof input === "string"
@@ -114,6 +117,7 @@ describe("AuthProvider and the stored tenant (ADM-15)", () => {
         tenant: new Headers(init?.headers).get("X-Tenant"),
       })
       if (url.includes("/api/auth/me")) return sessionAnswer()
+      if (url.includes("/api/auth/logout") && logoutAnswer !== null) await logoutAnswer
       return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } })
     }) as unknown as typeof fetch
   })
@@ -139,8 +143,32 @@ describe("AuthProvider and the stored tenant (ADM-15)", () => {
     expect(logout[0]!.tenant).toBeNull()
   })
 
-  it("a second person never sends or shows the first person's tenant", async () => {
+  // D5 (review round 1, R6): the key goes before the request, so it is gone even
+  // when that request never answers. The sign-out answer is held back, so what is
+  // stored while it is pending can be asserted at all.
+  it("signing out clears the stored tenant before the request answers", async () => {
     localStorage.setItem(ACTIVE_TENANT_STORAGE_KEY, "a2")
+    let answerLogout: () => void = () => {}
+    logoutAnswer = new Promise<void>((resolve) => {
+      answerLogout = resolve
+    })
+    render(
+      <AuthProvider>
+        <Harness />
+        <Controls />
+      </AuthProvider>,
+    )
+    await settled()
+    fireEvent.click(screen.getByRole("button", { name: "sign out" }))
+    await waitFor(() => expect(carried("/api/auth/logout").length).toBe(1))
+    // The request is in flight and still unanswered.
+    expect(carried("/api/auth/logout")[0]!.tenant).toBeNull()
+    expect(localStorage.getItem(ACTIVE_TENANT_STORAGE_KEY)).toBeNull()
+    answerLogout()
+    await waitFor(() => expect(screen.getByTestId("status").textContent).toBe("unauthenticated"))
+  })
+
+  it("a second person never sends or shows the first person's tenant", async () => {    localStorage.setItem(ACTIVE_TENANT_STORAGE_KEY, "a2")
     sessionAnswer = () => person(B)
     render(
       <AuthProvider>
