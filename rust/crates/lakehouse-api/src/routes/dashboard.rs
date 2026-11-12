@@ -966,7 +966,9 @@ fn parse_chart_input(body: &Bytes) -> Result<ChartInput, ApiError> {
 /// # Errors
 ///
 /// 400 on an unparseable body or a `lakehouse_bi` validation/`ClickHouse`
-/// failure, matching the `TypeScript`'s single `catch` around both.
+/// failure, matching the `TypeScript`'s single `catch` around both; 422 with
+/// the limit's sentence when the chart's own statement ended at the caller's
+/// time limit (`BI-45`, plan D5), in which case nothing is stored.
 pub async fn specs_create(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1005,14 +1007,19 @@ pub async fn specs_create(
     )
     .await
     .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
-    store::insert_chart(&state.clickhouse, &spec)
+    // QA `LH-BI-5-01` (`BI-45`, plan D5): the statement is checked under the
+    // caller's limit, and a limit that ends it is a 422 with the sentence
+    // instead of a stored chart.
+    crate::routes::support::insert_chart_checked(&state.clickhouse, &spec)
         .await
-        .map_err(|err| {
-            upstream_error::ch_error_as(
-                &upstream_error::DATABASE,
-                &err,
-                upstream_error::FailedAs::BadRequest,
-            )
+        .map_err(|failure| {
+            crate::routes::support::failure_as_api_error(failure, |err| {
+                upstream_error::ch_error_as(
+                    &upstream_error::DATABASE,
+                    err,
+                    upstream_error::FailedAs::BadRequest,
+                )
+            })
         })?;
     place_new_chart(&state.clickhouse, &spec.board, &spec.spec.id).await;
     snapshot(&state.clickhouse, &spec.board, &principal).await;
@@ -1227,7 +1234,9 @@ pub async fn specs_preview(
 /// # Errors
 ///
 /// 400 on an unparseable body, a missing `id`, or a validation/`ClickHouse`
-/// failure.
+/// failure; 422 with the limit's sentence when the chart's own statement ended
+/// at the caller's time limit (`BI-45`, plan D5), in which case the stored
+/// chart is left as it was.
 pub async fn specs_update(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1283,13 +1292,20 @@ pub async fn specs_update(
     let spec = store::spec_from_input(ch, &input, ChartSource::Ui, "ui", Some(id), &time)
         .await
         .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
-    store::insert_chart(ch, &spec).await.map_err(|err| {
-        upstream_error::ch_error_as(
-            &upstream_error::DATABASE,
-            &err,
-            upstream_error::FailedAs::BadRequest,
-        )
-    })?;
+    // QA `LH-BI-5-01` (`BI-45`, plan D5): as a create, the statement runs once
+    // under the caller's limit first; a limit that ends it is a 422 with the
+    // sentence and the old chart stays as it was.
+    crate::routes::support::insert_chart_checked(ch, &spec)
+        .await
+        .map_err(|failure| {
+            crate::routes::support::failure_as_api_error(failure, |err| {
+                upstream_error::ch_error_as(
+                    &upstream_error::DATABASE,
+                    err,
+                    upstream_error::FailedAs::BadRequest,
+                )
+            })
+        })?;
     // The board it left changed too, when the edit moved it.
     if old_board != spec.board {
         snapshot(ch, &old_board, &principal).await;

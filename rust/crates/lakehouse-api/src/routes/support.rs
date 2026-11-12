@@ -595,6 +595,39 @@ pub(crate) fn failure_as_api_error(
     }
 }
 
+/// Save `spec` from the console, its own statement checked under the caller's
+/// limit first (`BI-45`, plan D5; QA `LH-BI-5-01`).
+///
+/// The statement is run AS STORED, not rewritten for roles: a save keeps
+/// today's meaning, "does this statement execute", and only gains the time
+/// limit, the row cap and the query id — a chart a role's masks would change
+/// is saved as its author wrote it, and the mask is applied when someone reads
+/// it. The import of a dashboard file, the version revert and Duplicate of a
+/// whole dashboard still call [`store::smoke_test_chart`]: they check up to
+/// 200 charts in one request and need their own rule for a chart the limit
+/// ends (plan §4).
+///
+/// # Errors
+///
+/// [`SpecRunFailure::Tile`] when the limit or a Stop ended the statement (the
+/// answer carries the limit's sentence), [`SpecRunFailure::Refused`] when the
+/// limits cannot be read, or [`SpecRunFailure::Clickhouse`] when the engine
+/// failed or the row could not be written; nothing is stored in any of those
+/// cases.
+pub(crate) async fn insert_chart_checked(
+    ch: &ChClient,
+    spec: &store::StoredChartSpec,
+) -> Result<(), SpecRunFailure> {
+    if !spec.spec.sql.is_empty() {
+        // The rows are dropped: a save asks whether the statement executes
+        // under the limit, not what it returns.
+        run_statement_limited(ch, &spec.spec.sql).await?;
+    }
+    store::insert_chart_unchecked(ch, spec)
+        .await
+        .map_err(SpecRunFailure::Clickhouse)
+}
+
 /// Run `fut` (one tile's queries) with the rows its kind may read (`BI-5`
 /// review B1): a `pointmap` or `geoheat` reads up to the administrator's map
 /// limit, a `pivot` up to the cap its own statement carries (its `LIMIT`, one
@@ -1466,6 +1499,210 @@ mod limited_run {
         assert_eq!(settings["max_execution_time"], "60");
         assert_eq!(settings["max_result_rows"], "2001");
         assert!(settings.contains_key("query_id"), "{settings:?}");
+    }
+
+    /// A stored chart whose statement is `sql`, on `mart_x` (the shape
+    /// `store::spec_from_input` returns, without reading a mart).
+    fn stored_chart(sql: &str) -> store::StoredChartSpec {
+        let def: store::ChartInput = serde_json::from_value(json!({
+            "title": "Visitors",
+            "kind": "bar",
+            "mart": "mart_x",
+            "dimension": "d",
+            "measures": ["v"],
+        }))
+        .expect("a bar chart definition");
+        store::StoredChartSpec {
+            spec: store::ChartSpec {
+                id: "u_1".to_owned(),
+                title: "Visitors".to_owned(),
+                subtitle: None,
+                kind: lakehouse_bi::specs::ChartKind::Bar,
+                mart: "mart_x".to_owned(),
+                sql_source: None,
+                sql: sql.to_owned(),
+                x: "d".to_owned(),
+                y: lakehouse_bi::specs::ChartY::Single("v".to_owned()),
+                series: None,
+                map: None,
+                lat: None,
+                lon: None,
+                format: None,
+                span: None,
+                text: None,
+                caption: None,
+                target: None,
+                click: None,
+            },
+            source: ChartSource::Ui,
+            board: "b1".to_owned(),
+            def,
+            has_year: false,
+            created_by: Some("ui".to_owned()),
+            created_at: None,
+        }
+    }
+
+    /// QA `LH-BI-5-01` (`BI-45`, plan D5): a chart whose statement the limit
+    /// ended is not saved, and the failure is the limit's sentence — the same
+    /// words Query Studio uses for its own limit.
+    #[tokio::test]
+    async fn a_chart_whose_statement_hits_the_time_limit_is_not_saved_and_the_failure_is_the_limit_sentence()
+     {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(TIMEOUT_BODY))
+            .mount(&server)
+            .await;
+        let ch = clickhouse(&server);
+
+        let Err(err) = insert_chart_checked(&ch, &stored_chart("SELECT 1 AS n")).await else {
+            panic!("a statement the limit ended must not be saved");
+        };
+
+        let SpecRunFailure::Tile(answer) = err else {
+            panic!("the limit's answer, not {err:?}");
+        };
+        assert_eq!(
+            answer["error"], "This chart stopped after 60 seconds, the limit for this install.",
+            "{answer}"
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| !String::from_utf8_lossy(&r.body).contains("INSERT INTO console.bi_chart")),
+            "a chart the limit ended was written anyway"
+        );
+    }
+
+    /// `BI-45` plan D5: a save runs its statement once, under the caller's
+    /// limit, and only then writes the row.
+    #[tokio::test]
+    async fn a_chart_whose_statement_runs_is_saved_after_one_limited_run() {
+        let server = MockServer::start().await;
+        // The statement, the bootstrap's DDL and the `INSERT` all answer the
+        // engine's "Ok."; what the test reads is the order and the settings.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("Ok."))
+            .mount(&server)
+            .await;
+        let ch = clickhouse(&server);
+
+        insert_chart_checked(&ch, &stored_chart("SELECT 1 AS n"))
+            .await
+            .expect("a statement that runs is saved");
+
+        let requests = server.received_requests().await.unwrap();
+        let bodies: Vec<String> = requests
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        let select = requests
+            .iter()
+            .position(|r| String::from_utf8_lossy(&r.body).contains("SELECT 1 AS n"))
+            .expect("the chart's statement ran");
+        assert_eq!(url_settings(&requests[select])["max_execution_time"], "60");
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|b| b.contains("INSERT INTO console.bi_chart"))
+                .count(),
+            1,
+            "one row is written, once"
+        );
+        assert!(
+            select
+                < bodies
+                    .iter()
+                    .position(|b| b.contains("INSERT INTO console.bi_chart"))
+                    .expect("the row was written"),
+            "the statement runs before the row is written"
+        );
+    }
+
+    /// `BI-45` plan D5/D6: the one mapping from a failed limited statement to
+    /// a console answer — the limit's sentence as a 422, and an engine failure
+    /// through the caller's own mapping (never its text).
+    #[test]
+    fn a_limit_failure_becomes_a_422_with_the_sentence_and_an_engine_failure_keeps_the_callers_mapping()
+     {
+        let limit = json!({
+            "error": "This chart stopped after 5 seconds, the limit for your role.",
+            "limit": {"kind": "time", "value": 5, "source": {"kind": "role", "name": "Analyst"}},
+        });
+        let err = failure_as_api_error(SpecRunFailure::Tile(limit), |_err| {
+            lakehouse_core::ApiError::Internal("the engine's own answer".to_owned())
+        });
+        assert!(
+            matches!(
+                &err,
+                lakehouse_core::ApiError::Unprocessable(message)
+                    if message == "This chart stopped after 5 seconds, the limit for your role."
+            ),
+            "{err:?}"
+        );
+        // A tile answer without a sentence still says something fixed.
+        let err = failure_as_api_error(SpecRunFailure::Tile(json!({ "limit": {} })), |_err| {
+            lakehouse_core::ApiError::Internal("unused".to_owned())
+        });
+        assert!(
+            matches!(
+                &err,
+                lakehouse_core::ApiError::Unprocessable(message) if message == "The query did not finish."
+            ),
+            "{err:?}"
+        );
+        let err = failure_as_api_error(
+            SpecRunFailure::Refused("The query limits could not be read.".to_owned()),
+            |_err| lakehouse_core::ApiError::Internal("unused".to_owned()),
+        );
+        assert!(
+            matches!(
+                &err,
+                lakehouse_core::ApiError::Unprocessable(message)
+                    if message == "The query limits could not be read."
+            ),
+            "{err:?}"
+        );
+        let err = failure_as_api_error(
+            SpecRunFailure::Gated(lakehouse_core::ApiError::NotFound(
+                "Gold mart 'x' not found in serving.".to_owned(),
+            )),
+            |_err| lakehouse_core::ApiError::Internal("unused".to_owned()),
+        );
+        assert!(
+            matches!(&err, lakehouse_core::ApiError::NotFound(_)),
+            "the gate keeps its own answer: {err:?}"
+        );
+        let err = failure_as_api_error(
+            SpecRunFailure::Clickhouse(ChError::Server(
+                "Code: 62. DB::Exception: planted-marker".to_owned(),
+            )),
+            |err| {
+                upstream_error::ch_error_as(
+                    &upstream_error::DATABASE,
+                    err,
+                    upstream_error::FailedAs::BadRequest,
+                )
+            },
+        );
+        assert!(
+            !format!("{err:?}").contains("planted-marker"),
+            "the engine's text reached the answer: {err:?}"
+        );
+        assert!(
+            // The console's save keeps its own status for an engine failure:
+            // `FailedAs::BadRequest`, with the fixed database sentence.
+            matches!(
+                &err,
+                lakehouse_core::ApiError::BadRequest(message)
+                    if message.starts_with("The database request failed.")
+            ),
+            "{err:?}"
+        );
     }
 }
 
