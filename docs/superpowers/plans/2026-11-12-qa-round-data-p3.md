@@ -1851,3 +1851,123 @@ weakened, every QA case id cited exists in the backlog row, and the documents st
 - Check: the reviewer's own run of `bun test src/features/governance/table-picker.test.tsx` on
   `c7067d4a3~1` with the new test applied.
 
+
+### Round 1 fixes (developer)
+
+Developer: `opencode-go/deepseek-v4.1-flash` (not Opus). One finding per commit, each pushed to
+`origin/fix/qa-round-data-p3`; no force-push; no pull request opened or edited. The branch was
+brought up to `main` first: `67b3bd23` (`Merge remote-tracking branch 'origin/main' into
+fix/qa-round-data-p3`, no conflict). Every "wrong change" below was applied, the named test run,
+and the change undone; the text quoted is what the run printed.
+
+| Finding | Commit | What changed |
+| --- | --- | --- |
+| R3 | `8037383a` | `ensure_rule_table` asks `catalog_tenant_refusal` before the table (headers passed in, so create, an update that changes the table and the assistant all get it); the 403 is the same for every table. |
+| R1 | `f353cd11` | `draft_quality_rule` takes the dispatcher's principal and passes it to `create_quality_rule`; the false "no person behind it" comment is replaced. |
+| R2 | `ada20180` | `tier2_governance_drafts.rs` gets its own `app()` with a wiremock `ClickHouse` behind `CH_URL` answering `system.columns`; every existing assertion is unchanged. |
+| R4 | `1913276f` | The upload's sentence names no time ("…start after the orchestrator reports this load, not when the load ends…"), the changelog entry, D20 and T20 match, and the test asserts no `minute`/`second`. |
+| R5 | `945746d2` | `the_snippet_never_cuts_inside_a_character` cuts a 129-character `é`/`ö` description and reads a 202-character CJK one through `find`. |
+| R6 | `5aa0accc` | The "same sentence" test compares the narrowed caller's hidden-table refusal with an unrestricted caller's missing-table refusal (stand-in mounted). |
+| R7 | `4c9ffd33` | A table name that is not an `Ident` is refused in `ensure_rule_table` before either engine is asked; `bronze.orders-2024` and `bronze.` join the loop, and a new test proves a failed engine answer is a 503. |
+| R8 | `d3088b66` | `readable_asset_names` answers no names without `catalog:read`, so the tag-key sentence counts and names nobody. |
+| R9 | `9a79ac3d` | `set_certification` carries `IS DISTINCT FROM (EXCLUDED.…)` and answers whether it wrote; the handler audits and drops the search copy only then. The read-side early return is gone: with the statement deciding it was a second copy of the same guard (rule 4). |
+| R10 | `bebbf029` | The description piece starts at the word as typed, else the first part, else the first token within one edit of a part. |
+| R11 | `be70eff7` | The picker's fallback names `silver.<table>`, `serving.<table>` or `bronze.<table>`; the stale test title is renamed. |
+| R12 | `a7e4e2b3` | The handoff's T9 option order and its "would panic on a byte slice" clause are corrected to what the old code printed. |
+
+Proof, per finding (test, then the failure on the wrong change):
+
+- R3 `quality_incidents::a_caller_outside_the_catalog_tenant_is_refused_before_the_table_is_asked_about`.
+  Without the gate: `assertion left == right failed: {"id":"1dfba8c9-…","name":"r3_outside","asset":"silver.orders",…}`,
+  `left: 201`, `right: 403`.
+- R1 `quality_incidents::the_assistant_cannot_draft_a_rule_on_a_table_the_person_may_not_read`.
+  With `None` passed again:
+  `assertion left == right failed: {"tool":"draft_quality_rule","outcome":"executed","result":{"id":"315be2ca-…","name":"r1_hidden","asset":"silver.customers",…}}`,
+  `left: String("executed")`, `right: "failed"`.
+- R2 `tier2_governance_drafts::draft_quality_rule_is_never_passed_or_failed` fails with the
+  stand-in removed: `assertion left == right failed: draft_quality_rule:
+  {"tool":"draft_quality_rule","outcome":"failed","result":{"error":"The table could not be
+  checked. Try again."}}`, `left: String("failed")`, `right: "executed"` (the failure R2
+  predicted). `a_drafted_rule_for_a_table_that_is_not_there_is_refused` fails the same way.
+- R4 `upload-file-page.test.tsx says when on-load checks run once the load has finished`, with the
+  old sentence: `expect(received).not.toMatch(expected)` — `Expected substring or pattern: not
+  /minute|second/`, `Received: "Quality checks set to run on every load start within about a
+  minute. Their results are on the table's Quality tab."`.
+- R5 the same test with `line[start..end]`: `panicked at …catalog_search.rs:420:27: start byte
+  index 41 is not a char boundary; it is inside 'é' (bytes 40..42 of string)`.
+- R6 `a_rule_for_a_table_the_role_may_not_read_is_refused_with_the_same_sentence`, with a sentence
+  of its own in the `Ok(None)` arm: `left: "\"T\" is not a table you can read. Pick the table as
+  silver.<table>, serving.<table> or bronze.<table>."`, `right: "\"T\" is not a table you can read:
+  no such table."`.
+- R7 `a_rule_for_a_table_that_is_not_there_is_refused_and_nothing_is_stored` with the guard
+  dropped: `bronze.orders-2024: {"error":"The table could not be checked. Try again."}`, `left:
+  503`, `right: 400`. `a_table_that_cannot_be_checked_is_a_503_not_a_refusal` with `Err` mapped to
+  the refusal: `left: 400`, `right: 503`.
+- R8 `tag_key_handlers::a_caller_without_catalog_read_is_told_the_count_and_no_name` with the
+  permission check dropped: `{"error":"\"data_domain\" is still given to 2 tables: Orders,
+  Customers. Remove it from those tables first."}`.
+- R9 `lakehouse-store` `setting_the_mark_that_is_already_set_writes_no_row`, with the `WHERE`
+  removed: `a save carrying what is stored writes no row`.
+- R10 `a_description_match_carries_the_text_around_the_word`, with `position = 0`:
+  `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa…`.
+- R11 `table-picker.test.tsx is free text, with the reason, when the catalog cannot be read`, with
+  the old sentence: `Unable to find an element with the text: Could not read the catalog's tables;
+  type the table as silver.<table>, serving.<table> or bronze.<table>..` (the page printed
+  `…type the table as namespace.table.`).
+- R12 is the handoff itself: `bun test src/features/governance/table-picker.test.tsx` with
+  `c7067d4a~1`'s component printed `["primer.No Table", "primer.Northwind Orders",
+  "silver.Orders Clean"]` for `offers each row's table key, never its display name`, and
+  `["primer.Raw Orders", "silver.Orders"]` for the test that picks one.
+
+Integration test files that create a quality rule or call `draft_quality_rule` (the R2 step's
+`grep -rln "governance/quality\|draft_quality_rule" rust/crates/lakehouse-api/tests`), each run on
+the final commit:
+
+```text
+cargo test -p lakehouse-api --test quality_incidents      # 14 passed; 0 failed
+cargo test -p lakehouse-api --test tier2_governance_drafts # 5 passed; 0 failed
+cargo test -p lakehouse-api --test route_auth             # 93 passed; 0 failed
+cargo test -p lakehouse-api --test quality_anomalies      # 5 passed; 0 failed
+cargo test -p lakehouse-api --test upstream_errors        # 7 passed; 0 failed
+cargo test -p lakehouse-api --test quality_schedules      # 4 passed; 0 failed
+```
+
+Only `tier2_governance_drafts` failed for R2's reason; `route_auth` and `upstream_errors` read the
+quality routes without creating a rule and pass unchanged.
+
+Commands on the final commit (`a7e4e2b3`), from `rust/` with
+`CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-2 CARGO_BUILD_JOBS=6`:
+
+```text
+cargo fmt --check                                          # ok, no diff
+cargo clippy -p lakehouse-api -p lakehouse-store --all-targets -- -D warnings   # ok
+cargo test -p lakehouse-store --test annotation            # 21 passed; 0 failed
+cargo test -p lakehouse-api --lib routes::catalog_search   # 35 passed; 0 failed; 3518 filtered out
+cargo test -p lakehouse-api --lib routes::catalog          # 247 passed; 0 failed; 3306 filtered out
+cargo test -p lakehouse-api --lib routes::governance       # 70 passed; 0 failed; 3483 filtered out
+cargo test -p lakehouse-api --lib routes::quality          # 46 passed; 0 failed; 3507 filtered out
+cargo test -p lakehouse-api --lib routes::ai::tools        # 258 passed; 0 failed; 3295 filtered out
+```
+
+From the repository root:
+
+```text
+bun run typecheck      # ok, no output
+bun run lint           # 0 errors, 11 warnings (none in a file this round touched)
+bun run test           # 4087 passed, 1 skipped, 0 failed, 12325 expect() calls, 381 files, 74.70s
+python3 ops/lint/check_bare_iceberg_count.py        # R11 guard: no bare count() against a Bronze Iceberg table found.
+python3 ops/lint/check_intra_package_imports.py     # OK: all intra-package dispar_orchestrate imports resolve
+git status                                          # clean (nothing generated staged)
+```
+
+Not verified, and why:
+
+- `cargo test --workspace` — *not verified locally*, CI runs it (`REL-20`). The scoped commands
+  above are what was run.
+- `run_rule`'s missing tenant gate — deliberately not fixed: the planner files it as its own
+  backlog row (R3's ruling).
+- One `bun run test` of this handoff reported 1 failed (4086 passed, 1 skipped, 12325 expect
+  calls, 74.27s); the three after it reported 0 failed (4088 tests, 4087 passed, 1 skipped each).
+  Only the tail of the first run was kept, so which test it was is *not verified*.
+- `docker compose config` / `up`: nothing under `docker-compose.yml` or `dagster/` changed this
+  round, so neither ran.
