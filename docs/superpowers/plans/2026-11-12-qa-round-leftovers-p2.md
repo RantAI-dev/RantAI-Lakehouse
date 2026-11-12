@@ -1238,3 +1238,123 @@ test's assertions are identical to `main`'s, and the two changed row counts in
 - Check: with the second option, must fail with `|| reason == EMAIL_NOT_SET_UP` removed from
   `report_runner.rs:351`.
 
+
+### Round 1 fixes (developer)
+
+Branch `fix/qa-round-leftovers-p2`, one commit per finding, each pushed after its scoped checks.
+
+**Merge first.** `git merge origin/main` before the fixes, no conflict, committed as
+`ccc7f08e` ("46 files changed, 3397 insertions(+), 140 deletions(-)"). The planner's review
+commit (`e431f303`) was pulled fast-forward (`1 file changed, 194 insertions(+)`).
+
+| Finding | Commit | What changed |
+| --- | --- | --- |
+| R1 | `7f6a168d` | the three `LH-DATA-1-06` sites say `#484 review R4 (DATA-56)`; no code change |
+| R2 | `8e904965` | `a_log_capture_sees_a_call_site_another_thread_reached_first`, a shared call site reached first from a thread with no subscriber |
+| R3 | `482c8daa` | `early_failure` takes the mart's lock for its write and writes nothing when a publish holds it; `early_failure_under_lock` for the token read; two `wiremock` unit tests; route doc and D19 |
+| R4 | `28b1d8dc` | `list_tenants_by_ids` reads `ORDER BY id`, doc comment corrected, `sqlx::test` for the order; plan D4 and section 4 |
+| R5 | `0e41a6ca` | `early_failure`, `record_export_history` and the `gold_export_history` module doc now say what the code does (at most one row per call; `exists == false` is D23, a failed `system.tables` read never builds an `Attempt`) |
+| R6 | `4f0e73e9` | `signing out clears the stored tenant before the request answers`: the stub holds the sign-out answer, storage is read while it is pending |
+| R7 | `2ee8e992` | the list test makes the subscription due and runs `report_runner::tick` with an `EmailSender` from `runtime_settings::email`, so a scheduled delivery is what is counted (or not) |
+
+**R1.** `git grep -n "LH-DATA-1-06"` on the branch prints only this plan's review text. The
+commit body of `b0a5e51c7` still names `LH-DATA-1-06`; that QA case does not exist (principle
+2) and no history was rewritten — this is the correction by name.
+
+**R2, proof.** With the `Once` + `set_global_default` replaced by a per-thread
+`tracing::subscriber::set_default` kept in the guard,
+
+```
+cargo test -p lakehouse-api --test report_runner another_thread_reached_first
+thread 'a_log_capture_sees_a_call_site_another_thread_reached_first' panicked at
+crates/lakehouse-api/tests/report_runner.rs:1045:5:
+assertion `left == right` failed: the site registered on the other thread must still reach this capture:
+  left: 0
+ right: 1
+test result: FAILED. 0 passed; 1 failed; 0 ignored
+```
+
+and the sibling `a_log_capture_keeps_what_its_own_thread_logs_and_nothing_from_another_thread`
+still passed (1 passed), as the finding said. On the branch both pass (2 passed).
+One limit of the proof, measured: in a full parallel `cargo test --test report_runner` run
+with the same wrong change the new test passed 3 of 3, because the sibling capture test's
+live subscriber is a second dispatcher — `tracing-core` 0.1.36 then answers `sometimes`
+instead of `never` for the shared site. CI (`cargo nextest run --workspace`) runs one test
+per process, where the wrong change fails as above; `cargo test` on a single filter does too.
+
+**R3, proof.** With the `try_acquire` guard removed from `early_failure`:
+
+```
+cargo test -p lakehouse-api --lib an_early_failure
+test routes::gold::tests::an_early_failure_while_a_publish_is_in_flight_is_not_recorded ... FAILED
+assertion `left == right` failed: the publish in flight records its own run; a row here would hide its result
+  left: 1
+ right: 0
+```
+
+`an_early_failure_with_no_publish_in_flight_is_recorded_once` stayed green (one insert), so
+the pair distinguishes the two cases. On the branch both pass (2 passed).
+
+**R4, proof.** With `ORDER BY id` removed:
+
+```
+cargo test -p lakehouse-store --lib list_tenants_by_ids
+assertion `left == right` failed: ascending id is the order the console's first tenant depends on
+  left: ["11111111-1111-4111-8111-000000aa0002", "11111111-1111-4111-8111-000000aa0001"]
+ right: ["11111111-1111-4111-8111-000000aa0001", "11111111-1111-4111-8111-000000aa0002"]
+```
+
+On the branch it passes (1 passed).
+
+**R5.** Reading only, per the finding: no test applies.
+
+**R6, proof.** With `clearActiveTenantId()` moved below `await authClient.logout()`:
+
+```
+bun test src/features/auth/auth-provider-tenant.test.tsx
+(fail) AuthProvider and the stored tenant (ADM-15) > signing out clears the stored tenant before the request answers
+error: expect(received).toBeNull()
+Received: "a2"
+  at …/auth-provider-tenant.test.tsx:166:61
+8 pass, 1 fail
+```
+
+The pre-existing "signing out clears the stored tenant" still passed, which is the gap the
+finding described. On the branch: 9 pass, 0 fail.
+
+**R7, proof.** With `|| reason == EMAIL_NOT_SET_UP` removed from the counting guard:
+
+```
+cargo test -p lakehouse-api --test report_routes the_list_says_a_subscription_is_not_sent
+assertion `left == right` failed: DEC-18: a scheduled delivery that fails for this reason is not counted
+  left: Number(1)
+ right: Number(0)
+```
+
+and with the scheduled delivery absent the same assertions passed before this change, which
+is why the scheduled run is driven. On the branch (1 passed).
+
+**Verification on the final fix commit `2ee8e992`** (foreground, from the shared
+`CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-1`, `CARGO_BUILD_JOBS=6`):
+
+- `cargo fmt --check` — clean.
+- `cargo clippy -p lakehouse-api -p lakehouse-store --all-targets -- -D warnings` — finished, no warning.
+- `cargo test -p lakehouse-api --test report_runner` — 26 passed, 0 failed, run three times in
+  a row (26, 26, 26).
+- `cargo test -p lakehouse-api --test gold_publication` — 22 passed, 0 failed.
+- `cargo test -p lakehouse-api --test report_routes` — 16 passed, 0 failed.
+- `cargo test -p lakehouse-store --lib list_tenants_by_ids` — 1 passed, 0 failed.
+- `bun run typecheck` — clean; `bun run lint` — 0 errors, 11 pre-existing warnings; `bun run test`
+  — 4070 pass, 1 skip, 0 fail (4071 tests, 381 files).
+- `python3 ops/lint/check_bare_iceberg_count.py && python3 ops/lint/check_intra_package_imports.py`
+  — both OK.
+- `grep -rn "LH-DATA-1-06" rust src docs …` — only this plan's review text.
+
+**Not verified.** `cargo test --workspace` and the dagster/compose checks were not run (CI
+runs the full suite; this round touched no Python or compose file). The R2 wrong-change
+proof under a full parallel `cargo test --test report_runner` is the measured limit noted
+above, not a green claim.
+
+**Containers.** The `gold_publication` run started one `ClickHouse` container
+(`eloquent_wright`, created 22:37); it was removed with `docker rm -f`. The labelled Postgres
+(`sleepy_pike`) and the `ClickHouse` containers created before this session were left alone.
