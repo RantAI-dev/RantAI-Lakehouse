@@ -1140,7 +1140,12 @@ fix with `{"tool":"run_ingest","outcome":"executed","result":{"runId":"never"}}`
 Proof: `the_end_report_cannot_write_the_timed_out_reason` failed before the fix with
 `assertion left: 200, right: 400` (`{"recorded":true}`).
 
-#### Commands run on the final commit (`7c0fc58b`), with their counts
+**Follow-up** `1f85c157` — R8's client change left `ConnectorRun` unused in
+`src/services/clients/connectors.ts`, the one lint warning this round added (12 to 11 warnings once
+removed); `bun run typecheck`, `bun run lint` and `bun test src/features/connectors/` (451 passed) ran
+on it, and the block below was re-run on it.
+
+#### Commands run on the final commit (`1f85c157`), with their counts
 
 ```
 cd rust && cargo fmt --check
@@ -1160,7 +1165,7 @@ cargo test -p lakehouse-api --test ingest_run
 bun run typecheck
   clean (no output)
 bun run lint
-  ✖ 12 problems (0 errors, 12 warnings) — the warnings are on `main` too, none added here
+  ✖ 11 problems (0 errors, 11 warnings) — all pre-existing (none in a file this round changed)
 bun run test
   4001 pass, 1 skip, 0 fail, 11993 expect() calls, 4002 tests across 380 files [82.11s]
 docker compose --profile '*' config --quiet
