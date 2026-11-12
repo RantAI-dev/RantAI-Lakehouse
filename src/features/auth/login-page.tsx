@@ -143,13 +143,18 @@ export function LoginPage() {
       // along. `authClient.parse` already maps 401 → `permission_denied`.
       const serviceError = toServiceError(err);
       if (serviceError.code === "too_many_requests") {
-        let msg = serviceError.message;
+        // QA LH-SEC-2-02 (ADM-14 D13): ONE sentence, the console's, when the
+        // server said how long to wait. It used to join the server's
+        // sentence to the console's — "Try again later. Try again in about 5
+        // minutes." — which says the same thing twice. Without a wait, the
+        // server's sentence stands as it is.
         if (serviceError.retryAfterSecs && serviceError.retryAfterSecs > 0) {
           const minutes = Math.ceil(serviceError.retryAfterSecs / 60);
           const minutesText = minutes === 1 ? "1 minute" : `${minutes} minutes`;
-          msg += ` Try again in about ${minutesText}.`;
+          setError(`Too many failed sign-in attempts: try again in about ${minutesText}.`);
+        } else {
+          setError(serviceError.message);
         }
-        setError(msg);
       } else {
         setError(
           serviceError.code === "permission_denied"
