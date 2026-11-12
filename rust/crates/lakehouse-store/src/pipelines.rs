@@ -860,20 +860,27 @@ impl From<FullPipelineRow> for Pipeline {
     }
 }
 
-impl From<&FullPipelineRow> for PipelineDefinitionSnapshot {
-    fn from(row: &FullPipelineRow) -> Self {
+impl TryFrom<&FullPipelineRow> for PipelineDefinitionSnapshot {
+    type Error = StoreError;
+
+    /// BLD-1 part 1 review R1-B5: this used `From` with `unwrap_or_default()`
+    /// on three columns, so a snapshot written for an unreadable row recorded
+    /// an EMPTY definition — which a restore would then write back. It fails
+    /// closed instead, with [`StoreError::CorruptDefinition`] (through the
+    /// `serde_json::Error` conversion).
+    fn try_from(row: &FullPipelineRow) -> Result<Self, StoreError> {
         let (source_zone, source_table) = split_zone_table(&row.source);
         let (target_zone, target_table) = split_zone_table(&row.target);
-        let transforms: Vec<String> =
-            serde_json::from_value(row.transforms.clone()).unwrap_or_default();
+        let transforms: Vec<String> = serde_json::from_value(row.transforms.clone())
+            .map_err(|_| StoreError::CorruptDefinition)?;
         // BLD-1 part 1 / D13: the snapshot carries the new shape, decoded
         // from the same row that produced the legacy fields, so the two
         // cannot describe different pipelines.
-        let inputs: Vec<PipelineInput> =
-            serde_json::from_value(row.inputs.clone()).unwrap_or_default();
+        let inputs: Vec<PipelineInput> = serde_json::from_value(row.inputs.clone())
+            .map_err(|_| StoreError::CorruptDefinition)?;
         let steps: Vec<PipelineStep> =
-            serde_json::from_value(row.steps.clone()).unwrap_or_default();
-        Self {
+            serde_json::from_value(row.steps.clone()).map_err(|_| StoreError::CorruptDefinition)?;
+        Ok(Self {
             kind: row.kind.clone(),
             inputs,
             steps,
@@ -891,7 +898,7 @@ impl From<&FullPipelineRow> for PipelineDefinitionSnapshot {
             depends_on: row.depends_on.clone(),
             name: row.name.clone(),
             status: row.status.clone(),
-        }
+        })
     }
 }
 
@@ -1050,24 +1057,29 @@ pub async fn get_definition(
     .bind(id)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|row| {
+    row.map(|row| -> Result<AuthoredDefinition, StoreError> {
         // Mirrors `create_pipeline`'s own `format!("{}.{}", zone, table)`
         // construction — split back into the two halves it came from.
         let (source_zone, source_table) = split_zone_table(&row.source);
         let (target_zone, target_table) = split_zone_table(&row.target);
-        let transforms: Vec<String> = serde_json::from_value(row.transforms).unwrap_or_default();
-        // BLD-1 part 1 / D1: the stored shape. A row written before
-        // migration `0137` (or one the migration's backfill missed for any
-        // reason) has `[]`, and D3's rule is what turns it back into one
-        // input, so `inputs` is never empty on a readable pipeline.
-        let inputs: Vec<PipelineInput> = serde_json::from_value(row.inputs).unwrap_or_default();
-        let steps: Vec<PipelineStep> = serde_json::from_value(row.steps).unwrap_or_default();
+        // BLD-1 part 1 review R1-B5: a column this crate wrote and cannot
+        // read is a refusal, never an empty definition — an empty `steps`
+        // would compile to a plain copy and overwrite the output.
+        let transforms: Vec<String> =
+            serde_json::from_value(row.transforms).map_err(|_| StoreError::CorruptDefinition)?;
+        // A row written before migration `0137` (or one its backfill missed)
+        // has `[]`, and D3's rule is what turns it back into one input, so
+        // `inputs` is never empty on a readable pipeline.
+        let inputs: Vec<PipelineInput> =
+            serde_json::from_value(row.inputs).map_err(|_| StoreError::CorruptDefinition)?;
+        let steps: Vec<PipelineStep> =
+            serde_json::from_value(row.steps).map_err(|_| StoreError::CorruptDefinition)?;
         let (inputs, steps) = if inputs.is_empty() {
             legacy_definition(&source_zone, &source_table, &transforms)
         } else {
             (inputs, steps)
         };
-        AuthoredDefinition {
+        Ok(AuthoredDefinition {
             inputs,
             steps,
             source_zone,
@@ -1079,8 +1091,9 @@ pub async fn get_definition(
             target_table,
             connector_id: row.connector_id,
             max_retries: row.max_retries,
-        }
-    }))
+        })
+    })
+    .transpose()
 }
 
 /// Split a `"<zone>.<table>"` location on its first `.`, matching
@@ -1276,11 +1289,13 @@ pub async fn create_pipeline(
     // lost their defaults in `0048_pipeline_never_run.sql`, so omitting
     // them here inserts `NULL` — a freshly authored pipeline has honestly
     // never run, not a fabricated "just now".
-    let transforms = serde_json::to_value(&columns.transforms).unwrap_or(serde_json::Value::Null);
+    // R1-B5: an encode failure is a `StoreError`, not a NULL column — a NULL
+    // would decode to "no definition" and read as a plain copy.
+    let transforms = serde_json::to_value(&columns.transforms)?;
     // BLD-1 part 1 / D13: the new shape is written as it will be read, from
     // the same `definition_*` values the legacy columns came from.
-    let inputs_json = serde_json::to_value(&definition_inputs).unwrap_or(serde_json::Value::Null);
-    let steps_json = serde_json::to_value(&definition_steps).unwrap_or(serde_json::Value::Null);
+    let inputs_json = serde_json::to_value(&definition_inputs)?;
+    let steps_json = serde_json::to_value(&definition_steps)?;
     // `max_retries` (migration 0051): a present input is bound as-is; an
     // absent input resolves to the migration's `DEFAULT 2` here so the
     // row carries the same value either way (the column has no other
@@ -1330,7 +1345,7 @@ schedule, description, incremental_column, fbic_enabled, transforms, \
         .bind(input.run_as)
         .fetch_one(&mut *tx)
         .await?;
-    let snapshot = PipelineDefinitionSnapshot::from(&row);
+    let snapshot = PipelineDefinitionSnapshot::try_from(&row)?;
     insert_definition_version(
         &mut tx,
         &row.id,
@@ -1534,9 +1549,9 @@ async fn update_pipeline_with_event(
     let columns = definition_columns(&definition_inputs, &definition_steps);
     let source = columns.source;
     let target = format!("{}.{}", input.target_zone, input.target_table);
-    let transforms = serde_json::to_value(&columns.transforms).unwrap_or(serde_json::Value::Null);
-    let inputs_json = serde_json::to_value(&definition_inputs).unwrap_or(serde_json::Value::Null);
-    let steps_json = serde_json::to_value(&definition_steps).unwrap_or(serde_json::Value::Null);
+    let transforms = serde_json::to_value(&columns.transforms)?;
+    let inputs_json = serde_json::to_value(&definition_inputs)?;
+    let steps_json = serde_json::to_value(&definition_steps)?;
     // `max_retries` (migration 0051): `COALESCE($N, max_retries)` —
     // the route layer rejects out-of-range values with 400 first, so
     // the CHECK constraint here is defense in depth for whatever
@@ -1616,7 +1631,7 @@ owner = COALESCE($10, owner), max_retries = COALESCE($11, max_retries), \
             cycle.join(" -> ")
         )));
     }
-    let snapshot = PipelineDefinitionSnapshot::from(&row);
+    let snapshot = PipelineDefinitionSnapshot::try_from(&row)?;
     insert_definition_version(
         &mut tx,
         &row.id,
@@ -1672,7 +1687,7 @@ pub async fn delete_pipeline(
         tx.rollback().await?;
         return Ok(false);
     };
-    let snapshot = PipelineDefinitionSnapshot::from(&row);
+    let snapshot = PipelineDefinitionSnapshot::try_from(&row)?;
     let done = sqlx::query("DELETE FROM pipeline_definition WHERE id = $1")
         .bind(id)
         .execute(&mut *tx)

@@ -3869,3 +3869,66 @@ async fn the_cycle_check_sees_a_cycle_through_a_second_input(pool: PgPool) -> sq
     );
     Ok(())
 }
+
+// ── BLD-1 part 1 review R1-B5: a definition that cannot be read ────────
+
+/// R1-B5: `steps` this crate wrote and cannot decode is a refusal, never an
+/// empty definition — an empty `steps` compiles to a plain copy, which would
+/// overwrite the pipeline's output with unfiltered rows (principle 3).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_undecodable_steps_column_is_refused(pool: PgPool) -> sqlx::Result<()> {
+    let created = pipelines::create_pipeline(&pool, &input(), None)
+        .await
+        .expect("create should succeed");
+    sqlx::query("UPDATE pipeline_definition SET steps = '[{\"unknown\": true}]' WHERE id = $1")
+        .bind(&created.id)
+        .execute(&pool)
+        .await?;
+
+    let refused = pipelines::get_definition(&pool, &created.id).await;
+    assert!(
+        matches!(refused, Err(StoreError::CorruptDefinition)),
+        "an unreadable definition must be refused, got {refused:?}"
+    );
+    Ok(())
+}
+
+/// R1-B5, the write side: a version snapshot is built from the same row, so a
+/// corrupt one must not record an empty definition that a restore would then
+/// replay. `delete_pipeline` snapshots the PRE-delete row, which is corrupt:
+/// it fails closed and deletes nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_undecodable_definition_writes_no_snapshot(pool: PgPool) -> sqlx::Result<()> {
+    let created = pipelines::create_pipeline(&pool, &input(), None)
+        .await
+        .expect("create should succeed");
+    sqlx::query("UPDATE pipeline_definition SET inputs = '\"not an array\"' WHERE id = $1")
+        .bind(&created.id)
+        .execute(&pool)
+        .await?;
+
+    let refused = pipelines::delete_pipeline(&pool, &created.id, None).await;
+    assert!(
+        matches!(refused, Err(StoreError::CorruptDefinition)),
+        "the delete must fail closed, got {refused:?}"
+    );
+    assert!(
+        pipelines::get_pipeline(&pool, &created.id)
+            .await
+            .expect("get_pipeline")
+            .is_some(),
+        "a refused delete leaves the row"
+    );
+    let versions: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM pipeline_definition_version \
+         WHERE pipeline_id = $1 AND event = 'deleted'",
+    )
+    .bind(&created.id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        versions.0, 0,
+        "no snapshot may be written for a corrupt row"
+    );
+    Ok(())
+}
