@@ -1029,3 +1029,197 @@ reused, not started, and was left alone.
   compose, Python or dependency change in this slice.
 
 ## 6. Review
+
+### Round 1 (planner, 2026-11-12), at `4577ae57`
+
+Read against the plan and `AGENTS.md`; nothing was run for this review, CI on the draft pull
+request (#492) runs the suites. 1 BLOCKER (R1) and 6 SHOULD-FIX. No test was weakened: the PDF
+test's assertions are identical to `main`'s, and the two changed row counts in
+`tests/gold_publication.rs` are exact.
+
+**Planner's rulings** (where a ruling and a finding's "Fix" differ, the ruling holds).
+
+- **R1.** `LH-DATA-1-06` is not a QA case: nothing in the Lark base, the backlog or the plan
+  has that id (principle 2). At the three sites and in any later commit body, cite what this
+  work really comes from: `#484 review R4 (DATA-56)`. The commit `b0a5e51c7` stays as it is
+  (no history is rewritten); the handoff says its body names a case that does not exist.
+- **R2.** As the finding says: the shared-call-site test is the proof `REL-25` lacks.
+- **R3 (changes D19).** As the finding says: a failure before the per-mart lock is recorded
+  only when no publish of that mart is in flight; otherwise nothing is written and the error
+  is returned, by the rule of the `409`.
+- **R4 (changes D4 and section 4): in scope.** `list_tenants_by_ids` gets `ORDER BY id`, with
+  the `sqlx::test` the finding names, so the tenant the console starts in is the one the
+  server already uses without a header and nobody's data moves at the deploy.
+- **`notSent` on every subscription while e-mail is not set up: the plan (D13, D14) stands.**
+  While the installation has no e-mail, no subscription can be sent now, whatever its last
+  delivery was; the sentence is about now. The reviewer's brief was wrong on this point.
+- **R5, R6, R7.** As the findings say.
+
+### R1. BLOCKER: three fix sites and one commit body cite a QA case, `LH-DATA-1-06`, that exists nowhere in the plan, the backlog or any document of the repository.
+
+- Where: `rust/crates/lakehouse-api/src/routes/gold.rs:423` (route doc, "(QA `LH-DATA-1-06`)"),
+  `rust/crates/lakehouse-api/src/routes/gold.rs:478` (inline comment "QA `LH-DATA-1-06` (#484
+  review R4, DATA-56)"), `rust/crates/lakehouse-api/tests/gold_publication.rs:1121` (test doc),
+  and the body of commit `b0a5e51c7` ("(QA LH-DATA-1-06)").
+- What happens: `DATA-56` has no QA case. Its backlog row (`docs/core/BACKLOG.md:358`) names
+  its source as "#484 review, R4 (2026-11-12)", and the plan says "`DATA-56` (under `DATA-1`,
+  #484 review R4)" with no case. `git grep LH-DATA-1-06` finds only these three new lines; the
+  only `LH-DATA-1-*` cases the repository knows are `-01`, `-02` and `-51`. The ID looks copied
+  by analogy from `LH-RPT-1-06` (the real case of `RPT-2`). A reader who follows the tag finds
+  nothing, or a different case if the QA base ever numbers one `LH-DATA-1-06`. This is
+  principle 2 (never fabricate) and rule 13 (cite the finding) at a fix site; rule 1 as well.
+  It is a three-line fix, but it must not merge as written.
+- Fix: at the three sites cite only what exists: `DATA-56`, `#484 review R4`. In the body of the
+  fix commit say by name that `b0a5e51c7`'s body cites a QA case that does not exist (principle
+  5: a falsified claim is corrected by name); do not rewrite the pushed commit.
+- Check: `git grep -n "LH-DATA-1-06"` on the branch returns nothing outside the plan's review
+  section. No test applies.
+
+### R2. SHOULD-FIX: no test of T1 fails on the code before the change, so nothing in the suite proves `REL-25` is fixed or would catch the per-thread subscriber coming back.
+
+- Where: `rust/crates/lakehouse-api/tests/report_runner.rs:1020`
+  (`a_log_capture_keeps_what_its_own_thread_logs_and_nothing_from_another_thread`) and the
+  handoff's MISMATCH (plan section 5).
+- What happens: the handoff says the PDF test passed 3 of 3 before the change on that
+  machine and 5 of 5 after, so the five green runs prove nothing about the fix. The one new
+  test logs from the other thread at a DIFFERENT call site ("logged by another thread") than
+  the capturing thread ("logged by this thread"). It proves the per-thread isolation of the
+  writer, not the thing D9 is about: a call site SHARED with a thread that has no subscriber of
+  its own. Temporary wrong change that the whole file survives: in `LogCapture::start`
+  replace the `Once` + `set_global_default` with a per-thread `tracing::subscriber::set_default`
+  kept in the guard (the old mechanism, same writer). Both capture tests still pass.
+- Fix: add a plain `#[test]`, for example
+  `a_log_capture_sees_a_call_site_another_thread_reached_first`: a helper
+  `fn shared_site() { tracing::error!("from the shared call site"); }`; start a capture; run
+  `shared_site` on a `std::thread::spawn(..)` that is joined (that thread registers the call
+  site first); then call `shared_site()` on the test's thread; assert the text contains
+  "from the shared call site" exactly once. By `tracing-core` 0.1.36 (the reading D9 gives:
+  with one dispatcher the call site's interest is taken from the registering thread's default
+  and kept for the process) this fails deterministically with a per-thread `set_default` and
+  passes with the global subscriber, on any machine, under `cargo test` and under `nextest`.
+- Check: the new test passes on the branch; it must fail with the temporary change named
+  above (per-thread `set_default` instead of `set_global_default`). That run is the
+  "failed before" evidence the handoff could not give.
+
+### R3. SHOULD-FIX (plan D19, not a developer deviation): a failure recorded BEFORE the per-mart lock, while another publish of the same mart is in flight, is newer than that publish's row and hides its result, which is the exact harm D19 gives as the reason not to record the `409`.
+
+- Where: `rust/crates/lakehouse-api/src/routes/gold.rs:485-497` (the fingerprint read and the
+  `?ifChanged=true` history read both run before `try_acquire` at `:505-514`), `:783-801`
+  (`early_failure`), and the ordering in
+  `rust/crates/lakehouse-api/src/gold_export_history.rs:481-490` (`ORDER BY started_at DESC,
+  finished_at DESC LIMIT 1`).
+- What happens: publish A holds the lock and is exporting; its row will carry
+  `started_at` = the moment `export_mart` began (10:00:00). At 10:01:00 a second call B for the
+  same mart (the scheduler's `?ifChanged=true`, or a second click) fails its fingerprint read
+  or its history read (for example the `count()`/`sum(cityHash64(*))` query times out or hits
+  a memory limit while A is reading the same table). B has not reached the lock, so
+  `early_failure` writes a failed row with `started_at` 10:01:00. A then succeeds and writes
+  its row with `started_at` 10:00:00. `last_export_run` returns B's row: the card says "Last
+  publish failed" although the newest copy was published successfully after it, until the
+  next publish; and because a failed newest run is never skipped (`DATA-49`), the next
+  scheduled run exports the unchanged mart again. Had B got as far as the lock it would have
+  been a `409` with no row, for exactly this reason (the comment at `:502-504`).
+- Fix (planner's decision, then the developer): record a pre-lock early failure only when no
+  publish of that mart is in flight. In `early_failure`, for the two pre-lock sites, take
+  `state.gold_export_locks.try_acquire(mart)` and write the row only when it succeeds, holding
+  the guard for the write; when the lock is held, write nothing and return the error (same
+  rule and same comment as the `409`). The token site already holds the lock and needs no
+  change. Say it in the route's "What is recorded" section and in D19.
+- Check: a unit-level test in `gold.rs` that calls `early_failure` (or a small extracted
+  helper) with the mart's lock already held and asserts no insert reaches `ClickHouse`
+  (the file's existing mock-server pattern), and one with the lock free that asserts one
+  insert. Must fail: with the `try_acquire` guard removed from `early_failure`.
+
+### R4. SHOULD-FIX (plan D4, not a developer deviation): the tenant now written when nothing is stored is the first of an UNORDERED list, so it can differ from the server's default, changes what an existing multi-tenant person sees after this deploy, and is not the same tenant from one sign-in to the next.
+
+- Where: `src/features/auth/auth-provider.tsx:159-162` (`resolveActiveTenant(stored,
+  me.tenants)` then `writeActiveTenantId(resolved)`), `:68-74` (`tenants[0]`);
+  `rust/crates/lakehouse-store/src/identity.rs:1260-1264` (`SELECT id, name, slug FROM tenant
+  WHERE id = ANY($1)`, no `ORDER BY`, documented "in no particular order");
+  `rust/crates/lakehouse-auth/src/repository.rs:135-142` (`ORDER BY tenant_id`, with the comment
+  that the first tenant is "who acts" without a header);
+  `rust/crates/lakehouse-api/src/tenant_scope.rs:86` (`principal.tenant_ids.first()`).
+- What happens: a person in tenants T1 < T2 (by id) who never used the switcher. On `main`:
+  nothing stored, no `X-Tenant`, the server answers for T1 (lowest id) on every page. After
+  this deploy: `load()` writes `me.tenants[0]`; if Postgres returns T2 first, every request
+  now carries T2 and the person's lists, connectors and query tabs are T2's, with no action
+  on their part. (The navbar already said `me.tenants[0]`, so the label and the data now
+  agree; the data is what moved.) Second effect: sign-out now clears the key, so EVERY
+  sign-in starts from `me.tenants[0]`; with no `ORDER BY`, an update of a `tenant` row (a
+  rename) can change which row comes first, so the same person can start in a different
+  tenant on different days. A person who had picked a tenant loses the pick at each sign-out;
+  that part is D3 and decided. The plan names the missing `ORDER BY` in D4 and puts it out of
+  scope in section 4 on the ground that "the two orders no longer have to agree"; that holds
+  for the label, not for the change at deploy nor for the start tenant being stable.
+- Fix (planner's decision; it is outside this plan's file list): add `ORDER BY id` to
+  `list_tenants_by_ids` (and correct its doc comment), so `me.tenants[0]` is the same tenant
+  the server already defaults to: nobody's data moves at deploy and the start tenant is
+  deterministic. If that stays out of scope, give it a backlog row and say in the PR that
+  header-less multi-tenant people may land in another of their own tenants after the deploy.
+- Check: a `sqlx::test` in `lakehouse-store` that inserts two tenants whose insertion order is
+  the reverse of their id order (and updates the lower one so its row moves), calls
+  `list_tenants_by_ids` and asserts ascending id. Must fail: with the `ORDER BY` removed (on a
+  sequential scan the updated row comes last).
+
+### R5. SHOULD-FIX: three new doc comments say things the code does not do (rule 1, and T2 step 10 asked for exactly these comments to be made true).
+
+- Where: `rust/crates/lakehouse-api/src/routes/gold.rs:775-777` (`early_failure`),
+  `rust/crates/lakehouse-api/src/routes/gold.rs:594-598` (`record_export_history`),
+  `rust/crates/lakehouse-api/src/gold_export_history.rs:19-25` (module doc).
+- What happens:
+  1. `early_failure`'s doc says "`attempt.exists` carries the one answer that may not be
+     recorded: the read of `system.tables` that failed". It does not. A failed read of
+     `system.tables` returns from `Attempt::open` (`gold.rs:683-699`) and never builds an
+     `Attempt`; `exists == false` means the read SUCCEEDED and the name is not a table (D23).
+     The comment describes the wrong row of D19, at the one `if` that decides whether history
+     is written.
+  2. `record_export_history`'s doc and the module doc of `gold_export_history.rs` say every
+     `POST` "that gets past the mart's existence records exactly one row, success or failure".
+     Two calls that get past it record none (a `?ifChanged=true` skip, and the `409`), and a
+     name that is NOT in `system.tables` still records one when `export_mart` is reached (as
+     on `main`, D23). The route's own "What is recorded" section (`gold.rs:418-435`) is right;
+     these two contradict it.
+- Fix: `early_failure`: "`attempt.exists` is `false` for a name `system.tables` does not list
+  (D23): such a name goes on as before and no early failure is recorded for it. A failed read
+  of `system.tables` never gets here (`Attempt::open` returns it unrecorded)."
+  `record_export_history` and the module doc: "at most one row per call: none for a refusal,
+  a skip under `?ifChanged=true` or a `409`; one for the export's outcome; one for a failure
+  before the export on a mart `system.tables` lists", pointing at the route's section.
+- Check: reading; no test.
+
+### R6. SHOULD-FIX: D5's order ("`logout()` removes the key before it calls the API, so it is gone even if that request never returns") is not asserted by any test.
+
+- Where: `src/features/auth/auth-provider-tenant.test.tsx:126-141` (`signing out clears the
+  stored tenant`), against `src/features/auth/auth-provider.tsx:189-199`.
+- What happens: the test's `fetch` stub answers the sign-out at once and the test only waits
+  for the key to be absent afterwards. Temporary wrong change that passes all eight tests:
+  move `clearActiveTenantId()` to after `await authClient.logout()`. With that change a
+  sign-out whose request hangs (or a tab closed while it is pending) leaves the previous
+  person's tenant stored, which is the case D5 was written for.
+- Fix: in that test (or a new one, `signing out clears the stored tenant before the request
+  answers`), make the stub return a promise for `/api/auth/logout` that the test resolves
+  later; after the click assert, while it is still pending, that the request was recorded in
+  `seen`, carried no `X-Tenant`, and `localStorage.getItem(ACTIVE_TENANT_STORAGE_KEY)` is
+  already `null`; then resolve it.
+- Check: must fail with `clearActiveTenantId()` moved below the `await`.
+
+### R7. SHOULD-FIX: the two "DEC-18" assertions of the new list test are true whatever the counting rule is, because the only delivery in the test is a "Send now".
+
+- Where: `rust/crates/lakehouse-api/tests/report_routes.rs:952-957`
+  (`the_list_says_a_subscription_is_not_sent_while_email_is_not_set_up_and_nothing_is_counted`).
+- What happens: `routes/report_runner.rs:351` returns before counting when
+  `manual || reason == EMAIL_NOT_SET_UP`. The test sends through `POST …/send` (manual), so
+  `consecutiveFailures == 0` and `paused == false` hold with the `DEC-18` half of that
+  condition deleted. Temporary wrong change that the test survives: `if manual {` at
+  `report_runner.rs:351`. The rule itself is covered elsewhere
+  (`tests/report_runner.rs:1149-1151`, a run through the runner), so nothing is unprotected;
+  the messages "DEC-18: a delivery that fails for this reason is not counted" claim more than
+  the test shows. The plan asked for exactly these assertions, so this is the plan's wording
+  as much as the developer's.
+- Fix: either reword the two messages and the test's name to what is shown ("a failed Send now
+  is not counted and nothing is paused"), or drive a scheduled delivery in this harness (set
+  the subscription's `next_run_at` in the past and call `report_runner::tick` with an
+  `EmailSender` built from `runtime_settings::email`) before reading the list.
+- Check: with the second option, must fail with `|| reason == EMAIL_NOT_SET_UP` removed from
+  `report_runner.rs:351`.
+
