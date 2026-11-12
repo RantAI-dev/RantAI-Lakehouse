@@ -78,7 +78,7 @@ Lakeflow Designer does.
 - Python steps and notebooks. Not decided (`DEC-1`); needs a runner that is
   isolated from the orchestrator's secrets first.
 - dbt projects (`DEC-2`).
-- Refreshing only the changed rows. Every run rebuilds the output (`BLD-11`).
+- Refreshing only the changed rows. Every run rebuilds the output (`BLD-12`).
 - More than one statement in a step, and statements that change data or
   tables.
 - Storing a pipeline in a Git repository.
@@ -107,11 +107,11 @@ reviews that part.
 | 11 | Publishing a step as a table | Later (part 3) | Product owner, 2026-11-12 |
 | 12 | Window functions in a SQL step *(proposed)* | Allowed. It is still one `SELECT` through the same access rewrite. Replaces "no window functions" of 2026-10-14 | |
 | 13 | Who a preview reads as *(proposed)* | The person looking, never the author, so an editor sees no row the author can see and they cannot | |
-| 14 | Who the pipeline reads as after someone else edits it *(proposed)* | When someone other than the author changes the inputs or the steps, the pipeline reads as that person from then on. Closes `SEC-70` | |
+| 14 | Who the pipeline reads as after someone else edits it *(proposed)* | When someone other than the author changes the inputs or the steps, the pipeline reads as that person from then on. Closes `SEC-71` | |
 | 15 | Steps per pipeline *(proposed)* | 20 | |
 | 16 | Length of a SQL step *(proposed)* | 20,000 characters, the limit a dashboard's SQL source has | |
 | 17 | Time limit of a preview *(proposed)* | 30 seconds | |
-| 18 | Kind and incremental column *(proposed)* | Removed from the page. Nothing reads them today; every run rebuilds the output (`BLD-11`) | |
+| 18 | Kind and incremental column *(proposed)* | Removed from the page. Nothing reads them today; every run rebuilds the output (`BLD-12`) | |
 
 ## Limits to tell a customer
 

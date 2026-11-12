@@ -47,7 +47,7 @@ Findings on `main`, each handled below or in the backlog:
   to the API.
 - **F3. `kind` and `incrementalColumn` do nothing.** The orchestrator never
   reads `incrementalColumn`, and `kind` is not in what it receives
-  (`RunnablePipeline`, `pipelines.rs:1408`). Backlog `BLD-11`; S3 removes
+  (`RunnablePipeline`, `pipelines.rs:1408`). Backlog `BLD-12`; S3 removes
   the two fields from the page (decision 18).
 - **F4. A comment claims a shared test file that one side does not load.**
   `authored_transforms.py` says `transform_test_vectors.json` is loaded by
@@ -55,11 +55,11 @@ Findings on `main`, each handled below or in the backlog:
   the claim true (`AGENTS.md` rule 1).
 - **F5. A draft from `generate` skips the checks `create` runs**
   (`routes/pipelines.rs:3340`), and moving a draft to ready checks nothing
-  (`:3575`). Backlog `BLD-12`. Not in this plan. After S1 such a pipeline
+  (`:3575`). Backlog `BLD-13`. Not in this plan. After S1 such a pipeline
   still fails closed when it runs, because the run route compiles and checks
   it.
 - **F6. An editor can make a pipeline read what only its author may read.**
-  `update` keeps `run_as`. Backlog `SEC-70`; D10 closes it.
+  `update` keeps `run_as`. Backlog `SEC-71`; D10 closes it.
 
 ## 2. Decisions (planner; the product owner's are cited by number)
 
@@ -187,7 +187,7 @@ Findings on `main`, each handled below or in the backlog:
   runs every check except the rewrite, and the pipeline does not run until
   an administrator assigns an author, as today.
 
-- **D10. Who it reads as after an edit** (decision 14, closes `SEC-70`).
+- **D10. Who it reads as after an edit** (decision 14, closes `SEC-71`).
   On `update` and `restore_version`: when the caller is a user, is not the
   current `run_as`, and the inputs or steps differ from the stored ones,
   `run_as` becomes the caller, in the same transaction, and D9 checks as the
@@ -464,8 +464,8 @@ which pages were opened, in which theme, or *not verified*.
   (part 2).
 - Publishing a step as a table; output options (part 3).
 - The text form of a pipeline (last slice of part 1, planned after S3).
-- Python (`DEC-1`), dbt (`DEC-2`), refreshing only changed rows (`BLD-11`),
-  the checks on `generate` and on ready (`BLD-12`).
+- Python (`DEC-1`), dbt (`DEC-2`), refreshing only changed rows (`BLD-12`),
+  the checks on `generate` and on ready (`BLD-13`).
 - Any change to `check_sql_source`'s behaviour, to Query Studio, or to the
   dashboard preview.
 

@@ -89,7 +89,7 @@ These are conditions of the feature, not options:
   filter on the result. Tableau Prep: join, aggregate and a custom SQL input.
 
 Where we stay behind after all three parts: Python and notebooks (`DEC-1`),
-dbt projects (`DEC-2`), refreshing only changed rows (`BLD-11`), pipelines
+dbt projects (`DEC-2`), refreshing only changed rows (`BLD-12`), pipelines
 kept in a Git repository.
 
 ## Acceptance checklist
