@@ -127,6 +127,20 @@ describe("ADM-13 D7: nav-config access map and drift tests", () => {
       )
     })
 
+    // QA LH-DATA-15-03 F2 (GOV-11, DEC-20): a `query:read` grant made from a
+    // table opens that table's page; the API decides which table, so the
+    // console lets the permission through and the catalog list stays as it
+    // was.
+    it("opens a table's page for query:read, and not the catalog", () => {
+      const queryReader = (p: string) => p === "query:read"
+      expect(canOpen("/data/assets/customers", queryReader)).toBe(true)
+      expect(canOpen("/catalog", queryReader)).toBe(false)
+
+      const dashboardViewer = (p: string) => p === "dashboard:read"
+      expect(canOpen("/data/assets/customers", dashboardViewer)).toBe(false)
+      expect(canOpen("/catalog", dashboardViewer)).toBe(false)
+    })
+
     it("gates the WEB-7 form pages with the permission their submit route needs", () => {
       const reader = (p: string) => p === "identity:read" || p === "catalog:read"
       const identityWriter = (p: string) => p === "identity:write"
