@@ -239,6 +239,46 @@ async fn the_lock_sets_exactly_one_audit_event_naming_neither_the_email_nor_the_
     }
 }
 
+/// QA LH-SEC-2-06 (SEC-70), decision D4: the lockout happened before anybody
+/// signed in, so the audit list shows what caused it — the sign-in form, a
+/// service, the system — never the assistant.
+#[tokio::test]
+async fn a_lock_is_listed_in_the_audit_log_as_the_sign_in_forms_and_not_the_assistants() {
+    let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "300")).await;
+    seed_password_identity(&pool).await;
+    // Walk the account into the lock exactly as the audit test above does.
+    for _ in 0..2 {
+        let resp = login(&router, THROTTLED_EMAIL, WRONG_PASSWORD).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let cookie = common::session_cookie_for_seeded_user(&pool, THROTTLED_EMAIL).await;
+    let mut resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/governance/audit")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_str(&body_string(&mut resp).await).expect("audit body is JSON");
+    let entry = body["audit"]
+        .as_array()
+        .expect("audit is an array")
+        .iter()
+        .find(|row| row["action"] == "auth.login_locked")
+        .expect("the lock is listed");
+    assert_eq!(entry["actor"], "Sign-in form");
+    assert_eq!(entry["actorKind"], "service");
+    assert_eq!(entry["source"], "system");
+}
+
 #[tokio::test]
 async fn a_storage_failure_during_login_is_not_rendered_or_counted_as_a_wrong_password() {
     let TestApp { router, pool } = spin_up_with_env(&env_with(MAX_FAILURES, "300")).await;
