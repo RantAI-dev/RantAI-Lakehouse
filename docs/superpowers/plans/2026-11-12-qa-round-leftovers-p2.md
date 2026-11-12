@@ -790,4 +790,242 @@ None of these blocks the plan.
 
 ## 5. Handoff
 
+Branch `fix/qa-round-leftovers-p2`, off `origin/fix/qa-round-leftovers-p2` at
+`f7645656` (the plan commit), base `main` at `2e7b178ea`. Everything below was
+run on this machine (ARM64, `CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-1`,
+`CARGO_BUILD_JOBS=6`), in the foreground.
+
+### Commits
+
+| Commit | Title |
+| --- | --- |
+| `b3b5ae26` | `test(report_runner): one process-wide subscriber, a capture per thread (REL-25)` |
+| `b0a5e51c` | `feat(gold): a publish that fails after the mart is found is a recorded failed run (DATA-56, #484 review R4)` |
+| `fdb58100` | `feat(reports): the list says per subscription that it is not sent while e-mail is not set up (RPT-2, LH-RPT-1-06)` |
+| `da2c74e3` | `feat(ai): listing reports warns while e-mail is not set up (RPT-2, assistant parity)` |
+| `195a1611` | `feat(console): a subscription row says Not sent while e-mail is not set up (RPT-2, LH-RPT-1-06)` |
+| `3edcf81c` | `feat(console): no X-Tenant on /api/auth calls, and a way to clear the key (ADM-15, #483 review)` |
+| `934d674d` | `feat(console): the stored tenant is the signed-in person's, and sign-out clears it (ADM-15, #483 review)` |
+| `3264aa76` | `docs(features): what DEC-18 and DATA-56 made true (RPT-2, DATA-56)` |
+
+Each was pushed to `origin/fix/qa-round-leftovers-p2` right after its commit.
+No PR was opened. The working tree was clean before every commit; nothing
+generated was staged.
+
+### MISMATCH
+
+- **`REL-25` does not reproduce here.** T1 asked for three runs of
+  `cargo test -p lakehouse-api --test report_runner` on the code before the
+  change, expecting "23 passed, 1 failed" on
+  `a_pdf_failure_is_logged_for_the_operator_and_the_record_stays_fixed`. On this
+  machine all three runs printed `test result: ok. 24 passed; 0 failed; 0
+  ignored` (the binary has 24 tests, not 24 with one failing). So the defect D9
+  describes was not observed in three runs of four threads' worth of tests, and
+  the "five runs of five" in the plan's own preamble is not reproduced. T1 was
+  built as planned anyway: the per-thread default is gone, the subscriber is
+  installed once for the process, and the writer keeps only its own thread's
+  bytes. Whether that was needed cannot be claimed from a failing run here —
+  what is verified is that the mechanism the plan describes is what the test now
+  does, and that a shared buffer makes the new guard fail.
+
+### What the plan could not verify, and what was measured
+
+- **T2 test 3 (a view outliving the table it reads): works.** ClickHouse 26.8 in
+  the testcontainer let `DROP TABLE serving.ghost_base_mart` succeed while
+  `serving.ghost_view_mart` still selected from it; the `POST` answered `422`,
+  the sentence started "The database request failed. Reference: ", the run was
+  recorded and neither carried `ghost_base_mart`. The test is in the commit.
+- **T2 test 4 statuses: as planned.** (a) a session with `query:read` and no
+  configured run token: `503`, `error` starts "gold export is not configured";
+  (b) `gold:export` in tenant `…0002` only: `404`; (c) a never-seeded name from
+  the catalog's tenant: `503` at the token file. No row for any of the three.
+- **T5 `formatDateTime`:** it reads RFC 3339 (`2026-11-12T04:15:00Z`) — which is
+  what `not_sent_json` writes, through `time`'s `Rfc3339`. It does NOT read the
+  Postgres rendering `2026-11-12 04:15:00 +00:00:00` (that answers "—", which
+  `describeNotSent` then leaves out). No change was needed; worth knowing if a
+  later field reuses a `started_at` string from another route.
+- **T7 "no other console test depends on nothing being stored": holds.**
+  `bun run test` is 4057 passed, 1 skipped, 0 failed (4058 tests, 381 files), and
+  no other file needed a `localStorage.clear()`.
+
+### Implementation notes the reviewer should see
+
+- **T2/T4–T18 shape.** The early-failure recording was written as
+  `early_failure(attempt, fingerprint, err)` with a private `Attempt` struct
+  (`open()` reads `system.tables` and starts the clock, `skip_body()` and
+  `catalog_token()` are the two steps that can fail there), because the in-line
+  version took `export` to 158 lines and `clippy::too_many_lines` was denied at
+  121/100. The order of D19 is unchanged and the recording still sits at each
+  failing step; no decision moved. `stored_error` and `record_export_history`
+  take `Result<&GoldExportResult, &ApiError>` as decided.
+- **T1 helper.** `LogCapture::text()` compares the reading thread with the one
+  that started the capture (`clippy::unused_self`), so a capture cannot be read
+  from another thread; the assertions and the test's name are unchanged.
+
+### Tests added, and the failure seen before each fix
+
+**T1** (`tests/report_runner.rs`)
+- `a_log_capture_keeps_what_its_own_thread_logs_and_nothing_from_another_thread`.
+  Fails with every thread appending to one shared buffer:
+  `panicked at crates/lakehouse-api/tests/report_runner.rs:1019` — the kept text
+  held `ERROR report_runner: logged by another thread` as well as
+  `logged by this thread`.
+- Must fail (a): with `let _logged = crate::routes::pdf_export::pdf_failure(err);`
+  removed from `src/routes/report_runner.rs`,
+  `a_pdf_failure_is_logged_…` FAILED on the `log.contains("pdf render failed")`
+  assertion (the captured text in the message was only the two `WARN`s from
+  `AppState`). Each "must fail" below was made, seen, and undone.
+
+**T2** (`tests/gold_publication.rs`)
+- `a_publish_that_cannot_read_the_catalog_token_is_recorded_and_the_card_says_it_failed`
+  — must fail with the token site back to `read_catalog_token(…).await?`:
+  `the card names the failure: {"mart":"tokenless_mart",…,"lastFailure":null,…}`.
+- `a_scheduled_publish_that_fails_before_the_export_is_recorded_each_time` — the
+  same temporary change: ``assertion `left == right` failed: run 1 is recorded / left: 0 / right: 1``.
+- `a_publish_whose_fingerprint_read_fails_is_recorded_with_the_classified_sentence`
+  — must fail with the fingerprint site back to `.map_err(…)?`:
+  ``assertion `left == right` failed: {"mart":"ghost_view_mart","runs":[]} / left: Null / right: "failed"``.
+- `a_refused_publish_and_a_name_that_is_not_a_mart_record_no_run` — must fail with
+  `if exists` removed from `early_failure` (always record):
+  ``assertion `left == right` failed: a name that is not a table is not a publish (DATA-56 D23) / left: 1 / right: 0``.
+- Two corrected assertions (rule 2, corrected not weakened): `busy_mart` 1 → 2
+  and `retry_after_failure_mart` 2 → 3, each with a message saying the `503` at
+  the token file is now a recorded failed run.
+
+**T3** (`src/routes/reports.rs` unit tests, `tests/report_routes.rs`)
+- `not_sent_is_null_while_email_is_set_up`
+- `not_sent_names_the_cause_and_the_time_of_a_last_attempt_that_failed_for_it` —
+  must fail with `not_sent_json` always `Null`: ``left: Null / right:
+  String("email_not_set_up")``.
+- `not_sent_has_no_time_when_the_last_delivery_was_sent_or_failed_for_another_reason`
+- `the_list_says_a_subscription_is_not_sent_while_email_is_not_set_up_and_nothing_is_counted`
+  — must fail with `not_sent_json` always `Null`: ``left: Null / right: Object
+  {"cause": String("email_not_set_up"), "lastAttemptAt": Null}``.
+- `the_list_says_nothing_of_the_kind_while_email_is_set_up` — must fail with
+  `not_sent_json` ignoring `email_set_up`: ``left: Object {"cause":
+  String("email_not_set_up"), …} / right: Null``.
+
+**T4** (`tests/ai_report_tools.rs`)
+- `listing_reports_warns_while_email_is_not_set_up` — must fail with the two added
+  lines removed: ``left: Null / right: "Email is not set up on this deployment,
+  so nothing is sent until it is."``.
+
+**T5** (`report-words.test.ts`, `subscriptions-dialog.test.tsx`)
+- `describeNotSent says the cause, and the time when there was an attempt` — must
+  fail with the time left out: `Expected: "… Last attempt: Nov 12, 2026, 04:15."`,
+  `Received: "… installation."`.
+- `describeNotSent says nothing for a subscription that can be sent or for a
+  cause it does not know`.
+- `shows Not sent with the time of the last attempt on a subscription while email
+  is not set up, instead of its last status` — must fail with the status line
+  rendered unconditionally (the row kept `Failed. Email is not set up on this
+  deployment.`).
+- `keeps the Paused line under Not sent`
+- `shows the last status as before when the list says nothing of the kind`
+
+**T6** (`http.test.ts`)
+- `leaves X-Tenant off a call to /api/auth even when a tenant is stored` — must
+  fail with the `isAuthCall` condition removed: `Expected: false / Received: true`.
+- `clearActiveTenantId removes the stored tenant and never throws when storage
+  does`
+
+**T7** (`auth-provider-tenant.test.tsx`, corrected test in
+`tenant-switcher.test.tsx`)
+- `signing out clears the stored tenant` — must fail with the clear removed from
+  `logout`.
+- `a second person never sends or shows the first person's tenant` — must fail
+  with the correction removed from `load`.
+- `a person signing in after another signed out starts in their own first tenant`
+  — fails with either of those two removals.
+- `a person with no tenant has none stored` — must fail with the correction
+  removed from `load`.
+- `a person whose stored tenant is still theirs keeps it` — a control; it passes
+  on the old code too.
+- `a failed session check leaves the stored tenant alone` — a control.
+- `picking a tenant that is not the person's changes nothing` — must fail with
+  the guard removed from `setActiveTenant`.
+- `resolveActiveTenant keeps a tenant that is the person's, else takes the first,
+  else none` — unit.
+- The corrected existing test `setActiveTenant writes lh_active_tenant and a
+  sibling useAuth consumer observes the change`: the person has two tenants,
+  starts on the first, switches to the second from a click.
+
+### Commands, with the counts they printed
+
+Before T1, on `f7645656` (three runs, to check D9):
+
+```
+cargo test -p lakehouse-api --test report_runner   # ×3
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out   (all three)
+```
+
+Per commit (only what it touched):
+
+```
+(T1) cargo fmt --check                                             clean
+     cargo clippy -p lakehouse-api --all-targets -- -D warnings     Finished, no warning
+     cargo test -p lakehouse-api --test report_runner               ok. 25 passed; 0 failed   ×5
+(T2) cargo test -p lakehouse-api --lib the_stored_error_…           ok. 1 passed; 0 failed
+     cargo test -p lakehouse-api --test gold_publication            ok. 22 passed; 0 failed
+     cargo test -p lakehouse-api --test gold_export_auth            ok. 7 passed; 0 failed
+(T3) cargo test -p lakehouse-api --lib not_sent_                    ok. 5 passed; 0 failed
+     cargo test -p lakehouse-api --test report_routes               ok. 16 passed; 0 failed
+(T4) cargo test -p lakehouse-api --test ai_report_tools             ok. 13 passed; 0 failed
+(T5) bun test report-words.test.ts (6 pass) + subscriptions-dialog.test.tsx (14 pass), 0 fail
+(T6) bun test src/services/http.test.ts                            5 pass, 0 fail
+(T7) bun test auth-provider-tenant / tenant-switcher / login-page  8 / 8 / 3 pass, 0 fail
+     bun run test                                                  4057 pass, 1 skip, 0 fail
+```
+
+Before handoff, once, in the foreground, on `3264aa76`:
+
+```
+cd rust && cargo fmt --check                                        clean
+cargo clippy -p lakehouse-api --all-targets -- -D warnings           Finished, no warning
+cargo test -p lakehouse-api --lib the_stored_error_of_a_failed_publish_is_the_classified_sentence
+                                                                     ok. 1 passed; 0 failed
+cargo test -p lakehouse-api --lib not_sent_                          ok. 5 passed; 0 failed
+for i in 1 2 3 4 5; do cargo test -p lakehouse-api --test report_runner; done
+   run 1 ok. 25 passed; 0 failed
+   run 2 ok. 25 passed; 0 failed
+   run 3 ok. 25 passed; 0 failed
+   run 4 ok. 25 passed; 0 failed
+   run 5 ok. 25 passed; 0 failed
+cargo test -p lakehouse-api --test gold_publication                  ok. 22 passed; 0 failed
+cargo test -p lakehouse-api --test gold_export_auth                  ok. 7 passed; 0 failed
+cargo test -p lakehouse-api --test report_routes                     ok. 16 passed; 0 failed
+cargo test -p lakehouse-api --test ai_report_tools                   ok. 13 passed; 0 failed
+cd .. && bun run typecheck                                           no output (clean)
+bun run lint                                                         11 problems (0 errors, 11 warnings) — all pre-existing
+bun run test                                                         4057 pass, 1 skip, 0 fail (4058 tests, 381 files)
+python3 ops/lint/check_bare_iceberg_count.py                         "R11 guard: no bare count() … found."
+python3 ops/lint/check_intra_package_imports.py                      "OK: all intra-package dispar_orchestrate imports resolve"
+git status                                                           nothing modified, nothing staged
+```
+
+### Containers
+
+`docker ps -a` before the first test run: 32 containers (31 `ClickHouse` 26.8
+from other checkouts' earlier runs, 1 Postgres). My `gold_publication` runs
+started 7 `ClickHouse` testcontainers of their own — six left by the T2
+iterations (`d8c3fde464cd`, `77a9a2de8cb8`, `589c8fc998a7`, `dc4c5e3c354f`,
+`629039be0010`, `3dad0fb983df`) and one by the final block
+(`98586c3133f6`). All seven were removed with `docker rm -f`; the count is back
+to the 32 that were there before. The Postgres of `lakehouse-test-support` was
+reused, not started, and was left alone.
+
+### Not verified
+
+- `cargo test --workspace` — **not run locally**; the plan gives it to CI on the
+  pull request (three nextest partitions plus `cargo test --doc`).
+- `cargo clippy --workspace --all-targets --all-features` — **not run**; only
+  `-p lakehouse-api`, as section 3 names. The workspace run is CI's.
+- The `409` of a second publish in flight recording nothing, and the failed
+  history read of `?ifChanged=true` recording a run: **not tested**, for the
+  reasons T2 gives (a second publish in flight cannot be held from a router
+  test; the shared `ClickHouse` cannot fail only the history table). The
+  reviewer reads those two sites, which are marked at the code.
+- `docker compose config` / `up`, Python tests, `gitleaks`: **not run** — no
+  compose, Python or dependency change in this slice.
+
 ## 6. Review
