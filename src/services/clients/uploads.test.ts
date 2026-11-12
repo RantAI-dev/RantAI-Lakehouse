@@ -438,6 +438,20 @@ describe("uploadService folders (DATA-35)", () => {
     ])
   })
 
+  it("sends the table filter as table=<name> and nothing when it is empty", async () => {
+    const calls = stubFetch(() => json([]))
+    await uploadService.list(undefined, { table: "stock" })
+    await uploadService.list(undefined, { table: " stock " })
+    await uploadService.list(undefined, { table: "" })
+    await uploadService.list(undefined, { table: "   " })
+    expect(calls.map((c) => c.url)).toEqual([
+      "/api/uploads?table=stock",
+      "/api/uploads?table=stock",
+      "/api/uploads",
+      "/api/uploads",
+    ])
+  })
+
   it("lists, creates, renames, moves and deletes folders on the folder routes", async () => {
     // The list route answers an array of folders; every other folder route answers one.
     let listing = true

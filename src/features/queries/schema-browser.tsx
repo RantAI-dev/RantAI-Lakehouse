@@ -166,6 +166,14 @@ function TableRow({
         : proof?.status === "failed"
           ? TABLE_PROOF_FAILED
           : NO_SQL_NAME
+  // LH-QS-4-08: on a Trino tab a Bronze table's columns follow
+  // its row. A row that is not insertable (proving, failed) has columns that
+  // are not either, and a row whose Iceberg table is not there has none to
+  // show. A ClickHouse tab reads a Bronze table with Trino anyway, so its
+  // columns stay as they were.
+  const columnsFollowRow = table.trinoOnly === true && engine === "trino"
+  const columnsLocked = columnsFollowRow && !insertable
+  const noTable = columnsFollowRow && proof?.status === "missing"
   return (
     <li>
       <div className="flex items-center gap-1">
@@ -208,7 +216,9 @@ function TableRow({
       </div>
       {open ? (
         <div className="ml-8 border-l border-border pl-2">
-          {!state || state.status === "loading" ? (
+          {noTable ? (
+            <p className="py-1 text-xs text-muted-foreground">{NO_READABLE_TABLE}</p>
+          ) : !state || state.status === "loading" ? (
             <p className="py-1 text-xs text-muted-foreground">Loading columns…</p>
           ) : state.status === "failed" ? (
             <div className="py-1 text-xs">
@@ -231,8 +241,10 @@ function TableRow({
                 <li key={column.name}>
                   <button
                     type="button"
-                    className="flex w-full items-baseline justify-between gap-2 rounded px-1 py-0.5 text-left hover:bg-muted"
+                    className="flex w-full items-baseline justify-between gap-2 rounded px-1 py-0.5 text-left hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-transparent"
                     aria-label={`Insert column ${quoteIdent(column.name)}`}
+                    disabled={columnsLocked}
+                    title={columnsLocked ? missingReason : undefined}
                     onClick={() => onInsert(quoteIdent(column.name))}
                   >
                     <span className="truncate font-mono text-xs">{column.name}</span>

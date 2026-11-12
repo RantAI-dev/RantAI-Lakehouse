@@ -26,16 +26,17 @@ import type {
   GoldExportRun,
   GoldPublication,
   GoldReadBack,
+  GoldTrimSummary,
 } from "@/services/contracts/gold"
 
 function trimmedMart(assetId: string): string {
   return assetId.startsWith("serving.") ? assetId.slice("serving.".length) : assetId
 }
 
-function LastFiveRuns({ mart }: { mart: string }) {
+function LastFiveRuns({ mart, runsKey }: { mart: string; runsKey: number }) {
   const state = useService<GoldExportRun[]>(
     (signal) => goldService.listExportRuns(mart, signal),
-    [mart]
+    [mart, runsKey]
   )
   if (state.status === "loading") return <LoadingSkeleton rows={3} />
   if (state.status === "error") return <ErrorState error={state.error} onRetry={state.reload} />
@@ -74,9 +75,29 @@ function LastFiveRuns({ mart }: { mart: string }) {
   )
 }
 
+/**
+ * The detail after the copy count (`DATA-49`, D17): when the last trim counted
+ * it, and the oldest copy that trim kept.
+ *
+ * The number is the trim's, and no trim follows a manual publish (the Dagster
+ * `trim_gold_mart` op is the only writer of `console.gold_trim_run`), so a
+ * publish after the trim is not in it. Saying when it was counted is what keeps
+ * the number honest; the card must not pass it off as a live count.
+ */
+function copiesKeptDetail(trim: GoldTrimSummary): string {
+  const parts = [
+    trim.finishedAt !== "" ? `counted ${formatDateTime(trim.finishedAt)}` : null,
+    trim.oldestKeptExportedAt ? `oldest ${formatDateTime(trim.oldestKeptExportedAt)}` : null,
+  ].filter((part): part is string => part !== null)
+  return parts.length > 0 ? ` (${parts.join("; ")})` : ""
+}
+
 const stateLabelClass = (label: string): string => {
   if (label === "Up to date") return "font-medium text-green-600 dark:text-green-400"
   if (label === "Out of date") return "font-medium text-amber-600 dark:text-amber-400"
+  // QA LH-DATA-1-01 (DATA-49): a failed newest run is the state that needs a
+  // person, so it reads in the destructive tone, not the muted one.
+  if (label === "Last publish failed") return "font-medium text-destructive"
   return "font-medium text-muted-foreground"
 }
 
@@ -140,13 +161,13 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
   // console read a 401 as an expired session. So nothing is requested until
   // the publication says this person may; the card still shows its state.
   const mayReadHistory = pub.status === "success" && pub.data.canEdit
+  // QA LH-DATA-1-01 (DATA-49): a mart never published answers 200 with
+  // `published: false`, so nothing is caught here — a failure is a failure and
+  // the row below says it could not be read, instead of passing as "never
+  // published".
   const lastExport = useService<GoldReadBack | null>(async (signal) => {
     if (!mayReadHistory) return null
-    try {
-      return await goldService.getLastExport(mart, signal)
-    } catch {
-      return null
-    }
+    return await goldService.getLastExport(mart, signal)
   }, [mart, mayReadHistory])
   const readers = useService<GoldConsumers>(
     (signal) => goldService.getConsumers(mart, signal),
@@ -156,6 +177,9 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
     (signal, enabled: boolean) => goldService.setPublication(mart, enabled, signal)
   )
   const exportNow = useServiceAction((signal) => goldService.triggerExport(mart, signal))
+  // Bumped after a publish so `LastFiveRuns` reads again: its `useService` is keyed
+  // on the mart alone, so a new run would otherwise stay unseen.
+  const [runsKey, setRunsKey] = React.useState(0)
 
   async function handleToggle(checked: boolean) {
     const result = await toggle.run(checked)
@@ -175,7 +199,7 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
   // PR slice D review D-B3: always show the freshness line and,
   // when a publish exists, the last published time and snapshot,
   // whether the switch is on or off.
-  const showHistory = hasHistory && lastExport.status === "success" && lastExport.data
+  const showHistory = hasHistory && lastExport.status === "success" && lastExport.data?.published === true
 
   return (
     <SectionCard
@@ -222,6 +246,23 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
             {line}
           </span>
         </div>
+        {/* QA LH-DATA-1-01 (DATA-49): what failed, when, and where the last good
+            copy stands — so "Last publish failed" is actionable without opening
+            the history. The failure's own sentence is the API's. */}
+        {p.lastFailure && (
+          <>
+            <p className="text-xs text-destructive" data-testid="publication-failure">
+              {p.lastFailure.failedAt
+                ? `Failed ${formatDateTime(p.lastFailure.failedAt)}: ${p.lastFailure.reason}`
+                : `Failed: ${p.lastFailure.reason}`}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              {p.lastExportedAt
+                ? `Last successful publish: ${formatDateTime(p.lastExportedAt)}.`
+                : "Nothing has been published yet."}
+            </p>
+          </>
+        )}
         {!enabled && hasHistory && (
           <p className="text-xs text-muted-foreground">
             Publishing is off; this copy is no longer updated.
@@ -232,22 +273,33 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
           <dd className="col-span-2">
             <ReadersValue state={readers} />
           </dd>
-          {showHistory && (
+          {showHistory && lastExport.data && (
             <>
               <dt className="text-muted-foreground">Last published</dt>
-              <dd className="col-span-2">{lastExport.data!.exportedAt ? formatDateTime(lastExport.data!.exportedAt) : "—"}</dd>
+              <dd className="col-span-2">{lastExport.data.exportedAt ? formatDateTime(lastExport.data.exportedAt) : "—"}</dd>
               <dt className="text-muted-foreground">Snapshot</dt>
               <dd className="col-span-2 font-mono text-xs">
-                {fmtMeasured(lastExport.data!.snapshotId, (v) => String(v))}
+                {fmtMeasured(lastExport.data.snapshotId, (v) => String(v))}
+              </dd>
+            </>
+          )}
+          {/* QA LH-DATA-1-01 (DATA-49): the read-back failed, so the copy's time
+              and snapshot cannot be shown — say that, rather than leaving the rows
+              out and looking like a mart nobody published. */}
+          {hasHistory && lastExport.status === "error" && (
+            <>
+              <dt className="text-muted-foreground">Last published</dt>
+              <dd className="col-span-2 text-destructive" title={lastExport.error.message}>
+                Could not be read
               </dd>
             </>
           )}
           {p.trim && (p.trim.status === "success" || p.trim.status === "nothing_to_trim") && p.trim.copiesKept !== null && (
             <>
-              <dt className="text-muted-foreground">Copies kept</dt>
+              <dt className="text-muted-foreground">Copies kept at last trim</dt>
               <dd className="col-span-2">
                 {p.trim.copiesKept}
-                {p.trim.oldestKeptExportedAt ? ` (oldest ${formatDateTime(p.trim.oldestKeptExportedAt)})` : ""}
+                {copiesKeptDetail(p.trim)}
               </dd>
             </>
           )}
@@ -272,11 +324,14 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
                   variant="outline"
                   disabled={exportNow.status === "pending"}
                   onClick={() => {
+                    // QA LH-DATA-1-01 (DATA-49), review round 1 R1: a failed publish
+                    // answers `lastFailure` and records a run, so the state and the run
+                    // list are read again whatever the result — the card kept saying
+                    // "Up to date" until the page was loaded again.
                     void exportNow.run().then((result) => {
-                      if (result) {
-                        lastExport.reload()
-                        pub.reload()
-                      }
+                      pub.reload()
+                      setRunsKey((key) => key + 1)
+                      if (result) lastExport.reload()
                     })
                   }}
                 >
@@ -294,7 +349,7 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
             {canEdit && (
               <div>
                 <h4 className="mb-1 text-sm font-medium">Last 5 publish runs</h4>
-                <LastFiveRuns mart={mart} />
+                <LastFiveRuns mart={mart} runsKey={runsKey} />
               </div>
             )}
             <Link
