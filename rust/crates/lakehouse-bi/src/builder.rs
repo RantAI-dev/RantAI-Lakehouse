@@ -842,13 +842,10 @@ impl QueryBuilder<Ready> {
             |(g, week_start)| g.order_key(&dimension, week_start),
         );
         // BI-6: a sort by the dimension keeps the groups it keeps and only
-        // turns the final order round when it is descending.
-        let key_dir = match &self.sort {
-            Some(s) if self.is_dimension(&s.by) => {
-                format!(" {}", if s.desc { "DESC" } else { "ASC" })
-            }
-            _ => String::new(),
-        };
+        // turns the final order round when it is descending. One `key_dir`,
+        // the method below, is what the breakdown statement reads too (review
+        // round 1, developer's note 4: not two copies).
+        let key_dir = self.key_dir(&dimension);
 
         if self.breakdown.is_some() {
             return self.breakdown_statement(

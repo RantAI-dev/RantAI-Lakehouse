@@ -129,7 +129,10 @@ What QA saw:
   - A dimension **with a time grain** keeps every bucket: the limit is the breakdown's. (Today
     it keeps the latest N buckets.) The chart row limit of `BI-5` still applies to the result.
   - A dimension **without a grain** keeps its own top N as today, and the breakdown is cut to
-    N as well. Planner's choice, for three reasons: no saved chart gains bars; the assistant's
+    N as well. Its own top N is counted over the rows of the kept breakdown values, as the
+    built statement does (the dimension's guard sits inside the cap): ranked over every row, a
+    kept bar could have no row among the kept series (developer's note 4, review round 1).
+    Planner's choice, for three reasons: no saved chart gains bars; the assistant's
     rule "Top N of X by Y is dimension X, breakdown Y, limit N"
     (`routes/ai/prompt.rs:513`) stays true; both ways of building `BI-6-AC1` then show at most
     10 provinces. Open question 1.
@@ -697,8 +700,11 @@ In `rust/crates/lakehouse-api`. The AI team reviews this commit.
 ### T14. The feature pages say the new rules (BI-45, BI-46, BI-47)
 
 - `docs/core/features/chart-builder-questions.md`:
-  - Decisions table, a new last row:
-    `| 7 | On a bar, hbar, line or area chart with a breakdown, the limit keeps the N breakdown values with the largest total of the measure over the chart's filtered rows; the others are left out. A dimension with a time grain keeps every period; a dimension without one keeps its own top N as before. A date breakdown can be grouped by day, week, month, quarter or year | Owner, QA round 2026-11-12 (\`BI-46\`); the rule for a dimension without a grain is the planner's | Accepted by the owner, 2026-11-12 |`
+  - Decisions table, three new last rows (one cell reported a sign-off the plan never had —
+    `QA LH-BI-6-01` review round 1, R2):
+    `| 7 | Top N of the breakdown on a bar, hbar, line or area chart: the limit keeps the N breakdown values with the largest total of the measure over the chart's filtered rows; the others are left out. A dimension with a time grain keeps every period | Owner, QA round 2026-11-12 (\`BI-46\`) | Accepted by the owner, 2026-11-12 (\`BI-46\`) |`
+    `| 8 | A dimension without a grain keeps its own top N, counted over the rows of the kept breakdown values | Planner default (open question 1) | *(proposed, not yet signed)* |`
+    `| 9 | A date breakdown can be grouped by day, week, month, quarter or year | Planner default (\`BI-46\`) | *(proposed, not yet signed)* |`
   - "Limits to tell a customer", two new lines:
     `- A chart with a time grain and a breakdown shows every period (up to the chart row limit); to keep only recent periods, add a relative date filter to the chart.`
     `- The value list of a chart filter reads the chart's own table or SQL source only; while a SQL source is new or edited and not saved, no list is offered.`

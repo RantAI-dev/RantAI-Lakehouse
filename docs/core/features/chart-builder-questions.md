@@ -48,7 +48,9 @@ Part 2:
 | 4 | Up to three steps in all (the summary and two more) | Planner default | Owner to confirm at QA |
 | 5 | The builder shows up to 2,000 result rows | Spec | Owner to confirm at QA |
 | 6 | A click on "Other" offers no drill-down; a click on any other value lists the rows with the chart's own filters applied | Planner default | Owner to confirm at QA |
-| 7 | On a bar, hbar, line or area chart with a breakdown, the limit keeps the N breakdown values with the largest total of the measure over the chart's filtered rows; the others are left out. A dimension with a time grain keeps every period; a dimension without one keeps its own top N as before. A date breakdown can be grouped by day, week, month, quarter or year | Owner, QA round 2026-11-12 (`BI-46`); the rule for a dimension without a grain is the planner's | Accepted by the owner, 2026-11-12 |
+| 7 | Top N of the breakdown on a bar, hbar, line or area chart: the limit keeps the N breakdown values with the largest total of the measure over the chart's filtered rows; the others are left out. A dimension with a time grain keeps every period | Owner, QA round 2026-11-12 (`BI-46`) | Accepted by the owner, 2026-11-12 (`BI-46`) |
+| 8 | A dimension without a grain keeps its own top N, counted over the rows of the kept breakdown values | Planner default (open question 1) | *(proposed, not yet signed)* |
+| 9 | A date breakdown can be grouped by day, week, month, quarter or year | Planner default (`BI-46`) | *(proposed, not yet signed)* |
 
 ## Limits to tell a customer
 
