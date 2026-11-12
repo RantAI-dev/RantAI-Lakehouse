@@ -2,12 +2,13 @@
 
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::sync::Arc;
 
 use lakehouse_bi::builder::{FilteredSql, RelationColumns};
 use lakehouse_bi::filters::ColumnKind;
 use lakehouse_bi::specs::ChartSource;
 use lakehouse_bi::store;
-use lakehouse_clickhouse::{ChClient, ChError};
+use lakehouse_clickhouse::{ChClient, ChError, ChResult};
 use serde_json::{Map, Value, json};
 
 use crate::upstream_error;
@@ -378,43 +379,18 @@ pub(crate) async fn try_run_spec_sql(
     // the same numbers travel as URL settings, with the query id a Stop finds
     // it by. One row more than the cap is asked for, so a cut is told from an
     // exact fit.
-    let run = crate::query_limits::QueryRun::current_or_detached();
-    let limits = run.limits().await.map_err(|err| {
-        tracing::error!(error = %err, "the query limits could not be read");
-        SpecRunFailure::Refused("The query limits could not be read.".to_owned())
-    })?;
-    let seconds = u32::try_from(limits.timeout_seconds()).unwrap_or(u32::MAX);
+    let run = LimitedRun::current().await?;
     // BI-4 part B: the tables are named on the rewritten statement (after the
-    // masks wrapped the governed ones), the one the engine would run.
+    // masks wrapped the governed ones), the one the engine would run. Before
+    // the settings swap: the swap only rewrites the trailing `SETTINGS` text.
     let tables = crate::sql_rewrite::referenced_tables(
         &rewritten,
         &sqlparser::dialect::ClickHouseDialect {},
     );
-    let rewritten = lakehouse_bi::builder::with_run_settings(
-        &rewritten,
-        limits.chart_rows.saturating_add(1),
-        seconds,
-    );
-    // BI-5 review B1: a point map reads up to the map limit and a pivot up to
-    // its own cap, set around the tile by `with_tile_rows`; every other kind
-    // stays at the chart row limit. Only the outer cap moves: the SQL-source
-    // `SETTINGS` text above keeps the chart row limit.
-    let rows_cap = limits
-        .chart_rows
-        .max(crate::query_limits::row_cap_override().unwrap_or(0));
+    let rewritten = run.statement(&rewritten);
+    let rows_cap = run.rows_cap();
     let execute = || async {
-        // BI-5 review S2: Stop was pressed on this run while the tile waited
-        // for its round; it asks the engine nothing.
-        if run.is_stopped() {
-            return Err(SpecRunFailure::Tile(
-                json!({ "error": crate::query_limits::STOPPED_SENTENCE }),
-            ));
-        }
-        let options = run.options(&limits, rows_cap);
-        let mut r = ch
-            .query_with_options(&rewritten, &options, None)
-            .await
-            .map_err(|err| tile_failure(err, &limits))?;
+        let mut r = run.send(ch, &rewritten, rows_cap).await?;
         let columns: Vec<String> = r.meta.iter().map(|m| m.name.clone()).collect();
         // The engine was asked for `chart_rows + 1` rows and `break`s at the
         // end of a block, so a result of more than `chart_rows + 1` rows was
@@ -429,7 +405,7 @@ pub(crate) async fn try_run_spec_sql(
         }
         let mut out = json!({ "columns": columns, "rows": r.data });
         if cut {
-            out["limitHit"] = limits.rows_limit_json(rows_cap);
+            out["limitHit"] = run.limits().rows_limit_json(rows_cap);
         }
         Ok::<_, SpecRunFailure>(crate::result_cache::Computed {
             value: out,
@@ -447,7 +423,7 @@ pub(crate) async fn try_run_spec_sql(
     let settings = [
         (
             "max_execution_time",
-            u64::try_from(limits.timeout.as_millis()).unwrap_or(u64::MAX),
+            u64::try_from(run.limits().timeout.as_millis()).unwrap_or(u64::MAX),
         ),
         ("max_result_rows", u64::from(rows_cap) + 1),
     ];
@@ -485,6 +461,119 @@ fn tile_failure(err: ChError, limits: &crate::query_limits::TileLimits) -> SpecR
     } else {
         SpecRunFailure::Clickhouse(err)
     }
+}
+
+/// The one sender of a statement that runs under the caller's limits
+/// (`BI-45`, plan D4; QA `LH-BI-5-01`).
+///
+/// A tile, a chart preview, a save's own check and the SQL source preview's
+/// row read all reach `ClickHouse` through here. Four steps happen in one
+/// place, so no caller can have two of them and miss the others: the limits of
+/// the request's run (`QueryRun::current_or_detached().limits()`), the
+/// SQL-source `SETTINGS` text swapped for the administrator's numbers
+/// (`with_run_settings`), the run's options (time limit, row cap plus one, a
+/// query id) sent as URL settings, and the engine's answer mapped by
+/// [`tile_failure`] — so a limit the engine enforced is the limit's sentence
+/// and never the engine's text (AGENTS.md principle 4).
+pub(crate) struct LimitedRun {
+    run: Arc<crate::query_limits::QueryRun>,
+    limits: crate::query_limits::TileLimits,
+}
+
+impl LimitedRun {
+    /// The run of the request being served (or a detached one) and its limits.
+    ///
+    /// # Errors
+    ///
+    /// [`SpecRunFailure::Refused`] when the limits cannot be read; nothing is
+    /// sent in that case.
+    pub(crate) async fn current() -> Result<Self, SpecRunFailure> {
+        let run = crate::query_limits::QueryRun::current_or_detached();
+        let limits = run.limits().await.map_err(|err| {
+            tracing::error!(error = %err, "the query limits could not be read");
+            SpecRunFailure::Refused("The query limits could not be read.".to_owned())
+        })?;
+        Ok(Self { run, limits })
+    }
+
+    /// The limits every statement of this run is sent under.
+    pub(crate) fn limits(&self) -> &crate::query_limits::TileLimits {
+        &self.limits
+    }
+
+    /// `sql` with its SQL-source cap swapped for the configured numbers: the
+    /// chart row limit plus one (so a cut is told from an exact fit) and the
+    /// time limit in whole seconds.
+    pub(crate) fn statement(&self, sql: &str) -> String {
+        let seconds = u32::try_from(self.limits.timeout_seconds()).unwrap_or(u32::MAX);
+        lakehouse_bi::builder::with_run_settings(
+            sql,
+            self.limits.chart_rows.saturating_add(1),
+            seconds,
+        )
+    }
+
+    /// The rows a statement may read: `BI-5` review B1 — a point map reads up
+    /// to the map limit and a pivot up to its own cap, set around the tile by
+    /// [`with_tile_rows`]; every other kind stays at the chart row limit. Only
+    /// the outer cap moves: the SQL-source `SETTINGS` text keeps the chart row
+    /// limit.
+    pub(crate) fn rows_cap(&self) -> u32 {
+        self.limits
+            .chart_rows
+            .max(crate::query_limits::row_cap_override().unwrap_or(0))
+    }
+
+    /// Send `statement` under this run's limits with `rows_cap` rows.
+    ///
+    /// # Errors
+    ///
+    /// [`SpecRunFailure::Tile`] when Stop was pressed on this run before the
+    /// query went out, or when the engine stopped the query at the time limit
+    /// or with a `KILL QUERY`; [`SpecRunFailure::Clickhouse`] for every other
+    /// engine failure, for the caller to classify (its text never reaches a
+    /// response).
+    pub(crate) async fn send(
+        &self,
+        ch: &ChClient,
+        statement: &str,
+        rows_cap: u32,
+    ) -> Result<ChResult, SpecRunFailure> {
+        // BI-5 review S2: Stop was pressed on this run while the tile waited
+        // for its round; it asks the engine nothing.
+        if self.run.is_stopped() {
+            return Err(SpecRunFailure::Tile(
+                json!({ "error": crate::query_limits::STOPPED_SENTENCE }),
+            ));
+        }
+        let options = self.run.options(&self.limits, rows_cap);
+        ch.query_with_options(statement, &options, None)
+            .await
+            .map_err(|err| tile_failure(err, &self.limits))
+    }
+}
+
+/// Run `sql` once under the caller's limits (`BI-45`, plan D4): the limits,
+/// the settings swap, the run's options and the failure mapping all come from
+/// [`LimitedRun`]. For a statement that is not a tile — a save's own check and
+/// the SQL source preview's row read — whose rows the caller does not keep.
+///
+/// # Errors
+///
+/// As [`LimitedRun::current`] and [`LimitedRun::send`].
+// Removed by T3, which is the first caller (the SQL source preview's row
+// read); it is a separate commit of this same slice.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "first caller is T3 of this slice (BI-45)")
+)]
+pub(crate) async fn run_statement_limited(
+    ch: &ChClient,
+    sql: &str,
+) -> Result<ChResult, SpecRunFailure> {
+    let run = LimitedRun::current().await?;
+    let statement = run.statement(sql);
+    run.send(ch, &statement, run.rows_cap()).await
 }
 
 /// Run `fut` (one tile's queries) with the rows its kind may read (`BI-5`
@@ -1296,6 +1385,68 @@ mod tests {
         let text = upstream_message("planted-marker-bad-sql");
         assert!(!text.contains("planted-marker-bad-sql"), "{text}");
         assert!(text.contains("Reference: "), "{text}");
+    }
+}
+
+/// `BI-45` (plan T2, T4 and T5): the one sender of a statement that runs
+/// under the caller's limits, the checked save, and the assistant's reply for
+/// a save the limit ended. A wiremock `ClickHouse` only: no Postgres, so no
+/// policy row applies and nothing reaches the chart store.
+#[cfg(test)]
+mod limited_run {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const TIMEOUT_BODY: &str =
+        "Code: 159. DB::Exception: planted-marker Timeout exceeded (TIMEOUT_EXCEEDED)";
+
+    fn clickhouse(server: &MockServer) -> ChClient {
+        ChClient::new(server.uri(), "default".to_owned(), String::new())
+    }
+
+    fn url_settings(request: &wiremock::Request) -> HashMap<String, String> {
+        request.url.query_pairs().into_owned().collect()
+    }
+
+    /// `BI-45` plan D4 (QA `LH-BI-5-01`): one call sends the caller's time
+    /// limit, the row cap plus one and a query id as URL settings, and an
+    /// engine that stopped the statement at the limit comes back as the
+    /// limit's sentence with its `limit` object, never the engine's text.
+    #[tokio::test]
+    async fn a_statement_run_under_limits_sends_the_time_limit_and_says_the_limit_sentence_when_the_engine_stops_it()
+     {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(TIMEOUT_BODY))
+            .mount(&server)
+            .await;
+        let ch = clickhouse(&server);
+
+        let Err(err) = run_statement_limited(&ch, "SELECT 1").await else {
+            panic!("a statement the engine stopped is a failure");
+        };
+
+        let SpecRunFailure::Tile(answer) = err else {
+            panic!("a limit the engine enforced is the tile's answer, not {err:?}");
+        };
+        // A test runs outside a request, so the limits are the defaults.
+        assert_eq!(
+            answer["error"], "This chart stopped after 60 seconds, the limit for this install.",
+            "{answer}"
+        );
+        assert_eq!(answer["limit"]["kind"], "time", "{answer}");
+        assert!(
+            !answer.to_string().contains("planted-marker"),
+            "the engine's text reached the answer: {answer}"
+        );
+        let requests = server.received_requests().await.unwrap();
+        let settings = url_settings(&requests[0]);
+        assert_eq!(settings["max_execution_time"], "60");
+        assert_eq!(settings["max_result_rows"], "2001");
+        assert!(settings.contains_key("query_id"), "{settings:?}");
     }
 }
 
