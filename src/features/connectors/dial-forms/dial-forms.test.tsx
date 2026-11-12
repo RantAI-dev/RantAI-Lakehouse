@@ -1,5 +1,6 @@
 import { fireEvent, render, screen } from "@testing-library/react"
 import { describe, expect, it, mock } from "bun:test"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import { SqlDialForm } from "./sql-dial-form"
 import { OracleDialForm } from "./oracle-dial-form"
 import { RestDialForm } from "./rest-dial-form"
@@ -31,7 +32,11 @@ describe("dial forms", () => {
         driver="mysql"
       />
     )
-    expect((screen.getByLabelText("Driver") as HTMLSelectElement).value).toBe("postgres")
+    // WEB-9 D5: the control is a combobox now, so its shown label is what the
+    // old assertion read as the select's value.
+    expect(
+      screen.getByLabelText("Driver").querySelector('[data-slot="select-value"]')?.textContent
+    ).toBe("PostgreSQL")
   })
   it("CdcDialForm starts on the implied driver's port", () => {
     render(<CdcDialForm value={null} onChange={mock()} driver="mssql" />)
@@ -68,7 +73,9 @@ describe("dial forms", () => {
     for (const driver of ["postgres", "mysql", "mssql"] as const) {
       const onChange = mock()
       const { unmount } = render(<CdcDialForm value={null} onChange={onChange} driver={driver} />)
-      expect((screen.getByLabelText("TLS mode") as HTMLSelectElement).value).toBe("require")
+      expect(
+        screen.getByLabelText("TLS mode").querySelector('[data-slot="select-value"]')?.textContent
+      ).toBe("Require (encrypted, certificate not checked)")
       fireEvent.change(screen.getByLabelText("Host"), { target: { value: "h" } })
       expect(onChange.mock.calls[0][0]).toMatchObject({ sslMode: "require" })
       unmount()
@@ -83,12 +90,17 @@ describe("dial forms", () => {
         driver="mssql"
       />
     )
-    expect((screen.getByLabelText("TLS mode") as HTMLSelectElement).value).toBe("verify-full")
+    expect(
+      screen.getByLabelText("TLS mode").querySelector('[data-slot="select-value"]')?.textContent
+    ).toBe("Verify CA and host name")
+    // WEB-9 D5: the options live in the opened list now, as a person sees
+    // them; the label is what the native option's text said.
+    fireEvent.click(screen.getByLabelText("TLS mode"))
     expect(screen.getByRole("option", { name: "Disable (not encrypted)" })).toBeDefined()
     expect(screen.getByText(/Verify CA also checks the host name/)).toBeDefined()
     fireEvent.change(screen.getByLabelText("Host"), { target: { value: "h2" } })
     expect(onChange.mock.calls[0][0]).toMatchObject({ host: "h2", sslMode: "verify-full" })
-    fireEvent.change(screen.getByLabelText("TLS mode"), { target: { value: "disable" } })
+    chooseOption(screen.getByLabelText("TLS mode"), "Disable (not encrypted)")
     expect(onChange.mock.calls[1][0]).toMatchObject({ sslMode: "disable" })
   })
   it("CdcDialForm for Oracle asks for the container database and a PDB, offers two TLS modes, and sends only pdbName of the extras (SRC-4 slice 6)", () => {
@@ -100,8 +112,13 @@ describe("dial forms", () => {
       expect(screen.queryByLabelText(label)).toBeNull()
     }
     // Only the two modes Oracle's driver can honour: no certificate checking (SRC-37).
-    const modes = Array.from((screen.getByLabelText("TLS mode") as HTMLSelectElement).options).map((o) => o.value)
-    expect(modes).toEqual(["require", "disable"])
+    // WEB-9 D5: the list is read open, as a person sees it; the labels are
+    // what used to be read from `HTMLSelectElement.options`' values.
+    fireEvent.click(screen.getByLabelText("TLS mode"))
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Require (native network encryption, server not authenticated)",
+      "Disable (not encrypted)",
+    ])
     expect(screen.getByRole("option", { name: "Disable (not encrypted)" })).toBeDefined()
     expect(screen.getByText(/cannot check the server's certificate/)).toBeDefined()
     fireEvent.change(screen.getByLabelText("Host"), { target: { value: "h" } })
@@ -249,9 +266,10 @@ describe("dial forms", () => {
   })
   it("RestDialForm renders an auth-type selector with all five types", () => {
     render(<RestDialForm value={null} onChange={mock()} />)
-    const select = screen.getByLabelText("Auth type") as HTMLSelectElement
-    const options = Array.from(select.options).map((o) => o.value)
-    expect(options).toEqual([
+    // WEB-9 D5: the list is read open; each option's text is the API's word,
+    // which is what the old assertion read as the select's values.
+    fireEvent.click(screen.getByLabelText("Auth type"))
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
       "api_key",
       "bearer",
       "oauth2_client_credentials",
@@ -262,7 +280,7 @@ describe("dial forms", () => {
   it("RestDialForm starts the authorization-code auth with empty addresses and no scopes (SRC-12 part C)", () => {
     const onChange = mock()
     render(<RestDialForm value={null} onChange={onChange} />)
-    fireEvent.change(screen.getByLabelText("Auth type"), { target: { value: "oauth2_authorization_code" } })
+    chooseOption(screen.getByLabelText("Auth type"), "oauth2_authorization_code")
     expect(onChange.mock.calls[0][0].auth).toEqual({
       type: "oauth2_authorization_code",
       clientId: "",

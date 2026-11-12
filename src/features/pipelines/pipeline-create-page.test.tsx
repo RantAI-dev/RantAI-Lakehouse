@@ -30,8 +30,9 @@ mock.module("next/navigation", () => ({
   }),
 }))
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import type { PipelineDetail } from "@/services/contracts/pipelines"
 import { PipelineEditor } from "./pipeline-create-page"
 
@@ -309,8 +310,7 @@ describe("the zone and column pickers in the pipeline editor (WEB-8 D8)", () => 
       expect(screen.getByRole("combobox", { name: "Source zone" }).textContent).toContain("bronze")
     )
     fireEvent.click(screen.getByRole("combobox", { name: "Source zone" }))
-    // `within` the popup: the Connector field is a native select, and its
-    // options are always in the document.
+    // `within` the popup: only the open list's own options are read.
     expect(within(await screen.findByRole("listbox")).getAllByRole("option").map((o) => o.textContent)).toEqual(["bronze", "silver"])
   })
 
@@ -358,7 +358,7 @@ describe("the connector page's Create pipeline entry (BLD-7)", () => {
   const sourceZoneInput = () =>
     screen.getByRole("textbox", { name: /^source zone/i }) as HTMLInputElement
   const sourceTablePicker = () =>
-    screen.getByRole("combobox", { name: /^source table/i }) as HTMLSelectElement
+    screen.getByRole("combobox", { name: /^source table/i })
 
   beforeEach(() => {
     search = `connectorId=${SEED_CONNECTOR}`
@@ -372,14 +372,16 @@ describe("the connector page's Create pipeline entry (BLD-7)", () => {
     expect(sourceZoneInput().disabled).toBe(true)
     expect(sourceZoneInput().readOnly).toBe(true)
 
-    // Table: exactly the connector's ingest targets, plus "choose one".
-    await waitFor(() =>
-      expect(Array.from(sourceTablePicker().options).map((o) => o.value)).toEqual([
-        "",
-        "customers",
-        "orders",
-      ])
-    )
+    // Table: exactly the connector's ingest targets. The old prompt option
+    // is the placeholder now (WEB-9 D2), so the list holds the two tables.
+    const picker = sourceTablePicker()
+    expect(picker.textContent).toContain("Choose one of the connector's tables")
+    await act(async () => {})
+    fireEvent.click(picker)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "customers",
+      "orders",
+    ])
 
     // Trigger: the connector's load, ON by default; the upload switch
     // belongs to a table this pipeline uploads, not to a connector's.
@@ -392,8 +394,8 @@ describe("the connector page's Create pipeline entry (BLD-7)", () => {
     fireEvent.change(screen.getByPlaceholderText("orders_hourly_rollup"), {
       target: { value: "northwind_orders_clean" },
     })
-    await waitFor(() => expect(sourceTablePicker().options.length).toBe(3))
-    fireEvent.change(sourceTablePicker(), { target: { value: "orders" } })
+    await act(async () => {})
+    chooseOption(sourceTablePicker(), "orders")
 
     await advance()
     fireEvent.change(screen.getByPlaceholderText("order_id"), { target: { value: "id" } })
@@ -440,7 +442,7 @@ describe("the connector page's Create pipeline entry (BLD-7)", () => {
 
 describe("changing a pipeline's connector on the edit form (BLD-9)", () => {
   const connectorPicker = () =>
-    screen.getByRole("combobox", { name: "Connector" }) as HTMLSelectElement
+    screen.getByRole("combobox", { name: "Connector" })
   const zoneInput = () =>
     screen.getByRole("textbox", { name: /^source zone/i }) as HTMLInputElement
 
@@ -456,16 +458,18 @@ describe("changing a pipeline's connector on the edit form (BLD-9)", () => {
     })
     render(<PipelineEditor existing={stored} />)
 
-    await waitFor(() => expect(connectorPicker().value).toBe(SEED_CONNECTOR))
-    expect(Array.from(connectorPicker().options).map((o) => o.value)).toEqual([
-      "",
-      SEED_CONNECTOR,
-    ])
+    await waitFor(() => expect(connectorPicker().textContent).toContain("Lakehouse OLTP (Postgres)"))
     // With a connector the zone is fixed to bronze (decision 5).
     expect(zoneInput().value).toBe("bronze")
     expect(zoneInput().disabled).toBe(true)
 
-    fireEvent.change(connectorPicker(), { target: { value: "" } })
+    // WEB-9 D2: "No connector" is a real choice, so it stays an option.
+    chooseOption(connectorPicker(), "No connector (read a ClickHouse table directly)")
+    fireEvent.click(connectorPicker())
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "No connector (read a ClickHouse table directly)",
+      "Lakehouse OLTP (Postgres)",
+    ])
     // "No connector" is a real choice: the zone becomes editable again —
     // a picker over the lakehouse's namespaces since WEB-8 D8, so a
     // combobox rather than the text box the fixed field is.
@@ -493,8 +497,10 @@ describe("changing a pipeline's connector on the edit form (BLD-9)", () => {
     })
     render(<PipelineEditor existing={stored} />)
 
-    await waitFor(() => expect(connectorPicker().value).toBe(""))
-    fireEvent.change(connectorPicker(), { target: { value: SEED_CONNECTOR } })
+    await waitFor(() =>
+      expect(connectorPicker().textContent).toContain("No connector (read a ClickHouse table directly)")
+    )
+    chooseOption(connectorPicker(), "Lakehouse OLTP (Postgres)")
     // The source switches to the connector's shape as soon as it is picked:
     // zone fixed, table from the connector's own targets.
     await waitFor(() => expect(zoneInput().value).toBe("bronze"))

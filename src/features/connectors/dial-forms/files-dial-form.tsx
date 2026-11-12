@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import { SelectField } from "@/components/patterns/select-field"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import type { FilesDial } from "@/services/contracts/connectors"
@@ -45,16 +46,19 @@ export function FilesDialForm({
       </div>
       <div className="space-y-1.5">
         <Label htmlFor="files-dial-format">Format</Label>
-        <select
+        {/* WEB-9 D3: the console's one dropdown; the three formats and their
+            labels are unchanged. */}
+        <SelectField
           id="files-dial-format"
-          className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+          className="w-full"
           value={dial.format}
-          onChange={(e) => set("format", e.target.value as FilesDial["format"])}
-        >
-          <option value="csv">CSV</option>
-          <option value="json">Newline-delimited JSON</option>
-          <option value="parquet">Parquet</option>
-        </select>
+          options={[
+            { value: "csv", label: "CSV" },
+            { value: "json", label: "Newline-delimited JSON" },
+            { value: "parquet", label: "Parquet" },
+          ]}
+          onValueChange={(next) => set("format", next as FilesDial["format"])}
+        />
       </div>
       <div className="space-y-1.5">
         <Label htmlFor="files-dial-bucket">Bucket / root</Label>

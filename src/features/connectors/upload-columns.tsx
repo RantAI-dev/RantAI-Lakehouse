@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import { SelectField } from "@/components/patterns/select-field"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { formatNumber } from "@/lib/format"
@@ -8,8 +9,6 @@ import { COLUMN_TYPES, DATE_FORMATS, columnTypeLabel, columnNameProblem } from "
 import type { UploadBadValues, UploadColumnType, UploadDateFormat } from "@/services/contracts/uploads"
 import type { ColumnChoices } from "./use-column-choices"
 import { Refusal, UploadNotice } from "./upload-parts"
-
-const SELECT_CLASS = "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
 
 /** The types a column's select offers: the six, and "Floating point (from the file)" for a column that has it. */
 function typeOptions(type: UploadColumnType, guessed: UploadColumnType) {
@@ -75,19 +74,19 @@ export function UploadColumnsEditor({
                     />
                   </td>
                   <td className="px-3 py-2">
-                    <select
+                    {/* WEB-9 D3: the console's one dropdown, same types and
+                        order; a disabled row keeps the control disabled. */}
+                    <SelectField
                       aria-label={`Type of ${column.name || `column ${index + 1}`}`}
-                      className={SELECT_CLASS}
+                      className="w-full"
                       value={column.type}
                       disabled={fixed}
-                      onChange={(e) => choices.setType(index, e.target.value as UploadColumnType)}
-                    >
-                      {typeOptions(column.type, column.guessedType).map((t) => (
-                        <option key={t.value} value={t.value}>
-                          {t.label}
-                        </option>
-                      ))}
-                    </select>
+                      options={typeOptions(column.type, column.guessedType).map((t) => ({
+                        value: t.value,
+                        label: t.label,
+                      }))}
+                      onValueChange={(next) => choices.setType(index, next as UploadColumnType)}
+                    />
                     {column.type !== column.guessedType && !fixed ? (
                       <p className="mt-1 text-xs text-muted-foreground">Guessed: {columnTypeLabel(column.guessedType)}</p>
                     ) : null}
@@ -98,36 +97,31 @@ export function UploadColumnsEditor({
                         <Label className="sr-only" htmlFor={`upload-date-${index}`}>
                           How the dates of {column.name || `column ${index + 1}`} are read
                         </Label>
-                        <select
+                        {/* WEB-9 D2/D3: "Day first or month first?" was a
+                            disabled prompt option, so it is the placeholder;
+                            the three readings stay the options. */}
+                        <SelectField
                           id={`upload-date-${index}`}
-                          className={SELECT_CLASS}
+                          className="w-full"
                           value={column.dateFormat ?? ""}
+                          placeholder="Day first or month first?"
                           disabled={fixed && column.dateFormat !== undefined}
                           aria-invalid={asking}
-                          onChange={(e) => choices.setDateFormat(index, e.target.value as UploadDateFormat)}
-                        >
-                          {column.dateFormat === undefined ? (
-                            <option value="" disabled>
-                              Day first or month first?
-                            </option>
-                          ) : null}
-                          {DATE_FORMATS.map((f) => (
-                            <option key={f.value} value={f.value}>
-                              {f.label}
-                            </option>
-                          ))}
-                        </select>
+                          options={DATE_FORMATS.map((f) => ({ value: f.value, label: f.label }))}
+                          onValueChange={(next) => choices.setDateFormat(index, next as UploadDateFormat)}
+                        />
                         {column.type === "timestamp" ? (
-                          <select
+                          <SelectField
                             aria-label={`Time zone of ${column.name || `column ${index + 1}`}`}
-                            className={SELECT_CLASS}
+                            className="w-full"
                             value={column.timezone ? "zone" : "none"}
                             disabled={fixed}
-                            onChange={(e) => choices.setTimezone(index, e.target.value === "zone")}
-                          >
-                            <option value="none">No time zone in the values</option>
-                            <option value="zone">A time zone in every value (stored in UTC)</option>
-                          </select>
+                            options={[
+                              { value: "none", label: "No time zone in the values" },
+                              { value: "zone", label: "A time zone in every value (stored in UTC)" },
+                            ]}
+                            onValueChange={(next) => choices.setTimezone(index, next === "zone")}
+                          />
                         ) : null}
                       </>
                     ) : null}

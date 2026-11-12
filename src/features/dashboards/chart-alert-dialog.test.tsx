@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import { alertNumberShape, chartHasLatestPoint } from "./chart-alert"
 import { ChartAlertDialog, NO_LATEST_POINT_SENTENCE, OWN_ADDRESS_SENTENCE } from "./chart-alert-dialog"
 
@@ -55,9 +56,10 @@ describe("ChartAlertDialog", () => {
     // BI-19 owner QA 2026-10-28, QA-7
     const calls = mockApi()
     open({ id: "c5", title: "Trend", kind: "line", measures: ["sum_visitors", "__other", "avg_visitors"], labels: { sum_visitors: "sum of visitors", avg_visitors: "avg of visitors" } } as typeof line)
-    const series = screen.getByLabelText(/Series/) as HTMLSelectElement
-    expect(Array.from(series.options).map((o) => o.value)).toEqual(["sum_visitors", "avg_visitors"])
-    expect(Array.from(series.options).map((o) => o.textContent)).toEqual(["sum of visitors", "avg of visitors"])
+    const series = screen.getByRole("combobox", { name: /Series/ })
+    expect(series.textContent).toContain("sum of visitors")
+    fireEvent.click(series)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual(["sum of visitors", "avg of visitors"])
     fireEvent.change(screen.getByLabelText("Line"), { target: { value: "5" } })
     fireEvent.click(screen.getByRole("button", { name: "Save alert" }))
     await waitFor(() => expect(calls.length).toBe(1))
@@ -67,10 +69,12 @@ describe("ChartAlertDialog", () => {
   it("offers only 'returns any rows' for a chart sorted by value, with the reason, and hides the series", async () => {
     const calls = mockApi()
     open({ id: "c4", title: "By province", kind: "bar", measures: ["sum_visitors"], latestPoint: false } as typeof line)
-    const when = screen.getByLabelText("When") as HTMLSelectElement
-    expect(Array.from(when.options).map((o) => o.value)).toEqual(["any_rows"])
+    const when = screen.getByRole("combobox", { name: "When" })
+    expect(when.textContent).toContain("the chart returns any rows")
+    fireEvent.click(when)
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual(["the chart returns any rows"])
     expect(screen.getByText(NO_LATEST_POINT_SENTENCE)).toBeTruthy()
-    expect(screen.queryByLabelText(/Series/)).toBeNull()
+    expect(screen.queryByRole("combobox", { name: /Series/ })).toBeNull()
     fireEvent.click(screen.getByRole("button", { name: "Save alert" }))
     await waitFor(() => expect(calls.length).toBe(1))
     expect(calls[0].body).toMatchObject({ chart: "c4", condition: "any_rows" })
@@ -97,7 +101,7 @@ describe("ChartAlertDialog", () => {
     const calls = mockApi()
     open(line)
     fireEvent.change(screen.getByLabelText("Line"), { target: { value: "5" } })
-    fireEvent.change(screen.getByLabelText(/Series/), { target: { value: "bookings" } })
+    chooseOption(screen.getByRole("combobox", { name: /Series/ }), "bookings")
     fireEvent.click(screen.getByRole("button", { name: "Save alert" }))
     await waitFor(() => expect(calls.length).toBe(1))
     expect(calls[0].body).toMatchObject({ chart: "c2", series: "bookings", condition: "above" })

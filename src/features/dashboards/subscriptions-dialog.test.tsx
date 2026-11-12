@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import type { ReportSubscription } from "@/services/contracts/reports"
 import { AS_CREATOR_SENTENCE, EMAIL_NOT_SET_UP, SubscriptionsDialog } from "./subscriptions-dialog"
 
@@ -85,8 +86,8 @@ describe("SubscriptionsDialog", () => {
     fireEvent.click(await screen.findByRole("button", { name: "New subscription" }))
     expect(screen.getByText(AS_CREATOR_SENTENCE)).toBeDefined()
     expect(screen.getByText("Every Monday at 08:00 (Asia/Jakarta)")).toBeDefined()
-    fireEvent.change(screen.getByLabelText("Repeat"), { target: { value: "monthly" } })
-    fireEvent.change(screen.getByLabelText("Day of the month"), { target: { value: "last" } })
+    chooseOption(screen.getByRole("combobox", { name: "Repeat" }), "Every month")
+    chooseOption(screen.getByRole("combobox", { name: "Day of the month" }), "The last day")
     expect(screen.getByText("On the last day of every month at 08:00 (Asia/Jakarta)")).toBeDefined()
   })
 
@@ -94,7 +95,7 @@ describe("SubscriptionsDialog", () => {
     const calls = mockApi()
     render(<SubscriptionsDialog {...props} />)
     fireEvent.click(await screen.findByRole("button", { name: "New subscription" }))
-    fireEvent.change(screen.getByLabelText("File for Visits"), { target: { value: "csv" } })
+    chooseOption(screen.getByRole("combobox", { name: "File for Visits" }), "CSV")
     fireEvent.change(screen.getByLabelText("Find a person"), { target: { value: "dew" } })
     fireEvent.click(await screen.findByRole("button", { name: /Dewi/ }))
     fireEvent.change(screen.getByLabelText("Outside address"), { target: { value: "Press@Partner.Example" } })

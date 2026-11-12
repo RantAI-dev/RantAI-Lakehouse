@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import { SelectField } from "@/components/patterns/select-field"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import type { SftpAuth, SftpDial } from "@/services/contracts/connectors"
@@ -94,18 +95,15 @@ export function SftpDialForm({
       </div>
       <div className="space-y-1.5">
         <Label htmlFor="sftp-dial-auth-type">Auth type</Label>
-        <select
+        {/* WEB-9 D3: the console's one dropdown, same two choices in the same
+            order; the label is the API's own word, as the option text was. */}
+        <SelectField
           id="sftp-dial-auth-type"
-          className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+          className="w-full"
           value={dial.auth.type}
-          onChange={(e) => set("auth", { type: e.target.value as SftpAuth["type"] })}
-        >
-          {AUTH_TYPES.map((t) => (
-            <option key={t} value={t}>
-              {t}
-            </option>
-          ))}
-        </select>
+          options={AUTH_TYPES.map((t) => ({ value: t, label: t }))}
+          onValueChange={(next) => set("auth", { type: next as SftpAuth["type"] })}
+        />
         {dial.auth.type === "public_key" ? (
           <p className="text-xs text-muted-foreground">
             The private key PEM is the connector&apos;s secret — set the credential kind to

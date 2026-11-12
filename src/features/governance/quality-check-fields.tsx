@@ -105,6 +105,10 @@ export function CheckFields({
             <SelectField
               id={id("column")}
               className="w-full"
+              /* WEB-9 S1 review R1-S1 (D2a): a new rule's column starts as
+                 `""`, so without this the trigger is an empty box that says
+                 nothing about what to pick. */
+              placeholder="Pick a column"
               value={form.column}
               options={[
                 /* WEB-8 D8: a column the rule already names that this table

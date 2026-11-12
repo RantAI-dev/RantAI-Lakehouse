@@ -264,6 +264,332 @@ native select with `fireEvent.change`, now calling `chooseOption`:
 - No visual finding about list length to report: the converted lists are the
   same lengths they were (longest is the quality check list, unchanged).
 
+### Handoff (developer, 2026-11-12, S2)
+
+Branch `feat/web-9-select-s2`, cut from `origin/feat/web-9-select-s2` at
+`273d89e6b` (S1 merged). Only `src/` and this plan changed; no `rust/`,
+`dagster/`, `ops/`, migration, `docker-compose.yml` or `design-system/` file,
+and no cargo command was run. Nothing under `src/features/dashboards`,
+`src/features/pipelines`, `src/features/queries` or `eslint.config.mjs` was
+touched (S3 owns those).
+
+**Commits**
+
+| Hash | Subject |
+| --- | --- |
+| `c776f922a` | `fix(web-9): name the column choice on Add Quality Rule` |
+| `326e26798` | `refactor(web-9): replace the dial forms' native selects with SelectField` |
+| `d525a6659` | `refactor(web-9): replace the upload step's native selects with SelectField` |
+| `4b6da0933` | `refactor(web-9): replace the ingest panel's native selects with SelectField` |
+
+Each commit was pushed to `origin/feat/web-9-select-s2` immediately after it
+was made. T5 was split into three commits by group of files, as the task
+allows.
+
+**T0 — `WEB-9 S1 review R1-S1` (D2a).** `quality-check-fields.tsx`'s Column
+list gets `placeholder="Pick a column"`, with the finding cited at the site.
+`quality-rule-create-page.test.tsx` gains a test that the trigger reads
+"Pick a column" before a column is chosen, and the chosen column's name after.
+
+**Files converted (`SelectField`), with the number of selects in each — 11
+files, 19 selects**
+
+- T5a, dial forms — 7 files, 9 selects: `sftp-dial-form.tsx` (1),
+  `files-dial-form.tsx` (1), `sql-dial-form.tsx` (1), `rest-dial-form.tsx`
+  (2: auth type, pagination), `saas-dial-form.tsx` (1), `cdc-dial-form.tsx`
+  (2: driver, TLS mode), `kafka-dial-form.tsx` (1).
+- T5b, upload step — 2 files, 6 selects: `upload-columns.tsx` (3: type, date
+  reading, time zone), `upload-check-step.tsx` (3: sheet, encoding,
+  delimiter). Both private `SELECT_CLASS` constants are deleted.
+- T5c, ingest — 2 files, 4 selects: `connector-form-parts.tsx` (1: the tenant
+  picker, `TenantField`), `connector-ingest-panel.tsx` (3: schedule, load
+  mode, new-row column). `fieldClass` is deleted.
+
+The compact in-row controls use `size="sm"` plus `px-2 text-xs` (and
+`font-mono` where the old class had it) to keep their height and tone.
+
+**Placeholders added under D2a (a value that can be outside the list)**
+
+- `quality-check-fields.tsx`, Column — `"Pick a column"` (R1-S1).
+- `sql-dial-form.tsx`, Driver — `"Pick a driver"`: the options are the three
+  drivers that form serves, and a stored dial can name another (`oracle` has
+  its own form).
+- `saas-dial-form.tsx`, How it signs in — `"Pick how it signs in"`: a stored
+  dial can say `integration` where the vendor lists no integration option.
+- `connector-form-parts.tsx`, Tenant — `"Pick a tenant"`: a stored tenant the
+  person's own list lacks.
+
+**Prompts turned into placeholders under D2 (not real choices)**
+
+- `upload-check-step.tsx`, Encoding and Delimiter —
+  `"Detected by the service"` (was a disabled option with value `""`).
+- `upload-columns.tsx`, date reading — `"Day first or month first?"` (was a
+  disabled prompt option).
+- `connector-ingest-panel.tsx`, new-row column — `"Pick a column…"` (was a
+  prompt option with value `""`).
+
+Real choices keep their option and value `""`: "Unassigned" (tenant), "Manual
+only" (schedule), and the existing "None" options.
+
+**Commands run, with real counts (all in the foreground)**
+
+- `bun install --frozen-lockfile` once (this checkout had no `node_modules`):
+  678 packages installed.
+- T0: `bun test src/features/governance/quality-rule-create-page.test.tsx` →
+  9 pass, 0 fail, 25 `expect()` calls.
+- T5a: `bun test src/features/connectors/connector-create-page.test.tsx
+  src/features/connectors/connector-edit-page.test.tsx
+  src/features/connectors/dial-forms
+  src/features/connectors/saas-connectors.test.tsx` → 79 pass, 0 fail, 347
+  `expect()` calls, 5 files.
+- T5b: `bun test src/features/connectors/upload-file-page.test.tsx` → 88 pass,
+  0 fail, 1 file.
+- T5c: `bun test src/features/connectors/connector-ingest-panel.test.tsx` → 89
+  pass, 0 fail; then `bun test src/features/connectors` → 448 pass, 0 fail,
+  23 files.
+- `bun run typecheck` before every commit → no errors.
+- `bun run lint` before every commit → 0 errors, 11 warnings; the same 11
+  warnings exist on the base and none is in an S2 file.
+- Final commit, once: `bun run typecheck` → no errors; `bun run lint` → 0
+  errors, 11 warnings; `bun run test` → first run 3992 pass, 1 skip, **1
+  fail**, 11975 `expect()` calls, 380 files, 149.35s; the failing test's name
+  was not captured (the console output was truncated before it), so I cannot
+  say which test it was. Two further full runs were green: the second printed
+  no failing-test line (its counts were not captured), the third 3993 pass, 1
+  skip, 0 fail, 11975 `expect()` calls, 380 files, 150.07s. The single
+  failure did not recur; the known flaky `AssistantSettingsForm (ADM-9)`
+  (`REL-24`) was not confirmed as its cause.
+- `python3 ops/lint/check_bare_iceberg_count.py` → "R11 guard: no bare
+  count() against a Bronze Iceberg table found."
+- `python3 ops/lint/check_intra_package_imports.py` → "OK: all intra-package
+  dispar_orchestrate imports resolve".
+- S2 acceptance: `grep -rnE '<select\b' src/features/connectors
+  --include=*.tsx | grep -v '\.test\.'` prints nothing (exit 1).
+- `git status` before each commit: only the intended files; nothing generated
+  was staged.
+
+**Tests that had to change, and why**
+
+No test was deleted. Seven test files changed, all mechanism changes under
+D5 unless noted:
+
+- `src/features/governance/quality-rule-create-page.test.tsx` — one new test
+  for T0; no existing assertion changed.
+- `src/features/connectors/dial-forms/dial-forms.test.tsx` — driver and TLS
+  mode values read as the trigger's shown label; the TLS and auth-type option
+  lists read from the opened list; two `fireEvent.change` steps became
+  `chooseOption`.
+- `src/features/connectors/dial-forms/tier2-dial-forms.test.tsx` — Kafka and
+  SFTP option lists read from the opened list, which is portalled onto
+  `document.body`, outside the container that file scopes its queries to.
+- `src/features/connectors/saas-connectors.test.tsx` — the sign-in steps call
+  `chooseOption`, and the "integration credential only where the vendor has
+  one" test opens the list before asking what it offers (a closed combobox
+  has no options, so the old query would have passed for the wrong reason).
+- `src/features/connectors/connector-create-page.test.tsx` and
+  `connector-edit-page.test.tsx` — one auth-type step each became
+  `chooseOption`.
+- `src/features/connectors/upload-file-page.test.tsx` — delimiter, sheet,
+  column type and date-reading values read as the trigger's label; option
+  lists read from the opened list (the hidden sheet's "Notes (hidden)" label
+  among them); six `fireEvent.change` steps became `chooseOption`.
+- `src/features/connectors/connector-ingest-panel.test.tsx` — schedule, load
+  mode and the column list read as labels / opened lists; the mode and
+  schedule steps call `chooseOption`. Two things are worth naming:
+  - Three new-row-column steps still use `fireEvent.change`: when the source
+    cannot list a table's columns the cursor is a text `Input`, not a
+    `SelectField`, and those tests exercise that path.
+  - "stops its inputs stretching across the page" now looks for the page's
+    own `max-w-xs` on the Schedule trigger instead of the absence of any
+    `max-w-`, because the design system's trigger always carries
+    `max-w-full`. The fact asserted (the page layout caps it, the embedded
+    one does not) is the same.
+
+**Skipped / not verified**
+
+- No browser check. I cannot see the page in a browser here, so how the new
+  dropdowns look in either theme, and whether the compact `size="sm"`
+  triggers keep the old row height visually, are *not verified* beyond the
+  DOM-level tests.
+- D6 (a light dashboard's popup) does not apply to S2: no dashboard site is
+  in this slice.
+- `TenantField` has no caller in this tree (it is exported but unused); it was
+  converted like any other site, and its behaviour is not covered by a test
+  either before or after this slice.
+- No list is long enough to raise the "too long to scan" finding: the longest
+  converted list is the tenant list.
+- No Rust/Python/compose change, so none of those checks were run.
+
+### Handoff (developer, 2026-11-12, S3)
+
+Branch `feat/web-9-select-s3`, cut from `origin/feat/web-9-select-s3` at `273d89e6b`
+(S1 merged). Only `src/` and this plan changed; no `rust/`, `dagster/`, `ops/`,
+migration, `docker-compose.yml` or `design-system/` file, no cargo command, and
+nothing under `src/features/connectors` or `src/features/governance` (S2's files).
+
+**Commits**
+
+| Hash | Subject |
+| --- | --- |
+| `a53a09756` | `refactor(web-9): replace the subscription form's native selects with SelectField` |
+| `c767c7d7c` | `refactor(web-9): replace the rest of the dashboards' native selects with SelectField` |
+| `38df542c6` | `refactor(web-9): replace the pipelines' and queries' native selects with SelectField` |
+| `c6b56ddfa` | `chore(web-9): refuse a new native select in the console's lint` |
+
+Each was pushed to `origin/feat/web-9-select-s3` immediately after it was made.
+
+**Files converted (`SelectField`), with the number of selects in each**
+
+- T6, `src/features/dashboards` — 7 files, 16 selects, split over two commits:
+  - `subscriptions-dialog.tsx` (7): repeat, weekday, day of the month, paper,
+    orientation, one file per chart, values.
+  - `chart-alert-dialog.tsx` (2), `embed-settings-panel.tsx` (3),
+    `embed-filter-bar.tsx` (1), `filters/filter-editors.tsx` (1 native `<select>`
+    in the shared `PlainSelect`, used at 6 call sites; `PlainSelect` deleted),
+    `people-panel.tsx` (1), `public-link-panel.tsx` (1).
+- T7, `src/features/pipelines` and `src/features/queries` — 6 files, 11 selects:
+  `pipeline-create-page.tsx` (5), `pipeline-detail-page.tsx` (1),
+  `query-column-statistics.tsx` (1), `saved-query-access-panel.tsx` (2),
+  `save-query-page.tsx` (1, `<optgroup>` → `SelectOptionGroup`),
+  `saved-query-move-dialog.tsx` (1, `<optgroup>` → `SelectOptionGroup`).
+
+Every private class string is deleted; a site keeps only its width
+(`w-full`, `w-fit`, `min-w-52`, `w-20`) and, where the old control was the `h-7`
+size, passes `size="sm"`. The two folder pickers' groups keep the same order and
+the same labels (`Personal space (only you)` first, `Shared` second).
+
+**D2 and D2a: every placeholder at these sites**
+
+D2, an empty option that was only a prompt became the placeholder:
+
+- `embed-settings-panel.tsx`: `Choose a chart…` (was the empty option).
+- `pipeline-create-page.tsx`: `Choose one of the connector's tables` (was the
+  empty option; `aria-label` still says which connector).
+
+D2, an empty option that is a real choice stays an option with `value: ""`:
+
+- `pipeline-create-page.tsx`: `No connector (read a ClickHouse table directly)`.
+- `pipeline-detail-page.tsx`: the reads-as empty choice, whose label is still
+  "Nobody — this pipeline cannot run" or "Choose a user…" by state.
+- `saved-query-move-dialog.tsx`: `Shared` (the server reads it as `null`).
+- `embed-filter-bar.tsx`: `All` (it clears the filter).
+
+D2a, a value that can be outside the options gets a placeholder:
+
+- `chart-alert-dialog.tsx`, Series: `Pick a series`. The state starts at
+  `seriesChoices[0] ?? ""`, so a chart with no measure started as an empty box.
+- `people-panel.tsx`, Level: `Pick a level`. A row's level can be above the
+  viewer's own, so `levelAtLeast` drops it from the offered list and the value
+  matched no option.
+- `embed-settings-panel.tsx`, Mode: `Pick a mode`. A hidden-only column offers
+  only `Hidden`, so a saved mode of another kind matched no option.
+- `pipeline-create-page.tsx`, Source table: the D2 placeholder also covers a
+  stored table the connector no longer lists.
+- Sites whose value is always one of the options pass none: the subscription
+  form, the alert condition, the expiry choice, the access levels (their lists
+  append the row's current level), the column statistics column (it falls back
+  to the first column), both folder pickers, and the embed filter bar (a current
+  value outside the list is added as an option, as before).
+
+One difference of markup, reported not hidden: the embed filter mode's hint was
+a `title` on the `<select>`; `SelectField` takes data, not markup, so the
+`title` sits on a wrapper `<span>` around it (an ancestor's title still shows on
+hovering the trigger).
+
+**D6: a popup inside a light dashboard**
+
+Read `src/lib/dashboard-look.ts` (a dashboard fixed to light gets a
+`.theme-light` wrapper), `src/components/ui/select.tsx` (the popup is portalled
+to `<body>`, outside that wrapper, and reads `bg-popover` /
+`text-popover-foreground` from whatever tokens its ancestors set), and the
+`Select`s already on that surface (`grain-switch.tsx`, `param-controls.tsx`,
+`chart-builder.tsx` and the rest of `src/features/dashboards`, 24 files use it).
+They do exactly what `SelectField` now does: no theme class of their own, so a
+list opened from a `.theme-light` dashboard comes out in the console's tokens,
+not the light ones. Finding, per D6: this is unchanged behaviour of the shared
+`Select`, not something these two sites introduced. It is **not** verified in a
+browser; no second theme mechanism was invented.
+
+**T8: the lint rule (D4)**
+
+`eslint.config.mjs` had no `no-restricted-syntax` entry, so one block was added
+(not replaced) with `selector: "JSXOpeningElement[name.name='select']"`, the
+message D4 names, and `files: ["src/**/*.{ts,tsx}"]`. On this commit
+`bun run lint` reports **19 errors, all `no-restricted-syntax`, in 11 files,
+every one under `src/features/connectors`** (the S2 branch's native selects:
+`connector-form-parts.tsx` 1, `connector-ingest-panel.tsx` 3,
+`dial-forms/cdc-dial-form.tsx` 2, `files-dial-form.tsx` 1,
+`kafka-dial-form.tsx` 1, `rest-dial-form.tsx` 2, `saas-dial-form.tsx` 1,
+`sftp-dial-form.tsx` 1, `sql-dial-form.tsx` 1, `upload-check-step.tsx` 3,
+`upload-columns.tsx` 3). No exception was added for those files and the rule was
+not weakened. Once S2 merges and the branch is brought up to date, lint should be
+back to 0 errors and the base's 11 warnings; the planner runs it.
+
+**Commands run, with real counts (all in the foreground)**
+
+- `bun install --frozen-lockfile` once (this checkout had no `node_modules`):
+  678 packages installed.
+- T6 commit 1: `bun test src/features/dashboards/subscriptions-dialog.test.tsx`
+  → 11 pass, 0 fail. `bun run typecheck` → no errors. `bun run lint` → 0 errors,
+  11 warnings (the same 11 as the base).
+- T6 commit 2: `bun test src/features/dashboards` → 629 pass, 0 fail, 79 files.
+  `bun run typecheck` → no errors; `bun run lint` → 0 errors, 11 warnings.
+- T7: `bun test src/features/pipelines src/features/queries` → 499 pass, 0 fail,
+  40 files. `bun run typecheck` → no errors; `bun run lint` → 0 errors,
+  11 warnings.
+- T8: `bun run lint` → 19 errors (all the rule, all in `src/features/connectors`),
+  11 warnings.
+- Final commit, once:
+  - `bun run typecheck` → no errors.
+  - `bun run test` → 3992 pass, 1 skip, 0 fail, 11970 `expect()` calls, 380 files,
+    151.15s. The known flaky `AssistantSettingsForm (ADM-9)` test (`REL-24`) did
+    not fail, so the suite was run once.
+  - `python3 ops/lint/check_bare_iceberg_count.py` → "R11 guard: no bare count()
+    against a Bronze Iceberg table found."
+  - `python3 ops/lint/check_intra_package_imports.py` → "OK: all intra-package
+    dispar_orchestrate imports resolve".
+  - `bun run lint` → 19 errors, 11 warnings (the T8 result above).
+- S3 acceptance grep, after T8:
+  `grep -rnE '<select\b' src --include=*.tsx | grep -v '\.test\.' | grep -v 'src/features/connectors'`
+  prints nothing (exit 1). The 19 left in the repo are exactly S2's.
+- `git status` before each commit: only the intended files; nothing generated
+  was staged.
+
+**Tests that had to change, and why**
+
+No test was deleted or loosened. Where a test set a native select with
+`fireEvent.change` or read `HTMLSelectElement.value` / `.options`, it now calls
+`chooseOption` and reads the trigger's shown label or the open list, as S1 did:
+
+- `dashboards/subscriptions-dialog.test.tsx`, `chart-alert-dialog.test.tsx`,
+  `embed-settings-panel.test.tsx`, `people-panel.test.tsx`,
+  `public-link-panel.test.tsx`, `filters/filter-editors.test.tsx`,
+  `embed-view.test.tsx` — mechanism only; an option list is read after opening
+  the trigger, the trigger's label replaces `.value`.
+- `dashboards/embed-settings-panel.test.tsx` additionally reads two controls'
+  option lists in two renders: a bare trigger click opens a list and does not
+  close it, so the second control's list would otherwise sit beside the first.
+- `pipelines/pipeline-create-page.test.tsx` — the connector and source-table
+  lists are read after opening (their options are no longer always in the DOM),
+  and the source-table prompt moved to the placeholder, so the list is asserted
+  to hold the two tables only.
+- `queries/save-query-page.test.tsx` and `queries/saved-queries-page.test.tsx` —
+  the folder picker waits for `/folders` to be read (`act(async () => …)`) before
+  opening the list; the labels are the ones the tree already showed.
+- `queries/saved-query-move-dialog.test.tsx`, `query-results-section.test.tsx`,
+  `saved-query-access-panel.test.tsx` — mechanism only, the same facts.
+
+**Skipped / not verified**
+
+- No browser check: I cannot see the page in a browser here, so neither the new
+  popup in the dark theme nor D6's light-dashboard popup is verified beyond the
+  DOM-level tests. The owner's own look at a dashboard is still the real proof.
+- T8's clean lint is not verifiable on this branch by design (S2's files are not
+  here); the planner runs it after bringing the branch up to date with `main`.
+- No Rust/Python/compose change, so none of those checks were run.
+- No finding about list length: every converted list has the same length it had
+  (the longest are the connector's tables and the month/day lists, unchanged).
+
 ## 6. Review (planner)
 
 ### S1, round 1 (planner, 2026-11-12) — branch at `a192fe75`, pull request #472
@@ -306,3 +632,106 @@ handoff (3981 pass, 1 skip, 0 fail) and CI runs it on #472.
 
 Not verified by anyone: how the control looks in a browser, in either theme. The owner
 looks at Add Quality Rule after the merge.
+
+### S2, round 1 (planner, 2026-11-12) — branch at `112191e3`, pull request #474
+
+No `BLOCKER`, no `SHOULD-FIX`. R1-S1 is closed.
+
+Read: every converted site under `src/features/connectors` (11 files, 19 selects), the
+fix in `quality-check-fields.tsx`, and the lines the tests lost.
+
+- **R1-S1 closed** in `c776f922`: the Column list on Add Quality Rule has
+  `placeholder="Pick a column"`, with a test that reads it before a column is chosen.
+- **D2, D2a.** Prompts became placeholders (`Pick a column…`, `Day first or month
+  first?`, `Detected by the service`); real empty choices stayed options (`Unassigned`,
+  the schedule's manual preset). Three sites whose stored value can be outside the list
+  got a placeholder (`Pick a tenant`, `Pick a driver`, `Pick how it signs in`).
+- **D3.** Options, order, disabled states and effects are unchanged. A stored TLS mode
+  the adapter no longer lists is still appended and shown as it is. `SELECT_CLASS` and
+  `fieldClass` are gone; the compact rows of the ingest panel use `size="sm"`.
+- **D5.** The tests read the trigger's label and the opened list where they read
+  `HTMLSelectElement.value` and `.options`. One assertion was narrowed, with the reason at
+  the site: `connector-ingest-panel.test.tsx` looked for no `max-w-` on the Schedule
+  control and now looks for no `max-w-xs`, because the design system's trigger always
+  carries `max-w-full`. `max-w-xs` is the page layout's cap, which is what the test is
+  about, so the test still fails if the cap leaks into the panel layout.
+
+Re-run by the planner at `112191e3`, in the foreground:
+
+| Command | Result |
+| --- | --- |
+| `bun test src/features/connectors src/features/governance/quality-rule-create-page.test.tsx` | 457 pass, 0 fail, 24 files |
+| `bun run typecheck` | clean |
+| `bun run lint` | 0 errors, 11 warnings (the same 11 as `main`) |
+| S2's acceptance grep | prints nothing |
+
+The handoff reports one failing test in the first of three whole-suite runs, whose name
+the developer did not capture, and none in the next two. Not identified; `REL-24` is the
+known flaky test, and CI runs the suite on #474. A failure there is read before merging.
+
+Not verified by anyone: how the control looks in a browser.
+
+### S3, round 1 (planner, 2026-11-12) — branch at `faafbd7c`, pull request #475
+
+No `BLOCKER`, no `SHOULD-FIX`. One finding goes to the backlog (`WEB-10`).
+
+Read: every converted site under `src/features/dashboards` (7 files, 16 selects),
+`src/features/pipelines` (2 files, 6) and `src/features/queries` (4 files, 5), the lint
+rule, and the lines the tests lost.
+
+- **D2, D2a.** `Choose a chart…` and `Choose one of the connector's tables` became
+  placeholders; `All` and `No connector (read a ClickHouse table directly)` stayed real
+  choices. Sites whose value can fall outside the list got a placeholder (`Pick a series`,
+  `Pick a mode`, `Pick a level`).
+- **D3.** Options, order, disabled states and effects are unchanged. `PlainSelect` in
+  `filter-editors.tsx` is gone with its comment that the repo had no select fitting a
+  narrow popover. The filter mode's hint moved from the select's `title` to a wrapping
+  `span`, because `SelectField` takes data. The two `<optgroup>` sites use groups.
+- **A `Select` inside a popover.** `filter-editors.tsx` renders inside a Radix `Popover`
+  (`filter-bar.tsx:140`) while `SelectField` is Base UI. Radix decides "outside" through
+  the React tree, which a portal keeps, so choosing an option does not close the popover;
+  four files already put the design system's `Select` in a popover
+  (`query-parameter-menu.tsx`, `sql-panel.tsx`, `data-table-filter-controls.tsx`,
+  `data-table-sort-chip.tsx`). Read, not seen in a browser.
+- **D4.** `eslint.config.mjs` refuses `JSXOpeningElement[name.name='select']` under
+  `src/**/*.{ts,tsx}` with the plan's message. On this branch `bun run lint` reports 19
+  errors, all that rule, all in the 11 connector files S2 converts; nothing else.
+- **D6, the finding.** The list of a `SelectField` is portalled to `<body>`, so inside a
+  dashboard fixed to the light theme within a dark console (`.theme-light`, `BI-17` D6)
+  the list takes the console's dark tokens. It is readable, and it is what every other
+  design-system popup on that surface already does (menus, popovers, the existing
+  `Select`s), so it is not fixed here. For the embed filter bar it is a change: the native
+  list there used to come out light. Filed as `WEB-10`.
+
+Re-run by the planner at `faafbd7c`, in the foreground:
+
+| Command | Result |
+| --- | --- |
+| `bun test src/features/dashboards src/features/pipelines src/features/queries` | 1128 pass, 0 fail, 119 files |
+| `bun run typecheck` | clean |
+| `bun run lint` | 19 errors, all `no-restricted-syntax` in `src/features/connectors` (11 files); 11 warnings as on `main` |
+| S3's acceptance grep (connectors excluded) | prints nothing |
+
+`bun run lint` is run again, and must be clean, after S2 (#474) is merged and `main` is
+merged into this branch. The PR is not merged before that.
+
+Not verified by anyone: how the control looks in a browser, in either theme.
+
+### S3, after S2 merged (planner, 2026-11-12)
+
+S2 merged as `4973bf26` (#474). `main` was merged into this branch; the one conflict was
+this plan file, where both slices appended a handoff and a review. Resolved by hand: S2's
+handoff, then S3's; S2's review, then S3's. No line of either side is missing (checked by
+script).
+
+Re-run on the merge, in the foreground:
+
+| Command | Result |
+| --- | --- |
+| `bun run lint` | 0 errors, 11 warnings (the same 11 as `main`): the new rule reports nothing |
+| `bun run typecheck` | clean |
+| `grep -rnE '<select\b' src --include=*.tsx \| grep -v '\.test\.'` | prints nothing: no native select is left in the console |
+
+No open `BLOCKER` in any slice. `WEB-9` is Done when #475 merges; `WEB-10` carries the D6
+finding.
+

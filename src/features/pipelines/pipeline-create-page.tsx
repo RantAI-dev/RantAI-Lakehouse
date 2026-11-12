@@ -6,6 +6,7 @@ import { useRouter, useSearchParams } from "next/navigation"
 import { FormReviewSummary } from "@/components/patterns/form-review-summary"
 import { FormStepLayout, type FormStep } from "@/components/patterns/form-step-layout"
 import { PageHeader } from "@/components/patterns/page-header"
+import { SelectField } from "@/components/patterns/select-field"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -516,19 +517,18 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                 // connector reads that connector's Bronze tables
                 // (decision 5), and the source fields above switch to
                 // that shape as soon as one is picked here.
-                <select
-                  className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+                <SelectField
+                  className="w-full"
                   aria-label="Connector"
                   value={connectorId}
-                  onChange={(e) => setConnectorId(e.target.value)}
-                >
-                  <option value="">No connector (read a ClickHouse table directly)</option>
-                  {(connectors.data ?? []).map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name}
-                    </option>
-                  ))}
-                </select>
+                  /* WEB-9 D2: "No connector" is a real choice that sends
+                     `null`; it stays an option with the empty value. */
+                  options={[
+                    { value: "", label: "No connector (read a ClickHouse table directly)" },
+                    ...(connectors.data ?? []).map((c) => ({ value: c.id, label: c.name })),
+                  ]}
+                  onValueChange={setConnectorId}
+                />
               )}
             </Field>
             <Field label="Source table" className="sm:col-span-2">
@@ -564,19 +564,16 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                     .
                   </p>
                 ) : (
-                  <select
-                    className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+                  <SelectField
+                    className="w-full"
                     aria-label="Source table, one of this connector's tables"
                     value={sourceTableShown}
-                    onChange={(e) => setSourceTable(e.target.value)}
-                  >
-                    <option value="">Choose one of the connector&apos;s tables</option>
-                    {connectorTargets.map((target) => (
-                      <option key={target} value={target}>
-                        {target}
-                      </option>
-                    ))}
-                  </select>
+                    /* WEB-9 D2: the empty choice is only a prompt, so it is
+                       the placeholder now. */
+                    placeholder="Choose one of the connector's tables"
+                    options={connectorTargets.map((target) => ({ value: target, label: target }))}
+                    onValueChange={setSourceTable}
+                  />
                 )
               ) : (
                 <>
@@ -690,21 +687,17 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
               )}
               <div className="flex flex-wrap items-end gap-2 rounded-lg border border-dashed border-border p-3">
                 <Field label="Verb">
-                  <select
-                    className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+                  <SelectField
+                    className="w-full"
+                    aria-label="Verb"
                     value={pendingVerb}
-                    onChange={(e) => {
-                      const verb = e.target.value as TransformDraft["verb"]
+                    options={TRANSFORM_VERBS.map((verb) => ({ value: verb, label: verb }))}
+                    onValueChange={(next) => {
+                      const verb = next as TransformDraft["verb"]
                       setPendingVerb(verb)
                       setPendingDraft(emptyDraftFor(verb))
                     }}
-                  >
-                    {TRANSFORM_VERBS.map((verb) => (
-                      <option key={verb} value={verb}>
-                        {verb}
-                      </option>
-                    ))}
-                  </select>
+                  />
                 </Field>
                 {pendingDraft.verb === "dedupe" ? (
                   <ColumnField
@@ -725,22 +718,18 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                       placeholder="status"
                     />
                     <Field label="Operator">
-                      <select
-                        className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+                      <SelectField
+                        className="w-full"
+                        aria-label="Operator"
                         value={pendingDraft.operator}
-                        onChange={(e) =>
+                        options={FILTER_OPERATORS.map((op) => ({ value: op, label: op }))}
+                        onValueChange={(next) =>
                           setPendingDraft({
                             ...pendingDraft,
-                            operator: e.target.value as (typeof FILTER_OPERATORS)[number],
+                            operator: next as (typeof FILTER_OPERATORS)[number],
                           })
                         }
-                      >
-                        {FILTER_OPERATORS.map((op) => (
-                          <option key={op} value={op}>
-                            {op}
-                          </option>
-                        ))}
-                      </select>
+                      />
                     </Field>
                     {/* The value is the literal the column is compared to
                         (`filter(column op 'value')`, `renderTransformDraft`),
@@ -782,22 +771,18 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                       placeholder="amount"
                     />
                     <Field label="Type">
-                      <select
-                        className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+                      <SelectField
+                        className="w-full"
+                        aria-label="Type"
                         value={pendingDraft.type}
-                        onChange={(e) =>
+                        options={CAST_TYPES.map((t) => ({ value: t, label: t }))}
+                        onValueChange={(next) =>
                           setPendingDraft({
                             ...pendingDraft,
-                            type: e.target.value as (typeof CAST_TYPES)[number],
+                            type: next as (typeof CAST_TYPES)[number],
                           })
                         }
-                      >
-                        {CAST_TYPES.map((t) => (
-                          <option key={t} value={t}>
-                            {t}
-                          </option>
-                        ))}
-                      </select>
+                      />
                     </Field>
                   </>
                 ) : null}

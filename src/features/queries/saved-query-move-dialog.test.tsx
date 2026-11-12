@@ -11,6 +11,7 @@
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import { queryService } from "@/services"
 import type { QueryFolder, SavedQueryAccessList } from "@/services/contracts/queries"
 import { ServiceError } from "@/services/errors"
@@ -113,14 +114,15 @@ function renderDialog(over: {
       viewerId={over.noViewer ? undefined : VIEWER}
     />,
   )
-  return { onMove, picker: screen.getByLabelText("Target folder") as HTMLSelectElement }
+  return { onMove, picker: screen.getByRole("combobox", { name: "Target folder" }) }
 }
 
 describe("the move dialog", () => {
   it("offers the shared space, the caller's own space and the folders under them", () => {
     const { picker } = renderDialog()
 
-    expect(Array.from(picker.options).map((option) => option.text)).toEqual([
+    fireEvent.click(picker)
+    expect(screen.getAllByRole("option").map((option) => option.textContent)).toEqual([
       "Personal space (only you)",
       "Shared",
       "Team",
@@ -131,7 +133,7 @@ describe("the move dialog", () => {
   it("hands the shared space over as nothing, the way the server reads it", () => {
     const { onMove, picker } = renderDialog()
 
-    fireEvent.change(picker, { target: { value: "" } })
+    chooseOption(picker, "Shared")
     fireEvent.click(screen.getByRole("button", { name: "Move" }))
 
     // `null` is the shared space; the console never sends an absent field
@@ -143,7 +145,7 @@ describe("the move dialog", () => {
     spyOn(queryService, "getFolderAccess").mockResolvedValue(accessList([]))
     const { onMove, picker } = renderDialog()
 
-    fireEvent.change(picker, { target: { value: "quarterly" } })
+    chooseOption(picker, "Team / Quarterly")
     fireEvent.click(screen.getByRole("button", { name: "Move" }))
 
     expect(onMove).toHaveBeenCalledWith("quarterly")
@@ -153,16 +155,17 @@ describe("the move dialog", () => {
     spyOn(queryService, "getFolderAccess").mockResolvedValue(accessList([]))
     const { picker } = renderDialog({ currentFolderId: "team" })
 
-    expect(picker.value).toBe("team")
+    expect(picker.textContent).toContain("Team")
   })
 
   it("does not offer the folder that is being moved", () => {
     const { picker } = renderDialog({ excludeId: "team" })
 
-    expect(Array.from(picker.options).map((option) => option.value)).toEqual([
-      "personal-1",
-      "",
-      "quarterly",
+    fireEvent.click(picker)
+    expect(screen.getAllByRole("option").map((option) => option.textContent)).toEqual([
+      "Personal space (only you)",
+      "Shared",
+      "Team / Quarterly",
     ])
   })
 
@@ -197,7 +200,7 @@ describe("the move dialog", () => {
       const access = spyOn(queryService, "getFolderAccess").mockResolvedValue(TEAM_ACCESS)
       const { picker } = renderDialog()
 
-      fireEvent.change(picker, { target: { value: "team" } })
+      chooseOption(picker, "Team")
 
       expect(await screen.findByText("Shared with 2 people or roles: Dewi Lestari, Finance.")).toBeDefined()
       expect(access.mock.calls.at(-1)?.[0]).toBe("team")
@@ -217,7 +220,7 @@ describe("the move dialog", () => {
       )
       const { picker } = renderDialog()
 
-      fireEvent.change(picker, { target: { value: "team" } })
+      chooseOption(picker, "Team")
 
       expect(
         await screen.findByText("Shared with 2 people or roles: Unknown person, Unknown role."),
@@ -230,7 +233,7 @@ describe("the move dialog", () => {
       )
       const { picker } = renderDialog()
 
-      fireEvent.change(picker, { target: { value: "team" } })
+      chooseOption(picker, "Team")
 
       await loaded(access)
       expect(access).toHaveBeenCalledTimes(1)
@@ -241,7 +244,7 @@ describe("the move dialog", () => {
       const access = spyOn(queryService, "getFolderAccess").mockResolvedValue(accessList([]))
       const { picker } = renderDialog()
 
-      fireEvent.change(picker, { target: { value: "team" } })
+      chooseOption(picker, "Team")
 
       await loaded(access)
       expect(access).toHaveBeenCalledTimes(1)
@@ -252,7 +255,7 @@ describe("the move dialog", () => {
       spyOn(queryService, "getFolderAccess").mockResolvedValue(TEAM_ACCESS)
       const { picker } = renderDialog({ noViewer: true })
 
-      fireEvent.change(picker, { target: { value: "team" } })
+      chooseOption(picker, "Team")
 
       expect(
         await screen.findByText("Shared with 3 people or roles: Rina Wijaya, Dewi Lestari, Finance."),
@@ -264,7 +267,7 @@ describe("the move dialog", () => {
       // The dialog opens on the shared space (value "").
       const { picker } = renderDialog({ currentFolderId: null })
 
-      fireEvent.change(picker, { target: { value: "personal-1" } })
+      chooseOption(picker, "Personal space (only you)")
       await new Promise((resolve) => setTimeout(resolve, 20))
 
       expect(access).not.toHaveBeenCalled()
@@ -296,7 +299,7 @@ describe("the move dialog", () => {
         />,
       )
 
-      fireEvent.change(screen.getByLabelText("Target folder"), { target: { value: "reports" } })
+      chooseOption(screen.getByRole("combobox", { name: "Target folder" }), "Personal space (only you) / Reports")
 
       expect(await screen.findByText("Shared with 1 person or role: Dewi Lestari.")).toBeDefined()
       expect(access.mock.calls.at(-1)?.[0]).toBe("reports")
@@ -306,7 +309,7 @@ describe("the move dialog", () => {
       const access = spyOn(queryService, "getFolderAccess").mockReturnValue(new Promise(() => {}))
       const { picker, onMove } = renderDialog()
 
-      fireEvent.change(picker, { target: { value: "team" } })
+      chooseOption(picker, "Team")
       await waitFor(() => expect(access).toHaveBeenCalledTimes(1))
 
       const move = screen.getByRole("button", { name: "Move" }) as HTMLButtonElement
@@ -321,7 +324,7 @@ describe("the move dialog", () => {
       )
       const { picker, onMove } = renderDialog()
 
-      fireEvent.change(picker, { target: { value: "team" } })
+      chooseOption(picker, "Team")
 
       expect(await screen.findByText("The folder list could not be read.")).toBeDefined()
       expect(sharedLine().length).toBe(0)
@@ -365,7 +368,7 @@ describe("the move dialog", () => {
       expect(sharedLine().length).toBe(0)
       expect(screen.queryAllByText(/permission/i).length).toBe(0)
 
-      fireEvent.change(screen.getByLabelText("Target folder"), { target: { value: "read-only" } })
+      chooseOption(screen.getByRole("combobox", { name: "Target folder" }), "Read only")
       await act(async () => {
         await new Promise((resolve) => setTimeout(resolve, 20))
       })
@@ -386,7 +389,7 @@ describe("the move dialog", () => {
       const { picker } = renderDialog({ currentFolderId: "team" })
       expect(await screen.findByText("Shared with 2 people or roles: Dewi Lestari, Finance.")).toBeDefined()
 
-      fireEvent.change(picker, { target: { value: "quarterly" } })
+      chooseOption(picker, "Team / Quarterly")
 
       await waitFor(() => expect(asked.lines).not.toBeNull())
       expect(asked.lines).toBe(0)

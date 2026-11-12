@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import { SelectField } from "@/components/patterns/select-field"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import type { RestAuth, RestDial, RestEndpoint, RestPagination } from "@/services/contracts/connectors"
@@ -100,18 +101,15 @@ export function RestDialForm({
 
       <div className="space-y-1.5">
         <Label htmlFor="rest-dial-auth-type">Auth type</Label>
-        <select
+        {/* WEB-9 D3: the console's one dropdown; the five auth types and their
+            order are unchanged, labelled with the API's own words. */}
+        <SelectField
           id="rest-dial-auth-type"
-          className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+          className="w-full"
           value={dial.auth.type}
-          onChange={(e) => set("auth", defaultAuth(e.target.value as RestAuth["type"]))}
-        >
-          {AUTH_TYPES.map((t) => (
-            <option key={t} value={t}>
-              {t}
-            </option>
-          ))}
-        </select>
+          options={AUTH_TYPES.map((t) => ({ value: t, label: t }))}
+          onValueChange={(next) => set("auth", defaultAuth(next as RestAuth["type"]))}
+        />
       </div>
       {dial.auth.type === "api_key" ? (
         <div className="space-y-1.5">
@@ -148,16 +146,18 @@ export function RestDialForm({
 
       <div className="space-y-1.5">
         <Label htmlFor="rest-dial-pagination-type">Pagination</Label>
-        <select
+        {/* WEB-9 D3: the same three choices, in the same order. */}
+        <SelectField
           id="rest-dial-pagination-type"
-          className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+          className="w-full"
           value={dial.pagination.type}
-          onChange={(e) => set("pagination", defaultPagination(e.target.value as RestPagination["type"]))}
-        >
-          <option value="none">None</option>
-          <option value="page">Page number</option>
-          <option value="cursor">Cursor</option>
-        </select>
+          options={[
+            { value: "none", label: "None" },
+            { value: "page", label: "Page number" },
+            { value: "cursor", label: "Cursor" },
+          ]}
+          onValueChange={(next) => set("pagination", defaultPagination(next as RestPagination["type"]))}
+        />
       </div>
       {dial.pagination.type === "page" ? (
         <div className="space-y-1.5">

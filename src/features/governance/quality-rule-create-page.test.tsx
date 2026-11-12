@@ -265,6 +265,30 @@ describe("QualityRuleCreatePage table and column pickers (WEB-8 D8)", () => {
     ])
   })
 
+  it("says what to pick before a column is chosen, instead of an empty box", async () => {
+    stubApi()
+    renderPage()
+    fireEvent.change(await screen.findByLabelText("Name"), { target: { value: "email_filled" } })
+    await pickTable()
+    await waitFor(() =>
+      expect(screen.getByRole("combobox", { name: "Column" })).toBeTruthy()
+    )
+    // WEB-9 S1 review R1-S1 (D2a): the form holds "" until a column is picked,
+    // so the trigger names the choice instead of drawing an empty box.
+    expect(
+      screen
+        .getByRole("combobox", { name: "Column" })
+        .querySelector('[data-slot="select-value"]')?.textContent
+    ).toBe("Pick a column")
+    // Choosing one replaces the prompt with the column's own name.
+    chooseOption(screen.getByRole("combobox", { name: "Column" }), "amount")
+    expect(
+      screen
+        .getByRole("combobox", { name: "Column" })
+        .querySelector('[data-slot="select-value"]')?.textContent
+    ).toBe("amount")
+  })
+
   it("keeps a typed column that the table does not have, marked, instead of dropping it", async () => {
     stubApi()
     renderPage()
