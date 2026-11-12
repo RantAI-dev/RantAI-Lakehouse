@@ -4617,21 +4617,18 @@ mod tests {
         }
     }
 
-    /// [`fixture_member_principal`] with the unrestricted (`*:*`) grant.
+    /// The seeded `fajar@meridian.example` with NO tenant: a real `app_user`
+    /// (the `run_as` key) whose role is `*:*` in the DATABASE — which is what
+    /// the save-time gate reads (it runs as the author, not as the caller).
     ///
-    /// BLD-1 part 1 / D9 runs the tenant gate and the policy rewrite when a
-    /// pipeline is saved, as the person it will read as. A test whose setup
-    /// builds a pipeline through that check needs an author the gate lets
-    /// through — a `*:*` member of the seeded tenant — and a real `app_user`
-    /// for the `run_as` foreign key the create path now writes.
-    pub(super) fn fixture_admin_member_principal() -> Principal {
+    /// BLD-1 part 1 review R1-B8: a fixture that creates a pipeline with NO
+    /// tenant needs this author — a restricted one is refused by D9's gate,
+    /// which reads a tenantless pipeline as reaching nothing.
+    pub(super) fn fixture_admin_no_tenant_principal() -> Principal {
         Principal {
-            // The seeded `fajar@meridian.example`: a real `app_user` whose
-            // Platform Admin role is the `*:*` the save-time check needs (the
-            // check reads the author's real roles, not this fixture's).
             id: PrincipalId::User(Uuid::parse_str("33333333-3333-4333-8333-000000000006").unwrap()),
             permissions: PermissionSet::parse("*:*"),
-            ..fixture_member_principal()
+            ..fixture_user_principal()
         }
     }
 
@@ -5491,7 +5488,7 @@ mod tests {
             let state = state_with_dagster(&server.uri());
             let response = detail(
                 State(state),
-                Some(Extension(fixture_admin_member_principal())),
+                Some(Extension(fixture_member_principal())),
                 HeaderMap::new(),
                 Path("bronze_maintenance_job".to_owned()),
             )
@@ -5551,7 +5548,7 @@ mod tests {
             let state = state_with_dagster(&server.uri());
             let response = detail(
                 State(state),
-                Some(Extension(fixture_admin_member_principal())),
+                Some(Extension(fixture_member_principal())),
                 HeaderMap::new(),
                 Path("no_such_job".to_owned()),
             )
@@ -5617,9 +5614,19 @@ mod tests {
             use lakehouse_test_support as _;
 
             let state = pg_state_for(&pool);
+            // R1-B8: a restricted caller who MAY read the table it names — the
+            // connector's Bronze table, claimed by its own tenant.
+            lakehouse_store::uploads::claim_table(
+                &pool,
+                SEED_TENANT.parse().unwrap(),
+                "orders",
+                "upload-connector-route",
+            )
+            .await
+            .expect("claim the connector's table");
             let (_, ApiJson(created)) = create(
                 State(state.clone()),
-                Extension(fixture_admin_member_principal()),
+                Extension(fixture_member_principal()),
                 HeaderMap::new(),
                 create_body(&json!({
                     "connectorId": "conn-pg-lakehouse",
@@ -5660,9 +5667,18 @@ mod tests {
             use lakehouse_test_support as _;
 
             let state = pg_state_for(&pool);
+            // R1-B8: a restricted caller who MAY read the table it names.
+            lakehouse_store::uploads::claim_table(
+                &pool,
+                SEED_TENANT.parse().unwrap(),
+                "orders",
+                "upload-connector-route-2",
+            )
+            .await
+            .expect("claim the connector's table");
             let (status, ApiJson(created)) = create(
                 State(state),
-                Extension(fixture_admin_member_principal()),
+                Extension(fixture_member_principal()),
                 HeaderMap::new(),
                 create_body(&json!({
                     "connectorId": "conn-pg-lakehouse",
@@ -5819,6 +5835,15 @@ mod tests {
             use lakehouse_test_support as _;
 
             let state = pg_state_for(&pool);
+            // R1-B8: a restricted caller who MAY read the table it names.
+            lakehouse_store::uploads::claim_table(
+                &pool,
+                SEED_TENANT.parse().unwrap(),
+                "t",
+                "upload-detail-route",
+            )
+            .await
+            .expect("claim the fixture table");
             let body = Bytes::from(
                 serde_json::to_vec(&json!({
                     "name": format!("detail-route-test-{}", uuid::Uuid::new_v4()),
@@ -5834,7 +5859,7 @@ mod tests {
             );
             let (_, ApiJson(created)) = create(
                 State(state.clone()),
-                Extension(fixture_admin_member_principal()),
+                Extension(fixture_member_principal()),
                 HeaderMap::new(),
                 body,
             )
@@ -5874,7 +5899,7 @@ mod tests {
             let state = AppState::new(config);
             let response = detail(
                 State(state),
-                Some(Extension(fixture_admin_member_principal())),
+                Some(Extension(fixture_member_principal())),
                 HeaderMap::new(),
                 Path("pl-does-not-exist".to_owned()),
             )
@@ -6211,7 +6236,7 @@ mod tests {
             let tenant_principal = |tenant_id: uuid::Uuid| -> Principal {
                 Principal {
                     tenant_ids: vec![tenant_id],
-                    ..fixture_admin_member_principal()
+                    ..fixture_member_principal()
                 }
             };
 
@@ -6402,7 +6427,7 @@ mod tests {
             let state = state_with_dagster(&server.uri());
             let response = config_schema(
                 State(state),
-                Some(Extension(fixture_admin_member_principal())),
+                Some(Extension(fixture_member_principal())),
                 Path("pl-authored".to_owned()),
             )
             .await;
@@ -6438,7 +6463,7 @@ mod tests {
             let state = state_with_dagster(&server.uri());
             let response = config_schema(
                 State(state),
-                Some(Extension(fixture_admin_member_principal())),
+                Some(Extension(fixture_member_principal())),
                 Path("ingest_job".to_owned()),
             )
             .await;
@@ -6477,7 +6502,7 @@ mod tests {
             let state = state_with_dagster(&server.uri());
             let response = config_schema(
                 State(state),
-                Some(Extension(fixture_admin_member_principal())),
+                Some(Extension(fixture_member_principal())),
                 Path("not_a_job".to_owned()),
             )
             .await;
@@ -6517,7 +6542,7 @@ mod tests {
             let state = state_with_dagster(&server.uri());
             let response = config_schema(
                 State(state),
-                Some(Extension(fixture_admin_member_principal())),
+                Some(Extension(fixture_member_principal())),
                 Path("ingest_job".to_owned()),
             )
             .await;
@@ -7917,6 +7942,17 @@ mod tests {
         }
 
         async fn create_draft(state: &AppState) -> pipelines::Pipeline {
+            // R1-B8: a restricted caller who MAY read the table it names — the
+            // save-time gate (D9) allows a Bronze table its own tenant claimed.
+            let pool = state.pg.as_deref().expect("DATABASE_URL was set");
+            lakehouse_store::uploads::claim_table(
+                pool,
+                SEED_TENANT.parse().unwrap(),
+                "t",
+                "upload-status-route",
+            )
+            .await
+            .expect("claim the fixture table");
             let body = Bytes::from(
                 serde_json::to_vec(&json!({
                     "name": format!("status-route-test-{}", uuid::Uuid::new_v4()),
@@ -7931,7 +7967,7 @@ mod tests {
             );
             let (_, ApiJson(pipeline)) = create(
                 State(state.clone()),
-                Extension(fixture_admin_member_principal()),
+                Extension(fixture_member_principal()),
                 HeaderMap::new(),
                 body,
             )
@@ -8095,6 +8131,10 @@ mod tests {
         /// `0042_tenant_provisioning.sql` (whose own comment records that
         /// it backfills nothing for this table at all).
         async fn seed_pipeline_with_null_tenant(state: &AppState, name: &str) -> String {
+            // R1-B8: this fixture creates a pipeline with NO tenant, which a
+            // restricted caller cannot do — D9's gate reads a tenantless
+            // pipeline as reaching nothing (handoff mismatch 3). The seam under
+            // test (tenant assignment) is the route's, not the caller's.
             let body = Bytes::from(
                 serde_json::to_vec(&json!({
                     "name": name,
@@ -8109,7 +8149,7 @@ mod tests {
             );
             let (_, ApiJson(pipeline)) = create(
                 State(state.clone()),
-                Extension(fixture_admin_member_principal()),
+                Extension(fixture_admin_no_tenant_principal()),
                 HeaderMap::new(),
                 body,
             )
@@ -9604,15 +9644,25 @@ mod tests {
                 }))
                 .expect("serialize"),
             );
+            // R1-B8: a restricted caller who MAY read the table it names — the
+            // save-time gate (D9) allows a Bronze table its own tenant claimed.
+            let pool = state.pg.as_deref().expect("DATABASE_URL was set");
+            lakehouse_store::uploads::claim_table(
+                pool,
+                SEED_TENANT.parse().unwrap(),
+                "t",
+                "upload-run-finished-route",
+            )
+            .await
+            .expect("claim the fixture table");
             let (_, ApiJson(pipeline)) = create(
                 State(state.clone()),
-                Extension(fixture_admin_member_principal()),
+                Extension(fixture_member_principal()),
                 HeaderMap::new(),
                 body,
             )
             .await
             .expect("create should succeed");
-            let pool = state.pg.as_deref().expect("DATABASE_URL was set");
             sqlx::query("UPDATE pipeline_definition SET status = 'ready' WHERE id = $1")
                 .bind(&pipeline.id)
                 .execute(pool)
@@ -9824,7 +9874,7 @@ mod tests {
         fn tenant_principal(tenant_id: uuid::Uuid) -> Principal {
             Principal {
                 tenant_ids: vec![tenant_id],
-                ..fixture_admin_member_principal()
+                ..fixture_member_principal()
             }
         }
 
@@ -10951,7 +11001,7 @@ mod tests {
         fn tenant_principal(tenant_id: uuid::Uuid) -> Principal {
             Principal {
                 tenant_ids: vec![tenant_id],
-                ..fixture_admin_member_principal()
+                ..fixture_member_principal()
             }
         }
 

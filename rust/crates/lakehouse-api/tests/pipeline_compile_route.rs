@@ -45,10 +45,13 @@ use common::{TestApp, session_cookie_for_seeded_user, spin_up_with_env};
 /// The table every test here reads. A `serving.` table, because that is
 /// what an authored pipeline actually reads, and a name no other test in
 /// this binary shares.
-/// The SQL step every serving-table fixture runs. BLD-1 part 1 / D8: the
-/// orchestrator no longer sends SQL, so the statement under test is the one
-/// the API compiles from this step.
-const SQL: &str = "SELECT email FROM source";
+/// The statement under test: what the API compiles for the fixture below.
+///
+/// BLD-1 part 1 review R1-B8 / D4a: the fixture is today's shape — one input
+/// and one `transform` step reading it — so this is exactly the text
+/// `_build_select_sql` gave on `main`, and every assertion on it is exact
+/// equality again.
+const SQL: &str = "SELECT email FROM serving.`enforced_x`";
 /// The input that step reads: a `serving.` table, because that is what an
 /// authored pipeline actually reads.
 const READS: (&str, &str) = ("serving", "enforced_x");
@@ -56,7 +59,7 @@ const READS: (&str, &str) = ("serving", "enforced_x");
 /// `SEC-50`: the upload table a pipeline may name — `bronze.*` is where
 /// another tenant's upload lives, and it is the only namespace an
 /// authored pipeline can read that a tenant owns.
-const BRONZE_SQL: &str = "SELECT * FROM source";
+const BRONZE_SQL: &str = "SELECT * FROM icecat_api.`bronze.group_orders`";
 /// The Bronze input the upload-table cases read.
 const BRONZE_READS: (&str, &str) = ("bronze", "group_orders");
 
@@ -176,13 +179,34 @@ async fn seed_mask(pool: &PgPool, role: &str) {
 /// BLD-1 part 1 / D1: the definition is seeded through the store on purpose —
 /// these tests are about what the RUN route answers for a stored definition,
 /// and the save-time check (D9) is `pipeline_definition_save.rs`'s subject.
+enum FixtureStep<'a> {
+    /// Today's shape with no step: `SELECT * FROM <the input's table>`.
+    None,
+    /// Today's shape with one `transform` step: `SELECT email FROM …`.
+    SelectEmail,
+    /// A SQL step, which is not today's shape (the compiled text is a `WITH`).
+    Sql(&'a str),
+}
+
 async fn seed_pipeline_reading(
     pool: &PgPool,
     run_as: Option<Uuid>,
     tenant_id: Option<Uuid>,
     reads: (&str, &str),
-    sql: &str,
+    step: FixtureStep<'_>,
 ) -> String {
+    let steps = match step {
+        FixtureStep::None => Vec::new(),
+        FixtureStep::SelectEmail => vec![pipelines::PipelineStep::Transform {
+            name: "projected".to_owned(),
+            reads: "source".to_owned(),
+            transforms: vec!["select(email)".to_owned()],
+        }],
+        FixtureStep::Sql(sql) => vec![pipelines::PipelineStep::Sql {
+            name: "projected".to_owned(),
+            sql: sql.to_owned(),
+        }],
+    };
     let created = pipelines::create_pipeline(
         pool,
         &CreatePipelineInput {
@@ -191,10 +215,7 @@ async fn seed_pipeline_reading(
                 zone: reads.0.to_owned(),
                 table: reads.1.to_owned(),
             }],
-            steps: vec![pipelines::PipelineStep::Sql {
-                name: "projected".to_owned(),
-                sql: sql.to_owned(),
-            }],
+            steps,
             // A unique name: one test seeds two pipelines, and the name is
             // the table's natural key.
             name: format!("compile-probe-{}", Uuid::new_v4()),
@@ -340,7 +361,7 @@ async fn the_pipeline_detail_carries_no_author_name_when_there_is_no_author() {
 
 /// [`seed_pipeline_reading`] over the serving fixture.
 async fn seed_pipeline(pool: &PgPool, run_as: Option<Uuid>, tenant_id: Option<Uuid>) -> String {
-    seed_pipeline_reading(pool, run_as, tenant_id, READS, SQL).await
+    seed_pipeline_reading(pool, run_as, tenant_id, READS, FixtureStep::SelectEmail).await
 }
 
 /// [`seed_pipeline_reading`] over the Bronze upload-table fixture.
@@ -349,7 +370,7 @@ async fn seed_bronze_pipeline(
     run_as: Option<Uuid>,
     tenant_id: Option<Uuid>,
 ) -> String {
-    seed_pipeline_reading(pool, run_as, tenant_id, BRONZE_READS, BRONZE_SQL).await
+    seed_pipeline_reading(pool, run_as, tenant_id, BRONZE_READS, FixtureStep::None).await
 }
 
 async fn seeded_user_id(pool: &PgPool, email: &str) -> Uuid {
@@ -385,7 +406,7 @@ async fn a_masked_column_is_rewritten_for_an_author_who_has_the_obligation() {
     // projects the ORIGINAL column name from it, so the text that must be
     // gone is the original statement, not the bare word `SELECT email`.
     assert!(
-        !sql.contains("SELECT email FROM serving.enforced_x"),
+        !sql.contains(SQL),
         "the unmasked statement survived the rewrite: {sql}"
     );
 }
@@ -407,10 +428,13 @@ async fn an_author_without_the_obligation_gets_the_query_unchanged() {
 
     let (status, body) = compile(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let sql = body["sql"].as_str().expect("a sql string");
+    assert_eq!(body["sql"].as_str(), Some(SQL), "{body}");
     assert!(
-        sql.contains("FROM serving.`enforced_x`") && sql.contains("FROM `projected`"),
-        "{sql}"
+        !body["sql"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("replaceRegexpOne"),
+        "no obligation means no mask: {body}"
     );
 }
 
@@ -489,7 +513,7 @@ async fn a_refused_construct_is_refused_with_the_fixed_message_only() {
         Some(seeded_user_id(&pool, "rina@meridian.example").await),
         Some(first_tenant_of(&pool, "rina@meridian.example").await),
         READS,
-        "SELECT * FROM numbers(5)",
+        FixtureStep::Sql("SELECT * FROM numbers(5)"),
     )
     .await;
 
@@ -580,11 +604,7 @@ async fn the_authors_roles_are_read_at_enforcement_time_not_at_create() {
 
     let (status, body) = compile(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let sql = body["sql"].as_str().expect("a sql string");
-    assert!(
-        sql.contains("FROM serving.`enforced_x`") && sql.contains("FROM `projected`"),
-        "not governed yet: {sql}"
-    );
+    assert_eq!(body["sql"].as_str(), Some(SQL), "not governed yet: {body}");
 
     sqlx::query(
         "INSERT INTO app_user_role (user_id, role_id) \
@@ -768,11 +788,7 @@ async fn a_pipeline_reads_an_upload_table_its_own_tenant_claimed() {
     let (status, body) = compile(&router, &cookie, &id).await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
-    let sql = body["sql"].as_str().expect("a sql string");
-    assert!(
-        sql.contains("FROM icecat_api.`bronze.group_orders`") && sql.contains("FROM `projected`"),
-        "{sql}"
-    );
+    assert_eq!(body["sql"].as_str(), Some(BRONZE_SQL), "{body}");
 }
 
 /// `SEC-50` R3: a pipeline that belongs to no tenant is refused with its
@@ -829,11 +845,7 @@ async fn a_pipeline_authored_by_an_unrestricted_principal_is_not_refused_for_its
     let (status, body) = compile(&router, &cookie, &id).await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
-    let sql = body["sql"].as_str().expect("a sql string");
-    assert!(
-        sql.contains("FROM icecat_api.`bronze.group_orders`") && sql.contains("FROM `projected`"),
-        "{sql}"
-    );
+    assert_eq!(body["sql"].as_str(), Some(BRONZE_SQL), "{body}");
 }
 
 /// `SEC-50`: the author is applied as if they had sent the pipeline's
@@ -971,4 +983,64 @@ async fn reads_iceberg_is_true_only_with_a_bronze_input() {
     let (status, body) = compile(&router, &cookie, &bronze).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["readsIceberg"], true, "{body}");
+}
+
+/// BLD-1 part 1 review R1-B8: a SQL step is not today's shape, so it keeps
+/// the `WITH` form — and the whole answer is pinned, not a substring.
+#[tokio::test]
+async fn a_sql_step_pipeline_compiles_to_the_with_form() {
+    let (router, pool, cookie, _engine) = app().await;
+    let id = seed_pipeline_reading(
+        &pool,
+        Some(seeded_user_id(&pool, "yoga@meridian.example").await),
+        Some(first_tenant_of(&pool, "yoga@meridian.example").await),
+        READS,
+        FixtureStep::Sql("SELECT email FROM source"),
+    )
+    .await;
+
+    let (status, body) = compile(&router, &cookie, &id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["sql"].as_str(),
+        Some(
+            "WITH `source` AS (SELECT * FROM serving.`enforced_x`), `projected` AS \
+             (SELECT email FROM source) SELECT * FROM `projected`"
+        ),
+        "{body}"
+    );
+    assert_eq!(body["readsIceberg"], false, "{body}");
+    assert!(
+        !body["sql"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("replaceRegexpOne"),
+        "no obligation means no mask: {body}"
+    );
+}
+
+/// BLD-1 part 1 review R1-B8: the mask sits where the column is read inside
+/// a SQL step, and the unmasked projection is gone.
+#[tokio::test]
+async fn a_masked_column_inside_a_sql_step_comes_back_masked() {
+    let (router, pool, cookie, _engine) = app().await;
+    seed_mask(&pool, "Analyst").await;
+    let id = seed_pipeline_reading(
+        &pool,
+        Some(seeded_user_id(&pool, "rina@meridian.example").await),
+        Some(first_tenant_of(&pool, "rina@meridian.example").await),
+        READS,
+        FixtureStep::Sql("SELECT email FROM source"),
+    )
+    .await;
+
+    let (status, body) = compile(&router, &cookie, &id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let sql = body["sql"].as_str().expect("a sql string");
+    assert_eq!(
+        sql.matches("replaceRegexpOne(toString(`email`)").count(),
+        1,
+        "{sql}"
+    );
+    assert!(sql.contains("FROM serving.`enforced_x`"), "{sql}");
 }
