@@ -211,6 +211,53 @@ def test_the_walk_stops_after_sixteen_exceptions() -> None:
     assert e.classify(seventeenth).error_class == e.OTHER
 
 
+# --- object storage that is down (`s3fs` -> `botocore`), QA LH-SRC-6-53 (SRC-38) ---
+
+
+def _object_store_chain(storage_error: BaseException) -> BaseException:
+    """What `dlt` raises around a failing `s3fs` read: `PipelineStepFailed`
+    (with `.exception`) over `ResourceExtractionError`, over the `botocore`
+    error itself. Stand-in classes, so this file imports no `dlt`."""
+    inner = _driver_error("dlt", "ResourceExtractionError")("pipeline step failed")
+    inner.__cause__ = storage_error
+    outer = _driver_error("dlt", "PipelineStepFailed")("pipeline step failed")
+    outer.exception = inner
+    outer.__cause__ = inner
+    return outer
+
+
+def test_an_object_storage_endpoint_that_is_down_is_unreachable_and_retried() -> None:
+    from botocore.exceptions import EndpointConnectionError
+
+    storage = EndpointConnectionError(endpoint_url="http://storage.invalid:9000/b")
+    assert e.classify(_object_store_chain(storage)) == e.Classified(e.UNREACHABLE, retried=True)
+
+
+def test_each_object_storage_connection_error_gets_its_class() -> None:
+    from botocore.exceptions import ConnectTimeoutError, ConnectionClosedError, ReadTimeoutError
+
+    address = "http://storage.invalid:9000/b"
+    for error, expected in (
+        (ConnectionClosedError(endpoint_url=address), e.UNREACHABLE),
+        (ConnectTimeoutError(endpoint_url=address), e.TIMEOUT),
+        (ReadTimeoutError(endpoint_url=address), e.TIMEOUT),
+    ):
+        assert e.classify(error) == e.Classified(expected, retried=True), type(error).__name__
+
+
+def test_a_certificate_failure_at_the_object_store_is_not_called_unreachable() -> None:
+    from botocore.exceptions import SSLError
+
+    verdict = e.classify(
+        SSLError(endpoint_url="http://storage.invalid:9000/b", error="certificate verify failed")
+    )
+    assert verdict == e.Classified(e.OTHER, retried=False)
+
+
+def test_the_classifier_imports_no_object_storage_library() -> None:
+    assert not {"botocore", "s3fs", "aiohttp"} & set(vars(e))
+
+
 def test_nothing_of_a_message_is_in_the_verdict() -> None:
     verdict = e.classify(_driver_error("pymysql")(1045, "Access denied for user 'secret_user'@'10.1.2.3'"))
     assert "secret_user" not in repr(verdict) and "10.1.2.3" not in repr(verdict)

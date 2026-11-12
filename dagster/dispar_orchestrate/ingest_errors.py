@@ -37,9 +37,12 @@ is never logged, stored or sent, and nothing in this module returns any part
 of an exception's message.
 
 Drivers are recognised by the module their exception class claims (`pymysql`,
-`pyodbc`, `oracledb`, `psycopg2`, `kafka`, `paramiko`, `pymongo`), so this
-file imports none of them (`pyodbc` cannot be imported without a system ODBC
-library).
+`pyodbc`, `oracledb`, `psycopg2`, `kafka`, `paramiko`, `pymongo`,
+`botocore`), so this file imports none of them (`pyodbc` cannot be imported
+without a system ODBC library). `botocore` is what an object-storage read
+raises through `s3fs` (`QA LH-SRC-6-53`, `SRC-38`): `aiobotocore` turns
+every `aiohttp` failure into one of its classes and `s3fs` passes them on
+unchanged. It is still not imported here.
 
 # Retry delays
 
@@ -417,6 +420,17 @@ def _classify_driver(exc: BaseException, root: str) -> str | None:
             return UNREACHABLE
     if root == "pyiceberg" and names & {"ServiceUnavailableError", "ServerError"}:
         return SOURCE_BUSY
+    if root == "botocore":
+        # QA LH-SRC-6-53 (SRC-38): an object-storage endpoint that is down
+        # arrives through `s3fs` and `dlt` as a `botocore` error. The timeout
+        # names are tested first, because `ConnectTimeoutError` is also a
+        # botocore `ConnectionError`. A certificate problem (`SSLError`), a
+        # proxy error (this adapter sets no proxy) and a `ClientError` (the
+        # storage answered) stay `other`: a retry does not pass them.
+        if names & {"ConnectTimeoutError", "ReadTimeoutError"}:
+            return TIMEOUT
+        if names & {"EndpointConnectionError", "ConnectionClosedError"}:
+            return UNREACHABLE
     return None
 
 
