@@ -686,4 +686,242 @@ None of these blocks the build; each has a planned default.
 
 ## 5. Handoff
 
+Developer: a non-Opus coding agent, on the ARM64 build machine, in
+`/home/rismana/rantai/lakehouse-agents-4`, branch
+`fix/qa-round-connectors-p1` off `origin/fix/qa-round-connectors-p1` at
+`eb209d04`. Every commit was pushed after the checks below. No pull request was
+opened. Migration number: `git fetch origin && git ls-tree --name-only
+origin/main rust/migrations/ | tail -3` answered `0133`, `0134`, `0135`,
+`0136`, so `0137` was free and is used as planned.
+
+### Commits
+
+| Commit | Title |
+| --- | --- |
+| `f5229f15` | fix(dagster): read a failure chain sixteen exceptions deep |
+| `faf6f7c6` | fix(dagster): an object store that is down is unreachable and retried |
+| `6831fa70` | feat(dagster): every ingest run carries its time limit |
+| `52e6c658` | feat(dagster): report when a run was created and cancel one for good |
+| `e28f2447` | feat(store): a run record can end as timed out |
+| `a5a8a0d8` | feat(api): the two run limits are settings of the API |
+| `70c85a6a` | feat(api): a failed run past the limit closes as timed out |
+| `1e0b0658` | feat(api): an overdue run no longer locks the connector |
+| `9febaba0` | feat(api): a rule's target is returned only to whoever may manage it |
+| `3ab35d23` | feat(compose,dagster): run monitoring is on and the limits reach both services |
+| `7fd71e12` | feat(console): the connector page says when a run was stopped for running too long |
+| `69d4ca07` | feat(console): the Alerts pages say Webhook or E-mail when the address is hidden |
+| `27d75539` | docs: the pages and the config table name the run limits and the hidden target |
+
+Tasks T1 to T13, in the plan's order, one task per commit. T14 does not exist;
+the documents are T13.
+
+### Tests added, by task
+
+T1 (`dagster/dispar_orchestrate/test_ingest_errors.py`):
+`test_a_failure_five_wrappers_deep_is_still_found`,
+`test_a_failure_under_implicit_context_is_found_three_links_deep`,
+`test_the_walk_stops_after_sixteen_exceptions`. All three answered `other`
+before the change (3 failed, 66 deselected) and pass after it.
+
+T2 (`test_ingest_errors.py`, `test_ingest_retries.py`):
+`test_an_object_storage_endpoint_that_is_down_is_unreachable_and_retried`,
+`test_each_object_storage_connection_error_gets_its_class`,
+`test_a_certificate_failure_at_the_object_store_is_not_called_unreachable`
+(a pin: `other` before and after; its first run failed only because
+`SSLError` needs its `error=` argument, which the test now passes),
+`test_the_classifier_imports_no_object_storage_library`,
+`test_an_unreachable_object_store_is_retried_after_one_five_and_fifteen_minutes`.
+The first, second and last failed before the change (`other`, no wait).
+
+T3 (new `dagster/dispar_orchestrate/test_ingest_run_limit.py`):
+`test_an_ingest_run_is_limited_to_six_hours_by_default`,
+`test_the_run_limit_comes_from_the_setting`,
+`test_a_run_limit_that_cannot_be_read_falls_back_to_six_hours` (`"abc"`,
+`"0"`, `"-5"`, `"1.5"`, `"  "`; the warning never echoes the value, compared
+with the default removed from the log because `21600` contains `0`),
+`test_the_ingest_job_and_its_runs_carry_the_limit_tag`. All 8 cases errored
+before the change (no `RunLimitSettings`, no `_ingest_job_tags`).
+
+T4 (`lakehouse-dagster/src/lib.rs` tests):
+`list_runs_for_job_with_config_returns_when_each_run_was_created`,
+`cancel_run_now_asks_for_the_run_to_be_marked_cancelled_at_once`,
+`terminate_run_still_asks_for_a_safe_termination`. The first two did not
+compile before the change; the three existing `terminate_run_*` tests stay
+green unchanged.
+
+T5 (`lakehouse-store/tests/connector_run.rs`):
+`a_run_past_its_limit_ends_as_failed_with_the_limit_in_its_last_log_line`,
+`a_run_that_already_ended_or_has_no_record_is_left_alone_by_the_time_limit`.
+Both did not compile before the change.
+
+T6 (`lakehouse-api/src/config.rs` tests):
+`the_run_limits_default_to_six_hours_and_ten_minutes_and_ignore_garbage` (did
+not compile before the change).
+
+T7 (`lakehouse-api/src/routes/load_alerts.rs` tests):
+`a_failed_run_that_ran_past_the_limit_closes_its_record_as_timed_out`,
+`a_failed_run_inside_the_limit_still_ends_as_a_failed_table`,
+`a_run_with_a_missing_time_is_never_called_timed_out` (a plain `#[test]`; it
+did not compile before the change, and it was the one run before the fix).
+
+T8 (`lakehouse-api/src/routes/connectors.rs` tests and
+`lakehouse-api/tests/ingest_run.rs`):
+`a_run_started_longer_ago_than_the_limit_is_overdue_and_a_younger_one_is_not`,
+`a_run_that_never_started_is_overdue_after_the_start_limit`,
+`a_run_with_no_time_recorded_is_never_overdue`,
+`a_finished_run_is_never_overdue` (the first did not compile before the
+change); integration:
+`a_run_older_than_the_limit_is_cancelled_and_the_next_run_starts`,
+`a_run_that_never_started_stops_locking_the_connector_after_the_start_limit`,
+`an_orchestrator_that_refuses_the_cancel_does_not_keep_the_connector_locked`.
+`ingest_run_refuses_a_second_run_while_one_is_going` stays a 409.
+`ingest_run_for`/`dg_run` now say "a run is going" with a start of 60 seconds
+ago plus `creationTime`; that is in the commit body (rule 2: no assertion was
+weakened).
+
+T9 (`lakehouse-api/src/routes/alerts.rs` `mod hidden_targets`, and new
+`lakehouse-api/tests/alert_targets_hidden.rs`):
+`a_caller_with_alert_read_only_gets_the_rule_without_its_target`,
+`a_caller_with_alert_write_gets_the_target`,
+`the_owner_of_a_chart_alert_gets_their_own_target_without_alert_write`,
+`a_caller_with_no_principal_gets_no_target` (the first did not compile before
+the change); integration:
+`get_alerts_hides_the_target_from_a_caller_without_alert_write`,
+`get_alerts_returns_the_target_to_a_caller_with_alert_write`,
+`the_assistants_rule_list_hides_the_target_from_a_caller_without_alert_write`,
+`the_assistants_rule_list_returns_the_target_to_a_caller_with_alert_write`,
+`the_incident_list_never_carries_a_rule_target`,
+`the_alert_status_holds_one_boolean_and_nothing_else`. The two "hides" tests
+were also run with the redaction taken out of `listed_rules` and failed with
+the address in the body (5 passed, 2 failed), then passed with it.
+
+T11 (`src/features/connectors/connector-ingest-panel.test.tsx`,
+`connector-overview.test.tsx`): "says a run that outlived its limit was
+stopped" and "says a last run stopped by the time limit was stopped for
+running too long" (both failed before the change).
+
+T12 (`src/features/alerts/alerts-page.test.tsx`,
+`alert-rule-page.test.tsx`): "says Webhook for a hidden webhook rule, disables
+its switch and shows no actions", "says E-mail for a hidden e-mail rule",
+"shows the address, an enabled switch and the actions when the target is
+returned", "says a rule whose target is hidden cannot be changed", "still
+renders the form for a rule whose target is returned" (the first, second and
+fourth failed before the change; the switch's disabled state is base-ui's
+`aria-disabled`, not `.disabled`).
+
+### Commands run, with their counts
+
+Python, per commit (the interpreter is a venv built for this task with
+`uv venv /home/rismana/rantai/venv-agents-4 --python 3.12` and
+`uv pip install -e . pytest` in `dagster/`):
+
+- `(cd dagster && python -m pytest dispar_orchestrate/test_ingest_errors.py dispar_orchestrate/test_ingest_retries.py -q)`
+  → 81 passed (T1), 86 passed (T2).
+- `(cd dagster && python -m pytest dispar_orchestrate/test_ingest_errors.py dispar_orchestrate/test_ingest_retries.py dispar_orchestrate/test_ingest_run_limit.py -q)`
+  → 94 passed (T3).
+
+Rust, per commit, with `export CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-4 CARGO_BUILD_JOBS=6`:
+
+- `cargo fmt --check` → OK after every Rust commit.
+- `cargo test -p lakehouse-dagster --lib terminate` → 4 passed; `--lib cancel_run_now`
+  → 1 passed; `--lib list_runs_for_job_with_config_returns_when_each_run_was_created`
+  → 1 passed; `cargo clippy -p lakehouse-dagster --all-targets -- -D warnings`
+  → clean; `cargo check -p lakehouse-api` → OK (T4).
+- `cargo test -p lakehouse-store --test connector_run` → 11 passed;
+  `cargo clippy -p lakehouse-store --all-targets -- -D warnings` → clean (T5).
+- `cargo test -p lakehouse-api --lib the_run_limits_default_to_six_hours` → 1
+  passed; `cargo clippy -p lakehouse-api --all-targets -- -D warnings` → clean
+  (T6).
+- `cargo test -p lakehouse-api --lib "routes::load_alerts::tests"` → 25 passed
+  (T7).
+- `cargo test -p lakehouse-api --test ingest_run` → 25 passed;
+  `cargo test -p lakehouse-api --lib "routes::connectors::tests"` → 68 passed
+  (T8).
+- `cargo test -p lakehouse-api --test alert_targets_hidden` → 7 passed;
+  `cargo test -p lakehouse-api --lib "routes::alerts::"` → 42 passed (T9).
+  (`Docker` is running here, so the `#[sqlx::test]` tests of T5, T7, T8 and
+  T9 ran locally, not only in CI.)
+
+TypeScript (`bun install --frozen-lockfile` once first):
+
+- `bun test src/features/connectors/connector-ingest-panel.test.tsx src/features/connectors/connector-overview.test.tsx`
+  → 108 passed (T11).
+- `bun test src/features/alerts/alerts-page.test.tsx src/features/alerts/alert-rule-page.test.tsx`
+  → 43 passed (T12).
+- `bun run typecheck` → clean; `bun run lint` → 0 errors, 11 warnings, all
+  pre-existing in files this slice does not touch.
+
+Compose and Python lints (T10):
+
+- `sh ops/init-env.sh` once (no `.env` existed; it is untracked and not
+  staged), then `docker compose --profile '*' config --quiet` → OK.
+- `python3 ops/lint/check_intra_package_imports.py` → OK;
+  `python3 ops/lint/check_bare_iceberg_count.py` → OK.
+
+Before handoff, on the final commit `27d75539`, in the foreground:
+
+- `(cd dagster && python -m pytest dispar_orchestrate -q)` → **2540 passed, 1
+  skipped, 41 subtests passed** in 837.83s.
+- `python3 ops/lint/check_intra_package_imports.py` and
+  `check_bare_iceberg_count.py` → OK; `docker compose --profile '*' config --quiet`
+  → OK.
+- `(cd rust && cargo fmt --check)` → OK.
+- `(cd rust && cargo clippy --workspace --all-targets --all-features -- -D warnings)`
+  → clean (`Finished dev profile`).
+- `(cd rust && cargo test --workspace --no-fail-fast)` → every target and every
+  doc-test passed except one test (below). One failing test in the whole
+  workspace: `a_pdf_failure_is_logged_for_the_operator_and_the_record_stays_fixed`
+  (`lakehouse-api --test report_runner`: 23 passed, 1 failed).
+- `bun run typecheck` → clean; `bun run lint` → 0 errors, 11 warnings;
+  `bun run test` → **4000 passed, 1 skipped, 0 failed** (4001 tests, 380
+  files).
+- `git status` → clean (the `.env` is ignored; no `__pycache__/`, `*.pyc`,
+  `rust/target/` or other generated file is staged or tracked).
+
+### One failing test, and it fails on `main` too
+
+`a_pdf_failure_is_logged_for_the_operator_and_the_record_stays_fixed`
+(`rust/crates/lakehouse-api/tests/report_runner.rs`) reads a tracing capture
+from `tracing::subscriber::set_default` and is a flake under parallel test
+execution: it passes alone (`cargo test -p lakehouse-api --test report_runner
+a_pdf_failure_is_logged_for_the_operator_and_the_record_stays_fixed` → 1
+passed) and fails when the whole file runs (`--test report_runner` → 23
+passed, 1 failed). It is not caused by this branch: in a detached worktree at
+`origin/main` (`75010df8`) with the same target directory, the same file
+failed **5 of 5** runs, the same test. CI runs nextest, one process per test,
+where it passes. It is unrelated to this slice (reports and PDF rendering) and
+needs a backlog item — the planner's call; I did not edit `BACKLOG.md`.
+
+### Not verified locally, CI
+
+- **T10, its whole proof**: the real `docker compose up` this change needs
+  (rule 8) and gate step h (`step_stuck_runs_are_ended`) were **not verified
+  locally, CI**. The CI gate is `g6-ops` ("Rust · SRC-11 connector operations"),
+  which builds the Dagster image, brings the `dagster` profile up and runs the
+  new step h after real runs of steps a to g under monitoring; `g3a-dagster`
+  brings the same image up as well. `docker compose config --quiet` is all that
+  was run here.
+- Nothing else is unverified. The `#[sqlx::test]` tests of T5, T7, T8 and T9,
+  the `lakehouse-api` unit tests of T6, T8 and T9, and the integration tests
+  `ingest_run.rs` and `alert_targets_hidden.rs` all ran locally with their
+  counts above; CI runs them again through nextest's partitions.
+
+### Notes for the reviewer
+
+- `launch_ingest` grew past clippy's `too_many_lines`; the guard was extracted
+  as `guard_one_run_at_a_time` rather than allowed, and the one allow added is
+  `clippy::cast_precision_loss` with a checkable reason (Unix seconds to `f64`
+  to match `DgConfiguredRun`), in `connectors.rs` and in the `ingest_run.rs`
+  test module.
+- The 6 hours and the 10 minutes stay *(proposed)* in the feature page's
+  decision 15, with the Signed cell empty for the owner, as the plan says.
+- `tests/fixtures/tool_schemas.json` was not regenerated: no tool schema or
+  description changed (D20).
+
+### MISMATCH
+
+None. Every anchor of the plan was found by its text; the only differences were
+line numbers, and the plan's `:4103` `dg_run` fixture needed the `creation_time`
+field the same task adds, as it says.
+
 ## 6. Review
