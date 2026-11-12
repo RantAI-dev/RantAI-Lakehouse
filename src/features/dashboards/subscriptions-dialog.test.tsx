@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
 import { chooseOption } from "@/components/patterns/select-field.testing"
+import { formatDateTime } from "@/lib/format"
 import type { ReportSubscription } from "@/services/contracts/reports"
 import { AS_CREATOR_SENTENCE, EMAIL_NOT_SET_UP, SubscriptionsDialog } from "./subscriptions-dialog"
 
@@ -71,6 +72,40 @@ describe("SubscriptionsDialog", () => {
     expect(await screen.findByText("Every Monday at 08:00 (Asia/Jakarta)")).toBeDefined()
     expect(screen.getByText(/PDF and 1 chart file · to Colleague, press@partner.example/)).toBeDefined()
     expect(screen.getByText("Failed. The PDF took too long to make.")).toBeDefined()
+  })
+
+  it("shows Not sent with the time of the last attempt on a subscription while email is not set up, instead of its last status", async () => {
+    const lastAttemptAt = "2026-11-12T04:15:00Z"
+    const withoutEmail: ReportSubscription = {
+      ...sub,
+      consecutiveFailures: 0,
+      notSent: { cause: "email_not_set_up", lastAttemptAt },
+      lastDelivery: { id: "d2", startedAt: lastAttemptAt, finishedAt: lastAttemptAt, status: "failed", origin: "schedule", recipientCount: 2, reason: EMAIL_NOT_SET_UP },
+    }
+    mockApi({ items: [withoutEmail], emailSetUp: false })
+    render(<SubscriptionsDialog {...props} />)
+    expect(await screen.findByText(`Not sent: e-mail is not set up on this installation. Last attempt: ${formatDateTime(lastAttemptAt)}.`)).toBeDefined()
+    expect(screen.queryByText(`Failed. ${EMAIL_NOT_SET_UP}`)).toBeNull()
+  })
+
+  it("keeps the Paused line under Not sent", async () => {
+    const paused: ReportSubscription = {
+      ...sub,
+      paused: true,
+      pausedReason: "Paused after 5 failed sends in a row.",
+      notSent: { cause: "email_not_set_up", lastAttemptAt: null },
+    }
+    mockApi({ items: [paused], emailSetUp: false })
+    render(<SubscriptionsDialog {...props} />)
+    expect(await screen.findByText("Not sent: e-mail is not set up on this installation.")).toBeDefined()
+    expect(screen.getByText("Paused. Paused after 5 failed sends in a row.")).toBeDefined()
+  })
+
+  it("shows the last status as before when the list says nothing of the kind", async () => {
+    mockApi({ items: [{ ...sub, notSent: null }], emailSetUp: false })
+    render(<SubscriptionsDialog {...props} />)
+    expect(await screen.findByText("Failed. The PDF took too long to make.")).toBeDefined()
+    expect(screen.queryByText(/Not sent: e-mail is not set up/)).toBeNull()
   })
 
   it("says email is not set up while it is not, and still lets a subscription be made", async () => {

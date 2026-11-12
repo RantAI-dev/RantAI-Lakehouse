@@ -78,6 +78,14 @@ export type ReportSubscription = {
   lastDelivery?: ReportDelivery | null
   /** The caller owns it or is an administrator. */
   canEdit?: boolean
+  /**
+   * Set by the list only (`GET /api/reports/subscriptions`): why the
+   * subscription is not being sent right now. `email_not_set_up` while the
+   * installation has no mail server, with the start of the last attempt that
+   * failed for that reason, or `null` when nothing has been attempted since
+   * (`RPT-2`, `DEC-18`, QA `LH-RPT-1-06`).
+   */
+  notSent?: { cause: "email_not_set_up" | string; lastAttemptAt: string | null } | null
 }
 
 export type ReportList = {
