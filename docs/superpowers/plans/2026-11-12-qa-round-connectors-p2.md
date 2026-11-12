@@ -1132,3 +1132,103 @@ Per commit (the scoped lines of section 3), all on the final code:
   `0136` throughout.
 
 ## 6. Review
+
+### Round 1 (planner, 2026-11-12), at `b09b4210`
+
+Read against the plan and `AGENTS.md`, against the base `fix/qa-round-connectors-p1`; nothing
+was run for this review, CI on the draft pull request (#490) runs the suites. No BLOCKER, 5
+SHOULD-FIX, all to be fixed as the findings say. No defect found in the delivery record
+(tenant scope, the concurrent upsert, fixed failure sentences, no address in `lastDelivery`),
+in the check before a connector is created (it runs before anything is written and dials
+nothing), in the 30-second limits (connect and negotiation only, not reads) or in the
+`status === 403` predicate; no existing test was weakened.
+
+The developer's handled MISMATCH (a 403 reaches this client as `invalid_request` with
+`status`, not as `permission_denied`) is accepted as built.
+
+### R1. SHOULD-FIX: after a failed save, "Run test again" removes the only statement that the connection settings were not saved (T12)
+
+- Where: `src/features/connectors/connector-create-page.tsx:316-331` (the status block), `:364-368`
+  ("Run test again"), `:380` (the ingest panel's condition).
+- What happens: the create answers 201 and `PUT .../ingest-spec` fails (D11's "a save that fails for
+  another reason"). The screen first says, correctly, "The connection test was not run: the
+  connection settings could not be saved. ..." with the Edit link. "Run test again" is enabled
+  there (`settingsPending` is false for `saveSpec.status === "error"`), and its click sets
+  `testSkipped` to false. From then on the status block shows only the test's result, the Edit
+  link is gone, and the ingest panel is not mounted because `settingsSaved` is false. Nothing on
+  the screen says the settings are missing. Before this branch the panel mounted at that point
+  and said "This connector has no connection settings saved yet". The first state is right and
+  the path needs a failed save, which is why this is not a blocker.
+- Fix: keep the fact on screen while `saveSpec.status === "error"`. Either disable "Run test again"
+  in that state (a test of a connector with no settings says nothing useful, and the sentence
+  already sends the person to Edit), or render the "could not be saved" block with its Edit link
+  on `saveSpec.status === "error"` whatever `testSkipped` is.
+- Check: a new test in `connector-create-page.test.tsx`: the `PUT` answers 500; the sentence and
+  the Edit link are shown, no `GET .../ingest-spec` and no `/test` request is made, and "Run test
+  again" is disabled (or, if it stays enabled, the sentence is still shown after the click). The
+  created screen's failed-save state has no test at all today (`grep "could not be saved"` in the
+  test file finds nothing). Temporary wrong change: remove the new `saveSpec.status === "error"`
+  condition; the test must fail.
+
+### R2. SHOULD-FIX: no test proves that a rule's delivery row is removed with the rule or when an edit changes what it watches (D5)
+
+- Where: `rust/crates/lakehouse-api/src/routes/alerts.rs:851-860` (`forget_state`). The only test of
+  a delete is `rust/crates/lakehouse-store/tests/alert_delivery.rs` `a_deleted_rules_row_is_gone`,
+  which calls the store function itself.
+- What happens: delete the `alert_delivery::delete` call at `alerts.rs:856` and every test of the
+  branch stays green. A deleted rule then keeps its row, and a success rule moved to another
+  connector keeps showing the old connector's "Last sent". The code is right today; nothing holds
+  it. The sibling table has these tests (`tests/ai_alert_tools.rs:365-388`,
+  `tests/chart_alerts.rs:744-764`).
+- Fix: tests only. (a) In `tests/alert_targets_hidden.rs`
+  `a_caller_without_alert_write_cannot_delete_a_rule`: `alert_delivery::record` a row for `al_1`
+  first; after the reader's 403 `last_for` still holds it; after the writer's 200 it is empty.
+  (b) In `tests/ai_alert_tools.rs`, beside the `alert_rule_state` assertion at `:388`, the same for
+  `alert_rule_delivery` after `delete_alert_rule`. (c) One test of an edit that changes
+  `connector` (model on `tests/chart_alerts.rs:744-764`): the row is gone; an edit of the name
+  alone keeps it.
+- Check: remove the `alert_delivery::delete` call from `forget_state`; (a), (b) and (c) must fail.
+
+### R3. SHOULD-FIX: the handoff's "seven existing tests" is not what the code shows; five tests use the changed helper
+
+- Where: plan section 5, "Commands run" ("A first run showed 7 failures in
+  `connector-ingest-panel.test.tsx`") and "MISMATCH / deviations" ("seven existing tests ...
+  waited for `1 tables found`"); `src/features/connectors/connector-ingest-panel.test.tsx:1316`
+  (`openColumns`) and its callers at `:1329`, `:1345`, `:1364`, `:1381`, `:1410`.
+- What happens: the base file holds "1 tables found" once, in `openColumns`, and five tests call
+  it. So either two of the seven failures had another cause that the handoff does not name, or
+  the count is wrong. Rule 7 wants the counts that were seen, with what they were. The change
+  itself is clean: one expected text in the helper, no assertion removed, nothing skipped.
+- Fix: the developer lists the seven test names of that first run in the handoff. If two do not
+  call `openColumns`, say why they failed and why they pass now.
+- Check: `bun test src/features/connectors/connector-ingest-panel.test.tsx` on `b2ba9e7c6` (T15,
+  before `151cfa1e4`) prints the failing names.
+
+### R4. SHOULD-FIX: the console's copy of the account rule lower-cases with Unicode rules, the server with ASCII rules, so the form passes an account the server refuses
+
+- Where: `src/lib/connectors/saas-vendors.ts:405` and `:426` (`toLowerCase()`);
+  `rust/crates/lakehouse-store/src/saas_vendors.rs` `validate_account` (`to_ascii_lowercase`). The
+  plan's T11 says "in ASCII only (a character outside the classes fails)".
+- What happens: U+212A (KELVIN SIGN) lower-cases to `k` in JavaScript and stays as it is in Rust.
+  For Workday `wd2.worKday.com/t`, or for Dynamics 365
+  `aK.crm4.dynamics.com/00000000-0000-0000-0000-000000000001`, `saasAccountProblem` returns
+  `null`: Next is enabled and no sentence is shown. The server then refuses the create with the
+  D12 sentence. Nothing is created, so the cost is only that the form does not say it first; it is
+  the one input where the two copies disagree.
+- Fix: lower-case ASCII letters only in both places, for example
+  `account.replace(/[A-Z]/g, (c) => c.toLowerCase())`.
+- Check: add both accounts to "refuses each vendor's near misses" in
+  `src/lib/connectors/saas-vendors.test.ts` (not `null`). Temporary wrong change: put
+  `toLowerCase()` back; the test must fail.
+
+### R5. SHOULD-FIX: three T9 fix sites carry no comment naming the case (rule 13, plan D1)
+
+- Where: `src/features/alerts/alerts-page.tsx:215` (the list's red banner),
+  `src/features/alerts/alert-rule-page.tsx:439` (the measures' error) and `:565` (the save's
+  error). The one comment of T9 is at `alert-rule-page.tsx:509-515`, above `connectorsError`.
+- What happens: a reader of the banner in `alerts-page.tsx` finds `readableErrorMessage` with no
+  word on why or which QA case asked for it.
+- Fix: one line at each site, for example
+  `// QA LH-SRC-7-10 (SRC-40 D8): never the API's code-first text.`
+- Check: none (comments).
+
