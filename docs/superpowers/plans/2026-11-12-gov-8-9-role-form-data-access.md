@@ -214,3 +214,45 @@ flaky `ADM-9` (`REL-24`) test did not fail, so the suite was run once.
 
 
 ## 6. Review (planner)
+
+### Round 1 (planner, 2026-11-12) — branch at `f34c9039`, pull request #471
+
+No `BLOCKER`, no `SHOULD-FIX`.
+
+Read: the whole product diff (`role-form-page.tsx`, the new `role-access-rules.tsx`, the
+edit route's `page.tsx`), the test diff, and `docs/OPERATIONS.md`.
+
+- **D2.** Create role renders `RoleTableAccessSection` on a draft that starts at "All
+  tables", creates the role, and writes the tables with the returned id only when
+  `tableAccessChanged` says the draft differs. The `*:*` case sends no table-access write.
+- **D3.** A failed table write goes to `/admin/roles/<id>/edit?tables=unsaved`, and Edit
+  role shows the plan's sentence while that value is in the address. The table write on
+  Create is deliberately not wrapped in `withNotify`, so the failure is said once, on the
+  page that can fix it.
+- **D4, D5.** The rules list is built from `ruleClause` and `accessRule`, with an exact
+  `roles.includes(roleName)` on the stored name; no second parser. Without `policy:read`
+  no request is sent. A failed read shows the error and Retry and does not stop Save.
+- **Tests.** No existing test was removed or loosened; `stubApi` gained parameters for the
+  caller's permissions, the permission catalog and the policies answer. The five T1 tests
+  and six T2 tests are there under full-sentence names.
+- **The handoff's mismatch** is accepted as written: the permission picker cannot add
+  `*:*` to a role that does not hold it, so on Create the disabled state is reachable only
+  through a typed value. The guard costs nothing and matches Edit role.
+- **`page.tsx`** wraps the edit page in `Suspense` for `useSearchParams`. Correct for the
+  App Router; the route is dynamic, so it changes nothing a person sees.
+
+Re-run by the planner at `f34c9039`, in the foreground:
+
+| Command | Result |
+| --- | --- |
+| `bun test src/features/admin/role-form-page.test.tsx` | 27 pass, 0 fail |
+| `bun run typecheck` | clean |
+| `bun run lint` | 0 errors, 11 warnings (none in the files touched; the same 11 as `main`) |
+| `python3 ops/lint/check_bare_iceberg_count.py` | pass |
+| `python3 ops/lint/check_intra_package_imports.py` | pass |
+
+`bun run test` (whole suite) was not re-run by the planner: the developer's run is quoted in
+the handoff (3985 passed, 1 skipped, 0 failed) and CI runs it on #471.
+
+Not verified by anyone: the two sections in a browser. The owner's checklist on the
+feature page covers that.
