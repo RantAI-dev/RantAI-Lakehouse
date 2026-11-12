@@ -817,6 +817,66 @@ Other scoped runs: `--lib -- pipeline` 294 passed; `--lib -- lineage` 61;
   `venv-bld3` cannot import the package (`fastavro` is missing there).
 - `cargo test --workspace` / full workspace clippy: not run here; CI runs them.
 
+### Handoff S1, fix round 2 (developer, 2026-11-12)
+
+One BLOCKER this round, then `main` merged in.
+
+- **R2-B1 / D6a** — `edc1e083f`. The SQL step check no longer reads its names
+  through `sql_rewrite::referenced_tables`, which lowercased every name and
+  dropped a bare name equal to the statement's own `WITH` names. The step is
+  parsed once and walked with `sqlparser`'s visitor (`StepReads`), so every
+  table relation at any depth — a subquery, a join, the step's own CTE bodies
+  — is checked AS WRITTEN: a one-part name equal, case included, to an
+  input's name, an earlier step's name, or a `WITH` name the same step
+  declares. A qualified name is refused (D6a); a table function is left to the
+  rewrite. `sql_rewrite.rs` is unchanged.
+  Tests: `FROM ORDERS` over input `orders` is refused; input `Orders` with
+  `FROM Orders` compiles (whole text pinned); a step's own `WITH t` read as
+  `T` is refused and as `t` accepted; a name inside a subquery and inside a
+  join is refused; the round-1 D6a tests still pass.
+
+**The merge of `main`** — `67252c473` (no conflicts: `git merge origin/main`
+auto-merged; the files both sides touched — `lib.rs`, `policy.rs`,
+`routes/mod.rs`, `route_auth.rs` — kept both sides' additions, and
+`route_auth.rs` already held both tests from round 1's merge). It brought
+`main`'s `0137_connector_run_timed_out.sql`,
+`0138_data_engineer_catalog_read.sql` and `0139_alert_rule_delivery.sql`.
+
+**The migration is 0140 since the merge of main** (`0137` and `0138` were
+taken on `main`, `0139` by an open branch that has since merged). Renamed in
+`b1f488848` from `0137_pipeline_inputs_and_steps.sql` to
+`0140_pipeline_inputs_and_steps.sql`; it was never applied to a real
+database, so the rename is safe. Every reference that means OUR migration now
+says `0140` (the store's comments and test names, the API's target-lag
+comment, the migration's own header). The plan's earlier entries keep their
+history as written.
+
+**Verification, on the head commit (real counts).**
+
+```
+cd rust && cargo fmt --check                                  # clean
+cargo-locked clippy -j 2 -p lakehouse-store -p lakehouse-api --all-targets -- -D warnings
+                                                              # clean
+cargo-locked test -j 2 -p lakehouse-api --lib -- pipeline_compile sql_guard transform_grammar
+                                                              # 82 passed
+cargo-locked test -j 2 -p lakehouse-api --test pipeline_compile_route \
+  --test pipeline_definition_save --test column_lineage_pipeline \
+  --test route_auth --test sec11_guard --test table_access    # 24, 14, 8, 94, 4, 14 passed
+cargo-locked test -j 2 -p lakehouse-store --test pipelines     # 74 passed
+```
+
+After the rename, and before the rest: `--test pipelines` 74 and
+`--test pipeline_definition_save` 14, rebuilt so the embedded migration set
+is the one with `0140`.
+
+**Not verified**
+- CI's full run, including `g3a-dagster` (the G7 case and the author gate):
+  no local run covers them, and neither gate has passed on any commit of this
+  slice yet.
+- The Python suite was not re-run this round: neither commit touches
+  `dagster/` (the merge brought `main`'s changes, which its own CI covered).
+- `cargo test --workspace`: not run here.
+
 ## 7. Review
 
 
