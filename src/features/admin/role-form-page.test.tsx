@@ -8,6 +8,8 @@
 let pushed: string[] = []
 let params: Record<string, string> = { id: "r1" }
 let search = new URLSearchParams()
+/** Every request made, reads included (`GOV-9` D4: none without `policy:read`). */
+let requests: string[] = []
 mock.module("next/navigation", () => ({
   usePathname: () => "/admin/roles/new",
   useSearchParams: () => search,
@@ -28,6 +30,7 @@ import * as React from "react"
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { AuthProvider } from "@/features/auth/auth-provider"
+import type { Policy } from "@/services/contracts/governance"
 import { RoleCreatePage, RoleEditPage } from "./role-form-page"
 
 afterEach(() => {
@@ -39,6 +42,7 @@ beforeEach(() => {
   pushed = []
   params = { id: "r1" }
   search = new URLSearchParams()
+  requests = []
 })
 
 const json = (body: unknown, status = 200) =>
@@ -51,6 +55,23 @@ const ROLE = {
   permissions: "catalog:read",
   description: "Reads",
 }
+
+/** A policy row, shaped as `/api/governance/policies` answers it (`GOV-9` D4). */
+const POLICY_BASE: Policy = {
+  id: "p1",
+  name: "mask_email",
+  status: "ready",
+  kind: "Column mask",
+  subjects: "role:Analyst",
+  resources: "silver.customers",
+  effect: "Permit with obligation",
+  version: 1,
+  owner: "admin",
+  updatedAt: "2026-11-04T00:00:00.000Z",
+  enforceable: true,
+}
+
+const policy = (overrides: Partial<Policy>): Policy => ({ ...POLICY_BASE, ...overrides })
 
 /** The catalog the table picker lists (`GET /api/catalog`). */
 const ASSETS = [
@@ -66,14 +87,20 @@ type Stub = {
   assets?: unknown[]
   /** The permission catalog the picker lists; `*:*` is only offered when named (`GOV-8` D2). */
   permissions?: unknown[]
+  /** The signed-in person's grants; `policy:read` turns on the `GOV-9` section. */
+  mePermissions?: string[]
+  /** The policy rows the Access rules read answers (`GOV-9` D4). */
+  policies?: Policy[]
   catalogStatus?: number
   accessStatus?: number
+  policiesStatus?: number
   tableAccessAnswer?: () => Response
 }
 
 /**
  * Answers the session, the permission catalog, the role read, the role's
- * table access and the asset list; records every write in order.
+ * table access, the asset list and the policy rows; records every write in
+ * order.
  */
 function stubApi({
   roles = [ROLE],
@@ -83,8 +110,11 @@ function stubApi({
     { name: "catalog:read", area: "Data", description: "Browse tables." },
     { name: "query:read", area: "Data", description: "Run SQL." },
   ],
+  mePermissions = ["identity:write"],
+  policies = [],
   catalogStatus = 200,
   accessStatus = 200,
+  policiesStatus = 200,
   tableAccessAnswer,
 }: Stub = {}) {
   const writes: Write[] = []
@@ -95,11 +125,18 @@ function stubApi({
     const path = String(input)
     const method = init?.method ?? "GET"
     const body = init?.body ? JSON.parse(String(init.body)) : undefined
+    requests.push(path)
     if (path.includes("/api/auth/me")) {
-      return json({ id: "u1", name: "Admin", email: null, roles: ["Admin"], permissions: ["identity:write"], tenants: [] })
+      return json({ id: "u1", name: "Admin", email: null, roles: ["Admin"], permissions: mePermissions, tenants: [] })
     }
     if (path.includes("/api/identity/permissions")) {
       return json(permissions)
+    }
+    if (method === "GET" && path.includes("/api/governance/policies")) {
+      if (policiesStatus !== 200) {
+        return json({ error: "Policies unavailable" }, policiesStatus)
+      }
+      return json(policies)
     }
     if (path.includes("/table-access")) {
       if (method === "GET") {
@@ -575,5 +612,182 @@ describe("RoleEditPage: the unsaved-tables notice (GOV-8 D3)", () => {
     expect(
       screen.queryByText(/This role was created, but its tables were not saved/)
     ).toBeNull()
+  })
+})
+
+// GOV-9 D4: Edit role lists the masks and row filters that name the role
+// (`role.name`), read-only, below the tables section.
+describe("RoleEditPage: masks and row filters on this role (GOV-9 D4)", () => {
+  const policyRead = ["identity:write", "policy:read"]
+
+  it("lists only the rules that name the role exactly, as the engine matches", async () => {
+    stubApi({
+      mePermissions: policyRead,
+      policies: [
+        policy({
+          id: "p1",
+          name: "mask_analyst",
+          conditions: JSON.stringify({
+            roles: ["Analyst"],
+            table: "silver.customers",
+            mask: ["email"],
+          }),
+          assetId: "silver.customers",
+        }),
+        // `condition_names_role` matches case-sensitively: neither of these
+        // names the `Analyst` role.
+        policy({
+          id: "p2",
+          name: "mask_lower",
+          conditions: JSON.stringify({
+            roles: ["analyst"],
+            table: "silver.orders",
+            mask: ["email"],
+          }),
+          assetId: "silver.orders",
+        }),
+        policy({
+          id: "p3",
+          name: "mask_senior",
+          conditions: JSON.stringify({
+            roles: ["Senior Analyst"],
+            table: "bronze.orders",
+            mask: ["email"],
+          }),
+          assetId: "bronze.orders",
+        }),
+      ],
+    })
+    renderPage(<RoleEditPage />)
+
+    expect(await screen.findByRole("link", { name: "silver.customers" })).toBeTruthy()
+    expect(screen.queryByText("silver.orders")).toBeNull()
+    expect(screen.queryByText("bronze.orders")).toBeNull()
+  })
+
+  it("links a rule's table to its Access tab when the API named the asset, and shows it as text otherwise", async () => {
+    stubApi({
+      mePermissions: policyRead,
+      policies: [
+        policy({
+          id: "p1",
+          name: "mask_email",
+          conditions: JSON.stringify({
+            roles: ["Analyst"],
+            table: "silver.customers",
+            mask: ["email"],
+          }),
+          assetId: "silver.customers",
+        }),
+        policy({
+          id: "p2",
+          name: "filter_rows",
+          conditions: JSON.stringify({
+            roles: ["Analyst"],
+            table: "bronze.no_such_table",
+            rowFilter: "1 = 0",
+          }),
+          assetId: undefined,
+        }),
+      ],
+    })
+    renderPage(<RoleEditPage />)
+
+    const link = await screen.findByRole("link", { name: "silver.customers" })
+    expect(link.getAttribute("href")).toBe("/data/assets/silver.customers?tab=access")
+    // No asset id: plain text, never a guessed link.
+    expect(screen.getByText("bronze.no_such_table")).toBeTruthy()
+    expect(screen.queryByRole("link", { name: "bronze.no_such_table" })).toBeNull()
+  })
+
+  it("says a rule both masks and filters, and shows a draft rule's draft status", async () => {
+    stubApi({
+      mePermissions: policyRead,
+      policies: [
+        policy({
+          id: "p1",
+          name: "mask_and_filter",
+          conditions: JSON.stringify({
+            roles: ["Analyst"],
+            table: "silver.customers",
+            mask: ["email"],
+            rowFilter: "region = 'x'",
+          }),
+          assetId: "silver.customers",
+        }),
+        policy({
+          id: "p2",
+          name: "draft_mask",
+          status: "draft",
+          conditions: JSON.stringify({
+            roles: ["Analyst"],
+            table: "silver.orders",
+            mask: ["phone"],
+          }),
+          assetId: "silver.orders",
+        }),
+      ],
+    })
+    renderPage(<RoleEditPage />)
+
+    expect(await screen.findByText("Masks email; filters rows")).toBeTruthy()
+    // The draft reads as a draft, never as an enforced rule.
+    expect(screen.getByText("Draft")).toBeTruthy()
+  })
+
+  it("sends no policies request without policy:read and names the permission it needs", async () => {
+    stubApi()
+    renderPage(<RoleEditPage />)
+
+    expect(
+      await screen.findByText(
+        "Seeing the masks and row filters on a role needs the permission policy:read."
+      )
+    ).toBeTruthy()
+    await screen.findByLabelText("Name")
+    expect(requests.some((path) => path.includes("/api/governance/policies"))).toBe(false)
+  })
+
+  it("shows the policies error with Retry and still saves the role", async () => {
+    const writes = stubApi({ mePermissions: policyRead, policiesStatus: 503 })
+    renderPage(<RoleEditPage />)
+
+    expect(
+      await screen.findByText(
+        /The masks and row filters on this role could not be loaded: Policies unavailable/
+      )
+    ).toBeTruthy()
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy()
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    // The role save is independent of the unread list.
+    await waitFor(() =>
+      expect(writes.map((write) => write.path)).toEqual(["/api/identity/roles/r1"])
+    )
+  })
+
+  it("says no mask or row filter names the role when none does", async () => {
+    stubApi({
+      mePermissions: policyRead,
+      policies: [
+        policy({
+          id: "p1",
+          name: "mask_viewer",
+          conditions: JSON.stringify({
+            roles: ["Viewer"],
+            table: "silver.customers",
+            mask: ["email"],
+          }),
+          assetId: "silver.customers",
+        }),
+      ],
+    })
+    renderPage(<RoleEditPage />)
+
+    expect(
+      await screen.findByText(
+        "No mask or row filter names this role. They are added on a table's Access tab."
+      )
+    ).toBeTruthy()
   })
 })

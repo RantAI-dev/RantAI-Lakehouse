@@ -12,6 +12,7 @@ import { useService, useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
 import { identityService, type Role, type RoleTableAccess, type RoleTableGrant, type SetRoleTableAccessInput } from "@/services"
 import { PermissionPicker } from "./permission-picker"
+import { RoleAccessRulesSection } from "./role-access-rules"
 import {
   grantsUnrestricted,
   RoleTableAccessSection,
@@ -362,6 +363,10 @@ function RoleEditForm({ role }: { role: Role }) {
             : null
         }
       />
+      {/* `GOV-9` D4: read-only, below the tables section, and only here —
+          a role that does not exist yet is named by no rule Create role
+          could honestly attribute to it. */}
+      <RoleAccessRulesSection roleName={role.name} />
       {renamed && name.trim() ? (
         <p className="text-sm text-muted-foreground">
           Access rules name roles by name. A rename is refused while an access rule names{" "}
