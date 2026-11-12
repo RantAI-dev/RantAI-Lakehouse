@@ -2589,6 +2589,29 @@ async fn quality_incident_routes_are_gated_in_both_directions() {
     assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// `GOV-11` (`DEC-20`; QA `LH-DATA-12-07` F2): after
+/// `0138_data_engineer_catalog_read.sql` the seeded Data Engineer — the role
+/// that edits catalog entries — can open the Catalog and a table's page. It
+/// still cannot create roles.
+#[tokio::test]
+async fn a_seeded_data_engineer_may_read_the_catalog() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+
+    for path in ["/api/catalog", "/api/lakehouse/tables"] {
+        let resp = request_with_cookie(&router, "GET", path, &cookie).await;
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED, "{path}");
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+
+    let denied = request_with_cookie(&router, "POST", "/api/identity/roles", &cookie).await;
+    assert_eq!(
+        denied.status(),
+        StatusCode::FORBIDDEN,
+        "catalog:read does not make the role an identity administrator"
+    );
+}
+
 /// `GOV-10` (`DEC-17`; QA `LH-DATA-14-04`, `TC-1728`): running an authored
 /// rule by hand needs `governance:write`. A principal holding `query:read`
 /// and `governance:read` is refused (403); one holding `governance:write`
