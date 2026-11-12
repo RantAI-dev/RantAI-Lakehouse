@@ -3501,13 +3501,14 @@ fn validate_annotation_body(body: &AnnotationBody) -> Result<(), ApiError> {
     }
     if body.tags.len() > ANNOTATION_TAGS_MAX_COUNT {
         return Err(ApiError::BadRequest(format!(
-            "tags must have at most {ANNOTATION_TAGS_MAX_COUNT} entries"
+            "A table can have at most {ANNOTATION_TAGS_MAX_COUNT} tags."
         )));
     }
     for tag in &body.tags {
         if !tag_is_valid(tag) {
             return Err(ApiError::BadRequest(format!(
-                "tags: \"{tag}\" must be 1-{ANNOTATION_TAG_MAX_LEN} characters matching ^[a-z0-9][a-z0-9_-]*$"
+                "The tag \"{tag}\" is not accepted: a tag {WORD_RULE}.",
+                WORD_RULE = lakehouse_store::governed_tag::WORD_RULE
             )));
         }
     }
@@ -3518,14 +3519,15 @@ fn validate_annotation_body(body: &AnnotationBody) -> Result<(), ApiError> {
         let max = lakehouse_store::governed_tag::MAX_TAGS_PER_ASSET;
         if governed.len() > max {
             return Err(ApiError::BadRequest(format!(
-                "governedTags must have at most {max} entries"
+                "A table can have at most {max} governed tags."
             )));
         }
         for (key, value) in governed {
             for (what, word) in [("key", key), ("value", value)] {
                 if !lakehouse_store::governed_tag::is_valid_word(word) {
                     return Err(ApiError::BadRequest(format!(
-                        "governedTags: {what} \"{word}\" must be 1-{ANNOTATION_TAG_MAX_LEN} characters matching ^[a-z0-9][a-z0-9_-]*$"
+                        "The governed tag {what} \"{word}\" is not accepted: a {what} {WORD_RULE}.",
+                        WORD_RULE = lakehouse_store::governed_tag::WORD_RULE
                     )));
                 }
             }
@@ -4725,9 +4727,15 @@ mod tests {
         assert!(validate_annotation_body(&with(&[("data_domain", "finance")])).is_ok());
         assert!(validate_annotation_body(&with(&[])).is_ok());
         let err = validate_annotation_body(&with(&[("Data Domain", "finance")])).unwrap_err();
-        assert!(matches!(err, ApiError::BadRequest(m) if m.contains("governedTags: key")));
+        assert!(matches!(&err, ApiError::BadRequest(m) if m.contains("governed tag key")));
+        assert!(
+            matches!(&err, ApiError::BadRequest(m) if !m.contains('^') && !m.contains("governedTags"))
+        );
         let err = validate_annotation_body(&with(&[("data_domain", "")])).unwrap_err();
-        assert!(matches!(err, ApiError::BadRequest(m) if m.contains("governedTags: value")));
+        assert!(matches!(&err, ApiError::BadRequest(m) if m.contains("governed tag value")));
+        assert!(
+            matches!(&err, ApiError::BadRequest(m) if !m.contains('^') && !m.contains("governedTags"))
+        );
         let many: Vec<(String, String)> =
             (0..21).map(|i| (format!("k{i}"), "v".to_owned())).collect();
         let pairs: Vec<(&str, &str)> = many.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
@@ -5240,7 +5248,7 @@ mod tests {
         let mut body = valid_body();
         body.tags = vec!["a".repeat(65)];
         let err = validate_annotation_body(&body).expect_err("must reject");
-        assert!(matches!(err, ApiError::BadRequest(msg) if msg.contains("tags")));
+        assert!(matches!(err, ApiError::BadRequest(msg) if msg.contains("not accepted: a tag")));
     }
 
     #[test]
@@ -6647,7 +6655,7 @@ mod tests {
             .unwrap_err();
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert!(
-                message.contains("governedTags: value \"Finance\""),
+                message.contains("governed tag value \"Finance\""),
                 "{message}"
             );
             assert_eq!(annotation_rows(&pool, "serving.mart_x").await, 0);

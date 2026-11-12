@@ -3277,12 +3277,12 @@ mod tests {
             let state = state_for(&pool);
             let cases = [
                 (r#"{"key":"Bad Key","allowedValues":["a"]}"#, "key"),
-                (r#"{"key":"k","allowedValues":[]}"#, "allowedValues"),
+                (r#"{"key":"k","allowedValues":[]}"#, "allowed value"),
                 (
                     r#"{"key":"k","allowedValues":["Finance"]}"#,
-                    "allowedValues",
+                    "allowed value",
                 ),
-                (r#"{"key":"k","allowedValues":["a","a"]}"#, "allowedValues"),
+                (r#"{"key":"k","allowedValues":["a","a"]}"#, "allowed value"),
                 (r#"{"key":"k"}"#, "allowedValues"),
                 ("not json", "invalid JSON"),
             ];

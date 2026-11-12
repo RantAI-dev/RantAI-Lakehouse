@@ -74,7 +74,7 @@ async fn the_value_bounds_are_refused_before_anything_is_written(pool: PgPool) -
     assert!(refusal(create_key(&pool, "k", &[], "Rina").await).contains("at least one"));
     assert!(
         refusal(create_key(&pool, "k", &words(&["Finance"]), "Rina").await)
-            .contains("allowedValues: \"Finance\"")
+            .contains("The allowed value \"Finance\"")
     );
     assert!(
         refusal(create_key(&pool, "k", &words(&["a", "a"]), "Rina").await)
@@ -84,7 +84,7 @@ async fn the_value_bounds_are_refused_before_anything_is_written(pool: PgPool) -
     let long = "a".repeat(65);
     assert!(refusal(create_key(&pool, &long, &words(&["a"]), "Rina").await).contains("key"));
     assert!(
-        refusal(create_key(&pool, "k", &[long], "Rina").await).contains("allowedValues"),
+        refusal(create_key(&pool, "k", &[long], "Rina").await).contains("allowed value"),
         "a 65-character value is refused"
     );
     assert!(list_keys(&pool).await.expect("list").is_empty());
