@@ -3906,6 +3906,10 @@ fn validate_certification(
 /// pool, or when the catalog cannot be read to check a replacement (fail
 /// closed: an unchecked replacement is not stored). A classified
 /// [`lakehouse_store::StoreError`] on any database failure.
+///
+/// A save that would store what is already stored answers `200 {"ok": true}`
+/// and writes nothing (`DATA-54`): who set the mark and when stay as they
+/// were, and the change history gets no entry.
 pub async fn put_certification(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -3951,9 +3955,17 @@ pub async fn put_certification(
             );
         }
     }
-    let before = lakehouse_store::annotation::get_annotation(pool, &id)
-        .await?
-        .and_then(|r| r.certification);
+    let before_row = lakehouse_store::annotation::get_annotation(pool, &id).await?;
+    // QA LH-DATA-12-05 F2 (DATA-54): a save that changes nothing writes nothing: no row
+    // write (who set the mark and when stay), no dropped search copy, no history entry.
+    if let (Some(status), Some(row)) = (change.status, before_row.as_ref())
+        && row.certification.as_deref() == Some(status)
+        && row.certification_note == change.note
+        && row.replacement_asset_id == change.replacement_asset_id
+    {
+        return Ok(ApiJson(json!({ "ok": true })));
+    }
+    let before = before_row.and_then(|r| r.certification);
     let (action, args) = if let Some(status) = change.status {
         lakehouse_store::annotation::set_certification(
             pool,
@@ -5936,6 +5948,103 @@ mod tests {
             assert_eq!(row.certification, None);
             assert_eq!(row.certified_by, None);
             assert_eq!(row.certified_at, None);
+        }
+
+        // QA `LH-DATA-12-05` F2 (`DATA-54`): a save that changes nothing
+        // writes nothing — the row keeps who set the mark and when, and the
+        // change history gets no entry.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn saving_the_same_mark_again_writes_no_history_entry_and_keeps_who_set_it(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let ch = mock_clickhouse_with_table().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+            put_mark(
+                &state,
+                governor(TENANT_A),
+                "serving.mart_x",
+                r#"{"status":"deprecated","note":"Superseded"}"#,
+            )
+            .await
+            .unwrap();
+            let first = lakehouse_store::annotation::get_annotation(&pool, "serving.mart_x")
+                .await
+                .unwrap()
+                .unwrap();
+            let certified_at = first.certified_at;
+
+            let mut other = governor(TENANT_A);
+            other.display_name = "Second Person".to_owned();
+            put_mark(
+                &state,
+                other.clone(),
+                "serving.mart_x",
+                r#"{"status":"deprecated","note":"Superseded"}"#,
+            )
+            .await
+            .unwrap();
+
+            let deprecated = || {
+                let pool = pool.clone();
+                async move {
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT count(*) FROM audit_event WHERE action = 'catalog.deprecate' \
+                         AND resource_id = 'serving.mart_x'",
+                    )
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+                }
+            };
+            assert_eq!(deprecated().await, 1, "an unchanged save is no history");
+            let row = lakehouse_store::annotation::get_annotation(&pool, "serving.mart_x")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.certified_by.as_deref(), Some("Test Principal"));
+            assert_eq!(row.certified_at, certified_at);
+
+            // A real change is written, and the second person becomes the
+            // one who set it.
+            put_mark(
+                &state,
+                other,
+                "serving.mart_x",
+                r#"{"status":"deprecated","note":"Replaced in March"}"#,
+            )
+            .await
+            .unwrap();
+            assert_eq!(deprecated().await, 2);
+            let row = lakehouse_store::annotation::get_annotation(&pool, "serving.mart_x")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.certified_by.as_deref(), Some("Second Person"));
+
+            // The same holds for the certified mark.
+            let certified = || {
+                let pool = pool.clone();
+                async move {
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT count(*) FROM audit_event WHERE action = 'catalog.certify' \
+                         AND resource_id = 'serving.mart_x'",
+                    )
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+                }
+            };
+            for _ in 0..2 {
+                put_mark(
+                    &state,
+                    governor(TENANT_A),
+                    "serving.mart_x",
+                    r#"{"status":"certified"}"#,
+                )
+                .await
+                .unwrap();
+            }
+            assert_eq!(certified().await, 1);
         }
 
         #[sqlx::test(migrations = "../../migrations")]
