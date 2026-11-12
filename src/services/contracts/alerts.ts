@@ -80,6 +80,14 @@ export type AlertRule = {
   target?: string
   /** `true` when the API withheld `target` from this caller (`DEC-16`); never present otherwise. */
   targetHidden?: boolean
+  /**
+   * The latest delivery of a "run succeeded" rule (`SRC-40`, QA `TC-1695`),
+   * read from `alert_rule_delivery`: a success opens no incident, so its
+   * outcome is kept on the rule instead. `at` is ISO 8601; `reason` is one of
+   * the API's fixed sentences and present only when `delivered` is `false`.
+   * Absent when no delivery was ever attempted.
+   */
+  lastDelivery?: { at: string; delivered: boolean; reason?: string }
   enabled: boolean
   createdAt?: string
   /**

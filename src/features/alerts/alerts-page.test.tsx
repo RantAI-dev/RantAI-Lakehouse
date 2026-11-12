@@ -15,9 +15,11 @@ import {
 import {
   chartAlertHref,
   getRuleColumns,
+  lastDeliveryLabel,
   ruleKindLabel,
   ruleScope,
 } from "./rules-columns"
+import { formatDateTime } from "@/lib/format"
 
 afterEach(cleanup)
 
@@ -403,6 +405,43 @@ describe("a rule whose target is hidden (DEC-16)", () => {
     const hidden = { ...base, channel: "email", targetHidden: true } as AlertRule
     render(<div>{cell("delivery", hidden)}</div>)
     expect(screen.getByText("E-mail")).toBeTruthy()
+  })
+
+  it("shows when a success rule last sent, under its delivery", () => {
+    // QA TC-1695 (SRC-40): a "run succeeded" alert opens no incident, so its
+    // latest delivery is shown here. The expected text is built with
+    // `formatDateTime` and never a typed date: the zone differs by machine.
+    const at = "2026-11-12T03:04:05.000Z"
+    const rule = {
+      ...base, type: "connector_success", channel: "webhook", target: "https://hooks.example.com/t",
+      lastDelivery: { at, delivered: true },
+    } as AlertRule
+    render(<div>{cell("delivery", rule)}</div>)
+    expect(screen.getByText(`Last sent ${formatDateTime(at)}`)).toBeTruthy()
+  })
+
+  it("says a success alert was not delivered, with the reason", () => {
+    const at = "2026-11-12T03:04:05.000Z"
+    const rule = {
+      ...base, type: "connector_success", channel: "webhook", target: "https://hooks.example.com/t",
+      lastDelivery: { at, delivered: false, reason: "the webhook server answered with an error" },
+    } as AlertRule
+    render(<div>{cell("delivery", rule)}</div>)
+    expect(
+      screen.getByText(
+        `Last attempt ${formatDateTime(at)} · Not delivered: the webhook server answered with an error`
+      )
+    ).toBeTruthy()
+  })
+
+  it("shows no second line for a rule with no recorded delivery", () => {
+    const rule = {
+      ...base, type: "connector_success", channel: "webhook", target: "https://hooks.example.com/t",
+    } as AlertRule
+    render(<div>{cell("delivery", rule)}</div>)
+    expect(lastDeliveryLabel(rule)).toBeNull()
+    expect(screen.queryByText(/Last sent/)).toBeNull()
+    expect(screen.queryByText(/Last attempt/)).toBeNull()
   })
 
   it("shows the address, an enabled switch and the actions when the target is returned", () => {
