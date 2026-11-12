@@ -56,6 +56,11 @@ Planner; the owner asked for the fix, not for the shape of it.
     `No connector (read a ClickHouse table directly)`, `Unassigned`) stays an option whose
     value is `""`. If Base UI cannot hold `""` as an item value, `SelectField` maps it to a
     private sentinel inside the component; no site sees the sentinel.
+- **D2a. A value that can be outside the list gets a placeholder (planner, 2026-11-12,
+  from S1 review R1-S1).** A native select with a value none of its options had drew the
+  first option as if it were chosen; `SelectField` draws an empty trigger instead. That is
+  the honest reading, but an empty box says nothing. Every site whose value can be `""`
+  or otherwise outside `options` passes a `placeholder` that says what to pick.
 - **D3. Every native `<select>` becomes `SelectField`.** No site keeps its own class
   string (`selectClassName` constants are deleted). Behaviour does not change: the same
   options, the same order, the same disabled states, the same `onChange` effect.
@@ -88,9 +93,10 @@ Planner; the owner asked for the fix, not for the shape of it.
   `color-scheme` is set anywhere but `src/features/landing/landing.css:25`.
 - The screenshot's page: `src/features/governance/quality-rule-create-page.tsx:19`
   (`selectClassName`) and `quality-check-fields.tsx:72` (the Check list).
-- Native selects per area (files, selects): governance 6, 11; catalog 5, 5; connectors
-  11, 17; dashboards 7, 16; pipelines 2, 6; queries 4, 5. No `<select multiple>` among
-  them.
+- Native selects per area (files, selects): governance 5, 10; catalog 5, 5; connectors
+  11, 19; dashboards 7, 16; pipelines 2, 6; queries 4, 5: 34 files, 61 selects. No
+  `<select multiple>` among them. (Corrected 2026-11-12 from the S1 handoff: the plan
+  first said governance 6, 11 and connectors 11, 17, the planner's miscount.)
 - Empty-string options: `connector-form-parts.tsx:585`, `upload-columns.tsx:110`,
   `connector-ingest-panel.tsx:1055`, `pipeline-detail-page.tsx:435`,
   `embed-filter-bar.tsx:81`, `embed-settings-panel.tsx:122`,
@@ -112,7 +118,7 @@ Planner; the owner asked for the fix, not for the shape of it.
   placeholder; a disabled option cannot be chosen; an option whose value is the empty
   string can be chosen and shows its label; a group shows its label and its options; a
   `<Label htmlFor>` names the trigger.
-- **T3. Governance** (6 files): `quality-check-fields.tsx`, `quality-rule-create-page.tsx`,
+- **T3. Governance** (5 files): `quality-check-fields.tsx`, `quality-rule-create-page.tsx`,
   `quality-rule-edit-dialog.tsx`, `quality-schedule.tsx`, `freshness-target-dialog.tsx`,
   and any other file under `src/features/governance` the grep below still names.
 - **T4. Catalog** (5 files): `asset-about.tsx`, `asset-grants.tsx`, `asset-quality.tsx`,
@@ -124,7 +130,7 @@ pass; `bun run typecheck`; `bun run lint`.
 
 ### S2. Connectors — branch `feat/web-9-select-s2`, cut from `main` after S1 merges
 
-- **T5.** The 11 files under `src/features/connectors` (17 selects), dial forms included.
+- **T5.** The 11 files under `src/features/connectors` (19 selects), dial forms included.
 
 Accept: the same grep on `src/features/connectors` prints nothing; tests, typecheck, lint.
 
@@ -259,3 +265,44 @@ native select with `fireEvent.change`, now calling `chooseOption`:
   same lengths they were (longest is the quality check list, unchanged).
 
 ## 6. Review (planner)
+
+### S1, round 1 (planner, 2026-11-12) — branch at `a192fe75`, pull request #472
+
+No `BLOCKER`. One `SHOULD-FIX`, carried into S2.
+
+Read: `select-field.tsx`, `select-field.testing.ts`, `globals.css`, every converted site
+(5 governance files, 5 catalog files), and the four changed test files.
+
+- **D1.** `.dark { color-scheme: dark }` and `.theme-light { color-scheme: light }` in
+  `src/app/globals.css`, with the reason. `design-system/` is untouched.
+- **D2.** `SelectField` passes `items` so the trigger shows the label, holds `""` as a
+  private sentinel that no site sees, shows the placeholder for a value no option has, and
+  renders groups. Its seven tests are the seven the plan lists.
+- **D3.** The ten governance selects and five catalog selects keep their options, order
+  and effect; every `selectClassName` in the two areas is gone. `None` on a governed tag
+  stays a real choice; `Pick a column` became the placeholder.
+- **D5.** The changed tests assert what they asserted before, through the trigger's shown
+  label and the opened list instead of `HTMLSelectElement.value` and `.options`. None was
+  removed.
+- **The handoff's mismatch** is the planner's miscount, corrected in section 2 by name.
+
+**R1-S1 `SHOULD-FIX`.** `quality-check-fields.tsx`, the Column list: on Add Quality Rule
+the column starts as `""`, so the trigger is an empty box. Before, the native select drew
+the first column as if chosen while the form still held `""`, which was worse, but an
+empty box does not say what to do. Give it `placeholder="Pick a column"`. Decision D2a
+above makes this a rule for S2 and S3; the fix itself is the first task of S2.
+
+Re-run by the planner at `a192fe75`, in the foreground:
+
+| Command | Result |
+| --- | --- |
+| `bun test src/components/patterns/select-field.test.tsx src/features/governance src/features/catalog` | 454 pass, 0 fail, 28 files |
+| `bun run typecheck` | clean |
+| `bun run lint` | 0 errors, 11 warnings (the same 11 as `main`) |
+| S1's acceptance grep | prints nothing |
+
+`bun run test` (whole suite) was not re-run by the planner: the developer's run is in the
+handoff (3981 pass, 1 skip, 0 fail) and CI runs it on #472.
+
+Not verified by anyone: how the control looks in a browser, in either theme. The owner
+looks at Add Quality Rule after the merge.
