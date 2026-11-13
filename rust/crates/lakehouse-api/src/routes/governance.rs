@@ -2994,6 +2994,23 @@ mod tests {
         assert_eq!(severity_of("pass"), "info");
     }
 
+    /// The principal the auth gate always inserts before [`get`] runs. An
+    /// administrator is the right caller here: `replication` is not narrowed
+    /// by role (`GOV-15` covers the quality rules only). `tag_key_handlers`'s
+    /// own `admin()` lives in a sibling module and is not reachable from here,
+    /// so this is the same principal inline.
+    fn replication_admin() -> Principal {
+        Principal {
+            id: lakehouse_auth::PrincipalId::User(uuid::Uuid::new_v4()),
+            tenant_ids: Vec::new(),
+            display_name: "Rina Admin".to_owned(),
+            permissions: lakehouse_auth::PermissionSet::parse("governance:write,*:*"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
     /// `GET /api/governance/replication` against a `ClickHouse` stub that
     /// answers every query with `status` and `body`; returns the route's
     /// status and JSON body.
@@ -3022,6 +3039,7 @@ mod tests {
         let cfg = crate::config::Config::from_map(&env).unwrap();
         let router = axum::Router::new()
             .route("/api/governance/{kind}", axum::routing::get(get))
+            .layer(Extension(replication_admin()))
             .with_state(AppState::new(cfg));
 
         let resp = router
