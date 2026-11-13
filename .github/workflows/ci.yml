@@ -742,10 +742,13 @@ jobs:
 
   # ── Rust: test partitions (Docker/testcontainers required — Postgres) ──
   # OPS-24 S2 / OPS-30: these jobs download the archive `test-build` built and
-  # only run it. No Rust toolchain, no cache step and no disk step: the disk
-  # the old job ran out of was filled by the compile this job no longer does
-  # (the runner had 110 GB free after the disk step, `df -h /` in the build
-  # job's log), and `cargo-nextest` runs the binaries directly.
+  # only run it. No Rust toolchain and no cache step: `cargo-nextest` runs the
+  # binaries directly. No disk step either: the disk the old job ran out of was
+  # filled by the compile this job no longer does, and the runner starts with
+  # 86 GB free (`df -h /` before "Free runner disk", plan §0.1) against an
+  # archive measured at 9.66 GiB compressed and about 51 GiB unpacked on the
+  # ARM64 build machine. If the first run reports otherwise, the step comes
+  # back here.
   test:
     name: Rust · test ${{ matrix.partition }}/${{ needs.changes.outputs.test_partitions }} (stable)
     needs: [changes, test-build]
