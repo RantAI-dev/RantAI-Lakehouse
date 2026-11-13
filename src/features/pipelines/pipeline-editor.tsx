@@ -296,9 +296,18 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
   }
   // The ids of what was sent, so a refusal's `steps[1]` names the item it
   // meant even if the steps were moved since (D7).
-  const [sent, setSent] = React.useState<{ inputIds: string[]; stepIds: string[] } | null>(null)
+  const [sent, setSent] = React.useState<{
+    inputIds: string[]
+    stepIds: string[]
+    /** Each form step's operations as sent, so a refused one is marked only while they are unchanged (R1-S7). */
+    transforms: Record<string, string[]>
+  } | null>(null)
   async function handleSubmit() {
-    setSent({ inputIds: inputs.map((input) => input.id), stepIds: editor.steps.map((step) => step.id) })
+    setSent({
+      inputIds: inputs.map((input) => input.id),
+      stepIds: editor.steps.map((step) => step.id),
+      transforms: Object.fromEntries(editor.steps.flatMap((step) => (step.kind === "transform" ? [[step.id, step.transforms]] : []))),
+    })
     const result = await save.run(saveBody())
     // Straight to the pipeline's own page, where it can be marked ready and
     // run; the list is one click away.
@@ -406,7 +415,17 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
             readsName={readsName(shownState, step.reads)}
             columns={columnsRead(step, inputColumns, stepColumns)}
             readsStep={editor.steps.some((other) => "id" in step.reads && other.id === step.reads.id)}
-            failedTransform={errorItem === step.id && saveTarget?.kind === "step" ? saveTarget.transform : null}
+            // BLD-1 part 1 S3 review R1-S7: `steps[i].transforms[j]` names a
+            // row of what was sent. Once the operations change, row j may be
+            // another one, so the row is marked only while they are the ones
+            // sent; the message stays on the step.
+            failedTransform={
+              errorItem === step.id &&
+              saveTarget?.kind === "step" &&
+              sameList(sent?.transforms[step.id], step.transforms)
+                ? saveTarget.transform
+                : null
+            }
             failedMessage={errorItem === step.id ? saveError : null}
             failedMessageId={errorMessageId}
             onChange={(patch) => setEditor((prev) => updateStep(prev, step.id, patch))}
@@ -873,4 +892,8 @@ function InputColumnsReader({
     onColumns(id, columns)
   }, [id, columns, onColumns])
   return null
+}
+
+function sameList(a: readonly string[] | undefined, b: readonly string[]): boolean {
+  return a !== undefined && a.length === b.length && a.every((value, i) => value === b[i])
 }

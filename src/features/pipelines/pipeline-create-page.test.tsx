@@ -905,6 +905,33 @@ describe("the pipeline editor of inputs and steps (BLD-1 part 1)", () => {
     expect(await screen.findByText("Stale: the definition changed since this preview was refused.")).toBeTruthy()
   })
 
+  // BLD-1 part 1 S3 review R1-S11, R1-S7: `steps[i].transforms[j]` marks
+  // row j of that step, and the mark does not move to another row when an
+  // earlier one is removed.
+  it("marks the operation a refusal names, and drops the mark when the operations change", async () => {
+    const message = "steps[0].transforms[1]: this transform is not in the supported grammar"
+    saveAnswer = { status: 400, body: { error: message } }
+    const stored = existing()
+    stored.definition = {
+      ...stored.definition!,
+      steps: [{ name: "transformed", kind: "transform", reads: "orders_raw", transforms: ["dedupe(id)", "select(id)"] }],
+    }
+    renderEditor(stored)
+    fireEvent.click(saveButton(/save changes/i))
+
+    expect(await screen.findByText("Step 1 · Form")).toBeTruthy()
+    const rows = () => within(screen.getByRole("list", { name: "Operations of this step" })).getAllByRole("listitem")
+    await waitFor(() => expect(rows()[1].className).toContain("border-destructive"))
+    expect(rows()[0].className).not.toContain("border-destructive")
+    expect(rows()[1].textContent).toContain(message)
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove dedupe(id)" }))
+    await waitFor(() => expect(rows()).toHaveLength(1))
+    expect(rows()[0].className).not.toContain("border-destructive")
+    // The refusal is still said on the step.
+    expect(screen.getAllByText(message).length).toBeGreaterThan(0)
+  })
+
   it("moves and removes a step, and renames a step's reader with its input", async () => {
     renderEditor(twoSteps())
     selectRail(/2\. by_stock/)
