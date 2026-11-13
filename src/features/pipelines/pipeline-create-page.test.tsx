@@ -870,6 +870,18 @@ describe("the pipeline editor of inputs and steps (BLD-1 part 1)", () => {
     ).toBeTruthy()
   })
 
+  // BLD-1 part 1 S3 review R1-S6: each input's columns are read on their own.
+  it("reads one input's columns again only when that input's table changes", async () => {
+    renderEditor(twoSteps())
+    const reads = (path: string) => sent.filter((c) => c.method === "GET" && c.path === path).length
+    await waitFor(() => expect(reads("/api/lakehouse/tables/bronze/orders_raw")).toBe(1))
+    selectRail(/^stock/)
+    const table = await screen.findByDisplayValue("stock_raw")
+    for (const typed of ["stock_ra", "stock_r", "stock_raw"]) fireEvent.change(table, { target: { value: typed } })
+    await waitFor(() => expect(reads("/api/lakehouse/tables/bronze/stock_r")).toBe(1))
+    expect(reads("/api/lakehouse/tables/bronze/orders_raw")).toBe(1)
+  })
+
   it("moves and removes a step, and renames a step's reader with its input", async () => {
     renderEditor(twoSteps())
     selectRail(/2\. by_stock/)

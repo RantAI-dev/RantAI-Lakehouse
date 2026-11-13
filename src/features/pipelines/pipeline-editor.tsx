@@ -184,37 +184,13 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
     namespaces.status === "error" ? "Could not read the lakehouse's namespaces; type the zone name instead." : undefined
   const icebergZones = React.useMemo(() => new Set(zoneNames ?? []), [zoneNames])
 
-  // Every input's columns with their types, from the read the table page
-  // uses. `getTableDetail` answers for an Iceberg namespace only, so an
-  // input in a zone it does not list keeps `null` (the fields stay free
-  // text) instead of asking a question with no answer; a table that cannot
-  // be read is `null` too.
-  const columnsKey = JSON.stringify(inputs.map((input) => [input.id, input.zone.trim(), input.table.trim()]))
-  const zonesKey = [...icebergZones].sort().join(",")
-  const inputColumnsState = useService(
-    async (signal) => {
-      const wanted = JSON.parse(columnsKey) as [string, string, string][]
-      const zones = new Set(zonesKey.split(","))
-      const read = await Promise.all(
-        wanted.map(async ([id, zone, table]): Promise<[string, Column[] | null]> => {
-          if (!zones.has(zone) || table === "") return [id, null]
-          try {
-            const detail = await lakehouseService.getTableDetail(zone, table, signal)
-            const columns = Array.isArray(detail.schema) ? detail.schema.map((field) => ({ name: field.name, type: field.type })) : []
-            return [id, columns.length > 0 ? columns : null]
-          } catch {
-            return [id, null]
-          }
-        })
-      )
-      return Object.fromEntries(read) as Record<string, Column[] | null>
-    },
-    [columnsKey, zonesKey]
-  )
-  const inputColumns = React.useMemo<Record<string, Column[] | null>>(
-    () => (inputColumnsState.status === "success" ? inputColumnsState.data : {}),
-    [inputColumnsState.status, inputColumnsState.data]
-  )
+  // Every input's columns with their types, read per input by
+  // `InputColumnsReader` below (BLD-1 part 1 S3 review R1-S6: one read keyed
+  // on every input re-read all of them on each keystroke in one table name).
+  const [inputColumns, setInputColumns] = React.useState<Record<string, Column[] | null>>({})
+  const reportColumns = React.useCallback((id: string, columns: Column[] | null) => {
+    setInputColumns((prev) => (prev[id] === columns ? prev : { ...prev, [id]: columns }))
+  }, [])
 
   // ── the preview (D16) ──────────────────────────────────────────────
   const preview = useServiceAction((signal, body: PipelinePreviewInput) => pipelineService.previewPipelineStep(body, signal))
@@ -536,6 +512,16 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
       onCancel={() => router.push(backHref)}
       className="max-w-6xl"
     >
+      {inputs.map((input) => (
+        <InputColumnsReader
+          key={input.id}
+          id={input.id}
+          zone={input.zone.trim()}
+          table={input.table.trim()}
+          listable={icebergZones.has(input.zone.trim())}
+          onColumns={reportColumns}
+        />
+      ))}
       <div className="grid gap-3 sm:grid-cols-2">
         <div className="space-y-1.5">
           <Label htmlFor="pipeline-name">Pipeline name</Label>
@@ -811,4 +797,41 @@ function TriggerRow({
       <Switch checked={checked} onCheckedChange={onChange} aria-label={title} />
     </div>
   )
+}
+
+/**
+ * Reads one input's columns with their types, from the read the table page
+ * uses, and hands them to the editor; it renders nothing. One per input, so
+ * an input's columns are read again only when its own zone or table changes
+ * (R1-S6). `getTableDetail` answers for an Iceberg namespace only, so an
+ * input in a zone it does not list gets `null` (the fields stay free text)
+ * instead of asking a question with no answer; a table that cannot be read
+ * is `null` too.
+ */
+function InputColumnsReader({
+  id,
+  zone,
+  table,
+  listable,
+  onColumns,
+}: {
+  id: string
+  zone: string
+  table: string
+  listable: boolean
+  onColumns: (id: string, columns: Column[] | null) => void
+}) {
+  const detail = useService(
+    (signal) => (listable && table !== "" ? lakehouseService.getTableDetail(zone, table, signal) : Promise.resolve(null)),
+    [zone, table, listable]
+  )
+  const columns = React.useMemo(() => {
+    if (detail.status !== "success" || !Array.isArray(detail.data?.schema)) return null
+    const read = detail.data.schema.map((field) => ({ name: field.name, type: field.type }))
+    return read.length > 0 ? read : null
+  }, [detail.status, detail.data])
+  React.useEffect(() => {
+    onColumns(id, columns)
+  }, [id, columns, onColumns])
+  return null
 }
