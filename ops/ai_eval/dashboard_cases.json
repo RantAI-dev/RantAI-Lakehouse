@@ -69,6 +69,19 @@
     ]
   },
   {
+    "id": "chart_top_n_breakdown_over_time",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "src", "method": "POST", "path": "/api/dashboard/sources", "body": {"title": "Eval Visitors Top Regions", "sql": "SELECT makeDate(tahun, bulan_no, 1) AS bulan, negara, kawasan, jumlah FROM serving.mart_wisman"}, "id_at": "source.id"}
+    ],
+    "turns": ["Draw a line chart of foreign visitors per month from the saved source \"Eval Visitors Top Regions\", one line per region (kawasan), top 3 regions only."],
+    "expect_tool": {"name": "create_chart", "args_contains": {"sqlSource": "{src}", "grain": "month", "breakdown": "kawasan", "limit": 3}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"sqlSource": "{src}", "kind": "line", "def.grain": "month", "def.breakdown": "kawasan", "def.limit": 3}, "count": 1}
+    ]
+  },
+  {
     "id": "chart_quarterly_id",
     "mode": "build",
     "lang": "id",

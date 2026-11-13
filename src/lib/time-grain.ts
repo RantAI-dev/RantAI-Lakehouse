@@ -85,6 +85,27 @@ export function grainChoices(chartKind: string, column: ColumnKind | undefined):
   return GRAINS.filter((g) => grainFits(g, chartKind, column))
 }
 
+/**
+ * The periods a date or timestamp BREAKDOWN may be grouped by (`BI-46`, plan
+ * D13), in the picker's order. A part (weekday, month of year) is not offered:
+ * a series cut into weekdays is not a time axis.
+ */
+export const BREAKDOWN_GRAINS: readonly Grain[] = ["day", "week", "month", "quarter", "year"]
+
+/** Kinds whose breakdown is a series, so the limit keeps its top N (`lakehouse_bi::specs::ChartKind::breakdown_is_series`). */
+const SERIES_BREAKDOWN_KINDS: ReadonlySet<string> = new Set(["bar", "hbar", "line", "area"])
+
+/** Whether this kind's breakdown is a series (bar, hbar, line, area). */
+export function takesBreakdownGrain(chartKind: string): boolean {
+  return SERIES_BREAKDOWN_KINDS.has(chartKind)
+}
+
+/** What the breakdown's "Group the breakdown by" offers; empty when it should not show (`BI-46`). */
+export function breakdownGrainChoices(chartKind: string, column: ColumnKind | undefined): Grain[] {
+  if (!takesBreakdownGrain(chartKind)) return []
+  return column === "date" || column === "datetime" ? [...BREAKDOWN_GRAINS] : []
+}
+
 /** What a dashboard-wide switch offers: day to year, plus hour and minute only when every grained chart is on a timestamp (feature page decision 9). */
 export function switchChoices(columns: readonly (ColumnKind | undefined)[]): Grain[] {
   const allTimestamps = columns.length > 0 && columns.every((c) => c === "datetime")
@@ -208,15 +229,43 @@ export const DEFAULT_LIMIT = 20
  * BI-9 review fix (SHOULD-FIX) R2: the limit after a grain is chosen. A
  * truncation left at the untouched default would show 20 days and a cut-off
  * mark, so it starts at the grained maximum; a limit the person set is kept.
+ *
+ * `BI-46` review round 1, R7: beside a breakdown the limit counts breakdown
+ * values, not buckets, so `capsBreakdown` keeps the untouched default at 20 —
+ * raising it to the grained maximum would be no cap at all.
  */
-export function limitAfterGrainPick(next: Grain | "", current: number, touched: boolean): number {
+export function limitAfterGrainPick(next: Grain | "", current: number, touched: boolean, capsBreakdown = false): number {
+  if (capsBreakdown) return current
   return next && isTruncation(next) && !touched && current === DEFAULT_LIMIT ? MAX_GRAIN_LIMIT : current
+}
+
+/**
+ * `BI-46` review round 1, R7: the limit after a breakdown is added. A chart
+ * that already carried a grain may hold the grained maximum from an untouched
+ * default; once the limit counts breakdown values that is no cap, so it goes
+ * back to the default. A limit the person set is kept.
+ */
+export function limitAfterBreakdownPick(current: number, touched: boolean): number {
+  return !touched && current === MAX_GRAIN_LIMIT ? DEFAULT_LIMIT : current
 }
 
 /**
  * Whether the limit field does anything: a part of the date ordered by bucket
  * returns its whole range whatever the limit (R1), so the field is not shown.
+ * `BI-46`: beside a breakdown it always counts something — the N breakdown
+ * values with the largest total — whatever the dimension's grain.
  */
-export function limitHasEffect(grain: Grain | "", order: string): boolean {
+export function limitHasEffect(grain: Grain | "", order: string, capsBreakdown = false): boolean {
+  if (capsBreakdown) return true
   return !(grain && !isTruncation(grain) && order === "none")
+}
+
+/**
+ * `BI-46` (plan D13): the rows with a series column's bucket labels — a legend
+ * and a tooltip read "Mar 2026" like the axis does, instead of the raw date.
+ */
+export function labelSeriesBuckets<T extends Record<string, unknown>>(
+  rows: readonly T[], series: string, grain: Grain,
+): T[] {
+  return rows.map((row) => (series in row ? { ...row, [series]: bucketLabel(grain, row[series]) } : row))
 }

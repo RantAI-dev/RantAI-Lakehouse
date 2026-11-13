@@ -21,6 +21,7 @@ import type { FilterDef } from "@/services/clients/bi-store";
 import { BinPicker } from "./bin-picker";
 import { ColumnList } from "./table-settings";
 import { DateEditor, NumberEditor, TextEditor, blankFilter, type EditorProps } from "./filters/filter-editors";
+import type { OwnSource } from "./filters/use-filter-values";
 
 /**
  * The chart builder's sections for `BI-6`: the list of measures (each with
@@ -132,7 +133,7 @@ function FilterEditor({ kind, ...props }: EditorProps & { kind: string }) {
  * dashboard filter can only narrow them further.
  */
 export function ChartFilters({
-  value, onChange, columns, disabled, segments = [],
+  value, onChange, columns, disabled, segments = [], source,
 }: {
   readonly value: readonly FilterDef[];
   readonly onChange: (next: FilterDef[]) => void;
@@ -140,6 +141,12 @@ export function ChartFilters({
   readonly disabled: boolean;
   /** BI-2: the saved segments of the chart's table; one is added as a reference by name and stands for its filters. */
   readonly segments?: readonly { name: string; label: string }[];
+  /**
+   * `BI-47` (QA `LH-BI-6-01`): the source this chart (or question, segment or
+   * metric) reads, whose values its filter lists show — never a list gathered
+   * from every mart that happens to have the column.
+   */
+  readonly source: OwnSource;
 }) {
   // `null`: nothing open; a column: a new filter on it; a number: editing that one.
   const [open, setOpen] = React.useState<{ column: string } | { index: number } | null>(null);
@@ -179,8 +186,7 @@ export function ChartFilters({
         <div className="rounded-md border border-border p-2.5" aria-label={`Filter on ${column}`}>
           <p className="pb-2 text-xs font-medium text-muted-foreground">{column}</p>
           <FilterEditor
-            // A value list of a mart's column reads every mart that has it: the chart has no dashboard yet.
-            board="" column={column} others={others(column)} kind={kindOf(column)}
+            board="" column={column} others={others(column)} kind={kindOf(column)} source={source}
             initial={editing ?? blankFilter(column, kindOf(column))}
             onApply={(next) => {
               onChange(editing && open && "index" in open ? value.map((f, j) => (j === open.index ? next : f)) : [...value, next]);

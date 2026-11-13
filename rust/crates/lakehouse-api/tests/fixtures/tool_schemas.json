@@ -359,7 +359,7 @@
                 ]
               }
             ],
-            "description": "the number of groups to show; with `sort` it keeps the first N in that order"
+            "description": "the number of groups to show; with `sort` it keeps the first N in that order; on a bar, hbar, line or area chart with a breakdown it keeps that many breakdown values, the ones with the largest total"
           },
           "span": {
             "type": "number",
@@ -1211,6 +1211,17 @@
               "mode"
             ]
           },
+          "breakdownGrain": {
+            "type": "string",
+            "enum": [
+              "day",
+              "week",
+              "month",
+              "quarter",
+              "year"
+            ],
+            "description": "group a date or timestamp `breakdown` by this period; bar, hbar, line and area only; not with a bin"
+          },
           "grid": {
             "type": "object",
             "properties": {
@@ -1858,6 +1869,9 @@
           },
           "breakdownBin": {
             "type": "object"
+          },
+          "breakdownGrain": {
+            "type": "string"
           },
           "grid": {
             "type": "object"
