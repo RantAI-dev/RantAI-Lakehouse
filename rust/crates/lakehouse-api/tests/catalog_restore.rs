@@ -1216,6 +1216,7 @@ async fn a_catalog_that_answers_500_and_a_table_that_still_exists_keeps_the_reco
     .await
     .unwrap();
     assert_eq!(outcomes.len(), 2, "one entry before and one after");
+    assert_eq!(outcomes[0].0, "allowed");
     assert_eq!(outcomes[1].0, "failed");
     assert_eq!(
         outcomes[1].1.as_deref(),
@@ -1267,6 +1268,7 @@ async fn a_catalog_that_lists_a_deleted_table_that_still_exists_says_the_outcome
     .await
     .unwrap();
     assert_eq!(outcomes.len(), 2, "one entry before and one after");
+    assert_eq!(outcomes[0].0, "allowed");
     assert_eq!(outcomes[1].0, "failed");
     assert_eq!(
         outcomes[1].1.as_deref(),
@@ -1644,10 +1646,10 @@ async fn a_deleted_list_that_never_ends_keeps_the_record_and_says_the_outcome_is
 }
 
 /// `DATA-55` review R2, the kept-record rule, as narrowed by review S1: a
-/// record is believed only while the table is absent, and a record for a table
-/// that IS there is healed only once it is old enough that no drop it records
-/// can still be in flight. This record is backdated past that grace, so the
-/// next status read removes it and answers as if it were not there.
+/// record is believed whether or not the table is there, and a record for a
+/// table that IS there is healed only once it is old enough that no drop it
+/// records can still be in flight. This record is backdated past that grace, so
+/// the next status read removes it and answers as if it were not there.
 #[tokio::test]
 async fn a_stale_record_of_a_table_that_exists_is_removed_by_the_next_status_read() {
     let server = MockServer::start().await;
@@ -1961,7 +1963,9 @@ async fn without_the_admin_client_nothing_is_dropped() {
 }
 
 /// `DATA-55` D8: a restore of a table dropped from the console clears the
-/// record of its drop, so the name is free for a new load again.
+/// record of its drop, so the name is free for a new load again — and only the
+/// record it read: a record written after that read belongs to another drop
+/// (`DATA-55` review U2).
 #[tokio::test]
 async fn restoring_a_table_dropped_from_the_console_clears_its_record() {
     let server = MockServer::start().await;
@@ -2003,6 +2007,178 @@ async fn restoring_a_table_dropped_from_the_console_clears_its_record() {
             .unwrap()
             .is_none(),
         "the record is gone after the restore"
+    );
+}
+
+/// `DATA-55` review U2: the record a restore clears is the one it read BEFORE
+/// the undrop went out. A second drop of the same name can replace that record
+/// while the undrop is in flight (the old one is past its grace, so a read heals
+/// it and a new one is written); the restore must leave the new record, or that
+/// drop's table would be gone with no record of it — the one state this feature
+/// must never reach.
+#[tokio::test]
+async fn a_restore_leaves_a_record_written_while_its_undrop_was_in_flight() {
+    let server = MockServer::start().await;
+    mount_registry(&server, "orders").await;
+    mount_missing_table(&server).await;
+    mount_warehouse(&server).await;
+    mount_dropped(&server, "2099-01-01T00:00:00Z").await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/management/v1/warehouse/wh-1/deleted-tabulars/undrop",
+        ))
+        .respond_with(ResponseTemplate::new(204).set_delay(Duration::from_millis(1500)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    let tenant_id = Uuid::parse_str(CATALOG_TENANT).expect("a tenant id");
+    uploads::record_table_drop(
+        &pool,
+        &NewTableDrop {
+            bronze_table: "orders",
+            tenant_id,
+            asset_id: "orders",
+            dropped_by: "Ada Lovelace",
+            row_count: Some(1),
+            kept_seconds: 604_800,
+        },
+    )
+    .await
+    .unwrap()
+    .expect("the drop is recorded");
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let handler_router = router.clone();
+    let handler =
+        tokio::spawn(async move { call(&handler_router, "POST", RESTORE, &cookie).await });
+    let mut in_flight = false;
+    for _ in 0..200 {
+        if undrops(&server).await == 1 {
+            in_flight = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(in_flight, "the restore reached the catalog");
+    // A second drop of the same name, written while the undrop is in flight:
+    // its record is a different one, with a later `dropped_at` and its own
+    // window, and this restore never read it.
+    sqlx::query(
+        "UPDATE upload_table_drop SET dropped_at = now(), expires_at = now() + interval '7 days' \
+         WHERE bronze_table = 'orders'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (status, body) = handler.await.expect("the handler finished");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        uploads::dropped_table(&pool, "orders")
+            .await
+            .unwrap()
+            .is_some(),
+        "the record written while the undrop was in flight stays: the restore read another one"
+    );
+    assert_eq!(
+        wait_for_outcomes(&pool, "catalog.restore", 2).await,
+        vec!["allowed", "executed"],
+        "the trail of the restore that happened is complete"
+    );
+}
+
+/// `DATA-55` review U3: the "the table exists" path of `POST …/restore`. A
+/// record for a table that is there may still be a drop in flight, so a fresh
+/// one is left alone (`DATA-55` review S1, `HEAL_GRACE`).
+#[tokio::test]
+async fn a_restore_of_a_table_that_exists_leaves_a_fresh_record() {
+    let server = MockServer::start().await;
+    mount_registry(&server, "orders").await;
+    mount_existing_iceberg_table(&server, "orders").await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    let tenant_id = Uuid::parse_str(CATALOG_TENANT).expect("a tenant id");
+    uploads::record_table_drop(
+        &pool,
+        &NewTableDrop {
+            bronze_table: "orders",
+            tenant_id,
+            asset_id: "orders",
+            dropped_by: "Ada Lovelace",
+            row_count: Some(1),
+            kept_seconds: 604_800,
+        },
+    )
+    .await
+    .unwrap()
+    .expect("the drop is recorded");
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let (status, body) = call(&router, "POST", RESTORE, &cookie).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["error"],
+        json!("a table of that name exists again; it was recreated by a later load")
+    );
+    assert!(
+        uploads::dropped_table(&pool, "orders")
+            .await
+            .unwrap()
+            .is_some(),
+        "the record is younger than the grace: its drop may still be in flight, so it stands"
+    );
+    assert_eq!(
+        undrops(&server).await,
+        0,
+        "the catalog is not asked to undrop a table that is there"
+    );
+}
+
+/// `DATA-55` review U3, the other end: a record for a table that exists and is
+/// past its grace cannot be a drop in flight any more, so this path clears it.
+#[tokio::test]
+async fn a_restore_of_a_table_that_exists_clears_a_record_past_its_grace() {
+    let server = MockServer::start().await;
+    mount_registry(&server, "orders").await;
+    mount_existing_iceberg_table(&server, "orders").await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    let tenant_id = Uuid::parse_str(CATALOG_TENANT).expect("a tenant id");
+    uploads::record_table_drop(
+        &pool,
+        &NewTableDrop {
+            bronze_table: "orders",
+            tenant_id,
+            asset_id: "orders",
+            dropped_by: "Ada Lovelace",
+            row_count: Some(1),
+            kept_seconds: 604_800,
+        },
+    )
+    .await
+    .unwrap()
+    .expect("the drop is recorded");
+    // Ten minutes is unmistakably past `HEAL_GRACE`'s two minutes.
+    sqlx::query(
+        "UPDATE upload_table_drop SET dropped_at = now() - interval '10 minutes' \
+         WHERE bronze_table = 'orders'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let (status, body) = call(&router, "POST", RESTORE, &cookie).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["error"],
+        json!("a table of that name exists again; it was recreated by a later load")
+    );
+    assert!(
+        uploads::dropped_table(&pool, "orders")
+            .await
+            .unwrap()
+            .is_none(),
+        "past its grace the record is healed: the table is there, so it is not dropped"
     );
 }
 

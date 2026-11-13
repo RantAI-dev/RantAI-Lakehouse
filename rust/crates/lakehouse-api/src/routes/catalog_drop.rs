@@ -41,10 +41,11 @@
 //! nobody knows keeps it, so the name stays closed and a table that was dropped
 //! is not mistaken for one that is absent; and a record that cannot be written
 //! leaves the `allowed` entry and its `failed` ending, never an entry with no
-//! ending (review R7). A record is believed while the table is absent, and a
-//! record for a table that is there is healed only once it is too old for its
+//! ending (review R7). A record is believed whether or not the table is there,
+//! and one for a table that is there is healed only once it is too old for its
 //! drop to still be in flight ([`dropped_now`], [`HEAL_GRACE`]), so a stale one
-//! cannot close a live table's name and a fresh one cannot be lost.
+//! cannot close a live table's name for a week and a fresh one — whose `DELETE`
+//! may still be on its way — cannot be lost.
 //!
 //! # What never happens
 //!
@@ -114,17 +115,35 @@ const INTERRUPTED: &str = "The drop did not finish, so it is not known whether t
 /// A drop writes its record first and sends the catalog's `DELETE` afterwards,
 /// so from the insert until the catalog has applied the `DELETE` the table
 /// exists and the record is TRUE. Healing therefore has to outlast every
-/// stretch a drop can be in flight: the `DELETE`'s own fifteen seconds, the two
-/// outcome checks' ten seconds each ([`OUTCOME_CHECK_TIMEOUT`]), and margin.
-/// Two minutes covers all of it.
+/// stretch a drop can be in flight: the second load check's thirty seconds
+/// ([`LOAD_CHECK_TIMEOUT`]), the `DELETE`'s own fifteen, and the two outcome
+/// checks' ten seconds each ([`OUTCOME_CHECK_TIMEOUT`]) — 65 seconds of bounds
+/// in all — and margin. Two minutes covers all of it. Those are OUR bounds: the
+/// database calls in the stretch have the pool's own limits, not ours.
 pub(super) const HEAL_GRACE: i64 = 120;
+
+/// The bound on the second load check of a drop (`DATA-55` review U1).
+///
+/// The check settles every load `ingesting` into the name, and settling can
+/// read the object store and wait on the database, so it can outlast the grace
+/// and still let the `DELETE` go out after a read had healed the record. Thirty
+/// seconds is well inside [`HEAL_GRACE`], and a bound that passes keeps the
+/// record and drops nothing.
+const LOAD_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The loads into the table could not be checked, so nothing was dropped
+/// (`DATA-55` review U1). The drop's own task cannot know a load is not running,
+/// and a name it cannot check is not a name it may close.
+const LOAD_CHECK_FAILED: &str =
+    "The loads into this table could not be checked, so nothing was dropped. Try again shortly.";
 
 /// The bound on each of the two checks the unknown outcome makes (`DATA-55`
 /// review R2): the deleted-tabulars list, and the table's own presence. Ten
 /// seconds is a lookup, not a scan. Every catalog call inside the drop's or the
-/// restore's spawned task is bounded by one of these or by the client's own
-/// bound on its request (`DATA-55` review S2), so a hanging catalog cannot
-/// leave an `allowed` entry with no ending.
+/// restore's spawned task carries a named bound: one of these, or
+/// [`UNDROP_TIMEOUT`](super::catalog_restore) on the restore's undrop, or the
+/// client's `DROP_TABLE_TIMEOUT` on the drop's `DELETE` (`DATA-55` review S2,
+/// U5), so a hanging catalog cannot leave an `allowed` entry with no ending.
 pub(super) const OUTCOME_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// D4, answered before anything is written: may this table be dropped, and by
@@ -156,7 +175,8 @@ enum Readiness {
 /// target means the name is not only an upload's, and the one sentence says no
 /// more than that.
 ///
-/// Rule 4 believes a record only while the table is absent ([`dropped_now`]).
+/// Rule 4 believes a record unless the table is there AND the record is past
+/// its grace ([`dropped_now`]).
 ///
 /// Not [`super::catalog_restore::target`]: its "not configured" answer comes
 /// before the questions D4 asks first, and it knows nothing of claims or loads.
@@ -227,8 +247,9 @@ async fn loading_into_now(state: &AppState, pool: &PgPool, table: &str) -> Resul
     Ok(false)
 }
 
-/// Whether `table` is dropped right now, believing the record only while the
-/// table is absent (`DATA-55` review R2, QA `LH-DATA-15-06`, `TC-1731`).
+/// Whether `table` is dropped right now, believing the record whether or not
+/// the table is there (`DATA-55` review R2, U5, QA `LH-DATA-15-06`,
+/// `TC-1731`).
 ///
 /// A kept record must not lock a live table for seven days, but it must not be
 /// removed while the drop it records can still be in flight either
@@ -547,17 +568,18 @@ impl DropJob {
     /// Run the audited half of the drop and answer with the body of a drop the
     /// catalog made.
     ///
-    /// Every catalog call in here has a bound of its own
-    /// ([`OUTCOME_CHECK_TIMEOUT`], and the client's `DROP_TABLE_TIMEOUT` on the
-    /// `DELETE`): the route's deadline stops only the handler's waiting, so a
-    /// call without a bound would leave the `allowed` entry with no ending
-    /// (`DATA-55` review S2).
+    /// Every call in here has a bound of its own ([`LOAD_CHECK_TIMEOUT`] on the
+    /// second load check, [`OUTCOME_CHECK_TIMEOUT`] on each outcome check, and
+    /// the client's `DROP_TABLE_TIMEOUT` on the `DELETE`): the route's deadline
+    /// stops only the handler's waiting, so a call without a bound would leave
+    /// the `allowed` entry with no ending (`DATA-55` review S2, U1).
     ///
     /// # Errors
     ///
     /// `409` and `503` of D5 (the catalog's refusal, a name already dropped, a
-    /// load that started since the checks), the store's `500`, and the
-    /// `500` of an answer that cannot be written as a body.
+    /// load that started since the checks, a load check that did not answer),
+    /// the store's `500`, and the `500` of an answer that cannot be written as
+    /// a body.
     async fn run(&self) -> Result<Value, ApiError> {
         audit_first(&self.pool, self.event("allowed", None), NOT_AUDITED).await?;
         let record = match uploads::record_table_drop(
@@ -592,10 +614,34 @@ impl DropJob {
         // is asked a second time here, so a load that started between `assess`
         // and the record cannot pass the drop's check while the drop passes its
         // own.
-        match loading_into_now(&self.state, &self.pool, &self.table).await {
+        //
+        // `DATA-55` review U1: the check is bounded, because settling an ended
+        // load can read the object store and wait on the database. A check that
+        // did not answer leaves the record standing (`failed`, no `DELETE`): an
+        // unverified name is not a name this task may close.
+        let load_check = match tokio::time::timeout(
+            LOAD_CHECK_TIMEOUT,
+            loading_into_now(&self.state, &self.pool, &self.table),
+        )
+        .await
+        {
+            Ok(answered) => answered,
+            Err(_elapsed) => {
+                tracing::error!(
+                    table = %self.table,
+                    "drop: the load check did not answer within its bound; the record stands"
+                );
+                Err(ApiError::Unavailable(LOAD_CHECK_FAILED.to_owned()))
+            }
+        };
+        match load_check {
             Ok(false) => {}
             Ok(true) => {
-                if let Err(err) = uploads::forget_table_drop(&self.pool, &self.table).await {
+                // Only THIS attempt's record goes: a record another drop wrote
+                // in the meantime belongs to that drop (`DATA-55` review U1).
+                if let Err(err) =
+                    uploads::forget_table_drop_at(&self.pool, &self.table, record.dropped_at).await
+                {
                     tracing::error!(
                         ?err,
                         table = %self.table,
@@ -623,7 +669,7 @@ impl DropJob {
                     ),
                 )
                 .await;
-                return Err(err);
+                return Err(ApiError::Unavailable(LOAD_CHECK_FAILED.to_owned()));
             }
         }
         match self
@@ -654,12 +700,14 @@ impl DropJob {
     /// The catalog did not (or may not) have dropped the table: what is known
     /// decides whether the record stays, and the sentence says which.
     ///
-    /// `DATA-55` review R2, replacing D8 step 5: a definite refusal removes the
-    /// record; an unknown outcome asks the catalog once, and keeps the record
-    /// unless the catalog says the table is still there. The record is only
-    /// removed when it is known that nothing was dropped — otherwise the name
-    /// stays closed, because a dropped table that is not on record is exactly
-    /// the load `D11` exists to refuse.
+    /// `DATA-55` review R2, replacing D8 step 5: a definite refusal — the
+    /// catalog has no such table, or refused the drop — removes the record this
+    /// task wrote; every unknown outcome keeps it. Round 1's second arm ("not
+    /// listed as deleted and the table is still there") was withdrawn by
+    /// `DATA-55` review S1, because a `DELETE` whose client gave up may still be
+    /// applied by the catalog, so an unknown outcome always keeps the record:
+    /// a dropped table that is not on record is exactly the load `D11` exists
+    /// to refuse.
     async fn settle_not_dropped(
         &self,
         record: &lakehouse_store::uploads::TableDrop,
@@ -682,7 +730,9 @@ impl DropJob {
                 return self.settle_unknown_outcome(record).await;
             }
         };
-        if let Err(err) = uploads::forget_table_drop(&self.pool, &self.table).await {
+        if let Err(err) =
+            uploads::forget_table_drop_at(&self.pool, &self.table, record.dropped_at).await
+        {
             tracing::error!(
                 ?err,
                 table = %self.table,

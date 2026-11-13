@@ -3012,11 +3012,11 @@ async fn once_the_restore_window_has_passed_the_name_takes_a_new_load() {
 }
 
 /// `DATA-55` review R2, the healing rule as narrowed by review S1, on the load
-/// side: a record is believed only while the table is absent, and a record for
-/// a table that IS there is healed only once it is old enough that no drop it
-/// records can still be in flight. This record is backdated past that grace, so
-/// the next load removes it and goes through instead of refusing a live table's
-/// name for a week.
+/// side: a record is believed whether or not the table is there, and a record
+/// for a table that IS there is healed only once it is old enough that no drop
+/// it records can still be in flight. This record is backdated past that grace,
+/// so the next load removes it and goes through instead of refusing a live
+/// table's name for a week.
 #[tokio::test]
 async fn a_stale_record_of_a_table_that_exists_is_removed_by_the_next_load_and_the_load_goes_through()
  {

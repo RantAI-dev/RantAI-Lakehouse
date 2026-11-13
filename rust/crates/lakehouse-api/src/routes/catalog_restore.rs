@@ -31,8 +31,13 @@
 //! be audited does not happen), then the catalog is asked, then `executed` or
 //! `failed` is written. The record of the drop (`upload_table_drop`) is
 //! cleared on both ends of a restore: when the undrop succeeds, and when the
-//! table turns out to exist again anyway — a table that is there is not
-//! dropped, whatever a leftover record says.
+//! table turns out to exist again anyway — but there only once the record is
+//! past [`super::catalog_drop::HEAL_GRACE`], because until then the table may
+//! be there simply because the drop's `DELETE` is still on its way. Either
+//! clearing takes the record this restore READ before the undrop went out and
+//! removes it only if that is still the record, so a second drop of the same
+//! name written while the undrop is in flight keeps its own (`DATA-55` review
+//! U2).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -182,9 +187,10 @@ fn admin_unavailable(err: &OpenfgaError) -> ApiError {
 /// other asset-page read uses.
 ///
 /// `pub(super)` because the drop's healing rule (`DATA-55` review R2,
-/// [`super::catalog_drop::dropped_now`]) asks it too: a record of a drop is
-/// believed only while the table is absent, and this is the one way this
-/// service asks "is the table there".
+/// [`super::catalog_drop::dropped_now`]) asks it too: a record is believed
+/// whether or not the table is there, and a table that exists only heals it
+/// once the record is past its grace. This is the one way this service asks
+/// "is the table there".
 ///
 /// # Errors
 ///
@@ -419,6 +425,24 @@ pub async fn restore(
     let Some(warehouse) = warehouse else {
         return Err(ApiError::Unavailable(UNREACHABLE.to_owned()).into());
     };
+    // `DATA-55` review U2: the record of the drop this restore may clear, read
+    // BEFORE the undrop goes out, so the clearing removes that record and never
+    // one a second drop of the same name writes while the undrop is in flight
+    // (the old record can be past its grace, so a read heals it and a new one is
+    // written). No record, or an unreadable one: nothing is cleared, and the
+    // next read heals a leftover.
+    let dropped_at = match uploads::dropped_table(&pool, &table).await {
+        Ok(Some(record)) => Some(record.dropped_at),
+        Ok(None) => None,
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                %table,
+                "restore: the record of the drop could not be read; this restore clears no record"
+            );
+            None
+        }
+    };
     let job = RestoreJob {
         state,
         pool,
@@ -429,6 +453,7 @@ pub async fn restore(
         warehouse,
         tabular,
         expires_at,
+        dropped_at,
     };
     // `DATA-55` review R1: one task for the audited stretch, awaited here.
     let handle = tokio::spawn(async move { job.run().await });
@@ -466,6 +491,10 @@ struct RestoreJob {
     tabular: String,
     /// Until when it was restorable, as the audit entry records it.
     expires_at: String,
+    /// The `dropped_at` of the record read before the undrop, which is the ONLY
+    /// record this restore may clear (`DATA-55` review U2); `None` when there was
+    /// no record to read, and then nothing is cleared.
+    dropped_at: Option<OffsetDateTime>,
 }
 
 impl RestoreJob {
@@ -549,12 +578,30 @@ impl RestoreJob {
     /// The table is back: clear the drop's record (best effort) and write the
     /// `executed` entry, both inside the awaited task.
     async fn finish_restore(&self) {
-        // `DATA-55` D8 (QA `LH-DATA-15-06`, `TC-1731`): the record of the
-        // drop is cleared, because a table that is there is not
-        // dropped. A failure is logged, not turned into a failed restore — the
-        // table IS back, and the next status read heals a leftover record.
-        if let Err(err) = uploads::forget_table_drop(&self.pool, &self.table).await {
-            tracing::warn!(?err, %self.table, "restore: the record of the drop could not be cleared");
+        // `DATA-55` D8 (QA `LH-DATA-15-06`, `TC-1731`): the record of the drop
+        // is cleared, because a table that is there is not dropped — but only
+        // the record this restore read before the undrop went out (`DATA-55`
+        // review U2). A record written since belongs to a drop of the same name
+        // that may still be in flight, and removing it would leave that table
+        // dropped with no record of it. Nothing read (or the read failed):
+        // nothing is cleared, and the next read heals a leftover. A failure is
+        // logged, not turned into a failed restore — the table IS back.
+        if let Some(dropped_at) = self.dropped_at {
+            match uploads::forget_table_drop_at(&self.pool, &self.table, dropped_at).await {
+                Ok(true) => {}
+                Ok(false) => tracing::warn!(
+                    table = %self.table,
+                    "restore: the record read for this restore is gone or was replaced; a record written since stays"
+                ),
+                Err(err) => {
+                    tracing::warn!(?err, %self.table, "restore: the record of the drop could not be cleared");
+                }
+            }
+        } else {
+            tracing::warn!(
+                table = %self.table,
+                "restore: no record of the drop was read, so this restore clears none; the next read heals a leftover"
+            );
         }
         audit_after(&self.pool, self.event("executed", None)).await;
     }

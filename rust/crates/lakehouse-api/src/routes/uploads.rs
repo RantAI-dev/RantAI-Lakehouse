@@ -2670,9 +2670,11 @@ async fn ensure_table_free(
         // table was dropped from the console and can still be restored
         // (DATA-55 D11, QA LH-DATA-15-06, TC-1731). The load job would create a
         // new table of that name, and the dropped one could no longer be
-        // undropped. The record is believed only while the table is absent
-        // (`DATA-55` review R2, `dropped_now`), so a stale record cannot close a
-        // live table; an unreadable record is `unchecked` like its neighbours:
+        // undropped. The record is believed whether or not the table is there,
+        // and a table that IS there only heals it once the record is past its
+        // grace (`DATA-55` review R2, U5, `dropped_now`): a young record whose
+        // `DELETE` may still be on its way keeps the name closed, and a stale
+        // one cannot. An unreadable record is `unchecked` like its neighbours:
         // 503, never an assumption that the name is free (fail closed).
         TableClaim::Ours => {
             if super::catalog_drop::dropped_now(state, pool, table)

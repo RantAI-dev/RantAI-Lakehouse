@@ -139,7 +139,11 @@
 //!   now" — asked at every load, which is what keeps a dropped table's name
 //!   closed while it can still be restored: a new table of that name would make
 //!   the dropped one impossible to bring back.
-//! - [`forget_table_drop`] removes the row when the table is restored.
+//! - [`forget_table_drop_at`] removes the row a restore, a refused drop or a
+//!   drop the catalog answered read — and only that row: a record written after
+//!   that read belongs to another drop and stays.
+//! - [`heal_table_drop`] removes a row that says "dropped" for a table that is
+//!   there, once it is too old for its own drop to be in flight.
 //! - [`list_dropped_tables`] is the Catalog's list: the given tenants'
 //!   unexpired drops, newest first.
 //! - [`loading_into`] is the uploads loading into a name, for the check that
@@ -1709,21 +1713,35 @@ pub async fn dropped_table(pool: &PgPool, table: &str) -> Result<Option<TableDro
     .await?)
 }
 
-/// Remove the drop on record for `table`, whatever its window — the table is
-/// there again, so it is not dropped (`DATA-55` D8, the restore).
+/// Remove the drop on record for `table` ONLY when that row is still the one
+/// the caller read — the removal a restore, a drop the catalog refused and a
+/// drop whose second load check found a load all use (`DATA-55` review U1, U2).
 ///
-/// Returns whether a row went; `false` means there was no record, which is not
-/// an error (a restore of a table dropped outside the console has none).
+/// The name's record can change under a caller that waited: a restore reads the
+/// record, then waits for the catalog's undrop; if the answer is slow and the
+/// old record is past its window, a second person can drop the table in those
+/// seconds and replace the row. Removing "the record of this name" would then
+/// delete THAT drop's record while its own `DELETE` goes out, which is the one
+/// state this feature must never reach: a dropped table with no record of it.
+/// `dropped_at` is the value the caller read, bound (never built into the SQL),
+/// and the row is removed only while it still carries exactly that value.
+///
+/// No grace here: these callers know their own outcome, so the record they wrote
+/// or read is theirs to clear at once. Healing a record for a table that exists
+/// is the other function, [`heal_table_drop`].
+///
+/// Returns whether a row went; `false` means there is no record, or a different
+/// one is on record now — both of which leave the caller's answer as it is.
 ///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] on a database failure.
-pub async fn forget_table_drop(pool: &PgPool, table: &str) -> Result<bool, StoreError> {
-    let done = sqlx::query("DELETE FROM upload_table_drop WHERE bronze_table = $1")
-        .bind(table)
-        .execute(pool)
-        .await?;
-    Ok(done.rows_affected() > 0)
+pub async fn forget_table_drop_at(
+    pool: &PgPool,
+    table: &str,
+    dropped_at: OffsetDateTime,
+) -> Result<bool, StoreError> {
+    remove_table_drop(pool, table, dropped_at, 0).await
 }
 
 /// Remove the drop on record for `table` ONLY when that record cannot belong to
@@ -1747,6 +1765,24 @@ pub async fn forget_table_drop(pool: &PgPool, table: &str) -> Result<bool, Store
 ///
 /// Returns [`StoreError::Database`] on a database failure.
 pub async fn heal_table_drop(
+    pool: &PgPool,
+    table: &str,
+    dropped_at: OffsetDateTime,
+    grace_seconds: i64,
+) -> Result<bool, StoreError> {
+    remove_table_drop(pool, table, dropped_at, grace_seconds).await
+}
+
+/// The one guarded removal, written once for both callers above (`DATA-55`
+/// review U1): the row must carry the `dropped_at` that the caller read, and —
+/// when a grace is given — must be at least that old. `grace_seconds` of 0 asks
+/// for the `dropped_at` guard alone, which is what a caller that knows its own
+/// outcome wants.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+async fn remove_table_drop(
     pool: &PgPool,
     table: &str,
     dropped_at: OffsetDateTime,

@@ -36,10 +36,11 @@ use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::uploads::{
     ClaimFolder, ClaimedTable, LimitOutcome, LoadClaim, LoadLimits, LoadMode, MarkOutcome,
     NewReceiving, NewTableDrop, NewUpload, TableClaim, Upload, UploadPart, attach_run, claim_table,
-    delete, dropped_table, find_by_sha256, forget_table_drop, get, get_by_run_id, heal_table_drop,
-    insert, list, list_claims, list_dropped_tables, loading_into, loads_under_limits,
-    mark_finished, mark_group_within_limits, mark_ingesting, mark_ingesting_within_limits,
-    record_table_drop, table_being_loaded, table_claim, table_claimed, upload_in_tenants,
+    delete, dropped_table, find_by_sha256, forget_table_drop_at, get, get_by_run_id,
+    heal_table_drop, insert, list, list_claims, list_dropped_tables, loading_into,
+    loads_under_limits, mark_finished, mark_group_within_limits, mark_ingesting,
+    mark_ingesting_within_limits, record_table_drop, table_being_loaded, table_claim,
+    table_claimed, upload_in_tenants,
 };
 use lakehouse_store::uploads::{
     LARGE_LOAD_BYTES, count_receiving, find_by_parts_digest, finish_receiving, insert_receiving,
@@ -3170,10 +3171,13 @@ async fn a_drop_whose_window_has_passed_no_longer_counts_and_the_next_one_replac
     Ok(())
 }
 
-/// `DATA-55` D8: a restore removes the record and says whether there was one;
-/// an absent record is not an error.
+/// `DATA-55` review U1 (`DATA-55` D8): the removal a restore and a drop's own
+/// task use takes the record it read, and only that one. A record written for a
+/// different drop of the same name — the second drop's, after the first was past
+/// its window — stays: removing it would leave a dropped table with no record,
+/// which is the state this feature must never reach.
 #[sqlx::test(migrations = "../../migrations")]
-async fn forgetting_a_drop_removes_it_and_says_whether_there_was_one(
+async fn forgetting_a_drop_removes_the_record_it_read_and_no_other(
     pool: PgPool,
 ) -> sqlx::Result<()> {
     let tenant_a = tenant(&pool, "uploads-drop-forget").await;
@@ -3186,11 +3190,41 @@ async fn forgetting_a_drop_removes_it_and_says_whether_there_was_one(
     .unwrap()
     .expect("the drop is recorded");
 
-    assert!(forget_table_drop(&pool, "orders").await.unwrap());
+    let read = dropped_table(&pool, "orders").await.unwrap().unwrap();
+    assert!(
+        forget_table_drop_at(&pool, "orders", read.dropped_at)
+            .await
+            .unwrap(),
+        "the record that was read is removed"
+    );
     assert!(dropped_table(&pool, "orders").await.unwrap().is_none());
     assert!(
-        !forget_table_drop(&pool, "orders").await.unwrap(),
+        !forget_table_drop_at(&pool, "orders", read.dropped_at)
+            .await
+            .unwrap(),
         "there is no record left to remove"
+    );
+
+    // A second drop of the same name, written after `read`: only the
+    // `dropped_at` guard can keep it, and it must keep it.
+    record_table_drop(
+        &pool,
+        &new_drop("orders", tenant_a, "orders", "Grace Hopper", Some(2)),
+    )
+    .await
+    .unwrap()
+    .expect("the name is free again");
+    let second = dropped_table(&pool, "orders").await.unwrap().unwrap();
+    assert!(
+        !forget_table_drop_at(&pool, "orders", read.dropped_at)
+            .await
+            .unwrap(),
+        "a different record of the same name is not removed"
+    );
+    let left = dropped_table(&pool, "orders").await.unwrap().unwrap();
+    assert_eq!(
+        left.dropped_at, second.dropped_at,
+        "the record that was not read is the one left"
     );
     Ok(())
 }
@@ -3256,8 +3290,8 @@ async fn healing_a_drop_removes_only_a_record_older_than_the_grace_and_unchanged
     .await
     .unwrap();
     let read = dropped_table(&pool, "orders").await.unwrap().unwrap();
-    // A newer drop of the same name, written after `read`: still older than
-    // the grace, so only the `dropped_at` guard can keep it.
+    // A different record of the same name, written after `read` and backdated
+    // past the grace: only the `dropped_at` guard can keep it.
     sqlx::query(
         "UPDATE upload_table_drop SET dropped_at = now() - interval '20 minutes' \
          WHERE bronze_table = 'orders'",
@@ -3273,7 +3307,7 @@ async fn healing_a_drop_removes_only_a_record_older_than_the_grace_and_unchanged
     );
     assert!(
         dropped_table(&pool, "orders").await.unwrap().is_some(),
-        "the newer record is the one left"
+        "the record that was not read is the one left"
     );
     Ok(())
 }
