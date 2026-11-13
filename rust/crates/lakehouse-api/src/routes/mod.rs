@@ -405,18 +405,19 @@ fn chat_timeout_from(raw: Option<&str>) -> Duration {
 /// No `#[must_use]` here: `axum::Router` is already `#[must_use]`, and
 /// repeating the attribute without a message trips
 /// `clippy::double_must_use`.
-/// `POST /api/pipelines/runnable/{id}/enforce` (BLD-1 / D3), the rewrite
-/// the orchestrator asks for before it runs a pipeline's `SELECT`.
+/// `POST /api/pipelines/runnable/{id}/compile` (BLD-1 part 1 / D8), the one
+/// statement the orchestrator runs for a pipeline, compiled from its stored
+/// definition and rewritten as its author.
 ///
 /// Its own function for the same reason [`pipelines_router`] is: so the
 /// route can be added without pushing that function over
 /// `clippy::too_many_lines`. It merges straight back in, through
 /// [`authored_pipelines_router`], and carries no middleware or state of
 /// its own.
-fn pipeline_enforce_router() -> Router<AppState> {
+fn pipeline_compile_router() -> Router<AppState> {
     Router::new().route(
-        "/api/pipelines/runnable/{id}/enforce",
-        axum::routing::post(authored_pipelines::enforce_pipeline_sql),
+        "/api/pipelines/runnable/{id}/compile",
+        axum::routing::post(authored_pipelines::compile_pipeline),
     )
 }
 
@@ -428,7 +429,7 @@ fn pipeline_enforce_router() -> Router<AppState> {
 /// [`crate::policy`], and keeping them together makes that pairing the
 /// thing a reader sees first.
 fn authored_pipelines_router() -> Router<AppState> {
-    pipeline_enforce_router().route("/api/pipelines/runnable", get(authored_pipelines::runnable))
+    pipeline_compile_router().route("/api/pipelines/runnable", get(authored_pipelines::runnable))
 }
 
 /// The `/api/pipelines/*` sub-router (Task 2.5), split out of [`router`]

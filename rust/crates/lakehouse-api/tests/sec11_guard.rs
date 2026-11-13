@@ -211,11 +211,6 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "transform_grammar's own validation message",
     ),
     (
-        "pipelines.rs",
-        "invalid transform at transforms[{index}]: {err}",
-        "transform_grammar's own validation message",
-    ),
-    (
         "gold.rs",
         "invalid mart: {e}",
         "lakehouse_core::ident's own validation message about the caller's mart name",

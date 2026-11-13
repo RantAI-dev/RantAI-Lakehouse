@@ -142,6 +142,8 @@ async fn create_pipeline(
     let created = pipelines::create_pipeline(
         pool,
         &CreatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
             name: name.to_owned(),
             kind: "batch".to_owned(),
             source_zone: source
