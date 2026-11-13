@@ -36,10 +36,10 @@ use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::uploads::{
     ClaimFolder, ClaimedTable, LimitOutcome, LoadClaim, LoadLimits, LoadMode, MarkOutcome,
     NewReceiving, NewTableDrop, NewUpload, TableClaim, Upload, UploadPart, attach_run, claim_table,
-    delete, dropped_table, find_by_sha256, forget_table_drop, get, get_by_run_id, insert, list,
-    list_claims, list_dropped_tables, loading_into, loads_under_limits, mark_finished,
-    mark_group_within_limits, mark_ingesting, mark_ingesting_within_limits, record_table_drop,
-    table_being_loaded, table_claim, table_claimed, upload_in_tenants,
+    delete, dropped_table, find_by_sha256, forget_table_drop, get, get_by_run_id, heal_table_drop,
+    insert, list, list_claims, list_dropped_tables, loading_into, loads_under_limits,
+    mark_finished, mark_group_within_limits, mark_ingesting, mark_ingesting_within_limits,
+    record_table_drop, table_being_loaded, table_claim, table_claimed, upload_in_tenants,
 };
 use lakehouse_store::uploads::{
     LARGE_LOAD_BYTES, count_receiving, find_by_parts_digest, finish_receiving, insert_receiving,
@@ -3191,6 +3191,89 @@ async fn forgetting_a_drop_removes_it_and_says_whether_there_was_one(
     assert!(
         !forget_table_drop(&pool, "orders").await.unwrap(),
         "there is no record left to remove"
+    );
+    Ok(())
+}
+
+/// `DATA-55` review S1: healing a record is safe only once the drop it records
+/// cannot still be in flight, so the removal is guarded twice — by the record's
+/// own `dropped_at` and by a grace. A young record stays (its `DELETE` may still
+/// be on its way), an old one goes, and a record replaced since the read stays:
+/// the row the caller read is not the row it removes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn healing_a_drop_removes_only_a_record_older_than_the_grace_and_unchanged_since_it_was_read(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-drop-heal").await;
+    claim(&pool, tenant_a, "orders", "up-1").await;
+    record_table_drop(
+        &pool,
+        &new_drop("orders", tenant_a, "orders", "Ada Lovelace", Some(1)),
+    )
+    .await
+    .unwrap()
+    .expect("the drop is recorded");
+
+    let young = dropped_table(&pool, "orders").await.unwrap().unwrap();
+    assert!(
+        !heal_table_drop(&pool, "orders", young.dropped_at, 120)
+            .await
+            .unwrap(),
+        "a record younger than the grace is not removed: its drop may be in flight"
+    );
+    assert!(dropped_table(&pool, "orders").await.unwrap().is_some());
+
+    // Ten minutes is longer than any drop can be in flight (the route's
+    // `HEAL_GRACE` is two minutes).
+    sqlx::query(
+        "UPDATE upload_table_drop SET dropped_at = now() - interval '10 minutes' \
+         WHERE bronze_table = 'orders'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let old = dropped_table(&pool, "orders").await.unwrap().unwrap();
+    assert!(
+        heal_table_drop(&pool, "orders", old.dropped_at, 120)
+            .await
+            .unwrap(),
+        "a record older than the grace is removed"
+    );
+    assert!(dropped_table(&pool, "orders").await.unwrap().is_none());
+
+    record_table_drop(
+        &pool,
+        &new_drop("orders", tenant_a, "orders", "Grace Hopper", Some(2)),
+    )
+    .await
+    .unwrap()
+    .expect("the name is free again");
+    sqlx::query(
+        "UPDATE upload_table_drop SET dropped_at = now() - interval '10 minutes' \
+         WHERE bronze_table = 'orders'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let read = dropped_table(&pool, "orders").await.unwrap().unwrap();
+    // A newer drop of the same name, written after `read`: still older than
+    // the grace, so only the `dropped_at` guard can keep it.
+    sqlx::query(
+        "UPDATE upload_table_drop SET dropped_at = now() - interval '20 minutes' \
+         WHERE bronze_table = 'orders'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(
+        !heal_table_drop(&pool, "orders", read.dropped_at, 120)
+            .await
+            .unwrap(),
+        "a record replaced since the read is not removed"
+    );
+    assert!(
+        dropped_table(&pool, "orders").await.unwrap().is_some(),
+        "the newer record is the one left"
     );
     Ok(())
 }

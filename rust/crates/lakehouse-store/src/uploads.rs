@@ -1726,6 +1726,45 @@ pub async fn forget_table_drop(pool: &PgPool, table: &str) -> Result<bool, Store
     Ok(done.rows_affected() > 0)
 }
 
+/// Remove the drop on record for `table` ONLY when that record cannot belong to
+/// a drop still in flight — the guarded removal the healing rule uses
+/// (`DATA-55` review S1, [`dropped_now`] in `routes::catalog_drop`).
+///
+/// A drop writes its record first and sends the catalog's `DELETE` afterwards,
+/// so from the insert until the catalog has applied the `DELETE` the table
+/// exists and the record is TRUE. Healing therefore cannot be "the table
+/// exists, so the record is stale": that would let anything reading the record
+/// in that stretch remove it. Two guards make the removal safe: the record must
+/// be older than `grace_seconds`, longer than any drop can be in flight, and
+/// the row removed must still carry the `dropped_at` the caller read, so a
+/// record replaced since that read is never the one removed.
+///
+/// Returns whether a row went; `false` means the record is younger than the
+/// grace, was replaced, or is gone — all of which leave the caller's answer as
+/// "the record stands".
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn heal_table_drop(
+    pool: &PgPool,
+    table: &str,
+    dropped_at: OffsetDateTime,
+    grace_seconds: i64,
+) -> Result<bool, StoreError> {
+    let done = sqlx::query(
+        "DELETE FROM upload_table_drop \
+          WHERE bronze_table = $1 AND dropped_at = $2 \
+            AND dropped_at <= now() - ($3::bigint * interval '1 second')",
+    )
+    .bind(table)
+    .bind(dropped_at)
+    .bind(grace_seconds)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
 /// The unexpired drops of `tenant_ids`, newest first, at most `limit` — the
 /// Catalog's list (`DATA-55` D13). An empty `tenant_ids` lists nothing: the
 /// tenant rule has no "every tenant" reading here, unlike the unscoped

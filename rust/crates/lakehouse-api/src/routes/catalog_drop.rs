@@ -102,13 +102,20 @@ const NO_TABLE: &str = "There is no table to drop: the catalog holds no table of
 const REFUSED: &str = "The catalog refused to drop the table. Nothing was dropped.";
 /// The catalog did not answer, so the outcome is not known — the page says which.
 const UNKNOWN: &str = "The catalog did not answer, so it is not known whether the table was dropped. Open the table's page again: it says so if it was.";
-/// The catalog did not answer AND the table is still there: nothing was dropped
-/// (`DATA-55` review R2, the second unknown-outcome case).
-const NOT_DROPPED: &str =
-    "The catalog did not answer and the table was not dropped. Try again shortly.";
 /// The drop's own task did not finish, so the handler cannot claim an outcome
 /// (`DATA-55` review R1).
 const INTERRUPTED: &str = "The drop did not finish, so it is not known whether the table was dropped. Open the table's page again: it says so if it was.";
+
+/// The grace a drop's record must have before "the table exists" may heal it
+/// away (`DATA-55` review S1).
+///
+/// A drop writes its record first and sends the catalog's `DELETE` afterwards,
+/// so from the insert until the catalog has applied the `DELETE` the table
+/// exists and the record is TRUE. Healing therefore has to outlast every
+/// stretch a drop can be in flight: the `DELETE`'s own fifteen seconds, the two
+/// outcome checks' ten seconds each ([`OUTCOME_CHECK_TIMEOUT`]), and margin.
+/// Two minutes covers all of it.
+pub(super) const HEAL_GRACE: i64 = 120;
 
 /// The bound on asking the catalog once more what happened (`DATA-55` review
 /// R2): the deleted-tabulars list, and the table's own presence. Ten seconds is
@@ -219,11 +226,15 @@ async fn loading_into_now(state: &AppState, pool: &PgPool, table: &str) -> Resul
 /// Whether `table` is dropped right now, believing the record only while the
 /// table is absent (`DATA-55` review R2, QA `LH-DATA-15-06`, `TC-1731`).
 ///
-/// A kept record must not lock a live table for seven days: a table that IS
-/// there is not dropped, whatever a leftover record says, so the record is
-/// removed, logged once, and the caller goes on as if there were none. When the
-/// check itself fails, the record stands (fail closed): an answer that is not
-/// known is not an answer that the name is free.
+/// A kept record must not lock a live table for seven days, but it must not be
+/// removed while the drop it records can still be in flight either
+/// (`DATA-55` review S1). A table that IS there is healed only through
+/// [`uploads::heal_table_drop`], which needs the record to be older than
+/// [`HEAL_GRACE`] and unchanged since it was read; a younger record stands,
+/// because the drop's `DELETE` may still be on its way and the table is there
+/// until the catalog applies it. When the check itself fails, the record stands
+/// too (fail closed): an answer that is not known is not an answer that the
+/// name is free.
 ///
 /// The one definition of the rule, used by the drop's own assessment
 /// ([`assess`]) and by the load's [`super::uploads::ensure_table_free`] and
@@ -231,30 +242,38 @@ async fn loading_into_now(state: &AppState, pool: &PgPool, table: &str) -> Resul
 ///
 /// # Errors
 ///
-/// The store's error when the record cannot be read or removed.
+/// The store's error when the record cannot be read. A failed healing removal
+/// is logged and the record stands; it is not an error here.
 pub(super) async fn dropped_now(
     state: &AppState,
     pool: &PgPool,
     table: &str,
 ) -> Result<bool, lakehouse_store::StoreError> {
-    if uploads::dropped_table(pool, table).await?.is_none() {
+    let Some(record) = uploads::dropped_table(pool, table).await? else {
         return Ok(false);
-    }
+    };
     match super::catalog_restore::table_exists(state, table).await {
         Ok(true) => {
-            match uploads::forget_table_drop(pool, table).await {
-                Ok(true) => tracing::warn!(
-                    %table,
-                    "a drop was on record for a table that exists; the stale record was removed"
-                ),
-                Ok(false) => {}
-                Err(err) => tracing::warn!(
-                    ?err,
-                    %table,
-                    "a stale record of a drop could not be removed"
-                ),
+            match uploads::heal_table_drop(pool, table, record.dropped_at, HEAL_GRACE).await {
+                Ok(true) => {
+                    tracing::warn!(
+                        %table,
+                        "a drop was on record for a table that exists and the record was past its grace; the table was not dropped"
+                    );
+                    Ok(false)
+                }
+                // Younger than the grace, or replaced since the read: the drop
+                // may still be in flight, so the record stands.
+                Ok(false) => Ok(true),
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        %table,
+                        "a stale record of a drop could not be removed; the record stands"
+                    );
+                    Ok(true)
+                }
             }
-            Ok(false)
         }
         // Absent, or the check itself failed: the record stands.
         Ok(false) => Ok(true),
@@ -522,6 +541,12 @@ impl Drop {
     /// Run the audited half of the drop and answer with the body of a drop the
     /// catalog made.
     ///
+    /// Every catalog call in here has a bound of its own
+    /// ([`OUTCOME_CHECK_TIMEOUT`], and the client's `DROP_TABLE_TIMEOUT` on the
+    /// `DELETE`): the route's deadline stops only the handler's waiting, so a
+    /// call without a bound would leave the `allowed` entry with no ending
+    /// (`DATA-55` review S2).
+    ///
     /// # Errors
     ///
     /// `409` and `503` of D5 (the catalog's refusal, a name already dropped, a
@@ -662,9 +687,20 @@ impl Drop {
         Err(error)
     }
 
-    /// Whether the drop happened, asked of the catalog once: the deleted list
-    /// first, then — only when the list holds no such table — whether the table
-    /// still exists. See [`Drop::settle_not_dropped`].
+    /// Whether the drop happened, asked of the catalog once. The deleted list
+    /// says a copy of the name was deleted, but that alone is not proof the
+    /// drop went out (`DATA-55` review S3): an older deleted copy of the same
+    /// name would make a failed `DELETE` read as a drop. Only a table that is
+    /// GONE is a drop. Every other answer — listed but still there, not listed,
+    /// too long to tell, or a check that failed or did not answer — keeps the
+    /// record and answers D5's "not known" sentence (`DATA-55` review S1
+    /// withdrew round 1's "not listed and the table is there" arm: a `DELETE`
+    /// whose client gave up may still be applied by the catalog).
+    ///
+    /// Both catalog calls here are bounded ([`OUTCOME_CHECK_TIMEOUT`] and
+    /// [`Self::bounded_table_exists`]): the task is no longer cut by the
+    /// route's deadline, so an unbounded one would leave `allowed` with no
+    /// ending.
     async fn settle_unknown_outcome(
         &self,
         record: &lakehouse_store::uploads::TableDrop,
@@ -678,41 +714,46 @@ impl Drop {
         let Ok(Ok(lookup)) = lookup else {
             return Err(self.keep_record_and_refuse().await);
         };
-        match lookup {
-            // The drop happened: the catalog keeps it, so the caller is told
-            // the drop succeeded and the record stays.
-            DeletedTableLookup::Found(_) => {
-                audit_after(&self.pool, self.event("executed", None)).await;
-                drop_answer(record, self.rows)
+        if !matches!(lookup, DeletedTableLookup::Found(_)) {
+            return Err(self.keep_record_and_refuse().await);
+        }
+        if self.bounded_table_exists().await != Some(false) {
+            return Err(self.keep_record_and_refuse().await);
+        }
+        // The drop happened: the catalog keeps it, so the caller is told the
+        // drop succeeded and the record stays.
+        audit_after(&self.pool, self.event("executed", None)).await;
+        drop_answer(record, self.rows)
+    }
+
+    /// Whether the table is there, asked inside the spawned task with a bound
+    /// of its own (`DATA-55` review S2): the route's deadline no longer cuts
+    /// this task, so an unbounded catalog call would leave the `allowed` entry
+    /// with no ending. `None` is "not known" — the bound passed, or the lookup
+    /// failed — and every caller treats that as the record standing.
+    async fn bounded_table_exists(&self) -> Option<bool> {
+        match tokio::time::timeout(
+            OUTCOME_CHECK_TIMEOUT,
+            super::catalog_restore::table_exists(&self.state, &self.table),
+        )
+        .await
+        {
+            Ok(Ok(exists)) => Some(exists),
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    ?err,
+                    table = %self.table,
+                    "drop: whether the table exists could not be checked; the record stands"
+                );
+                None
             }
-            // The catalog lists no such deleted table: only the table's own
-            // presence can say the drop did not happen.
-            DeletedTableLookup::None => {
-                match super::catalog_restore::table_exists(&self.state, &self.table).await {
-                    Ok(true) => {
-                        if let Err(err) = uploads::forget_table_drop(&self.pool, &self.table).await
-                        {
-                            tracing::error!(
-                                ?err,
-                                table = %self.table,
-                                "drop: the record of a drop that did not happen could not be removed"
-                            );
-                        }
-                        audit_after(
-                            &self.pool,
-                            self.event(
-                                "failed",
-                                Some("the catalog did not answer and the table was not dropped"),
-                            ),
-                        )
-                        .await;
-                        Err(ApiError::Unavailable(NOT_DROPPED.to_owned()))
-                    }
-                    _ => Err(self.keep_record_and_refuse().await),
-                }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    table = %self.table,
+                    "drop: the check of the table's presence did not answer in time; the record stands"
+                );
+                None
             }
-            // The list is too long to tell, so nothing is known.
-            DeletedTableLookup::CouldNotTell => Err(self.keep_record_and_refuse().await),
         }
     }
 

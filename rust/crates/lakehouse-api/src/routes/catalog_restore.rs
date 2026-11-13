@@ -35,6 +35,7 @@
 //! dropped, whatever a leftover record says.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Extension;
 use axum::extract::{Path, State};
@@ -79,6 +80,13 @@ const NOT_AUDITED_RESTORE: &str =
 /// The restore's own task did not finish (`DATA-55` review R1): the handler
 /// cannot claim an outcome the task never reached.
 const INTERRUPTED: &str = "The restore did not finish, so it is not known whether the table was restored. Open the table's page again: it says so if it was.";
+
+/// The bound on the restore's own undrop (`DATA-55` review S2): the same
+/// fifteen seconds the drop's own request has. The task is no longer cut by the
+/// route's deadline, so an undrop that accepts the connection and never answers
+/// would otherwise leave the `allowed` entry with no ending. An elapsed bound is
+/// an unknown outcome, which the mirror case below settles.
+const UNDROP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// What can be done about the asset's table.
 #[derive(Debug, PartialEq, Eq)]
@@ -226,6 +234,45 @@ async fn inspect(
     ))
 }
 
+/// Clear a leftover drop record for a table that exists again — only through
+/// the guarded removal (`DATA-55` review S1, [`uploads::heal_table_drop`]): the
+/// record must be older than [`super::catalog_drop::HEAL_GRACE`] and unchanged
+/// since it was read, because a drop that was just recorded may still have its
+/// `DELETE` on the way and the table is there until the catalog applies it.
+/// Best effort: a failure is logged and the caller's `409` is the same either
+/// way.
+async fn clear_stale_record(pool: &PgPool, table: &str) {
+    match uploads::dropped_table(pool, table).await {
+        Ok(Some(record)) => {
+            match uploads::heal_table_drop(
+                pool,
+                table,
+                record.dropped_at,
+                super::catalog_drop::HEAL_GRACE,
+            )
+            .await
+            {
+                Ok(true) => tracing::warn!(
+                    %table,
+                    "restore: a drop record past its grace was cleared for a table that exists"
+                ),
+                Ok(false) => {}
+                Err(err) => tracing::warn!(
+                    ?err,
+                    %table,
+                    "restore: a leftover drop record could not be cleared"
+                ),
+            }
+        }
+        Ok(None) => {}
+        Err(err) => tracing::warn!(
+            ?err,
+            %table,
+            "restore: a leftover drop record could not be read"
+        ),
+    }
+}
+
 /// The audit record of one restore, mirrored on `routes::uploads::
 /// upload_audit_event`: `resource_kind` is `catalog`, paired with the asset's
 /// id, and `args` names the table and until when it had been restorable
@@ -347,11 +394,11 @@ pub async fn restore(
     let (tabular, expires_at) = match assessment {
         Assessment::Exists => {
             // `DATA-55` D8 (QA `LH-DATA-15-06`, `TC-1731`): a table that
-            // is there is not dropped, whatever a leftover
-            // record says. Best effort: the 409 below is the same either way.
-            if let Err(err) = uploads::forget_table_drop(&pool, &table).await {
-                tracing::warn!(?err, %table, "restore: a leftover drop record could not be cleared");
-            }
+            // is there is not dropped, whatever a leftover record says — and
+            // only a record past its grace is cleared here (`DATA-55` review
+            // S1): the drop it records may still be in flight, and the table is
+            // there until the catalog applies the `DELETE`.
+            clear_stale_record(&pool, &table).await;
             return Err(ApiError::Conflict(
                 "a table of that name exists again; it was recreated by a later load".to_owned(),
             )
@@ -424,6 +471,12 @@ struct Restore {
 impl Restore {
     /// Undrop the table and answer `{ "ok": true }`.
     ///
+    /// Every catalog call in here has a bound of its own ([`UNDROP_TIMEOUT`]
+    /// here, [`super::catalog_drop::OUTCOME_CHECK_TIMEOUT`] in the mirror
+    /// case): the route's deadline stops only the handler's waiting, so a call
+    /// without a bound would leave the `allowed` entry with no ending
+    /// (`DATA-55` review S2).
+    ///
     /// # Errors
     ///
     /// `409` when the catalog refuses the undrop, `503` when it cannot be
@@ -432,11 +485,22 @@ impl Restore {
         // `DATA-55` D8 (QA `LH-DATA-15-06`, `TC-1731`): the `allowed`
         // entry first, or the restore does not happen.
         audit_first(&self.pool, self.event("allowed", None), NOT_AUDITED_RESTORE).await?;
-        if let Err(err) = self
-            .admin
-            .undrop_table(&self.warehouse, &self.tabular)
-            .await
-        {
+        let undropped = tokio::time::timeout(
+            UNDROP_TIMEOUT,
+            self.admin.undrop_table(&self.warehouse, &self.tabular),
+        )
+        .await;
+        let undropped = match undropped {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                tracing::warn!(
+                    table = %self.table,
+                    "restore: the undrop did not answer within its bound; the outcome is not known"
+                );
+                Err(OpenfgaError::Transport)
+            }
+        };
+        if let Err(err) = undropped {
             let (detail, refusal) = match err {
                 // A race with a load that recreated the table between the check
                 // and the undrop.

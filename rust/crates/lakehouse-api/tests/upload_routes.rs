@@ -3011,10 +3011,12 @@ async fn once_the_restore_window_has_passed_the_name_takes_a_new_load() {
     );
 }
 
-/// `DATA-55` review R2, the healing rule, on the load side: a record is
-/// believed only while the table is absent. A record left for a table that IS
-/// there is stale, so the next load removes it and goes through instead of
-/// refusing a live table's name for a week.
+/// `DATA-55` review R2, the healing rule as narrowed by review S1, on the load
+/// side: a record is believed only while the table is absent, and a record for
+/// a table that IS there is healed only once it is old enough that no drop it
+/// records can still be in flight. This record is backdated past that grace, so
+/// the next load removes it and goes through instead of refusing a live table's
+/// name for a week.
 #[tokio::test]
 async fn a_stale_record_of_a_table_that_exists_is_removed_by_the_next_load_and_the_load_goes_through()
  {
@@ -3043,6 +3045,16 @@ async fn a_stale_record_of_a_table_that_exists_is_removed_by_the_next_load_and_t
     .await
     .unwrap()
     .expect("the drop is recorded");
+    // `DATA-55` review S1: healing waits out the stretch a drop can be in
+    // flight (`HEAL_GRACE`, two minutes), so this record must be older than
+    // that to be stale at all. Ten minutes is unmistakably older.
+    sqlx::query(
+        "UPDATE upload_table_drop SET dropped_at = now() - interval '10 minutes' \
+         WHERE bronze_table = 'stock_raw'",
+    )
+    .execute(&stack.app.pool)
+    .await
+    .unwrap();
     let second = stack.upload(&bayu, "again.csv", b"id,name\n1,a\n").await;
 
     let reply = stack
@@ -3132,6 +3144,103 @@ async fn a_load_whose_table_is_dropped_between_its_checks_is_409_and_settles_its
     assert_eq!(
         reply.json["error"],
         "That table was dropped and can still be restored. Restore it from its page in the Catalog, or choose another name."
+    );
+    let (status, run_id, error) = stack.status_of(&id).await;
+    assert_ne!(status, "ingesting", "the claim was not left loading");
+    assert_eq!(status, "failed");
+    assert_eq!(run_id, None);
+    assert_eq!(error.as_deref(), Some("The load could not be started."));
+    assert!(
+        requests_containing(&stack.dagster, "launchRun")
+            .await
+            .is_empty(),
+        "nothing was launched"
+    );
+}
+
+/// `DATA-55` review S1, the load side: the drop's record is written before the
+/// catalog applies its `DELETE`, so the table still exists while the record is
+/// true. A load that reaches its post-claim check in that stretch must not heal
+/// the record away — the catalog is reachable and says "the table exists", and
+/// the load is still refused with T6's `409`, nothing is launched, and the
+/// record stays.
+#[tokio::test]
+async fn a_load_whose_table_is_dropped_between_its_checks_keeps_the_record_when_the_table_still_exists()
+ {
+    let catalog = MockServer::start().await;
+    mount_existing_iceberg_table(&catalog, "stock_raw").await;
+    let stack = Stack::with(Options {
+        catalog_url: Some(catalog.uri()),
+        ..Options::default()
+    })
+    .await;
+    let bayu = stack.bayu().await;
+    mount_registered(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-2").await;
+    stack.seed_ingested(GROUP, "up-first", "stock_raw").await;
+    let second = stack.upload(&bayu, "again.csv", b"id,name\n1,a\n").await;
+    let id = id_of(&second);
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    Mock::given(method("POST"))
+        .and(body_string_contains("DESCRIBE TABLE"))
+        .respond_with(HeldDescribe {
+            entered: Mutex::new(entered_tx),
+            release: Mutex::new(release_rx),
+        })
+        .with_priority(2)
+        .mount(&stack.ch)
+        .await;
+
+    let pool = stack.app.pool.clone();
+    let tenant = GROUP.parse::<Uuid>().unwrap();
+    let recorder = tokio::spawn(async move {
+        tokio::task::spawn_blocking(move || {
+            entered_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the load asks for its columns");
+        })
+        .await
+        .expect("the gate did not panic");
+        uploads::record_table_drop(
+            &pool,
+            &NewTableDrop {
+                bronze_table: "stock_raw",
+                tenant_id: tenant,
+                asset_id: "stock-raw",
+                dropped_by: "Ada Lovelace",
+                row_count: Some(1),
+                kept_seconds: 604_800,
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the drop is recorded");
+        release_tx.send(()).expect("the load is waiting");
+    });
+
+    let mut body = ingest_body("stock_raw");
+    body["mode"] = json!("append");
+    body["columns"] = json!([
+        { "source": "id", "name": "id", "type": "integer" },
+        { "source": "name", "name": "name", "type": "text" },
+    ]);
+    body["onBadValue"] = json!("stop");
+    let reply = stack.ingest(&bayu, &id, body).await;
+    recorder.await.expect("the record was written");
+
+    assert_eq!(reply.status, StatusCode::CONFLICT, "{}", reply.text);
+    assert_eq!(
+        reply.json["error"],
+        "That table was dropped and can still be restored. Restore it from its page in the Catalog, or choose another name."
+    );
+    assert!(
+        uploads::dropped_table(&stack.app.pool, "stock_raw")
+            .await
+            .unwrap()
+            .is_some(),
+        "a drop that may still be in flight keeps its record"
     );
     let (status, run_id, error) = stack.status_of(&id).await;
     assert_ne!(status, "ingesting", "the claim was not left loading");

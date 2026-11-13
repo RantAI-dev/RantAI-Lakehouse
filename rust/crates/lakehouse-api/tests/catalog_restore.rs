@@ -796,10 +796,6 @@ const UNKNOWN: &str = "The catalog did not answer, so it is not known whether th
 /// D5).
 const UNREACHABLE: &str =
     "The catalog could not be reached, so nothing was dropped. Try again shortly.";
-/// The catalog did not answer AND the table is still there, so nothing was
-/// dropped (`DATA-55` review R2, the second unknown-outcome case).
-const NOT_DROPPED: &str =
-    "The catalog did not answer and the table was not dropped. Try again shortly.";
 
 /// The warehouse lookup, the keep write and the one `DELETE` the drop sends
 /// (`DATA-55` D2/D3): the profile `POST` answers 204, and the catalog's drop
@@ -1143,6 +1139,9 @@ async fn a_catalog_that_answers_500_and_lists_the_table_as_deleted_keeps_the_rec
     )
     .await;
     mount_dropped(&server, "2099-01-01T00:00:00Z").await;
+    // `DATA-55` review S3: the deleted list alone is not proof, so the catalog
+    // must also say the table is gone for the drop to count as executed.
+    mount_missing_table(&server).await;
     let TestApp { router, pool } = drop_app(&server, true).await;
     claim(&pool, CATALOG_TENANT, "orders").await;
     let cookie = governor(&pool, "catalog:read, governance:write").await;
@@ -1172,12 +1171,13 @@ async fn a_catalog_that_answers_500_and_lists_the_table_as_deleted_keeps_the_rec
     assert_eq!(outcomes, vec!["allowed", "executed"]);
 }
 
-/// `DATA-55` review R2: the catalog did not answer, the table is NOT among the
-/// deleted ones, and the table itself is still there — so nothing was dropped.
-/// The record goes, `failed` is written, and the sentence says what happened
-/// instead of saying the outcome is unknown.
+/// `DATA-55` review S1, withdrawing round 1's second arm: a `DELETE` whose
+/// client gave up may still be applied by the catalog, so "not listed as
+/// deleted, and the table is still there" is NOT proof that nothing was
+/// dropped. It is the third arm: the record is kept, `failed` says the outcome
+/// is not known, and the caller gets D5's sentence.
 #[tokio::test]
-async fn a_catalog_that_answers_500_and_a_table_that_still_exists_removes_the_record_and_says_nothing_was_dropped()
+async fn a_catalog_that_answers_500_and_a_table_that_still_exists_keeps_the_record_and_says_the_outcome_is_not_known()
  {
     const MARKER: &str = "planted-upstream-marker";
     let server = MockServer::start().await;
@@ -1197,7 +1197,7 @@ async fn a_catalog_that_answers_500_and_a_table_that_still_exists_removes_the_re
 
     let (status, body) = call(&router, "POST", DROP, &cookie).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert_eq!(body["error"], json!(NOT_DROPPED));
+    assert_eq!(body["error"], json!(UNKNOWN));
     assert!(
         !body.to_string().contains(MARKER),
         "upstream text reached the response: {body}"
@@ -1206,16 +1206,73 @@ async fn a_catalog_that_answers_500_and_a_table_that_still_exists_removes_the_re
         uploads::dropped_table(&pool, "orders")
             .await
             .unwrap()
-            .is_none(),
-        "the table was not dropped, so the record goes"
+            .is_some(),
+        "a DELETE that did not answer may still be applied: the record stays"
     );
-    let outcomes: Vec<String> = sqlx::query_scalar(
-        "SELECT outcome FROM audit_event WHERE action = 'catalog.drop' ORDER BY at, id",
+    let outcomes: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT outcome, detail FROM audit_event WHERE action = 'catalog.drop' ORDER BY at, id",
     )
     .fetch_all(&pool)
     .await
     .unwrap();
-    assert_eq!(outcomes, vec!["allowed", "failed"]);
+    assert_eq!(outcomes.len(), 2, "one entry before and one after");
+    assert_eq!(outcomes[1].0, "failed");
+    assert_eq!(
+        outcomes[1].1.as_deref(),
+        Some("the outcome is not known"),
+        "the trail names the reason in our own words"
+    );
+}
+
+/// `DATA-55` review S3: the deleted list is not proof either. An older deleted
+/// copy of the same name would make a `DELETE` that failed read as a drop, so
+/// "listed as deleted" only counts when the table itself is gone; a table that
+/// is still there means the answers do not agree, which is the third arm.
+#[tokio::test]
+async fn a_catalog_that_lists_a_deleted_table_that_still_exists_says_the_outcome_is_not_known() {
+    const MARKER: &str = "planted-upstream-marker";
+    let server = MockServer::start().await;
+    mount_row_count(&server, 3).await;
+    mount_registry(&server, "orders").await;
+    mount_drop(
+        &server,
+        ResponseTemplate::new(500).set_body_string(MARKER),
+        1,
+    )
+    .await;
+    mount_dropped(&server, "2099-01-01T00:00:00Z").await;
+    mount_existing_iceberg_table(&server, "orders").await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    claim(&pool, CATALOG_TENANT, "orders").await;
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let (status, body) = call(&router, "POST", DROP, &cookie).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"], json!(UNKNOWN));
+    assert!(
+        !body.to_string().contains(MARKER),
+        "upstream text reached the response: {body}"
+    );
+    assert!(
+        uploads::dropped_table(&pool, "orders")
+            .await
+            .unwrap()
+            .is_some(),
+        "the answers do not agree, so the record stays"
+    );
+    let outcomes: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT outcome, detail FROM audit_event WHERE action = 'catalog.drop' ORDER BY at, id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(outcomes.len(), 2, "one entry before and one after");
+    assert_eq!(outcomes[1].0, "failed");
+    assert_eq!(
+        outcomes[1].1.as_deref(),
+        Some("the outcome is not known"),
+        "the trail names the reason in our own words"
+    );
 }
 
 /// `DATA-55` review R2: the catalog did not answer and the lookup that would
@@ -1318,12 +1375,68 @@ async fn a_catalog_that_does_not_answer_within_the_clients_bound_keeps_the_recor
     assert_eq!(outcomes, vec!["allowed", "failed"]);
 }
 
-/// `DATA-55` review R2, the kept-record rule: a record is believed only while
-/// the table is absent. A record for a table that IS there is stale — the load
-/// that recreated it was not the record's — so the next status read removes it
-/// and answers as if it were not there.
+/// `DATA-55` review R2, the kept-record rule, as narrowed by review S1: a
+/// record is believed only while the table is absent, and a record for a table
+/// that IS there is healed only once it is old enough that no drop it records
+/// can still be in flight. This record is backdated past that grace, so the
+/// next status read removes it and answers as if it were not there.
 #[tokio::test]
 async fn a_stale_record_of_a_table_that_exists_is_removed_by_the_next_status_read() {
+    let server = MockServer::start().await;
+    mount_registry(&server, "orders").await;
+    mount_existing_iceberg_table(&server, "orders").await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    let tenant_id = Uuid::parse_str(CATALOG_TENANT).expect("a tenant id");
+    claim(&pool, CATALOG_TENANT, "orders").await;
+    uploads::record_table_drop(
+        &pool,
+        &NewTableDrop {
+            bronze_table: "orders",
+            tenant_id,
+            asset_id: "orders",
+            dropped_by: "Ada Lovelace",
+            row_count: Some(1),
+            kept_seconds: 604_800,
+        },
+    )
+    .await
+    .unwrap()
+    .expect("the record is written");
+    // `DATA-55` review S1: healing waits out the stretch a drop can be in
+    // flight (`HEAL_GRACE`, two minutes), so this record must be older than
+    // that to be stale at all. Ten minutes is unmistakably older.
+    sqlx::query(
+        "UPDATE upload_table_drop SET dropped_at = now() - interval '10 minutes' \
+         WHERE bronze_table = 'orders'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let (status, body) = call(&router, "GET", DROP, &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["droppable"],
+        json!(true),
+        "a table that is there is not dropped: {body}"
+    );
+    assert!(
+        uploads::dropped_table(&pool, "orders")
+            .await
+            .unwrap()
+            .is_none(),
+        "the stale record was removed"
+    );
+}
+
+/// `DATA-55` review S1: a FRESH record of a table that exists is not stale — a
+/// drop that was just recorded may still have its `DELETE` on the way, and the
+/// table is there until the catalog applies it. Opening the table's page must
+/// not remove that record, or the name would be open to the very load the
+/// record closes it against.
+#[tokio::test]
+async fn a_fresh_record_of_a_table_that_exists_is_not_healed_by_the_status_read() {
     let server = MockServer::start().await;
     mount_registry(&server, "orders").await;
     mount_existing_iceberg_table(&server, "orders").await;
@@ -1350,15 +1463,16 @@ async fn a_stale_record_of_a_table_that_exists_is_removed_by_the_next_status_rea
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body["droppable"],
-        json!(true),
-        "a table that is there is not dropped: {body}"
+        json!(false),
+        "a drop that may be in flight still closes the name: {body}"
     );
+    assert_eq!(body["reason"], json!(ALREADY_DROPPED));
     assert!(
         uploads::dropped_table(&pool, "orders")
             .await
             .unwrap()
-            .is_none(),
-        "the stale record was removed"
+            .is_some(),
+        "the record of the drop is still there"
     );
 }
 
@@ -2104,6 +2218,62 @@ async fn two_drops_of_one_table_at_the_same_moment_are_one_drop_and_one_conflict
         .count();
     assert_eq!((dropped, refused), (1, 1), "{statuses:?} {bodies:?}");
     assert_eq!(deletes(&server).await, 1, "the catalog was asked once");
+}
+
+/// `DATA-55` review S1: a drop's record is true from the insert until the
+/// catalog applies the `DELETE`, and in that stretch the table still exists. A
+/// second drop sent while the first is in flight must not read that record as
+/// stale and remove it: one drop answers, the other is refused with D4's
+/// already-dropped sentence, the catalog is asked once, and the record stays.
+#[tokio::test]
+async fn two_drops_of_a_table_that_still_exists_are_one_drop_one_conflict_and_keep_the_record() {
+    let server = MockServer::start().await;
+    mount_row_count(&server, 3).await;
+    mount_registry(&server, "orders").await;
+    // The first drop's `DELETE` is answered late, so it is still in flight
+    // while the second drop runs — the stretch in which the table exists and
+    // the record is true.
+    mount_drop(
+        &server,
+        ResponseTemplate::new(204).set_delay(Duration::from_secs(3)),
+        1,
+    )
+    .await;
+    mount_existing_iceberg_table(&server, "orders").await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    claim(&pool, CATALOG_TENANT, "orders").await;
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let first_router = router.clone();
+    let first_cookie = cookie.clone();
+    let first = tokio::spawn(async move { call(&first_router, "POST", DROP, &first_cookie).await });
+    let mut in_flight = false;
+    for _ in 0..200 {
+        if deletes(&server).await == 1 {
+            in_flight = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(in_flight, "the first drop reached the catalog");
+    let (second_status, second_body) = call(&router, "POST", DROP, &cookie).await;
+    let (first_status, first_body) = first.await.expect("the first drop finished");
+
+    assert_eq!(first_status, StatusCode::OK, "{first_body}");
+    assert_eq!(second_status, StatusCode::CONFLICT, "{second_body}");
+    assert_eq!(
+        second_body["error"],
+        json!(ALREADY_DROPPED),
+        "the second drop is refused as a drop on record, not healed"
+    );
+    assert_eq!(deletes(&server).await, 1, "the catalog was asked once");
+    assert!(
+        uploads::dropped_table(&pool, "orders")
+            .await
+            .unwrap()
+            .is_some(),
+        "the record of the drop that went out is still there"
+    );
 }
 
 /// `DATA-55` D7 (review R5): a table whose rows cannot be counted is still
