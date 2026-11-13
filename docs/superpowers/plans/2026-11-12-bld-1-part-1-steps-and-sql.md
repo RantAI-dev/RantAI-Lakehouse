@@ -1056,6 +1056,133 @@ two tests in `pipeline-detail-page.test.tsx`, a two-input SQL case in
   reaches 7 GB here. The five touched folders were run one by one (above);
   CI runs the whole suite on the pull request.
 
+### Handoff S3, fix round 1 (developer, 2026-11-13)
+
+Branch `feat/bld-1-steps-console`. One commit per finding, or per group that
+touches the same lines; each commit and each fix site cites the finding.
+Console only; no cargo command was run.
+
+**Per finding**
+
+- **R1-B1** — `a6a3e69b6`. An edit sends the stored `incrementalColumn`
+  back unchanged, as it does the kind. The comment is corrected (the store
+  writes `incremental_column = $7` with no COALESCE). The test that pinned
+  the loss now pins that `updated_at` is sent back.
+- **R1-B2** — `0cdfb5516`. A form step holds the id of the item it reads
+  (`StepRead`), and the name is written only when the body is built. A
+  stored `reads` that names no item is written back as it was and flagged.
+  A step moved before the step it reads says so. Tests: a rename typed
+  through the empty name (lib, and on the page in `2711b9d54`), the reorder,
+  the round trip.
+- **R1-B3** — `0cb0a84dc`. The test switches the plain copy on (the page
+  says the output is a copy of the input), then off (it does not).
+- **R1-S1** — `a4895ebba`. An input's name follows its table only while no
+  step names it (no form step reads it, no SQL step's text has the name). A
+  SQL step that names, after FROM or JOIN, something that is not an input,
+  an earlier step or a WITH name of its own gets a hint on its pane
+  (`sqlStepHint`). The hint does not block a save.
+- **R1-S2** — `8ea21aeb1`. The contract gains `PipelineOtherStep`
+  (`kind: string`), and `knownStep` tells the kinds apart by their fields.
+  In the editor such a step is shown with its kind and stored record, can
+  be moved or removed, is not renamed or edited, and is saved back exactly
+  as stored. The read view draws it with its name and kind and shows its
+  record. Tests in lib, the editor, the flow layout and the detail page.
+- **R1-S3** — `79b253578`. `saveBlockers` lists why Save is disabled (name,
+  each item's problem, output, schedule). The page says each one next to
+  the button, and each line goes to what it is about.
+- **R1-S4** — `83e8762e7`. Until the connector's tables are read, or when
+  that read fails, the stored input stays as it is: not flagged, and no
+  change counted. Test with an unreadable ingest spec.
+- **R1-S5** — `d9864d1b3`. `previewRequest` returns the body with the
+  editor item of each input and step, and `errorItemId` reads a refusal's
+  path through what was sent. The save path uses the same mapping. The rail
+  marks the item a preview refusal names, the preview offers a button to
+  it, and an old refusal is marked stale after an edit. A step preview
+  leaves out inputs with no name or table.
+- **R1-S6** — `cd6f27037`. `InputColumnsReader`, one per input, reads that
+  input's columns, keyed on its own zone and table. Test: typing in the
+  second input's table does not re-read the first input's columns.
+- **R1-S7** — three commits, by the lines each touches:
+  - `0cb0a84dc`: the rail's no-step line and the Output pane's "Written
+    from" line are now true for each state (`noStepLine`,
+    `outputSourceLine`).
+  - `d9864d1b3`: the preview says why there is none, for the item it is
+    about, and "It returned no rows." is said once
+    (`SqlColumnChips noRowsText={null}`; the dashboard's default is
+    unchanged).
+  - `2dee9f0f6`: a refused operation's mark is kept only while the step's
+    operations are the ones sent.
+- **R1-S8** — `658c7d333`. Corrected: `runAs` in the contract (it changes
+  on an edit, D10) and `assignRunAs` (no longer "the only way"); the create
+  body's note about the builder dialog; `sql-rows-table.tsx` (two
+  additions); "five-step form" in both trigger modules; the `Field` wrapper
+  in `pipeline-pickers.tsx`. `sqlStepReads` was made true in `a4895ebba`:
+  one scanner skips a FROM inside a function call.
+- **R1-S9** — `658c7d333` and `db0f21583`. `sourceZone`, `sourceTable` and
+  `transforms` left the create and update input types, and `inputs`/`steps`
+  are now required there (`658c7d333`, the same lines as the comment).
+  `parseTransformDraft` and `transformErrorRowIndex` are removed with their
+  tests. The flowchart's `transform` node kind is removed with its card and
+  verb icons; the layout test of an edge inside one column uses `step`.
+- **R1-S10** — `ec3c732ec`.
+  - Each rail item carries its own description element (problem, save
+    refusal or preview refusal).
+  - Every problem names its control (`Problem.field`), which gets
+    `aria-invalid` and `aria-describedby`. `SelectField` and `ZoneField` take
+    an `aria-describedby`.
+  - The table label names a control only while there is one.
+  - `aria-invalid` is off the list item.
+  - Two existing assertions now look where the sentence is: the Output pane
+    rather than the whole page (the rail has its own copy), and the rail
+    item's description by text rather than by the pane's id.
+- **R1-S11** — tests: the `steps[i].transforms[j]` highlight (`2dee9f0f6`);
+  R1-B2's rename (`0cdfb5516` lib, `2711b9d54` page); R1-S1 (`a4895ebba`);
+  R1-S2 in the editor and the read view (`8ea21aeb1`); R1-S4 (`83e8762e7`).
+
+**The merge of `main`** — `e0bbddd3a`, no conflict. It brought PR #486
+(dashboards QA round p1), which touches `chart-builder.tsx` and its test.
+This branch's change to `chart-builder.tsx` is only the import of
+`SqlRowsTable` from `components/patterns/`, which the merge kept.
+
+**No finding was found wrong against the code.** Two notes on how they
+were done:
+- R1-S1 asks that the name follow the table only while no form step reads
+  it either. Since R1-B2, a form step follows by id, so a rename would not
+  break it; the rule still holds for form steps, as the review asks.
+- R1-S5's "select or mark it": the item is marked on the rail and the
+  preview offers a button to it. The selection is not moved by itself,
+  because the person may be reading the step they previewed.
+
+**Verification, on the head commit `e0bbddd3a` (real counts)**
+
+```
+bun run typecheck                                        # exit 0
+bun run lint                                             # exit 0; 0 errors, 11 warnings (the 11 on main)
+flock /home/shiro/rantai/.heavy.lock bun test src/features/pipelines/    #  154 pass, 0 fail (12 files)
+flock /home/shiro/rantai/.heavy.lock bun test src/lib/                   # 1354 pass, 0 fail, 1 skip (129 files)
+flock /home/shiro/rantai/.heavy.lock bun test src/components/patterns/   #   32 pass, 0 fail (6 files)
+flock /home/shiro/rantai/.heavy.lock bun test src/services/              #  254 pass, 0 fail (22 files)
+flock /home/shiro/rantai/.heavy.lock bun test src/features/dashboards/   #  652 pass, 0 fail (81 files)
+python3 ops/lint/check_bare_iceberg_count.py                              # R11 guard: none found
+python3 ops/lint/check_intra_package_imports.py                           # OK
+git status                                                                # clean
+```
+
+Total: 2446 pass, 0 fail, 1 skip. The skip is
+`src/lib/connectors/brand-marks.test.ts`, which this branch does not touch.
+`src/features/dashboards/` was run because the shared `SqlColumnChips` and
+`SelectField` changed. Its count rose from 636 to 652 with the 16 tests
+`main` brought.
+
+**Not verified**
+- **Not verified in a browser.** There is no browser on this machine.
+- **Not verified against a running API.** S2's preview route is still not on
+  `main` (no `pipelines/preview` in `routes/mod.rs` at `43d36f55b`), so every
+  preview, save and refusal here is against stubbed `fetch`.
+- **The whole console suite was not run** (memory limit); the five folders
+  above were run one by one, and CI runs the whole suite on the pull
+  request.
+
 ## 7. Review
 
 
