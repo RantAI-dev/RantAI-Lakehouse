@@ -939,9 +939,9 @@ Record the wall time and the job-minutes of the pull request's run next to §0.1
 ### 3a. Change of machine
 
 The developer works on the ARM64 build machine in the checkout
-`/home/rismana/rantai/lakehouse-agents-2`, and only under `/home/rismana/rantai/`. No cargo
+the build machine's second checkout, and only under the build user's work directory. No cargo
 build is needed for this slice. If a task wants one to measure something:
-`export CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-2 CARGO_BUILD_JOBS=6`, plain
+`export CARGO_TARGET_DIR=<the checkout's own cargo target directory> CARGO_BUILD_JOBS=6`, plain
 `cargo`, never `cargo clean`, never `cargo test --workspace`. The developer never opens or
 merges a pull request, never sets or changes a repository setting or variable, and never
 registers or configures a runner.
@@ -1174,3 +1174,92 @@ paths are not run by any pull request: they need `CI_WORKER_COMPILE` or
 
 
 ## 6. Review
+
+### Round 1 (planner, 2026-11-13, at `10424039`)
+
+An independent reviewer read the whole diff, ran every self-test, 41 hand cases on the gate,
+46 on the proof, and the proof against six real pushes (all as the plan's §0.4 table says);
+then the planner's rulings. What holds: on a pull request every job, step, flag, timeout
+and count check of today is still there and still in `ci-required`; no test is retried;
+`ci-required` and the proof fail closed on every hand input except R6 (a) and (b); the four
+MISMATCH entries are true. The pull request's own run had not finished when it was read.
+
+One BLOCKER, on a path that is off by default. Everything below goes in ONE commit,
+`fix(review): round 1 of OPS-24 (R1 to R12)`, after `main` is merged if it moved.
+
+- **R1. BLOCKER: the Coverage clean-up on the worker removes every container that is not
+  labelled, when the step that notes the existing containers did not run.** The clean-up
+  runs under `always()`; when the note step was skipped (the refuse step failed on a
+  runner that is not the worker, or checkout failed) the list is empty and every container
+  on that machine is "new". Fix: (1) the note step gets `id: note`; (2) the clean-up's `if`
+  becomes `always() && runner.environment == 'self-hosted' && steps.note.outcome ==
+  'success'`, and its first lines exit 0 with "no note of the existing containers:
+  removing nothing" when the file is missing; (3) it removes only containers that
+  testcontainers started (label `org.testcontainers.managed-by` equals `testcontainers`)
+  AND are not in the note, and keeps the existing exception for the test-support label;
+  (4) the workflow lint in `test_select_runner.sh` gains a rule: in a job that can run
+  self-hosted, a step whose `if` holds `always()` must also hold a `steps.<id>.outcome ==
+  'success'` condition; one negative test.
+- **R2. Four self-test blocks print FAIL and still count as passed** (subshells that set
+  the counters inside the subshell): `test_detect_change_scope.sh` (the two new blocks and
+  the old one beside them) and `test_detect_push_proof.sh` (the renamed-sentinel block).
+  Make each block report through its exit status and count outside the subshell. Then
+  break the rule once per block (as the reviewer did: the unreadable base writing
+  `all=false`; the renamed-sentinel copy identical), see the self-test exit non-zero, put it
+  back, and quote that in the handoff.
+- **R3. The nightly run is a full run only through the empty base.** `detect_change_scope.sh`:
+  any event other than `push` and `pull_request` forces `all=true` explicitly, with a log
+  line. `required_gate.sh`: `schedule` and `workflow_dispatch` require every job whatever
+  the scope. Two gate tests: those events with empty scopes and skipped gates are red.
+- **R4. The kill switch half-works for `TRUE`.** The scope script prints the variable's
+  value next to the event, and a warning when it is set to anything other than `true`;
+  the workflow expression and the script must agree: compare in the script only (pass the
+  raw value through `env:`), and derive the proof's "off" from the script's output, not
+  from a second expression. Document "exactly `true`, lower case" for `CI_PUSH_FULL`; for
+  `CI_COVERAGE_ON_WORKER` make the code compare exactly too (through `select_runner.sh` or
+  an exact check), so the documents' "exactly `true`" is true. Self-test cases for
+  `TRUE` and `1`.
+- **R5. Three more files compiled into Rust are outside the `rust` scope:**
+  `ops/release/release.pub`, `ops/release/fixtures/`, `public/geo/` (the reviewer names the
+  `include_str!`/`include_bytes!` sites). Add them to the Rust condition, to the `paths:` of
+  `coverage.yml` and to `docs/CI.md`'s scope table, with three self-test cases. Then add a
+  repo lint (a small script under `ops/lint/` or `scripts/ci/`, run in `Repo lints`) that
+  lists every `include_str!`/`include_bytes!` path resolving outside `rust/` and fails when
+  the scope script does not set `rust` for it; it must pass on this branch and fail if one
+  of the three lines is removed (show that once in the handoff).
+- **R6. The proof:** (a) `finish` strips line breaks from every value it writes to
+  `$GITHUB_OUTPUT`, and the filter prints a check run's conclusion only when it is one of
+  GitHub's known values, else `unknown`; one test with a conclusion holding a line break.
+  (b) A tie on `completed_at` between a success and a non-success is NOT proven; one test.
+  (c) `docs/CI.md`, next to the six conditions: the accepted limit of D4 (a head whose
+  green `ci-required` came from a run against another base), with the nightly run as its
+  backstop. (d) Every `gh` call in the script is wrapped in `timeout 60`; a timeout is
+  "not proven".
+- **R7. Error paths with no test.** Add, at least: `gh` failing on the `/pulls` call; a
+  body that is not JSON; two merged pull requests naming the same commit; `merged_at: null`;
+  a failed fetch of `refs/pull/<n>/head`; three parents; a check run `queued`; a second page
+  of check runs carrying a newer failure; a shallow clone. Give the fake `gh` a per-endpoint
+  answer and exit code. The other cases of the reviewer's list are optional.
+- **R8.** `select_runner.sh` chooses the worker only for `push`, `schedule`,
+  `workflow_dispatch`, or `pull_request` whose head repository equals the repository;
+  everything else, an empty event included, is hosted. Two test cases
+  (`pull_request_target` with a fork; an empty event).
+- **R9.** `worker_prepare.sh`: refuse a runner name that is `.` or `..` (or empty) with an
+  error; replace the guard that cannot fail with a real one (the directory's parent is the
+  cache root and the directory is not a symlink); warn when `TARGET_MAX_GB` is set and out
+  of its range. Three test cases.
+- **R10.** `coverage.yml`: the worker is chosen only for `refs/heads/main` (a dispatch of
+  another branch runs hosted), and `docs/CI.md` says so.
+- **R11. Documents.** `docs/plans/CI-SPEED-PLAN.md`: the two statements that are now false
+  (§4.1 "On `push` to `main`, run everything regardless of scope." and §9 "every job runs
+  on `main`") each get a dated line saying they were changed by `OPS-24` (D1, D3), without
+  deleting the old text. `docs/CI.md`: the owner's checklist of this plan's §3c as a list
+  under "Runners"; the "(below)" that points up is corrected. (The planner removed the home
+  directory paths from this plan's own §3a in the review commit.)
+- **R12.** The pre-pull: `timeout 180` around each `docker pull`, no sleep after the last
+  attempt.
+
+The developer's handoff for this round, appended below this entry: the merge commit (if
+any) and the fix commit; every self-test with its counts; the break-it-once results of R2
+and R5 (with the non-zero exit); the YAML check used; anything *not verified*; every
+MISMATCH.
