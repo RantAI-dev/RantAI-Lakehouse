@@ -120,7 +120,10 @@ export function buildOption(
         const o = p as { name: string; value: number; percent: number };
         return `${escapeHtml(o.name)}<br/><b>${fmtInt(o.value)}</b> (${o.percent}%)`;
       } },
-      legend: { bottom: 0, textStyle: { color: axis, fontSize: 11, ...LEGEND_TEXT }, tooltip: { show: true }, icon: "circle" },
+      // QA LH-BI-6-39 (BI-55, D6): the pie's legend was the only category
+      // legend without a pager, so twenty entries wrapped upward from the
+      // bottom over the chart and past the canvas. It pages like the rose's.
+      legend: { bottom: 0, type: "scroll", textStyle: { color: axis, fontSize: 11, ...LEGEND_TEXT }, tooltip: { show: true }, icon: "circle" },
       series: [
         {
           type: "pie",
