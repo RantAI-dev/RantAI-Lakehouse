@@ -442,7 +442,7 @@ export function PreviewRowsTable({
       </summary>
       {data.truncated ? <p className="px-2 pb-1 text-muted-foreground">Only the first {data.limit.toLocaleString("en-US")} rows are shown.</p> : null}
       <div className="max-h-56 overflow-auto">
-        <RowsTable columns={columns} labels={headers} rows={data.rows} />
+        <RowsTable columns={columns} labels={headers} rows={data.rows} namePlaceholders />
       </div>
     </details>
   );
