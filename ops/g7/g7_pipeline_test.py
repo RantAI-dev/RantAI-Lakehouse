@@ -1211,6 +1211,115 @@ TARGET_LAG_MINUTES = 1
 TARGET_LAG_SECONDS = float(TARGET_LAG_MINUTES * 60)
 
 
+def step_a_two_input_sql_pipeline_matches_a_direct_query() -> None:
+    """BLD-1 part 1 (D1, D4, D8): a pipeline written as inputs and a SQL step
+    runs the statement the API compiles, and its output equals the same query
+    run directly against the Bronze source.
+
+    The stack this gate runs on guarantees ONE loaded Bronze table, so the two
+    inputs are that table under two names — the case is D1's shape (two
+    inputs, a join through them, an aggregate by a column), the compile, the
+    author rewrite and the run, not the second table's contents.
+
+    The totals are compared through the same client the row assertions use,
+    against `CATALOG_DB` (this gate's own `DataLakeCatalog` database), so a
+    compiled statement that reads somewhere else shows up as a difference
+    rather than a pass.
+    """
+    target = "g7_two_input_out"
+    create = API.post(
+        f"{API_URL}/api/pipelines",
+        json={
+            "name": "g7_two_input_join",
+            "kind": "batch",
+            "inputs": [
+                {"name": "left_orders", "zone": "bronze", "table": BRONZE_TABLE_NAME},
+                {"name": "right_orders", "zone": "bronze", "table": BRONZE_TABLE_NAME},
+            ],
+            "steps": [
+                {
+                    "name": "joined",
+                    "kind": "sql",
+                    "sql": (
+                        "SELECT l.customer AS customer, sum(l.amount) AS total "
+                        "FROM left_orders AS l "
+                        "JOIN right_orders AS r ON l.id = r.id "
+                        "GROUP BY l.customer"
+                    ),
+                }
+            ],
+            "targetZone": "silver",
+            "targetTable": target,
+            "schedule": "manual",
+        },
+        timeout=30,
+    )
+    if not create.ok:
+        raise G7Failure(
+            f"POST /api/pipelines with inputs and a SQL step failed: "
+            f"{create.status_code} {create.text}"
+        )
+    pipeline_id = create.json()["id"]
+    activate = API.post(
+        f"{API_URL}/api/pipelines/{pipeline_id}/status",
+        json={"status": "ready"},
+        timeout=30,
+    )
+    if not activate.ok:
+        raise G7Failure(f"POST .../status failed: {activate.status_code} {activate.text}")
+    job = f"authored__{pipeline_id.replace('-', '_')}"
+    _wait_for(f"{job} to load", lambda: _dagster_job_is_loaded(job), 180)
+    # The same trigger-and-wait the fixture pipeline's step uses, with this
+    # pipeline's own job as the start-up-race fallback name.
+    trigger = _post_trigger(f"{API_URL}/api/pipelines/{pipeline_id}/trigger", job)
+    if not trigger.ok:
+        raise G7Failure(f"POST .../trigger failed: {trigger.status_code} {trigger.text}")
+    run_id = trigger.json().get("id") or trigger.json().get("runId")
+    if not run_id:
+        raise G7Failure(f"trigger response had no run id: {trigger.json()}")
+
+    def steps_are_terminal() -> bool:
+        resp = API.get(f"{API_URL}/api/pipelines/{pipeline_id}/runs/{run_id}/steps", timeout=30)
+        resp.raise_for_status()
+        steps = resp.json().get("steps", [])
+        return bool(steps) and all(s.get("status") in TERMINAL_STEP_STATUSES for s in steps)
+
+    _wait_for(
+        f"run {run_id} terminal",
+        steps_are_terminal,
+        timeout_s=RUN_TERMINAL_TIMEOUT_S,
+        interval_s=3.0,
+    )
+    steps = API.get(
+        f"{API_URL}/api/pipelines/{pipeline_id}/runs/{run_id}/steps", timeout=30
+    ).json()["steps"]
+    failed = [s for s in steps if s.get("status") == "failed"]
+    if failed:
+        raise G7Failure(
+            f"the two-input run FAILED on step(s) {[s.get('stepKey') for s in failed]}:\n"
+            f"{_run_failure_message(pipeline_id, run_id)}"
+        )
+
+    # R1-S5: the direct query is the SAME join the pipeline runs, against the
+    # catalog database, and it carries the Iceberg read setting every other
+    # read of that database in this file carries.
+    direct = ch_query(
+        f"SELECT l.customer, sum(l.amount) FROM {CATALOG_DB}.`bronze.{BRONZE_TABLE_NAME}` AS l "
+        f"JOIN {CATALOG_DB}.`bronze.{BRONZE_TABLE_NAME}` AS r ON l.id = r.id "
+        "GROUP BY l.customer ORDER BY l.customer "
+        "SETTINGS allow_database_iceberg = 1 FORMAT TabSeparated"
+    ).strip()
+    written = ch_query(
+        f"SELECT customer, total FROM silver.`{target}` ORDER BY customer FORMAT TabSeparated"
+    ).strip()
+    if direct != written:
+        raise G7Failure(
+            f"the SQL step's output differs from the same query run directly:\n"
+            f"direct:\n{direct}\nwritten:\n{written}"
+        )
+    print(f"[g7] two-input SQL step output equals the direct query ({len(written.splitlines())} rows)")
+
+
 def step_verify_target_lag_bronze_to_silver(pipeline_id: str) -> None:
     """BLD-2 D11 gate: measure Bronze-to-Silver lag with the measured
     floor as target on the compose stack.
@@ -1423,6 +1532,7 @@ def main() -> int:
         step_verify_column_lineage_of_the_pipeline_target(pipeline_id)
         step_verify_graph_and_source()
         step_verify_target_lag_bronze_to_silver(pipeline_id)
+        step_a_two_input_sql_pipeline_matches_a_direct_query()
     except G7Failure as exc:
         print(f"[g7] FAILED: {exc}", file=sys.stderr)
         return 1

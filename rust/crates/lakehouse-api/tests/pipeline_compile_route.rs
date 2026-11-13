@@ -1,6 +1,7 @@
-//! `POST /api/pipelines/runnable/{id}/enforce` (BLD-1 / D3): the rewrite a
-//! pipeline's AUTHOR is allowed to run, which is the only SQL the
-//! orchestrator runs (`dagster/dispar_orchestrate/authored_factory.py`).
+//! `POST /api/pipelines/runnable/{id}/compile` (BLD-1 part 1 / D8): the one
+//! statement a pipeline's AUTHOR is allowed to run, compiled from the stored
+//! definition and rewritten for them — the only SQL the orchestrator runs
+//! (`dagster/dispar_orchestrate/authored_factory.py`).
 //!
 //! Driven through the real router against a real per-test Postgres (users,
 //! roles, policies) and a `wiremock` stand-in for `ClickHouse`, the same
@@ -44,12 +45,23 @@ use common::{TestApp, session_cookie_for_seeded_user, spin_up_with_env};
 /// The table every test here reads. A `serving.` table, because that is
 /// what an authored pipeline actually reads, and a name no other test in
 /// this binary shares.
-const SQL: &str = "SELECT email FROM serving.enforced_x";
+/// The statement under test: what the API compiles for the fixture below.
+///
+/// BLD-1 part 1 review R1-B8 / D4a: the fixture is today's shape — one input
+/// and one `transform` step reading it — so this is exactly the text
+/// `_build_select_sql` gave on `main`, and every assertion on it is exact
+/// equality again.
+const SQL: &str = "SELECT email FROM serving.`enforced_x`";
+/// The input that step reads: a `serving.` table, because that is what an
+/// authored pipeline actually reads.
+const READS: (&str, &str) = ("serving", "enforced_x");
 
 /// `SEC-50`: the upload table a pipeline may name — `bronze.*` is where
 /// another tenant's upload lives, and it is the only namespace an
 /// authored pipeline can read that a tenant owns.
-const BRONZE_SQL: &str = "SELECT * FROM bronze.group_orders";
+const BRONZE_SQL: &str = "SELECT * FROM icecat_api.`bronze.group_orders`";
+/// The Bronze input the upload-table cases read.
+const BRONZE_READS: (&str, &str) = ("bronze", "group_orders");
 
 /// The raw name that upload table is claimed under.
 const BRONZE_TABLE: &str = "group_orders";
@@ -129,6 +141,10 @@ async fn app_with_engine() -> (axum::Router, PgPool, String, MockServer) {
     let mut overrides = std::collections::HashMap::new();
     overrides.insert("CH_URL".to_owned(), ch.uri());
     overrides.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
+    // BLD-1 part 1 / D4: a Bronze input is compiled through the catalog
+    // database (R1-CI2: named here, not in the shared harness, so a test that
+    // asserts the "not configured" answer keeps its premise).
+    overrides.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
     let TestApp { router, pool } = spin_up_with_env(&overrides).await;
     // A Platform Admin: `runnable`'s rule allows a service identity OR an
     // unrestricted principal, and a test cannot mint the orchestrator's
@@ -160,16 +176,57 @@ async fn seed_mask(pool: &PgPool, role: &str) {
     .unwrap();
 }
 
-/// A pipeline authored by `run_as`, which may be `None` (the "created by a
-/// service identity" case), in `tenant_id` (also possibly `None`).
-async fn seed_pipeline(pool: &PgPool, run_as: Option<Uuid>, tenant_id: Option<Uuid>) -> String {
+/// A pipeline authored by `run_as` (which may be `None`, the "created by a
+/// service identity" case), in `tenant_id` (also possibly `None`), reading
+/// `reads` through one SQL step that runs `sql`.
+///
+/// BLD-1 part 1 / D1: the definition is seeded through the store on purpose —
+/// these tests are about what the RUN route answers for a stored definition,
+/// and the save-time check (D9) is `pipeline_definition_save.rs`'s subject.
+enum FixtureStep<'a> {
+    /// Today's shape with no step: `SELECT * FROM <the input's table>`.
+    None,
+    /// Today's shape with one `transform` step: `SELECT email FROM …`.
+    SelectEmail,
+    /// A SQL step, which is not today's shape (the compiled text is a `WITH`).
+    Sql(&'a str),
+}
+
+async fn seed_pipeline_reading(
+    pool: &PgPool,
+    run_as: Option<Uuid>,
+    tenant_id: Option<Uuid>,
+    reads: (&str, &str),
+    step: FixtureStep<'_>,
+) -> String {
+    let steps = match step {
+        FixtureStep::None => Vec::new(),
+        FixtureStep::SelectEmail => vec![pipelines::PipelineStep::Transform {
+            name: "projected".to_owned(),
+            reads: "source".to_owned(),
+            transforms: vec!["select(email)".to_owned()],
+        }],
+        FixtureStep::Sql(sql) => vec![pipelines::PipelineStep::Sql {
+            name: "projected".to_owned(),
+            sql: sql.to_owned(),
+        }],
+    };
     let created = pipelines::create_pipeline(
         pool,
         &CreatePipelineInput {
-            name: "enforce-probe".to_owned(),
+            inputs: vec![pipelines::PipelineInput {
+                name: "source".to_owned(),
+                zone: reads.0.to_owned(),
+                table: reads.1.to_owned(),
+            }],
+            steps,
+            // A unique name: one test seeds two pipelines, and the name is
+            // the table's natural key.
+            name: format!("compile-probe-{}", Uuid::new_v4()),
+
             kind: "batch".to_owned(),
-            source_zone: "bronze".to_owned(),
-            source_table: "orders".to_owned(),
+            source_zone: reads.0.to_owned(),
+            source_table: reads.1.to_owned(),
             target_zone: "silver".to_owned(),
             target_table: "orders_clean".to_owned(),
             schedule: "0 3 * * *".to_owned(),
@@ -211,16 +268,16 @@ async fn first_tenant_of(pool: &PgPool, email: &str) -> Uuid {
     .unwrap()
 }
 
-async fn enforce(router: &axum::Router, cookie: &str, id: &str, sql: &str) -> (StatusCode, Value) {
+/// The run route: no body — the API compiles the stored definition (D8).
+async fn compile(router: &axum::Router, cookie: &str, id: &str) -> (StatusCode, Value) {
     let resp = router
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!("/api/pipelines/runnable/{id}/enforce"))
-                .header("content-type", "application/json")
+                .uri(format!("/api/pipelines/runnable/{id}/compile"))
                 .header("cookie", cookie)
-                .body(Body::from(json!({ "sql": sql }).to_string()))
+                .body(Body::empty())
                 .unwrap(),
         )
         .await
@@ -306,6 +363,20 @@ async fn the_pipeline_detail_carries_no_author_name_when_there_is_no_author() {
     );
 }
 
+/// [`seed_pipeline_reading`] over the serving fixture.
+async fn seed_pipeline(pool: &PgPool, run_as: Option<Uuid>, tenant_id: Option<Uuid>) -> String {
+    seed_pipeline_reading(pool, run_as, tenant_id, READS, FixtureStep::SelectEmail).await
+}
+
+/// [`seed_pipeline_reading`] over the Bronze upload-table fixture.
+async fn seed_bronze_pipeline(
+    pool: &PgPool,
+    run_as: Option<Uuid>,
+    tenant_id: Option<Uuid>,
+) -> String {
+    seed_pipeline_reading(pool, run_as, tenant_id, BRONZE_READS, FixtureStep::None).await
+}
+
 async fn seeded_user_id(pool: &PgPool, email: &str) -> Uuid {
     sqlx::query_scalar("SELECT id FROM app_user WHERE email = $1")
         .bind(email)
@@ -328,7 +399,7 @@ async fn a_masked_column_is_rewritten_for_an_author_who_has_the_obligation() {
     )
     .await;
 
-    let (status, body) = enforce(&router, &cookie, &id, SQL).await;
+    let (status, body) = compile(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let sql = body["sql"].as_str().expect("a sql string");
     assert!(
@@ -339,7 +410,7 @@ async fn a_masked_column_is_rewritten_for_an_author_who_has_the_obligation() {
     // projects the ORIGINAL column name from it, so the text that must be
     // gone is the original statement, not the bare word `SELECT email`.
     assert!(
-        !sql.contains("SELECT email FROM serving.enforced_x"),
+        !sql.contains(SQL),
         "the unmasked statement survived the rewrite: {sql}"
     );
 }
@@ -359,9 +430,16 @@ async fn an_author_without_the_obligation_gets_the_query_unchanged() {
     )
     .await;
 
-    let (status, body) = enforce(&router, &cookie, &id, SQL).await;
+    let (status, body) = compile(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["sql"].as_str(), Some(SQL), "{body}");
+    assert!(
+        !body["sql"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("replaceRegexpOne"),
+        "no obligation means no mask: {body}"
+    );
 }
 
 /// D2, first case: no author at all. The op must not be told to run the
@@ -372,7 +450,7 @@ async fn a_pipeline_with_no_author_is_refused_with_d2s_message() {
     seed_mask(&pool, "Analyst").await;
     let id = seed_pipeline(&pool, None, None).await;
 
-    let (status, body) = enforce(&router, &cookie, &id, SQL).await;
+    let (status, body) = compile(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(
         body["error"].as_str(),
@@ -395,7 +473,7 @@ async fn a_pipeline_authored_by_a_deactivated_user_is_refused_with_d2s_message()
         .await
         .unwrap();
 
-    let (status, body) = enforce(&router, &cookie, &id, SQL).await;
+    let (status, body) = compile(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(
         body["error"].as_str(),
@@ -418,7 +496,7 @@ async fn a_pipeline_whose_author_was_deleted_is_refused_with_d2s_message() {
         .await
         .unwrap();
 
-    let (status, body) = enforce(&router, &cookie, &id, SQL).await;
+    let (status, body) = compile(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(
         body["error"].as_str(),
@@ -434,14 +512,16 @@ async fn a_pipeline_whose_author_was_deleted_is_refused_with_d2s_message() {
 async fn a_refused_construct_is_refused_with_the_fixed_message_only() {
     let (router, pool, cookie, _engine) = app().await;
     seed_mask(&pool, "Analyst").await;
-    let id = seed_pipeline(
+    let id = seed_pipeline_reading(
         &pool,
         Some(seeded_user_id(&pool, "rina@meridian.example").await),
         Some(first_tenant_of(&pool, "rina@meridian.example").await),
+        READS,
+        FixtureStep::Sql("SELECT * FROM numbers(5)"),
     )
     .await;
 
-    let (status, body) = enforce(&router, &cookie, &id, "SELECT * FROM numbers(5)").await;
+    let (status, body) = compile(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     let message = body["error"].as_str().expect("an error string");
     assert!(!message.is_empty(), "{body}");
@@ -471,7 +551,7 @@ async fn a_caller_who_is_neither_service_nor_admin_is_refused() {
     .await;
     let data_engineer = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
 
-    let (status, body) = enforce(&router, &data_engineer, &id, SQL).await;
+    let (status, body) = compile(&router, &data_engineer, &id).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }
 
@@ -490,8 +570,8 @@ async fn an_unknown_pipeline_and_a_dagster_job_id_answer_the_same_404() {
     )
     .await;
 
-    let (unknown_status, unknown_body) = enforce(&router, &cookie, "pl-does-not-exist", SQL).await;
-    let (job_status, job_body) = enforce(&router, &cookie, "ingest_job", SQL).await;
+    let (unknown_status, unknown_body) = compile(&router, &cookie, "pl-does-not-exist").await;
+    let (job_status, job_body) = compile(&router, &cookie, "ingest_job").await;
 
     assert_eq!(unknown_status, StatusCode::NOT_FOUND, "{unknown_body}");
     assert_eq!(job_status, StatusCode::NOT_FOUND, "{job_body}");
@@ -526,7 +606,7 @@ async fn the_authors_roles_are_read_at_enforcement_time_not_at_create() {
     )
     .await;
 
-    let (status, body) = enforce(&router, &cookie, &id, SQL).await;
+    let (status, body) = compile(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["sql"].as_str(), Some(SQL), "not governed yet: {body}");
 
@@ -539,7 +619,7 @@ async fn the_authors_roles_are_read_at_enforcement_time_not_at_create() {
     .await
     .unwrap();
 
-    let (status, body) = enforce(&router, &cookie, &id, SQL).await;
+    let (status, body) = compile(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let sql = body["sql"].as_str().expect("a sql string");
     assert!(
@@ -610,10 +690,9 @@ async fn an_upstream_database_failure_loading_the_author_carries_no_upstream_tex
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!("/api/pipelines/runnable/{id}/enforce"))
-                .header("content-type", "application/json")
+                .uri(format!("/api/pipelines/runnable/{id}/compile"))
                 .header("authorization", format!("Bearer {TOKEN}"))
-                .body(Body::from(json!({ "sql": SQL }).to_string()))
+                .body(Body::empty())
                 .unwrap(),
         )
         .await
@@ -676,14 +755,14 @@ async fn a_pipeline_cannot_read_an_upload_table_another_tenant_claimed() {
     // The table belongs to the catalog's tenant; the pipeline belongs to
     // the other one.
     claim_table_for(&pool, CATALOG_TENANT).await;
-    let id = seed_pipeline(
+    let id = seed_bronze_pipeline(
         &pool,
         Some(seeded_user_id(&pool, "sari@meridian.example").await),
         Some(OTHER_TENANT.parse::<Uuid>().expect("a seeded tenant id")),
     )
     .await;
 
-    let (status, body) = enforce(&router, &cookie, &id, BRONZE_SQL).await;
+    let (status, body) = compile(&router, &cookie, &id).await;
 
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(body["error"].as_str(), Some(BRONZE_REFUSAL), "{body}");
@@ -703,14 +782,14 @@ async fn a_pipeline_cannot_read_an_upload_table_another_tenant_claimed() {
 async fn a_pipeline_reads_an_upload_table_its_own_tenant_claimed() {
     let (router, pool, cookie, _engine) = app_with_engine().await;
     claim_table_for(&pool, OTHER_TENANT).await;
-    let id = seed_pipeline(
+    let id = seed_bronze_pipeline(
         &pool,
         Some(seeded_user_id(&pool, "sari@meridian.example").await),
         Some(OTHER_TENANT.parse::<Uuid>().expect("a seeded tenant id")),
     )
     .await;
 
-    let (status, body) = enforce(&router, &cookie, &id, BRONZE_SQL).await;
+    let (status, body) = compile(&router, &cookie, &id).await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["sql"].as_str(), Some(BRONZE_SQL), "{body}");
@@ -724,14 +803,14 @@ async fn a_pipeline_reads_an_upload_table_its_own_tenant_claimed() {
 async fn a_pipeline_with_no_tenant_is_refused() {
     let (router, pool, cookie, _engine) = app_with_engine().await;
     claim_table_for(&pool, OTHER_TENANT).await;
-    let id = seed_pipeline(
+    let id = seed_bronze_pipeline(
         &pool,
         Some(seeded_user_id(&pool, "sari@meridian.example").await),
         None,
     )
     .await;
 
-    let (status, body) = enforce(&router, &cookie, &id, BRONZE_SQL).await;
+    let (status, body) = compile(&router, &cookie, &id).await;
 
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(
@@ -760,14 +839,14 @@ async fn a_pipeline_authored_by_an_unrestricted_principal_is_not_refused_for_its
     let (router, pool, cookie, _engine) = app_with_engine().await;
     claim_table_for(&pool, OTHER_TENANT).await;
     // `fajar` is the seeded Platform Admin: its role grants `*:*`.
-    let id = seed_pipeline(
+    let id = seed_bronze_pipeline(
         &pool,
         Some(seeded_user_id(&pool, "fajar@meridian.example").await),
         None,
     )
     .await;
 
-    let (status, body) = enforce(&router, &cookie, &id, BRONZE_SQL).await;
+    let (status, body) = compile(&router, &cookie, &id).await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["sql"].as_str(), Some(BRONZE_SQL), "{body}");
@@ -784,7 +863,7 @@ async fn an_author_who_left_the_pipelines_tenant_is_refused() {
     let (router, pool, cookie, _engine) = app_with_engine().await;
     claim_table_for(&pool, OTHER_TENANT).await;
     let author = seeded_user_id(&pool, "sari@meridian.example").await;
-    let id = seed_pipeline(
+    let id = seed_bronze_pipeline(
         &pool,
         Some(author),
         Some(OTHER_TENANT.parse::<Uuid>().expect("a seeded tenant id")),
@@ -797,8 +876,234 @@ async fn an_author_who_left_the_pipelines_tenant_is_refused() {
         .await
         .unwrap();
 
-    let (status, body) = enforce(&router, &cookie, &id, BRONZE_SQL).await;
+    let (status, body) = compile(&router, &cookie, &id).await;
 
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(body["error"].as_str(), Some("tenant not found"), "{body}");
+}
+
+/// BLD-1 part 1 / D8: a join of two governed inputs comes back with BOTH
+/// rewritten — the rewrite runs over the compiled statement, so every table
+/// the definition reads is held to the author's policies, not only the first.
+#[tokio::test]
+async fn a_join_of_two_governed_inputs_comes_back_with_both_rewritten() {
+    let (router, pool, cookie, _engine) = app().await;
+    for table in ["serving.enforced_x", "serving.enforced_y"] {
+        governance::create_policy(
+            &pool,
+            &CreatePolicyInput {
+                name: format!("join-mask-{table}"),
+                kind: "Row filter".to_owned(),
+                subjects: "Analyst".to_owned(),
+                resources: table.to_owned(),
+                effect: "Permit with obligation".to_owned(),
+                conditions: Some(
+                    json!({"roles": ["Analyst"], "table": table, "mask": ["email"]}).to_string(),
+                ),
+                activate: true,
+                owner: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let created = pipelines::create_pipeline(
+        &pool,
+        &CreatePipelineInput {
+            inputs: vec![
+                pipelines::PipelineInput {
+                    name: "left_t".to_owned(),
+                    zone: "serving".to_owned(),
+                    table: "enforced_x".to_owned(),
+                },
+                pipelines::PipelineInput {
+                    name: "right_t".to_owned(),
+                    zone: "serving".to_owned(),
+                    table: "enforced_y".to_owned(),
+                },
+            ],
+            steps: vec![pipelines::PipelineStep::Sql {
+                name: "joined".to_owned(),
+                sql: "SELECT a.email AS ea, b.email AS eb FROM left_t AS a \
+                      JOIN right_t AS b ON a.email = b.email"
+                    .to_owned(),
+            }],
+            name: "compile-join".to_owned(),
+            kind: "batch".to_owned(),
+            source_zone: "serving".to_owned(),
+            source_table: "enforced_x".to_owned(),
+            target_zone: "silver".to_owned(),
+            target_table: "compile_join_out".to_owned(),
+            schedule: "manual".to_owned(),
+            description: None,
+            incremental_column: None,
+            transforms: Vec::new(),
+            fbic_enabled: false,
+            max_retries: None,
+            owner: None,
+            tenant_id: Some(first_tenant_of(&pool, "rina@meridian.example").await),
+            depends_on: Vec::new(),
+            connector_id: None,
+            id: None,
+            target_lag: None,
+            run_as: Some(seeded_user_id(&pool, "rina@meridian.example").await),
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    let (status, body) = compile(&router, &cookie, &created.id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let sql = body["sql"].as_str().expect("a sql string");
+    assert_eq!(
+        sql.matches("replaceRegexpOne(toString(`email`)").count(),
+        2,
+        "both governed inputs must be masked: {sql}"
+    );
+}
+
+/// D8: `readsIceberg` says whether the orchestrator must attach
+/// `allow_database_iceberg` — true exactly when an input is Bronze.
+#[tokio::test]
+async fn reads_iceberg_is_true_only_with_a_bronze_input() {
+    let (router, pool, cookie, _engine) = app().await;
+    let serving = seed_pipeline(
+        &pool,
+        Some(seeded_user_id(&pool, "fajar@meridian.example").await),
+        Some(first_tenant_of(&pool, "fajar@meridian.example").await),
+    )
+    .await;
+    let (status, body) = compile(&router, &cookie, &serving).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["readsIceberg"], false, "{body}");
+
+    let bronze = seed_bronze_pipeline(
+        &pool,
+        Some(seeded_user_id(&pool, "fajar@meridian.example").await),
+        Some(first_tenant_of(&pool, "fajar@meridian.example").await),
+    )
+    .await;
+    let (status, body) = compile(&router, &cookie, &bronze).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["readsIceberg"], true, "{body}");
+}
+
+/// BLD-1 part 1 review R1-B8: a SQL step is not today's shape, so it keeps
+/// the `WITH` form — and the whole answer is pinned, not a substring.
+#[tokio::test]
+async fn a_sql_step_pipeline_compiles_to_the_with_form() {
+    let (router, pool, cookie, _engine) = app().await;
+    let id = seed_pipeline_reading(
+        &pool,
+        Some(seeded_user_id(&pool, "yoga@meridian.example").await),
+        Some(first_tenant_of(&pool, "yoga@meridian.example").await),
+        READS,
+        FixtureStep::Sql("SELECT email FROM source"),
+    )
+    .await;
+
+    let (status, body) = compile(&router, &cookie, &id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["sql"].as_str(),
+        Some(
+            "WITH `source` AS (SELECT * FROM serving.`enforced_x`), `projected` AS \
+             (SELECT email FROM source) SELECT * FROM `projected`"
+        ),
+        "{body}"
+    );
+    assert_eq!(body["readsIceberg"], false, "{body}");
+    assert!(
+        !body["sql"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("replaceRegexpOne"),
+        "no obligation means no mask: {body}"
+    );
+}
+
+/// BLD-1 part 1 review R1-B8: the mask sits where the column is read inside
+/// a SQL step, and the unmasked projection is gone.
+#[tokio::test]
+async fn a_masked_column_inside_a_sql_step_comes_back_masked() {
+    let (router, pool, cookie, _engine) = app().await;
+    seed_mask(&pool, "Analyst").await;
+    let id = seed_pipeline_reading(
+        &pool,
+        Some(seeded_user_id(&pool, "rina@meridian.example").await),
+        Some(first_tenant_of(&pool, "rina@meridian.example").await),
+        READS,
+        FixtureStep::Sql("SELECT email FROM source"),
+    )
+    .await;
+
+    let (status, body) = compile(&router, &cookie, &id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let sql = body["sql"].as_str().expect("a sql string");
+    assert_eq!(
+        sql.matches("replaceRegexpOne(toString(`email`)").count(),
+        1,
+        "{sql}"
+    );
+    assert!(sql.contains("FROM serving.`enforced_x`"), "{sql}");
+}
+
+/// R1-S4: a `transform`-step pipeline (today's shape) through the compile
+/// route — the exact statement, and the mask where the column is read.
+#[tokio::test]
+async fn a_transform_step_pipeline_compiles_to_todays_statement() {
+    let (router, pool, cookie, _engine) = app().await;
+    seed_mask(&pool, "Analyst").await;
+    let id = seed_pipeline_reading(
+        &pool,
+        Some(seeded_user_id(&pool, "rina@meridian.example").await),
+        Some(first_tenant_of(&pool, "rina@meridian.example").await),
+        READS,
+        FixtureStep::SelectEmail,
+    )
+    .await;
+
+    let (status, body) = compile(&router, &cookie, &id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let sql = body["sql"].as_str().expect("a sql string");
+    // The rewrite wraps the source in a masked subquery and projects the
+    // column from it, so the mask sits where the column is read and the
+    // unmasked projection is gone.
+    assert!(
+        sql.contains("SELECT replaceRegexpOne(toString(`email`)"),
+        "a transform step's column is masked where it is read: {sql}"
+    );
+    assert!(sql.contains("FROM serving.`enforced_x`"), "{sql}");
+    assert!(
+        !sql.contains("SELECT email FROM serving.`enforced_x`"),
+        "the unmasked statement survived the rewrite: {sql}"
+    );
+}
+
+/// R1-S4: a stored definition that does not compile answers the route's 422
+/// with the item at fault named — never a parser's text (D7).
+#[tokio::test]
+async fn a_stored_definition_that_does_not_compile_is_422() {
+    let (router, pool, cookie, _engine) = app().await;
+    let id = seed_pipeline_reading(
+        &pool,
+        Some(seeded_user_id(&pool, "fajar@meridian.example").await),
+        Some(first_tenant_of(&pool, "fajar@meridian.example").await),
+        READS,
+        // A qualified name in a step is refused by D6a, so this cannot be
+        // stored through the API — which is the point: a row that an older
+        // API (or a direct write) left behind is refused at run time.
+        FixtureStep::Sql("SELECT * FROM silver.enforced_x"),
+    )
+    .await;
+
+    let (status, body) = compile(&router, &cookie, &id).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let message = body["error"].as_str().expect("an error string");
+    assert!(message.starts_with("steps[0]: "), "{message}");
+    assert!(
+        !message.contains("silver.enforced_x"),
+        "the refusal must not echo the statement: {message}"
+    );
 }

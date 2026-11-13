@@ -65,7 +65,7 @@ it had: any holder of the role that belongs to some tenant.
 # What this gate cannot prove
 
 It cannot prove anything about a DAGSTER-NATIVE job: those have no
-`run_as` and no enforce call. It cannot prove the rewrite for a policy
+`run_as` and no compile call. It cannot prove the rewrite for a policy
 authored through the console UI, only that the engine applies what is
 stored. And the `***` it looks for is the rewriter's own mask expression
 as ClickHouse evaluates it; what it proves is that the CLEAR value never
@@ -511,26 +511,27 @@ def step_a_pipeline_with_no_author_is_refused_with_d2s_message() -> None:
         print(
             "[bld-1] SKIPPED: the no-author case needs BLD1_NO_AUTHOR_PIPELINE_ID "
             "(see this file's module doc for the fixture). It is covered by "
-            "crates/lakehouse-api/tests/pipeline_enforce.rs, which proves the same 409 "
+            "crates/lakehouse-api/tests/pipeline_compile_route.rs, which proves the same 409 "
             "for a NULL run_as and for a deactivated author."
         )
         return
     pipeline_id = NO_AUTHOR_PIPELINE_ID
 
-    # 1. Direct enforcement check: the API refuses with D2's fixed 409 message
-    enforce_resp = API.post(
-        f"{API_URL}/api/pipelines/runnable/{pipeline_id}/enforce",
-        json={"sql": f"SELECT {MASKED_COLUMN} FROM bronze.{BRONZE_TABLE_NAME}"},
+    # 1. Direct compile check: the API refuses with D2's fixed 409 message.
+    # BLD-1 part 1 / D8: the route takes no body -- it compiles the stored
+    # definition itself -- so there is no SQL to send here any more.
+    compile_resp = API.post(
+        f"{API_URL}/api/pipelines/runnable/{pipeline_id}/compile",
         timeout=30,
     )
-    if enforce_resp.status_code != 409:
+    if compile_resp.status_code != 409:
         raise Bld1Failure(
-            f"expected 409 from enforce for no-author pipeline, got {enforce_resp.status_code}: {enforce_resp.text}"
+            f"expected 409 from compile for no-author pipeline, got {compile_resp.status_code}: {compile_resp.text}"
         )
-    enforce_err = enforce_resp.json().get("error", "")
-    if NO_AUTHOR_REASON not in enforce_err:
+    compile_err = compile_resp.json().get("error", "")
+    if NO_AUTHOR_REASON not in compile_err:
         raise Bld1Failure(
-            f"enforce error missing D2 reason; expected {NO_AUTHOR_REASON!r}, got: {enforce_err!r}"
+            f"compile error missing D2 reason; expected {NO_AUTHOR_REASON!r}, got: {compile_err!r}"
         )
 
     # 2. End-to-end orchestrator run: the run fails and writes nothing

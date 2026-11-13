@@ -391,8 +391,9 @@ pub(crate) fn target_of(pipeline: &Pipeline) -> (Option<i32>, bool) {
     }
 }
 
-/// The inputs of `pipeline` (plan D4): its own source, plus the target of
-/// every pipeline in `depends_on` that resolves to an authored pipeline.
+/// The inputs of `pipeline` (plan D4, BLD-1 part 1 / D11): EVERY input it
+/// reads, plus the target of every pipeline in `depends_on` that resolves to
+/// an authored pipeline.
 ///
 /// A `depends_on` entry naming a `Dagster`-native job is skipped rather
 /// than failing the check: such a job has no `pipeline_definition` row, so
@@ -410,11 +411,16 @@ pub async fn inputs_of_conn(
     conn: &mut sqlx::PgConnection,
     pipeline: &Pipeline,
 ) -> Result<Option<Vec<InputTable>>, StoreError> {
-    let mut inputs = Vec::new();
-    let Some(source) = InputTable::parse(&pipeline.source) else {
-        return Ok(None);
-    };
-    inputs.push(source);
+    // BLD-1 part 1 / D11: every input, not only the first, through the store's
+    // one rule for a row that predates migration `0140` (D11a).
+    let tables = pipelines::input_tables_of(pipeline);
+    let mut inputs = Vec::with_capacity(tables.len());
+    for table in &tables {
+        let Some(input) = InputTable::parse(table) else {
+            return Ok(None);
+        };
+        inputs.push(input);
+    }
     for (id, target) in
         pipelines::targets_for_conn(conn, pipeline.tenant_id, &pipeline.depends_on).await?
     {
@@ -1986,6 +1992,7 @@ mod tests {
             status: "ready".to_owned(),
             owner: "o".to_owned(),
             source: "bronze.orders".to_owned(),
+            input_tables: vec!["bronze.orders".to_owned()],
             target: "silver.orders_clean".to_owned(),
             connector_id: None,
             source_asset_id: None,
@@ -2097,6 +2104,8 @@ mod tests {
         let created = pipelines::create_pipeline(
             pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: id.to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -2589,6 +2598,8 @@ mod tests {
         let upstream = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "upstream".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -2626,6 +2637,26 @@ mod tests {
         assert_eq!(
             inputs,
             vec![input_of("bronze", "orders"), input_of("silver", "staged")]
+        );
+    }
+
+    /// BLD-1 part 1 / D11 and review R1-S4: `inputs_of` returns EVERY input
+    /// of a pipeline with two of them, not only the first.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn inputs_of_returns_both_inputs_of_a_two_input_pipeline(pool: PgPool) {
+        let tenant_id = seed_tenant(&pool).await;
+        let mut pipeline = pipeline("pl-two-inputs", 10);
+        pipeline.tenant_id = Some(tenant_id);
+        pipeline.source = "bronze.first".to_owned();
+        pipeline.input_tables = vec!["bronze.first".to_owned(), "silver.second".to_owned()];
+
+        let inputs = inputs_of(&pool, &pipeline)
+            .await
+            .expect("resolve the inputs")
+            .expect("inputs parseable");
+        assert_eq!(
+            inputs,
+            vec![input_of("bronze", "first"), input_of("silver", "second")]
         );
     }
 
@@ -2727,6 +2758,8 @@ mod tests {
         let u = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "u_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -2758,6 +2791,8 @@ mod tests {
         let p = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "p_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
@@ -2827,6 +2862,8 @@ mod tests {
         let u = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "u_pipe2".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -2857,6 +2894,8 @@ mod tests {
         let p = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "p_pipe2".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
@@ -2941,6 +2980,8 @@ mod tests {
         let u = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "lonely_downstream".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -3272,6 +3313,8 @@ mod tests {
         let created_orphan = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "pl-orphan".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
@@ -3301,6 +3344,8 @@ mod tests {
         let created_wanted = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "pl-wanted".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
@@ -3332,6 +3377,8 @@ mod tests {
         pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "pl-consumer".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
@@ -3509,6 +3556,8 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn failed_run_retries_with_real_derived_key_and_stops_at_max_retries(pool: PgPool) {
         let pipe_input = pipelines::CreatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
             name: "pl-retry".to_owned(),
             kind: "batch".to_owned(),
             source_zone: "bronze".to_owned(),
@@ -3605,6 +3654,8 @@ mod tests {
         let pipe_consumed = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "pl-retry-consumed".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -3704,6 +3755,8 @@ mod tests {
         let u = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "u_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -3732,6 +3785,8 @@ mod tests {
         let p = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "p_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
@@ -3853,6 +3908,8 @@ mod tests {
         let u = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "u_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -3881,6 +3938,8 @@ mod tests {
         let p = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "p_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
@@ -4055,6 +4114,8 @@ mod tests {
         let _u = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "u_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -4083,6 +4144,8 @@ mod tests {
         let p = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "p_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
@@ -4167,6 +4230,8 @@ mod tests {
         let u = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "u_dep_read".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -4195,6 +4260,8 @@ mod tests {
         let _reader = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "reader_dep".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
@@ -4237,6 +4304,8 @@ mod tests {
         let _u = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "u_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -4265,6 +4334,8 @@ mod tests {
         let p = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "p_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
@@ -4414,6 +4485,8 @@ mod tests {
         let u = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "u_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -4442,6 +4515,8 @@ mod tests {
         let p = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "p_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
@@ -4564,6 +4639,8 @@ mod tests {
         let u = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "u_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),
@@ -4592,6 +4669,8 @@ mod tests {
         let _p = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "p_pipe".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "silver".to_owned(),
