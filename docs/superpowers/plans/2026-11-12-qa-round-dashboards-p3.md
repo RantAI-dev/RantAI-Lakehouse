@@ -1114,4 +1114,231 @@ decisions in this plan has been seen by the owner.
 
 ## 5. Handoff
 
+### Commits
+
+Branch `fix/qa-round-dashboards-p3`, base `de9148b8a`, pushed after every
+commit. One task per commit, in plan order; T3 is not among them.
+
+| Commit | Title |
+| --- | --- |
+| `de4ba2bd` | fix(bi): an average, a minimum and a maximum keep six decimals (T1, LH-BI-6-04, BI-55) |
+| `6a7fca68` | fix(bi): bins of a whole-number column are never narrower than 1 (T2, LH-BI-2-02, BI-55) |
+| `931bec10` | fix(bi): a rupiah amount reads Rp in both locales, and compact money is a choice (T4, LH-BI-1-06, BI-55) |
+| `56d83a53` | fix(bi): a joined column reads table.column in the record list and a downloaded header (T5, LH-BI-7-04, BI-55) |
+| `77369b91` | fix(api): the API logs how long each stage of a PDF took (T6, LH-BI-1-01 F3, BI-53) |
+| `bf9cd69f` | test(api): probe the renderer for its window, its media and its time (T7, LH-BI-1-01, LH-BI-6-22, LH-BI-6-23, BI-53) |
+| `1cf81018` | fix(dashboards): a donut's legend pages instead of running over the chart (T8, LH-BI-6-39, BI-55) |
+| `f6e0426e` | fix(dashboards): the Rows tables name a missing and an empty value as the chart does (T9, LH-BI-6-38, BI-55) |
+| `35fdb75d` | fix(dashboards): the records panel says which question the records belong to (T10, LH-BI-13-04, BI-55) |
+| `c94bac08` | fix(dashboards): the PDF is printed light, whatever the dashboard's theme (T11, LH-BI-1-01 F2, BI-53) |
+| `aade8536` | fix(dashboards): the print view is laid out at the paper's width before a chart is drawn (T12, LH-BI-1-01 F1, LH-BI-6-22, LH-BI-6-23, BI-53) |
+| `62418fa3` | docs(features): the feature pages and the changelog say the new rules (T13, BI-55, BI-53) |
+
+**T3: not built, held by the planner for the owner's answer.** No code, no
+test, no commit; the lines of T13 that describe the Excel text cell are left
+out (see T13 below).
+
+### MISMATCH: T2's engine expectation for a year column
+
+The plan expects the binned statement over five years (2020 to 2024, width 1)
+to answer **five** rows, `b` 2020 to 2024, each `n` 1. Measured on
+`ClickHouse` 26.8 through `Range::bin_expr` and `Range::scalars_sql`, it
+answers **four**: 2020, 2021 and 2022 once each and 2023 twice.
+
+Cause, read in `bin.rs`: `bin_expr` clamps the last bin to
+`ceil(mx / w) - 1`, so when the maximum sits on a bin edge the last bin's
+lower edge is `mx - w` — the 2023 bin covers `[2023, 2024]` and holds both
+years. That is `BI-10`'s own rule ("the maximum is never alone in a bin of its
+own") meeting the new width-1 rule; the plan did not account for it. So a
+five-year column reads four bars under "Automatic", the last one labelled
+"2023" and holding two years, where D5 says it reads 2020 to 2024.
+
+I did not change `bin_expr` and did not change the expected value. The test
+`automatic_bins_of_a_year_column_are_one_year_wide_and_a_fractional_column_keeps_its_width`
+builds the statement and runs it (so the measurement is repeatable) and
+asserts only that every row of the table lands in exactly one bin (the sum of
+`n` is 5), with the finding written at the site. **The planner decides**: either
+`bin_expr`'s last-bin rule is excepted for whole-number bins of width 1, or D5
+and its feature-page line say four bars. Everything else T2 asks for — width
+1, `whole` on the wire, the label "2020" — is built and measured.
+
+### Commands run, with counts
+
+Every line ran in the foreground, with
+`CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-4 CARGO_BUILD_JOBS=6`.
+`bun install --frozen-lockfile` ran once before the first TypeScript check
+(`Checked 779 installs across 753 packages (no changes)`). Before the first
+`cargo test --test`, `docker ps -a` showed three `postgres:16-alpine`
+containers from another session (`dreamy_dhawan`, `upbeat_tu`,
+`upbeat_engelbart`); I started only `bi53-gotenberg-scratch` (T7) and removed
+it with `docker stop`.
+
+Per task, before the fix (the same test on the code without it; the working
+tree held the test, and the fix was stashed where the two are in different
+files):
+
+| Task | Before the fix | After |
+| --- | --- | --- |
+| T1 | `cargo test -p lakehouse-bi --lib a_sum_is_a_whole_number` → 0 tests, 640 filtered out (the function and the test are the commit); `cargo test -p lakehouse-api --test chart_numbers` → 0 passed, **1 failed** (`the saved statement keeps the average's decimals: … round(sum(v)) AS __m0, round(avg(v)) AS __m1, round(max(v)) AS __m2 …`) | 1 passed, 640 filtered out; `chart_numbers` 1 passed |
+| T2 | `bun test src/lib/chart-bins.test.ts` with the old `chart-bins.ts` → 8 pass, **3 fail** | 11 pass, 0 fail |
+| T4 | `bun test src/lib/value-format.test.ts` with the old `value-format.ts` → 24 pass, **1 fail**; `bun test src/features/dashboards/format-section.test.tsx` with the old `format-section.tsx` → 14 pass, **2 fail** | 25 pass; 16 pass |
+| T5 | `bun test src/features/dashboards/drill.test.tsx` with the old `drill.tsx` → 8 pass, **1 fail** | 9 pass, 0 fail |
+| T6 | no test (the change is four log lines) | see below |
+| T7 | n/a (a measurement) | see below |
+| T8 | `bun test src/features/dashboards/chart-option.test.ts` with the old `chart-option.ts` → 17 pass, **1 fail** | 18 pass |
+| T9 | the three files with the old sources → 30 pass, **3 fail** | 33 pass |
+| T10 | `combined-tile.test.tsx` + `drill.test.tsx` with the old sources → 15 pass, **2 fail** | 30 pass (three files) |
+| T11 | `render-view.test.tsx` with the old `render-view.tsx` → 9 pass, **1 fail** | 10 pass |
+| T12 | `render-summary.test.ts` + `render-view.test.tsx` with the old sources → 10 pass, **2 fail, 1 error** (the missing export) | 15 pass |
+
+Per task, the checks of sections 3 and 3a for what the commit touched:
+
+- T1: `cargo fmt --check` OK; `cargo clippy -p lakehouse-bi --all-targets -- -D warnings` OK; `cargo clippy -p lakehouse-api --all-targets -- -D warnings` OK; `cargo test -p lakehouse-bi --lib` → **637 passed, 0 failed, 4 ignored**; `cargo test -p lakehouse-api --test chart_numbers` → 1 passed.
+- T2: `cargo test -p lakehouse-bi --lib bin::tests` → **15 passed, 627 filtered out**; `cargo test -p lakehouse-api --test chart_numbers` → 2 passed; `cargo test -p lakehouse-api --lib bin_rewrite` → **7 passed, 3630 filtered out**; `cargo test -p lakehouse-api --test sec11_guard` → 4 passed; `--test route_auth` → 94 passed; `bun test src/lib/chart-bins.test.ts` → 11 pass.
+- T4: the formatter oracle (the `bun -e` script of T4) before any edit → **`0 lines differ`**, and after the case file was edited → **`0 lines differ`**; `cargo test -p lakehouse-bi --lib export_format` → **5 passed, 637 filtered out**; `cargo test -p lakehouse-api --test dashboard_export` → 11 passed; `bun test src/lib/value-format.test.ts src/features/dashboards/format-section.test.tsx` → 41 pass.
+- T5: `cargo test -p lakehouse-bi --lib joins::tests` → **11 passed, 632 filtered out**; `dashboard_export` → 11 passed; `sec11_guard` → 4; `route_auth` → 94; `bun test src/features/dashboards/drill.test.tsx` → 9 pass.
+- T6: `cargo clippy -p lakehouse-api --all-targets -- -D warnings` OK; `cargo test -p lakehouse-api --lib pdf_export` → **3 passed, 3634 filtered out**; `sec11_guard` → 4; `route_auth` → 94.
+- T7: `cargo clippy -p lakehouse-api --all-targets -- -D warnings` OK; `cargo test -p lakehouse-api --test pdf_real_gotenberg` → **0 passed, 4 ignored** (the new test is ignored by default); the probe's own run: **1 passed, 0 failed, 3 filtered out**, output below.
+- T8–T12 (console): `bun run typecheck` → 0 errors; `bun run lint` → **0 errors, 11 warnings** (the same eleven that `main` has); the test files named above. T12 also `cargo test -p lakehouse-api --lib pdf::tests` → **8 passed, 3629 filtered out**.
+- Every commit: `python3 ops/lint/check_bare_iceberg_count.py` (OK) and
+  `python3 ops/lint/check_intra_package_imports.py` (OK), and `git status`
+  showed only the files the task touched.
+
+The before-handoff block of section 3a, on the final commit (`62418fa3`),
+foreground:
+
+```text
+cd rust && cargo fmt --check                                        # OK
+cargo clippy -p lakehouse-bi --all-targets -- -D warnings           # OK
+cargo clippy -p lakehouse-api --all-targets -- -D warnings          # OK
+cargo test -p lakehouse-bi --lib                                    # 639 passed; 0 failed; 4 ignored
+cargo test -p lakehouse-api --test chart_numbers                    # 2 passed; 0 failed
+cargo test -p lakehouse-api --test dashboard_export                 # 11 passed; 0 failed
+cargo test -p lakehouse-api --test query_download                   # 24 passed; 0 failed
+cargo test -p lakehouse-api --test sec11_guard                      # 4 passed; 0 failed
+cargo test -p lakehouse-api --test route_auth                       # 94 passed; 0 failed
+cd .. && bun run typecheck                                          # 0 errors
+bun run lint                                                        # 0 errors, 11 warnings (as main)
+bun run test                                                        # 4237 pass, 1 skip, 0 fail, 4238 tests, 389 files
+python3 ops/lint/check_bare_iceberg_count.py                        # OK
+python3 ops/lint/check_intra_package_imports.py                     # OK
+git status                                                          # clean
+```
+
+`cargo test -p lakehouse-api --test chart_numbers` reports exactly its own
+tests (2), because the file does not include `tests/common/mod.rs` and so does
+not run the `tls_proxy` test; `dashboard_export` reports 11 and
+`query_download` 24, one more than each file's own tests.
+
+### Tests added, by name
+
+- T1: `specs::tests::a_sum_is_a_whole_number_and_an_average_a_minimum_and_a_maximum_keep_six_decimals` (`lakehouse-bi`); `an_average_keeps_its_decimals_and_a_maximum_of_whole_numbers_stays_whole_on_the_engine` (`tests/chart_numbers.rs`, new file).
+- T2: `bin::tests::a_column_of_whole_numbers_is_never_cut_narrower_than_one_and_the_tile_is_told`; `automatic_bins_of_a_year_column_are_one_year_wide_and_a_fractional_column_keeps_its_width` (`chart_numbers.rs`); `a bin of width 1 over whole numbers reads as its one value, with no separator`, `the tile's bins say whole only when the server said so`, `a year in a bin of one reads as the year` (`src/lib/chart-bins.test.ts`).
+- T4: `a rupiah amount reads Rp in the English number locale too`, `a rupiah amount shown as its code still reads IDR, and other currencies keep their symbol` (`src/lib/value-format.test.ts`); `offers a compact amount of money as one choice and stores it as the compact style with the currency`, `shows a stored compact amount as that choice, and plain Compact drops the currency` (`src/features/dashboards/format-section.test.tsx`).
+- T5: `joins::tests::a_joined_column_reads_table_dot_column_and_any_other_name_is_left_alone`; `a joined column is headed table.column in the list and in the one-record view` (`drill.test.tsx`).
+- T6: none.
+- T7: `the_renderer_reports_its_window_its_media_and_how_long_a_conversion_takes` (`tests/pdf_real_gotenberg.rs`, `#[ignore]`).
+- T8: `a donut's legend pages when its entries do not fit, like a rose's and a funnel's` (`chart-option.test.ts`, inserted directly after the test the plan names).
+- T9: `names a missing value (No value) and an empty one (Empty) when asked`, `leaves both blank when not asked` (`src/components/patterns/rows-table.test.tsx`, new file); `the Rows table under the preview names a missing and an empty category` (`chart-shape-section.test.tsx`); `the numbers behind a chart name a missing and an empty category` (`tile-dialogs.test.tsx`).
+- T10: `tells a click the name of the question the mark belongs to` (`combined-tile.test.tsx`, inserted directly after the test the plan names); `says which question the records belong to`, `says nothing about a question for a chart with one` (`drill.test.tsx`); `the question's name is shown, never sent` (`records.test.ts`).
+- T11: `a dark dashboard is printed light: the page, the cards and the charts`, `a chart image keeps the dashboard's dark theme` (`render-view.test.tsx`).
+- T12: `the printable width is the paper's width less the two side margins, in pixels` (`render-summary.test.ts`); `the print view is as wide as the paper's printable width` (`render-view.test.tsx`).
+
+### Existing assertions edited (rule 2: because the rule changed, not to get green)
+
+T1, nine fragments, each the exact new statement:
+
+| File | Old | New |
+| --- | --- | --- |
+| `builder.rs` (`two_aggregations_of_one_column_are_two_result_columns`) | `round(avg(stay)) AS avg_stay` | `round(avg(stay), 6) AS avg_stay` |
+| `builder.rs` (same test) | `round(max(stay)) AS max_stay` | `round(max(stay), 6) AS max_stay` |
+| `builder.rs` | `round(avg(visitors)) AS __m1` | `round(avg(visitors), 6) AS __m1` |
+| `builder.rs` | `round(avg(stay)) AS avg_stay` (the `FROM` statement) | `round(avg(stay), 6) AS avg_stay` |
+| `builder.rs` | `round(avg(stay)) AS __m0` | `round(avg(stay), 6) AS __m0` |
+| `builder.rs` | `round(max(visitors)) AS __s0` | `round(max(visitors), 6) AS __s0` |
+| `store.rs` | `round(avg(visitors)) AS visitors` | `round(avg(visitors), 6) AS visitors` |
+| `store.rs` | `round(avg(stay)) AS avg_stay` | `round(avg(stay), 6) AS avg_stay` |
+| `store.rs` | `round(avg(capacity__rooms)) AS capacity__rooms` | `round(avg(capacity__rooms), 6) AS capacity__rooms` |
+
+`builder.rs:979`'s doc comment also changed: `round(avg(v)) AS avg_v` →
+`round(avg(v), 6) AS avg_v`. No `round(sum(` line changed anywhere, and
+`grep -rn 'round(avg(\|round(max(\|round(min(' rust/crates src ops` shows only the
+six-decimal form (and the three expected strings in `specs.rs`).
+
+T4 (three assertions and the case file):
+
+| File | Old | New |
+| --- | --- | --- |
+| `export_format.rs` (`idr_compact_two_decimals_is_a_three_tier_excel_format`, en-US half) | `[>=1000000000]"IDR "#,##0.00,,," B";…` | `[>=1000000000]"Rp "#,##0.00,,," B";…` |
+| `tests/dashboard_export.rs` | `styles.contains("IDR ")` | `styles.contains("Rp ")` |
+| `tests/dashboard_export.rs` | `email,amount` + CRLF + `***,IDR 1.23 M` + CRLF, behind a byte-order mark | the same with `***,Rp 1.23 M` |
+| `export_format_cases.jsonl` | 40 `en-US`/IDR/not-code lines with a leading `IDR ` or `-IDR ` | `Rp ` / `-Rp `; nothing else in the file moved (`40 insertions(+), 40 deletions(-)`) |
+
+The case with `currencyDisplay: "code"` stays `"IDR "#,##0`, unchanged.
+
+T5 (one assertion):
+
+| File | Old | New |
+| --- | --- | --- |
+| `tests/dashboard_export.rs` | `email,mart_y__email,mart_y__secret` | `email,mart_y.email,mart_y.secret` |
+
+### The probe (T7)
+
+Container `gotenberg/gotenberg:8.37.0`, ARM64, on a container that had just
+started, 2026-11-13. The test's own output:
+
+```text
+A4 landscape: 1966 ms for the conversion, 2 reports
+  GET /probe?stage=start&w=780&box=780&print=false HTTP/1.1
+  GET /probe?stage=later&w=780&box=780&print=true HTTP/1.1
+A4 portrait: 1721 ms for the conversion, 2 reports
+  GET /probe?stage=start&w=780&box=780&print=false HTTP/1.1
+  GET /probe?stage=later&w=780&box=780&print=true HTTP/1.1
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out
+```
+
+Read against the plan's table: `print` is `false` at `start` (F1's mechanism),
+and the box is 780 px — narrower than the landscape page (1027, part empty)
+and wider than the portrait page (697, cut at the card's right edge:
+`LH-BI-6-22`, `LH-BI-6-23`). The last row of that table ("the plan's reading is
+wrong") is **not** what was seen, so **T12 was built**. The numbers and the
+*not measured* stages are in `docs/plans/BI-53-RESULT.md`, written in T7's
+commit.
+
+### Not verified
+
+- **T6's four log lines on a running stack**: *not verified*. The crate has no
+  log capture in its tests and no product stack runs on the build machine
+  (D18); the planner reads them from staging after the merge.
+- **T7's stages of a real dashboard's PDF**: *not measured* — slot wait, the
+  renderer's start and page load, the dashboard's read, and draw/wait/print.
+  Same reason; `docs/plans/BI-53-RESULT.md` section 4 says how to read them
+  from one PDF of `LH-BI-1-01` on a deployment that runs this branch.
+- **T12's stylesheet rule**: *not verified*. A unit test does not lay a page
+  out, and no PDF of the real print view was made on the build machine. The
+  owner runs `LH-BI-1-01`, `LH-BI-6-22` and `LH-BI-6-23` on staging.
+- **T9's `add_bins`**: no test drives it — it needs the engine, the gate and
+  the policy store together, and none exists today. The read's `whole` column
+  is proven on the engine and the console's reading of it by unit tests; the
+  route's insertion is covered only by the typecheck and the existing
+  `dashboard_export` tests.
+- **T10's two `dashboard-page.tsx` lines**: no test of their own (a page test
+  would need a click through a canvas); the typecheck covers the field names.
+- **T2's planned engine answer**: see the MISMATCH above; the plan's expected
+  five rows are not asserted.
+- Nothing here was seen in a browser or on a real PDF of a dashboard: the owner
+  runs the QA cases of section 3 on staging after the merge.
+
+### T13, as built
+
+The five feature pages and `CHANGELOG.md` (the plan says "the six pages": the
+sixth is `query-studio-results.md`, whose only line in T13 describes the Excel
+text cell, held with T3). Every added line carries its
+`*(proposed, not yet signed)*` mark; nothing says the owner accepted anything.
+Left out with T3: the row 7 sentence and the last limit of
+`export-pdf-excel.md`, the appended sentence of `query-studio-results.md` row 6,
+and the Excel clause of the first changelog bullet. Row 12 of
+`export-pdf-excel.md` keeps "and laid out at the paper's width" and "and a
+chart is as wide as its card" because T12 was built.
+
 ## 6. Review
