@@ -1,15 +1,20 @@
-# REL-20 (slice B, D3): profile for the CI test job in `.github/workflows/ci.yml`.
+# REL-20 (slice B, D3): profile for the CI test jobs in `.github/workflows/ci.yml`
+# -- `test-build`, which writes the nextest archive, and the `test` partitions
+# that run it (`OPS-24` S2, `OPS-30`).
 #
 # `slow-timeout` names a test slow once it has run for 60 s and terminates it
 # after 10 such periods (10 min): a hung test ends instead of consuming the
 # job's 60-minute budget (the same reason the old `cargo test` job carried
 # `timeout-minutes: 60`). `fail-fast = false` lets every partition finish and
 # report its full count even when one partition has a failure, so the
-# cross-partition sum check in the `ci-required` job always has all three
-# numbers (D4). `junit` writes a machine-readable report to
-# `target/nextest/ci/junit.xml` for inspection; the per-partition count the
-# sum check uses comes from the `tests run:` line of nextest's own summary,
-# which is colour-free under `--color never`.
+# cross-partition sum check in the `ci-required` job always has all M numbers;
+# M is `CI_TEST_PARTITIONS` (1 to 6, 3 when unset) and one script,
+# `scripts/ci/test_partitions.sh`, gives it to the matrix and to that check
+# (`OPS-30`). `junit` writes a machine-readable report to
+# `target/nextest/ci/junit.xml` of the workspace the run happens in, for
+# inspection; the per-partition count the sum check uses comes from the
+# `tests run:` line of nextest's own summary, which is colour-free under
+# `--color never` (nextest writes it the same way for `--archive-file` runs).
 [profile.ci]
 slow-timeout = { period = "60s", terminate-after = 10 }
 fail-fast = false

@@ -83,11 +83,13 @@ A push whose diff was already tested by a pull request does not run that test ag
 Anything else is **not proven** — an error, an empty answer, a failed API call, an
 unexpected value — and then every job in scope runs, as before. A proven push still
 runs `changes`, `repo-lints`, the console and Dagster unit jobs when in scope, `fmt`,
-`clippy`, `build`, `msrv`, `images` and one leg of `test` in its cheapest form: it
-restores the cache and compiles (`cargo nextest run --no-run`) only when the restore
-was not an exact hit. It skips the nextest runs, the doctest step, the test-count
-check, the 25 gate jobs and `image-smoke`. `images` keeps running because it is the
-only writer of the image layer cache the pull requests read.
+`clippy`, `build`, `msrv`, `test-build` and `images`. `test-build` keeps the cache
+current in the cheapest form: it restores the cache and builds the test archive
+(`cargo nextest archive`) only when the restore was not an exact hit, which is what
+the single compile-only leg of `test` did before `OPS-30`. It skips the test
+partitions and their archive download, the doctest step, the test-count check, the
+25 gate jobs and `image-smoke`. `images` keeps running because it is the only writer
+of the image layer cache the pull requests read.
 
 **The accepted limit of this proof (`OPS-24` D4, R6c).** Condition 5 reads the
 `ci-required` check run of the head commit `P`, and a head's checks are reported for
@@ -108,7 +110,8 @@ the run's base SHA, which the check-run payload does not carry.
 |---|---|
 | `changes`, `repo-lints` | never |
 | `verify` | neither `frontend` nor `all` |
-| `fmt`, `clippy`, `build`, `msrv`, `test` | neither `rust` nor `all` (a proven push does not excuse them) |
+| `fmt`, `clippy`, `build`, `msrv`, `test-build` | neither `rust` nor `all` (a proven push does not excuse them) |
+| `test` (the nextest partitions) | neither `rust` nor `all`; **or** the event is `push` and the push is proven, which `test-build` above covers instead (`OPS-30`) |
 | `dagster-unit-tests`, `dagster-loader-tests` | neither `dagster` nor `all` |
 | `images` | none of `rust`, `dagster`, `stack`, `all` (a proven push does not excuse it) |
 | the 25 gate jobs and `image-smoke` | none of `rust`, `dagster`, `stack`, `all` (a gate job's own group narrows this further, see "Gates by path" below); **or** the event is `push` and the push is proven |
@@ -223,7 +226,31 @@ Downstream jobs execute according to scope:
 - **`g6-oauth`** (`SRC-12` part C, `ops/g6/src12_oauth_test.py`): starts the same stack as `g6-ops` with `ops/g6/docker-compose.src12.override.yml` (the writable credentials volume and the runner's read-only view of it), and the CI-only `.env` sets the gate-only `CONNECTOR_OAUTH_ALLOW_HTTP=true` and `CONNECTOR_OAUTH_REDIRECT_URI=http://lakehouse-api:8080/api/connectors/oauth/callback`. The provider is a thread of the gate's runner: an authorize endpoint that approves at once and redirects with a code, a token endpoint that checks the PKCE verifier, issues 5-second access tokens and rotates the refresh token (honouring only the latest), a revocation endpoint, and a REST API whose pages answer 2 seconds late and require the bearer token. Steps: the client secret is saved before any sign-in (unverified, sealed); the gate signs in as a browser would (S256, random state, redirect to the product's callback with its own session); a load of 5 rows outlives one access token (at least two refresh grants are counted at the provider); the rotated refresh token is sealed in place (the file changed, still no clear text) and a second load after the first access token expired succeeds (the run record says so, the provider counted a refresh-token grant for it, the sealed token changed again; the table is loaded by `replace`, so rows are not the proof); the connection test refreshes and passes twice; a wrong and a replayed `state` are refused with the fixed page and never reach the provider; a refresh token the provider no longer honours fails one attempt as `sign_in_refused` with none of the provider's words in the log, and signing in again restores loading; signing out and deleting the connector each call the revocation address with the stored token and remove the files. Its own job, 25 minutes; the first CI runs are its measurement. Not run against a real stack before it reached CI.
 - **`g6-saas-a`** and **`g6-saas-b`** (`SRC-3` AD9 amended before slice 6, `ops/g6/g6_saas_test.py`): the gate of the business-app (`saas`) connectors is two jobs that run in parallel on the same scripts, each given the vendors it owns by `SAAS_GATE_VENDORS` (comma separated vendor ids, or `--vendors=`; empty means every vendor, as in a local run). `g6-saas-a` owns HubSpot, Zendesk, Salesforce, Google Analytics 4 and ServiceNow; `g6-saas-b` owns Confluence, SharePoint, Dynamics 365, Workday and NetSuite. One job with eight vendors took 16m17s of the signed 20 minutes (`7a8af090`), so ten would not fit; no step was removed to make them fit, and each job has its own compose project (`saasagci`, `saasbgci`). Both are in `ci-required` and `scripts/ci/required_gate.sh` (`G6_SAAS_A_RESULT`, `G6_SAAS_B_RESULT`), and `coverage.json` (slice 7) names the job each type is proven in. The rest of this entry describes what either job runs for its vendors. It is a gate in jobs of their own so that no existing connector gate grows (`g6-ingest-other` measured 14m53s to 18m36s of its 20 minutes, `docs/plans/SRC-9-RESULT.md`). One mock vendor server (`ops/g6/saas_stub.py`, stdlib only, service `saas-stub-g6`, profile `g6-saas`) answers for every vendor on the vendor's own port (the vendor's real paths, `VENDOR_PORTS` in the stub; `GET /health` and the `/__admin/<vendor>` state controls on 8080). **Through the product (slice 2 review BLOCKER 4):** the job runs the Dagster stack as `g6-ingest-other` does (`--profile dagster`: API, `dagster-code-location`, `dagster-webserver`, `dagster-daemon`, ClickHouse and the catalog as dependencies) with `ops/g6/docker-compose.g6-saas.override.yml` layered on `docker-compose.g6.override.yml`; that file turns on, for the API and the code location only, the gate-only `CONNECTOR_OAUTH_ALLOW_HTTP` and `SAAS_GATE_ORIGINS` (vendor id to the mock's origin; a no-op without the switch, in Rust and in Python, both tested) so that the product dials the mock. For every vendor in `PRODUCT_VENDORS` the gate: creates the connector through the API (a type that is `supported = false` is not refused) and saves its ingest spec; runs the API's connection test (passes, names the account, repeats none of the mock's words); lists the objects through the orchestrator (the object says it loads incrementally) and previews it (HubSpot's properties API, Zendesk honestly `not_supported`); loads with `ingest_job` into Bronze Iceberg and reads the rows back through ClickHouse; changes the vendor, reloads, and reads back the merged table (no key twice; Zendesk's deleted ticket says `status = deleted`; HubSpot's archived deal stays because HubSpot reports no deletes); revokes the sign-in and checks the API's test and a run fail without the vendor's words. The browser sign-in has no browser here, so it stays a vendor-level step, and the vendor-level steps (the vendor module and `SaasSession` run in the runner against the mock) stay as well: HubSpot connect with the private-app token and the browser sign-in, discover, load, reload through search, a new property in describe, a 429 with `Retry-After` waited out and one that never lifts, a revoked token and refresh token; Zendesk connect with an email and API token and with the browser sign-in (the token request is JSON and the refresh token rotates), the mock's time-based export repeating tickets at page boundaries (upstream #659) and the connector reading each once, a cursor reload with a changed, a new and a deleted ticket, a new field, rate limits, a forbidden and a revoked sign-in. `--vendors-only` runs the vendor-level steps with no API against a local `python ops/g6/saas_stub.py` (set `PORT` if 8080 is taken). The API steps first assert the ten types are `supported: false`. ServiceNow (client credentials; Table API paged by the `Link` header; the dictionary describes the table) and Confluence (email + API token for the product steps; the browser sign-in behind Atlassian's gateway, with its cloud id, at vendor level; a reload that must stop near the cursor, `max_reads`) joined in slice 4. SharePoint (Graph delta feed, its link kept in dlt state; a delete marked; a 410 Gone resync at vendor level and in the dlt-state pytest) and Dynamics 365 (an untracked table filtered by `modifiedon`, a tracked table read by its change-tracking delta link) joined in slice 5; each has a product entry for client credentials and one for the browser sign-in's connection test and load, with Entra's token endpoint in the mock at the customer's tenant. Workday (a report read once and replaced; Basic for the integration user, the refresh grant with the client in the Basic header) and NetSuite (SuiteQL pages by `offset` and `hasMore`; the certificate way, whose PS256 assertion the mock verifies with the public key the gate registers, and the browser sign-in) joined in slice 6, each with a vendor-level run and two product entries in `g6-saas-b`; both are models of documentation that could not be run against a real account. Each later vendor adds an entry to `PRODUCT_VENDORS`, its mock and its vendor-level steps in its own slice, and the types stay `supported = false` until slice 7. Budget: the signed 20 minutes per job (each job's cut-off is 25, as `g6-ingest-other`'s); the first CI runs are its measurement and the job summary has each vendor's product steps time.
 - **`g6-discovery-scale`** (`SRC-13` decisions D9 and D12, `ops/g6/src13_discovery_scale_test.py`): creates a PostgreSQL schema of 10,000 tables in the stack's own database, lists it through `POST /api/connectors/conn-pg-lakehouse/discovery/list`, searches one table by part of its name, previews it, and prints each call's seconds on `[src13]` lines that are copied to the job summary. **Fails if the listing takes more than 120 seconds** (the feature page's "10,000 tables in 2 minutes", D9) or does not return exactly the 10,000 names. The stack is the API and its PostgreSQL only (with ClickHouse and `oidc-mock`, which the API depends on): no Dagster, because the API lists PostgreSQL itself. Its own job, so no existing connector gate grows past its 20 minutes (the type-by-type `discover` steps of `g6-ingest`, `g6-ingest-other`, `g4-cdc` and `g6-oracle` are quick calls, and the ones the orchestrator answers run after the loads). Estimated 8 to 12 minutes; the first CI runs are its measurement. The measured seconds are for a CI runner against a local PostgreSQL, not a customer's database. Not run against a real stack before it reached CI.
-- **Rust fmt / clippy / build / test / msrv**: Runs if `rust` or `all` is true. The `test` job runs `cargo nextest run --workspace` across three partitions (`--partition count:N/3`, `REL-20`) plus `cargo test --doc` for doctests; local developers may keep `cargo test`.
+- **Rust fmt / clippy / build / test / msrv**: Runs if `rust` or `all` is true. The tests are
+  compiled once, by **`test-build`** (`OPS-24` S2, `OPS-30`): it restores the cache
+  (`shared-key: stable-test`, the same `v0-rust-stable-test-…` key the old `test` job
+  used), runs `cargo nextest archive --workspace --locked` into
+  `nextest-archive.tar.zst`, prints its size, runs `cargo test --workspace --locked --doc`
+  for the doctests, and uploads the archive as `nextest-archive` (one-day retention,
+  `compression-level: 0`). The **`test`** job's partitions (`Rust · test N/M (stable)`)
+  download it and only run:
+  `cargo-nextest nextest run --archive-file … --workspace-remap "$GITHUB_WORKSPACE/rust"
+  --profile ci --partition count:N/M`. Each keeps the checkout (the tests read fixtures
+  and migrations from it), pulls the three test images first, sets up Bun (for
+  `lakehouse-bi`'s `specs_match_typescript`), and records and uploads its count; it has
+  no Rust toolchain, no cache step and no disk step, because it compiles nothing. `M`
+  comes from `scripts/ci/test_partitions.sh`: repository variable
+  `CI_TEST_PARTITIONS`, a whole number from 1 to 6, unset meaning 3 (the `REL-20`
+  count). That one answer is the matrix, the `--partition` argument and the
+  `ci-required` sum check's loop bound; any other value is a `::warning::` and 3, the
+  rule `CI_PUSH_FULL` follows, so one variable cannot turn every Rust run red.
+  Partitions balance by test count (`count:`, `REL-20`). A partition that failed, was
+  cancelled or ran zero tests turns `ci-required` red, and the sum across partitions
+  must stay at or above 6,826. A proven push skips the partitions.
+  The archive is large — measured on the ARM64 build machine, not in CI: 9.66 GiB
+  compressed, unpacking to about 51 GiB, which `cargo nextest run --archive-file`
+  extracts under `$TMPDIR` (the runner had 110 GB free after its disk step, §0.1 of
+  the plan). Local developers may keep `cargo test`.
 - **Acceptance jobs (`g1-rustfs`, `g2-seaweedfs`, `g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g4-mysql`, `g4-mssql`, `g4-mongo`, `g4-oracle`, `g6-ingest`, `g6-ingest-other`, `g6-oracle`, `g9-upload`, `g6-alerts`, `g6-ops`, `g6-credentials`, `g6-secret-managers`, `g6-oauth`, `g6-discovery-scale`, `g6-saas-a`, `g6-saas-b`, `gold-export`, `g8-governance`, `g8-time-travel`)**: Run if `rust`, `dagster`, `stack`, or `all` is true **and** the job's gate group was selected ("Gates by path").
 - **`images` and `image-smoke`**: Same condition as the acceptance jobs; see "Images: built once per run" below.
 
@@ -307,8 +334,8 @@ The repository's Actions cache is capped at 10 GB and was at 9.9 GB when PR 2 wa
   'refs/heads/main'`. PRs restore `main`'s cache and do not store their own (PR #88 stored a
   980 MB copy of `build`'s). The `fmt` job has no cache step at all: `cargo fmt --check`
   compiles nothing.
-- On a proven push the cache writers still run: `clippy`, `build`, `msrv`, one leg of
-  `test` (it compiles only when its cache is not current) and `images`.
+- On a proven push the cache writers still run: `clippy`, `build`, `msrv`, `test-build`
+  (it builds only when its cache is not current) and `images`.
 
 If `images` is cold on `main` more often than on a Cargo.lock change, the cache is being
 evicted: reduce what `rust-cache` stores before anything else (CI-SPEED-PLAN §9).
