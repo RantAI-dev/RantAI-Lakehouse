@@ -80,6 +80,9 @@ jobs:
       proven_by: ${{ steps.proof.outputs.proven_by }}
       proven_pr: ${{ steps.proof.outputs.proven_pr }}
       proof_reason: ${{ steps.proof.outputs.reason }}
+      # OPS-24 D10: the runner of the small Rust jobs, chosen by
+      # scripts/ci/select_runner.sh. Default hosted; the switch is off.
+      compile_runner: ${{ steps.runner.outputs.compile_runner }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -125,6 +128,25 @@ jobs:
             echo "proven=false" >> "$GITHUB_OUTPUT"
             echo "reason=the proof script failed" >> "$GITHUB_OUTPUT"
           }
+
+      - name: Self-test runner selection
+        run: bash ./scripts/ci/tests/test_select_runner.sh
+
+      - name: Self-test worker preparation
+        run: bash ./scripts/ci/tests/test_worker_prepare.sh
+
+      # OPS-24 D10: hosted unless the repository variable CI_WORKER_COMPILE is
+      # exactly `true` and the run is not a fork's pull request. The labels are
+      # fixed in the script, so no variable can name another runner.
+      - name: Choose the runner of the small Rust jobs
+        id: runner
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          SWITCH: ${{ vars.CI_WORKER_COMPILE }}
+          OUTPUT_NAME: compile_runner
+        run: ./scripts/ci/select_runner.sh
 
   # ── Repo Lints (merged: parity corpus, R11, compose init, Dagster imports) ──
   # Folded into a single job with one step each: these four fast static checks
@@ -358,13 +380,31 @@ jobs:
         working-directory: dagster
 
   # ── Rust: fast feedback ─────────────────────────────────────────────
+  # OPS-24 D10: these four jobs can run on the CI worker when the repository
+  # variable CI_WORKER_COMPILE is `true` (scripts/ci/select_runner.sh picks the
+  # runner and hands it over in `needs.changes.outputs.compile_runner`). With
+  # the variable unset they run on `ubuntu-latest`, exactly as before. Each of
+  # them refuses a self-hosted runner that is not marked as the CI worker
+  # before checkout, and keeps its cache and disk steps to a hosted runner.
   fmt:
     name: Rust · fmt
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(needs.changes.outputs.compile_runner || '["ubuntu-latest"]') }}
     timeout-minutes: 5
     steps:
+      # OPS-24 D10: second line of defence. A self-hosted runner only takes
+      # this job if it carries the label, and this step refuses one that is
+      # not marked in its own `.env`. It runs BEFORE checkout, whose
+      # `git clean -ffdx` would delete that file.
+      - name: Refuse a self-hosted runner that is not the CI worker
+        if: runner.environment == 'self-hosted'
+        run: |
+          if [ "${LAKEHOUSE_CI_WORKER:-}" != "1" ]; then
+            echo "::error::this self-hosted runner is not marked as the CI worker (LAKEHOUSE_CI_WORKER=1 in the runner's .env); refusing before checkout"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v7
 
@@ -385,9 +425,18 @@ jobs:
     name: Rust · clippy
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(needs.changes.outputs.compile_runner || '["ubuntu-latest"]') }}
     timeout-minutes: 15
     steps:
+      # OPS-24 D10: see the `fmt` job's refuse step.
+      - name: Refuse a self-hosted runner that is not the CI worker
+        if: runner.environment == 'self-hosted'
+        run: |
+          if [ "${LAKEHOUSE_CI_WORKER:-}" != "1" ]; then
+            echo "::error::this self-hosted runner is not marked as the CI worker (LAKEHOUSE_CI_WORKER=1 in the runner's .env); refusing before checkout"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v7
 
@@ -396,6 +445,15 @@ jobs:
         with:
           components: clippy
 
+      # OPS-24 D10: the worker keeps its own target directory, so uploading and
+      # downloading a cache its disk already has would only cost time.
+      - name: Prepare the CI worker
+        if: runner.environment == 'self-hosted'
+        run: bash ./scripts/ci/worker_prepare.sh
+        env:
+          TARGET_MAX_GB: ${{ vars.CI_WORKER_TARGET_MAX_GB }}
+          WORKER_CARGO_JOBS: ${{ vars.CI_WORKER_CARGO_JOBS }}
+
       # Restore on every run, SAVE only on `main`. Measured 2026-10-09: PR #88
       # stored its own 980 MB `build` cache next to `main`'s identical one,
       # and the repository's Actions cache sat at 9.9 GB of its 10 GB cap,
@@ -403,6 +461,7 @@ jobs:
       # §4.2, §9). A PR still restores `main`'s cache; it just no longer adds
       # its own copy.
       - name: Cache cargo
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
@@ -416,17 +475,37 @@ jobs:
     name: Rust · build
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(needs.changes.outputs.compile_runner || '["ubuntu-latest"]') }}
     timeout-minutes: 15
     steps:
+      # OPS-24 D10: see the `fmt` job's refuse step.
+      - name: Refuse a self-hosted runner that is not the CI worker
+        if: runner.environment == 'self-hosted'
+        run: |
+          if [ "${LAKEHOUSE_CI_WORKER:-}" != "1" ]; then
+            echo "::error::this self-hosted runner is not marked as the CI worker (LAKEHOUSE_CI_WORKER=1 in the runner's .env); refusing before checkout"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v7
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # OPS-24 D10: see the `clippy` job's prepare step.
+      - name: Prepare the CI worker
+        if: runner.environment == 'self-hosted'
+        run: bash ./scripts/ci/worker_prepare.sh
+        env:
+          TARGET_MAX_GB: ${{ vars.CI_WORKER_TARGET_MAX_GB }}
+          WORKER_CARGO_JOBS: ${{ vars.CI_WORKER_CARGO_JOBS }}
+
       # Save on `main` only; see the `clippy` job's `Cache cargo` step.
+      # OPS-24 D10: a hosted runner only; the worker has its own target
+      # directory.
       - name: Cache cargo
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
@@ -662,9 +741,18 @@ jobs:
     name: Rust · MSRV check (1.99.0)
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(needs.changes.outputs.compile_runner || '["ubuntu-latest"]') }}
     timeout-minutes: 15
     steps:
+      # OPS-24 D10: see the `fmt` job's refuse step.
+      - name: Refuse a self-hosted runner that is not the CI worker
+        if: runner.environment == 'self-hosted'
+        run: |
+          if [ "${LAKEHOUSE_CI_WORKER:-}" != "1" ]; then
+            echo "::error::this self-hosted runner is not marked as the CI worker (LAKEHOUSE_CI_WORKER=1 in the runner's .env); refusing before checkout"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v7
 
@@ -673,8 +761,19 @@ jobs:
         with:
           toolchain: "1.99.0"
 
+      # OPS-24 D10: see the `clippy` job's prepare step.
+      - name: Prepare the CI worker
+        if: runner.environment == 'self-hosted'
+        run: bash ./scripts/ci/worker_prepare.sh
+        env:
+          TARGET_MAX_GB: ${{ vars.CI_WORKER_TARGET_MAX_GB }}
+          WORKER_CARGO_JOBS: ${{ vars.CI_WORKER_CARGO_JOBS }}
+
       # Save on `main` only; see the `clippy` job's `Cache cargo` step.
+      # OPS-24 D10: a hosted runner only; the worker has its own target
+      # directory.
       - name: Cache cargo
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust

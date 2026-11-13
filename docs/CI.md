@@ -204,6 +204,54 @@ The repository's Actions cache is capped at 10 GB and was at 9.9 GB when PR 2 wa
 If `images` is cold on `main` more often than on a Cargo.lock change, the cache is being
 evicted: reduce what `rust-cache` stores before anything else (CI-SPEED-PLAN §9).
 
+## Runners
+
+Two repository variables, both unset by default, decide whether work may run on a
+self-hosted CI worker (`OPS-24` D10, D11). With both unset the workflows are exactly as
+they were: every job runs on `ubuntu-latest`.
+
+| Variable | What it moves | Default |
+|---|---|---|
+| `CI_WORKER_COMPILE` | the four small Rust jobs: `fmt`, `clippy`, `build`, `msrv` | unset, hosted |
+| `CI_COVERAGE_ON_WORKER` | the `coverage` job of `coverage.yml` | unset, hosted |
+
+The labels are fixed in the repository, not read from a variable:
+`scripts/ci/select_runner.sh` holds `["self-hosted","lakehouse-ci"]` as a constant. A job
+is only offered to a runner that carries every label, so no variable value can reach
+another machine — the staging runner carries `self-hosted, Linux, X64, staging` and never
+`lakehouse-ci`.
+
+The first step of every job that can run self-hosted is "Refuse a self-hosted runner that
+is not the CI worker": it fails unless the runner's own environment holds
+`LAKEHOUSE_CI_WORKER=1`. It runs **before** `actions/checkout`, whose `git clean -ffdx`
+would delete the file that marker lives in on another machine. That is the second line of
+defence; the label is the first.
+
+**A fork's pull request always gets `ubuntu-latest`.** `select_runner.sh` decides from the
+event and `github.event.pull_request.head.repo.full_name`, and has a self-test. The honest
+limit: this protects an unmodified workflow. A fork can edit the workflow in its own pull
+request; only the repository setting that requires approval for external contributors
+stops that, and it is the owner's to set.
+
+**The worker's target directory.** `scripts/ci/worker_prepare.sh` (self-hosted steps only)
+prints the machine's facts, then gives cargo `$HOME/.cache/lakehouse-ci/target/<runner>`,
+one directory per runner registration, exported as `CARGO_TARGET_DIR`. Its size is
+bounded: `CI_WORKER_TARGET_MAX_GB` (5 to 500, default 40) is the limit; over it, files not
+read for three days are deleted, and if that is not enough the directory itself is
+recreated empty. That is the only place a file outside the workspace is deleted on a
+self-hosted runner, and it is the runner's own cache — never `cargo clean`, never on every
+run. `CI_WORKER_CARGO_JOBS` (1 to 64) becomes `CARGO_BUILD_JOBS`.
+
+**A machine below this size must not get a job a pull request requires:** 24 hardware
+threads or more, 48 GB of RAM or more (12 GB per runner instance), four runner instances,
+always on. That is what keeps utilisation under 0.7 at the measured peak and finishes a
+burst of five runs within today's eight minutes. A machine that can sleep blocks every
+pull request that waits for it, for up to 24 hours.
+
+**The cost of turning `CI_WORKER_COMPILE` on:** `main` no longer writes the hosted caches
+of `clippy`, `build` and `msrv` (those steps are guarded to a hosted runner), so a fork's
+pull request compiles them cold. That is why the switch is off by default.
+
 ## MSRV
 
 `rust/Cargo.toml`'s `rust-version` is `1.99` (REL-9, product-owner decision
