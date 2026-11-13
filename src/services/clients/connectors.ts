@@ -32,7 +32,7 @@ import type {
   UpdateConnectorInput,
 } from "../contracts/connectors";
 import { apiFetch } from "../http";
-import { ServiceError } from "../errors";
+import { ServiceError, deniedFor } from "../errors";
 
 /**
  * ConnectorService is real — connector definitions (source/sink) go through
@@ -59,6 +59,9 @@ async function getJson<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await apiFetch(url, init);
   const json = await res.json();
   if (!res.ok) {
+    // QA LH-DATA-9-20 (WEB-11): Sources said "Request could not be processed" for a missing permission.
+    const denied = deniedFor(res.status, json);
+    if (denied) throw denied;
     const kind = res.status === 404 ? "not_found" : res.status >= 500 ? "unavailable" : "invalid_request";
     throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`, res.status);
   }
@@ -74,6 +77,8 @@ async function postJson<T>(url: string, body: unknown, signal?: AbortSignal): Pr
   });
   const json = await res.json();
   if (!res.ok) {
+    const denied = deniedFor(res.status, json);
+    if (denied) throw denied;
     const kind = res.status === 404 ? "not_found" : res.status >= 500 ? "unavailable" : "invalid_request";
     throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`, res.status);
   }
@@ -95,6 +100,8 @@ async function sendJson<T>(
   // `PUT .../tenant` answers 204 with no body.
   const json = res.status === 204 ? null : await res.json().catch(() => null);
   if (!res.ok) {
+    const denied = deniedFor(res.status, json);
+    if (denied) throw denied;
     const kind = res.status === 404 ? "not_found" : res.status >= 500 ? "unavailable" : "invalid_request";
     throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`, res.status);
   }
@@ -171,6 +178,8 @@ export const postgresConnectorService: ConnectorService = {
     );
     if (!res.ok) {
       const json = await res.json().catch(() => null);
+      const denied = deniedFor(res.status, json);
+      if (denied) throw denied;
       const kind = res.status === 404 ? "not_found" : res.status >= 500 ? "unavailable" : "invalid_request";
       throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`, res.status);
     }
@@ -245,16 +254,16 @@ export const postgresConnectorService: ConnectorService = {
     });
     if (!res.ok) {
       const json = await res.json().catch(() => null);
+      const denied = deniedFor(res.status, json);
+      if (denied) throw denied;
       // A 409 (pipelines still depend on it, or a CDC slot could not be
       // dropped) keeps its status on the error; the message says which.
       const kind =
         res.status === 404
           ? "not_found"
-          : res.status === 401 || res.status === 403
-            ? "permission_denied"
-            : res.status >= 500
-              ? "unavailable"
-              : "invalid_request";
+          : res.status >= 500
+            ? "unavailable"
+            : "invalid_request";
       throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`, res.status);
     }
   },
