@@ -1424,3 +1424,104 @@ Before handoff, once, on the final commit (`07abae4d`):
 No other anchor, signature or quoted text differed from the code at `7ac20f8be`.
 
 ## 6. Review
+
+### Round 1 (planner, 2026-11-13, at `37f1a58a`)
+
+Reviewed against sections 1 to 4, with a security reading of the policy engine's part (an
+independent reviewer's notes, then the planner's rulings). The Rust code was read, not
+built, on the planner's machine; CI on the pull request (#504) is the run. The console was
+run in a clean checkout of the branch: `bun run typecheck` clean; `bun run lint` 0 errors,
+11 warnings; `bun run test` 4238 pass, 1 skip, 0 fail across 392 files; sixteen of the new
+console tests were run against `origin/main`'s code and all sixteen fail there.
+
+What holds. `policy_engine.rs`: enforcement is not changed (the one removed loop is now
+`hidden_read`, same resolver, same order, same refusals); `access_cause` only reads, and
+reads masks and table access, never a row filter. The mark is decided from the policy alone,
+after the statement has already failed; the unrestricted statement is never run, so it is no
+way to learn whether hidden rows exist; a row filter that empties a result gives plain empty
+rows and no mark. A refused parameter value never reaches a statement (it is dropped at
+`check_value`); the PDF, report and alert reads stay strict. No existing assertion was
+loosened; the seven ignored engine tests of `layers_rewrite` were ignored on `main` too.
+The developer's MISMATCH (`pub(crate) fn explains`) is right and harmless. Noted, not new:
+a failed question's entry still carries its `label` and `source`, which name the question's
+table when the author gave no label; that was so before this branch.
+
+One BLOCKER, in the planner's own decision D16.3. The fixes go in ONE commit,
+`fix(review): round 1 of dashboards-p2 (R1 to R8, R10, R11)`, after `main` is merged into
+the branch if it moved.
+
+- **R1. BLOCKER (D16.3 as written): any engine failure on a question that names a masked
+  column is shown as the viewer's access.** `routes/layers.rs`, `explains`:
+  `SpecRunFailure::Clickhouse(err) => err.server_code().is_some() && cause ==
+  Some(AccessCause::MaskedColumn)`. A mask does not always make a question fail (a masked
+  dimension with a count draws `***` groups), so for such a viewer a memory limit (241), too
+  many queries (202) or a missing table (60) would read "Not available with your access."
+  with no reference, and nobody would report it. **D16.3 is narrowed:** the engine's refusal
+  counts as the viewer's access only when its code is the one a masked value produces in an
+  aggregate, `43` (`ILLEGAL_TYPE_OF_ARGUMENT`), which is the case QA saw and the only one
+  measured. `explains` compares `err.server_code() == Some(43)` (a named constant with a doc
+  that says where the number comes from and that other codes are added only when measured:
+  principle 5). In the table test of `layers_rewrite.rs` add rows: code 241 and code 60
+  with `Some(MaskedColumn)` are NOT access and keep the reference. Documents: in
+  `docs/core/features/combined-charts.md`, the limit line this branch added gains: "Only the
+  engine's refusal of a masked value in a calculation is recognised; any other failure keeps
+  its reference." *(proposed, not yet signed)*.
+- **R4. SHOULD-FIX, same place:** the policy is asked again for every engine failure,
+  including a connection failure that can never be access. In the `match` of
+  `RoleRunner::access_is_the_cause` (`layers.rs`), ask only for a `Clickhouse` failure whose
+  code is R1's; every other `Clickhouse` failure answers "not access" without a read.
+- **R2. SHOULD-FIX: the mask test would pass if masking stopped.** `tests/table_access.rs`,
+  `LayerFake` answers 500 to every read of the second mart. Give it a mode: in
+  `a_question_that_sums_a_column_masked_for_the_viewer_is_marked_as_access` it answers the
+  500 (with `Code: 43`) only to a statement that holds both `replaceRegexpOne` and the
+  mart's name, and no rows otherwise; the test also asserts that such a statement was
+  received. The third test keeps the unconditional 500.
+- **R3. SHOULD-FIX: a failed read of the parameter definitions strips every value from the
+  address.** `routes/params.rs` answers `appliedParams: {}` with `storeError` when the store
+  fails; `dashboard-page.tsx` stores `applied: json.appliedParams` and the address then
+  loses `p=`. Before this branch the banner showed and the values stayed. Fix in
+  `dashboard-page.tsx`: `applied: json.storeError ? undefined : json.appliedParams`, with a
+  comment (`QA LH-BI-11-05 (BI-52), review R3`), and one test (in `params.test.ts` or the
+  page test) that a store error keeps the address's values.
+- **R5. SHOULD-FIX (read, not run): a chart with its own grain that fell back to its stored
+  statement is told it "has no date grouping of its own".** `routes/support.rs`,
+  `annotate_grain_switch`: when the chart was not rebuilt (`built` is `None`) and the
+  chart's definition has a grain, say nothing (return before `switch_skip`): no mark is
+  better than a wrong reason (rule 14). One test in `mod time_grain`. If the code is not
+  shaped as this says, report it as a MISMATCH and leave it.
+- **R6. SHOULD-FIX:** `combined-tile.test.tsx`, the existing test "says under the chart
+  which question was cut off …": its `it(…` line and its first statement were joined into
+  one line. Put the line break back. No assertion changes.
+- **R7. SHOULD-FIX (rule 1), three comments:** `policy_engine.rs`, `AccessCause::HiddenTable`:
+  "a table the viewer's roles do not include" (the tenant gate is not seen by this
+  function); the doc of `access_cause`: "a column the policy masks that is among `columns`"
+  (it does not read columns from the statement); `layers_rewrite.rs`: "exactly four shapes"
+  above a list of three: make the number match the list after R1's rows are added.
+- **R8. SHOULD-FIX (D1, rule 13):** the fix sites that cite only the backlog ID and "plan
+  Dnn" also name their QA case: `LH-BI-9-05` for the date-grouping sites (`grain.rs`
+  `SwitchSkip`/`switch_skip`, `grain-marker.tsx`, the `dashboard.rs` and
+  `dashboard-page.tsx` sites of `BI-50`), `LH-BI-11-05` for the parameter sites
+  (`lakehouse-bi/src/params.rs`, `routes/params.rs`, `param-controls.tsx`, the
+  `dashboard.rs` and `dashboard-page.tsx` sites of `BI-52`), `LH-BI-13-03` for the access
+  sites (`policy_engine.rs`, the `BI-51` sites). One citation per item is enough.
+- **R10. SHOULD-FIX:** the radar builder test in `chart-builder.test.tsx` sits inside the
+  `describe` of another QA case (`LH-BI-6-01`). Move it into a `describe` of its own
+  (`ChartBuilder radar measures (QA LH-BI-6-25)`), with its own copy of the small `choose`
+  helper, as T8 said.
+- **R11. SHOULD-FIX (the plan's own text):** `docs/core/features/combined-charts.md`: "… and
+  the others still draw A question the viewer's access …" lacks a full stop after "draw".
+- **R9. In the handoff only:** `grain-marker.test.tsx` and `dashboard-page-role.test.tsx`
+  run 6 tests, not 4; the T14 commit cites no QA case (`LH-BI-6-25`); and T13 asked for the
+  output of `grep -n "export function deniedFor" src/services/errors.ts` and for the
+  sentence that `src/services/clients/metrics.ts` leaves the list of `WEB-11` slice S2.
+  Write all four in the round's handoff. History is not rewritten.
+
+The developer's handoff for this round, appended below this entry: the merge commit (if
+any) and the fix commit; every command with its counts: `cargo fmt --check`; `cargo clippy
+-p lakehouse-api --all-targets -- -D warnings`; `cargo test -p lakehouse-api --lib
+layers_rewrite` (quote the count, and that the new table rows fail before R1's change);
+`cargo test -p lakehouse-api --lib time_grain`; `cargo test -p lakehouse-api --test
+table_access`; `--test sec11_guard`; `--test route_auth`; `bun run typecheck`; `bun run
+lint`; `bun test src/features/dashboards src/lib`; `bun run test` once;
+`python3 ops/lint/check_bare_iceberg_count.py && python3 ops/lint/check_intra_package_imports.py`;
+and R9's four lines.
