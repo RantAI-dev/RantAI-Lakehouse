@@ -17,7 +17,7 @@ import { bucketActions, bucketRangeFilter, dashboardRangeDestination, toggleBuck
 import { ParamControls } from "./param-controls";
 import { ParamDialog } from "./param-dialog";
 import { PARAMS_PARAM, normalizeDef, paramsDiffer, paramsQuery, readParamsParam, savedParamsBody, withParamsParam, withValue, type BoardParam, type ParamControl, type ParamValue } from "@/lib/params";
-import { GRAIN_PARAM, differsFromSaved, grainQuery, readGrainParam, savedGrainBody, shownGrain, withGrainParam, type GrainChoice } from "@/lib/grain-switch";
+import { GRAIN_PARAM, differsFromSaved, grainNotAppliedSentence, grainQuery, readGrainParam, savedGrainBody, shownGrain, withGrainParam, type GrainChoice } from "@/lib/grain-switch";
 import { PART_NO_CLICK_REASON, isGrain, isTruncation, switchChoices, type ColumnKind, type Grain, type ReportingContext } from "@/lib/time-grain";
 import { effectiveRefresh, canSaveRefresh as refreshIsSaveable, listedInterval } from "@/lib/dashboard-refresh";
 import { enterFullscreen, leaveFullscreen, readFullscreenDark, writeFullscreenDark } from "@/lib/dashboard-fullscreen";
@@ -1086,6 +1086,11 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       };
     }
     const cell = data?.results[spec.id];
+    // BI-50 (QA LH-BI-9-05): the mark is shown only while the control is in use
+    // and this answer applied a grain, so a chart the control does not change
+    // says why. Without a grain on screen the mark would answer nobody.
+    const notApplied = hasRows(cell) && data?.appliedGrain && grainedCharts.length > 0
+      ? grainNotAppliedSentence(cell.grainNotApplied) : null;
     const badge = SOURCE_BADGE[spec.source];
     const drilled = tileDrills.drills[spec.id];
     const level = drilled ? tileDrills.currentLevel(spec) : undefined;
@@ -1153,8 +1158,14 @@ export function DashboardPage({ boardId }: { boardId: string }) {
           {spec.def?.filters?.length ? <OwnFiltersMarker filters={spec.def.filters} /> : null}
           {hasRows(cell) && cell.filtersSkipped?.length ? <SkippedFiltersMarker skipped={cell.filtersSkipped} /> : null}
           {/* A pivot says its own cut-off in its footer (the cell cap, not the latest buckets). */}
-          {hasRows(cell) && (cell.grainSkipped || (cell.truncated && spec.kind !== "pivot"))
-            ? <GrainMarkers skipped={cell.grainSkipped} truncated={cell.truncated && spec.kind !== "pivot"} limit={typeof spec.def?.limit === "number" ? spec.def.limit : undefined} /> : null}
+          {/* BI-50 (QA LH-BI-9-05): the grain mark is drawn only while the control is in use and applied a grain. */}
+          {hasRows(cell) && (cell.grainSkipped || (cell.truncated && spec.kind !== "pivot") || notApplied)
+            ? <GrainMarkers
+                skipped={cell.grainSkipped}
+                truncated={cell.truncated && spec.kind !== "pivot"}
+                limit={typeof spec.def?.limit === "number" ? spec.def.limit : undefined}
+                notApplied={notApplied ?? undefined}
+              /> : null}
           {drillable ? (
         <Tooltip>
           <TooltipTrigger render={<span className="inline-flex shrink-0 text-muted-foreground/70" />}>
