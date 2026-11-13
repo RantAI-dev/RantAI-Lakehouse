@@ -99,8 +99,11 @@ export type DashboardService = {
    * names when `edit` is set (`PUT`). `WEB-7` D6 moved the builder's own
    * `fetch` here. Needs edit on the dashboard it lands on, or
    * `dashboard:write`; the server's refusal arrives as the error's message.
+   *
+   * Answers the saved chart's id (`BI-48`: a tile's Duplicate places the new
+   * chart below the original), as `""` when the answer does not carry one.
    */
-  saveChart(input: Record<string, unknown>, edit: boolean, signal?: AbortSignal): Promise<void>
+  saveChart(input: Record<string, unknown>, edit: boolean, signal?: AbortSignal): Promise<{ id: string }>
   /**
    * The marts a chart or an alert rule can be built on
    * (`GET /api/dashboard/fields`), by name. `WEB-7` D7 moved the alerts

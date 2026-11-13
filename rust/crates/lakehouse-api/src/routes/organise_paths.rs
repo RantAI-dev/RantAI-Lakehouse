@@ -443,6 +443,7 @@ async fn the_filter_values_of_a_board_come_only_from_charts_the_caller_may_see()
     let _ = values_for_roles(
         &ch,
         query,
+        &[],
         (&roles, &viewer),
         &PlaceholderValues::none(),
         &obligations,

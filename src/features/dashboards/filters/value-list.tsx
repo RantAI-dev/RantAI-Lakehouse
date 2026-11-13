@@ -5,7 +5,7 @@ import { Check } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import type { FilterDef } from "@/services/clients/bi-store";
-import { useFilterValues } from "./use-filter-values";
+import { useFilterValues, type OwnSource } from "./use-filter-values";
 
 /**
  * A searchable multi-select of a column's values, "is" / "is not". Used for
@@ -13,16 +13,18 @@ import { useFilterValues } from "./use-filter-values";
  * edits the draft; the editor's Apply commits it.
  */
 export function ValueList({
-  board, column, others, draft, onDraft,
+  board, column, others, draft, onDraft, source,
 }: {
   board: string;
   column: string;
   others: FilterDef[];
   draft: FilterDef;
   onDraft: (next: FilterDef) => void;
+  /** `BI-47`: the chart's own relation, when the filter belongs to a chart. */
+  source?: OwnSource;
 }) {
   const [search, setSearch] = React.useState("");
-  const { values, truncated, loading, error } = useFilterValues({ board, column, others, search });
+  const { values, truncated, loading, error } = useFilterValues({ board, column, others, search, source });
   const negate = draft.op === "not_in";
   const picked = new Set(draft.values);
   // A value picked earlier stays visible and unpickable-by-accident even

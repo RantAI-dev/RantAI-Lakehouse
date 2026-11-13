@@ -627,3 +627,153 @@ describe("ChartBuilder chosen mart mark (QA LH-DATA-12-17)", () => {
     expect(screen.queryByTestId("chosen-mart-mark")).toBeNull()
   })
 })
+
+// `BI-47` (QA `LH-BI-6-01`): a dashboard parameter slot (`{ukuran}`) is a
+// dimension, a breakdown and a measure, never a filter column — the server has
+// no column to list its values from.
+describe("ChartBuilder and a parameter slot (QA LH-BI-6-01)", () => {
+  /** The board's parameters: one list whose values are columns, so the builder offers it as a dimension. */
+  function withListParam() {
+    const inner = global.fetch
+    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes("/api/dashboard/params")) {
+        const params = [{
+          id: "p1", name: "ukuran", label: "Ukuran", type: "list", default: "provinsi",
+          values: [{ value: "provinsi", label: "provinsi" }, { value: "category", label: "category" }],
+        }]
+        return new Response(JSON.stringify({ params }), { status: 200, headers: { "Content-Type": "application/json" } })
+      }
+      return inner(input, init)
+    }) as unknown as typeof fetch
+  }
+
+  it("a parameter slot is offered as a dimension and not as a filter column", async () => {
+    withListParam()
+    renderBuilder(barDef)
+    await screen.findByLabelText("Aggregation of visitors")
+    // The slot is a dimension of the picker.
+    const dimensionField = screen.getByText(/^Dimension \(X\)/).closest("div") as HTMLElement
+    fireEvent.click(dimensionField.querySelector('[role="combobox"]') as HTMLElement)
+    expect(await screen.findByRole("option", { name: /\{ukuran\}/ })).toBeTruthy()
+    // Close that list, open the filter section, and ask for a filter column.
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" })
+    fireEvent.click(screen.getByRole("button", { name: /Sort and filter/ }))
+    fireEvent.click(await screen.findByLabelText("Add a filter"))
+    expect(await screen.findByRole("option", { name: "provinsi" })).toBeTruthy()
+    expect(screen.queryByRole("option", { name: /\{ukuran\}/ })).toBeNull()
+  })
+})
+
+// `BI-46` (QA `LH-BI-6-01`): a date breakdown can be grouped by a period, and
+// the limit says what it counts when the chart has a breakdown.
+describe("ChartBuilder breakdown grain and limit label (QA LH-BI-6-01)", () => {
+  /** Adds a date column the base stub does not have. */
+  function withDateColumn() {
+    const inner = global.fetch
+    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      const res = await inner(input, init)
+      if (url.includes("/api/dashboard/fields") && url.includes("mart=")) {
+        const body = (await res.json()) as Record<string, unknown>
+        return new Response(JSON.stringify({
+          ...body,
+          dimensions: [...(body.dimensions as string[]), "d"],
+          kinds: { d: "date" },
+          columns: [...(body.columns as { name: string; type: string }[]), { name: "d", type: "Date" }],
+        }), { status: 200, headers: { "Content-Type": "application/json" } })
+      }
+      return res
+    }) as unknown as typeof fetch
+  }
+
+  /** A base-ui Select choice: open, focus the option, click it (as format-section does). */
+  function choose(trigger: HTMLElement, option: string) {
+    fireEvent.click(trigger)
+    const target = screen.getByRole("option", { name: option })
+    fireEvent.focus(target)
+    fireEvent.click(target)
+  }
+
+  it("choosing a date breakdown offers its grain and the preview request carries it", async () => {
+    withDateColumn()
+    renderBuilder({ ...barDef })
+    await screen.findByLabelText("Aggregation of visitors")
+    const breakdownField = document.querySelector('[data-slot="breakdown-field"]') as HTMLElement
+    choose(breakdownField.querySelector('[role="combobox"]') as HTMLElement, "d")
+    const groupBy = await screen.findByLabelText("Group the breakdown by")
+    choose(groupBy, "Month")
+    await waitFor(() => expect(bodies.some((b) => b.breakdownGrain === "month")).toBe(true))
+  })
+
+  it("the limit label names the breakdown when the chart has one", async () => {
+    renderBuilder({ ...barDef, breakdown: "category" })
+    await screen.findByLabelText("Aggregation of visitors")
+    fireEvent.click(screen.getByRole("button", { name: /Sort and filter/ }))
+    expect(await screen.findByText("Limit (Top N, dimension and breakdown)")).toBeTruthy()
+    cleanup()
+    // A grain on a date dimension makes the limit the breakdown's alone.
+    withDateColumn()
+    renderBuilder({ ...barDef, dimension: "d", breakdown: "category", grain: "month" })
+    await screen.findByLabelText("Aggregation of visitors")
+    fireEvent.click(screen.getByRole("button", { name: /Sort and filter/ }))
+    expect(await screen.findByText("Breakdown values (Top N)")).toBeTruthy()
+  })
+
+  /** Adds a table-calculation measure the base stub does not have. */
+  function withTableCalc() {
+    const inner = global.fetch
+    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      const res = await inner(input, init)
+      if (url.includes("/api/dashboard/fields") && url.includes("mart=")) {
+        const body = (await res.json()) as Record<string, unknown>
+        return new Response(JSON.stringify({
+          ...body,
+          measures: [...(body.measures as string[]), "running"],
+          calculated: [{
+            id: "f_1", sourceKind: "mart", sourceId: "mart_visits", name: "running",
+            formula: "RunningTotal(Sum(visitors))", level: "table", type: "number", createdBy: "u",
+          }],
+        }), { status: 200, headers: { "Content-Type": "application/json" } })
+      }
+      return res
+    }) as unknown as typeof fetch
+  }
+
+  // `BI-46` review round 1, R7: beside a breakdown the limit counts breakdown
+  // values, so a grain pick keeps the untouched 20 instead of lifting it to the
+  // grained maximum, which the preview request would carry as no cap at all.
+  // A NEW chart: an edited one opens with its saved limit already "touched".
+  it("a grain pick beside a breakdown keeps the untouched limit at twenty", async () => {
+    withDateColumn()
+    renderBuilder()
+    fireEvent.click(await screen.findByRole("combobox", { name: /pick a mart/i }).catch(() => screen.getByText(/pick a mart/)))
+    fireEvent.click(await screen.findByRole("option", { name: /mart_visits/ }))
+    fireEvent.click(await screen.findByRole("button", { name: /What to show/ }))
+    const dimensionField = document.querySelector("[data-slot=dimension-field]") as HTMLElement
+    choose(dimensionField.querySelector('[role="combobox"]') as HTMLElement, "d")
+    // The pickers' lists close after a choice; wait for it so the next list is
+    // the only one with its options.
+    await waitFor(() => expect(screen.queryAllByRole("option")).toHaveLength(0))
+    const breakdownField = document.querySelector('[data-slot="breakdown-field"]') as HTMLElement
+    choose(breakdownField.querySelector('[role="combobox"]') as HTMLElement, "category")
+    await waitFor(() => expect(screen.queryAllByRole("option")).toHaveLength(0))
+    choose(await screen.findByLabelText("Measure (Y)"), "visitors")
+    await waitFor(() => expect(screen.queryAllByRole("option")).toHaveLength(0))
+    choose(await screen.findByLabelText("Group by"), "Month")
+    await waitFor(() => expect(bodies.some((b) => b.grain === "month" && b.limit === 20)).toBe(true))
+    expect(bodies.some((b) => b.grain === "month" && b.limit === 1000)).toBe(false)
+  })
+
+  // `BI-46` review round 1, R4: the server builds no breakdown cap for a table
+  // calculation, so the field must not be labelled as one.
+  it("a table-calculation measure keeps the limit label the chart always had", async () => {
+    withTableCalc()
+    renderBuilder({ ...barDef, measures: ["running"], breakdown: "category" })
+    await screen.findByLabelText("Aggregation of running")
+    fireEvent.click(screen.getByRole("button", { name: /Sort and filter/ }))
+    expect(await screen.findByText("Limit (Top N)")).toBeTruthy()
+    expect(screen.queryByText("Limit (Top N, dimension and breakdown)")).toBeNull()
+    expect(screen.queryByText("Breakdown values (Top N)")).toBeNull()
+  })
+})

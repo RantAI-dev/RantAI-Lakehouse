@@ -379,9 +379,12 @@ async fn save_edited_chart(
     )
     .await
     .map_err(|err| upstream_error::bi(&upstream_error::DATABASE, &err).to_json())?;
-    store::insert_chart(ch, &spec)
+    // QA `LH-BI-5-01` (`BI-45`, plan D5): the reformat saves the chart through
+    // the checked save, so a limit that ends its statement is the tile's
+    // answer and nothing is stored.
+    crate::routes::support::insert_chart_checked(ch, &spec)
         .await
-        .map_err(|err| upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json())?;
+        .map_err(crate::routes::support::failure_as_tool_reply)?;
     snapshot_as(ch, &spec.board, principal).await;
     Ok(spec)
 }

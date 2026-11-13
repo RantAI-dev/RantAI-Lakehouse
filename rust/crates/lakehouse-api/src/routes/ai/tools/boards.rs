@@ -20,12 +20,13 @@
 //! attached nothing is changed, as for the tab tools.
 //!
 //! One seam is not that: `move_chart` saves the chart itself through
-//! `store::spec_from_input` + `store::insert_chart`, not through
+//! `store::spec_from_input` + `support::insert_chart_checked`, not through
 //! `routes::dashboard::specs_update`. It saves on the new
 //! board *before* removing the tile from the old one, so a failure
 //! leaves the chart readable rather than on two boards, and that
-//! ordering needs the two writes split. `spec_from_input` still runs
-//! its own smoke test, so the chart is validated — but a guard added to
+//! ordering needs the two writes split. The checked save runs the
+//! statement under the caller's limit (`BI-45`), so the chart is
+//! validated as on the console's save — but a guard added to
 //! the `specs_update` handler later would not reach this path, and that
 //! is the one place to look when it changes.
 //!
@@ -40,8 +41,8 @@
 //!   folder-`ensure_folder_exists` checks inside it are unchanged.
 //! - `move_chart` removes the chart's tile from the old board's layout,
 //!   which `specs_update` does not do (feature page decision 4).
-//!   Neither `spec_from_input` nor `insert_chart` does it, so the tool
-//!   does it.
+//!   Neither `spec_from_input` nor `insert_chart_checked` does it, so the
+//!   tool does it.
 //! - `settle_layout` settles the layout before it is saved: the tiles of
 //!   the call keep their boxes and the tile they land on moves down
 //!   (`AI-1` AC1, 2026-11-08). It mirrors the console's `settleLayout`
@@ -552,8 +553,16 @@ pub(super) async fn move_chart(
             );
         }
     };
-    if let Err(err) = store::insert_chart(ch, &spec).await {
-        return json!(upstream_error_json(&err));
+    // QA `LH-BI-5-01` (`BI-45`, plan D5): the move stores the chart through
+    // the checked save. Its engine failure keeps this tool's own
+    // `upstream_error_json`; a limit or a refusal is the shared reply.
+    if let Err(failure) = crate::routes::support::insert_chart_checked(ch, &spec).await {
+        return match failure {
+            crate::routes::support::SpecRunFailure::Clickhouse(err) => {
+                json!(upstream_error_json(&err))
+            }
+            other => crate::routes::support::failure_as_tool_reply(other),
+        };
     }
 
     // Feature page decision 4: remove the chart's tile from the old
