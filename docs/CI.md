@@ -252,6 +252,29 @@ pull request that waits for it, for up to 24 hours.
 of `clippy`, `build` and `msrv` (those steps are guarded to a hosted runner), so a fork's
 pull request compiles them cold. That is why the switch is off by default.
 
+**Coverage on the worker (`CI_COVERAGE_ON_WORKER`).** `coverage.yml`'s `coverage` job can
+run on the CI worker when the variable is exactly `true`. It qualifies because nothing
+reads its result — it is not a required check and no workflow names its artifacts — and
+because the workflow has no `pull_request` trigger, so only `main`'s code reaches the
+worker through it. It needs Docker (testcontainers) and 44 to 55 job-minutes on a hosted
+runner. When the worker is offline the run waits; `coverage.yml`'s concurrency rule allows
+one running and one waiting run and a newer push replaces the waiting one, so nothing
+piles up, and GitHub fails a job no runner took within 24 hours. Nothing waits for it, so
+that is acceptable. The job removes the containers it started and keeps the labelled
+reusable Postgres; the `sbom` job of the same workflow stays hosted, because 34 seconds
+have nothing to gain.
+
+What may run on the worker, and what may not (`OPS-24` D11):
+
+| Candidate | Read by anything? | Needs | Verdict |
+|---|---|---|---|
+| `coverage.yml`, job `coverage` | no (not a required check, no artifact consumer) | Docker (testcontainers), 44 to 55 min on 4 vCPU | **qualifies**, behind `CI_COVERAGE_ON_WORKER`, default hosted |
+| `coverage.yml`, job `sbom` | no | 34 s | stays hosted: nothing to gain |
+| `catalog-search-bench.yml` | its numbers are published as "on a GitHub runner" | a stack, up to 180 min | no: a different machine changes the numbers |
+| `g9-upload-large.yml` | same (`DATA-17-RESULT.md`) | reads container memory, 2 GiB files | no: same reason |
+| `security-all-branches.yml` | people | minutes, 03:17 UTC | no: about 2 job-minutes a day, off peak |
+| the nightly run | people | 42 jobs | no: the gates would collide on one machine, and the night has free hosted runners |
+
 ## MSRV
 
 `rust/Cargo.toml`'s `rust-version` is `1.99` (REL-9, product-owner decision
