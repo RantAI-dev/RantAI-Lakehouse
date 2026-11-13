@@ -36,6 +36,7 @@ import {
   renameItem,
   setInputTable,
   sqlStepReads,
+  sqlStepHint,
   stepCompletion,
   suggestInputName,
   updateStep,
@@ -481,5 +482,37 @@ describe("a step of a kind this console does not know", () => {
     expect(definitionBody(state.inputs, state.steps).steps[0]).toBe(join)
     expect(readableNames(state, 1)).toContain("joined")
     expect(editorProblems(state, OUTPUT).items["step-3"]).toBeUndefined()
+  })
+})
+
+// BLD-1 part 1 S3 review R1-S1 and R1-S8.
+describe("what a SQL step names in a table position", () => {
+  it("does not take a FROM inside a function call", () => {
+    expect(sqlStepReads("SELECT EXTRACT(YEAR FROM paid) FROM orders", ["orders", "paid"])).toEqual(["orders"])
+    expect(sqlStepReads("SELECT * FROM (SELECT * FROM paid) AS p", ["paid"])).toEqual(["paid"])
+  })
+
+  it("hints at a name that is not an input, an earlier step or a WITH name of its own", () => {
+    const readable = ["orders", "paid"]
+    expect(sqlStepHint("SELECT * FROM paid JOIN orders ON 1=1", readable)).toBeNull()
+    expect(sqlStepHint("WITH t AS (SELECT * FROM paid) SELECT * FROM t", readable)).toBeNull()
+    expect(sqlStepHint("SELECT TRIM(BOTH ' ' FROM name) FROM orders", readable)).toBeNull()
+    expect(sqlStepHint("SELECT * FROM orders_v2", readable)).toBe(
+      "This step reads orders_v2, which is not an input or an earlier step."
+    )
+    expect(sqlStepHint("SELECT * FROM silver.orders", readable)).toMatch(/^This step reads silver\.orders; a step reads an input by its name/)
+  })
+
+  it("keeps an input's name when its table changes and a SQL step names it", () => {
+    let state = editorStateFrom({
+      inputs: [{ name: "orders", zone: "bronze", table: "orders" }],
+      steps: [{ name: "s", kind: "sql", sql: "SELECT * FROM orders" }],
+    })
+    state = setInputTable(state, "input-1", "orders_v2")
+    expect(state.inputs[0]).toMatchObject({ name: "orders", table: "orders_v2" })
+    // With no step naming it, the name still follows the table.
+    let free = editorStateFrom({ inputs: [{ name: "orders", zone: "bronze", table: "orders" }], steps: [] })
+    free = setInputTable(free, "input-1", "orders_v2")
+    expect(free.inputs[0]).toMatchObject({ name: "orders_v2" })
   })
 })

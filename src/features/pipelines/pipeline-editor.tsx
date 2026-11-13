@@ -41,6 +41,8 @@ import {
   previewBody,
   previewKey,
   readableItems,
+  readableNames,
+  sqlStepHint,
   readsName,
   readsAsYouAfterSave,
   removeItem,
@@ -421,6 +423,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
             step={step}
             state={shownState}
             inputColumns={inputColumns}
+            hint={sqlStepHint(step.sql, readableNames(shownState, index))}
             onSql={(sql) => setEditor((prev) => updateStep(prev, step.id, { sql }))}
           />
         ) : (

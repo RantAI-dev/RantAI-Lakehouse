@@ -293,15 +293,18 @@ export function updateInput(state: EditorState, id: string, patch: Partial<Omit<
 }
 
 /**
- * Sets an input's table. While the input's name is blank or still the one
- * its previous table suggested, the name follows the table: picking
- * `orders` names the input `orders`, and a name the user typed is kept.
+ * Sets an input's table. While the input's name is blank, or still the one
+ * its previous table suggested and no step names it, the name follows the
+ * table: picking `orders` names the input `orders`, and a name the user
+ * typed is kept. BLD-1 part 1 S3 review R1-S1: once a step names the input,
+ * its name stays, so a SQL step that reads it by name is not left behind.
  */
 export function setInputTable(state: EditorState, id: string, table: string): EditorState {
   const input = state.inputs.find((candidate) => candidate.id === id)
   if (!input) return state
   const others = otherNames(state, id)
-  const followed = input.name === "" || input.name === suggestInputName(input.table, others)
+  const followed =
+    input.name === "" || (input.name === suggestInputName(input.table, others) && !inputIsNamed(state, id))
   const withTable = updateInput(state, id, { table })
   return followed ? renameItem(withTable, id, suggestInputName(table, others)) : withTable
 }
@@ -623,23 +626,44 @@ export function stepCompletion(
   return { tables, columns }
 }
 
-// ── what a SQL step reads, for drawing (D17 read view) ───────────────────
+// ── what a SQL step names (D17 read view, R1-S1 hint) ───────────────────
 
 /**
- * The names of `names` a SQL step reads right after a `FROM` or a `JOIN`,
- * in the order it first names them. The pipeline page draws an edge for
- * each; it is a drawing aid, not a check (the API's `StepReads` walk is
- * the check, D6a). It reads the text through the console's one scanner, so
- * a name inside a string or a comment is not taken; it compares as written,
- * case included, as the API does; and it leaves out what it cannot place
- * without a parser (a second table after a comma in `FROM a, b`), so an
- * edge it draws is one the step has and none is invented.
+ * Words that, right before a `(`, open a subquery or a grouping rather than
+ * a function call. After any other word a `(` is a call (`EXTRACT(`,
+ * `TRIM(`, `count(`), and a `FROM` inside it is not a table position.
  */
-export function sqlStepReads(sql: string, names: readonly string[]): string[] {
+const NOT_A_CALL = new Set([
+  "ALL", "AND", "ANY", "AS", "BY", "ELSE", "EXISTS", "FROM", "HAVING", "IN", "JOIN", "LATERAL", "NOT", "ON",
+  "OR", "SELECT", "SOME", "THEN", "UNION", "USING", "VALUES", "WHEN", "WHERE", "WITH",
+])
+
+/** One name a SQL step writes right after `FROM` or `JOIN`, outside any function call. */
+type TableWord = { name: string; qualified: boolean }
+
+/**
+ * The names a SQL step writes in a table position: right after `FROM` or
+ * `JOIN`, not inside a function call's brackets (`EXTRACT(year FROM paid)`
+ * names no table), not in a string or a comment (the console's one
+ * scanner), as written, case included. A name followed by `.` is a
+ * qualified one (`zone.table`). A second table after a comma (`FROM a, b`)
+ * is not placed: without a parser it cannot be told from a column list.
+ */
+function tableWords(sql: string): TableWord[] {
   const tokens = tokenizeSql(sql).filter((token) => token.kind !== "comment")
-  const out: string[] = []
+  const calls: boolean[] = []
+  const out: TableWord[] = []
   tokens.forEach((token, i) => {
     const previous = tokens[i - 1]
+    if (token.kind === "punctuation" && token.text === "(") {
+      calls.push(previous?.kind === "word" && !NOT_A_CALL.has(previous.text.toUpperCase()))
+      return
+    }
+    if (token.kind === "punctuation" && token.text === ")") {
+      calls.pop()
+      return
+    }
+    if (calls.includes(true)) return
     if (!previous || previous.kind !== "word" || !/^(FROM|JOIN)$/i.test(previous.text)) return
     // A backtick- or double-quoted name is the name inside the quotes.
     const name =
@@ -648,9 +672,76 @@ export function sqlStepReads(sql: string, names: readonly string[]): string[] {
         : token.kind === "quoted" && /^[`"]/.test(token.text)
           ? token.text.slice(1, -1)
           : null
-    // `zone.table` is not a step's name (D6a refuses it); skip a qualified one.
-    if (name === null || tokens[i + 1]?.text === ".") return
-    if (names.includes(name) && !out.includes(name)) out.push(name)
+    if (name === null) return
+    const qualified = tokens[i + 1]?.text === "."
+    out.push({ name: qualified ? `${name}.${tokens[i + 2]?.text ?? ""}` : name, qualified })
   })
   return out
+}
+
+/** The names a step declares in its own `WITH` (`name AS (`), which it may read. */
+function ownWithNames(sql: string): string[] {
+  const tokens = tokenizeSql(sql).filter((token) => token.kind !== "comment")
+  return tokens
+    .filter(
+      (token, i) =>
+        token.kind === "word" &&
+        tokens[i + 1]?.kind === "word" &&
+        tokens[i + 1]?.text.toUpperCase() === "AS" &&
+        tokens[i + 2]?.text === "("
+    )
+    .map((token) => token.text)
+}
+
+/**
+ * The names of `names` a SQL step reads in a table position, in the order
+ * it first names them (`tableWords`). The pipeline page draws an edge for
+ * each; it is a drawing aid, not a check (the API's `StepReads` walk is the
+ * check, D6a). What it cannot place is left out rather than guessed, and a
+ * name in a function call, a string or a comment is not taken
+ * (BLD-1 part 1 S3 review R1-S8).
+ */
+export function sqlStepReads(sql: string, names: readonly string[]): string[] {
+  const out: string[] = []
+  for (const word of tableWords(sql)) {
+    if (!word.qualified && names.includes(word.name) && !out.includes(word.name)) out.push(word.name)
+  }
+  return out
+}
+
+/**
+ * A hint for a SQL step that names, in a table position, something that is
+ * not an input, an earlier step or a `WITH` name of its own; `null` when it
+ * names none. BLD-1 part 1 S3 review R1-S1: so a rename or a table change
+ * that leaves the SQL behind is said on the page, not first by the API's
+ * refusal on save. The API stays the authority (D6a); this does not block a
+ * save.
+ */
+export function sqlStepHint(sql: string, readable: readonly string[]): string | null {
+  const own = ownWithNames(sql)
+  for (const word of tableWords(sql)) {
+    if (word.qualified)
+      return `This step reads ${word.name}; a step reads an input by its name in this pipeline. Add the table under Inputs.`
+    if (!readable.includes(word.name) && !own.includes(word.name))
+      return `This step reads ${word.name}, which is not an input or an earlier step.`
+  }
+  return null
+}
+
+/**
+ * Whether a step names the input `id`: a form step that reads it, or a SQL
+ * step whose text has its name as a word (outside strings and comments).
+ * Broad on purpose: it decides only whether the name may still follow the
+ * table (R1-S1), and keeping a name is the safe answer.
+ */
+function inputIsNamed(state: EditorState, id: string): boolean {
+  const name = state.inputs.find((input) => input.id === id)?.name ?? ""
+  return state.steps.some((step) => {
+    if (step.kind === "transform") return "id" in step.reads && step.reads.id === id
+    if (step.kind !== "sql" || name === "") return false
+    return tokenizeSql(step.sql).some(
+      (token) =>
+        (token.kind === "word" && token.text === name) || (token.kind === "quoted" && /^[`"]/.test(token.text) && token.text.slice(1, -1) === name)
+    )
+  })
 }

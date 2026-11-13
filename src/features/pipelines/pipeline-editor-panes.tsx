@@ -360,6 +360,7 @@ export function SqlStepPane({
   state,
   inputColumns,
   problem,
+  hint,
   onRename,
   onSql,
   onMove,
@@ -371,6 +372,8 @@ export function SqlStepPane({
   state: EditorState
   inputColumns: Readonly<Record<string, Column[] | null>>
   problem: React.ReactNode
+  /** R1-S1: a name the SQL reads that is not an input or an earlier step; does not block a save. */
+  hint: string | null
   onRename: (name: string) => void
   onSql: (sql: string) => void
   onMove: (delta: -1 | 1) => void
@@ -427,6 +430,7 @@ export function SqlStepPane({
           {length.toLocaleString("en-US")} of {MAX_SQL_CHARS.toLocaleString("en-US")} characters
         </p>
       </div>
+      {hint ? <PaneProblem message={hint} tone="hint" /> : null}
       {problem}
     </div>
   )

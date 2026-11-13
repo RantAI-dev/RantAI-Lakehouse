@@ -824,6 +824,26 @@ describe("the pipeline editor of inputs and steps (BLD-1 part 1)", () => {
     expect(body.steps).toEqual([join])
   })
 
+  // BLD-1 part 1 S3 review R1-S1: a table change does not rename an input a
+  // SQL step reads by name, and a name the SQL reads that is not an input is
+  // said on the step.
+  it("keeps an input's name under a SQL step when its table changes, and says when the SQL names no input", async () => {
+    const stored = existing()
+    stored.definition = {
+      ...stored.definition!,
+      steps: [{ name: "copy", kind: "sql", sql: "SELECT * FROM orders_raw" }],
+    }
+    renderEditor(stored)
+    fireEvent.change(await screen.findByPlaceholderText("orders_events"), { target: { value: "stock_raw" } })
+    expect((screen.getByLabelText("Name in this pipeline") as HTMLInputElement).value).toBe("orders_raw")
+
+    fireEvent.change(screen.getByLabelText("Name in this pipeline"), { target: { value: "stock" } })
+    selectRail(/1\. copy/)
+    expect(
+      await screen.findByText("This step reads orders_raw, which is not an input or an earlier step.")
+    ).toBeTruthy()
+  })
+
   it("moves and removes a step, and renames a step's reader with its input", async () => {
     renderEditor(twoSteps())
     selectRail(/2\. by_stock/)
