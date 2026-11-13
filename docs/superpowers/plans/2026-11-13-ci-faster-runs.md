@@ -1263,3 +1263,94 @@ The developer's handoff for this round, appended below this entry: the merge com
 any) and the fix commit; every self-test with its counts; the break-it-once results of R2
 and R5 (with the non-zero exit); the YAML check used; anything *not verified*; every
 MISMATCH.
+
+### Round 1, developer's handoff
+
+**Merge.** `main` had not moved: `origin/main` at `9d2c27dd` was already an ancestor of
+`15e167dd`, so there is no merge commit and nothing was rebased. Branch `ci/faster-runs`,
+head before this round `15e167dd`.
+
+**Fix commit.** `65793d44` — `fix(review): round 1 of OPS-24 (R1 to R12)`, one commit for
+R1 to R12. Pushed to `ci/faster-runs`; no force-push, no pull request opened.
+
+#### What was run, on `65793d44`, in the foreground
+
+```
+bash scripts/ci/tests/test_detect_change_scope.sh   → === Results: 51 passed, 0 failed ===  exit 0
+bash scripts/ci/tests/test_detect_push_proof.sh     → === Results: 38 passed, 0 failed ===  exit 0
+bash scripts/ci/tests/test_required_gate.sh         → === Results: 75 passed, 0 failed ===  exit 0
+bash scripts/ci/tests/test_select_runner.sh         → === Results: 23 passed, 0 failed ===  exit 0
+bash scripts/ci/tests/test_worker_prepare.sh        → === Results: 12 passed, 0 failed ===  exit 0
+python3 ops/lint/check_rust_embedded_paths.py       → 22 path(s) compiled into Rust from outside rust/, 0 without the rust scope  exit 0
+bash -n <the 5 scripts and their 5 self-tests>      → 0 syntax errors, exit 0
+python3 -c "import yaml,sys; [yaml.safe_load(open(f)) for f in sys.argv[1:]]" \
+  .github/workflows/*.yml                           → yaml ok, exit 0 (all 8 workflow files)
+python3 ops/lint/check_bare_iceberg_count.py        → R11 guard: no bare count() against a Bronze Iceberg table found.  exit 0
+python3 ops/lint/check_intra_package_imports.py     → OK: all intra-package dispar_orchestrate imports resolve  exit 0
+git status                                           → clean after the commit
+```
+
+Counts before this round were 38 / 24 / 72 / 17 / 9; the cases added by R3 to R10 take
+them to 51 / 38 / 75 / 23 / 12. No test was removed, no threshold lowered, no nextest
+retry added.
+
+`shellcheck` and `actionlint` are **not installed** on this machine, so the YAML check is
+the weaker `yaml.safe_load` one the plan allows: it parses all eight workflow files and
+knows nothing about expressions, contexts or `needs`.
+
+The new repo lint's own list: 22 paths compiled into Rust from outside `rust/`, every one
+sets `rust`; 2 are printed as skipped with the reason (the `fixture!` macro in
+`upload_parse.rs` builds its paths from a `macro_rules!` metavariable, and
+`ops/fixtures/**` already forces `all`).
+
+#### Break-it-once, R2 and R5
+
+Each break was applied in place, the check run, the file restored from a copy, and the
+check run again.
+
+| Break | Rule broken | With the break | Restored |
+|---|---|---|---|
+| A | the unreadable-base branch of `detect_change_scope.sh` writes `all=false` | `49 passed, 2 failed`, **exit 1** — `unreadable base SHA did not force all=true`, `a push with an unreadable base did not force all=true` | 51 / 0, exit 0 |
+| B | the base check skipped for `push`, and the `git diff failed` branch writes `all=false` (two edits, so that only the push block is broken) | `49 passed, 2 failed`, **exit 1** — `failed git diff did not force all=true (all=false)`, `a push with an unreadable base did not force all=true` | 51 / 0, exit 0 |
+| C | the R3 event branch writes `all=false` for a non-`push`/`pull_request` event | `49 passed, 2 failed`, **exit 1** — `a scheduled run did not force all=true`, `an event other than push and pull_request did not force all=true` | 51 / 0, exit 0 |
+| D | the renamed-sentinel `sed` in `test_detect_push_proof.sh` made a no-op, so the copy is identical | `37 passed, 1 failed`, **exit 1** — `the consistency check passed with a renamed sentinel` (before R2 this FAIL did not reach the count and the suite exited 0) | 38 / 0, exit 0 |
+| E | `public/geo/*` removed from the `rust` condition (R5) | `check_rust_embedded_paths.py` **exit 1** — `FAIL: public/geo/id-provinces.geojson (compiled in by rust/crates/lakehouse-bi/src/formula/compile.rs) does not set rust`; `test_detect_change_scope.sh` `50 passed, 1 failed`, **exit 1** | lint exit 0 (22 paths, 0 without rust), self-test 51 / 0 |
+
+B needed two edits because the push block's input (a null `github.event.before`) reaches
+the same unreadable-base branch as the pull-request block; one edit reddens both, which is
+what A shows. With both edits, only the push block fails.
+
+#### Notes (decisions taken inside a finding, no scope added)
+
+- **R4 for `CI_COVERAGE_ON_WORKER`** is implemented through `select_runner.sh`, which is
+  the "through `select_runner.sh`" option the finding allows: `coverage.yml` gains one
+  hosted job, `choose`, that only runs the script and hands
+  `needs.choose.outputs.coverage_runner` to `coverage`. No new action, no new permission,
+  no new secret. R10 rides on the same job: `REQUIRE_REF=refs/heads/main` and
+  `REF=github.ref`, so a manual dispatch of another branch is hosted.
+- **R7's shallow-clone case** answers `not a merge commit with one or two parents`: a
+  shallow fetch of the pushed commit shows it with no parents, and the script cannot
+  decide from that, so it says "not proven". The test asserts exactly that.
+- **A consequence of R4:** `grep -c "github.event_name == 'push' &&"` in `ci.yml` now
+  prints **2** (the two `cache-to` expressions), because the third occurrence was the
+  `proven` output that R4 replaced with the script's `push_full`. T1's check of the old
+  plan is satisfied again.
+
+#### Not verified
+
+- **No GitHub Actions run of this commit exists** (the developer does not open the pull
+  request). Every statement about a run is what to look for, not a measured result. In
+  particular: `coverage.yml`'s new `choose` job and the `needs:` chain, the container
+  clean-up on a worker, and `select_runner.sh`'s `REQUIRE_REF` on a real dispatch.
+- **`docker` was not invoked.** The R1 clean-up step is read and `bash -n`-checked only;
+  its `docker inspect` template and the label comparison were never run against a
+  container.
+- **`shellcheck` and `actionlint`** are not installed.
+- **`gh api --paginate`** is simulated in the proof test by two concatenated JSON
+  documents, not a recorded transcript; the script reads both the same way.
+- **`timeout 60` / `timeout 180` on a hung command** is not exercised: the tests drive
+  the exit-code paths (1 and 124), not a real hang.
+
+#### MISMATCH
+
+None. Every ruling of R1 to R12 is implemented as written.
