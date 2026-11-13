@@ -44,7 +44,7 @@ use crate::lakehouse_catalog::{self, CatalogAccessError};
 use crate::state::AppState;
 
 /// The namespace Bronze datasets' Iceberg tables live in.
-const BRONZE_NAMESPACE: &str = "bronze";
+pub(super) const BRONZE_NAMESPACE: &str = "bronze";
 
 const NOT_CONFIGURED: &str = "restore is not configured on this install";
 const NOT_ICEBERG: &str = "only an open table can be restored; this table is rewritten in place and keeps no dropped copy";

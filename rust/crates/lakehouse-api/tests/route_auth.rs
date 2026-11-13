@@ -1008,6 +1008,36 @@ async fn a_seeded_data_engineer_is_denied_the_undrop() {
     );
 }
 
+/// `DATA-55` (QA `LH-DATA-15-06`, `TC-1731`): dropping a table needs
+/// `governance:write`, for the status read and for the drop alike *(proposed,
+/// not yet signed, D6)*. A seeded Data Engineer holds `catalog:write` but not
+/// `governance:write`, so the permission middleware refuses both with the
+/// permission named.
+#[tokio::test]
+async fn a_seeded_data_engineer_is_denied_the_drop_and_its_status() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+    for method in ["GET", "POST"] {
+        let resp = request_with_cookie(
+            &router,
+            method,
+            "/api/catalog/commerce_orders/drop",
+            &cookie,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method}");
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        assert_eq!(
+            body.get("error").and_then(serde_json::Value::as_str),
+            Some("permission_denied: governance:write"),
+            "{method}: the 403 must come from the permission middleware"
+        );
+    }
+}
+
 /// `DATA-15` F4: the restore status read is `catalog:read`, which a seeded
 /// Analyst holds (and `governance:write` it does not), so the permission
 /// middleware must not refuse it. The first version of this check used the

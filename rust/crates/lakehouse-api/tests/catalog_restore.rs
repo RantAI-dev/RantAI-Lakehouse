@@ -653,3 +653,445 @@ async fn the_drop_status_of_a_dropped_table_says_it_is_already_dropped() {
     assert_eq!(body["droppable"], json!(false));
     assert_eq!(body["reason"], json!(ALREADY_DROPPED));
 }
+
+/// The keep could not be confirmed, so nothing was dropped (`DATA-55` D3).
+const KEEP_UNCONFIRMED: &str = "The catalog could not confirm that a dropped table is kept for 7 days, so nothing was dropped. Try again shortly.";
+/// The `allowed` entry could not be written, so nothing was dropped (D8).
+const NOT_AUDITED: &str =
+    "The drop could not be written to the audit trail, so nothing was dropped.";
+/// The catalog holds no table of that name (`DATA-55` D5).
+const NO_TABLE: &str = "There is no table to drop: the catalog holds no table of that name.";
+/// The catalog refused the drop (`DATA-55` D5).
+const REFUSED: &str = "The catalog refused to drop the table. Nothing was dropped.";
+/// The catalog did not answer, so the outcome is not known (`DATA-55` D5).
+const UNKNOWN: &str = "The catalog did not answer, so it is not known whether the table was dropped. Open the table's page again: it says so if it was.";
+
+/// The warehouse lookup, the keep write and the one `DELETE` the drop sends
+/// (`DATA-55` D2/D3): the profile `POST` answers 204, and the catalog's drop
+/// answers `template`, `times` times.
+async fn mount_drop(server: &MockServer, template: ResponseTemplate, times: u64) {
+    mount_warehouse(server).await;
+    Mock::given(method("POST"))
+        .and(path("/management/v1/warehouse/wh-1/delete-profile"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/catalog/v1/wh-1/namespaces/bronze/tables/orders"))
+        .respond_with(template)
+        .expect(times)
+        .mount(server)
+        .await;
+}
+
+/// How many `DELETE` requests the server received: the drop's own call, and
+/// nothing else this file sends one for.
+async fn deletes(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method.as_str() == "DELETE")
+        .count()
+}
+
+/// The statement of T4's "the audit entry cannot be written" tests: a check
+/// constraint that refuses every `catalog.drop` row, in this test's own
+/// database.
+async fn refuse_drop_audit(pool: &sqlx::PgPool, action: &str) {
+    // A `CHECK` expression cannot take a bind parameter, and both callers pass
+    // one of this file's own constants, never a value a caller chose.
+    let sql = format!(
+        "ALTER TABLE audit_event ADD CONSTRAINT no_drop_audit CHECK (action <> '{action}')"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+        .execute(pool)
+        .await
+        .expect("the audit table takes the constraint");
+}
+
+/// `DATA-55` D2/D8: a permitted person drops an upload's table, the catalog is
+/// asked once, and the record and the answer carry the counted rows and the
+/// 7-day window.
+#[tokio::test]
+async fn a_permitted_person_drops_an_uploads_table_and_the_catalog_is_asked_once() {
+    let server = MockServer::start().await;
+    mount_row_count(&server, 1234).await;
+    mount_registry(&server, "orders").await;
+    mount_drop(&server, ResponseTemplate::new(204), 1).await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    claim(&pool, CATALOG_TENANT, "orders").await;
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let (status, body) = call(&router, "POST", DROP, &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], json!(true));
+    assert_eq!(body["table"], json!("bronze.orders"));
+    assert_eq!(body["rowCount"], json!(1234));
+    let dropped_at = time::OffsetDateTime::parse(
+        body["droppedAt"].as_str().expect("a droppedAt"),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .expect("RFC 3339 droppedAt");
+    let expires_at = time::OffsetDateTime::parse(
+        body["expiresAt"].as_str().expect("an expiresAt"),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .expect("RFC 3339 expiresAt");
+    assert_eq!(
+        (expires_at - dropped_at).whole_seconds(),
+        604_800,
+        "the answer names the 7 days the catalog keeps"
+    );
+
+    assert_eq!(deletes(&server).await, 1, "the catalog is asked once");
+    let requests = server.received_requests().await.unwrap();
+    let profile = requests
+        .iter()
+        .position(|r| r.url.path().ends_with("/delete-profile"))
+        .expect("the keep was written");
+    let drop = requests
+        .iter()
+        .position(|r| r.method.as_str() == "DELETE")
+        .expect("the drop was sent");
+    assert!(
+        profile < drop,
+        "the keep is written before the table is dropped"
+    );
+
+    let recorded: (String, Option<i64>) = sqlx::query_as(
+        "SELECT dropped_by, row_count FROM upload_table_drop WHERE bronze_table = 'orders'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(recorded.0, "Single Perm Test User");
+    assert_eq!(recorded.1, Some(1234));
+}
+
+/// `DATA-55` D8: two entries per action, `allowed` then `executed`, each
+/// naming who, which table and its row count.
+#[tokio::test]
+async fn the_drop_writes_who_dropped_which_table_and_its_row_count_to_the_audit_trail() {
+    let server = MockServer::start().await;
+    mount_row_count(&server, 1234).await;
+    mount_registry(&server, "orders").await;
+    mount_drop(&server, ResponseTemplate::new(204), 1).await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    claim(&pool, CATALOG_TENANT, "orders").await;
+    let user = create_principal_with_permissions(&pool, "catalog:read, governance:write").await;
+    in_the_catalog_tenant(&pool, user).await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let (status, body) = call(&router, "POST", DROP, &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let rows: Vec<(String, Option<String>, Value)> = sqlx::query_as(
+        "SELECT outcome, principal_id, args FROM audit_event \
+          WHERE action = 'catalog.drop' AND resource_id = 'orders' ORDER BY at, id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2, "one entry before and one after: {rows:?}");
+    assert_eq!(rows[0].0, "allowed");
+    assert_eq!(rows[1].0, "executed");
+    for (_, principal_id, args) in &rows {
+        assert_eq!(principal_id.as_deref(), Some(user.to_string().as_str()));
+        assert_eq!(args["table"], json!("orders"));
+        assert_eq!(args["rowCount"], json!(1234));
+        assert_eq!(args["keptDays"], json!(7));
+    }
+}
+
+/// `DATA-55` D9: a second drop is a clear `409` and the catalog is not asked
+/// again — answering "dropped" twice would name a second person on a drop
+/// they did not make.
+#[tokio::test]
+async fn a_second_drop_of_a_dropped_table_is_a_409_and_the_catalog_is_not_asked_again() {
+    let server = MockServer::start().await;
+    mount_row_count(&server, 7).await;
+    mount_registry(&server, "orders").await;
+    mount_drop(&server, ResponseTemplate::new(204), 1).await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    claim(&pool, CATALOG_TENANT, "orders").await;
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let (status, body) = call(&router, "POST", DROP, &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(&router, "POST", DROP, &cookie).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], json!(ALREADY_DROPPED));
+    assert_eq!(deletes(&server).await, 1, "the catalog was asked once only");
+}
+
+/// `DATA-55` D4/D5: none of a connector's table, another tenant's upload's
+/// table, a name a connector also targets and a Silver table is dropped, and
+/// the catalog is never asked.
+#[tokio::test]
+async fn a_table_that_is_not_an_upload_of_the_callers_tenant_is_not_dropped_and_the_catalog_is_not_asked()
+ {
+    let server = MockServer::start().await;
+    mount_registry(&server, "orders").await;
+    mount_drop(&server, ResponseTemplate::new(204), 0).await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let (status, body) = call(&router, "POST", DROP, &cookie).await;
+    assert_eq!(status, StatusCode::CONFLICT, "no claim at all: {body}");
+    assert_eq!(body["error"], json!(ONLY_UPLOAD));
+
+    claim(&pool, "11111111-1111-4111-8111-000000000002", "orders").await;
+    let (status, body) = call(&router, "POST", DROP, &cookie).await;
+    assert_eq!(status, StatusCode::CONFLICT, "another tenant: {body}");
+    assert_eq!(body["error"], json!(ONLY_UPLOAD));
+
+    sqlx::query("DELETE FROM upload_table_claim WHERE bronze_table = 'orders'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    claim(&pool, CATALOG_TENANT, "orders").await;
+    sqlx::query(
+        "UPDATE connector SET source_objects = '[{\"name\":\"public.orders\",\"target\":\"orders\"}]'::jsonb \
+         WHERE id = 'conn-pg-lakehouse'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (status, body) = call(&router, "POST", DROP, &cookie).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a connector targets it: {body}"
+    );
+    assert_eq!(body["error"], json!(ONLY_UPLOAD));
+
+    let (status, body) = call(&router, "POST", "/api/catalog/silver.orders/drop", &cookie).await;
+    assert_eq!(status, StatusCode::CONFLICT, "a Silver table: {body}");
+    assert_eq!(body["error"], json!(ONLY_UPLOAD));
+
+    assert_eq!(deletes(&server).await, 0, "nothing was dropped");
+    let audited: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_event WHERE action = 'catalog.drop'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(audited, 0, "a refused drop writes no audit entry");
+}
+
+/// `DATA-55` D4 rule 5: a table a load is running into is not dropped.
+#[tokio::test]
+async fn a_table_with_a_load_in_progress_is_not_dropped() {
+    let server = MockServer::start().await;
+    mount_registry(&server, "orders").await;
+    mount_drop(&server, ResponseTemplate::new(204), 0).await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    let tenant_id = Uuid::parse_str(CATALOG_TENANT).expect("a tenant id");
+    uploads::insert(
+        &pool,
+        &NewUpload {
+            id: "up-1",
+            original_filename: "stock.csv",
+            storage_key: "uploads/up-1/up-1.csv",
+            content_type: "text/csv",
+            size_bytes: 8,
+            sha256: "",
+            uploaded_by: "Seeded Uploader",
+            tenant_id,
+        },
+    )
+    .await
+    .unwrap();
+    claim(&pool, CATALOG_TENANT, "orders").await;
+    let options = json!({ "encoding": "utf-8", "delimiter": ",", "headerRow": 0 });
+    uploads::mark_ingesting(&pool, "up-1", &options, "orders", LoadMode::Replace, None)
+        .await
+        .unwrap()
+        .expect("the upload is loadable");
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let (status, body) = call(&router, "POST", DROP, &cookie).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], json!(LOADING));
+    assert_eq!(deletes(&server).await, 0);
+}
+
+/// `DATA-55` D5: a table the caller's roles may not read is a `404` as for an
+/// unknown asset, and learns nothing else.
+#[tokio::test]
+async fn a_caller_whose_role_does_not_read_the_table_cannot_drop_it_and_learns_nothing() {
+    let server = MockServer::start().await;
+    mount_registry(&server, "orders").await;
+    mount_drop(&server, ResponseTemplate::new(204), 0).await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    claim(&pool, CATALOG_TENANT, "orders").await;
+    let user = create_principal_with_permissions(&pool, "catalog:read, governance:write").await;
+    in_the_catalog_tenant(&pool, user).await;
+    narrow(&pool, user, &[("finance", "*")]).await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let (status, body) = call(&router, "POST", DROP, &cookie).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], json!("Asset not found"));
+    assert_eq!(deletes(&server).await, 0);
+}
+
+/// `DATA-55` D8: a drop whose `allowed` entry cannot be written does not
+/// happen, and the catalog is not asked.
+#[tokio::test]
+async fn a_drop_is_refused_when_its_audit_entry_cannot_be_written() {
+    let server = MockServer::start().await;
+    mount_row_count(&server, 3).await;
+    mount_registry(&server, "orders").await;
+    mount_drop(&server, ResponseTemplate::new(204), 0).await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    claim(&pool, CATALOG_TENANT, "orders").await;
+    refuse_drop_audit(&pool, "catalog.drop").await;
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let (status, body) = call(&router, "POST", DROP, &cookie).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"], json!(NOT_AUDITED));
+    assert_eq!(deletes(&server).await, 0);
+    let recorded: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM upload_table_drop WHERE bronze_table = 'orders'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(recorded, 0, "no record was written");
+}
+
+/// `DATA-55` D3: the keep is written before every drop, and nothing is dropped
+/// when it cannot be confirmed.
+#[tokio::test]
+async fn a_drop_is_refused_when_the_seven_day_keep_cannot_be_confirmed() {
+    let server = MockServer::start().await;
+    mount_registry(&server, "orders").await;
+    mount_warehouse(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/management/v1/warehouse/wh-1/delete-profile"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/catalog/v1/wh-1/namespaces/bronze/tables/orders"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    claim(&pool, CATALOG_TENANT, "orders").await;
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let (status, body) = call(&router, "POST", DROP, &cookie).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"], json!(KEEP_UNCONFIRMED));
+    assert_eq!(deletes(&server).await, 0);
+}
+
+/// `DATA-55` D5/D8: a catalog that does not answer leaves no record, writes
+/// `allowed` then `failed`, and never puts the catalog's own text on screen.
+#[tokio::test]
+async fn a_catalog_that_does_not_answer_the_drop_leaves_no_record_and_no_upstream_text() {
+    const MARKER: &str = "planted-upstream-marker";
+    let server = MockServer::start().await;
+    mount_row_count(&server, 3).await;
+    mount_registry(&server, "orders").await;
+    mount_drop(
+        &server,
+        ResponseTemplate::new(500).set_body_string(MARKER),
+        1,
+    )
+    .await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    claim(&pool, CATALOG_TENANT, "orders").await;
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let (status, body) = call(&router, "POST", DROP, &cookie).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"], json!(UNKNOWN));
+    assert!(
+        !body.to_string().contains(MARKER),
+        "upstream text reached the response: {body}"
+    );
+    let recorded: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM upload_table_drop WHERE bronze_table = 'orders'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        recorded, 0,
+        "the record of a drop that did not happen is gone"
+    );
+    let outcomes: Vec<String> = sqlx::query_scalar(
+        "SELECT outcome FROM audit_event WHERE action = 'catalog.drop' ORDER BY at, id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(outcomes, vec!["allowed", "failed"]);
+}
+
+/// `DATA-55` D5: a catalog that has no such table, or refuses the drop, is a
+/// `409` in our own words, with no record left behind.
+#[tokio::test]
+async fn a_catalog_that_refuses_the_drop_or_has_no_such_table_is_a_409_with_no_upstream_text() {
+    const MARKER: &str = "planted-upstream-marker";
+
+    let refused = MockServer::start().await;
+    mount_row_count(&refused, 3).await;
+    mount_registry(&refused, "orders").await;
+    mount_drop(
+        &refused,
+        ResponseTemplate::new(403).set_body_string(MARKER),
+        1,
+    )
+    .await;
+    let TestApp { router, pool } = drop_app(&refused, true).await;
+    claim(&pool, CATALOG_TENANT, "orders").await;
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+    let (status, body) = call(&router, "POST", DROP, &cookie).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], json!(REFUSED));
+    assert!(!body.to_string().contains(MARKER), "{body}");
+    let recorded: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM upload_table_drop WHERE bronze_table = 'orders'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(recorded, 0);
+
+    let missing = MockServer::start().await;
+    mount_row_count(&missing, 3).await;
+    mount_registry(&missing, "orders").await;
+    mount_drop(&missing, ResponseTemplate::new(404), 1).await;
+    let TestApp { router, pool } = drop_app(&missing, true).await;
+    claim(&pool, CATALOG_TENANT, "orders").await;
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+    let (status, body) = call(&router, "POST", DROP, &cookie).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], json!(NO_TABLE));
+    let recorded: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM upload_table_drop WHERE bronze_table = 'orders'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(recorded, 0);
+}
+
+/// `DATA-55` D3/D4 rule 6: with no admin client nothing is dropped, and the
+/// answer says why.
+#[tokio::test]
+async fn without_the_admin_client_nothing_is_dropped() {
+    let server = MockServer::start().await;
+    mount_registry(&server, "orders").await;
+    let TestApp { router, pool } = drop_app(&server, false).await;
+    claim(&pool, CATALOG_TENANT, "orders").await;
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let (status, body) = call(&router, "POST", DROP, &cookie).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"], json!(NOT_SET_UP));
+    assert_eq!(deletes(&server).await, 0);
+}

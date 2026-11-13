@@ -297,6 +297,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // D6)*: it is the one the signed decision gives the restore, so whoever is
     // offered Drop table is also offered Restore on the same page.
     ("GET", "/api/catalog/{id}/drop",                    Policy::RequiresPermission("governance:write")),
+    ("POST", "/api/catalog/{id}/drop",                   Policy::RequiresPermission("governance:write")),
 
     // ── Lakehouse (WS2 §4): the read-only Iceberg warehouse/namespace/
     //    table surface, gated by the same seeded `catalog:read` permission
@@ -1403,6 +1404,16 @@ mod tests {
     fn the_drop_status_needs_governance_write() {
         assert_eq!(
             policy_for("GET", "/api/catalog/{id}/drop"),
+            Some(Policy::RequiresPermission("governance:write"))
+        );
+    }
+
+    /// `DATA-55` D6: dropping a table needs `governance:write` (proposed, not
+    /// yet signed), the permission the restore already takes.
+    #[test]
+    fn dropping_a_table_needs_governance_write() {
+        assert_eq!(
+            policy_for("POST", "/api/catalog/{id}/drop"),
             Some(Policy::RequiresPermission("governance:write"))
         );
     }

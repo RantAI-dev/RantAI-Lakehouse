@@ -761,7 +761,10 @@ fn catalog_access_router() -> Router<AppState> {
         // `DATA-55` (QA `LH-DATA-15-06`, `TC-1731`): drop a table a file upload
         // made, keeping the catalog's soft delete so the restore above can
         // bring it back.
-        .route("/api/catalog/{id}/drop", get(catalog_drop::status))
+        .route(
+            "/api/catalog/{id}/drop",
+            get(catalog_drop::status).post(catalog_drop::drop_table),
+        )
 }
 
 /// The `/api/overview/alerts/*` sub-router (Task 2.6), split out for the
