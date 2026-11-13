@@ -1328,3 +1328,217 @@ git status                                                     clean
   re-worded (no predicate added, no test or threshold changed).
 
 ## 6. Review
+
+### Round 1 (planner, 2026-11-13, at `285af382`)
+
+Reviewed against sections 0 to 4 as a feature that drops data (an independent reviewer's
+notes, then the planner's rulings). The Rust code was read, not built, on the planner's
+machine; CI on the pull request (#501) is the run and was still going. The console was run
+in a clean checkout of the branch: `bun run typecheck` clean; `bun run lint` 0 errors, 11
+warnings; `bun run test` 4206 pass, 1 skip, 0 fail across 388 files.
+
+What holds: no path was found by which a connector's table, a Silver or Gold table, another
+tenant's table, an unclaimed table or a table being loaded reaches the catalog's `DELETE`;
+there is no `*:*` bypass and no purge; the name checked is the name sent; the 7-day keep is
+written before every drop; no existing test was weakened, removed, renamed or ignored. The
+developer's MISMATCH about the seeded connector changes the tests' own database only, and a
+test where a connector targets the name and the drop is refused is still there.
+
+Two BLOCKERs, both about a state nobody recorded. R2 is the planner's own error in D8.
+The fixes go in the commits named below, in this order, after `main` is merged into the
+branch (it moved: `43d36f55b`; the merge is clean by `git merge-tree`). One commit per R
+group as listed; push after each.
+
+**Commit A, `fix(review): the drop keeps its record when the outcome is not known (R1, R2, R7)`**
+
+- **R1. BLOCKER: a hanging catalog or a closed tab stops the drop between the record and its
+  ending.** The admin client has no request timeout (`lakehouse-auth/src/openfga.rs`,
+  `reqwest::Client::new()`), so a catalog that accepts the connection and does not answer is
+  ended only by the route's 60-second deadline (`routes/mod.rs`, the `tokio::time::timeout`
+  around `next.run`), which drops the handler at its current `.await`; a client that
+  disconnects drops it the same way. If that lands inside `admin.drop_table(...)`, the
+  record and the `allowed` entry stay, no `executed` or `failed` is written, nothing is
+  logged, and the caller gets a 408. Fix, all three parts:
+  1. In `LakekeeperAdminClient::drop_table`, the `DELETE` request gets its own bound,
+     `.timeout(Duration::from_secs(15))`, with a named constant and a doc saying why (a
+     hang becomes `OpenfgaError::Transport`). Do not change the client's other calls.
+  2. In `routes/catalog_drop.rs`, everything from the first audit entry (`audit_first`) to
+     the closing audit entry runs inside ONE `tokio::spawn`ed task that the handler awaits
+     (`handle.await`, a join error is a 500 with a fixed sentence and one `tracing::error!`).
+     A deadline or a disconnect then stops only the waiting, never the work between the
+     record and its ending. The checks before the audit entry stay in the handler. Say this
+     in a comment at the spawn (`DATA-55 review R1`). Clone or move what the task needs
+     (`AppState` is `Clone`); no reference may cross the spawn.
+  3. Do the same in `catalog_restore.rs` for the restore's stretch from its first audit
+     entry to its closing one.
+- **R2. BLOCKER (D8 step 5 was wrong): an unknown outcome removed the record.** For
+  `OpenfgaError::Transport` and `Server` the answer says "it is not known whether the table
+  was dropped", and the code then removed the record as if it were known that it was not.
+  If the catalog had dropped the table, the name was open to the very load D11 exists to
+  refuse, the table was missing from the list of dropped tables, and the trail's last word
+  was `failed`. **D8 step 5 is replaced by this rule** (the planner's decision):
+  - A definite refusal by the catalog (a 4xx): as built. The record is removed, `failed`
+    is written, the answer is D5's.
+  - An unknown outcome (`Transport`, `Server`): ask the catalog once whether the table is
+    among the deleted ones, `admin.find_deleted_table(&warehouse, BRONZE_NAMESPACE, &table)`,
+    inside `tokio::time::timeout(Duration::from_secs(10), …)`:
+    - it is there: the drop happened. Keep the record, write `executed`, answer `200` as a
+      successful drop;
+    - it is not there AND `catalog_restore::table_exists` says the table exists: the drop
+      did not happen. Remove the record, write `failed`, answer D5's `503` "The catalog did
+      not answer, so it is not known …" is no longer true here, so answer `503` with a new
+      fixed sentence: `The catalog did not answer and the table was not dropped. Try again
+      shortly.`;
+    - anything else (the lookup failed, timed out, or the two answers do not agree): **keep
+      the record** (the name stays closed: fail closed), write `failed` with the reason
+      `the outcome is not known`, answer `503` with D5's existing sentence ("… it is not
+      known whether the table was dropped. Open the table's page again: it says so if it
+      was.").
+  - **A kept record must not lock a live table for 7 days.** Where a record is read to
+    refuse something (`assess` rule 4 in `catalog_drop.rs`, and the dropped-name refusal
+    T6 added to `ensure_table_free` in `routes/uploads.rs`): believe the record only while
+    the table is absent. Call `catalog_restore::table_exists` (the function the restore
+    already uses; make it `pub(super)` if needed, do not copy it): if the table EXISTS, the
+    record is stale: remove it (`forget_table_drop`), log one `tracing::warn!` with the
+    table name, and go on as if there were no record; if the check itself fails, the record
+    stands (treated as dropped). The list of dropped tables (`GET /api/catalog/dropped/tables`)
+    is not changed by this: it shows records, and a stale one disappears at the next read
+    that heals it.
+  - The restore's mirror case (`catalog_restore.rs`): an undrop that answers `Transport` or
+    `Server` may have happened. Apply the same idea: check `table_exists` once (10-second
+    bound); if the table exists, the restore happened: clear the record, write `executed`,
+    answer as a success; otherwise leave the record, write `failed`, answer as today.
+  - Rewrite the test `a_catalog_that_does_not_answer_the_drop_leaves_no_record_and_no_upstream_text`
+    for the new rule (rule 2: the old assertion pinned the planner's wrong decision; say so
+    in the commit body) into three tests, full-sentence names: the catalog answers 500 and
+    then lists the table as deleted (record kept, `allowed` then `executed`, 200); answers
+    500 and the table still exists (record removed, `failed`, the new 503 sentence); answers
+    500 and the lookup fails too (record KEPT, `failed`, D5's 503 sentence, no upstream
+    text). Add: a catalog that does not answer at all within the client's bound
+    (`ResponseTemplate::new(204).set_delay(Duration::from_secs(20))`; to keep the test
+    short, the bound may be read from a `#[cfg(test)]`-settable constant or the client may
+    take the bound as a constructor argument the test sets to 1 second: choose the smaller
+    change and say which) ends as the third case. Add: a stale record for a table that
+    exists is removed by the next status read and by the next load, and the load goes
+    through. Add the two tests for the restore's mirror case.
+- **R7. SHOULD-FIX: an `allowed` entry with no ending, and a refusal blamed on the
+  catalog.** (a) Compute `kept_seconds` (the `i64::try_from` guard) BEFORE `audit_first`,
+  and when the record insert fails write `failed` ("the drop could not be recorded") before
+  returning the error, so every `allowed` has an ending (D8: two entries per action).
+  (b) A registry table name that is not a plain identifier is refused inside the client
+  after `allowed` and the record are written, and is then audited as "the catalog refused".
+  Test the name in `assess` rule 1 with the client's own check (expose
+  `is_plain_identifier` from `lakehouse-auth`; do not write a second copy) and answer D5's
+  one sentence `Only a table made by a file upload can be dropped here.` there, before
+  anything is written. One test: a registry name with a `/` in it is refused with that
+  sentence, no audit entry, no record, no `DELETE`.
+
+**Commit B, `fix(review): a load and a drop of one table cannot both pass (R3)`**
+
+- **R3. SHOULD-FIX: up to 30 seconds lie between "no load is running" and the record.**
+  Rule 5 is read once in `assess`; the row count (up to 30 seconds) and two catalog calls
+  run before the record closes the name; on the load side `ensure_table_free` runs before a
+  workbook conversion and `claim_load`. A load and a drop can each pass the other's check.
+  Section 4 called this "the same instant"; it is tens of seconds. Each side now writes
+  first and checks second, so one of the two always sees the other:
+  1. `drop_table`: directly after the record is written, ask `uploads::loading_into` again
+     (settled as in `assess`). If a load is `ingesting`: remove the record, write `failed`,
+     answer the existing `409` "A file is being loaded into this table, so it cannot be
+     dropped yet.", and do not ask the catalog.
+  2. `ingest` (`routes/uploads.rs`): directly after `claim_load` marked the upload
+     `ingesting`, read `uploads::dropped_table` for the name (with R2's healing rule). If
+     it is dropped: settle the claim as failed the way a refused launch does (find the
+     existing path; do not write a new one) and answer T6's `409`, before `launch`.
+  Tests: one where the record appears between `ensure_table_free` and `claim_load` (write
+  the record directly through the store in the test, with the stand-ins arranged so the
+  load reaches `claim_load`): the load answers T6's 409, nothing is launched, the upload is
+  not left `ingesting`. One where an upload is `ingesting` when the drop's second check
+  runs: 409, no `DELETE`, no record left, `allowed` then `failed`. If the first cannot be
+  arranged through the route without a hook, write a unit-level test of the second check
+  and say in the handoff what is not covered.
+
+**Commit C, `test(review): the refusals and failure paths of the drop that had no test (R5)`**
+
+- **R5. SHOULD-FIX: rows of D5 and paths of D8 with no test.** Add, in
+  `tests/catalog_restore.rs`, full-sentence names, each asserting the status, the exact
+  sentence, that the catalog stand-in received NO `DELETE` where one must not be sent, and
+  the record and audit state:
+  1. the tenant gate on the three routes: `403` with the gate's reason on `POST …/drop`,
+     `200 { "supported": false }` on `GET …/drop`, `{ "supported": false, "tables": [] }`
+     on the list;
+  2. an unknown id is `404 Asset not found` on `GET` and `POST …/drop` (the registry
+     stand-in must answer "no such dataset" for that id: today it names a table for every
+     slug);
+  3. the warehouse cannot be looked up (an error, and "no such warehouse"): `503`, D5's
+     sentence, no `DELETE`;
+  4. the record insert fails: the store's `database error`, no `DELETE`, `allowed` then
+     `failed` (after R7);
+  5. two `POST …/drop` at once (`tokio::join!`): exactly one `200`, one `409`, one `DELETE`;
+  6. a drop whose rows cannot be counted still drops, with `rowCount: null` in the answer,
+     in the record and in both audit entries;
+  7. the list for a `*:*` caller who is in no tenant is empty, and the list stops at 100;
+  8. `the_drop_status_says_null_when_the_rows_cannot_be_counted_and_never_zero` gets its
+     `null` from a count query the stand-in answers with a 500, not from a registry row
+     without `n`. Change the stand-in for that test, not the assertion.
+  If a test cannot be made to fail-then-pass honestly (for example the record insert
+  failure needs a fault the test database cannot produce without changing product code),
+  do not fake it: say in the handoff which case is not tested and why.
+
+**Commit D, `docs(review): comments say what the code does, and cite the cases (R6, R9, R10)`**
+
+- **R6. SHOULD-FIX (rule 1): doc comments that say what the code does not do.**
+  `catalog_drop.rs`: `status` and `list` claim a `403` for the tenant gate, they answer
+  `200` with `supported: false`; `drop_table`'s `# Errors` omits the `400` of an over-long
+  id and the `500`s; the module doc lists two routes, the file has three; "Each failure
+  before the catalog answers leaves nothing behind" is rewritten to what holds after R1,
+  R2 and R7. `rust/migrations/0141_upload_table_drop.sql` (not applied anywhere yet, so its
+  header may be corrected in this branch): the crate is `lakehouse-auth`, not
+  `lakekeeper-auth`; and "so the API and the catalog agree on when the window ends" is not
+  true (the catalog stamps its own, later time): say the record's end is the API's own
+  clock and may differ from the catalog's by the seconds between the insert and the
+  `DELETE`. `lakehouse-store/src/uploads.rs`, the list's doc: "because no caller of the
+  list has none" is false for a `*:*` principal in no tenant; say that such a caller is
+  shown nothing. `lakehouse-auth/src/openfga.rs`, `drop_table`'s doc: `Transport` also
+  covers a connection lost after the catalog acted. `src/features/catalog/dropped-tables.tsx`:
+  the comment about `clockNow()` says the opposite of where it is called; make it true.
+- **R9. SHOULD-FIX: small console texts.** `dropped-tables.tsx`: one row reads "1 rows";
+  use the singular as the dialog does, and add the case to `dropped-tables.test.tsx`. The
+  test "says less than a day is left on the last day" pins `expiresAt` equal to now, which
+  the server never lists: rename it to what it pins (`says less than a day is left for a
+  row at its end`); D15's text is unchanged. In `asset-detail-tabs.test.tsx`, "offers Drop
+  table on the Snapshots card…" must find the button inside that card (`within(...)`), not
+  anywhere on the page.
+- **R10. SHOULD-FIX (D16, rule 13).** These fix sites cite `DATA-55` without the cases; add
+  `(QA LH-DATA-15-06, TC-1731)`: `lakehouse-auth/src/openfga.rs` (the two new sites),
+  `routes/catalog_restore.rs` (the four changed sites), `lakehouse-store/src/uploads.rs`
+  (the type and the new functions: one citation on the section's first item is enough, say
+  "and the functions below"), `src/services/contracts/assets.ts` (the three types),
+  `src/components/patterns/confirm-action-dialog.tsx`.
+
+**Not for the developer.**
+
+- **R4.** `POST /api/pipelines/runs/{runId}/retry` re-executes any run that is not an
+  authored pipeline's, so a person with `pipeline:write` can re-run an old file load with
+  its old table name, around `ensure_table_free` and around rule 5. The gap is older than
+  this branch; D11 makes it matter. Read, not run. It gets its own backlog row (the
+  planner files it), and the feature page's limits get one line in commit D:
+  `docs/core/features/asset-page-depth.md`, at the end of "Limits to tell a customer":
+  "- Re-running an old file load from the Pipelines page is not stopped by a drop: it can
+  load into a dropped table's name during the 7 days, after which that dropped table can
+  no longer be restored. To be closed in its own item. *(proposed, not yet signed)*".
+- **R8.** The handoff's reason for the `route_auth` count is wrong (the loops add no test;
+  the file has 94 tests of its own, one new, plus the `tls_proxy` test), the number 95 is
+  right. No change. The testcontainer leftovers the handoff names are the planner's to
+  remove.
+- **Section 4 is corrected by this entry:** the race of a load and a drop is not "the same
+  instant" and is closed by R3; "no data is lost" holds only with R2 and R3 in.
+
+The developer's handoff for this round, appended below this entry: the merge commit, the
+four commits, every command with its counts (`cargo fmt --check`; `cargo clippy -p
+lakehouse-api --all-targets -- -D warnings`, the same for `lakehouse-auth` and
+`lakehouse-store`; `cargo test -p lakehouse-auth --test openfga`; `cargo test -p
+lakehouse-store --test uploads`; `cargo test -p lakehouse-api --test catalog_restore`;
+`--test upload_routes`; `--test sec11_guard`; `--test route_auth`; `bun run typecheck`;
+`bun run lint`; `bun test src/features/catalog`; `bun run test` once), each new test by
+name, each case of R5 or R3 that could not be tested with the reason, and how the client's
+bound is set in the R1 test.
