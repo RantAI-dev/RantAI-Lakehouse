@@ -180,6 +180,13 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "the tenant gate's own fixed sentence (SEC-20's 404 or D6's 422), written in this repository",
     ),
     (
+        // `BI-45` (QA `LH-BI-5-01`): the assistant's reply for a save the gate
+        // refused. The same gate error `run_spec_sql` shows in its tile above.
+        "support.rs",
+        "SpecRunFailure::Gated(err) => json!({ \"error\": err.to_string() }),",
+        "the tenant gate's own fixed sentence (SEC-20's 404 or D6's 422), written in this repository",
+    ),
+    (
         "quality.rs",
         "Invalid request body: {err}",
         "serde error over the caller's own request body",
@@ -200,11 +207,6 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     // Our own validators: the text is written in this repository.
     (
         "authored_pipelines.rs",
-        "invalid transform at transforms[{index}]: {err}",
-        "transform_grammar's own validation message",
-    ),
-    (
-        "pipelines.rs",
         "invalid transform at transforms[{index}]: {err}",
         "transform_grammar's own validation message",
     ),
@@ -262,6 +264,11 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "connectors.rs",
         "_ => ApiError::Unprocessable(err.to_string()), // SEC-11 allowlisted",
         "SRC-11 D9-D11, the other InvalidExcludedColumns variants: fixed sentences (ingest_spec.rs) that name only the object and column the request itself sent",
+    ),
+    (
+        "connectors.rs",
+        "The connection settings are not valid: {source}",
+        "IngestSpecError::InvalidDial's source: a fixed sentence of ingest_spec.rs or serde's field text about the caller's own dial; nothing is dialled before it, so it holds no upstream text and no resolved address (it can repeat a host the caller typed)",
     ),
     (
         "connectors.rs",

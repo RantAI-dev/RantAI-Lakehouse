@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { assetService, queryService } from "@/services"
 import { EDITOR_SHORTCUTS } from "@/lib/editor-shortcuts"
 import { SqlPanel } from "./sql-panel"
+import { queryDraftKey } from "@/lib/query-draft"
 import { useQueryStudio } from "./use-query-studio"
 
 afterEach(() => {
@@ -26,7 +27,7 @@ function stubServices() {
 
 /** Wraps the studio hook with the SQL panel, the same way the page does. */
 function Harness() {
-  const studio = useQueryStudio()
+  const studio = useQueryStudio(queryDraftKey("u1", null))
   return <SqlPanel studio={studio} onSave={() => {}} />
 }
 

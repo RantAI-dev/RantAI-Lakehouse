@@ -1130,6 +1130,24 @@ pub struct Config {
     /// lowers it for its own job and says so; it is not a per-connector
     /// setting.
     pub connector_auto_disable_after: i32,
+    /// How long one connector run may run before the API stops treating it as
+    /// going (`SRC-39`, QA `TC-1702`): `INGEST_RUN_MAX_RUNTIME_SECONDS`,
+    /// default 21600 (six hours). The run route cancels a run older than this
+    /// plus its grace, records it as failed with `timed_out`, and lets the
+    /// next run start; the orchestrator's own run monitoring enforces the
+    /// same number through the `dagster/max_runtime` tag. Zero, negative, or
+    /// unparseable values keep the default.
+    pub ingest_run_max_runtime_seconds: u32,
+    /// How long a connector run the orchestrator has taken off its queue may
+    /// take to start before the API stops holding the connector for it
+    /// (`SRC-39`, QA `TC-1702`): `INGEST_RUN_START_TIMEOUT_SECONDS`, default
+    /// 600 (ten minutes). A run still waiting in the orchestrator's queue is
+    /// judged by [`Config::ingest_run_max_runtime_seconds`] instead
+    /// (`review round 1, R1`): its run monitoring never ends a queued run.
+    /// It MUST equal `start_timeout_seconds` in `dagster/dagster.yaml`:
+    /// whoever changes one changes both. Zero, negative, or unparseable
+    /// values keep the default.
+    pub ingest_run_start_timeout_seconds: u32,
 }
 
 /// Placeholder shown for secret fields instead of their real value.
@@ -1419,6 +1437,14 @@ impl std::fmt::Debug for Config {
                 "connector_auto_disable_after",
                 &self.connector_auto_disable_after,
             )
+            .field(
+                "ingest_run_max_runtime_seconds",
+                &self.ingest_run_max_runtime_seconds,
+            )
+            .field(
+                "ingest_run_start_timeout_seconds",
+                &self.ingest_run_start_timeout_seconds,
+            )
             .finish()
     }
 }
@@ -1472,6 +1498,42 @@ fn parse_positive_u32_or_default(env: &HashMap<String, String>, key: &str, defau
         .filter(|v| *v > 0)
         .and_then(|v| u32::try_from(v).ok())
         .unwrap_or(default)
+}
+
+/// Reads one of the two run limits of `SRC-39` (QA `TC-1702`; `review round
+/// 1, R9`).
+///
+/// The same rule the orchestrator's `RunLimitSettings.from_env` applies
+/// (`dagster/dispar_orchestrate/ingest_factory.py`): surrounding spaces
+/// trimmed, ASCII digits only, a value from 1 to `u32::MAX`. It is not
+/// [`parse_positive_u32_or_default`]: that one accepts a leading `+` and
+/// rejects a padded number, so `"86_400"` or `" 900 "` would be read one way
+/// here and another there, and the API would cancel a run the orchestrator
+/// still believes in.
+///
+/// A value that cannot be read keeps `default`, with a warning that names the
+/// variable and never the value (the orchestrator's own rule; the API used to
+/// fall back without a word). An empty value is unset — the normal case in
+/// compose, which passes `${X:-}` — and warns about nothing.
+fn parse_run_limit(env: &HashMap<String, String>, key: &str, default: u32) -> u32 {
+    let Some(raw) = env.get(key) else {
+        return default;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return default;
+    }
+    if trimmed.bytes().all(|byte| byte.is_ascii_digit())
+        && let Ok(value) = trimmed.parse::<u32>()
+        && value > 0
+    {
+        return value;
+    }
+    tracing::warn!(
+        variable = key,
+        "a run limit is not a whole number of seconds of 1 or more; using the default"
+    );
+    default
 }
 
 /// Whether the environment names `key` with a whole number of 1 or more
@@ -2026,6 +2088,16 @@ impl Config {
                 30,
             ))
             .unwrap_or(lakehouse_store::connectors::DEFAULT_AUTO_DISABLE_AFTER),
+            ingest_run_max_runtime_seconds: parse_run_limit(
+                env,
+                "INGEST_RUN_MAX_RUNTIME_SECONDS",
+                21_600,
+            ),
+            ingest_run_start_timeout_seconds: parse_run_limit(
+                env,
+                "INGEST_RUN_START_TIMEOUT_SECONDS",
+                600,
+            ),
         })
     }
 
@@ -2408,6 +2480,46 @@ mod tests {
         }
         let cfg = Config::from_map(&map(&[("CONNECTOR_AUTO_DISABLE_AFTER", "4")])).unwrap();
         assert_eq!(cfg.connector_auto_disable_after, 4);
+    }
+
+    /// `SRC-39` (QA `TC-1702`): six hours a run may run, ten minutes a run
+    /// the orchestrator launched may take to start; a value that is not a
+    /// whole number of 1 or more keeps the default.
+    ///
+    /// `review round 1, R9`: the orchestrator reads the same setting by the
+    /// same rule, so `"86_400"` (which `int()` would take), a number above
+    /// `u32::MAX` and a padded value are all decided here as they are there:
+    /// `" 900 "` is 900, `"86_400"` and `"4294967296"` keep the default.
+    #[test]
+    fn the_run_limits_default_to_six_hours_and_ten_minutes_and_ignore_garbage() {
+        let cfg = Config::from_map(&map(&[])).unwrap();
+        assert_eq!(cfg.ingest_run_max_runtime_seconds, 21_600);
+        assert_eq!(cfg.ingest_run_start_timeout_seconds, 600);
+        for bad in ["0", "-3", "many", "", "86_400", "4294967296", "+900", "1.5"] {
+            let cfg = Config::from_map(&map(&[
+                ("INGEST_RUN_MAX_RUNTIME_SECONDS", bad),
+                ("INGEST_RUN_START_TIMEOUT_SECONDS", bad),
+            ]))
+            .unwrap();
+            assert_eq!(cfg.ingest_run_max_runtime_seconds, 21_600, "{bad:?}");
+            assert_eq!(cfg.ingest_run_start_timeout_seconds, 600, "{bad:?}");
+        }
+        let cfg = Config::from_map(&map(&[
+            ("INGEST_RUN_MAX_RUNTIME_SECONDS", "900"),
+            ("INGEST_RUN_START_TIMEOUT_SECONDS", "120"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.ingest_run_max_runtime_seconds, 900);
+        assert_eq!(cfg.ingest_run_start_timeout_seconds, 120);
+        // `review round 1, R9`: both services trim, so a padded value is read,
+        // not thrown away.
+        let cfg = Config::from_map(&map(&[
+            ("INGEST_RUN_MAX_RUNTIME_SECONDS", " 900 "),
+            ("INGEST_RUN_START_TIMEOUT_SECONDS", " 120 "),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.ingest_run_max_runtime_seconds, 900);
+        assert_eq!(cfg.ingest_run_start_timeout_seconds, 120);
     }
 
     /// The compose stack's documented opt-out — only the literal string

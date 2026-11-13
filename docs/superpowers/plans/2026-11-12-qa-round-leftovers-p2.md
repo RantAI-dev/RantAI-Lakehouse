@@ -1,0 +1,1378 @@
+# QA round, leftovers (P2): the stored tenant, a test that fails in one process, e-mail not set up, a publish that fails early
+
+Fixes for four backlog rows left over from the QA round on staging (2026-11-02 to 11-12) and
+its reviews: `ADM-15` (the active tenant kept in the browser), `REL-25` (a test that fails when
+its binary runs in one process), `RPT-2` (under `RPT-1`, case `LH-RPT-1-06`, decision `DEC-18`)
+and `DATA-56` (under `DATA-1`, #484 review R4).
+
+Base: `main` at `2e7b178ea` (every anchor below was read there, in a checkout detached at
+`origin/main`). Branch: `fix/qa-round-leftovers-p2`. One pull request for the whole slice,
+opened as a draft by the planner as soon as T1 is pushed, so CI (x86_64) runs every test.
+
+Planner and reviewer: Claude Opus. Developer: another agent (not Opus). The developer pushes
+after every commit and does not change a decision below. If the code is not what a task says,
+stop that task and report the mismatch in the handoff.
+
+Five pull requests of the same round are open and merge before or around this one: #483, #485,
+#486, #487 and #489. This plan changes no file they change today (checked against their
+branches at this commit). One task works in a directory one of them owns, and says so: T5
+(`src/features/dashboards/*`, #486). There, **find each anchor by the text quoted, not by
+its line number**. The same holds for every anchor if `main` has moved when the work starts.
+
+What QA and the reviews saw:
+
+- `ADM-15` (#483 review, round 1): after a second person picks their tenant, the first
+  person's next sign-in on the same browser starts in a tenant that is not theirs.
+  Tenant-scoped pages answer 404 until they pick one, and since `QS-8` their query tabs are
+  keyed under that tenant.
+- `REL-25` (a developer run, 2026-11-12): `cargo test -p lakehouse-api --test report_runner`
+  ends "23 passed, 1 failed" on `main`, five runs of five. The failing test is
+  `a_pdf_failure_is_logged_for_the_operator_and_the_record_stays_fixed`. It passes alone and
+  under `nextest` (one process per test), which is why CI is green.
+- `RPT-2` (QA `LH-RPT-1-06`, fail, Major): with e-mail not set up, six "Send now" and one
+  scheduled run each recorded a failed delivery with the reason "Email is not set up on this
+  deployment.", `consecutiveFailures` stayed 0, `paused` stayed false, and nothing told the
+  owner of the subscription. The product owner then decided (`DEC-18`) to keep the counting
+  as it is and to show the state on the list.
+- `DATA-56` (#484 review R4): a publish in open format that fails before the export starts
+  writes no run, so the card never says "Last publish failed" for it. A scheduler whose
+  every run fails that way leaves the card on "Up to date" or "Out of date".
+
+## 1. Decisions
+
+- **D1. One task per commit, in the order of section 2** (Rust first, then the console, then
+  the documents). Each commit body cites the backlog ID and, where there is one, the QA case
+  or the review (`LH-RPT-1-06`, `#483 review round 1`, `#484 review R4`). Each fix site
+  carries a short comment naming it (rule 13), for example `// ADM-15 (#483 review): …`.
+- **D2. What the product owner and the planner already decided is not reopened.** It is
+  restated in D3, D8, D11 and D16 and made exact against the code in the decisions that
+  follow each.
+
+### ADM-15, the active tenant kept in the browser
+
+- **D3. The rule (decided).** The stored tenant (`lh_active_tenant`) is cleared on sign-out.
+  Whenever the session answers (`GET /api/auth/me`), a stored tenant that is not among the
+  signed-in person's tenants is ignored and replaced by the person's first tenant, and the
+  stored value is corrected. A person whose stored tenant is still theirs keeps it.
+- **D4. After the session answers, the stored value is always one of the person's own
+  tenants, or absent.** Made exact:
+  - stored and among `me.tenants` → kept;
+  - stored and not among them, or nothing stored, and the person has tenants → the first of
+    `me.tenants` is **written**;
+  - the person has no tenant → the key is **removed** (the navbar shows no switcher for such
+    a person, `src/components/app-shell/tenant-switcher.tsx:44`, so they could never
+    correct a stale value themselves).
+
+  Writing the first tenant when nothing is stored goes one step past D3, on purpose. With
+  nothing stored the console shows `me.tenants[0]` and sends no header, and the server then
+  takes the first of `principal.tenant_ids`. Those two lists are in the same order, and on
+  purpose: `tenant_ids` is read `ORDER BY tenant_id`
+  (`rust/crates/lakehouse-auth/src/repository.rs:141-142`) and `me.tenants` comes from
+  `list_tenants_by_ids`, which reads `ORDER BY id`
+  (`rust/crates/lakehouse-store/src/identity.rs`, added in review round 1, R4), both
+  ascending id. Without that order the tenant written at deploy could be another of the
+  person's own — their lists, connectors and query tabs would move with it, with no action
+  on their part — and a rename could change which row comes first, so the same person could
+  start in a different tenant on different days; a `sqlx::test` in `lakehouse-store` holds
+  the order. Once sign-out clears the key (D3), every sign-in would start in that state.
+  Writing the tenant the console shows makes
+  the header say it, so the console and the server agree. It widens nobody's reach: the
+  server already resolves a person with tenants to one of their own
+  (`rust/crates/lakehouse-api/src/tenant_scope.rs:76-90`), and "no tenant at all" is kept
+  for a person who has none.
+- **D5. Sign-out clears; a session that merely ended does not.** `logout()` removes the key
+  before it calls the API, so it is gone even if that request never returns. The `401`
+  redirect (`redirectToLogin`, `src/services/http.ts:78-85`) does not clear it: a person
+  whose session expired signs in again and keeps their choice ("a person whose stored tenant
+  is still theirs keeps it"); if somebody else signs in instead, D4 corrects it before any
+  page renders. A failed `GET /api/auth/me` (no session, or the network) changes nothing in
+  storage.
+- **D6. Requests to `/api/auth/*` never carry `X-Tenant`.** `apiFetch` already treats that
+  prefix specially for the `401` (`src/services/http.ts:105`). Without this, the sign-in
+  request and the session check of the next person would still carry the previous person's
+  tenant in the D5 case. No handler under `/api/auth/` reads the header (checked:
+  `rust/crates/lakehouse-api/src/routes/auth.rs` does not call `tenant_scope`, on `main` and
+  on the #487 branch). After D4 to D6 the first request that can carry a tenant is made
+  after the session answered and the value was corrected: pages render only once
+  `status === "authenticated"` (`src/components/app-shell/app-frame.tsx:49-56`), and the
+  correction is written before that status is set (T7).
+- **D7. One function decides, and the server already refuses.** `resolveActiveTenant(stored,
+  tenants)` is used by `load()` and by the context value, so `activeTenantId` can never be a
+  tenant the person is not in. `setActiveTenant(id)` ignores an id that is not among the
+  person's tenants. The server needs no change: a header naming a tenant the caller is not
+  in is `404` (`tenant_scope.rs:76-90`), which is what QA saw.
+- **D8. Every reader and writer of the key** (grep of `lh_active_tenant`,
+  `ACTIVE_TENANT_STORAGE_KEY`, `readActiveTenantId`, `writeActiveTenantId`,
+  `activeTenantId`, `setActiveTenant`, `X-Tenant` under `src/`, at this commit):
+  - the key and its helpers: `src/services/http.ts:41`, `:48-55` (read), `:63-70` (write);
+  - the header: `src/services/http.ts:100-103`, the only place `X-Tenant` is set. The pages
+    that do not use `apiFetch` (public link, embed, print view, `src/proxy.ts`) send no
+    tenant at all;
+  - the provider: `src/features/auth/auth-provider.tsx:120` (state), `:139-141` (read on
+    mount), `:160-163` (`setActiveTenant`), `:178` (the value);
+  - readers of `activeTenantId`: `src/components/app-shell/app-navbar.tsx:45`, `:127`, `:136`
+    (the switcher), `src/features/connectors/connector-create-page.tsx:74-95`,
+    `src/features/connectors/connector-scope-fields.tsx:80`, `:118`; on the #483 branch also
+    `src/features/queries/query-studio-page.tsx` and `save-query-page.tsx` (the draft key).
+    All of them read the provider's value, so T7 fixes them without touching them.
+
+### REL-25, the test that fails in one process
+
+- **D9. The cause (read, not run by the planner).** The test installs its capture with
+  `tracing::subscriber::set_default` (`rust/crates/lakehouse-api/tests/report_runner.rs:958`),
+  which is the default of the test's own thread only. The line it waits for is logged by
+  `upstream_error::report` (`rust/crates/lakehouse-api/src/upstream_error.rs:323`), one call
+  site shared by every upstream failure. `tracing-core` 0.1.36 decides once per call site,
+  the first time any thread reaches it, whether anybody is interested, and keeps the answer
+  for the whole process; while one subscriber exists it asks only the default of the thread
+  that got there first (`callsite.rs:308-321`, `:544-570`). Another test of the binary
+  reaches that call site on its own thread, which has no subscriber, the answer "never" is
+  kept, and this test's record is dropped before its subscriber is asked. The test starts
+  with `a_`, so it creates its subscriber first and then waits for its database: the other
+  order almost never happens. `rust/crates/lakehouse-api/tests/common/mod.rs:211-215`
+  already describes the same effect.
+- **D10. The fix is in the test only: one subscriber for the whole test binary, and a
+  capture per thread.** A subscriber set for the process (once, behind `std::sync::Once`)
+  is the default of every thread, so no thread can record "never". Its writer keeps a record
+  only on the thread that wrote it, and only while a test on that thread is capturing. A
+  `#[tokio::test]` runs its future, and every task it spawns, on the test's own thread, so
+  the test reads exactly what its own run logged: another test's "pdf render failed" cannot
+  satisfy it. `with_subscriber` / `WithSubscriber` is **not** used: it sets the same
+  per-thread default and does not change what D9 describes. Product logging is not touched,
+  and the test's three assertions stay word for word.
+- **D11. The other captures.**
+  - `rust/crates/lakehouse-api/tests/identity_password.rs:184-238`: one subscriber set for
+    the process, and an assertion that a text is **absent** from the log. Not this weakness.
+    Not changed.
+  - `rust/crates/lakehouse-api/src/upstream_error.rs:837-846` (`with_captured_log`, unit
+    tests): the same per-thread pattern, on the same call site. The window there is the few
+    instructions between creating the subscriber and logging, not a database start, and no
+    failure has been seen. Not changed in this slice (section 4); reported so the backlog can
+    hold it.
+  - No other file under `rust/crates/lakehouse-api/tests/` captures the log.
+
+### RPT-2, a subscription on an installation with no e-mail
+
+- **D12. What the owner decided (`DEC-18`), unchanged here.** A delivery that fails because
+  e-mail is not set up is recorded with its reason and is not counted towards the pause
+  (`rust/crates/lakehouse-api/src/routes/report_runner.rs:345-353`); the subscriptions list
+  says e-mail is not set up. This slice changes no counting, no pausing, no stored reason
+  and no line of `report_runner.rs`.
+- **D13. The list answers a typed field per subscription, `notSent`.**
+  `GET /api/reports/subscriptions?board=` gives every item
+  `"notSent": { "cause": "email_not_set_up", "lastAttemptAt": <RFC 3339 text or null> }`
+  while e-mail is not set up, and `"notSent": null` while it is. `lastAttemptAt` is the
+  start of the subscription's newest delivery **if** that delivery failed with the reason
+  `EMAIL_NOT_SET_UP`; otherwise `null` (nothing has been attempted since e-mail went away,
+  or nothing ever). The console does not compare sentences to find this out. "E-mail is set
+  up" is read once per request, from the same answer that fills `emailSetUp`.
+- **D14. What the row shows.** While `notSent.cause` is `email_not_set_up`, the row shows
+  **"Not sent: e-mail is not set up on this installation."**, followed by
+  **" Last attempt: {time}."** when `lastAttemptAt` is there. That line stands in place of
+  the status line ("Sent", "Not sent yet", "Failed. …"); a paused subscription keeps its
+  "Paused. …" line under it. An unknown `cause` shows the status line as today. The banner
+  above the list and the result of "Send now" are unchanged.
+- **D15. The assistant.** `list_report_subscriptions` answers the same `warning` that
+  `create_report_subscription` already gives while e-mail is not set up
+  (`rust/crates/lakehouse-api/src/routes/ai/tools/reports.rs:193-199`, `:303-305`). No
+  argument changes, so `tests/fixtures/tool_schemas.json` is not regenerated. The AI team
+  reviews T4.
+- **D16. The feature page.** `docs/core/features/scheduled-reports.md` has no acceptance row
+  for case 06 at this commit (its checklist ends at `RPT-1-AC5`). T8 adds `RPT-1-AC6` and a
+  section quoting `DEC-18`. `DEC-18` is cited for exactly what it says; the words on screen
+  are marked *(proposed, not yet signed)*.
+
+### DATA-56, a publish that fails before the export starts
+
+- **D17. The rule (decided).** A failure that happens after the caller is authenticated and
+  allowed and the mart is a valid, existing Gold mart of the caller's tenant becomes a
+  recorded failed run. A refusal of the request itself records nothing. The stored text is
+  the classified sentence, never upstream text. A scheduler run (`?ifChanged=true`) follows
+  the same rule.
+- **D18. "The mart exists" is one read, after the tenant gate.** The route reads
+  `mart_exists` (`rust/crates/lakehouse-api/src/routes/gold.rs:872-874`, the helper `PUT
+  …/publication` uses) right after `gated_source_table` (`gold.rs:455`). Before it answers
+  `true`, nothing is recorded; after it, every failure is, up to and including the export.
+- **D19. Exactly what is recorded and what is not**, in the order of `export`
+  (`gold.rs:429-581`):
+
+  | Step (line at this commit) | Answer | Recorded |
+  | --- | --- | --- |
+  | `check_export_token` (`:437-442`) | 401, 403, 503 "not configured" | no: the caller is not allowed |
+  | `Ident::new` (`:444-445`) | 400 | no: not a valid name |
+  | `gated_source_table` (`:455`) | 404, 422, 503 of the tenant gate | no: the mart is not shown to be the caller's |
+  | `mart_exists` (new) fails | classified 422 or 503 | no: nothing is known about the mart, and the engine that failed holds the history |
+  | `mart_exists` answers `false` | the route goes on as today | no early failure is recorded for it |
+  | `mart_content_fingerprint` (`:459-465`) fails | classified 422 or 503 | **yes, when no publish of the mart is in flight** |
+  | `?ifChanged=true`, the history read (`:472-478`) fails | classified 422 or 503 | **yes, when no publish of the mart is in flight** (attempted, D21) |
+  | `?ifChanged=true` finds nothing to do (`:479-481`) | 200 `skipped` | no, as today |
+  | the per-mart lock is held (`:487-497`) | 409 | no: the publish that holds the lock records its own run, and a row here would be newer than it and hide its result |
+  | `read_catalog_token` (`:498`) fails | 503 | **yes** |
+  | `export_mart` (`:531`) | any | yes, as today (unchanged) |
+
+  **D19 changes in review round 1 (R3).** The two pre-lock failures (fingerprint read,
+  history read) are recorded only when no publish of that mart is in flight: the write takes
+  the mart's lock (`MartLocks::try_acquire`) and happens only if it is free, holding it for
+  the write. If a publish is running, nothing is written and its error is returned — the
+  same rule and the same reason as the `409` row above, because the running publish's row
+  carries an older `started_at` and a fresher row would hide its result (the card would say
+  "Last publish failed" after a successful publish, and the next scheduled run would export
+  the unchanged mart again). The catalog token read happens with the lock already held, so
+  it records unconditionally.
+
+- **D20. The stored text is #484's conversion and nothing else.** The row's `error` is
+  `stored_error(…)`, that is `ApiError::to_string()` of the error the response carries
+  (`gold.rs:634-636`). For a fingerprint or history failure that is "The database request
+  failed. Reference: …" or "The database is unavailable. Reference: …"
+  (`upstream_error::ch_error`). For the token file it is the fixed sentence of
+  `lakekeeper_token::token_unavailable_message` (`lakekeeper_token.rs:38-40`): it names the
+  purpose and the setting, never the path or the io error, and it has no reference because
+  `read_token_file` makes none. No new sentence is written and no sentence embeds upstream
+  text. `lastFailure` (`gold.rs:1015-1031`) carries the time and that sentence, no person's
+  name.
+- **D21. If the history store is what failed, nothing can be recorded.** The history table
+  lives in the same ClickHouse the mart does. The write is attempted in every "yes" case of
+  D19 and stays best-effort: a write that fails is logged by `record_export_history`
+  ("failed to record gold export history", `gold.rs:622-625`) and the response is the
+  failure the caller already had. With ClickHouse down the card cannot say "Last publish
+  failed"; its own read fails too. This is said in the route's documentation (T2).
+- **D22. A scheduler run adds one failed row per run while the cause lasts.** Since
+  `DATA-49` a mart whose newest run failed is never skipped, so each scheduled run tries
+  again and records again. That is what makes the card honest; it is one small row per mart
+  per run.
+- **D23. No new refusal is added.** The route has no refusal for "publishing is switched
+  off" (it never reads the switch; the scheduler asks only for the enabled marts) and none
+  for a name that is not in `system.tables` (such a name goes on and fails where it fails
+  today). This slice adds neither: `tests/gold_export_auth.rs` asserts that a publish against
+  an engine that lists no table is **not** answered `404`, and the acceptance gate publishes
+  without the switch. The run that `export_mart` itself records is not changed, also for
+  such a name. Question 2 at the end.
+- **D24. How it is built.** `record_export_history` and `stored_error` take
+  `Result<&GoldExportResult, &ApiError>` instead of a reference to an owned `Result`, so an
+  early failure can be recorded from the error alone and then returned. An early failure's
+  row starts at the moment `mart_exists` answered; the export's own `started_at`
+  (`gold.rs:530`) is not moved, so a successful run's time means what it meant.
+
+### Text, and the assistant
+
+- **D25. Text on screen (English, as the console).** New: "Not sent: e-mail is not set up on
+  this installation." and " Last attempt: {time}." (D14). Nothing else is new: `DATA-56`
+  shows sentences that exist, `ADM-15` and `REL-25` show none.
+- **D26. Assistant parity.** `RPT-2` is the only dashboard behaviour here; its part is T4
+  (D15). `DATA-56` is not a dashboard feature; the assistant's own publish tool is in
+  section 4. `ADM-15` and `REL-25` change nothing the assistant uses.
+
+## 2. Tasks
+
+Rust first (T1 to T4), then the console (T5 to T7), then the documents (T8). In every Check,
+"must fail" names a temporary wrong change the developer makes, sees the test fail, and
+undoes; it is never committed. Say in the handoff that each was done.
+
+### T1. The PDF-failure test reads its own thread's log (REL-25)
+
+Test code only. `rust/crates/lakehouse-api/tests/report_runner.rs`.
+
+- Anchors: `:928-947` (`struct Captured` and its two `impl`s), `:949-974` (the test;
+  `set_default` at `:958`, the three assertions at `:966-973`). The product line it waits
+  for: `src/routes/report_runner.rs:945-946` (`pdf_failure(err)`), which logs through
+  `src/routes/pdf_export.rs:117-126` and `src/upstream_error.rs:314-328`.
+- Before changing anything, run `cargo test -p lakehouse-api --test report_runner` once and
+  write the counts in the handoff (expected: 23 passed, 1 failed, the test named above). If
+  it passes, say so and go on.
+- Change, replacing `Captured` (nothing else uses it):
+  1. A `thread_local!` holding `RefCell<Option<Vec<u8>>>`, `None` at first: what this
+     thread is keeping.
+  2. A unit struct (for example `ThreadCapture`) that implements `std::io::Write` by
+     appending to that thread-local **when it is `Some`** and doing nothing when it is
+     `None`, and `tracing_subscriber::fmt::MakeWriter` by returning itself.
+  3. A guard (for example `LogCapture`) with:
+     - `start()`: inside a `static` `std::sync::Once`, build
+       `tracing_subscriber::fmt().with_writer(ThreadCapture).with_ansi(false).finish()` and
+       install it with `tracing::subscriber::set_global_default(…)`, with an `expect` whose
+       message says that this test binary installs no other global subscriber (a capture
+       that silently records nothing must not pass); then set the thread-local to
+       `Some(Vec::new())`;
+     - `text()`: the kept bytes as a `String` (lossy);
+     - `Drop`: set the thread-local back to `None`.
+  4. In the test, replace `:953-958` with `let capture = LogCapture::start();` and `:971`
+     with `let log = capture.text();`. Do not change the fixture, the `tick`, the assertion
+     on the stored reason, or the two assertions on the log.
+  5. Above the helper, a comment that says why (D9 in four lines: the per-thread default,
+     the call site shared with other tests, the answer kept for the process), citing
+     `REL-25`. Update the doc comment of the test only if it no longer matches.
+- Do not use `set_default`, `with_default` or `with_subscriber` in this file. Do not change
+  any file under `src/`.
+- Check:
+  - `a_pdf_failure_is_logged_for_the_operator_and_the_record_stays_fixed` (name and
+    assertions unchanged) passes with the whole file: `cargo test -p lakehouse-api --test
+    report_runner`, **five runs in a row, all green**; quote the five count lines.
+  - New, a plain `#[test]` in the same file:
+    `a_log_capture_keeps_what_its_own_thread_logs_and_nothing_from_another_thread`. It
+    starts a capture, logs `tracing::error!("logged by another thread")` from a
+    `std::thread::spawn(…)` that it joins, logs `tracing::error!("logged by this thread")`
+    itself, and asserts the text contains the second and not the first.
+  - Must fail: (a) with `let _logged = crate::routes::pdf_export::pdf_failure(err);`
+    removed from `src/routes/report_runner.rs:946`, the PDF test fails on
+    `log.contains("pdf render failed")` (it reaches the line it is named for); (b) with the
+    `Some`/`None` check removed from the writer so every thread appends to one shared
+    buffer, the new test fails.
+
+### T2. A publish that fails after the mart is found is a recorded failed run (#484 review R4; DATA-56)
+
+`rust/crates/lakehouse-api/src/routes/gold.rs`,
+`rust/crates/lakehouse-api/src/gold_export_history.rs` (comments only),
+`rust/crates/lakehouse-api/tests/gold_publication.rs`.
+
+- Anchors in `gold.rs`: `:429-581` (`export`), `:455` (the gate), `:459-465` (the
+  fingerprint), `:472-481` (`?ifChanged=true`), `:487-497` (the lock), `:498` (the token),
+  `:530` (`started_at`), `:551-557` (`triggered_by`), `:558-567` (the one recording call),
+  `:596-629` (`record_export_history`), `:634-636` (`stored_error`), `:872-874`
+  (`mart_exists`), `:1622-1646` (the unit test of `stored_error`).
+- Change, in this order:
+  1. `stored_error` takes `Result<&gold_export::GoldExportResult, &ApiError>` and returns
+     `result.err().map(ToString::to_string)`. `record_export_history` takes the same type
+     as its last parameter; inside it use `export_result.is_ok()` and `export_result.ok()`
+     (the type is `Copy`). The existing call passes `export_result.as_ref()`. The unit test
+     at `:1622` passes `result.as_ref()` and `Ok(&GoldExportResult { … })`; its assertions
+     do not change (say in the commit that only the parameter type moved).
+  2. Move the `triggered_by` binding (`:551-557`, unchanged) up to just after the gate.
+  3. After `gated_source_table` (`:455`):
+     `let exists = mart_exists(&state.clickhouse, &state.config.gold_source_schema,
+     mart_ident.as_str()).await.map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;`
+     then `let attempt_started_at = time::OffsetDateTime::now_utc();`.
+  4. A private helper next to `record_export_history`:
+     `async fn early_failure(state, exists: bool, mart, triggered_by, attempt_started_at,
+     content_fingerprint: &str, err: ApiError) -> ApiError`. When `exists`, it calls
+     `record_export_history(…, attempt_started_at, time::OffsetDateTime::now_utc(),
+     content_fingerprint, Err(&err))`; it always returns `err`. Its doc comment states the
+     rule of D19 and D21 and cites `DATA-56` and `#484 review R4`.
+  5. The fingerprint (`:459-465`): `let current_fingerprint = if exists { match … }
+     else { None };`. On `Err(e)`: build the error exactly as today
+     (`upstream_error::ch_error(&upstream_error::DATABASE, &e)`) and
+     `return Err(early_failure(…, "", err).await.into());`.
+  6. `?ifChanged=true` (`:472-481`): keep the condition; `match` the answer of
+     `unchanged_since_last_export_reason`: `Ok(Some(reason))` returns the skip as today,
+     `Ok(None)` goes on, `Err(err)` returns
+     `Err(early_failure(…, current_fingerprint.as_deref().unwrap_or(""), err).await.into())`.
+  7. The lock (`:487-497`): unchanged, and a comment that a `409` is not recorded and why
+     (D19).
+  8. The token (`:498`): `match`; on `Err(err)` return through `early_failure` with the
+     current fingerprint as in step 6. The lock guard is still held while the row is
+     written.
+  9. Leave `started_at` (`:530`), the call of `export_mart` and the recording after it as
+     they are.
+  10. Comments that are no longer true (rule 1): the route's doc comment (`:384-428`) gains
+      a section "What is recorded" with the table of D19 in words and the sentence of D21;
+      `record_export_history`'s doc (`:581-589`, "every `POST` records exactly one row");
+      `gold_export_history.rs:19-24` (module doc) and `:250-253` (`NewGoldExportRun`).
+- Do not add a refusal for a mart that is not there or for a switch that is off (D23). Do
+  not change `read_catalog_token`, `lakekeeper_token.rs`, `gold_export.rs`, or the
+  assistant's tool.
+- Check, in `tests/gold_publication.rs` (real ClickHouse, the harness of `:90-106`, which
+  has no token file; helpers `seed_mart` `:132`, `Sessions` `:157`, `send` `:180`,
+  `history_row_count` `:520`):
+  1. `a_publish_that_cannot_read_the_catalog_token_is_recorded_and_the_card_says_it_failed`
+     (the test the #484 review named). Seed a mart, `POST /api/gold/export/<mart>` as a
+     `gold:export` session: `503`, and `body["error"]` equals
+     `lakehouse_api::lakekeeper_token::token_unavailable_message("gold-export",
+     "LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE")`. Then `GET /api/gold/export/<mart>/publication`:
+     `lastFailure.reason` starts with that sentence and equals the response's `error`,
+     `lastFailure.failedAt` is a string, `lastExportedAt` is null. Then
+     `GET /api/gold/exports?mart=<mart>`: `runs[0].status` is `failed` and `runs[0].error`
+     is the same sentence. `history_row_count` is 1.
+  2. `a_scheduled_publish_that_fails_before_the_export_is_recorded_each_time`. Same mart
+     shape, `POST …?ifChanged=true` twice: both `503`, neither body has `skipped`,
+     `history_row_count` is 1 after the first and 2 after the second.
+  3. `a_publish_whose_fingerprint_read_fails_is_recorded_with_the_classified_sentence`.
+     Create `serving.<base>` (as `seed_mart` does), create a view
+     `serving.<mart>` as `SELECT * FROM serving.<base>`, then drop `serving.<base>`: the
+     view is in `system.tables` and cannot be read. `POST /api/gold/export/<mart>`: `422`,
+     `body["error"]` starts with "The database request failed. Reference: ". Then
+     `GET /api/gold/exports?mart=<mart>`: `runs[0].status` is `failed`, `runs[0].error`
+     equals the response's `error`, and it does not contain the base table's name. If
+     ClickHouse refuses the `DROP`, or the `POST` answers another status, leave this one
+     test out, report exactly what was answered, and stop there: the planner corrects the
+     plan.
+  4. `a_refused_publish_and_a_name_that_is_not_a_mart_record_no_run`. First call
+     `gold_export_history::ensure_gold_export_run_table(&ch)` (a refused request never
+     creates the table, and `history_row_count` reads it). Then, each followed by
+     `history_row_count == 0` for the name used: (a) a seeded mart, a session without
+     `gold:export` (`sessions.with("query:read")`): `503` with an `error` that starts with
+     "gold export is not configured"; (b) a seeded mart, a person holding `gold:export`
+     who belongs only to another seeded tenant (create the principal with
+     `create_principal_with_permissions`, insert one `app_user_tenant` row for the tenant
+     whose id ends in `…0002`, not for `CATALOG_TENANT`): `404`; (c) a name that was never
+     seeded, a `gold:export` session of the catalog's tenant: `503` (the token file), no
+     row.
+  5. Two assertions written for the old behaviour change, and the commit says why (rule 2:
+     the old numbers stated that an early failure writes nothing, which is the defect):
+     `:604-608` (`busy_mart`) becomes 2, and `:1112-1116` (`retry_after_failure_mart`)
+     becomes 3, each with a message that the `503` at the token file is now a recorded
+     failed run.
+  - Must fail: test 1 and test 2 with the token site put back to
+    `read_catalog_token(…).await?`; test 3 with the fingerprint site put back to
+    `.map_err(…)?`; test 4 (c) with the `if exists` removed from `early_failure`.
+  - Not tested, and why: the `409` (a second publish in flight cannot be held from a test
+    of the router) and the failed history read of `?ifChanged=true` (the history table
+    cannot be made to fail without failing every other test of the binary, which shares one
+    ClickHouse, `:43-52`). The reviewer reads those two sites.
+  - Also run, unchanged, as a guard on the new order of reads:
+    `cargo test -p lakehouse-api --test gold_export_auth`.
+
+### T3. The list says, per subscription, that it is not sent while e-mail is not set up (LH-RPT-1-06; RPT-2)
+
+`rust/crates/lakehouse-api/src/routes/reports.rs`,
+`rust/crates/lakehouse-api/tests/report_routes.rs`.
+
+- Anchors: `reports.rs:50-52` (the import from `report_runner`), `:429-439`
+  (`delivery_json`), `:471-479` (`settings_flags`), `:558-599` (`list`; the last delivery
+  at `:591`, `canEdit` at `:593`, `settings_flags` at `:596`), `:911` (unit tests);
+  `report_runner.rs:94` (`EMAIL_NOT_SET_UP`);
+  `lakehouse-store/src/report_subscriptions.rs:478-497` (`DeliveryStatus::as_str`),
+  `:520-537` (`Delivery`).
+- Change:
+  1. Add `EMAIL_NOT_SET_UP` to the import at `:50-52`.
+  2. A private function `not_sent_json(email_set_up: bool, last: Option<&Delivery>) ->
+     Value`: `Value::Null` when `email_set_up`; otherwise
+     `json!({ "cause": "email_not_set_up", "lastAttemptAt": … })`, where the time is
+     `last.filter(|d| d.status == DeliveryStatus::Failed.as_str() && d.reason.as_deref() ==
+     Some(EMAIL_NOT_SET_UP)).and_then(|d| d.started_at.format(&Rfc3339).ok())` (import
+     `time::format_description::well_known::Rfc3339`, as `routes/capture_lag.rs:45` does).
+     Its doc comment cites `RPT-2`, `DEC-18` and QA `LH-RPT-1-06`, and says that nothing
+     here counts or pauses.
+  3. In `list`: move `let mut body = settings_flags(&state).await;` above the loop, read
+     `let email_set_up = body["emailSetUp"] == json!(true);` from it (one read of the
+     setting per request, one owner of "is e-mail set up"), and in the loop, next to
+     `canEdit`, set `item["notSent"] = not_sent_json(email_set_up, last);`.
+  4. `subscription_json`, `get`, `create`, `update`, `send_now` and `deliveries` are not
+     changed: `notSent` is the list's field, like `canEdit`. Say so in the list's doc
+     comment (`:550-557`) and in the module doc's "Email not set up" section (`:27-33`).
+- Check:
+  - Unit tests in `reports.rs`: `not_sent_is_null_while_email_is_set_up`;
+    `not_sent_names_the_cause_and_the_time_of_a_last_attempt_that_failed_for_it` (the time
+    parses back as RFC 3339 to the delivery's `started_at`);
+    `not_sent_has_no_time_when_the_last_delivery_was_sent_or_failed_for_another_reason`
+    (also with no delivery at all).
+  - `tests/report_routes.rs`:
+    `the_list_says_a_subscription_is_not_sent_while_email_is_not_set_up_and_nothing_is_counted`.
+    With `fixture(&[])` (no mail server): create a subscription as the owner; the list's
+    item has `notSent == {"cause":"email_not_set_up","lastAttemptAt":null}`; `POST
+    …/send`; the list's item now has a `lastAttemptAt` that is a string and parses as RFC
+    3339, `lastDelivery.status == "failed"`, `consecutiveFailures == 0`, `paused == false`.
+  - `the_list_says_nothing_of_the_kind_while_email_is_set_up`: the fixture of
+    `send_now_to_an_unreachable_mail_server_gives_the_fixed_reason_only` (`:583-589`, a mail
+    server named on a closed local port); create a subscription; the item's `notSent` is
+    null and `emailSetUp` is `true`.
+  - Must fail: the first integration test and the second unit test with `not_sent_json`
+    returning `Value::Null` always; the second integration test with it ignoring
+    `email_set_up`.
+
+### T4. The assistant's list says so too (RPT-2, assistant parity)
+
+`rust/crates/lakehouse-api/src/routes/ai/tools/reports.rs`,
+`rust/crates/lakehouse-api/tests/ai_report_tools.rs`.
+
+- Anchors: `tools/reports.rs:193-199` (`email_note`), `:300-306` (how `create` adds
+  `warning`), `:312-326` (`list`).
+- Change: in `list`, build the answer as `let mut out = json!({ "items": items });` and add
+  `out["warning"] = json!(note)` when `email_note(state).await` is `Some`, exactly as
+  `create` does. Reuse `email_note`; write no second sentence. No tool argument changes;
+  do not regenerate `tests/fixtures/tool_schemas.json`.
+- Check: `tests/ai_report_tools.rs`,
+  `listing_reports_warns_while_email_is_not_set_up`: with the file's `fixture()` (no mail
+  server), create one subscription through the tool as
+  `updating_and_listing_work_on_the_callers_own…` does (`:357-366`), call
+  `list_report_subscriptions`, and assert `listed["result"]["warning"]` equals "Email is
+  not set up on this deployment, so nothing is sent until it is." and that the items are
+  still listed. Must fail: with the two added lines removed.
+
+### T5. The subscriptions dialog shows "Not sent" on each row (LH-RPT-1-06; RPT-2)
+
+`src/services/contracts/reports.ts`, `src/features/dashboards/report-words.ts`,
+`src/features/dashboards/subscriptions-dialog.tsx` and their two test files. The two files
+under `src/features/dashboards/` are in a directory #486 owns: **find the anchors by their
+text**. This dialog is the only place that lists subscriptions (checked: no other file
+under `src/features/` calls `reportService.list`).
+
+- Anchors: `contracts/reports.ts:61-81` (`ReportSubscription`; `lastDelivery` and
+  `canEdit` are its last fields); `report-words.ts:49-56` (`describeStatus`);
+  `subscriptions-dialog.tsx:174` (`<div className="text-xs">{describeStatus(s)}</div>`),
+  `:117-121` (the banner, unchanged); `src/lib/format.ts:94-106` (`formatDateTime`, which
+  answers "—" for a time it cannot read).
+- Change:
+  1. Contract: `notSent?: { cause: "email_not_set_up" | string; lastAttemptAt: string |
+     null } | null`, with a comment: set by the list only; why the subscription is not
+     being sent now (`RPT-2`, `DEC-18`).
+  2. `report-words.ts`: export `NOT_SENT_EMAIL = "Not sent: e-mail is not set up on this
+     installation."` and `describeNotSent(s): string | null`. It returns `null` unless
+     `s.notSent?.cause === "email_not_set_up"`; otherwise `NOT_SENT_EMAIL`, followed by
+     `` ` Last attempt: ${formatDateTime(at)}.` `` when `lastAttemptAt` is a string that
+     `formatDateTime` can read (not "—"). Reuse `formatDateTime`; write no date code.
+  3. Dialog row: compute `const notSent = describeNotSent(s)`. When it is not `null`,
+     render it as a `<p>` with the banner's amber text classes (`text-amber-700
+     dark:text-amber-400`, `text-xs font-medium`) and **no** `role`; render the existing
+     status line only when `notSent` is `null` or `s.paused`. A comment at the site: `// QA
+     LH-RPT-1-06 (RPT-2, DEC-18): …`.
+  4. Do not change the banner, the buttons, "Send now" or its result line, or
+     `EMAIL_NOT_SET_UP`.
+- Check:
+  - `report-words.test.ts`:
+    `describeNotSent says the cause, and the time when there was an attempt` (compare
+    against `formatDateTime` of the same text, not a literal, so the machine's time zone
+    does not matter); `describeNotSent says nothing for a subscription that can be sent or
+    for a cause it does not know`.
+  - `subscriptions-dialog.test.tsx`:
+    `shows Not sent with the time of the last attempt on a subscription while email is not
+    set up, instead of its last status` (list answers `emailSetUp: false` and an item with
+    `notSent` and a failed `lastDelivery`: the sentence and the time are on the row, and
+    "Failed. Email is not set up on this deployment." is not);
+    `keeps the Paused line under Not sent` (the same item, paused with a reason);
+    `shows the last status as before when the list says nothing of the kind` (`notSent`
+    null).
+  - Must fail: the first dialog test with the status line rendered unconditionally; the
+    first `report-words` test with the time left out.
+
+### T6. Calls to `/api/auth/*` carry no tenant, and the key can be removed (#483 review; ADM-15)
+
+`src/services/http.ts`, `src/services/http.test.ts`.
+
+- Anchors: `http.ts:23-30` (the module comment on `X-Tenant`), `:63-70`
+  (`writeActiveTenantId`), `:87-91` (`resolveUrl`), `:98-109` (`apiFetch`; the header at
+  `:100-103`, the `/api/auth/` test at `:105`).
+- Change:
+  1. `export function clearActiveTenantId(): void`, next to the writer and shaped like it
+     (`removeItem`, the same `typeof window` guard and `try`/`catch`).
+  2. In `apiFetch`, compute once `const isAuthCall =
+     resolveUrl(input).startsWith("/api/auth/")`; attach `X-Tenant` only when it is false;
+     use the same constant for the `401` test.
+  3. The module comment says that the header is left off `/api/auth/*` and why (D6), citing
+     `ADM-15`.
+- Check, in `http.test.ts`:
+  `leaves X-Tenant off a call to /api/auth even when a tenant is stored` (stored tenant,
+  `apiFetch("/api/auth/me")` and `apiFetch("/api/auth/login", { method: "POST" })`: no
+  header; `apiFetch("/api/connectors")` in the same test: the header);
+  `clearActiveTenantId removes the stored tenant and never throws when storage does` (the
+  hostile-storage stub of the test at `:34-47`). The three existing tests stay as they are.
+  Must fail: the first with the `isAuthCall` condition removed.
+
+### T7. The stored tenant is the signed-in person's, and sign-out clears it (#483 review; ADM-15)
+
+`src/features/auth/auth-provider.tsx`, a new
+`src/features/auth/auth-provider-tenant.test.tsx`, and one test in
+`src/components/app-shell/tenant-switcher.test.tsx`.
+
+- Anchors in `auth-provider.tsx`: `:7` (the import from `@/services/http`), `:48` (the
+  re-export of the helpers), `:58-65` (the doc of `activeTenantId`), `:115-120` (the
+  state and its comment), `:122-131` (`load`), `:137-141` (the read on mount), `:153-158`
+  (`logout`), `:160-163` (`setActiveTenant`), `:173-178` (the value). Do not touch
+  `src/features/auth/login-page.tsx` (#487): it already calls `refresh()` after a sign-in
+  (`:133`), which is `load`.
+- Change:
+  0. Import `clearActiveTenantId` at `:7` and add it to the re-export at `:48`.
+  1. `export function resolveActiveTenant(stored: string | null, tenants: readonly { id:
+     string }[]): string | null`: `stored` when a tenant has that id; else
+     `tenants[0]?.id ?? null`. Doc comment: D4, citing `ADM-15`.
+  2. `load`, after `authClient.me()` answers and **before** `setUser` and `setStatus`:
+     read the stored value, resolve it against `me.tenants`; `null` →
+     `clearActiveTenantId()`; different from what was stored → `writeActiveTenantId(…)`;
+     then `setStoredActiveTenantId(resolved)`. The storage write comes first because
+     `apiFetch` reads storage at each call and pages render when the status flips. The
+     `catch` branch is unchanged (D5).
+  3. Remove the read-on-mount effect (`:137-141`): nothing reads the state before a person
+     is loaded, and the value is trusted only after the session answered.
+  4. `logout`: `clearActiveTenantId()` first, then the existing `await
+     authClient.logout()`, then `setStoredActiveTenantId(null)` with the existing state
+     changes.
+  5. `setActiveTenant(id)`: return without doing anything unless `user?.tenants` has that
+     id (the callback then depends on `user`).
+  6. The value: `activeTenantId: user ? resolveActiveTenant(storedActiveTenantId,
+     user.tenants) : null`.
+  7. Rewrite the comments at `:58-65`, `:115-119` and `:173-177` (they say the stored value
+     is not reset and that a stale id falls back; that is no longer what happens).
+- Check, in the new test file (stub `next/navigation` and `fetch` as
+  `tenant-switcher.test.tsx:10-20` and `:98-123` do; record the URL and the `X-Tenant`
+  header of every request; clear `localStorage` before and after each test). The probe
+  component makes one `apiFetch("/api/connectors")` when the status is `authenticated`.
+  1. `signing out clears the stored tenant`: a person with tenants `a1`, `a2`, stored `a2`;
+     call `logout()`; the key is absent, and the sign-out request carried no `X-Tenant`.
+  2. `a second person never sends or shows the first person's tenant`: stored `a2` (left by
+     a person whose session ended), the session answers a person with tenants `b1`, `b2`:
+     the shown `activeTenantId` is `b1`, the key holds `b1`, the session check carried no
+     `X-Tenant`, and the request to `/api/connectors` carried `b1`; no recorded request
+     carried `a2`.
+  3. `a person signing in after another signed out starts in their own first tenant`:
+     person A (`a1`, `a2`) picks `a2`, signs out; the stub now answers person B (`b1`,
+     `b2`); call `refresh()`; shown `b1`, stored `b1`.
+  4. `a person whose stored tenant is still theirs keeps it`: stored `b2`, the person has
+     `b1`, `b2`: shown `b2`, stored `b2`, the request carried `b2`. (A control: it passes
+     on today's code too; say so in the handoff.)
+  5. `a person with no tenant has none stored`: stored `a2`, the person has no tenant:
+     shown none, the key is absent, the request carried no `X-Tenant`.
+  6. `a failed session check leaves the stored tenant alone`: stored `a2`, the session
+     check answers `401`: the key still holds `a2`. (A control.)
+  7. `picking a tenant that is not the person's changes nothing`: `setActiveTenant("zz")`:
+     shown and stored unchanged.
+  8. Unit: `resolveActiveTenant keeps a tenant that is the person's, else takes the first,
+     else none`.
+- The existing test `setActiveTenant writes lh_active_tenant and a sibling useAuth consumer
+  observes the change` (`tenant-switcher.test.tsx:141-166`) gives the person **no** tenants
+  and switches to `"a"`, a state the console cannot reach (no switcher is shown) and the new
+  rule refuses. Correct it, and say why in the commit (rule 2): the person has `TENANTS`
+  (`a`, `b`); wait until `a` is shown; then switch to `b` from a click; expect `b` shown
+  and stored. The other tests of that file stay as they are.
+- Must fail: test 1 with the clear removed from `logout`; tests 2, 3 and 5 with the
+  correction removed from `load`; test 7 with the guard removed from `setActiveTenant`.
+- If a test of another file fails because a tenant is now stored after the provider
+  renders, do not change its assertion: clear `localStorage` in that file's `beforeEach`,
+  and name the file in the handoff.
+
+### T8. The documents say what is now true (RPT-2, DATA-56)
+
+Documents only; no code. The developer does not edit `docs/core/BACKLOG.md` or
+`docs/core/PRODUCT.md` (the reviewer does, after the merge).
+
+- `docs/core/features/scheduled-reports.md`:
+  - After the section "Owner decisions at the phase 4 QA (2026-10-23)" (`:63-65`), a new
+    section, with exactly these two points:
+
+    > ## Owner decision of 2026-11-12 (`DEC-18`)
+    >
+    > - On an installation with no e-mail set up, a delivery that fails for that reason is
+    >   recorded with its reason and is not counted towards the pause; the subscriptions
+    >   list says e-mail is not set up (`DEC-18`, QA `LH-RPT-1-06`). This is the exception
+    >   to decision 7's pause after 5 failures in a row.
+    > - On each subscription the list shows "Not sent: e-mail is not set up on this
+    >   installation." and, when the last attempt failed for that reason, its time. Changed
+    >   2026-11-12 (`RPT-2`), *(proposed, not yet signed)*.
+
+  - In the acceptance checklist, after `RPT-1-AC5` (`:75`) and before `AI-10-AC1`:
+
+    > - `RPT-1-AC6` With e-mail not set up on the installation, "Send now" and a scheduled
+    >   run each record a failed send with the reason "Email is not set up on this
+    >   deployment."; the failures are not counted and the subscription is not paused
+    >   (`DEC-18`). The subscriptions list shows on that subscription "Not sent: e-mail is
+    >   not set up on this installation." with the time of the last attempt. Row added
+    >   2026-11-12 (`RPT-2`) for QA `LH-RPT-1-06`; the words on screen are *(proposed, not
+    >   yet signed)*.
+
+  - In "Asking the assistant" (`:56-61`), one sentence: `list_report_subscriptions` answers
+    a `warning` while e-mail is not set up (`RPT-2`).
+  - Do not edit the Decisions table (`:34-47`).
+- `docs/core/features/gold-publish-per-mart.md`, at the end of "Limits to tell a customer"
+  (after the point that ends "only "Publish now" works.", `:79-80`):
+
+  > - A publish that fails before the copy starts (for example, the catalog's credentials
+  >   cannot be read) is recorded as a failed publish with its reason, also for an
+  >   automatic publish. A request that is turned away is not a publish and is not
+  >   recorded: no permission, a table of another organisation, or another publish of the
+  >   same table still running. If the database that keeps the publish history is itself
+  >   down, nothing can be recorded. Changed 2026-11-12 (`DATA-56`), *(proposed, not yet
+  >   signed)*.
+
+  Do not edit its Decisions table or any "Signed" cell.
+- Check: `git diff --stat` shows only these two files in this commit.
+
+## 3. Verification
+
+The build machine is a strong ARM64 host (20 CPUs, 121 GB of memory, Docker running); see
+section 3a for the checkout and the cargo settings. CI on the pull request runs on x86_64
+and is the final word: a check that is green here and red there is red.
+
+Per commit, only for what the commit touched. Never `cargo clean`. Never a bare
+`cargo test -p lakehouse-api <filter>` and never `cargo test --workspace` (CI runs the full
+suite): a unit test runs with `--lib` and its name, an integration test file runs with
+`--test <file>`.
+
+- Rust, from `rust/`: `cargo fmt --check`, then
+  `cargo clippy -p lakehouse-api --all-targets -- -D warnings`, then the tests of the task:
+
+  | Task | Tests |
+  | --- | --- |
+  | T1 | `cargo test -p lakehouse-api --test report_runner`, once before the change (write down the counts), then five times in a row after it, all green |
+  | T2 | `cargo test -p lakehouse-api --lib the_stored_error_of_a_failed_publish_is_the_classified_sentence`; `cargo test -p lakehouse-api --test gold_publication`; `cargo test -p lakehouse-api --test gold_export_auth` |
+  | T3 | `cargo test -p lakehouse-api --lib not_sent_`; `cargo test -p lakehouse-api --test report_routes` |
+  | T4 | `cargo test -p lakehouse-api --test ai_report_tools` |
+
+- TypeScript: `bun install --frozen-lockfile` once, then per commit `bun run typecheck`,
+  `bun run lint`, and `bun test` on the touched test files:
+  `src/features/dashboards/report-words.test.ts` and
+  `src/features/dashboards/subscriptions-dialog.test.tsx` (T5);
+  `src/services/http.test.ts` (T6); `src/features/auth/auth-provider-tenant.test.tsx`,
+  `src/components/app-shell/tenant-switcher.test.tsx` and, as a guard,
+  `src/features/auth/login-page.test.tsx` (T7). Do not run prettier.
+- Always: `python3 ops/lint/check_bare_iceberg_count.py && python3
+  ops/lint/check_intra_package_imports.py`.
+- No Python, no migration, no route added (`POLICY_TABLE` and `tests/route_auth.rs` are not
+  touched), no compose file: none of their checks apply.
+
+Before handoff, once, in the foreground, on the final commit:
+
+```bash
+cd rust && cargo fmt --check
+cargo clippy -p lakehouse-api --all-targets -- -D warnings
+cargo test -p lakehouse-api --lib the_stored_error_of_a_failed_publish_is_the_classified_sentence
+cargo test -p lakehouse-api --lib not_sent_
+for i in 1 2 3 4 5; do cargo test -p lakehouse-api --test report_runner || break; done
+cargo test -p lakehouse-api --test gold_publication
+cargo test -p lakehouse-api --test gold_export_auth
+cargo test -p lakehouse-api --test report_routes
+cargo test -p lakehouse-api --test ai_report_tools
+cd .. && bun run typecheck && bun run lint && bun run test
+python3 ops/lint/check_bare_iceberg_count.py && python3 ops/lint/check_intra_package_imports.py
+git status   # nothing generated staged
+```
+
+The full `cargo test --workspace` is CI's on the pull request; list it in the handoff as
+*not verified locally, CI*. The handoff quotes each command with its counts, names every
+test added or changed so it can be found in the CI log, says which "must fail" changes were
+made and seen to fail, and says *not verified* for anything not run (rule 7).
+
+What the planner read and did not run, and the developer's runs must confirm. If one of
+these answers differently, report the answer and stop that task; the plan is corrected, not
+the assertion.
+
+- That the `report_runner` binary fails as D9 says and passes five times after T1. The
+  cause is read from `tracing-core` 0.1.36 and from the note in `tests/common/mod.rs`; no
+  test was run.
+- That the record the PDF test waits for is written on the test's own thread (the runner
+  logs it inside `tick`, which the test awaits on a current-thread runtime).
+- That `set_global_default` succeeds in that binary (nothing else in it or in
+  `tests/common/mod.rs` installs one).
+- That ClickHouse 26.8 lets a view outlive the table it reads, and that reading it then
+  fails with a statement error that becomes `422` (T2, test 3).
+- That a person holding `gold:export` who belongs only to another tenant is answered `404`
+  by the gate in the `gold_publication` harness, and a session without the permission
+  `503` "gold export is not configured" (T2, test 4).
+- That no other console test depends on nothing being stored after the provider renders
+  (T7; the full `bun run test` is the proof).
+- That `formatDateTime` reads the RFC 3339 text the API writes (T5).
+
+## 3a. Machine
+
+- Checkout: `/home/rismana/rantai/lakehouse-agents-1` (the planner fills in `<n>`).
+- Before any cargo command:
+  `export CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-1 CARGO_BUILD_JOBS=6`.
+- The machine is shared. Work only under `/home/rismana/rantai/`. Start no container you do
+  not remove.
+- The Rust integration tests start containers: one Postgres through
+  `lakehouse-test-support`, reused when it already runs, and `gold_publication` starts a
+  ClickHouse of its own. Before the first `cargo test --test …`, run `docker ps -a` and
+  write down what is there. After the last one, remove what your runs started and nothing
+  else (`docker rm -f <id>`); a container that was there before belongs to another
+  checkout. Say in the handoff which you removed.
+
+## 4. Out of scope
+
+- **A browser whose storage cannot be written** (private browsing): it still sends no
+  header and shows `me.tenants[0]`. Since review round 1, R4 that is the tenant the server
+  defaults to as well (`list_tenants_by_ids` reads `ORDER BY id`), so it is as it is today
+  and not a mismatch.
+- **Clearing the stored tenant when a session expires** (D5), **two tabs signed in as two
+  people**, and **a tenant list that comes back empty because its read failed**
+  (`routes/auth.rs:376-381` answers an empty list then; T7 removes the stored choice, which
+  costs the person their last pick and nothing else).
+- **The unit tests of `upstream_error.rs` that capture the log with `with_default`** (D11):
+  the same pattern with a far smaller window; not seen failing. For the backlog.
+- **Any change to counting, pausing, the stored reason, the banner or "Send now"** of a
+  report (`DEC-18`), and **an e-mail or other notice to the owner** of a subscription that
+  is not sent.
+- **A refusal of `POST /api/gold/export/<mart>` for a mart whose switch is off or whose
+  name is not a table** (D23), and **the run that `export_mart` records for such a name**.
+- **The assistant's publish tool** (`routes/ai/tools/gold.rs`): it calls `export_mart`
+  itself and writes no run of any outcome. Not a finding of #484 R4; for the backlog.
+- **A reference in the token-file sentence** (D20): `read_token_file` is shared with the
+  outside-reading door, which repeats the same sentence.
+- **`docs/core/BACKLOG.md` and `docs/core/PRODUCT.md`**, and the QA case `LH-RPT-1-06`
+  itself, which lives in the QA base: the planner rewords it there.
+- Everything else in the QA round that is not on rows `ADM-15`, `REL-25`, `RPT-2` and
+  `DATA-56`.
+
+### Open questions for the owner
+
+None of these blocks the plan.
+
+1. The new row says "installation"; the banner above the list and the stored reason say
+   "Email is not set up on this deployment." Should all three use one word? The planner's
+   proposal: keep them for now (the stored reason is compared by the runner and is in every
+   past record), and choose one word in a later pass over the texts.
+2. The console hides "Publish now" while a mart's switch is off, but the API still
+   publishes such a mart when asked (`POST /api/gold/export/<mart>` never reads the
+   switch). Should the API refuse it? The planner's proposal: its own backlog item, because
+   the acceptance gate, several tests and the assistant's tool publish without the switch.
+3. A session that expires keeps the person's last tenant for their next sign-in; only
+   "Sign out" clears it (D5). The planner's proposal is to keep that; say if an expired
+   session should clear it too.
+
+## 5. Handoff
+
+Branch `fix/qa-round-leftovers-p2`, off `origin/fix/qa-round-leftovers-p2` at
+`f7645656` (the plan commit), base `main` at `2e7b178ea`. Everything below was
+run on this machine (ARM64, `CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-1`,
+`CARGO_BUILD_JOBS=6`), in the foreground.
+
+### Commits
+
+| Commit | Title |
+| --- | --- |
+| `b3b5ae26` | `test(report_runner): one process-wide subscriber, a capture per thread (REL-25)` |
+| `b0a5e51c` | `feat(gold): a publish that fails after the mart is found is a recorded failed run (DATA-56, #484 review R4)` |
+| `fdb58100` | `feat(reports): the list says per subscription that it is not sent while e-mail is not set up (RPT-2, LH-RPT-1-06)` |
+| `da2c74e3` | `feat(ai): listing reports warns while e-mail is not set up (RPT-2, assistant parity)` |
+| `195a1611` | `feat(console): a subscription row says Not sent while e-mail is not set up (RPT-2, LH-RPT-1-06)` |
+| `3edcf81c` | `feat(console): no X-Tenant on /api/auth calls, and a way to clear the key (ADM-15, #483 review)` |
+| `934d674d` | `feat(console): the stored tenant is the signed-in person's, and sign-out clears it (ADM-15, #483 review)` |
+| `3264aa76` | `docs(features): what DEC-18 and DATA-56 made true (RPT-2, DATA-56)` |
+
+Each was pushed to `origin/fix/qa-round-leftovers-p2` right after its commit.
+No PR was opened. The working tree was clean before every commit; nothing
+generated was staged.
+
+### MISMATCH
+
+- **`REL-25` does not reproduce here.** T1 asked for three runs of
+  `cargo test -p lakehouse-api --test report_runner` on the code before the
+  change, expecting "23 passed, 1 failed" on
+  `a_pdf_failure_is_logged_for_the_operator_and_the_record_stays_fixed`. On this
+  machine all three runs printed `test result: ok. 24 passed; 0 failed; 0
+  ignored` (the binary has 24 tests, not 24 with one failing). So the defect D9
+  describes was not observed in three runs of four threads' worth of tests, and
+  the "five runs of five" in the plan's own preamble is not reproduced. T1 was
+  built as planned anyway: the per-thread default is gone, the subscriber is
+  installed once for the process, and the writer keeps only its own thread's
+  bytes. Whether that was needed cannot be claimed from a failing run here —
+  what is verified is that the mechanism the plan describes is what the test now
+  does, and that a shared buffer makes the new guard fail.
+
+### What the plan could not verify, and what was measured
+
+- **T2 test 3 (a view outliving the table it reads): works.** ClickHouse 26.8 in
+  the testcontainer let `DROP TABLE serving.ghost_base_mart` succeed while
+  `serving.ghost_view_mart` still selected from it; the `POST` answered `422`,
+  the sentence started "The database request failed. Reference: ", the run was
+  recorded and neither carried `ghost_base_mart`. The test is in the commit.
+- **T2 test 4 statuses: as planned.** (a) a session with `query:read` and no
+  configured run token: `503`, `error` starts "gold export is not configured";
+  (b) `gold:export` in tenant `…0002` only: `404`; (c) a never-seeded name from
+  the catalog's tenant: `503` at the token file. No row for any of the three.
+- **T5 `formatDateTime`:** it reads RFC 3339 (`2026-11-12T04:15:00Z`) — which is
+  what `not_sent_json` writes, through `time`'s `Rfc3339`. It does NOT read the
+  Postgres rendering `2026-11-12 04:15:00 +00:00:00` (that answers "—", which
+  `describeNotSent` then leaves out). No change was needed; worth knowing if a
+  later field reuses a `started_at` string from another route.
+- **T7 "no other console test depends on nothing being stored": holds.**
+  `bun run test` is 4057 passed, 1 skipped, 0 failed (4058 tests, 381 files), and
+  no other file needed a `localStorage.clear()`.
+
+### Implementation notes the reviewer should see
+
+- **T2/T4–T18 shape.** The early-failure recording was written as
+  `early_failure(attempt, fingerprint, err)` with a private `Attempt` struct
+  (`open()` reads `system.tables` and starts the clock, `skip_body()` and
+  `catalog_token()` are the two steps that can fail there), because the in-line
+  version took `export` to 158 lines and `clippy::too_many_lines` was denied at
+  121/100. The order of D19 is unchanged and the recording still sits at each
+  failing step; no decision moved. `stored_error` and `record_export_history`
+  take `Result<&GoldExportResult, &ApiError>` as decided.
+- **T1 helper.** `LogCapture::text()` compares the reading thread with the one
+  that started the capture (`clippy::unused_self`), so a capture cannot be read
+  from another thread; the assertions and the test's name are unchanged.
+
+### Tests added, and the failure seen before each fix
+
+**T1** (`tests/report_runner.rs`)
+- `a_log_capture_keeps_what_its_own_thread_logs_and_nothing_from_another_thread`.
+  Fails with every thread appending to one shared buffer:
+  `panicked at crates/lakehouse-api/tests/report_runner.rs:1019` — the kept text
+  held `ERROR report_runner: logged by another thread` as well as
+  `logged by this thread`.
+- Must fail (a): with `let _logged = crate::routes::pdf_export::pdf_failure(err);`
+  removed from `src/routes/report_runner.rs`,
+  `a_pdf_failure_is_logged_…` FAILED on the `log.contains("pdf render failed")`
+  assertion (the captured text in the message was only the two `WARN`s from
+  `AppState`). Each "must fail" below was made, seen, and undone.
+
+**T2** (`tests/gold_publication.rs`)
+- `a_publish_that_cannot_read_the_catalog_token_is_recorded_and_the_card_says_it_failed`
+  — must fail with the token site back to `read_catalog_token(…).await?`:
+  `the card names the failure: {"mart":"tokenless_mart",…,"lastFailure":null,…}`.
+- `a_scheduled_publish_that_fails_before_the_export_is_recorded_each_time` — the
+  same temporary change: ``assertion `left == right` failed: run 1 is recorded / left: 0 / right: 1``.
+- `a_publish_whose_fingerprint_read_fails_is_recorded_with_the_classified_sentence`
+  — must fail with the fingerprint site back to `.map_err(…)?`:
+  ``assertion `left == right` failed: {"mart":"ghost_view_mart","runs":[]} / left: Null / right: "failed"``.
+- `a_refused_publish_and_a_name_that_is_not_a_mart_record_no_run` — must fail with
+  `if exists` removed from `early_failure` (always record):
+  ``assertion `left == right` failed: a name that is not a table is not a publish (DATA-56 D23) / left: 1 / right: 0``.
+- Two corrected assertions (rule 2, corrected not weakened): `busy_mart` 1 → 2
+  and `retry_after_failure_mart` 2 → 3, each with a message saying the `503` at
+  the token file is now a recorded failed run.
+
+**T3** (`src/routes/reports.rs` unit tests, `tests/report_routes.rs`)
+- `not_sent_is_null_while_email_is_set_up`
+- `not_sent_names_the_cause_and_the_time_of_a_last_attempt_that_failed_for_it` —
+  must fail with `not_sent_json` always `Null`: ``left: Null / right:
+  String("email_not_set_up")``.
+- `not_sent_has_no_time_when_the_last_delivery_was_sent_or_failed_for_another_reason`
+- `the_list_says_a_subscription_is_not_sent_while_email_is_not_set_up_and_nothing_is_counted`
+  — must fail with `not_sent_json` always `Null`: ``left: Null / right: Object
+  {"cause": String("email_not_set_up"), "lastAttemptAt": Null}``.
+- `the_list_says_nothing_of_the_kind_while_email_is_set_up` — must fail with
+  `not_sent_json` ignoring `email_set_up`: ``left: Object {"cause":
+  String("email_not_set_up"), …} / right: Null``.
+
+**T4** (`tests/ai_report_tools.rs`)
+- `listing_reports_warns_while_email_is_not_set_up` — must fail with the two added
+  lines removed: ``left: Null / right: "Email is not set up on this deployment,
+  so nothing is sent until it is."``.
+
+**T5** (`report-words.test.ts`, `subscriptions-dialog.test.tsx`)
+- `describeNotSent says the cause, and the time when there was an attempt` — must
+  fail with the time left out: `Expected: "… Last attempt: Nov 12, 2026, 04:15."`,
+  `Received: "… installation."`.
+- `describeNotSent says nothing for a subscription that can be sent or for a
+  cause it does not know`.
+- `shows Not sent with the time of the last attempt on a subscription while email
+  is not set up, instead of its last status` — must fail with the status line
+  rendered unconditionally (the row kept `Failed. Email is not set up on this
+  deployment.`).
+- `keeps the Paused line under Not sent`
+- `shows the last status as before when the list says nothing of the kind`
+
+**T6** (`http.test.ts`)
+- `leaves X-Tenant off a call to /api/auth even when a tenant is stored` — must
+  fail with the `isAuthCall` condition removed: `Expected: false / Received: true`.
+- `clearActiveTenantId removes the stored tenant and never throws when storage
+  does`
+
+**T7** (`auth-provider-tenant.test.tsx`, corrected test in
+`tenant-switcher.test.tsx`)
+- `signing out clears the stored tenant` — must fail with the clear removed from
+  `logout`.
+- `a second person never sends or shows the first person's tenant` — must fail
+  with the correction removed from `load`.
+- `a person signing in after another signed out starts in their own first tenant`
+  — fails with either of those two removals.
+- `a person with no tenant has none stored` — must fail with the correction
+  removed from `load`.
+- `a person whose stored tenant is still theirs keeps it` — a control; it passes
+  on the old code too.
+- `a failed session check leaves the stored tenant alone` — a control.
+- `picking a tenant that is not the person's changes nothing` — must fail with
+  the guard removed from `setActiveTenant`.
+- `resolveActiveTenant keeps a tenant that is the person's, else takes the first,
+  else none` — unit.
+- The corrected existing test `setActiveTenant writes lh_active_tenant and a
+  sibling useAuth consumer observes the change`: the person has two tenants,
+  starts on the first, switches to the second from a click.
+
+### Commands, with the counts they printed
+
+Before T1, on `f7645656` (three runs, to check D9):
+
+```
+cargo test -p lakehouse-api --test report_runner   # ×3
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out   (all three)
+```
+
+Per commit (only what it touched):
+
+```
+(T1) cargo fmt --check                                             clean
+     cargo clippy -p lakehouse-api --all-targets -- -D warnings     Finished, no warning
+     cargo test -p lakehouse-api --test report_runner               ok. 25 passed; 0 failed   ×5
+(T2) cargo test -p lakehouse-api --lib the_stored_error_…           ok. 1 passed; 0 failed
+     cargo test -p lakehouse-api --test gold_publication            ok. 22 passed; 0 failed
+     cargo test -p lakehouse-api --test gold_export_auth            ok. 7 passed; 0 failed
+(T3) cargo test -p lakehouse-api --lib not_sent_                    ok. 5 passed; 0 failed
+     cargo test -p lakehouse-api --test report_routes               ok. 16 passed; 0 failed
+(T4) cargo test -p lakehouse-api --test ai_report_tools             ok. 13 passed; 0 failed
+(T5) bun test report-words.test.ts (6 pass) + subscriptions-dialog.test.tsx (14 pass), 0 fail
+(T6) bun test src/services/http.test.ts                            5 pass, 0 fail
+(T7) bun test auth-provider-tenant / tenant-switcher / login-page  8 / 8 / 3 pass, 0 fail
+     bun run test                                                  4057 pass, 1 skip, 0 fail
+```
+
+Before handoff, once, in the foreground, on `3264aa76`:
+
+```
+cd rust && cargo fmt --check                                        clean
+cargo clippy -p lakehouse-api --all-targets -- -D warnings           Finished, no warning
+cargo test -p lakehouse-api --lib the_stored_error_of_a_failed_publish_is_the_classified_sentence
+                                                                     ok. 1 passed; 0 failed
+cargo test -p lakehouse-api --lib not_sent_                          ok. 5 passed; 0 failed
+for i in 1 2 3 4 5; do cargo test -p lakehouse-api --test report_runner; done
+   run 1 ok. 25 passed; 0 failed
+   run 2 ok. 25 passed; 0 failed
+   run 3 ok. 25 passed; 0 failed
+   run 4 ok. 25 passed; 0 failed
+   run 5 ok. 25 passed; 0 failed
+cargo test -p lakehouse-api --test gold_publication                  ok. 22 passed; 0 failed
+cargo test -p lakehouse-api --test gold_export_auth                  ok. 7 passed; 0 failed
+cargo test -p lakehouse-api --test report_routes                     ok. 16 passed; 0 failed
+cargo test -p lakehouse-api --test ai_report_tools                   ok. 13 passed; 0 failed
+cd .. && bun run typecheck                                           no output (clean)
+bun run lint                                                         11 problems (0 errors, 11 warnings) — all pre-existing
+bun run test                                                         4057 pass, 1 skip, 0 fail (4058 tests, 381 files)
+python3 ops/lint/check_bare_iceberg_count.py                         "R11 guard: no bare count() … found."
+python3 ops/lint/check_intra_package_imports.py                      "OK: all intra-package dispar_orchestrate imports resolve"
+git status                                                           nothing modified, nothing staged
+```
+
+### Containers
+
+`docker ps -a` before the first test run: 32 containers (31 `ClickHouse` 26.8
+from other checkouts' earlier runs, 1 Postgres). My `gold_publication` runs
+started 7 `ClickHouse` testcontainers of their own — six left by the T2
+iterations (`d8c3fde464cd`, `77a9a2de8cb8`, `589c8fc998a7`, `dc4c5e3c354f`,
+`629039be0010`, `3dad0fb983df`) and one by the final block
+(`98586c3133f6`). All seven were removed with `docker rm -f`; the count is back
+to the 32 that were there before. The Postgres of `lakehouse-test-support` was
+reused, not started, and was left alone.
+
+### Not verified
+
+- `cargo test --workspace` — **not run locally**; the plan gives it to CI on the
+  pull request (three nextest partitions plus `cargo test --doc`).
+- `cargo clippy --workspace --all-targets --all-features` — **not run**; only
+  `-p lakehouse-api`, as section 3 names. The workspace run is CI's.
+- The `409` of a second publish in flight recording nothing, and the failed
+  history read of `?ifChanged=true` recording a run: **not tested**, for the
+  reasons T2 gives (a second publish in flight cannot be held from a router
+  test; the shared `ClickHouse` cannot fail only the history table). The
+  reviewer reads those two sites, which are marked at the code.
+- `docker compose config` / `up`, Python tests, `gitleaks`: **not run** — no
+  compose, Python or dependency change in this slice.
+
+## 6. Review
+
+### Round 1 (planner, 2026-11-12), at `4577ae57`
+
+Read against the plan and `AGENTS.md`; nothing was run for this review, CI on the draft pull
+request (#492) runs the suites. 1 BLOCKER (R1) and 6 SHOULD-FIX. No test was weakened: the PDF
+test's assertions are identical to `main`'s, and the two changed row counts in
+`tests/gold_publication.rs` are exact.
+
+**Planner's rulings** (where a ruling and a finding's "Fix" differ, the ruling holds).
+
+- **R1.** `LH-DATA-1-06` is not a QA case: nothing in the Lark base, the backlog or the plan
+  has that id (principle 2). At the three sites and in any later commit body, cite what this
+  work really comes from: `#484 review R4 (DATA-56)`. The commit `b0a5e51c7` stays as it is
+  (no history is rewritten); the handoff says its body names a case that does not exist.
+- **R2.** As the finding says: the shared-call-site test is the proof `REL-25` lacks.
+- **R3 (changes D19).** As the finding says: a failure before the per-mart lock is recorded
+  only when no publish of that mart is in flight; otherwise nothing is written and the error
+  is returned, by the rule of the `409`.
+- **R4 (changes D4 and section 4): in scope.** `list_tenants_by_ids` gets `ORDER BY id`, with
+  the `sqlx::test` the finding names, so the tenant the console starts in is the one the
+  server already uses without a header and nobody's data moves at the deploy.
+- **`notSent` on every subscription while e-mail is not set up: the plan (D13, D14) stands.**
+  While the installation has no e-mail, no subscription can be sent now, whatever its last
+  delivery was; the sentence is about now. The reviewer's brief was wrong on this point.
+- **R5, R6, R7.** As the findings say.
+
+### R1. BLOCKER: three fix sites and one commit body cite a QA case, `LH-DATA-1-06`, that exists nowhere in the plan, the backlog or any document of the repository.
+
+- Where: `rust/crates/lakehouse-api/src/routes/gold.rs:423` (route doc, "(QA `LH-DATA-1-06`)"),
+  `rust/crates/lakehouse-api/src/routes/gold.rs:478` (inline comment "QA `LH-DATA-1-06` (#484
+  review R4, DATA-56)"), `rust/crates/lakehouse-api/tests/gold_publication.rs:1121` (test doc),
+  and the body of commit `b0a5e51c7` ("(QA LH-DATA-1-06)").
+- What happens: `DATA-56` has no QA case. Its backlog row (`docs/core/BACKLOG.md:358`) names
+  its source as "#484 review, R4 (2026-11-12)", and the plan says "`DATA-56` (under `DATA-1`,
+  #484 review R4)" with no case. `git grep LH-DATA-1-06` finds only these three new lines; the
+  only `LH-DATA-1-*` cases the repository knows are `-01`, `-02` and `-51`. The ID looks copied
+  by analogy from `LH-RPT-1-06` (the real case of `RPT-2`). A reader who follows the tag finds
+  nothing, or a different case if the QA base ever numbers one `LH-DATA-1-06`. This is
+  principle 2 (never fabricate) and rule 13 (cite the finding) at a fix site; rule 1 as well.
+  It is a three-line fix, but it must not merge as written.
+- Fix: at the three sites cite only what exists: `DATA-56`, `#484 review R4`. In the body of the
+  fix commit say by name that `b0a5e51c7`'s body cites a QA case that does not exist (principle
+  5: a falsified claim is corrected by name); do not rewrite the pushed commit.
+- Check: `git grep -n "LH-DATA-1-06"` on the branch returns nothing outside the plan's review
+  section. No test applies.
+
+### R2. SHOULD-FIX: no test of T1 fails on the code before the change, so nothing in the suite proves `REL-25` is fixed or would catch the per-thread subscriber coming back.
+
+- Where: `rust/crates/lakehouse-api/tests/report_runner.rs:1020`
+  (`a_log_capture_keeps_what_its_own_thread_logs_and_nothing_from_another_thread`) and the
+  handoff's MISMATCH (plan section 5).
+- What happens: the handoff says the PDF test passed 3 of 3 before the change on that
+  machine and 5 of 5 after, so the five green runs prove nothing about the fix. The one new
+  test logs from the other thread at a DIFFERENT call site ("logged by another thread") than
+  the capturing thread ("logged by this thread"). It proves the per-thread isolation of the
+  writer, not the thing D9 is about: a call site SHARED with a thread that has no subscriber of
+  its own. Temporary wrong change that the whole file survives: in `LogCapture::start`
+  replace the `Once` + `set_global_default` with a per-thread `tracing::subscriber::set_default`
+  kept in the guard (the old mechanism, same writer). Both capture tests still pass.
+- Fix: add a plain `#[test]`, for example
+  `a_log_capture_sees_a_call_site_another_thread_reached_first`: a helper
+  `fn shared_site() { tracing::error!("from the shared call site"); }`; start a capture; run
+  `shared_site` on a `std::thread::spawn(..)` that is joined (that thread registers the call
+  site first); then call `shared_site()` on the test's thread; assert the text contains
+  "from the shared call site" exactly once. By `tracing-core` 0.1.36 (the reading D9 gives:
+  with one dispatcher the call site's interest is taken from the registering thread's default
+  and kept for the process) this fails deterministically with a per-thread `set_default` and
+  passes with the global subscriber, on any machine, under `cargo test` and under `nextest`.
+- Check: the new test passes on the branch; it must fail with the temporary change named
+  above (per-thread `set_default` instead of `set_global_default`). That run is the
+  "failed before" evidence the handoff could not give.
+
+### R3. SHOULD-FIX (plan D19, not a developer deviation): a failure recorded BEFORE the per-mart lock, while another publish of the same mart is in flight, is newer than that publish's row and hides its result, which is the exact harm D19 gives as the reason not to record the `409`.
+
+- Where: `rust/crates/lakehouse-api/src/routes/gold.rs:485-497` (the fingerprint read and the
+  `?ifChanged=true` history read both run before `try_acquire` at `:505-514`), `:783-801`
+  (`early_failure`), and the ordering in
+  `rust/crates/lakehouse-api/src/gold_export_history.rs:481-490` (`ORDER BY started_at DESC,
+  finished_at DESC LIMIT 1`).
+- What happens: publish A holds the lock and is exporting; its row will carry
+  `started_at` = the moment `export_mart` began (10:00:00). At 10:01:00 a second call B for the
+  same mart (the scheduler's `?ifChanged=true`, or a second click) fails its fingerprint read
+  or its history read (for example the `count()`/`sum(cityHash64(*))` query times out or hits
+  a memory limit while A is reading the same table). B has not reached the lock, so
+  `early_failure` writes a failed row with `started_at` 10:01:00. A then succeeds and writes
+  its row with `started_at` 10:00:00. `last_export_run` returns B's row: the card says "Last
+  publish failed" although the newest copy was published successfully after it, until the
+  next publish; and because a failed newest run is never skipped (`DATA-49`), the next
+  scheduled run exports the unchanged mart again. Had B got as far as the lock it would have
+  been a `409` with no row, for exactly this reason (the comment at `:502-504`).
+- Fix (planner's decision, then the developer): record a pre-lock early failure only when no
+  publish of that mart is in flight. In `early_failure`, for the two pre-lock sites, take
+  `state.gold_export_locks.try_acquire(mart)` and write the row only when it succeeds, holding
+  the guard for the write; when the lock is held, write nothing and return the error (same
+  rule and same comment as the `409`). The token site already holds the lock and needs no
+  change. Say it in the route's "What is recorded" section and in D19.
+- Check: a unit-level test in `gold.rs` that calls `early_failure` (or a small extracted
+  helper) with the mart's lock already held and asserts no insert reaches `ClickHouse`
+  (the file's existing mock-server pattern), and one with the lock free that asserts one
+  insert. Must fail: with the `try_acquire` guard removed from `early_failure`.
+
+### R4. SHOULD-FIX (plan D4, not a developer deviation): the tenant now written when nothing is stored is the first of an UNORDERED list, so it can differ from the server's default, changes what an existing multi-tenant person sees after this deploy, and is not the same tenant from one sign-in to the next.
+
+- Where: `src/features/auth/auth-provider.tsx:159-162` (`resolveActiveTenant(stored,
+  me.tenants)` then `writeActiveTenantId(resolved)`), `:68-74` (`tenants[0]`);
+  `rust/crates/lakehouse-store/src/identity.rs:1260-1264` (`SELECT id, name, slug FROM tenant
+  WHERE id = ANY($1)`, no `ORDER BY`, documented "in no particular order");
+  `rust/crates/lakehouse-auth/src/repository.rs:135-142` (`ORDER BY tenant_id`, with the comment
+  that the first tenant is "who acts" without a header);
+  `rust/crates/lakehouse-api/src/tenant_scope.rs:86` (`principal.tenant_ids.first()`).
+- What happens: a person in tenants T1 < T2 (by id) who never used the switcher. On `main`:
+  nothing stored, no `X-Tenant`, the server answers for T1 (lowest id) on every page. After
+  this deploy: `load()` writes `me.tenants[0]`; if Postgres returns T2 first, every request
+  now carries T2 and the person's lists, connectors and query tabs are T2's, with no action
+  on their part. (The navbar already said `me.tenants[0]`, so the label and the data now
+  agree; the data is what moved.) Second effect: sign-out now clears the key, so EVERY
+  sign-in starts from `me.tenants[0]`; with no `ORDER BY`, an update of a `tenant` row (a
+  rename) can change which row comes first, so the same person can start in a different
+  tenant on different days. A person who had picked a tenant loses the pick at each sign-out;
+  that part is D3 and decided. The plan names the missing `ORDER BY` in D4 and puts it out of
+  scope in section 4 on the ground that "the two orders no longer have to agree"; that holds
+  for the label, not for the change at deploy nor for the start tenant being stable.
+- Fix (planner's decision; it is outside this plan's file list): add `ORDER BY id` to
+  `list_tenants_by_ids` (and correct its doc comment), so `me.tenants[0]` is the same tenant
+  the server already defaults to: nobody's data moves at deploy and the start tenant is
+  deterministic. If that stays out of scope, give it a backlog row and say in the PR that
+  header-less multi-tenant people may land in another of their own tenants after the deploy.
+- Check: a `sqlx::test` in `lakehouse-store` that inserts two tenants whose insertion order is
+  the reverse of their id order (and updates the lower one so its row moves), calls
+  `list_tenants_by_ids` and asserts ascending id. Must fail: with the `ORDER BY` removed (on a
+  sequential scan the updated row comes last).
+
+### R5. SHOULD-FIX: three new doc comments say things the code does not do (rule 1, and T2 step 10 asked for exactly these comments to be made true).
+
+- Where: `rust/crates/lakehouse-api/src/routes/gold.rs:775-777` (`early_failure`),
+  `rust/crates/lakehouse-api/src/routes/gold.rs:594-598` (`record_export_history`),
+  `rust/crates/lakehouse-api/src/gold_export_history.rs:19-25` (module doc).
+- What happens:
+  1. `early_failure`'s doc says "`attempt.exists` carries the one answer that may not be
+     recorded: the read of `system.tables` that failed". It does not. A failed read of
+     `system.tables` returns from `Attempt::open` (`gold.rs:683-699`) and never builds an
+     `Attempt`; `exists == false` means the read SUCCEEDED and the name is not a table (D23).
+     The comment describes the wrong row of D19, at the one `if` that decides whether history
+     is written.
+  2. `record_export_history`'s doc and the module doc of `gold_export_history.rs` say every
+     `POST` "that gets past the mart's existence records exactly one row, success or failure".
+     Two calls that get past it record none (a `?ifChanged=true` skip, and the `409`), and a
+     name that is NOT in `system.tables` still records one when `export_mart` is reached (as
+     on `main`, D23). The route's own "What is recorded" section (`gold.rs:418-435`) is right;
+     these two contradict it.
+- Fix: `early_failure`: "`attempt.exists` is `false` for a name `system.tables` does not list
+  (D23): such a name goes on as before and no early failure is recorded for it. A failed read
+  of `system.tables` never gets here (`Attempt::open` returns it unrecorded)."
+  `record_export_history` and the module doc: "at most one row per call: none for a refusal,
+  a skip under `?ifChanged=true` or a `409`; one for the export's outcome; one for a failure
+  before the export on a mart `system.tables` lists", pointing at the route's section.
+- Check: reading; no test.
+
+### R6. SHOULD-FIX: D5's order ("`logout()` removes the key before it calls the API, so it is gone even if that request never returns") is not asserted by any test.
+
+- Where: `src/features/auth/auth-provider-tenant.test.tsx:126-141` (`signing out clears the
+  stored tenant`), against `src/features/auth/auth-provider.tsx:189-199`.
+- What happens: the test's `fetch` stub answers the sign-out at once and the test only waits
+  for the key to be absent afterwards. Temporary wrong change that passes all eight tests:
+  move `clearActiveTenantId()` to after `await authClient.logout()`. With that change a
+  sign-out whose request hangs (or a tab closed while it is pending) leaves the previous
+  person's tenant stored, which is the case D5 was written for.
+- Fix: in that test (or a new one, `signing out clears the stored tenant before the request
+  answers`), make the stub return a promise for `/api/auth/logout` that the test resolves
+  later; after the click assert, while it is still pending, that the request was recorded in
+  `seen`, carried no `X-Tenant`, and `localStorage.getItem(ACTIVE_TENANT_STORAGE_KEY)` is
+  already `null`; then resolve it.
+- Check: must fail with `clearActiveTenantId()` moved below the `await`.
+
+### R7. SHOULD-FIX: the two "DEC-18" assertions of the new list test are true whatever the counting rule is, because the only delivery in the test is a "Send now".
+
+- Where: `rust/crates/lakehouse-api/tests/report_routes.rs:952-957`
+  (`the_list_says_a_subscription_is_not_sent_while_email_is_not_set_up_and_nothing_is_counted`).
+- What happens: `routes/report_runner.rs:351` returns before counting when
+  `manual || reason == EMAIL_NOT_SET_UP`. The test sends through `POST …/send` (manual), so
+  `consecutiveFailures == 0` and `paused == false` hold with the `DEC-18` half of that
+  condition deleted. Temporary wrong change that the test survives: `if manual {` at
+  `report_runner.rs:351`. The rule itself is covered elsewhere
+  (`tests/report_runner.rs:1149-1151`, a run through the runner), so nothing is unprotected;
+  the messages "DEC-18: a delivery that fails for this reason is not counted" claim more than
+  the test shows. The plan asked for exactly these assertions, so this is the plan's wording
+  as much as the developer's.
+- Fix: either reword the two messages and the test's name to what is shown ("a failed Send now
+  is not counted and nothing is paused"), or drive a scheduled delivery in this harness (set
+  the subscription's `next_run_at` in the past and call `report_runner::tick` with an
+  `EmailSender` built from `runtime_settings::email`) before reading the list.
+- Check: with the second option, must fail with `|| reason == EMAIL_NOT_SET_UP` removed from
+  `report_runner.rs:351`.
+
+
+### Round 1 fixes (developer)
+
+Branch `fix/qa-round-leftovers-p2`, one commit per finding, each pushed after its scoped checks.
+
+**Merge first.** `git merge origin/main` before the fixes, no conflict, committed as
+`ccc7f08e` ("46 files changed, 3397 insertions(+), 140 deletions(-)"). The planner's review
+commit (`e431f303`) was pulled fast-forward (`1 file changed, 194 insertions(+)`).
+
+| Finding | Commit | What changed |
+| --- | --- | --- |
+| R1 | `7f6a168d` | the three `LH-DATA-1-06` sites say `#484 review R4 (DATA-56)`; no code change |
+| R2 | `8e904965` | `a_log_capture_sees_a_call_site_another_thread_reached_first`, a shared call site reached first from a thread with no subscriber |
+| R3 | `482c8daa` | `early_failure` takes the mart's lock for its write and writes nothing when a publish holds it; `early_failure_under_lock` for the token read; two `wiremock` unit tests; route doc and D19 |
+| R4 | `28b1d8dc` | `list_tenants_by_ids` reads `ORDER BY id`, doc comment corrected, `sqlx::test` for the order; plan D4 and section 4 |
+| R5 | `0e41a6ca` | `early_failure`, `record_export_history` and the `gold_export_history` module doc now say what the code does (at most one row per call; `exists == false` is D23, a failed `system.tables` read never builds an `Attempt`) |
+| R6 | `4f0e73e9` | `signing out clears the stored tenant before the request answers`: the stub holds the sign-out answer, storage is read while it is pending |
+| R7 | `2ee8e992` | the list test makes the subscription due and runs `report_runner::tick` with an `EmailSender` from `runtime_settings::email`, so a scheduled delivery is what is counted (or not) |
+
+**R1.** `git grep -n "LH-DATA-1-06"` on the branch prints only this plan's review text. The
+commit body of `b0a5e51c7` still names `LH-DATA-1-06`; that QA case does not exist (principle
+2) and no history was rewritten — this is the correction by name.
+
+**R2, proof.** With the `Once` + `set_global_default` replaced by a per-thread
+`tracing::subscriber::set_default` kept in the guard,
+
+```
+cargo test -p lakehouse-api --test report_runner another_thread_reached_first
+thread 'a_log_capture_sees_a_call_site_another_thread_reached_first' panicked at
+crates/lakehouse-api/tests/report_runner.rs:1045:5:
+assertion `left == right` failed: the site registered on the other thread must still reach this capture:
+  left: 0
+ right: 1
+test result: FAILED. 0 passed; 1 failed; 0 ignored
+```
+
+and the sibling `a_log_capture_keeps_what_its_own_thread_logs_and_nothing_from_another_thread`
+still passed (1 passed), as the finding said. On the branch both pass (2 passed).
+One limit of the proof, measured: in a full parallel `cargo test --test report_runner` run
+with the same wrong change the new test passed 3 of 3, because the sibling capture test's
+live subscriber is a second dispatcher — `tracing-core` 0.1.36 then answers `sometimes`
+instead of `never` for the shared site. CI (`cargo nextest run --workspace`) runs one test
+per process, where the wrong change fails as above; `cargo test` on a single filter does too.
+
+**R3, proof.** With the `try_acquire` guard removed from `early_failure`:
+
+```
+cargo test -p lakehouse-api --lib an_early_failure
+test routes::gold::tests::an_early_failure_while_a_publish_is_in_flight_is_not_recorded ... FAILED
+assertion `left == right` failed: the publish in flight records its own run; a row here would hide its result
+  left: 1
+ right: 0
+```
+
+`an_early_failure_with_no_publish_in_flight_is_recorded_once` stayed green (one insert), so
+the pair distinguishes the two cases. On the branch both pass (2 passed).
+
+**R4, proof.** With `ORDER BY id` removed:
+
+```
+cargo test -p lakehouse-store --lib list_tenants_by_ids
+assertion `left == right` failed: ascending id is the order the console's first tenant depends on
+  left: ["11111111-1111-4111-8111-000000aa0002", "11111111-1111-4111-8111-000000aa0001"]
+ right: ["11111111-1111-4111-8111-000000aa0001", "11111111-1111-4111-8111-000000aa0002"]
+```
+
+On the branch it passes (1 passed).
+
+**R5.** Reading only, per the finding: no test applies.
+
+**R6, proof.** With `clearActiveTenantId()` moved below `await authClient.logout()`:
+
+```
+bun test src/features/auth/auth-provider-tenant.test.tsx
+(fail) AuthProvider and the stored tenant (ADM-15) > signing out clears the stored tenant before the request answers
+error: expect(received).toBeNull()
+Received: "a2"
+  at …/auth-provider-tenant.test.tsx:166:61
+8 pass, 1 fail
+```
+
+The pre-existing "signing out clears the stored tenant" still passed, which is the gap the
+finding described. On the branch: 9 pass, 0 fail.
+
+**R7, proof.** With `|| reason == EMAIL_NOT_SET_UP` removed from the counting guard:
+
+```
+cargo test -p lakehouse-api --test report_routes the_list_says_a_subscription_is_not_sent
+assertion `left == right` failed: DEC-18: a scheduled delivery that fails for this reason is not counted
+  left: Number(1)
+ right: Number(0)
+```
+
+and with the scheduled delivery absent the same assertions passed before this change, which
+is why the scheduled run is driven. On the branch (1 passed).
+
+**Verification on the final fix commit `2ee8e992`** (foreground, from the shared
+`CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-1`, `CARGO_BUILD_JOBS=6`):
+
+- `cargo fmt --check` — clean.
+- `cargo clippy -p lakehouse-api -p lakehouse-store --all-targets -- -D warnings` — finished, no warning.
+- `cargo test -p lakehouse-api --test report_runner` — 26 passed, 0 failed, run three times in
+  a row (26, 26, 26).
+- `cargo test -p lakehouse-api --test gold_publication` — 22 passed, 0 failed.
+- `cargo test -p lakehouse-api --test report_routes` — 16 passed, 0 failed.
+- `cargo test -p lakehouse-store --lib list_tenants_by_ids` — 1 passed, 0 failed.
+- `bun run typecheck` — clean; `bun run lint` — 0 errors, 11 pre-existing warnings; `bun run test`
+  — 4070 pass, 1 skip, 0 fail (4071 tests, 381 files).
+- `python3 ops/lint/check_bare_iceberg_count.py && python3 ops/lint/check_intra_package_imports.py`
+  — both OK.
+- `grep -rn "LH-DATA-1-06" rust src docs …` — only this plan's review text.
+
+**Not verified.** `cargo test --workspace` and the dagster/compose checks were not run (CI
+runs the full suite; this round touched no Python or compose file). The R2 wrong-change
+proof under a full parallel `cargo test --test report_runner` is the measured limit noted
+above, not a green claim.
+
+**Containers.** The `gold_publication` run started one `ClickHouse` container
+(`eloquent_wright`, created 22:37); it was removed with `docker rm -f`. The labelled Postgres
+(`sleepy_pike`) and the `ClickHouse` containers created before this session were left alone.
+
+### Round 2 (planner, 2026-11-12), at `2e5a391e`
+
+Read the round-1 fix commits. R1 to R7 are fixed, one commit each, each new test shown red on
+the wrong change before it was kept. No product or test file names `LH-DATA-1-06` any more;
+commit `b0a5e51c7`'s body still does, and stays (no history is rewritten).
+
+- R2: the shared-call-site test fails with the per-thread subscriber when it runs alone or
+  under `nextest` (one process per test, which is how CI runs it). In a full parallel
+  `cargo test --test report_runner` run a sibling test's live subscriber can hide the wrong
+  change; the developer measured this and wrote it down. Accepted: CI is where the guard
+  holds, and `REL-25` itself was the in-process run failing, which the global subscriber
+  removes.
+- R3: a failure before the per-mart lock writes a run only when the lock is free.
+- R4: `list_tenants_by_ids` answers in id order, so the console starts in the tenant the
+  server already uses without a header.
+
+No open BLOCKER. Merge when CI on #492 is green.

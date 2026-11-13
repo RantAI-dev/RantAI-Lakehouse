@@ -46,7 +46,7 @@ reported, not quietly lowered.
 | 3 | Incident lifecycle. | A failure opens an incident; it is **resolved by a person**, with actor and reason recorded; the next passing run marks it stale but does not auto-resolve it. Editing a rule **keeps** its past runs — today's delete-on-edit goes away. | 2026-10-15 |
 | 4 | Schedules. | Per table: on every load, or on an interval of 1 hour to 1 day (the spec's range). On-load checks run **after** the load commits and never block or fail it; a schedule change takes effect at the next tick. | 2026-10-15 |
 | 5 | Anomaly detection. | Volume and freshness anomalies are learned per table from at least **14 days** of history (the spec's proposed number). Before that, the page says "not learned yet — collecting history" and detects nothing, rather than guessing. A volume anomaly is a load far under the recent median; a freshness anomaly is a load later than the learned interval allows. Alerts go through SRC-7's channels. | 2026-10-15 |
-| 6 | Permissions. | Unchanged from today's quality feature: viewing needs what the Data Quality page needs, defining rules and resolving incidents need `governance:write`. | 2026-10-15 |
+| 6 | Permissions. | Viewing needs what the Data Quality page needs; defining rules, resolving incidents and running a rule by hand need `governance:write`. Running by hand took `query:read` before (product owner 2026-11-12, `DEC-17`). Scheduled and on-load checks run as the system and are not affected. | 2026-10-15 (updated 2026-11-12) |
 
 ## Limits to tell a customer
 
@@ -56,6 +56,13 @@ reported, not quietly lowered.
   load itself stays committed.
 - Alerts need SRC-7's channels configured; without them an incident still
   opens, only nothing is sent.
+- A rule is written for a table that exists and that its author may read; any
+  other table is refused (`DATA-54`).
+- On-load checks start when the orchestrator reports the finished load, not
+  when the load ends: QA saw about 36 seconds on staging (`LH-DATA-14-05`). The
+  upload's result page says so.
+- A stale incident is one whose check has passed since it opened. It stays
+  open until a person resolves it.
 
 ## Spec rows
 

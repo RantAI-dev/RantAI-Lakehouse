@@ -68,7 +68,7 @@ and the last result) keeps working, and follows the active query tab.
 | 2 | Suggestions show within 200 ms of a keystroke once the table's columns are loaded *(proposed in the spec)*. The first time a table is named, its columns may take one request longer, and the list says it is loading them | 200 ms | Owner, 2026-10-23 |
 | 3 | Run all sends the statements one after another, as separate requests, in the order written. It stops at the first failure, and the statements after it show "Not run" in their tabs. The server keeps its one-statement rule | Stop at the first failure | Owner, 2026-10-23 |
 | 4 | Run all runs at most 20 statements; more is refused with a message before anything runs *(proposed)* | 20 | Owner, 2026-10-23 |
-| 5 | Query tabs are stored in this browser (`localStorage`), not on the server: each tab keeps its name, SQL and engine, not its result. At most 20 tabs *(proposed)* | Browser only, 20 tabs | Owner, 2026-10-23 |
+| 5 | Query tabs are stored in this browser (`localStorage`), not on the server, under a key of the signed-in person and their active tenant: each tab keeps its name, SQL and engine, not its result. A person never sees another person's tabs on the same browser; signing out keeps their tabs for their next sign-in on that browser. The entry every person shared before `QS-8` is removed, not migrated. At most 20 tabs *(proposed)* | Browser only, 20 tabs | Owner, 2026-10-23; changed 2026-11-12 (`QS-8`), *(proposed, not yet signed)* |
 | 6 | ⌘/Ctrl+Enter runs the selection when there is one, and otherwise the whole tab (Run all). Today it runs the whole buffer | Selection, else all | Owner, 2026-10-23 |
 | 7 | Format keeps this repository's small formatter and adds two settings, kept in this browser: keyword case (upper, lower, as typed) and indent (none, 2 or 4 spaces). Indent puts each clause's body on the line after its keyword, indented by that width; none is today's output. No new dependency | Upper case, no indent (today's output) | Owner, 2026-10-23; indent default corrected by the planner the same day, because today's formatter does not indent and a 2-space default would change everyone's output |
 | 8 | Find and replace, comment toggling, bracket matching and folding come from the editor component already installed; the work is to check each one and add the shortcut list | none | Owner, 2026-10-23 |
@@ -82,7 +82,9 @@ and the last result) keeps working, and follows the active query tab.
 ## Limits to tell a customer
 
 - Query tabs are kept in the browser they were opened in. Clearing the
-  browser's site data removes them; saved queries are not affected.
+  browser's site data removes them; saved queries are not affected. They are
+  kept per signed-in person and tenant; an administrator cannot read or move
+  them.
 - Run all is not a transaction. A statement that ran before a failure is not
   undone (the editor runs read-only statements, so nothing was written).
 - Autocomplete and the schema browser know only the tables the catalog shows
@@ -113,6 +115,7 @@ a pass.
 | `QS-1-AC10` | (operator) Make the catalog's table detail fail for one table, then type its alias and a dot | The list says the columns could not be loaded; the query still runs | Not run |
 | `QS-1-AC11` | Sign in as a user without `catalog:read` but with `query:read` | The schema browser says it needs catalog access; the editor still runs SQL | Not run |
 | `QS-1-AC12` | Paste 21 statements and press Run all | Refused before anything runs, with a message naming the limit of 20 | Not run |
+| `QS-1-AC13` | Sign in as one person, write SQL in two tabs, sign out, sign in as a second person on the same browser, open Query Studio; then sign in as the first person again | The second person sees one empty tab and none of the first person's SQL; the first person finds their two tabs | Not run |
 
 **Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
 

@@ -113,6 +113,30 @@ def test_run_bronze_ingest_pins_postgres_via_hostaddr(monkeypatch) -> None:
     assert captured["credentials"]["host"] == "postgres"
 
 
+def test_run_bronze_ingest_hands_the_runs_label_to_the_sink(monkeypatch) -> None:
+    """`DATA-52`, review round 1 R2: the PostgreSQL connector's load is a connector's
+    replace or append, so its commits name the run like every other path's. The
+    label is the caller's (`ingest_factory._run_author`); this function neither
+    invents one nor drops it."""
+    sink_configs = []
+
+    monkeypatch.setattr("dispar_orchestrate.dlt_pipeline.sql_database", lambda **kwargs: _FakeSource("orders"))
+    monkeypatch.setattr(
+        "dispar_orchestrate.dlt_pipeline.ssrf_guard.resolve_checked",
+        lambda host, port: ssrf_guard.ResolvedAddress(ip="10.0.0.9", port=port, family=2),
+    )
+    monkeypatch.setattr(
+        "dispar_orchestrate.dlt_pipeline.load_via_sink",
+        lambda source, table_name, sink_config, plan: sink_configs.append(sink_config) or _FakeLoadResult(),
+    )
+
+    run_bronze_ingest(_base_config(), author="connector conn-x, run 9z8y")
+    # No run context records none rather than a guess.
+    run_bronze_ingest(_base_config())
+
+    assert [config.author for config in sink_configs] == ["connector conn-x, run 9z8y", ""]
+
+
 def test_run_bronze_ingest_refuses_a_blocked_host_before_building_credentials(monkeypatch) -> None:
     def fake_resolve_checked(host, port):
         raise ssrf_guard.SsrfBlocked("refused")

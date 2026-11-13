@@ -342,14 +342,32 @@ export type QueryPlanStage = {
 }
 
 export type QueryEstimate = {
+  /**
+   * `QS-6` (decision 7): whether the server could estimate this statement at
+   * all. Absent from an older server, which only ever answered a ClickHouse
+   * estimate — so absent reads as supported.
+   */
+  supported?: boolean
+  /** Why there is no estimate, as the server's fixed sentence (`QS-6`). */
+  reason?: string | null
+  /**
+   * `QS-6`: which engine answered. `null`/absent from an older server, whose
+   * estimate always described ClickHouse.
+   */
+  queryEngine?: QueryEngine | string
   /** Null when the query could not be planned — see `error`. */
   estimatedBytes: number | null
   estimatedCostMin: number | null
   estimatedCostMax: number | null
-  /** Why there is no estimate, in ClickHouse's words. */
+  /**
+   * Why there is no estimate, as the server sends it: today the engine's
+   * trimmed diagnosis (`SEC-11`, decision 4).
+   */
   error?: string | null
-  workloadClass: WorkloadClass
-  engine: EngineCategory
+  /** Null for a Trino statement, which has no ClickHouse workload class. */
+  workloadClass: WorkloadClass | null
+  /** Null for a Trino statement, which has no ClickHouse storage tier. */
+  engine: EngineCategory | null
   /**
    * `EXPLAIN ESTIMATE` doesn't report cache eligibility — null until a
    * real cache-eligibility check exists.
@@ -411,8 +429,10 @@ export type QueryResult = {
     durationMs: number
     scannedBytes: number
     costUnits: number
-    engine: EngineCategory
-    workloadClass: WorkloadClass
+    /** Null for a Trino run, which has no ClickHouse storage tier. */
+    engine: EngineCategory | null
+    /** Null for a Trino run, which has no ClickHouse workload class. */
+    workloadClass: WorkloadClass | null
     /** ClickHouse's response carries no cache-hit flag — not measured. */
     cacheHit: boolean | null
     /** No pushdown computation exists — not measured. */
@@ -420,6 +440,14 @@ export type QueryResult = {
     /** No policy engine exists yet — WS7 builds one. */
     policyObligations: string[] | null
   }
+  /**
+   * QA `LH-QS-2-06` (`QS-9`): whether this person may download a result at
+   * all. `false` when every role they hold is switched off from downloading
+   * (the same switch the dashboard reads); the console turns Download and
+   * "Copy as TSV" off with it. Absent from an older server, which counts as
+   * allowed — and the download route refuses on its own either way.
+   */
+  canDownload?: boolean
   /**
    * WS1 task 1.6: the old plan was a single hardcoded stage claiming
    * "scan + aggregate" for every query. Null until a real plan exists.
@@ -629,9 +657,11 @@ export interface QueryService {
    */
   listHistoryPage(filter?: QueryHistoryFilter, signal?: AbortSignal): Promise<QueryHistoryPage>
   /**
-   * `options` carries the `{{name}}` values and definitions (`QS-5`); with
-   * none, the request is the one sent before parameters existed. The
-   * estimate always asks ClickHouse.
+   * `options` carries the `{{name}}` values and definitions (`QS-5`): with
+   * none, the request is the one sent before parameters existed. The console
+   * asks only from a ClickHouse tab (M2 of the round-3 rulings): a `Trino`
+   * statement has no pre-run estimate, and the route still takes an `engine`
+   * from any other caller and answers `supported: false` with the reason.
    */
   estimate(sql: string, options?: QueryParamInputs, signal?: AbortSignal): Promise<QueryEstimate>
   /**

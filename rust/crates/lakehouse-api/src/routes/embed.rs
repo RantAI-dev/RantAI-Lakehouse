@@ -566,6 +566,9 @@ pub async fn values(State(state): State<AppState>, body: Bytes) -> Response {
     match crate::routes::dashboard::values_with_limit(
         &state.clickhouse,
         crate::routes::dashboard::ValuesQuery::for_board(&column, &subject.board_id, filters_json),
+        // A board's value list reads no joined mart: the chart's own list is
+        // the page's, not the embed's (`QA LH-BI-6-01` review round 1, R10).
+        &[],
         (&roles, &Viewer::anonymous()),
         (
             &crate::sql_rewrite::PlaceholderValues::none(),

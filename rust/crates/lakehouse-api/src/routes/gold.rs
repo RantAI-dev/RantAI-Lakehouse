@@ -415,6 +415,29 @@ async fn gated_source_table(
 /// has no dedup). A DIFFERENT mart is unaffected — the lock is keyed by
 /// mart name.
 ///
+/// # What is recorded (`DATA-56`, #484 review R4)
+///
+/// The history table is the card's source of truth, so a publish that fails
+/// has to leave a run there — otherwise a mart whose every publish fails before
+/// the copy starts stays "Up to date" or "Out of date" for ever (#484 review R4,
+/// `DATA-56`). After the caller is authenticated and allowed and the mart
+/// is shown to be theirs, every failure is recorded: the content fingerprint
+/// read, the `?ifChanged=true` history read, the catalog token file, and the
+/// export itself. A failure of the content fingerprint or the history read, both
+/// of which happen BEFORE the per-mart lock, is recorded only when no publish of
+/// that mart is in flight (review round 1, R3): otherwise its row, newer than the
+/// running publish's, would hide that publish's result — the rule the `409`
+/// follows. A refusal records nothing: `401`/`403`/`503` from
+/// [`check_export_token`], `400` for a mart name that is not an identifier, the
+/// tenant gate's `404`/`422`/`503`, and the `409` of a publish already in
+/// flight (that publish records its own run, and a row for the turned-away call
+/// would be newer and hide its result). A name that is not a table is not
+/// refused — it goes on and fails where it fails today (D23). The row's
+/// sentence is the sentence the response carries ([`stored_error`]), never
+/// upstream text. When the database that keeps the history is the thing that
+/// failed, nothing can be recorded: the write is best-effort and the caller
+/// gets the failure it already had.
+///
 /// # Errors
 ///
 /// Returns 401/503 from [`check_export_token`], `409` if an export of the
@@ -454,15 +477,17 @@ pub async fn export(
     let actor = gold_export_gate_actor(principal.as_ref().map(|Extension(p)| p), &headers);
     let source_table = gated_source_table(&state, mart_ident.as_str(), actor).await?;
 
+    let triggered_by = triggered_by(principal.as_ref().map(|Extension(p)| p));
+
+    // #484 review R4 (DATA-56): from here on the caller is
+    // authenticated and allowed and the mart is shown to be theirs, so every
+    // failure below is a failed publish and is recorded as one.
+    let attempt = Attempt::open(&state, mart_ident.as_str(), &triggered_by).await?;
+
     // DATA-10 review SHOULD-FIX 1 / DATA-10 D2: The fingerprint is computed before
     // the export reads rows, and written on the history row of that export.
-    let current_fingerprint = gold_export_history::mart_content_fingerprint(
-        &state.clickhouse,
-        &state.config.gold_source_schema,
-        mart_ident.as_str(),
-    )
-    .await
-    .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
+    let current_fingerprint =
+        read_content_fingerprint(&attempt, &state.config.gold_source_schema).await?;
 
     // DATA-10 / DATA-1 task 4 — `?ifChanged=true`: a proven-unchanged mart is
     // skipped BEFORE the single-flight lock is taken (a skip holds
@@ -470,20 +495,17 @@ pub async fn export(
     // snapshot — the response is the only trace). Unknown facts export, per
     // [`if_changed_skip_reason`].
     if query.if_changed.as_deref() == Some("true")
-        && let Some(reason) = unchanged_since_last_export_reason(
-            &state,
-            mart_ident.as_str(),
-            current_fingerprint.as_deref(),
-        )
-        .await?
+        && let Some(body) = attempt.skip_body(current_fingerprint.as_deref()).await?
     {
-        return Ok(ApiJson(skipped_body(&reason)));
+        return Ok(ApiJson(body));
     }
 
     // Held for the rest of this handler (dropped at function return,
     // success or error alike) — see this function's "Single-flight" doc
     // section above for why acquiring it is the very first thing done
-    // after validating the mart name.
+    // after validating the mart name. A `409` here records NO run (DATA-56):
+    // the publish that holds the lock records its own row, and a row written
+    // by the call it turned away would be newer and hide that result.
     let _export_guard = state
         .gold_export_locks
         .try_acquire(mart_ident.as_str())
@@ -495,7 +517,9 @@ pub async fn export(
             ))
         })?;
 
-    let token = read_catalog_token(&state.config.lakekeeper_gold_export_token_file).await?;
+    let token = attempt
+        .catalog_token(current_fingerprint.as_deref())
+        .await?;
     let iceberg_config = gold_export::iceberg_config(
         state.config.lakekeeper_catalog_uri.clone(),
         state.config.lakekeeper_warehouse.clone(),
@@ -548,13 +572,6 @@ pub async fn export(
     // the same reference. `GoldExportError`'s `Display` is the log's only.
     let export_result = export_result.map_err(ApiError::from);
 
-    let triggered_by = principal.as_ref().map_or_else(
-        || "unknown".to_owned(),
-        |Extension(p)| match p.id {
-            PrincipalId::Service(_) => format!("service:{}", p.display_name),
-            PrincipalId::User(_) => format!("user:{}", p.display_name),
-        },
-    );
     record_export_history(
         &state,
         mart_ident.as_str(),
@@ -562,7 +579,7 @@ pub async fn export(
         started_at,
         finished_at,
         current_fingerprint.as_deref().unwrap_or(""),
-        &export_result,
+        export_result.as_ref(),
     )
     .await;
 
@@ -578,16 +595,21 @@ pub async fn export(
     })))
 }
 
-/// Best-effort history write for one finished export attempt: every
-/// `POST` records exactly one row, success or failure (the acceptance
-/// test counts on it), but a failed write is logged, never propagated —
-/// this table is a history view, not a correctness dependency of the
-/// export itself (`gold_export_history::record_export_run`'s doc comment).
+/// Best-effort history write for one finished export attempt: at most one row
+/// per call — none for a refusal, a skip under `?ifChanged=true`, or a `409`;
+/// one for the export's outcome; one for a failure before the export on a mart
+/// `system.tables` lists (the exact list is this module's "What is recorded"
+/// section on `export`). The acceptance test counts on it. A failed write is
+/// logged, never propagated — this table is a history view, not a correctness
+/// dependency of the export itself (`gold_export_history::record_export_run`'s
+/// doc comment).
 ///
-/// `export_result` is the already-converted result, so the row's `error` is the
+/// `export_result` is the converted result, so the row's `error` is the
 /// sentence the response carries (`DATA-49`, QA `LH-DATA-1-01`) — the
 /// `ApiError`'s own text, never the `Display` of a `GoldExportError`, which
-/// holds upstream text for the log.
+/// holds upstream text for the log. A failure that happens before the export
+/// starts is recorded from the error alone ([`early_failure`], `DATA-56`,
+/// #484 review R4).
 #[allow(
     clippy::cast_possible_truncation,
     reason = "rows_exported is a usize from an in-memory Vec of one ClickHouse batch, \
@@ -600,7 +622,7 @@ async fn record_export_history(
     started_at: time::OffsetDateTime,
     finished_at: time::OffsetDateTime,
     content_fingerprint: &str,
-    export_result: &Result<gold_export::GoldExportResult, ApiError>,
+    export_result: Result<&gold_export::GoldExportResult, &ApiError>,
 ) {
     let error_message = stored_error(export_result);
     let history_row = gold_export_history::NewGoldExportRun {
@@ -610,9 +632,9 @@ async fn record_export_history(
         } else {
             "failed"
         },
-        rows_exported: export_result.as_ref().ok().map(|r| r.rows_exported as u64),
-        format_version: export_result.as_ref().ok().map(|r| r.format_version),
-        snapshot_id: export_result.as_ref().ok().and_then(|r| r.snapshot_id),
+        rows_exported: export_result.ok().map(|r| r.rows_exported as u64),
+        format_version: export_result.ok().map(|r| r.format_version),
+        snapshot_id: export_result.ok().and_then(|r| r.snapshot_id),
         error: error_message.as_deref(),
         triggered_by,
         content_fingerprint,
@@ -625,14 +647,211 @@ async fn record_export_history(
     }
 }
 
+/// Who triggered the publish, for the history row: a service and a person are
+/// told apart, and a call that authenticated only through the shared run token
+/// names no person at all.
+fn triggered_by(principal: Option<&Principal>) -> String {
+    principal.map_or_else(
+        || "unknown".to_owned(),
+        |p| match p.id {
+            PrincipalId::Service(_) => format!("service:{}", p.display_name),
+            PrincipalId::User(_) => format!("user:{}", p.display_name),
+        },
+    )
+}
+
+/// A publish attempt that has passed the token check, the mart name and the
+/// tenant gate — the facts a failure before the export still needs to leave a
+/// run with (`DATA-56`, #484 review R4). It carries the gate's answer instead of
+/// asking again, so a recording helper cannot be reached for a mart the caller
+/// was never shown.
+struct Attempt<'a> {
+    state: &'a AppState,
+    /// Whether `system.tables` lists the mart. The one answer that is never
+    /// recorded with a failed run (see [`early_failure`]).
+    exists: bool,
+    mart: &'a str,
+    triggered_by: &'a str,
+    /// When this attempt's row starts: the moment the mart was found to exist.
+    started_at: time::OffsetDateTime,
+}
+
+impl<'a> Attempt<'a> {
+    /// Opens the attempt on a mart the caller has already reached: asks whether
+    /// `system.tables` lists it, which is the last step that answers without
+    /// recording anything (`DATA-56` D19) — the engine that failed holds the
+    /// history — and starts the clock its row would carry.
+    ///
+    /// # Errors
+    ///
+    /// Returns the classified `ClickHouse` failure of that read; nothing is
+    /// recorded for it.
+    async fn open(
+        state: &'a AppState,
+        mart: &'a str,
+        triggered_by: &'a str,
+    ) -> Result<Self, ApiError> {
+        let exists = mart_exists(&state.clickhouse, &state.config.gold_source_schema, mart)
+            .await
+            .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))?;
+        Ok(Self {
+            state,
+            exists,
+            mart,
+            triggered_by,
+            started_at: time::OffsetDateTime::now_utc(),
+        })
+    }
+
+    /// `?ifChanged=true`: the skip body when the mart is proven unchanged since
+    /// its last successful export, `None` when it must be exported (unknown
+    /// facts export, per [`if_changed_skip_reason`]). A read that fails is a
+    /// failed publish, not a skip (`DATA-56`, #484 review R4).
+    ///
+    /// # Errors
+    ///
+    /// Returns the classified history-read failure, after [`early_failure`] has
+    /// recorded it for a mart that exists.
+    async fn skip_body(&self, fingerprint: Option<&str>) -> Result<Option<Value>, ApiError> {
+        match unchanged_since_last_export_reason(self.state, self.mart, fingerprint).await {
+            Ok(Some(reason)) => Ok(Some(skipped_body(&reason))),
+            Ok(None) => Ok(None),
+            Err(err) => Err(early_failure(self, fingerprint.unwrap_or(""), err).await),
+        }
+    }
+
+    /// The catalog token the export publishes with. A token that cannot be read
+    /// is a failed publish, recorded before the error is returned (`DATA-56`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`lakekeeper_token::token_unavailable_message`]'s fixed sentence
+    /// as a `503`, after it is recorded for a mart that exists.
+    async fn catalog_token(
+        &self,
+        fingerprint: Option<&str>,
+    ) -> Result<lakehouse_core::secret::SecretValue, ApiError> {
+        match read_catalog_token(&self.state.config.lakekeeper_gold_export_token_file).await {
+            Ok(token) => Ok(token),
+            Err(err) => Err(early_failure_under_lock(self, fingerprint.unwrap_or(""), err).await),
+        }
+    }
+}
+
+/// The mart's content fingerprint, or `None` for a name that is not a table
+/// (`DATA-10` D2). A read that fails is a failed publish, recorded before the
+/// error is returned (`DATA-56`).
+///
+/// # Errors
+///
+/// Returns the classified `ClickHouse` failure (`422`/`503` with a reference),
+/// after [`early_failure`] has recorded it for a mart that exists.
+async fn read_content_fingerprint(
+    attempt: &Attempt<'_>,
+    schema: &str,
+) -> Result<Option<String>, ApiError> {
+    if !attempt.exists {
+        // DATA-56 D23: a name that is not a table goes on as it did before —
+        // it is not refused here and no early failure is recorded for it.
+        return Ok(None);
+    }
+    match gold_export_history::mart_content_fingerprint(
+        &attempt.state.clickhouse,
+        schema,
+        attempt.mart,
+    )
+    .await
+    {
+        Ok(fingerprint) => Ok(fingerprint),
+        Err(e) => {
+            let err = upstream_error::ch_error(&upstream_error::DATABASE, &e);
+            Err(early_failure(attempt, "", err).await)
+        }
+    }
+}
+
+/// Records a publish that failed before `export_mart` was reached, and returns
+/// the error the caller answers with (`DATA-56`, #484 review R4).
+///
+/// The rule (`DATA-56` D19): once the caller is authenticated and allowed and
+/// the mart is shown to be theirs, a failure is a failed publish and leaves a
+/// run — the fingerprint read, the `?ifChanged=true` history read, and the
+/// catalog token are all inside that boundary. Before it, nothing is recorded:
+/// the token check, the mart name, and the tenant gate all refuse the request
+/// rather than fail it. `attempt.exists` is `false` for a name `system.tables`
+/// does not list (D23): such a name goes on as before and no early failure is
+/// recorded for it. A failed read of `system.tables` never gets here:
+/// `Attempt::open` returns it unrecorded, so it never builds an `Attempt`
+/// (review round 1, R5).
+///
+/// This is the PRE-LOCK helper, used for the content fingerprint and the
+/// `?ifChanged=true` history read (review round 1, R3): the row is written only
+/// when no publish of this mart is in flight. A publish in flight will write its
+/// own row with an older `started_at`, which a fresher row here would hide — the
+/// card would say "Last publish failed" although that publish succeeded, the
+/// exact harm the `409` avoids by recording nothing. The lock is held across the
+/// write, so the two cannot interleave. The catalog token is read with the lock
+/// already held ([`early_failure_under_lock`]).
+///
+/// The write is best-effort, like every other history write here: when
+/// `ClickHouse` is what failed, the row cannot be written and the card's own
+/// read fails with it, so nothing can be said about "Last publish failed"
+/// (`DATA-56` D21). The caller's error is returned unchanged either way.
+async fn early_failure(
+    attempt: &Attempt<'_>,
+    content_fingerprint: &str,
+    err: ApiError,
+) -> ApiError {
+    if let Ok(_guard) = attempt
+        .state
+        .gold_export_locks
+        .try_acquire(attempt.mart)
+        .await
+    {
+        record_early_failure(attempt, content_fingerprint, &err).await;
+    }
+    err
+}
+
+/// [`early_failure`] for the catalog token read, which `export` reaches with the
+/// mart's lock already held: acquiring it again would always fail, so this
+/// records without asking (review round 1, R3). A publish in flight cannot exist
+/// here — this call IS the publish that holds the lock.
+async fn early_failure_under_lock(
+    attempt: &Attempt<'_>,
+    content_fingerprint: &str,
+    err: ApiError,
+) -> ApiError {
+    record_early_failure(attempt, content_fingerprint, &err).await;
+    err
+}
+
+/// The one history write both early-failure helpers share: nothing for a name
+/// `system.tables` does not list (D23), one failed row otherwise.
+async fn record_early_failure(attempt: &Attempt<'_>, content_fingerprint: &str, err: &ApiError) {
+    if attempt.exists {
+        record_export_history(
+            attempt.state,
+            attempt.mart,
+            attempt.triggered_by,
+            attempt.started_at,
+            time::OffsetDateTime::now_utc(),
+            content_fingerprint,
+            Err(err),
+        )
+        .await;
+    }
+}
+
 /// The sentence a failed publish stores, or `None` for a success.
 ///
 /// Takes the converted result, not the `GoldExportError`, so this module cannot
 /// store an upstream text by accident (`DATA-49`, QA `LH-DATA-1-01`): the
 /// `ApiError` is what the response carries, and the row and the response are
-/// meant to read the same.
-fn stored_error(result: &Result<gold_export::GoldExportResult, ApiError>) -> Option<String> {
-    result.as_ref().err().map(ToString::to_string)
+/// meant to read the same. Borrowed, not owned, so a failure recorded before
+/// the export starts can be stored and then answered (`DATA-56`).
+fn stored_error(result: Result<&gold_export::GoldExportResult, &ApiError>) -> Option<String> {
+    result.err().map(ToString::to_string)
 }
 
 /// Renders an `Iceberg` snapshot's Unix-millisecond commit time as an RFC
@@ -1625,7 +1844,7 @@ mod tests {
                 "Code: 60. DB::Exception: Unknown table (version 26.8.1.1)".to_owned(),
             )),
         ));
-        let stored = stored_error(&result).expect("a failed publish stores a sentence");
+        let stored = stored_error(result.as_ref()).expect("a failed publish stores a sentence");
         assert!(
             stored.starts_with("The database request failed. Reference: "),
             "{stored}"
@@ -1633,7 +1852,7 @@ mod tests {
         assert!(!stored.contains("Code: 60"), "{stored}");
         assert!(!stored.contains("26.8"), "{stored}");
         assert!(
-            stored_error(&Ok(gold_export::GoldExportResult {
+            stored_error(Ok(&gold_export::GoldExportResult {
                 namespace: "gold".to_owned(),
                 table: "orders_rollup".to_owned(),
                 format_version: 2,
@@ -1723,6 +1942,112 @@ mod tests {
             "the refusal precedes the engine: no fingerprint and no parts read"
         );
         Ok(())
+    }
+
+    /// The `AppState` of a `wiremock` `ClickHouse` stand-in, with no live
+    /// Postgres (the history write needs neither).
+    fn state_with_clickhouse(url: &str) -> AppState {
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
+        env.insert("CH_URL".to_owned(), url.to_owned());
+        AppState::new(Config::from_map(&env).unwrap())
+    }
+
+    /// How many rows the stand-in was asked to insert into the history table —
+    /// the table's own `CREATE`/`ALTER` statements are not counted.
+    async fn history_inserts(server: &wiremock::MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .expect("mock records requests")
+            .iter()
+            .filter(|r| {
+                String::from_utf8_lossy(&r.body).contains("INSERT INTO console.gold_export_run")
+            })
+            .count()
+    }
+
+    /// `DATA-56` D19 (review round 1, R3): with nothing publishing the mart, a
+    /// failure before the per-mart lock leaves one failed run.
+    #[tokio::test]
+    async fn an_early_failure_with_no_publish_in_flight_is_recorded_once() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("Ok.\n"))
+            .mount(&server)
+            .await;
+        let state = state_with_clickhouse(&server.uri());
+        let attempt = Attempt {
+            state: &state,
+            exists: true,
+            mart: "orders_rollup",
+            triggered_by: "user:operator",
+            started_at: time::OffsetDateTime::now_utc(),
+        };
+        let err = early_failure(
+            &attempt,
+            "10:1:2",
+            ApiError::Unavailable("The database is unavailable.".to_owned()),
+        )
+        .await;
+        assert_eq!(
+            err.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the caller's own error is returned unchanged"
+        );
+        assert_eq!(
+            history_inserts(&server).await,
+            1,
+            "a failure before the export, with no publish in flight, is one failed run"
+        );
+    }
+
+    /// `DATA-56` D19 (review round 1, R3): while a publish of the mart is in
+    /// flight, a failure before the per-mart lock writes nothing — its row would
+    /// be newer than the running publish's and hide its result, the harm the
+    /// `409` avoids by recording nothing.
+    #[tokio::test]
+    async fn an_early_failure_while_a_publish_is_in_flight_is_not_recorded() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("Ok.\n"))
+            .mount(&server)
+            .await;
+        let state = state_with_clickhouse(&server.uri());
+        let _in_flight = state
+            .gold_export_locks
+            .try_acquire("orders_rollup")
+            .await
+            .expect("no publish of the mart is running yet");
+        let attempt = Attempt {
+            state: &state,
+            exists: true,
+            mart: "orders_rollup",
+            triggered_by: "user:operator",
+            started_at: time::OffsetDateTime::now_utc(),
+        };
+        let err = early_failure(
+            &attempt,
+            "",
+            ApiError::Unavailable("The database is unavailable.".to_owned()),
+        )
+        .await;
+        assert_eq!(
+            err.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the caller still gets its own error"
+        );
+        assert_eq!(
+            history_inserts(&server).await,
+            0,
+            "the publish in flight records its own run; a row here would hide its result"
+        );
     }
 
     #[tokio::test]

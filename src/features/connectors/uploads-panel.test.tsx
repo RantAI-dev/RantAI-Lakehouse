@@ -6,6 +6,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
 import type { Upload, UploadFolder } from "@/services/contracts/uploads"
+import { UPLOAD_LIST_LIMIT } from "@/lib/uploads"
 import { UploadsPanel } from "./uploads-panel"
 
 const originalFetch = global.fetch
@@ -154,11 +155,14 @@ describe("UploadsPanel", () => {
     expect((row.getByRole("button", { name: "Delete big.csv" }) as HTMLButtonElement).disabled).toBe(false)
   })
 
-  it("says in the empty state that CSV, TSV, Excel and Parquet files can be uploaded", async () => {
+  it("says in the empty state every format this upload reads can be uploaded", async () => {
     stubFetch(() => [])
     render(<UploadsPanel />)
     expect(await screen.findByText("No uploaded files")).toBeDefined()
-    expect(screen.getByText("Upload CSV, TSV, Excel or Parquet files to bring them in as raw tables.")).toBeDefined()
+    // `DATA-51` (QA `LH-DATA-9-02`): one list of formats, the same as the New Connector link's.
+    expect(
+      screen.getByText("Upload CSV, TSV, JSON, JSON Lines, Avro, Excel or Parquet files to bring them in as raw tables.")
+    ).toBeDefined()
   })
 
   it("offers Load for an uploaded or failed file, opening the upload page on it, and for no other", async () => {
@@ -267,6 +271,16 @@ describe("UploadsPanel", () => {
     stubFetch(() => json({ error: "You do not have permission to do this." }, 403))
     render(<UploadsPanel />)
     expect(await screen.findByText("You don't have access")).toBeDefined()
+  })
+
+  // QA LH-DATA-9-20 (WEB-11): the tab said "You don't have access" but did not name the missing permission.
+  it("names the missing permission on the Uploaded files tab", async () => {
+    stubFetch(() => json({ error: "permission_denied: connector:manage" }, 403))
+    render(<UploadsPanel />)
+    expect(await screen.findByText("You don't have access")).toBeDefined()
+    expect(
+      screen.getByText("This needs the connector:manage permission. Ask a workspace admin.")
+    ).toBeDefined()
   })
 
   it("shows the API's sentence for an unavailable list, with Retry", async () => {
@@ -419,6 +433,8 @@ describe("UploadsPanel folders", () => {
     fireEvent.click(folderNav().getByRole("button", { name: /^Ops/ }))
     expect((screen.getByRole("button", { name: "Delete folder Ops" }) as HTMLButtonElement).disabled).toBe(false)
     expect(screen.queryByTestId("folder-delete-reason")).toBeNull()
+    // Ops can take a subfolder, so no reason is shown for that button either.
+    expect(screen.queryByTestId("folder-nest-reason")).toBeNull()
   })
 
   it("deletes an empty folder after a confirmation and goes back to every file", async () => {
@@ -487,7 +503,39 @@ describe("UploadsPanel folders", () => {
     fireEvent.click(folderNav().getByRole("button", { name: /^C/ }))
     const button = screen.getByRole("button", { name: "New subfolder" }) as HTMLButtonElement
     expect(button.disabled).toBe(true)
+    // `DATA-51` (QA `LH-DATA-35-07`): the reason is text under the button too, not
+    // only a `title` a touch screen never shows.
     expect(button.getAttribute("title")).toBe("Folders can be nested at most 3 levels deep.")
+    expect(screen.getByTestId("folder-nest-reason").textContent).toBe("Folders can be nested at most 3 levels deep.")
+  })
+
+  it("says the list is cut when a hundred files came back, and not for ninety-nine", async () => {
+    // `DATA-51` (QA `LH-DATA-35-10`): `GET /api/uploads` has no paging, so a full answer
+    // is a cut one and the page says so. Review round 1 R7: the counts and both sentences
+    // are built from `UPLOAD_LIST_LIMIT`, so a page that typed the number would fail here
+    // the moment the constant moved.
+    const many = (count: number) =>
+      Array.from({ length: count }, (_, i) => upload({ id: `up-${i}`, originalFilename: `file-${i}.csv` }))
+    const cut = `Showing the newest ${UPLOAD_LIST_LIMIT} files; search to find older ones.`
+    const cutMatching = `Showing the newest ${UPLOAD_LIST_LIMIT} files that match; narrow the search to find older ones.`
+    stubFetch(() => many(UPLOAD_LIST_LIMIT))
+    render(<UploadsPanel />)
+    await screen.findByText("file-0.csv")
+    expect(screen.getByTestId("upload-list-cut").textContent).toBe(cut)
+    cleanup()
+
+    stubFetch(() => many(UPLOAD_LIST_LIMIT - 1))
+    render(<UploadsPanel />)
+    await screen.findByText("file-0.csv")
+    expect(screen.queryByTestId("upload-list-cut")).toBeNull()
+    cleanup()
+
+    // While a search is on, the sentence says so.
+    stubFetch(() => many(UPLOAD_LIST_LIMIT))
+    render(<UploadsPanel />)
+    await screen.findByText("file-0.csv")
+    fireEvent.change(screen.getByLabelText("Search uploaded files"), { target: { value: "file" } })
+    await waitFor(() => expect(screen.getByTestId("upload-list-cut").textContent).toBe(cutMatching))
   })
 
   it("renames the open folder", async () => {

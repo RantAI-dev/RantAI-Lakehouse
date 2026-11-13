@@ -29,7 +29,11 @@
 //! A subscription can be saved without `SMTP_HOST`; the list says
 //! `emailSetUp: false` so the console can say "Email is not set up on this
 //! deployment", and a run records the same sentence (principle 2: no invented
-//! success). A PDF attachment is refused while the deployment has no PDF
+//! success). Such a failed delivery is not counted towards the pause, by
+//! decision (`DEC-18`, QA `LH-RPT-1-06`), so the list also says per row that
+//! the subscription is not being sent ([`not_sent_json`]) rather than leaving
+//! the person to read "Failed" and wonder whether something is wrong with
+//! their report. A PDF attachment is refused while the deployment has no PDF
 //! service.
 
 use axum::body::Bytes;
@@ -40,15 +44,18 @@ use lakehouse_bi::store;
 use lakehouse_core::ApiError;
 use lakehouse_store::report_schedule::{MonthDay, Schedule, zone_is_known};
 use lakehouse_store::report_subscriptions::{
-    self as subscriptions, Delivery, NewSubscription, Recipient, RecipientRow, Subscription,
+    self as subscriptions, Delivery, DeliveryStatus, NewSubscription, Recipient, RecipientRow,
+    Subscription,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use super::report_runner::{
-    AttachmentSpec, MAX_RECIPIENTS, domain_allowed, normalise_address, run_subscription,
+    AttachmentSpec, EMAIL_NOT_SET_UP, MAX_RECIPIENTS, domain_allowed, normalise_address,
+    run_subscription,
 };
 use crate::error::ApiResult;
 use crate::json::ApiJson;
@@ -478,6 +485,33 @@ async fn settings_flags(state: &AppState) -> Value {
     })
 }
 
+/// `notSent`: why a subscription is not being sent right now, or `null`
+/// (`RPT-2`, QA `LH-RPT-1-06`, `DEC-18`).
+///
+/// While the installation has no e-mail set up, every delivery fails for that
+/// one reason and nothing is paused for it (`DEC-18`), so the list says so on
+/// each row instead. `lastAttemptAt` is the start of the subscription's newest
+/// delivery **if** that delivery failed for this reason, `null` otherwise —
+/// nothing has been attempted since e-mail went away, or nothing ever.
+///
+/// Nothing here counts a failure or pauses a subscription: the counting is the
+/// runner's and stays exactly as `DEC-18` decided.
+fn not_sent_json(email_set_up: bool, last: Option<&Delivery>) -> Value {
+    if email_set_up {
+        return Value::Null;
+    }
+    let last_attempt_at = last
+        .filter(|d| {
+            d.status == DeliveryStatus::Failed.as_str()
+                && d.reason.as_deref() == Some(EMAIL_NOT_SET_UP)
+        })
+        .and_then(|d| d.started_at.format(&Rfc3339).ok());
+    json!({
+        "cause": "email_not_set_up",
+        "lastAttemptAt": last_attempt_at,
+    })
+}
+
 // ── Authorisation ────────────────────────────────────────────────────────
 
 fn is_admin(principal: &Principal) -> bool {
@@ -549,7 +583,13 @@ pub struct ListQuery {
 
 /// `GET /api/reports/subscriptions?board=` — the subscriptions of one
 /// dashboard that the caller owns (an administrator sees all), each with its
-/// last delivery, and whether email and the PDF service are set up.
+/// last delivery, whether email and the PDF service are set up, and — while
+/// e-mail is not set up — `notSent`, which says the subscription is not being
+/// sent and when it was last tried (`RPT-2`, `DEC-18`).
+///
+/// `notSent` and `canEdit` are the LIST's fields, like the ones that describe
+/// what the caller may do: [`subscription_json`] and the single-subscription
+/// routes do not carry them.
 ///
 /// # Errors
 ///
@@ -586,14 +626,18 @@ pub async fn list(
     let last = subscriptions::last_deliveries(pool, &ids)
         .await
         .map_err(|e| store_failed(&e))?;
+    // One read of the setting per request, one owner of "is e-mail set up":
+    // the same answer that fills `emailSetUp` decides `notSent` (`RPT-2`).
+    let mut body = settings_flags(&state).await;
+    let email_set_up = body["emailSetUp"] == json!(true);
     let mut items = Vec::with_capacity(rows.len());
     for sub in &rows {
         let last = last.iter().find(|d| d.subscription_id == sub.id);
         let mut item = subscription_json(pool, sub, last).await?;
         item["canEdit"] = json!(admin || sub.owner_id == principal.id.uuid());
+        item["notSent"] = not_sent_json(email_set_up, last);
         items.push(item);
     }
-    let mut body = settings_flags(&state).await;
     body["items"] = Value::Array(items);
     Ok(ApiJson(body))
 }
@@ -980,6 +1024,63 @@ mod tests {
         ] {
             assert_eq!(schedule(&schedule_json(s)).unwrap(), s);
         }
+    }
+
+    /// A recorded delivery of `status` with `reason`, started at `started`.
+    fn delivery(status: &str, reason: Option<&str>) -> Delivery {
+        let started = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        Delivery {
+            id: Uuid::new_v4(),
+            subscription_id: Uuid::new_v4(),
+            started_at: started,
+            finished_at: started,
+            status: status.to_owned(),
+            origin: "schedule".to_owned(),
+            recipient_count: 1,
+            reason: reason.map(str::to_owned),
+        }
+    }
+
+    /// `RPT-2` (`DEC-18`): with e-mail set up the list says nothing of the
+    /// kind, whatever the last delivery did.
+    #[test]
+    fn not_sent_is_null_while_email_is_set_up() {
+        let failed = delivery("failed", Some(EMAIL_NOT_SET_UP));
+        assert_eq!(not_sent_json(true, Some(&failed)), Value::Null);
+        assert_eq!(not_sent_json(true, None), Value::Null);
+    }
+
+    /// `RPT-2` (`DEC-18`): the cause, and the time of the attempt that failed
+    /// for it — read back as the delivery's own `started_at`.
+    #[test]
+    fn not_sent_names_the_cause_and_the_time_of_a_last_attempt_that_failed_for_it() {
+        let failed = delivery("failed", Some(EMAIL_NOT_SET_UP));
+        let said = not_sent_json(false, Some(&failed));
+        assert_eq!(said["cause"], json!("email_not_set_up"));
+        let at = said["lastAttemptAt"].as_str().expect("a time");
+        let read_back = OffsetDateTime::parse(at, &Rfc3339).expect("RFC 3339 as written");
+        assert_eq!(read_back, failed.started_at);
+    }
+
+    /// `RPT-2` (`DEC-18`): no time when the newest delivery was sent, was
+    /// skipped, failed for another reason, or there is none at all.
+    #[test]
+    fn not_sent_has_no_time_when_the_last_delivery_was_sent_or_failed_for_another_reason() {
+        for last in [
+            delivery("sent", None),
+            delivery("skipped", None),
+            delivery("failed", Some("The PDF could not be made.")),
+            delivery("failed", None),
+        ] {
+            let said = not_sent_json(false, Some(&last));
+            assert_eq!(said["cause"], json!("email_not_set_up"), "{said}");
+            assert_eq!(said["lastAttemptAt"], Value::Null, "{said}");
+        }
+        let said = not_sent_json(false, None);
+        assert_eq!(
+            said,
+            json!({ "cause": "email_not_set_up", "lastAttemptAt": null })
+        );
     }
 
     #[test]

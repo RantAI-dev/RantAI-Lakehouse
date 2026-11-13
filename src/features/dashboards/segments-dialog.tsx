@@ -14,6 +14,7 @@ import type { FilterDef } from "@/services/clients/bi-store"
 import type { Segment } from "@/services/contracts/metrics"
 import { ChartFilters } from "./chart-shape-section"
 import { SourceChoiceLabel, sourceChoiceItems } from "./source-choice-label"
+import { ownSourceOf } from "./filters/use-filter-values"
 import { useSourceChoices, useSourceColumns } from "./use-source-columns"
 
 /**
@@ -120,7 +121,7 @@ export function SegmentsDialog({ open, onOpenChange }: { readonly open: boolean;
                 <Input id="segment-label" value={label} placeholder="Domestic visitors" maxLength={100} onChange={(e) => setLabel(e.target.value)} />
               </div>
             </div>
-            <ChartFilters value={filters} onChange={setFilters} columns={columns} disabled={!source} />
+            <ChartFilters value={filters} onChange={setFilters} columns={columns} disabled={!source} source={ownSourceOf(source)} />
             {problem ? <p role="alert" className="text-sm text-destructive">{problem}</p> : null}
             <DialogFooter>
               {existing ? <Button type="button" variant="outline" className="sm:mr-auto" disabled={busy} onClick={() => void remove()}>Delete</Button> : null}

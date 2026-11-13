@@ -67,6 +67,10 @@ export function DataQualityPage() {
     []
   )
 
+  // QA `LH-DATA-14-01` F1 (`DATA-54`): the incidents panel is read again
+  // after a rule ran, was added, edited or deleted.
+  const [incidentsKey, setIncidentsKey] = React.useState(0)
+
   const filteredData = React.useMemo(() => {
     if (state.status !== "success" || !state.data) return []
     return filterDataClientSide(state.data, {
@@ -114,6 +118,7 @@ export function DataQualityPage() {
       lastValue: result.value,
       lastRunAt: new Date().toISOString(),
     })
+    setIncidentsKey((k) => k + 1)
     state.reload()
   }
 
@@ -124,6 +129,7 @@ export function DataQualityPage() {
     if (ok === null) return
     setDeleting(null)
     setSelected(null)
+    setIncidentsKey((k) => k + 1)
     state.reload()
   }
 
@@ -154,7 +160,7 @@ export function DataQualityPage() {
         </TabsList>
         <TabsContent value="rules" className="flex flex-col gap-4">
           {/* DATA-14 (F7): what is wrong now leads; the rules follow. */}
-          <QualityIncidents />
+          <QualityIncidents reloadKey={incidentsKey} />
 
           {state.status === "loading" ? <LoadingSkeleton /> : null}
           {state.status === "error" ? (
@@ -226,7 +232,10 @@ export function DataQualityPage() {
               </section>
             ) : null}
             <div className="flex flex-wrap gap-2">
-              {selected.evaluable ? (
+              {/* QA LH-DATA-14-04 (GOV-10, DEC-17): running a rule by hand is
+                  a governance action, like editing one — the API takes
+                  `governance:write` for it, so the button follows. */}
+              {selected.evaluable && hasPermission("governance:write") ? (
                 <Button
                   size="sm"
                   onClick={() => void handleRun(selected)}
@@ -269,6 +278,7 @@ export function DataQualityPage() {
             setEditing(null)
             // The drawer shows the rule as it now reads; the list catches up.
             setSelected(saved)
+            setIncidentsKey((k) => k + 1)
             state.reload()
           }}
         />

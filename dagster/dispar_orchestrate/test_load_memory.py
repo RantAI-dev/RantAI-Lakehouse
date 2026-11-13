@@ -143,6 +143,8 @@ def probe(fmt: str, path: Path, work: Path) -> float:
         header_row=0,
         columns=(),
         on_bad_value="stop",
+        # `DATA-52`: the author of the load; none is recorded for this measurement.
+        author="",
     )
     base = _resident_mib()
     peak = base

@@ -28,6 +28,14 @@
  * chosen, or in an environment where `localStorage` throws (private
  * browsing, SSR), goes out with no `X-Tenant` header at all rather than an
  * empty one.
+ *
+ * Calls to `/api/auth/*` carry no `X-Tenant`, ever (`ADM-15`, #483 review):
+ * signing in and signing out are the moments the stored tenant is about to
+ * be replaced or cleared, so the request of the NEXT person on this browser
+ * must not name the previous person's tenant. No handler under `/api/auth/`
+ * reads the header (`routes/auth.rs` never calls `tenant_scope`), and the
+ * session check is where the stored value is corrected to the signed-in
+ * person's, so nothing is lost by leaving it off.
  */
 
 /**
@@ -69,6 +77,20 @@ export function writeActiveTenantId(id: string): void {
   }
 }
 
+/**
+ * Forget the active tenant, on sign-out (`ADM-15`, #483 review). Best-effort
+ * for the same reason the writer is: a storage that refuses the removal costs
+ * a stale value, which the session check corrects before any page renders.
+ */
+export function clearActiveTenantId(): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.removeItem(ACTIVE_TENANT_STORAGE_KEY);
+  } catch {
+    // See the doc comment.
+  }
+}
+
 let redirecting = false;
 
 function isLoginPath(pathname: string): boolean {
@@ -97,12 +119,16 @@ export function __resetApiFetchRedirectStateForTests(): void {
 
 export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   const headers = new Headers(init?.headers);
-  const activeTenantId = readActiveTenantId();
+  // One test for the `/api/auth/` prefix decides both the header and the 401
+  // (`ADM-15`, #483 review): a sign-in or sign-out call is exactly when the
+  // stored tenant may still be the previous person's.
+  const isAuthCall = resolveUrl(input).startsWith("/api/auth/");
+  const activeTenantId = isAuthCall ? null : readActiveTenantId();
   if (activeTenantId) {
     headers.set("X-Tenant", activeTenantId);
   }
   const res = await fetch(input, { ...init, headers });
-  if (res.status === 401 && !resolveUrl(input).startsWith("/api/auth/")) {
+  if (res.status === 401 && !isAuthCall) {
     redirectToLogin();
   }
   return res;

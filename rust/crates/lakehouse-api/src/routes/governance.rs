@@ -307,26 +307,61 @@ pub(crate) async fn observed_quality(
 /// `"schedule"` principal kinds onto `"agent"` — the closest existing
 /// meaning — rather than emit a value the frontend type doesn't know,
 /// preserving the existing response shape for existing consumers.
+///
+/// `None` is a service, not an agent (`SEC-70`, decision D4): an event with
+/// no recorded principal is one nobody signed in caused — a refused sign-in,
+/// a locked public link, a refused single sign-on link — and the platform
+/// recorded it. The actor's own name comes from `actor_label`
+/// ([`actor_of`]).
 fn actor_kind_of(principal_kind: Option<&str>) -> &'static str {
     match principal_kind {
         Some("user") => "user",
-        Some("service") => "service",
         // "copilot" and "schedule" are both non-human actors from the
         // frontend's point of view.
-        _ => "agent",
+        Some("copilot" | "schedule") => "agent",
+        // A recorded service, and no recorded kind at all (`SEC-70` D4).
+        _ => "service",
     }
 }
 
 /// The `source` an `audit_event` row reports (QA LH-DATA-15-03 F3, plan D9):
 /// where the action came from, following `principal_kind`. No recorded kind
-/// keeps `"copilot"`, the same fallback the actor label uses in [`audit`].
+/// is the system, never the assistant (`SEC-70`, decision D4): the event
+/// happened before anybody signed in, so nobody else can have sent it.
 fn source_of(principal_kind: Option<&str>) -> &'static str {
     match principal_kind {
         Some("user") => "console",
+        Some("copilot") => "copilot",
         Some("schedule") => "schedule",
         Some("service") => "service",
-        _ => "copilot",
+        _ => "system",
     }
+}
+
+/// The name for an event nobody recorded an actor for. `AI-23` keeps one name
+/// for the assistant, but only for an event whose kind *is* `copilot`.
+const UNKNOWN_ACTOR: &str = "System";
+
+/// The `actor` an `audit_event` row reports, in order of what the row knows
+/// (`SEC-70`, decision D4): the stored label, then the principal id, then —
+/// only for an event whose kind is `copilot` and that carries no name —
+/// `AI-23`'s one name for the assistant, and otherwise [`UNKNOWN_ACTOR`],
+/// which is what rows stored before `SEC-70` read as.
+fn actor_of(
+    label: Option<&str>,
+    principal_id: Option<&str>,
+    principal_kind: Option<&str>,
+) -> String {
+    if let Some(label) = label {
+        return label.to_owned();
+    }
+    if let Some(id) = principal_id {
+        return id.to_owned();
+    }
+    if principal_kind == Some("copilot") {
+        return lakehouse_store::agents::COPILOT_EMPLOYEE_NAME.to_owned();
+    }
+    UNKNOWN_ACTOR.to_owned()
 }
 
 /// One sentence saying what a catalog grant or revoke did, for the audit
@@ -375,9 +410,12 @@ fn policy_decision_of(outcome: &str) -> &'static str {
 
 /// `GET /api/governance/audit`. Unions `audit_event` rows (copilot/console
 /// actions) onto the `Dagster`-run-derived pipeline history, adding a
-/// `source` field (`"console" | "copilot" | "schedule" | "service"` for
-/// stored events, `"pipeline"` for runs) so a consumer can filter by
-/// origin. This is additive: every field the pre-existing response shape
+/// `source` field (`"console" | "copilot" | "schedule" | "service" |
+/// "system"` for stored events, `"pipeline"` for runs) so a consumer can
+/// filter by origin. `"system"` is an event nobody signed in caused
+/// (`SEC-70` D4); no source is ever the assistant unless the event's kind
+/// is `copilot`. This is additive: every field the pre-existing response
+/// shape
 /// had is still present with the same meaning, so
 /// `src/services/clients/governance.ts` and the `/audit` page keep
 /// working unchanged (see `AuditEvent` in
@@ -434,8 +472,14 @@ async fn audit(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, GovErro
                 "id": e.id,
                 "at": e.at,
                 // AI-23 (product owner 2026-11-02): one name for the
-                // assistant — "AI Copilot", the same name the console shows.
-                "actor": e.actor_label.clone().or_else(|| e.principal_id.clone()).unwrap_or_else(|| "AI Copilot".to_owned()),
+                // assistant — "AI Copilot", for an event whose kind is
+                // `copilot`; SEC-70 D4: an event nobody signed in caused
+                // carries only its label, and reads as "System" otherwise.
+                "actor": actor_of(
+                    e.actor_label.as_deref(),
+                    e.principal_id.as_deref(),
+                    e.principal_kind.as_deref(),
+                ),
                 "actorKind": actor_kind_of(e.principal_kind.as_deref()),
                 "tenant": TENANT_ID.as_str(),
                 "action": e.action,
@@ -450,9 +494,7 @@ async fn audit(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, GovErro
             });
             // QA LH-DATA-15-03 F1 (plan D9): the row names who got which
             // permission, from the stored fields only.
-            if let (Some(detail), Some(o)) =
-                (detail_of(&e.action, &e.args), row.as_object_mut())
-            {
+            if let (Some(detail), Some(o)) = (detail_of(&e.action, &e.args), row.as_object_mut()) {
                 o.insert("detail".to_owned(), json!(detail));
             }
             row
@@ -1007,30 +1049,35 @@ pub(crate) async fn audit_table_change(
 ///
 /// # Errors
 ///
-/// 400 for an unrecognized `kind` or a malformed body; 503/500 as above.
+/// 400 for an unrecognized `kind` or a malformed body; 403 for the quality
+/// kind when the caller is outside the tenant that owns the shared catalog
+/// (PR review round 1 R3); 503/500 as above.
 pub async fn create_rule(
     State(state): State<AppState>,
     Path(kind): Path<String>,
     principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let actor = principal.as_ref().map(|Extension(p)| p);
     match Kind::parse(&kind) {
-        Kind::Quality => match create_quality_rule(State(state.clone()), body).await {
-            Ok(resp) => {
-                let rule = &resp.1.0;
-                audit_table_change(
-                    &state,
-                    actor,
-                    &rule.asset,
-                    "quality.rule_create",
-                    json!({ "name": rule.name, "threshold": rule.threshold }),
-                )
-                .await;
-                resp.into_response()
+        Kind::Quality => {
+            match create_quality_rule(State(state.clone()), actor, &headers, body).await {
+                Ok(resp) => {
+                    let rule = &resp.1.0;
+                    audit_table_change(
+                        &state,
+                        actor,
+                        &rule.asset,
+                        "quality.rule_create",
+                        json!({ "name": rule.name, "threshold": rule.threshold }),
+                    )
+                    .await;
+                    resp.into_response()
+                }
+                Err(err) => err.into_response(),
             }
-            Err(err) => err.into_response(),
-        },
+        }
         Kind::Classification => {
             match create_classification_rule(State(state.clone()), body).await {
                 Ok(resp) => {
@@ -1636,12 +1683,19 @@ pub struct CreateQualityRuleBody {
 ///
 /// # Errors
 ///
-/// 400 on a malformed body; 409 if the name is taken; 503/500 as above.
+/// 400 on a malformed body, or for a table that is not there or that the
+/// author's roles do not let them read (QA `LH-DATA-14-01` F2, `DATA-54`);
+/// 403 when the caller is outside the tenant that owns the shared catalog
+/// (PR review round 1 R3); 409 if the name is taken; 503 when the table
+/// cannot be checked; 500 on a store failure.
 pub async fn create_quality_rule(
     State(state): State<AppState>,
+    actor: Option<&Principal>,
+    headers: &HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<QualityRule>)> {
     let body: CreateQualityRuleBody = parse_body(&body)?;
+    crate::routes::quality::ensure_rule_table(&state, actor, headers, &body.asset).await?;
     let input = CreateQualityRuleInput {
         name: body.name,
         asset: body.asset,
@@ -2059,9 +2113,11 @@ pub async fn update_tag_key(
 }
 
 /// `DELETE /api/governance/tag-keys/{key}` — remove a key nobody uses.
-/// Needs `governance:write`. Refused while any table has a value for it, with
-/// the number of tables in the sentence: a tag is never lost silently.
-/// Audited as `governance.tag_key_delete`.
+/// Needs `governance:write`. Refused while any table has a value for it: a
+/// tag is never lost silently. The sentence counts the tables and names up to
+/// three of them — only the ones the caller may read, the rest are counted
+/// (QA `LH-DATA-12-15`, `DATA-54`). Audited as
+/// `governance.tag_key_delete`.
 ///
 /// # Errors
 ///
@@ -2079,12 +2135,37 @@ pub async fn delete_tag_key(
     {
         return Err(ApiError::PermissionDenied(reason.to_owned()).into());
     }
-    lakehouse_store::governed_tag::delete_key(pool(&state)?, &key)
-        .await
-        .map_err(|err| match err {
-            lakehouse_store::StoreError::NotFound => tag_key_not_found(&key),
-            other => ApiError::from(other),
-        })?;
+    match lakehouse_store::governed_tag::delete_key(pool(&state)?, &key).await {
+        Ok(()) => {}
+        Err(lakehouse_store::StoreError::NotFound) => {
+            return Err(tag_key_not_found(&key).into());
+        }
+        // QA `LH-DATA-12-15` (`DATA-54`): only tables the caller may read are
+        // named, the rest are counted. A catalog that cannot be read keeps the
+        // store's sentence, which still counts them, and the refusal stands.
+        Err(lakehouse_store::StoreError::Validation(counted)) => {
+            let ids = lakehouse_store::governed_tag::assets_with_key(pool(&state)?, &key).await;
+            let sentence = match ids {
+                Ok(ids) => {
+                    match crate::routes::catalog::readable_asset_names(&state, &principal, &ids)
+                        .await
+                    {
+                        Some(names) => tag_key_in_use_sentence(&key, ids.len(), &names),
+                        None => counted,
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        "the tables holding a tag key could not be read"
+                    );
+                    counted
+                }
+            };
+            return Err(ApiError::BadRequest(sentence).into());
+        }
+        Err(other) => return Err(ApiError::from(other).into()),
+    }
     audit_tag_key(
         &state,
         &principal,
@@ -2096,6 +2177,31 @@ pub async fn delete_tag_key(
     Ok(ApiJson(json!({ "ok": true, "key": key })))
 }
 
+/// The refusal to delete a tag key in use: the count of every table that
+/// holds it, then up to three of them by name and "and N more" for the rest
+/// (QA `LH-DATA-12-15`, `DATA-54`). `names` are the ones the caller may read;
+/// `total` is the count of all of them, so a caller never learns of a table
+/// it may not read.
+fn tag_key_in_use_sentence(key: &str, total: usize, names: &[String]) -> String {
+    let (noun, them) = if total == 1 {
+        ("table", "that table")
+    } else {
+        ("tables", "those tables")
+    };
+    let head = format!("\"{key}\" is still given to {total} {noun}");
+    if names.is_empty() {
+        return format!("{head}. Remove it from {them} first.");
+    }
+    let shown: Vec<&str> = names.iter().take(3).map(String::as_str).collect();
+    let rest = total.saturating_sub(shown.len());
+    let list = if rest > 0 {
+        format!("{} and {rest} more", shown.join(", "))
+    } else {
+        shown.join(", ")
+    };
+    format!("{head}: {list}. Remove it from {them} first.")
+}
+
 fn tag_key_not_found(key: &str) -> ApiError {
     ApiError::NotFound(format!("the tag key \"{key}\" is not defined"))
 }
@@ -2105,6 +2211,23 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    // QA `LH-DATA-12-15` (`DATA-54`): the refusal names up to three tables
+    // and counts the rest; with no table to name it says which forms to
+    // remove the key from.
+    #[test]
+    fn the_refusal_names_up_to_three_tables_and_counts_the_rest() {
+        let names = ["A", "B", "C", "D"].map(str::to_owned);
+        assert_eq!(
+            tag_key_in_use_sentence("data_domain", 5, &names),
+            "\"data_domain\" is still given to 5 tables: A, B, C and 2 more. \
+             Remove it from those tables first."
+        );
+        assert_eq!(
+            tag_key_in_use_sentence("data_domain", 1, &[]),
+            "\"data_domain\" is still given to 1 table. Remove it from that table first."
+        );
+    }
 
     /// `WEB-8` S2 T8 (D8): the grammar route's answer is what the validator
     /// accepts. Every function and operator the route names is accepted in a
@@ -2933,7 +3056,11 @@ mod tests {
         // than leak an unrecognized string into a typed field.
         assert_eq!(actor_kind_of(Some("copilot")), "agent");
         assert_eq!(actor_kind_of(Some("schedule")), "agent");
-        assert_eq!(actor_kind_of(None), "agent");
+        // Changed by SEC-70 D4: this line asserted "agent" until the QA case
+        // showed the list handing a pre-sign-in lockout to the assistant.
+        // With no recorded kind nobody signed in, so the platform recorded
+        // the event: a service.
+        assert_eq!(actor_kind_of(None), "service");
     }
 
     #[test]
@@ -2942,7 +3069,39 @@ mod tests {
         assert_eq!(source_of(Some("copilot")), "copilot");
         assert_eq!(source_of(Some("schedule")), "schedule");
         assert_eq!(source_of(Some("service")), "service");
-        assert_eq!(source_of(None), "copilot");
+        // Changed by SEC-70 D4: this line asserted "copilot" until the QA
+        // case showed an event nobody signed in caused listed as the
+        // assistant's. No recorded kind is the system.
+        assert_eq!(source_of(None), "system");
+    }
+
+    #[test]
+    fn actor_of_names_the_label_then_the_id_then_the_assistant_only_for_a_copilot_event() {
+        // A label is the name, whatever the kind: that is how an event
+        // nobody signed in caused names itself (SEC-70 D3).
+        assert_eq!(
+            actor_of(Some("Sign-in form"), None, None),
+            "Sign-in form".to_owned()
+        );
+        assert_eq!(
+            actor_of(Some("Sign-in form"), Some("u_1"), Some("user")),
+            "Sign-in form".to_owned()
+        );
+        // No label: the principal id is what the row knows.
+        assert_eq!(actor_of(None, Some("u_1"), Some("user")), "u_1".to_owned());
+        // The one name for the assistant is only for a copilot event (AI-23),
+        // and a copilot event with a label keeps the label.
+        assert_eq!(
+            actor_of(None, None, Some("copilot")),
+            lakehouse_store::agents::COPILOT_EMPLOYEE_NAME.to_owned()
+        );
+        // Nothing at all: a row stored before SEC-70, or before the label.
+        assert_eq!(actor_of(None, None, None), "System".to_owned());
+        assert_eq!(
+            actor_of(None, None, Some("service")),
+            "System".to_owned(),
+            "a service with no name is not the assistant"
+        );
     }
 
     #[test]
@@ -3199,12 +3358,12 @@ mod tests {
             let state = state_for(&pool);
             let cases = [
                 (r#"{"key":"Bad Key","allowedValues":["a"]}"#, "key"),
-                (r#"{"key":"k","allowedValues":[]}"#, "allowedValues"),
+                (r#"{"key":"k","allowedValues":[]}"#, "allowed value"),
                 (
                     r#"{"key":"k","allowedValues":["Finance"]}"#,
-                    "allowedValues",
+                    "allowed value",
                 ),
-                (r#"{"key":"k","allowedValues":["a","a"]}"#, "allowedValues"),
+                (r#"{"key":"k","allowedValues":["a","a"]}"#, "allowed value"),
                 (r#"{"key":"k"}"#, "allowedValues"),
                 ("not json", "invalid JSON"),
             ];
@@ -3294,6 +3453,121 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(kept, vec!["finance", "ops"], "a refusal changes nothing");
+        }
+
+        // QA `LH-DATA-12-15` (`DATA-54`): the refusal names up to three of
+        // the tables that hold the key, and only ones the caller may read.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn deleting_a_key_in_use_names_the_tables_that_hold_it(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let state = state_for(&pool);
+            create(
+                &state,
+                r#"{"key":"data_domain","allowedValues":["finance","ops"]}"#,
+            )
+            .await;
+            for asset in ["silver.a", "silver.b"] {
+                lakehouse_store::governed_tag::set_asset_tags(
+                    &pool,
+                    asset,
+                    &[("data_domain".to_owned(), "ops".to_owned())],
+                    "Rina",
+                )
+                .await
+                .unwrap();
+            }
+            crate::routes::catalog::prime_search_copy_for_test(
+                &state,
+                vec![
+                    json!({ "id": "silver.a", "name": "Orders" }),
+                    json!({ "id": "silver.b", "name": "Customers" }),
+                ],
+            )
+            .await;
+
+            let (status, refused) = remove(&state, "data_domain").await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(
+                refused["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("2 tables: Orders, Customers."),
+                "{refused}"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM governed_tag_key")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
+                1,
+                "a refusal changes nothing"
+            );
+        }
+
+        // Review round 1 R8 (`DATA-54`): a caller who may not open the catalog
+        // is told how many tables hold the key, and named none of them.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_caller_without_catalog_read_is_told_the_count_and_no_name(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let state = state_for(&pool);
+            // A deployment with no tenant of the seeded ones: the catalog's
+            // tenant rule then changes nothing, and the permissions are what
+            // is under test.
+            sqlx::query("DELETE FROM app_user_tenant")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM tenant")
+                .execute(&pool)
+                .await
+                .unwrap();
+            create(
+                &state,
+                r#"{"key":"data_domain","allowedValues":["finance","ops"]}"#,
+            )
+            .await;
+            for asset in ["silver.a", "silver.b"] {
+                lakehouse_store::governed_tag::set_asset_tags(
+                    &pool,
+                    asset,
+                    &[("data_domain".to_owned(), "ops".to_owned())],
+                    "Rina",
+                )
+                .await
+                .unwrap();
+            }
+            crate::routes::catalog::prime_search_copy_for_test(
+                &state,
+                vec![
+                    json!({ "id": "silver.a", "name": "Orders" }),
+                    json!({ "id": "silver.b", "name": "Customers" }),
+                ],
+            )
+            .await;
+
+            // Governance Admin without `catalog:read`: it may delete a key, but
+            // it may not list the tables the sentence would name.
+            let writer = Principal {
+                permissions: PermissionSet::parse("governance:write"),
+                ..admin()
+            };
+            let (status, refused) = answer(
+                delete_tag_key(
+                    State(state.clone()),
+                    Extension(writer),
+                    Path("data_domain".to_owned()),
+                    HeaderMap::new(),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let message = refused["error"].as_str().unwrap();
+            assert!(message.contains("2 tables."), "{refused}");
+            assert!(!message.contains("Orders"), "{refused}");
+            assert!(!message.contains("Customers"), "{refused}");
         }
 
         // PR #106 review R1 BLOCKER 1

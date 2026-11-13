@@ -174,6 +174,8 @@ async fn dependent_pipelines_are_derived_from_pipeline_definition(
     let pipeline = create_pipeline(
         &pool,
         &CreatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
             name: "dependents test pipeline".to_owned(),
             kind: "batch".to_owned(),
             source_zone: "bronze".to_owned(),

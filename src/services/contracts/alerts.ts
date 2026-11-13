@@ -71,7 +71,23 @@ export type AlertRule = {
   threshold: number
   board?: string
   channel: AlertChannel
-  target: string
+  /**
+   * Where the rule sends: a webhook URL or an e-mail address. Left out of the
+   * wire body, with `targetHidden: true`, when the caller may not manage the
+   * rule (`DEC-16`, QA `LH-SRC-7-04`, `SRC-42`); the list then says "Webhook"
+   * or "E-mail" instead.
+   */
+  target?: string
+  /** `true` when the API withheld `target` from this caller (`DEC-16`); never present otherwise. */
+  targetHidden?: boolean
+  /**
+   * The latest delivery of a "run succeeded" rule (`SRC-40`, QA `TC-1695`),
+   * read from `alert_rule_delivery`: a success opens no incident, so its
+   * outcome is kept on the rule instead. `at` is ISO 8601; `reason` is one of
+   * the API's fixed sentences and present only when `delivered` is `false`.
+   * Absent when no delivery was ever attempted.
+   */
+  lastDelivery?: { at: string; delivered: boolean; reason?: string }
   enabled: boolean
   createdAt?: string
   /**

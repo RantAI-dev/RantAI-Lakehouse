@@ -51,16 +51,21 @@ export function finderKind(adapter: string, dial: Dial | null | undefined): Find
 /** The kinds the API answers in the first call (no orchestrator job): the wait is for the source only. */
 const ANSWERS_INLINE: ReadonlySet<FinderKind> = new Set(["sql", "files", "rest"])
 
-/** What the finder calls the things it lists, and the button that finds them. */
-export const FINDER_WORDS: Record<FinderKind, { many: string; find: string }> = {
-  sql: { many: "tables", find: "Find tables" },
-  oracle: { many: "tables", find: "Find tables" },
-  files: { many: "files", find: "Find files" },
-  sftp: { many: "files", find: "Find files" },
-  rest: { many: "endpoints", find: "Find endpoints" },
-  mongodb: { many: "collections", find: "Find collections" },
-  kafka: { many: "topics", find: "Find topics" },
-  saas: { many: "objects", find: "Find objects" },
+/**
+ * What the finder calls the things it lists, and the button that finds them.
+ * `one` exists because a count of one is singular (`SRC-41` D18, QA
+ * `LH-SRC-6-50`/`LH-SRC-6-55`): the list used to say "1 files found". The other
+ * uses of `many` are about the kind, not a count of one, and keep it.
+ */
+export const FINDER_WORDS: Record<FinderKind, { one: string; many: string; find: string }> = {
+  sql: { one: "table", many: "tables", find: "Find tables" },
+  oracle: { one: "table", many: "tables", find: "Find tables" },
+  files: { one: "file", many: "files", find: "Find files" },
+  sftp: { one: "file", many: "files", find: "Find files" },
+  rest: { one: "endpoint", many: "endpoints", find: "Find endpoints" },
+  mongodb: { one: "collection", many: "collections", find: "Find collections" },
+  kafka: { one: "topic", many: "topics", find: "Find topics" },
+  saas: { one: "object", many: "objects", find: "Find objects" },
 }
 
 /**
@@ -492,7 +497,7 @@ export function TableFinder({
               />
             ) : (
               <span className="flex-1 text-xs text-muted-foreground">
-                {baseObjects.length} {words.many} found
+                {baseObjects.length} {baseObjects.length === 1 ? words.one : words.many} found
               </span>
             )}
             {single ? null : (

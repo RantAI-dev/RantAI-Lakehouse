@@ -299,6 +299,63 @@ Findings on `main`, each handled below or in the backlog:
     page's builder dialog and the assistant panel stay as they are), a run
     button inside the editor, the text form.
 
+### Plan changes after the S1 review, round 1 (planner, 2026-11-12)
+
+These change section 2. Where one differs from a decision above, this one
+holds.
+
+- **D3a. A body in today's form cannot flatten a pipeline.** On `PUT`, a body
+  in today's form (`sourceZone`, `sourceTable`, `transforms`) is accepted
+  only when the stored definition is one input and at most one `transform`
+  step reading it. It then keeps the stored names of that input and step and
+  changes only the zone, the table and the transforms. For any other stored
+  definition it is refused, 409, with fixed text saying the pipeline has
+  inputs and steps this form cannot hold. Reason: until S3 ships, the console
+  sends today's form on every save, and it would store one input and no step
+  over a pipeline the assistant made with SQL steps; the next run would then
+  overwrite the output with a copy of the first input.
+- **D4a. A pipeline of today's shape compiles to today's statement.** A
+  definition that is one input and either no step or exactly one `transform`
+  step reading that input compiles with no `WITH`:
+  `SELECT <columns> FROM <the input's table> [WHERE ...] [ORDER BY k LIMIT 1 BY k]`,
+  and `SELECT * FROM <the input's table>` with no step. The text is what
+  `_build_select_sql` gave on `main` for the same pipeline. `up_to` follows
+  the same rule for the part it renders. Every other definition compiles as
+  D4 says. Reason: column lineage (`DATA-13`) reads this statement and cannot
+  see through a `WITH`; with D4 alone every existing pipeline lost its column
+  mappings.
+- **D4b. No lineage row for a column the output does not have.** For a
+  definition D4a does not cover, the column lineage of a run is either right
+  or absent. Until the mapper can read a `WITH` (a backlog item the planner
+  adds), the compiled statement of such a pipeline is not noted for column
+  lineage, and the route's doc says so. Table lineage (D11) is unaffected.
+- **D6a. A step names what it reads exactly.** `reads`, every bare table name
+  in a SQL step, and `upTo` match an input's or an earlier step's name
+  exactly, case included. Uniqueness of names stays without regard to case.
+  A qualified name (`zone.table`) in a SQL step is refused with the sentence
+  for a table that is not an input: a step reads an input by its name in the
+  pipeline. Reason: `ClickHouse` matches a `WITH` name by exact case, while
+  the gate and the rewrite treat any casing of it as that name; a reference
+  that differs only in case would be looked up as a real table in the
+  connection's database, unseen by both.
+- **D10a. An edit by a service identity.** When the caller is not a user and
+  the inputs or steps differ from the stored ones: an unrestricted identity
+  leaves `run_as` as it is; any other identity clears `run_as`, in the same
+  transaction, and the audit entry records it. The pipeline then does not run
+  until an administrator assigns who it reads as (the existing rule for a
+  pipeline with no author). Reason: decision 14 covers "someone other than
+  the author"; a service identity with `pipeline:write` is one, and it cannot
+  be read as.
+- **D11a. Two more readers of the single source.** `routes/lineage.rs` (the
+  edge from a pipeline's source to its target) draws one edge per input, and
+  the orchestrator's lag sensor (`authored_factory._pipeline_source`) takes
+  every input of the definition. The four readers in the store and the API
+  use one rule for a row with no `input_tables`.
+- **D17a. For S3.** Saving a change to the inputs or steps of a pipeline that
+  reads as someone else says so before it is saved: "This pipeline will read
+  as you from now on." An administrator who edits another person's pipeline
+  makes its output unmasked; the feature page lists this as a limit.
+
 ## 3. Contracts
 
 Request and response fields are camelCase, as the rest of the API.
@@ -475,6 +532,612 @@ which pages were opened, in which theme, or *not verified*.
 
 *(the developer appends one entry per slice)*
 
+### Handoff S1 (developer, 2026-11-12)
+
+Branch `feat/bld-1-steps-api`, base `origin/main` at `512f6e37c`.
+
+**Commits**
+
+| Commit | Subject |
+| --- | --- |
+| `a5214a2f5` | feat(pipelines): store a pipeline as inputs and steps (S1-T1) |
+| `f62b05e1d` | feat(pipelines): compile a definition into one statement (S1-T2) |
+| `9e1e35524` | wip: S1-T3 save path (intermediate, kept because sessions die) |
+| `b8338e4e4` | feat(pipelines): check access when a pipeline is saved (S1-T3) |
+| `4bf4b1509` | feat(pipelines): the orchestrator compiles instead of sending SQL (S1-T4) |
+| `5b0a66bec` | feat(pipelines): target lag follows every input (S1-T5) |
+| `5b56c0f28` | feat(dagster): the orchestrator asks the API for the SQL (S1-T6) |
+| `db8b6e529` | feat(ai): the assistant authors inputs and SQL steps (S1-T7) |
+| `a2df5fcd7` | docs(operations): a run gets its SQL from the compile route (S1-T8) |
+| (this commit) | docs(plan): BLD-1 part 1 S1 handoff |
+
+**Migration.** `0137_pipeline_inputs_and_steps.sql`. Checked every remote
+branch first: the highest number any of them holds is `0136`, so 0137 was
+free. It adds `inputs JSONB`, `steps JSONB` and `input_tables TEXT[]` (all
+`NOT NULL DEFAULT`), two `IMMUTABLE` SQL functions (`pipeline_legacy_input`,
+`pipeline_legacy_steps`, plus the name predicate) and one backfill `UPDATE`.
+The functions exist so the store test can compare the migration's answer with
+`pipelines::legacy_definition` instead of restating the rule in SQL.
+
+**Verification, run on the final commit (counts are real).**
+
+```
+cd rust && cargo fmt --check                                  # clean
+cargo-locked clippy -j 2 -p lakehouse-store -p lakehouse-api --all-targets -- -D warnings
+                                                              # clean
+cargo-locked test -j 2 -p lakehouse-store --test pipelines     # 70 passed, 0 failed
+cargo-locked test -j 2 -p lakehouse-api --lib -- pipeline_compile sql_guard transform_grammar
+                                                              # 69 passed, 0 failed
+cargo-locked test -j 2 -p lakehouse-api --test pipeline_compile_route --test route_auth
+                                                              # 20 passed; 90 passed; 0 failed
+python3 ops/lint/check_intra_package_imports.py               # OK
+python3 ops/lint/check_bare_iceberg_count.py                  # R11 guard: none found
+```
+
+Other scoped runs during the slice (each on the commit that needed it):
+`-p lakehouse-api --lib -- pipeline` 284 passed (all create/update/status/
+detail/connector/restore/depends-on route tests); `--lib -- pipeline_lag` 42
+passed; `--test pipeline_definition_save` 10 passed; `--test
+column_lineage_pipeline` 7 passed; `--test table_access` 14; `--test
+pipeline_lag_check` 7; `--test pipeline_lag_page` 6; `--lib --
+create_pipeline_accepts_inputs_and_a_sql_step` 1 passed.
+
+**Python.** `pytest dispar_orchestrate` was run in full after S1-T6: 2511
+passed, 1 skipped, 25 subtests (`/home/shiro/rantai/venv-pr186/bin/python`;
+see "not verified" below). After S1-T7/T8 only Rust and Markdown changed, so
+the re-run was scoped: `test_authored_factory.py` + `test_op_source_metadata.py`
+111 passed, 18 subtests.
+
+**D11: every reader of the single `source` column, and what was done.**
+Found with `grep -n "\.source\b\|p\.source\|source ="` over
+`lakehouse-store` and `lakehouse-api`:
+1. `lag_reader_predicate` (store) — the `p.source = candidate` term became
+   `candidate = ANY (p.input_tables)`.
+2. `upstream_downstream_pipelines_conn` (store) — starts from every input;
+   `source` is the fallback for a row with an empty array.
+3. `find_target_lag_cycle_conn` (store) — the walk starts from every input of
+   each lag pipeline, same fallback.
+4. `pipeline_lag::inputs_of_conn` (API) — parses every input, same fallback.
+5. `Pipeline::source` itself, and the create/update write of the column, are
+   the only others; both are the definition's storage shape (D3) and were not
+   readers of "what does this pipeline read". `pipeline_lag` snapshots
+   (`inputs_of`) feed `InputTable`s, not `source`.
+No fifth reader exists. `Pipeline` gained `input_tables`, `#[serde(skip)]` so
+the wire shape does not change in this release.
+
+**Python tests removed with their code (D14), and the Rust test that
+replaces each**
+- `BuildSelectSqlTest::test_select_rename_cast_filter_dedupe_compose_into_one_statement`
+  → `pipeline_compile::tests::a_transform_step_renders_select_rename_cast_filter_and_dedupe`
+- `BuildSelectSqlTest::test_no_transforms_selects_star_with_no_where_or_order`
+  → `pipeline_compile::tests::one_input_and_no_steps_is_a_plain_copy`
+- `BronzeSourceTest::test_a_bronze_source_is_read_through_the_api_iceberg_query_database`
+  → `pipeline_compile::tests::a_bronze_input_is_read_through_the_catalog_database`
+- `BronzeSourceTest::test_resolve_source_marks_only_bronze_as_an_iceberg_read`
+  → same compiler test, plus `tests/pipeline_compile_route.rs::reads_iceberg_is_true_only_with_a_bronze_input`
+- `BronzeSourceTest::test_a_silver_source_is_read_exactly_as_before`
+  → `pipeline_compile::tests::one_input_and_no_steps_is_a_plain_copy`
+- `BronzeSourceTest::test_this_module_creates_no_catalog_database_of_its_own`
+  → nothing: the module no longer creates a database at all
+- `OpForPipelineTest::test_a_rejected_transform_raises_a_non_retryable_failure_wrapping_transform_error`
+  → `pipeline_compile_route.rs`'s 422 refusal cases (the grammar left Python)
+- `test_authored_transforms.py` (whole file) → `transform_grammar::shared_vectors::the_shared_accept_reject_vectors_match_this_grammar`
+The enforcement tests were kept, renamed `CompileSqlTest`, against the new
+route.
+
+**Existing Rust tests changed because behaviour changed by plan, and why**
+- `tests/pipeline_enforce.rs` → `tests/pipeline_compile_route.rs` (D8).
+- `tests/column_lineage_pipeline.rs`: the noted SQL is now the COMPILED
+  statement, whose inputs are CTEs; the mapper records `partial: true` with
+  the reason "read through the CTE …, which is not traced" instead of an
+  invented source column, and the test now asserts that answer. **See
+  "mismatch" below.**
+- `tests/pipeline_lag_check.rs::unparseable_source_preserves_existing_state`
+  corrupts `input_tables` (D11's column) instead of `source`.
+- route-test fixtures that build a pipeline as a tenantless stand-in principal
+  or as a user whose real roles cannot read the table now meet the save-time
+  gate (D9); they use the seeded Platform Admin (`fajar`), and the test
+  `Config`s name `ICEBERG_QUERY_DB` because D4 compiles a Bronze input
+  through it.
+- `tests/table_access.rs` and the store's `update_input_for` needed no change.
+
+**Mismatch between plan and code (for the planner)**
+
+1. `docs/core/features/pipeline-joins-and-sql.md` still shows decisions 12–18
+   as *(proposed)* with an empty Signed cell, although the brief says they
+   were signed on 2026-11-12. I built to 12 (window functions allowed), 15
+   (20 steps), 16 (20,000 characters) and 18 (nothing reaches the page from
+   this slice); the feature page should be updated.
+2. **DATA-13 lineage degrades for pipelines.** D8 says "same lineage note",
+   and the note is the compiled statement. Because every input is a CTE and
+   the outer select is `SELECT * FROM <last step>`, the lineage mapper can no
+   longer prove which source column a target column came from: it writes
+   `partial: true` with an honest reason instead of the previous exact
+   mapping. The target table/columns are still recorded. Fixing it needs
+   either a CTE-aware mapper or noting the last step's SQL expanded; it is
+   not in this slice's scope and should be a backlog item (BLD-1 follow-up or
+   DATA-13 follow-up) before AC1-style acceptance reads lineage.
+3. The save-time gate (D9) refuses a pipeline saved by a restricted user when
+   the pipeline has no tenant (the gate's `TenantReach::NoTenant`), which is a
+   new refusal for a deployment where a user creates before an admin assigns
+   a tenant. Platform Admins are unaffected. This follows from "exactly as D8
+   does" (D8 answers 409 before the gate) but the plan did not say it.
+4. `validate_per_table_upstream` and the connector rule now read the FIRST
+   input (D12) rather than a `sourceZone` field; no behaviour change for a
+   one-input pipeline, which is every pipeline a connector can have.
+
+**Not verified locally**
+- `ops/g7/g7_pipeline_test.py` (the new two-input SQL-join case) and
+  `ops/g7/bld1_pipeline_author_test.py`: they need the whole stack. Both were
+  `python3 -m py_compile`d and checked by eye; CI job `g3a-dagster` runs them.
+  In the new gate case the two "inputs" are the same Bronze table under two
+  names, because the G7 stack guarantees one loaded Bronze table; the case
+  still exercises two inputs, a join, an aggregate, the compile, the rewrite
+  and the run.
+- The assistant's end-to-end behaviour against a live model; only the schema
+  snapshot test and the tool test above were run.
+- `pytest` under `/home/shiro/rantai/venv-bld3/bin/python`: that venv cannot
+  import the package (`ModuleNotFoundError: fastavro`), so the full suite was
+  run under `venv-pr186/bin/python`, which has the same `dagster 1.13.20` and
+  the missing dependency. CI runs the full suite in the `g3a-dagster` job.
+- `cargo test --workspace` and the full clippy workspace run: not run here
+  (the brief scopes local runs); CI runs them on the draft PR.
+
+**For S2/S3**
+- `pipeline_compile::compile(inputs, steps, Some(upTo), catalog_db)` is the
+  preview's seam; `DefinitionError::path()` gives the `inputs[i]`/`steps[i]`
+  prefix the editor selects an item with.
+- The wire shape S3 can rely on: `AuthoredDefinition` carries `inputs` and
+  `steps` (camelCase, `PipelineStep` internally tagged by `kind`), and keeps
+  `sourceZone`/`sourceTable`/`transforms`.
+- `POST /api/pipelines` and `PUT /api/pipelines/{id}` refuse a body that
+  sends both forms, and a body that sends neither.
+
+### Handoff S1, fix round 1 (developer, 2026-11-12)
+
+Branch `feat/bld-1-steps-api` (base `origin/main` as of `1a30be00a`'s merge;
+`main` merged again at `64055f47a`). One line per finding:
+
+- **R1-B1 / D4a, D4b** — `52d1ecc9c`. Today's shape (one input, no step or one
+  `transform` step reading it) compiles with NO `WITH` to exactly the text
+  `_build_select_sql` gave on `main`; `up_to` follows the same rule. Every
+  other definition keeps the `WITH`, and the route notes no SQL for column
+  lineage for it (D4b). `tests/column_lineage_pipeline.rs` is `origin/main`'s
+  file again, retargeted to `.../compile`: the exact `price_f` walk and the
+  three pairs are back; a new test pins that a SQL-step pipeline writes no
+  column row. The G7 gate's exact-mapping assertion (`:650`) holds again.
+- **R1-B2** — `ecd8abb22` (in the wip, final in `6536878b1`'s round).
+  `tests/table_access.rs`'s GOV-7 case posts to `.../compile` with the hidden
+  table as the pipeline's input; it still proves the 404 and the SEC-20
+  sentence.
+- **R1-B3 / D3a** — `aea0e2eac`. Today's form on `PUT` is accepted only for a
+  stored definition of today's shape, keeping that input's and step's names;
+  anything else is 409 `LEGACY_FORM_CANNOT_EDIT`. Two tests: a 409 that
+  changes nothing over a two-input SQL-step pipeline, and a save that keeps
+  `orders_named`/`my_step` and does not move the author.
+- **R1-B4** — `361678213`. The migration splits `source` at the FIRST dot
+  (`pipeline_legacy_zone`/`pipeline_legacy_table`), picks the step name
+  without regard to case, and the backfill is a function the test runs over
+  rows it inserts. Fixtures: no dot, two dots, an unusable name,
+  `Transformed`.
+- **R1-B5** — `ccd35aabb`. `StoreError::CorruptDefinition` (422); decode
+  failures propagate from `get_definition`; `PipelineDefinitionSnapshot` is
+  `TryFrom`, so a write never records an empty snapshot; both writes use `?`.
+  Two tests: an undecodable `steps` is refused; a refused delete writes no
+  snapshot and leaves the row.
+- **R1-B6 / D6a** — `439bf7a5f`. `reads`, bare names in a SQL step and `upTo`
+  match exactly (case included); a qualified `zone.table` in a step is
+  refused as not-an-input; uniqueness stays case-insensitive. Four tests.
+- **R1-B7 / D11a** — `f215471ba`. `routes/lineage.rs` draws one edge per
+  input; `_pipeline_sources` gives the lag sensor every input; the "no
+  `input_tables`" fallback is ONE store rule (`input_tables_of` /
+  `input_tables_or_source`) used by all four readers and those two. Tests: a
+  two-input pipeline has both edges; a lag pipeline is watched at its second
+  input.
+- **R1-B8** — `ecd8abb22`/`6536878b1`. `pipeline_compile_route.rs`'s fixtures
+  are today's shape again, so the four statements are exact `assert_eq!`
+  again; "an author with no obligation gets no mask" is asserted; the
+  `!sql.contains(SQL)` line can fail again; the two SQL-step cases are
+  additional tests that pin the whole answer and the mask's presence/absence.
+  In `routes/pipelines.rs`, the 7 non-save call sites are back on
+  `fixture_member_principal`; the save-path fixtures now use a restricted
+  member who MAY read the table (their tenant claims it with
+  `uploads::claim_table`), and the two that create a pipeline with NO tenant
+  use `fixture_admin_no_tenant_principal` (a real seeded `*:*` author) —
+  a restricted caller cannot create a tenantless pipeline (D9).
+- **R1-B9 / D10a** — `f34f325ef`. `RunAsChange` (`Keep`/`Clear`/`Set`) on
+  `UpdatePipelineInput`; a service identity that changes the definition clears
+  `run_as` unless it holds `*:*`; the audit entry records the change. Tests:
+  the rule, the store clear, a service-created pipeline has no author, and an
+  editor who may not read an input is refused with `inputs[i]`.
+  **Not reachable through HTTP today**: a restricted service identity has no
+  tenant, so `in_scope` (`authored_pipelines.rs`, rule 7) answers 404 before
+  `update` runs. The `Clear` branch is unit- and store-tested, not
+  route-tested.
+- **R1-S1** — `d42b7bc02`. Only the gate's own refusals are a 422 at save; an
+  outage keeps its status (`EnforcementRefusal::into_api_error`).
+- **R1-S2** — `1cba5c09e`. 404 (GOV-7) joins the refused statuses, so the
+  orchestrator does not retry it or report its address. `OPERATIONS.md` lists
+  409/404/422, which carry `inputs[i]`/`steps[i]`, and that the orchestrator
+  no longer needs `ICEBERG_QUERY_DB`.
+- **R1-S3** — `1cba5c09e`. The old-flow comments and the transform-grammar
+  references are gone from `authored_factory.py`, `AuthoredPipelineConfig` no
+  longer reads `iceberg_query_db`, `backup_job.py` no longer cites the deleted
+  module, the vacuous assertion is replaced by one that can fail, and the lost
+  test is back (no `allow_database_iceberg` when `readsIceberg` is false).
+- **R1-S4** — `6536878b1`. `inputs_of` returns both inputs; an old snapshot
+  restores through the route; an unsafe zone; the `--` comment and both
+  `up_to` cases pin the whole text; a `transform`-step pipeline through the
+  compile route; an uncompilable stored definition is 422 naming `steps[0]`.
+- **R1-S5 / R1-S6** — `e40e5de21`. The G7 direct query is the same self-join
+  with `SETTINGS allow_database_iceberg = 1`; the doc above `MAX_INPUTS` says
+  what the constant is; the tool test's input zone is `silver`, which the
+  tool's schema lists.
+- **R1-CI1** — `efa1039e1`. `definition_message(&DefinitionError)` builds the
+  sentence from `path()` and `message()`; both response sites use it, so no
+  response line calls `.to_string()` on an error. The guard's stale
+  `pipelines.rs` allowlist entry (the loop moved to `authored_pipelines.rs` in
+  S1-T3) is removed; the pattern was not loosened.
+- **R1-CI2** — `0ed866cc6`. `ICEBERG_QUERY_DB` is gone from
+  `tests/common/mod.rs`; `pipeline_compile_route.rs` and
+  `column_lineage_pipeline.rs` set it in their own overrides.
+
+**Verification, on the final commit (real counts).**
+
+```
+cd rust && cargo fmt --check                                  # clean
+cargo-locked clippy -j 2 -p lakehouse-store -p lakehouse-api --all-targets -- -D warnings
+                                                              # clean
+cargo-locked test -j 2 -p lakehouse-store --test pipelines     # 74 passed
+cargo-locked test -j 2 -p lakehouse-api --lib -- pipeline_compile sql_guard transform_grammar
+                                                              # 78 passed
+cargo-locked test -j 2 -p lakehouse-api --test pipeline_compile_route --test route_auth
+                                                              # 24 + 94 passed
+cargo-locked test -j 2 -p lakehouse-api --test table_access --test column_lineage_pipeline \
+  --test pipeline_definition_save --test pipeline_lag_check   # 14, 8, 14, 7 passed
+cargo-locked test -j 2 -p lakehouse-api --test sec11_guard    # 4 passed
+cargo-locked test -j 2 -p lakehouse-api --test upload_routes  # 175 passed
+cargo-locked test -j 2 -p lakehouse-api --test quality_anomalies --test quality_on_load \
+  --test pipeline_lag_page                                    # 6, 5, 16 passed
+python3 ops/lint/check_intra_package_imports.py               # OK
+python3 ops/lint/check_bare_iceberg_count.py                  # none found
+(cd dagster && /home/shiro/rantai/venv-pr186/bin/python -m pytest dispar_orchestrate -q)
+                                                              # 2514 passed, 1 skipped, 25 subtests
+```
+
+Other scoped runs: `--lib -- pipeline` 294 passed; `--lib -- lineage` 61;
+`--lib -- pipeline_lag` 42; `--test pipeline_definition_save` 14;
+`test_authored_factory.py` 102.
+
+**Not verified locally**
+- `ops/g7/g7_pipeline_test.py` (the R1-S5 fix) and
+  `ops/g7/bld1_pipeline_author_test.py`: `py_compile`d only; they need the
+  stack. CI job `g3a-dagster` runs them.
+- The `pytest` run used `/home/shiro/rantai/venv-pr186/bin/python` again:
+  `venv-bld3` cannot import the package (`fastavro` is missing there).
+- `cargo test --workspace` / full workspace clippy: not run here; CI runs them.
+
+### Handoff S1, fix round 2 (developer, 2026-11-12)
+
+One BLOCKER this round, then `main` merged in.
+
+- **R2-B1 / D6a** — `edc1e083f`. The SQL step check no longer reads its names
+  through `sql_rewrite::referenced_tables`, which lowercased every name and
+  dropped a bare name equal to the statement's own `WITH` names. The step is
+  parsed once and walked with `sqlparser`'s visitor (`StepReads`), so every
+  table relation at any depth — a subquery, a join, the step's own CTE bodies
+  — is checked AS WRITTEN: a one-part name equal, case included, to an
+  input's name, an earlier step's name, or a `WITH` name the same step
+  declares. A qualified name is refused (D6a); a table function is left to the
+  rewrite. `sql_rewrite.rs` is unchanged.
+  Tests: `FROM ORDERS` over input `orders` is refused; input `Orders` with
+  `FROM Orders` compiles (whole text pinned); a step's own `WITH t` read as
+  `T` is refused and as `t` accepted; a name inside a subquery and inside a
+  join is refused; the round-1 D6a tests still pass.
+
+**The merge of `main`** — `67252c473` (no conflicts: `git merge origin/main`
+auto-merged; the files both sides touched — `lib.rs`, `policy.rs`,
+`routes/mod.rs`, `route_auth.rs` — kept both sides' additions, and
+`route_auth.rs` already held both tests from round 1's merge). It brought
+`main`'s `0137_connector_run_timed_out.sql`,
+`0138_data_engineer_catalog_read.sql` and `0139_alert_rule_delivery.sql`.
+
+**The migration is 0140 since the merge of main** (`0137` and `0138` were
+taken on `main`, `0139` by an open branch that has since merged). Renamed in
+`b1f488848` from `0137_pipeline_inputs_and_steps.sql` to
+`0140_pipeline_inputs_and_steps.sql`; it was never applied to a real
+database, so the rename is safe. Every reference that means OUR migration now
+says `0140` (the store's comments and test names, the API's target-lag
+comment, the migration's own header). The plan's earlier entries keep their
+history as written.
+
+**Verification, on the head commit (real counts).**
+
+```
+cd rust && cargo fmt --check                                  # clean
+cargo-locked clippy -j 2 -p lakehouse-store -p lakehouse-api --all-targets -- -D warnings
+                                                              # clean
+cargo-locked test -j 2 -p lakehouse-api --lib -- pipeline_compile sql_guard transform_grammar
+                                                              # 82 passed
+cargo-locked test -j 2 -p lakehouse-api --test pipeline_compile_route \
+  --test pipeline_definition_save --test column_lineage_pipeline \
+  --test route_auth --test sec11_guard --test table_access    # 24, 14, 8, 94, 4, 14 passed
+cargo-locked test -j 2 -p lakehouse-store --test pipelines     # 74 passed
+```
+
+After the rename, and before the rest: `--test pipelines` 74 and
+`--test pipeline_definition_save` 14, rebuilt so the embedded migration set
+is the one with `0140`.
+
+**Not verified**
+- CI's full run, including `g3a-dagster` (the G7 case and the author gate):
+  no local run covers them, and neither gate has passed on any commit of this
+  slice yet.
+- The Python suite was not re-run this round: neither commit touches
+  `dagster/` (the merge brought `main`'s changes, which its own CI covered).
+- `cargo test --workspace`: not run here.
+
 ## 7. Review
 
-*(the reviewer appends findings per slice, tagged `BLOCKER` or `SHOULD-FIX`)*
+
+### S1, round 1 (reviewer, 2026-11-12)
+
+Reviewed `origin/main...7b48cb44b` (36 files, +4452 −1180) against sections
+2 and 4. `main` was merged into the branch before this entry (no conflict).
+
+**Not re-run by the reviewer this round.** The slice goes back for the
+findings below, and the reviewer's own scoped run happens on the fixed
+commit. CI's full run on `7b48cb44b` had not finished when this was written;
+its last finished runs were on unfinished commits.
+
+What is right, so it is not redone: the compiler is one pure module with
+fixed refusal text and paths; `check_sql_source` kept its behaviour and its
+tests and shares one core with the step check; the route, the save path and
+the restore path call one "who reads" function; the store writes `source`,
+`transforms`, `input_tables`, `inputs` and `steps` from one place; the
+orchestrator runs only what the API returns and refuses a 2xx without `sql`
+or `readsIceberg`; the handoff is exact about what was not run.
+
+#### BLOCKER
+
+- **R1-B1. Every pipeline loses its column lineage (`DATA-13`).** The noted
+  statement is now a `WITH`, which `sql_lineage` records as partial. The
+  rewritten test `a_successful_run_records_partial_mappings_through_the_compiled_ctes`
+  (`tests/column_lineage_pipeline.rs:289`) pins target columns `amount`,
+  `id`, `price` for a step that outputs `id`, `amt`, `price_f`: rows for
+  columns that do not exist (principle 2). `ops/g7/g7_pipeline_test.py:650`
+  still requires the exact, non-partial mapping, so CI job `g3a-dagster`
+  fails there. The handoff names the loss (mismatch 2) but not the gate.
+  Fix: **D4a** and **D4b**. Restore the old assertions of the lineage test
+  (the exact walk for `price_f`, the three pairs) on a pipeline of today's
+  shape; add one test that a pipeline with a SQL step writes no column row.
+- **R1-B2. A test still calls the removed route.**
+  `tests/table_access.rs:942` posts to `/enforce`. Retarget it to the compile
+  route and keep what it proves (`GOV-7`: an author whose role may not read
+  the table is answered "not found" with the fixed sentence). The handoff's
+  count for this file is from before S1-T4 removed the route.
+- **R1-B3. A save from today's console can destroy a pipeline.**
+  `definition_form` (`routes/authored_pipelines.rs:1055`) turns today's form
+  into one input and at most one step on every `PUT`, and the store
+  overwrites `inputs` and `steps`. Fix: **D3a**, with tests: a `PUT` in
+  today's form on a two-input pipeline is 409 and changes nothing; on a
+  pipeline of today's shape with its own names it keeps the names and does
+  not move `run_as`.
+- **R1-B4. The migration and the Rust rule disagree, and a migration cannot
+  be edited once applied.** For a `source` with no dot or with two, the SQL
+  takes `split_part(.., 1)` and `split_part(.., 2)` while
+  `legacy_definition` splits at the first dot: `serving.sales.orders`
+  becomes input `serving.sales` in SQL, a different table that compiles and
+  is read. A table named `Transformed` gets a step named `transformed`, which
+  the compiler then refuses as a duplicate, so a pipeline that ran stops.
+  The comment "running this UPDATE again is idempotent" is not true for a
+  row with several inputs or steps. Fix: one rule in both (split at the
+  first dot; the step's name avoids the input's name without regard to
+  case); correct the comment; the equality test gets fixtures with no dot,
+  two dots, a table that is not a usable name, a table named `Transformed`,
+  and runs the migration's `UPDATE` on existing rows.
+- **R1-B5. A stored definition that cannot be decoded becomes a plain copy.**
+  `lakehouse-store/src/pipelines.rs:1059`, `:1060` (and `:869`, `:871` for a
+  snapshot) use `unwrap_or_default()`; `:1275` to `:1279` and `:1533` write
+  `unwrap_or(Value::Null)`. A row whose `steps` do not decode compiles to
+  `SELECT * FROM <input>` and overwrites its output with unfiltered rows
+  (principle 3). Fix: a decode failure is a `StoreError`; the compile route
+  answers its fixed refusal; the detail route does not invent an empty
+  definition. Test both.
+- **R1-B6. A reference that differs only in case is read as a real table.**
+  `pipeline_compile.rs:292`, `:349`: `reads` and bare names are compared
+  lowercased. Input `SECRET`, step `SELECT * FROM secret`: the compiler
+  accepts it, the rewrite skips `secret` as a `WITH` name, and `ClickHouse`
+  looks up `secret` as a table. Fix: **D6a**, with tests for `reads`, a bare
+  name, `upTo`, and a qualified name.
+- **R1-B7. Two readers of the single source were missed (D11).**
+  `routes/lineage.rs:459` draws only `pipeline.source`;
+  `authored_factory.py:1397` `_pipeline_source` gives the lag sensor only
+  the first input, so a pipeline with a time lag whose second input is made
+  by a `downstream` pipeline never has that pipeline run. The handoff's "no
+  fifth reader exists" is not so; its own grep matches the first. Fix:
+  **D11a**, with a test for each.
+- **R1-B8. Tests were weakened (rule 2).**
+  `tests/pipeline_compile_route.rs`: four assertions that were exact equality
+  with the expected statement are now two `contains` (`:411`, `:584`,
+  `:772`, `:833`); "an author with no obligation gets no mask" is no longer
+  asserted anywhere; `!sql.contains("SELECT email FROM serving.enforced_x")`
+  (`:387`) can no longer fail. With D4a the old fixtures give the old
+  statements again: restore the exact assertions, and keep the SQL-step cases
+  as additional tests that pin the whole compiled text and assert the mask
+  expression is absent where it must be. In `routes/pipelines.rs`'s tests, 16
+  call sites swapped a restricted principal for the seeded administrator:
+  put the nine that do not pass through a save back, and give the seven that
+  do a restricted user who may read the table, so they still exercise a
+  caller who is not an administrator.
+- **R1-B9. `SEC-71` is not closed for a service identity, and its refusal has
+  no test.** `author_after_edit` (`routes/authored_pipelines.rs:1416`)
+  ignores a caller who is not a user, so a service identity with
+  `pipeline:write` can change what another person's pipeline reads and it
+  still runs as that person. Fix: **D10a**. Add the tests the plan's S1-T3
+  check lists and the slice lacks: a second user's edit is refused when they
+  may not read an input; a service identity can create a pipeline and it has
+  no author; and for D10a, a restricted service identity's edit of the steps
+  clears `run_as` while an edit of the schedule does not.
+
+#### SHOULD-FIX
+
+- **R1-S1.** `save_check_compiled` turns every gate error into a 422 with
+  `other.to_string()` (`gate_message`). An error that is not a refusal keeps
+  its own status at save, as at the run route
+  (`gate_refusal_as_unprocessable`); an outage must not read as a bad
+  request.
+- **R1-S2.** The orchestrator retries a 404 from the compile route (an
+  author whose role may not read an input, `GOV-7`) and then fails with the
+  HTTP client's text, which holds the API's internal address. Treat 404 as a
+  refusal: not retried, the fixed sentence. `docs/OPERATIONS.md` then says
+  what is true: which refusals carry an `inputs[i]` or `steps[i]` path, the
+  404 case, and that the orchestrator no longer needs `ICEBERG_QUERY_DB`.
+- **R1-S3.** Python leftovers (rule 1): the module doc and the comments at
+  `authored_factory.py:9`, `:134` to `:149`, `:292`, `:337` to `:362`,
+  `:584`, `:612` still describe the old flow or the deleted
+  `authored_transforms.py`; `iceberg_query_db` is read and never used;
+  `backup_job.py:322` cites the deleted file;
+  `test_authored_factory.py:357` asserts something that cannot fail. Add the
+  test that was lost: no statement carries `allow_database_iceberg` when
+  `readsIceberg` is false; restore the assertion on which statements carry it
+  when true.
+- **R1-S4.** Tests the plan lists that are missing or thin: `inputs_of_conn`
+  returns both inputs; an old snapshot restored through the route; an unsafe
+  zone; the `--` comment and the two `up_to` cases pin the whole text; a
+  `transform`-step pipeline through the compile route; a stored definition
+  that does not compile answers the route's 422.
+- **R1-S5.** The new G7 case: the direct query has no
+  `SETTINGS allow_database_iceberg = 1`, which every other read of the
+  catalog database in that file has; and a self-join on `id` equals the
+  direct sum only if `id` is unique. Compare with the same join run
+  directly.
+- **R1-S6.** `pipeline_compile.rs:61`: the doc comment above `MAX_INPUTS`
+  describes something else. The assistant's tool test uses zone `serving`,
+  which the tool's own schema does not list: make the schema and the test
+  agree on the zones an input may have.
+
+#### Notes, nothing for the developer
+
+- Handoff mismatch 1 is settled: the feature page on `main` carries the
+  signatures (#480).
+- Handoff mismatch 3 (a restricted user saving a pipeline that has no tenant
+  is refused) stands as built; it is the run route's rule applied at save.
+- A consequence of decision 14 the product owner should know: see **D17a**.
+- Not in this slice, not verified on a running `ClickHouse`: the rewrite and
+  the gate leave out a bare name that matches any `WITH` name without regard
+  to case, in every surface that takes SQL. The planner checks it and adds a
+  backlog item.
+
+### S1, round 2 (reviewer, 2026-11-12)
+
+Reviewed the fix round, `85a26c224..b5e22cd42` (14 commits by the developer,
+`main` merged at `64055f47a`), finding by finding.
+
+**Re-run by the reviewer on `b5e22cd42`**, in the developer's worktree, with
+`cargo-locked -j 2`:
+
+```
+cargo fmt --check                                                          # clean
+cargo test -p lakehouse-api --lib -- pipeline_compile sql_guard transform_grammar   # 78 passed
+cargo test -p lakehouse-api --test column_lineage_pipeline                 # 8 passed
+cargo test -p lakehouse-api --test pipeline_compile_route                  # 24 passed
+cargo test -p lakehouse-api --test pipeline_definition_save                # 14 passed
+cargo test -p lakehouse-api --test sec11_guard                             # 4 passed
+cargo test -p lakehouse-api --test table_access                            # 14 passed
+```
+
+The counts equal the handoff's. Not re-run by the reviewer: the store's
+`--test pipelines`, `route_auth`, `upload_routes`, clippy, and the Python
+suite (the handoff's counts stand unchecked). CI's full run on `b5e22cd42`
+had not started when this was written; the last full run that finished was on
+`f215471ba` and failed the two tests that became R1-CI1 and R1-CI2. The G7
+gate has not passed on any commit of this slice yet.
+
+**Closed, read in the code:** R1-B1 (today's shape compiles with no `WITH`;
+the lineage test is `main`'s again; no SQL is noted for other shapes), R1-B2,
+R1-B3 (`legacy_form_over_stored`), R1-B4 (the migration splits at the first
+dot and its backfill is a function the test runs), R1-B5, R1-B7, R1-B8 (the
+four exact assertions are back; the principals are members again, not the
+administrator), R1-B9 (`RunAsChange`), R1-S1 to R1-S6, R1-CI1 (the guard's
+pattern is untouched; one stale allowlist entry is gone), R1-CI2.
+
+**Accepted as reported:** the `Clear` branch of D10a cannot be reached over
+HTTP today, because a restricted service identity has no tenant and
+`in_scope` answers 404 before `update` runs. So the gap R1-B9 named could not
+be used through the API; the rule is in place for the day a service identity
+can have a tenant.
+
+#### BLOCKER
+
+- **R2-B1. D6a is not met for a SQL step: the names are compared after they
+  were lowercased.** `check_step_tables` (`pipeline_compile.rs:372`) takes
+  its names from `sql_rewrite::referenced_tables`, and that collector
+  lowercases every name (`object_name_parts`, `sql_rewrite.rs:4801`) and
+  drops any bare name that equals a `WITH` name of the step, also lowercased
+  (`:541`). So:
+  - input `orders`, step `SELECT * FROM ORDERS`: the collector gives
+    `orders`, which equals the input's name, and the step is accepted.
+    `ClickHouse` does not match `ORDERS` to the `WITH` name `orders` and
+    looks it up as a table. This is the case R1-B6 was about; the test added
+    for it (`a_read_that_differs_only_in_case_is_refused`, input `SECRET`,
+    step `FROM secret`) covers only the other direction.
+  - step `WITH T AS (SELECT 1) SELECT * FROM t`: `t` is dropped as the
+    step's own `WITH` name and never checked.
+  - input `Orders`, step `SELECT * FROM Orders`: refused, although it is
+    exact. A name with a capital letter can never be read by a SQL step.
+
+  Fix: the step check reads the names as written. Parse the step with the
+  parser already used there and walk it with `sqlparser`'s visitor (the
+  `visitor` feature is on for this crate): every table relation in the
+  step, at any depth, is either a one-part name that equals, case included,
+  an input's name, an earlier step's name, or a `WITH` name declared in that
+  same step (also compared as written); or it is refused. A name of more
+  than one part is refused (D6a). A table function is left to the rewrite,
+  as today. `sql_rewrite` itself is not changed in this slice.
+  Tests, each on the compiler: input `orders` with `FROM ORDERS` is refused;
+  input `Orders` with `FROM Orders` is accepted and compiles; a step's own
+  `WITH t` read as `T` is refused and read as `t` is accepted; a name inside
+  a subquery and inside a `JOIN` is checked the same way; the existing D6a
+  tests still pass.
+
+#### Before this can leave draft
+
+- R2-B1 fixed and handed off.
+- `main` merged into the branch again (it is behind).
+- CI's full run green on the head commit, including `g3a-dagster` (the G7
+  case and the author gate), which no local run covers.
+
+### S1, round 3 (reviewer, 2026-11-12)
+
+Reviewed `e2cd356b2..911cd742a`: the fix for R2-B1, the merge of `main`, the
+migration renamed to `0140`.
+
+- **R2-B1: closed.** `check_step_tables` (`pipeline_compile.rs`) parses the
+  step and walks it with `sqlparser`'s visitor (`StepReads`): it collects the
+  step's own `WITH` names and every `TableFactor::Table` that is not a
+  function call, at any depth, and compares each as written. A name of more
+  than one part is refused. `sql_rewrite.rs` is unchanged. The tests cover
+  both directions of a case difference, the step's own `WITH`, a subquery and
+  a join.
+- **The migration is `0140_pipeline_inputs_and_steps.sql`.** `main` took
+  `0137`, `0138` and `0139` while this slice was in review. No reference to
+  the old number is left in the code. D13's "0137" above is history.
+- `main` merged again by the reviewer with this entry (documents only on
+  `main`; no conflict).
+
+**Re-run by the reviewer on `911cd742a`**, in the developer's worktree:
+`cargo test -p lakehouse-api --lib -- pipeline_compile sql_guard transform_grammar`:
+82 passed, the handoff's count. The other suites were re-run by the reviewer
+in round 2 on `b5e22cd42` (24, 14, 8, 4, 14); since then only
+`pipeline_compile.rs` and the migration's file name changed, and the
+developer's counts for this round stand unchecked by the reviewer.
+
+**No open BLOCKER and no open SHOULD-FIX.**
+
+**Not yet true, and required before merge:** CI's full run green on the head
+commit. No full run has finished green on any commit of this slice, and the
+two gates in `g3a-dagster` (the G7 case with two inputs and a SQL step; the
+author gate against the compile route) have never run to the end on it. The
+pull request stays a draft until that run is green; a failure there reopens
+the review.

@@ -45,14 +45,20 @@ const CHOICES: { value: Choice; label: string; note: string }[] = [
  * On a deprecated asset's page: says so, with the reason and a link to the
  * replacement when there is one (`DATA-12`). Renders nothing otherwise. The
  * style is `StandInNotice`'s: the page has no shared alert component.
+ *
+ * `replacementHidden` says the caller was not sent the replacement rather
+ * than that there is none: a page opened with a table grant is not told it.
  */
 export function DeprecationNotice({
   asset,
+  replacementHidden = false,
 }: {
   asset: Pick<
     Asset,
     "certification" | "certificationNote" | "replacementAssetId" | "replacementName"
   >
+  /** True when the caller is not sent the replacement (`shownWithTableGrant`). */
+  replacementHidden?: boolean
 }) {
   if (asset.certification !== "deprecated") return null
   // DATA-12 review SHOULD-FIX 1: the note is its own sentence, so it never
@@ -80,6 +86,11 @@ export function DeprecationNotice({
           instead.
         </>
       ) : null}
+      {/* QA `LH-DATA-12-05` F1 (`DATA-54`): a replacement is optional (feature
+          page, "if there is one"), so the notice says when there is none. A
+          page opened with a table grant is not sent the replacement, which is
+          not the same as none. */}
+      {!asset.replacementAssetId && !replacementHidden ? <> No replacement is named.</> : null}
     </p>
   )
 }
@@ -172,7 +183,9 @@ function CertificationDialog({
                 />
               </div>
               <div className="grid gap-1.5">
-                <Label htmlFor="asset-certification-replacement">Replacement asset id</Label>
+                <Label htmlFor="asset-certification-replacement">
+                  Replacement table id (optional)
+                </Label>
                 <Input
                   id="asset-certification-replacement"
                   value={replacement}
@@ -180,6 +193,9 @@ function CertificationDialog({
                   placeholder="serving.monthly_orders"
                   maxLength={200}
                 />
+                <p className="text-xs text-muted-foreground">
+                  Leave it empty when no table replaces this one.
+                </p>
               </div>
             </>
           ) : null}

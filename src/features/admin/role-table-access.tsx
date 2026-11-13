@@ -8,6 +8,7 @@ import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useService } from "@/hooks/use-service"
+import { tableKeyOf } from "@/lib/table-key"
 import {
   assetService,
   type Asset,
@@ -71,24 +72,6 @@ export function grantsUnrestricted(permissions: string): boolean {
 }
 
 const sameName = (a: string, b: string) => a.toLowerCase() === b.toLowerCase()
-
-/**
- * The `<schema>.<table>` key a list row names, or `null` when it names none.
- * `GOV-7` D9: a Bronze list row carries `tableKey` (`bronze.<table_name>`);
- * a Silver or Gold list row carries none, because its `id` already is its
- * key (`silver_catalog_row`, `gold_catalog_row`). The `id` is therefore the
- * second candidate, which is also what keeps a row from an older API build —
- * one that sends no `tableKey` at all — usable.
- * `GOV-7 S2 review 2 R2-S1`.
- */
-function tableKeyOf(asset: CatalogAsset): string | null {
-  for (const candidate of [asset.tableKey, asset.id]) {
-    const key = candidate?.trim() ?? ""
-    const dot = key.indexOf(".")
-    if (dot > 0 && dot < key.length - 1) return key
-  }
-  return null
-}
 
 const EMPTY_ASSETS: readonly CatalogAsset[] = []
 

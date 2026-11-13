@@ -86,6 +86,8 @@ async fn seed_lagged_pipeline(pool: &PgPool, name: &str, minutes: i32) -> String
     let created = pipelines::create_pipeline(
         pool,
         &CreatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
             name: name.to_owned(),
             kind: "batch".to_owned(),
             source_zone: "bronze".to_owned(),
@@ -150,6 +152,8 @@ async fn another_tenants_pipeline_and_an_unknown_id_answer_the_same_404() {
     let theirs = pipelines::create_pipeline(
         &app.pool,
         &CreatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
             name: format!("lag-theirs-{}", uuid::Uuid::new_v4().simple()),
             kind: "batch".to_owned(),
             source_zone: "bronze".to_owned(),
@@ -300,6 +304,8 @@ async fn unparseable_source_with_no_target_lag_does_not_persist_state() {
     let created = pipelines::create_pipeline(
         &app.pool,
         &CreatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
             name: "no-target-unparseable".to_owned(),
             kind: "batch".to_owned(),
             source_zone: "bronze".to_owned(),
@@ -351,7 +357,8 @@ async fn unparseable_source_with_no_target_lag_does_not_persist_state() {
     );
 }
 
-/// BLD-2 review R2 SHOULD-FIX 2: Unparseable source preserves existing row
+/// BLD-2 review R2 SHOULD-FIX 2 (BLD-1 part 1 / D11 moved the read to
+/// `input_tables`): an unreadable input preserves the existing row
 /// (consumed tokens, requested run key, request attempt) and records `not_measured`.
 #[tokio::test]
 async fn unparseable_source_preserves_existing_state() {
@@ -379,7 +386,9 @@ async fn unparseable_source_preserves_existing_state() {
         .await
         .expect("seed initial state");
 
-    sqlx::query("UPDATE pipeline_definition SET source = 'invalid' WHERE id = $1")
+    // BLD-1 part 1 / D11: the reader asks `input_tables`, so that is the
+    // column that has to be unreadable for this case to exist at all.
+    sqlx::query("UPDATE pipeline_definition SET input_tables = ARRAY['invalid'] WHERE id = $1")
         .bind(&id)
         .execute(&app.pool)
         .await

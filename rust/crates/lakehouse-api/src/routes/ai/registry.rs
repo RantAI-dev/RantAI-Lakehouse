@@ -332,6 +332,10 @@ fn with_shape_properties(mut schema: Value) -> Value {
             "description": "table only: the columns a grouped table is grouped by (1 to 5), instead of dimension" },
         "bin": bin_schema("group the number `dimension` (or a pivot's first number row or column field) in ranges, for example visitors in bins of 500; the result value is each bin's lower edge. bar, hbar, line, area, stacked, combo, pie, rose, funnel, treemap, radar, waterfall, grouped table, pivot; not with a grain"),
         "breakdownBin": bin_schema("the same for a number `breakdown`"),
+        // `BI-46` (`QA LH-BI-6-01` review round 1, R9): no description here.
+        // Every description of this schema is stripped before the kept ones are
+        // restored, so the sentence lives in `KEPT_CHART_DESCRIPTIONS` only.
+        "breakdownGrain": { "type": "string", "enum": ["day", "week", "month", "quarter", "year"] },
         "grid": { "type": "object", "properties": {
             "size": { "type": ["string", "number"], "description": "auto, or the cell size in degrees: 0.01, 0.1, 1 or 10" } },
             "required": ["size"],
@@ -597,6 +601,14 @@ const KEPT_CHART_DESCRIPTIONS: &[(&str, &str)] = &[
         "/function/parameters/properties/grain",
         "how to group a date or timestamp `dimension` (describe_mart gives the column's kind); a calendar chart takes day only",
     ),
+    // `BI-46` (`QA LH-BI-6-01` review round 1, R9): the model saw only the
+    // field's name and its five values, so "a date or timestamp breakdown;
+    // bar, hbar, line and area only; not with a bin" reached it only as a
+    // refusal after a wrong call.
+    (
+        "/function/parameters/properties/breakdownGrain",
+        "group a date or timestamp `breakdown` by this period; bar, hbar, line and area only; not with a bin",
+    ),
     (
         "/function/parameters/properties/measures",
         "the columns to aggregate (numbers): a column name, {column, aggregate} for a column with its own aggregate (its result is named <aggregate>_<column>), or {metric: name}",
@@ -639,7 +651,7 @@ const KEPT_CHART_DESCRIPTIONS: &[(&str, &str)] = &[
     ),
     (
         "/function/parameters/properties/limit",
-        "the number of groups to show; with `sort` it keeps the first N in that order",
+        "the number of groups to show; with `sort` it keeps the first N in that order; on a bar, hbar, line or area chart with a breakdown it keeps that many breakdown values, the ones with the largest total",
     ),
 ];
 
@@ -1704,10 +1716,26 @@ fn rotate_connector_credential_schema() -> Value {
 
 fn create_pipeline_schema() -> Value {
     json!({ "type": "function", "function": { "name": "create_pipeline",
-        "description": "Author a new pipeline that reads a source table, applies transforms and writes a target table. It is saved as a draft; mark_pipeline_ready makes it runnable. Source zones: bronze, silver, gold. Target zones: silver, gold -- a pipeline never writes bronze, which is written by ingestion. Transforms use a fixed vocabulary, one per entry: dedupe(col), filter(col = 'value') with = != < > <= >=, rename(old,new), cast(col,Int64) with String Int32 Int64 Float64 Boolean Date DateTime UUID, select(col1,col2).",
+        "description": "Author a new pipeline that reads tables and writes a target table. It is saved as a draft; mark_pipeline_ready makes it runnable. Source zones: bronze, silver, gold. Target zones: silver, gold -- a pipeline never writes bronze, which is written by ingestion. A pipeline is 1-5 named inputs and 0-20 named steps. Give the shape one of two ways: (a) inputs and steps, which is the fuller one -- a step is { name, kind: 'sql', sql } with ONE read-only SELECT over the inputs and earlier steps by their names (joins, aggregations, CASE, subqueries and window functions are allowed; a table that is not an input is refused, so list every table you read under inputs), or { name, kind: 'transform', reads, transforms } with the five operations below; or (b) today's sourceZone, sourceTable and transforms, which is one input and one transform step. Send one form, never both. Use a SQL step whenever the person asks for a join, a group-by, an aggregate, a calculated column or anything the five operations cannot say. Transforms use a fixed vocabulary, one per entry: dedupe(col), filter(col = 'value') with = != < > <= >=, rename(old,new), cast(col,Int64) with String Int32 Int64 Float64 Boolean Date DateTime UUID, select(col1,col2).",
         "parameters": { "type": "object", "properties": {
             "name": { "type": "string" },
             "description": { "type": "string" },
+            "inputs": { "type": "array", "minItems": 1, "maxItems": 5,
+                "description": "the tables the pipeline reads, each with the short name its steps use",
+                "items": { "type": "object", "properties": {
+                    "name": { "type": "string", "description": "name steps read it by, letters digits and _ only" },
+                    "zone": { "type": "string", "enum": ["bronze", "silver", "gold"] },
+                    "table": { "type": "string" } },
+                    "required": ["name", "zone", "table"] } },
+            "steps": { "type": "array", "maxItems": 20,
+                "description": "the pipeline's steps in order; the last one's result is the output",
+                "items": { "type": "object", "properties": {
+                    "name": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["sql", "transform"] },
+                    "sql": { "type": "string", "description": "kind=sql: one read-only SELECT over the inputs and earlier steps" },
+                    "reads": { "type": "string", "description": "kind=transform: the input or earlier step it reads" },
+                    "transforms": { "type": "array", "items": { "type": "string" }, "description": "kind=transform: the operations, one per entry" } },
+                    "required": ["name", "kind"] } },
             "sourceZone": { "type": "string", "enum": ["bronze", "silver", "gold"] },
             "sourceTable": { "type": "string" },
             "targetZone": { "type": "string", "enum": ["silver", "gold"] },
@@ -1715,7 +1743,7 @@ fn create_pipeline_schema() -> Value {
             "transforms": { "type": "array", "items": { "type": "string" } },
             "incrementalColumn": { "type": "string", "description": "optional column for incremental loads" },
             "schedule": { "type": "string", "description": "\"manual\" or a cron expression" } },
-            "required": ["name", "sourceZone", "sourceTable", "targetZone", "targetTable"] } } })
+            "required": ["name", "targetZone", "targetTable"] } } })
 }
 
 fn get_pipeline_schema() -> Value {
@@ -3335,6 +3363,7 @@ mod tests {
             "joins",
             "bin",
             "breakdownBin",
+            "breakdownGrain",
             "grid",
         ] {
             assert!(
@@ -3365,6 +3394,7 @@ mod tests {
             "joins",
             "bin",
             "breakdownBin",
+            "breakdownGrain",
             "grid",
         ] {
             assert!(
@@ -3612,6 +3642,14 @@ mod tests {
             assert_eq!(node["description"], json!(description), "{pointer}");
         }
         let properties = &schema["function"]["parameters"]["properties"];
+        // `BI-46` review round 1, R9: the model sees only a name and five
+        // values without this, and learns the rule from a refusal.
+        assert!(
+            properties["breakdownGrain"]["description"]
+                .as_str()
+                .is_some_and(|text| text.contains("not with a bin")),
+            "breakdownGrain must say what it is for"
+        );
         for field in [
             "joins",
             "layers",

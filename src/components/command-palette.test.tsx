@@ -127,6 +127,23 @@ describe("CommandPalette catalog search", () => {
     expect(await screen.findByText("approximate match")).toBeTruthy()
   })
 
+  // QA `LH-DATA-11-01` F1 and `LH-DATA-11-04` (`DATA-54`): the row shows the
+  // table's physical name, and the matched description as text.
+  it("shows the physical name under the friendly name, and the matched text as text", async () => {
+    stubCatalog({
+      assets: [
+        asset(1, {
+          matchedOn: { field: "description", value: "<b>bold</b> revenue", approximate: false },
+        }),
+      ],
+    })
+    await search("revenue")
+    const row = (await screen.findByText("Table 1")).closest('[cmdk-item=""]') as HTMLElement
+    expect(row.textContent).toContain("silver.t1")
+    expect(screen.getByText('description: "<b>bold</b> revenue"')).toBeTruthy()
+    expect(document.querySelector('[cmdk-item=""] b')).toBeNull()
+  })
+
   it("lists at most eight assets", async () => {
     stubCatalog({ assets: Array.from({ length: 12 }, (_, i) => asset(i + 1)) })
     await search("table")
@@ -143,6 +160,35 @@ describe("CommandPalette catalog search", () => {
     await search("table")
     await screen.findByText("Table 1")
     expect(requested[0]).toContain("limit=8")
+  })
+
+  // QA `LH-DATA-11-02` (`DATA-54`): the box shows eight tables; when more
+  // matched it says how many, so eight does not read as "that is all".
+  it("says how many tables matched when it shows only eight of them", async () => {
+    stubCatalog({
+      assets: Array.from({ length: 8 }, (_, i) => asset(i + 1)),
+      total: 23,
+    })
+    await search("table")
+    await screen.findByText("Table 1")
+    const text = document.body.textContent ?? ""
+    const line = text.indexOf("Showing 8 of 23: refine the search")
+    expect(line).toBeGreaterThan(-1)
+    expect(line).toBeLessThan(text.indexOf("See all results"))
+  })
+
+  it("says nothing about more when every match is shown", async () => {
+    stubCatalog({ assets: [asset(1), asset(2)], total: 2 })
+    await search("table")
+    await screen.findByText("Table 2")
+    expect(screen.queryByText(/^Showing /)).toBeNull()
+    cleanup()
+    requested.length = 0
+    // A server that sends no total: all of its answer is on screen.
+    stubCatalog({ assets: [asset(1), asset(2)] })
+    await search("table")
+    await screen.findByText("Table 2")
+    expect(screen.queryByText(/^Showing /)).toBeNull()
   })
 
   it("opens the Catalog with the typed words from See all results", async () => {
@@ -173,6 +219,17 @@ describe("CommandPalette catalog search", () => {
     await search("orders")
     await waitFor(() => expect(screen.getByText("Set CATALOG_TENANT_ID first.")).toBeTruthy())
     expect(screen.queryByText("Catalog search is unavailable")).toBeNull()
+  })
+
+  // QA `LH-DATA-11-14` (`DATA-54`): `cmdk` accepted letters in order anywhere,
+  // so `gic` listed pages that do not hold those letters together.
+  it("does not list a page for letters scattered through its name", async () => {
+    stubCatalog({ assets: [] })
+    await search("gic")
+    await waitFor(() => expect(screen.queryByText("Access rules")).toBeNull())
+    expect(screen.queryByText("Data Quality")).toBeNull()
+    fireEvent.change(screen.getByPlaceholderText(/Search pages/), { target: { value: "polic" } })
+    expect(await screen.findByText("Access rules")).toBeTruthy()
   })
 
   it("lists See all results after every asset row, whatever is typed", async () => {
@@ -293,6 +350,50 @@ describe("CommandPalette dashboards and charts", () => {
   })
 })
 
+describe("CommandPalette search length", () => {
+  // QA `LH-DATA-11-15` F2 (`DATA-54`): the dashboard search refuses a text
+  // over 100 characters with 400; the box says to shorten it rather than
+  // calling the search unavailable.
+  it("says to shorten the search when the dashboard search refuses the text", async () => {
+    global.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes("/api/auth/me")) return authResponse()
+      requested.push(url)
+      const body = url.includes("/api/dashboard/search")
+        ? { error: "Search text can be at most 100 characters." }
+        : { assets: [] }
+      return new Response(JSON.stringify(body), {
+        status: url.includes("/api/dashboard/search") ? 400 : 200,
+        headers: { "Content-Type": "application/json" },
+      })
+    }) as unknown as typeof fetch
+    render(
+      <AuthProvider>
+        <CommandPalette />
+      </AuthProvider>
+    )
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true })
+    const input = await screen.findByPlaceholderText(/Search pages/)
+    // A value set by code is not cut by `maxLength`; the refusal is still
+    // reachable, as an older page or a shorter box can be.
+    fireEvent.change(input, { target: { value: "x".repeat(120) } })
+    expect(await screen.findByText(/^Shorten the search/)).toBeTruthy()
+    expect(screen.queryByText("Dashboard search is unavailable")).toBeNull()
+  })
+
+  it("the search box takes at most 100 characters", async () => {
+    stubCatalog({ assets: [] })
+    render(
+      <AuthProvider>
+        <CommandPalette />
+      </AuthProvider>
+    )
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true })
+    const input = (await screen.findByPlaceholderText(/Search pages/)) as HTMLInputElement
+    expect(input.maxLength).toBe(100)
+  })
+})
+
 describe("CommandPalette empty state and recents (BI-18 part C review fix R12)", () => {
   function stubWith(handler: (url: string) => Promise<Response> | Response) {
     global.fetch = mock(async (input: RequestInfo | URL) => {
@@ -365,7 +466,9 @@ describe("CommandPalette catalog order", () => {
     const names = [...document.querySelectorAll('[cmdk-item=""]')]
       .map((el) => el.textContent ?? "")
       .filter((t) => /A long note about rev|Zzz|Revenue/.test(t))
-    expect(names.map((t) => t.replace(/\W+$/, ""))).toEqual([
+    // A row now ends with its table's physical name (`DATA-54`); the order
+    // asserted is the order of the rows.
+    expect(names.map((t) => t.replace(/silver\.t\d+$/, ""))).toEqual([
       "A long note about rev",
       "Zzz",
       "Revenue",
