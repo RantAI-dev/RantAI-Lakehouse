@@ -15,6 +15,18 @@
 //! At most [`crate::state::PDF_AT_ONCE`] PDFs are made at once per process; a
 //! further request waits for a slot. Every failure is a fixed sentence under a
 //! reference (`upstream_error`, SEC-11), never Gotenberg's text.
+//!
+//! # Measuring one PDF
+//!
+//! `BI-53` (QA `LH-BI-1-01` F3) needs to know where the time of one PDF goes,
+//! so four `info` lines mark the stages in order, each with durations only — no
+//! token, no name, no address, no error text: `slot_wait_ms` and "pdf render
+//! started" after the slot is taken; "render data requested" and `payload_ms`
+//! with "render data read" in `routes::render::data`, which is the print view's
+//! own read; and `render_ms` with `ok` at "pdf render finished" after the
+//! conversion. The gaps between them are the four stages: the slot wait; the
+//! renderer's start and the page load; the dashboard's read; and draw, wait for
+//! ready and print.
 
 use axum::Extension;
 use axum::extract::{Query, State};
@@ -193,7 +205,11 @@ impl PdfFailure {
 ///
 /// [`PdfFailure`] as described there.
 pub(crate) async fn make_pdf(state: &AppState, job: &PdfJob<'_>) -> Result<Vec<u8>, PdfFailure> {
+    let started = std::time::Instant::now();
     let _slot = take_slot(state).await?;
+    // BI-53 (QA LH-BI-1-01 F3): the stages of one PDF, in order; durations
+    // only, never a token or an address.
+    tracing::info!(slot_wait_ms = millis(started), "pdf render started");
     let (page_url, gotenberg) = render_page(
         state,
         &RenderPage {
@@ -205,14 +221,25 @@ pub(crate) async fn make_pdf(state: &AppState, job: &PdfJob<'_>) -> Result<Vec<u
             paper: (job.paper.as_str(), job.orientation.as_str()),
         },
     )?;
-    convert_url(
+    let converted = convert_url(
         gotenberg,
         &page_url,
         (job.paper, job.orientation),
         crate::pdf::PDF_DEADLINE,
     )
-    .await
-    .map_err(PdfFailure::Conversion)
+    .await;
+    tracing::info!(
+        render_ms = millis(started),
+        ok = converted.is_ok(),
+        "pdf render finished"
+    );
+    converted.map_err(PdfFailure::Conversion)
+}
+
+/// [`std::time::Instant`]'s elapsed time in whole milliseconds, saturated
+/// rather than truncated (the line only reports a duration).
+fn millis(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// What a chart image is made of (`BI-19` part D, plan D13): one chart of a
