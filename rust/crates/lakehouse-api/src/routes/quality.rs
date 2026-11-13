@@ -1124,7 +1124,8 @@ async fn evaluate(state: &AppState, rule: &QualityRule, run_by: &str) -> Result<
 /// - `404` when no rule has that id.
 /// - `403` when the caller is outside the tenant that owns the shared
 ///   catalog ([`crate::routes::catalog::catalog_tenant_refusal`]) — the same
-///   answer for every rule and every table.
+///   answer whatever the table, for every rule whose asset is a table key; an
+///   asset that is not one is the `400` below for everyone.
 /// - `400` when the rule cannot be evaluated as written: a threshold
 ///   outside the grammar (the message is [`GRAMMAR_HINT`]), an `asset`
 ///   that is not a readable `silver.`/`serving.`/`bronze.` table, or a

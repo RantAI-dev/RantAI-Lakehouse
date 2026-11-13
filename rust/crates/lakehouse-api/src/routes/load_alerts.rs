@@ -233,11 +233,12 @@ fn ran_at_least(start: Option<f64>, end: Option<f64>, limit_seconds: u32) -> boo
 /// run list (`SRC-43` D12): a run that ended as `FAILURE` or `CANCELED` and
 /// ran for its limit or longer closes as `failed` with `timed_out` and a last
 /// line that names the limit; otherwise `SUCCESS` closes as succeeded and
-/// `FAILURE` as a failed table, and a `CANCELED` run (cancelled before its
-/// limit, which is what "Run now" does) closes as failed with the reason
-/// `other`. Every close changes only a record that still says `running`, so a
-/// record that already ended keeps its own end and a second call writes
-/// nothing.
+/// `FAILURE` as a failed table, and a `CANCELED` run that was stopped before
+/// its limit (by something other than "Run now", which cancels only a run
+/// already past its limit and so closes as `timed_out`) closes as failed with
+/// the reason `other`. Every close changes only a record that still says
+/// `running`, so a record that already ended keeps its own end and a second
+/// call writes nothing.
 ///
 /// # Errors
 ///
@@ -259,12 +260,12 @@ pub(super) async fn close_run_record(
     if ended != FinalStatus::Success && ran_at_least(info.start_time, info.end_time, limit) {
         connector_run::end_timed_out_run(pool, connector_id, run_id, i64::from(limit), at).await?;
     }
+    // `SRC-11` D7: close the run record from the orchestrator's own final
+    // status when its end report never came (a killed run, an orchestrator
+    // that could not reach this API). Idempotent, and a no-op for a run with
+    // no record or one that already ended.
     match ended {
         FinalStatus::Success => {
-            // `SRC-11` D7: close the run record from the orchestrator's own
-            // final status when its end report never came (a killed run, an
-            // orchestrator that could not reach this API). Idempotent, and a
-            // no-op for a run with no record or one that already ended.
             connector_run::settle_run(pool, connector_id, run_id, true, at).await
         }
         FinalStatus::Failure => {

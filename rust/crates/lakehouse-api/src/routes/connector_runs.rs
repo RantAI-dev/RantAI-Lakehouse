@@ -780,7 +780,8 @@ pub struct EndBody {
 /// `POST /api/connectors/{id}/run-reports/{runId}/end` -- the run ended
 /// (`SRC-11` decisions D5, D7, D13: `paused` is a run that loaded nothing
 /// because the connector is paused). The first end wins; a repeat, or an end
-/// after the run sensor already closed the run, answers `recorded: false`.
+/// after the run sensor or a read of the run list already closed the run,
+/// answers `recorded: false`.
 ///
 /// # Errors
 ///

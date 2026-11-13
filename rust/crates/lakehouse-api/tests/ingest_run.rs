@@ -975,6 +975,10 @@ async fn a_record_left_running_after_its_run_was_cancelled_is_closed_by_one_read
     let stored = recorded_runs(&app.pool, "conn-ingest-reconcile").await;
     assert_eq!(stored[0].status, "failed");
     assert_eq!(stored[0].end_reason.as_deref(), Some("timed_out"));
+    assert!(
+        stored[0].ended_at.is_some(),
+        "the record carries the orchestrator's end"
+    );
     let log = lakehouse_store::connector_run::get_run_log(
         &app.pool,
         "conn-ingest-reconcile",
@@ -997,6 +1001,7 @@ async fn a_record_left_running_after_its_run_was_cancelled_is_closed_by_one_read
     // A second read answers the same, writes nothing and asks nothing.
     let (status, again) = get_runs(&app, &cookie, "conn-ingest-reconcile").await;
     assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again, listed, "a second read answers the same");
     assert_eq!(again["runs"][0]["status"], "failed", "{again}");
     let log = lakehouse_store::connector_run::get_run_log(
         &app.pool,
@@ -1320,15 +1325,27 @@ async fn the_run_list_still_answers_when_the_orchestrator_cannot_be_asked() {
 async fn two_reads_at_once_close_a_record_once() {
     let server = MockServer::start().await;
     let now = time::OffsetDateTime::now_utc().unix_timestamp() as f64;
-    mount_run_status(
-        &server,
-        "run-racing",
-        json!({
-            "__typename": "Run", "status": "CANCELED",
-            "startTime": now - 7.0 * 3600.0, "endTime": now - 60.0, "stepStats": [],
-        }),
-    )
-    .await;
+    // R3 (review round 1): the answer takes 300 ms, so a second read can only
+    // see the record still `running` if the two reads overlap.
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("pipelineRunOrError"))
+        .and(body_partial_json(
+            json!({"variables": {"rid": "run-racing"}}),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(300))
+                .set_body_json(json!({
+                    "data": { "pipelineRunOrError": {
+                        "__typename": "Run", "status": "CANCELED",
+                        "startTime": now - 7.0 * 3600.0, "endTime": now - 60.0,
+                        "stepStats": [],
+                    } }
+                })),
+        )
+        .mount(&server)
+        .await;
     let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
     let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
     seed_sql_connector(&app.pool, "conn-ingest-racing").await;
@@ -1365,6 +1382,11 @@ async fn two_reads_at_once_close_a_record_once() {
             .count(),
         1,
         "the record is closed once"
+    );
+    assert_eq!(
+        run_status_requests(&server).await.len(),
+        2,
+        "both reads saw the record running"
     );
 }
 
