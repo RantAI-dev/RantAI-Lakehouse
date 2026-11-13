@@ -472,3 +472,52 @@ async fn catalog_did_not_drop(
     .await;
     error
 }
+
+/// `GET /api/catalog/dropped/tables` — the caller's tenants' tables dropped
+/// from the console, while each can still be restored (`DATA-55` D13).
+///
+/// The path has TWO literal segments so it can never shadow an asset's own
+/// `/api/catalog/{id}`; `access-requests` is the same shape and the reason is
+/// the same. The list is `catalog:read`, like the restore's status read: it
+/// shows what can be restored, and restoring needs `governance:write`.
+///
+/// Rows the caller's roles may not read are dropped from the list, not
+/// marked: the answer must not say which hidden tables exist (fail closed).
+///
+/// # Errors
+///
+/// `403` with the tenant gate's reason; `503` when the pool or the store
+/// cannot be reached.
+pub async fn list(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+) -> ApiResult<ApiJson<Value>> {
+    if let Some(reason) = catalog_tenant_refusal(&state, &principal, &headers).await? {
+        return Ok(ApiJson(json!({
+            "supported": false, "reason": reason, "tables": [],
+        })));
+    }
+    let pool = annotation_pool(&state)?;
+    let access = super::catalog::table_access_for(&state, &principal).await?;
+    let rows = uploads::list_dropped_tables(pool, &principal.tenant_ids, 100).await?;
+    let tables: Vec<Value> = rows
+        .into_iter()
+        .filter(|row| access.is_all() || access.allows_key(&format!("bronze.{}", row.bronze_table)))
+        .filter_map(|row| {
+            // A row whose time cannot be written is left out rather than shown
+            // with a made-up date: the list exists to say how long is left.
+            let dropped_at = row.dropped_at.format(&Rfc3339).ok()?;
+            let expires_at = row.expires_at.format(&Rfc3339).ok()?;
+            Some(json!({
+                "assetId": row.asset_id,
+                "table": format!("bronze.{}", row.bronze_table),
+                "droppedBy": row.dropped_by,
+                "rowCount": row.row_count,
+                "droppedAt": dropped_at,
+                "expiresAt": expires_at,
+            }))
+        })
+        .collect();
+    Ok(ApiJson(json!({ "tables": tables })))
+}

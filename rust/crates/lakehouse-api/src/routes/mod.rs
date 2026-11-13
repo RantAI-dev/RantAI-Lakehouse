@@ -765,6 +765,10 @@ fn catalog_access_router() -> Router<AppState> {
             "/api/catalog/{id}/drop",
             get(catalog_drop::status).post(catalog_drop::drop_table),
         )
+        // `DATA-55` D13: the dropped tables of the caller's tenants. TWO
+        // literal segments, so the path can never shadow `/api/catalog/{id}`,
+        // the same shape `access-requests` explains above.
+        .route("/api/catalog/dropped/tables", get(catalog_drop::list))
 }
 
 /// The `/api/overview/alerts/*` sub-router (Task 2.6), split out for the

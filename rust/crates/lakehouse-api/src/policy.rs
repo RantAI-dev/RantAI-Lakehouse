@@ -298,6 +298,9 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // offered Drop table is also offered Restore on the same page.
     ("GET", "/api/catalog/{id}/drop",                    Policy::RequiresPermission("governance:write")),
     ("POST", "/api/catalog/{id}/drop",                   Policy::RequiresPermission("governance:write")),
+    // The list of dropped tables is `catalog:read`, like the restore's status
+    // read: it shows what can be restored, and restoring needs more.
+    ("GET", "/api/catalog/dropped/tables",               Policy::RequiresPermission("catalog:read")),
 
     // ── Lakehouse (WS2 §4): the read-only Iceberg warehouse/namespace/
     //    table surface, gated by the same seeded `catalog:read` permission
@@ -1415,6 +1418,16 @@ mod tests {
         assert_eq!(
             policy_for("POST", "/api/catalog/{id}/drop"),
             Some(Policy::RequiresPermission("governance:write"))
+        );
+    }
+
+    /// `DATA-55` D13: the list of dropped tables is `catalog:read`, like the
+    /// restore's status read.
+    #[test]
+    fn the_dropped_list_needs_catalog_read() {
+        assert_eq!(
+            policy_for("GET", "/api/catalog/dropped/tables"),
+            Some(Policy::RequiresPermission("catalog:read"))
         );
     }
 

@@ -1262,3 +1262,129 @@ async fn a_caller_whose_role_does_not_read_the_table_cannot_restore_it() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(body["error"], json!("Asset not found"));
 }
+
+/// `DATA-55` D13: the list is the caller's tenants' unexpired drops, and a row
+/// the caller's roles may not read is not shown at all.
+#[tokio::test]
+async fn the_dropped_list_shows_the_callers_tenants_unexpired_tables_they_may_read_with_when_each_expires()
+ {
+    let server = MockServer::start().await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    let tenant_id = Uuid::parse_str(CATALOG_TENANT).expect("a tenant id");
+    let other_tenant =
+        Uuid::parse_str("11111111-1111-4111-8111-000000000002").expect("a tenant id");
+    for (table, tenant, asset, rows) in [
+        ("orders", tenant_id, "orders", Some(12)),
+        ("expired_t", tenant_id, "expired-t", Some(1)),
+        ("other_t", other_tenant, "other-t", None),
+        ("hidden_t", tenant_id, "hidden-t", Some(3)),
+    ] {
+        uploads::record_table_drop(
+            &pool,
+            &NewTableDrop {
+                bronze_table: table,
+                tenant_id: tenant,
+                asset_id: asset,
+                dropped_by: "Ada Lovelace",
+                row_count: rows,
+                kept_seconds: 604_800,
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the drop is recorded");
+    }
+    sqlx::query(
+        "UPDATE upload_table_drop SET expires_at = now() - interval '1 second' \
+         WHERE bronze_table = 'expired_t'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let all = governor(&pool, "catalog:read, governance:write").await;
+
+    let (status, body) = call(&router, "GET", "/api/catalog/dropped/tables", &all).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let tables = body["tables"].as_array().expect("a list");
+    let names: Vec<&str> = tables
+        .iter()
+        .map(|t| t["table"].as_str().expect("a table name"))
+        .collect();
+    assert_eq!(names.len(), 2, "the expired and the other tenant's: {body}");
+    assert!(names.contains(&"bronze.orders"));
+    assert!(names.contains(&"bronze.hidden_t"));
+    let orders = tables
+        .iter()
+        .find(|t| t["table"] == json!("bronze.orders"))
+        .expect("orders is listed");
+    assert_eq!(orders["assetId"], json!("orders"));
+    assert_eq!(orders["droppedBy"], json!("Ada Lovelace"));
+    assert_eq!(orders["rowCount"], json!(12));
+    let expires = time::OffsetDateTime::parse(
+        orders["expiresAt"].as_str().expect("an expiresAt"),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .expect("RFC 3339 expiresAt");
+    assert!(expires > time::OffsetDateTime::now_utc());
+
+    let user = create_principal_with_permissions(&pool, "catalog:read, governance:write").await;
+    in_the_catalog_tenant(&pool, user).await;
+    narrow(&pool, user, &[("bronze", "orders")]).await;
+    let narrowed = session_cookie_for_user(&pool, user).await;
+    let (status, body) = call(&router, "GET", "/api/catalog/dropped/tables", &narrowed).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let names: Vec<&str> = body["tables"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|t| t["table"].as_str().expect("a table name"))
+        .collect();
+    assert_eq!(names, vec!["bronze.orders"], "the hidden row is not shown");
+}
+
+/// `DATA-55` D8/D13: a table is listed after its drop and gone from the list
+/// after its restore. The asset itself stays in `GET /api/catalog` by design
+/// (D12): what a drop removes is the Iceberg table, and the page that restores
+/// it lives in the registry.
+#[tokio::test]
+async fn a_table_is_listed_after_its_drop_and_gone_from_the_list_after_its_restore() {
+    let server = MockServer::start().await;
+    mount_row_count(&server, 3).await;
+    mount_registry(&server, "orders").await;
+    mount_drop(&server, ResponseTemplate::new(204), 1).await;
+    mount_missing_table(&server).await;
+    mount_dropped(&server, "2099-01-01T00:00:00Z").await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/management/v1/warehouse/wh-1/deleted-tabulars/undrop",
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    claim(&pool, CATALOG_TENANT, "orders").await;
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let (status, body) = call(&router, "POST", DROP, &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(&router, "GET", "/api/catalog/dropped/tables", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let names: Vec<&str> = body["tables"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|t| t["table"].as_str().expect("a table name"))
+        .collect();
+    assert_eq!(names, vec!["bronze.orders"]);
+
+    let (status, body) = call(&router, "POST", RESTORE, &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(&router, "GET", "/api/catalog/dropped/tables", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["tables"],
+        json!([]),
+        "the list is empty once the table is back"
+    );
+}
