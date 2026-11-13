@@ -555,4 +555,110 @@ VM's limits from the common brief for this plan only.
 
 ## 5. Handoff
 
+Developer: a DeepSeek V4.1 Flash (OpenCode) session, on the ARM64 build machine of section 3a,
+checkout `/home/rismana/rantai/lakehouse-agents-3`, branch `refactor/one-test-binary` off
+`origin/refactor/one-test-binary` at `a3a40fb0` (the plan commit; the base `main` it sits on is
+`7e8775fba`). Every commit was pushed to `refactor/one-test-binary`; no pull request was opened.
+
+### Commits
+
+| Commit | What |
+|---|---|
+| `59c47764` | `ci: fail when a Rust test file is not compiled into a test binary (OPS-32 D6)`: the guard, its 8-case self-test, the `Repo lints` step |
+| `a2d7aad1` | `refactor(tests): lakehouse-api builds one integration-test binary (OPS-32)`: T3, one commit as D7 requires (manifest, `tests/it.rs`, 112 `use crate::common;`, the three `crate::query_history::` paths) |
+| `a2748e51` | `docs(tests): the two instructions that named a former test binary (OPS-32 D5)`: T4 |
+| `64b20368` | `refactor(tests): lakehouse-store builds one integration-test binary (OPS-32)`: T5b |
+| `28a3895f` | `refactor(tests): lakehouse-auth builds one integration-test binary (OPS-32)`: T6 |
+| `0c14ae6e` | `docs: one test binary per crate in AGENTS.md, CI.md, the code standard and the CI comment (OPS-32)`: T7, five files, plus `docs/plans/OPS-32-RESULT.md` |
+| this one | `docs(plan): handoff for OPS-32` |
+
+### Measurements (detail and the deviation log in `docs/plans/OPS-32-RESULT.md`)
+
+- **A, the stop rule's number** (`lakehouse-api` rebuilt, dependencies cached): **14:04.09 before,
+  0:48.59 after**, 5.8 % of the before time. Stop rule (D8, "at least 30 % shorter") **passed**, so
+  T5b–T7 were done.
+- **B, CI-like** (every crate rebuilt): **13:58.89 before, 1:17.90 after**, 9.3 %.
+- **Binaries and size** (`nextest list --list-type binaries-only` + `stat`): 191 binaries /
+  142.4 GB before, **26 binaries / 8.3 GB after**; `lakehouse-api` alone 124 / 128.4 GB before,
+  6 / 4.9 GB after T4.
+- **Test list**: 7,826 before, 7,715 after. `comm -23` = exactly **112** lines, one per `it`
+  module that had `mod common;`, every one the `tls_proxy` test; `comm -13` = exactly **1** line,
+  `lakehouse-api<TAB>common::tls_proxy::…<TAB>false`; no other line, no changed `ignored` flag.
+  **No test was lost**: −111, the copies of that one test.
+
+### Commands run, with counts
+
+Per commit, scoped (all from `rust/` unless said otherwise):
+
+- T2 (`59c47764`): `bash scripts/ci/tests/test_check_test_modules.sh` → 8 passed, 0 failed;
+  `./scripts/ci/check_test_modules.sh` → exit 0; with a temporary `autotests = false` in
+  `lakehouse-api/Cargo.toml` (reverted, not committed) → exit 1 and 122 `tests/*.rs` lines plus
+  `tests/common/mod.rs`; `python3 ops/lint/check_gate_groups.py` → consistent; no cargo.
+- T3 (`a2d7aad1`): `cargo fmt --check` → 0; `cargo check --workspace --all-targets --locked` → no
+  error, no warning; `cargo clippy -p lakehouse-api --all-targets --locked -- -D warnings` → 0
+  (1m45s); `./scripts/ci/check_test_modules.sh` → 0; `cargo nextest list -p lakehouse-api
+  --list-type binaries-only` → exactly `lakehouse-api`, `lakehouse-api::bin/lakehouse-api`,
+  `lakehouse-api::it`, `lakehouse-api::hostile_uploads`, `lakehouse-api::identity_password`,
+  `lakehouse-api::parity`; smoke run
+  `cargo nextest run -p lakehouse-api --test it --test-threads 4 -E 'test(/^(route_auth|sec11_guard|query_history)::/)'`
+  → 126 tests run, 126 passed, 1387 skipped.
+- T4 (`a2748e51`): `cargo fmt --check` → 0; `cargo clippy -p lakehouse-api …` → 0;
+  `cargo test -p lakehouse-api --test it permission_catalog:: -- --ignored --list` → 1 test, listed
+  and not run.
+- T5b (`64b20368`), T6 (`28a3895f`): `cargo fmt --check` → 0; `cargo clippy -p lakehouse-store` /
+  `-p lakehouse-auth --all-targets --locked -- -D warnings` → 0; guard → 0;
+  `nextest list --list-type binaries-only` → exactly `<crate>` and `<crate>::it`.
+- T7 (`0c14ae6e`): `./scripts/ci/check_test_modules.sh` → 0; `python3 ops/lint/check_gate_groups.py`
+  → consistent; no cargo.
+- Once, before this handoff, on `0c14ae6e`'s tree: `cargo fmt --check` → 0;
+  `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` → 0 (1m13s);
+  `cargo nextest run -p lakehouse-api --locked --profile ci --test-threads 4` → **5,168 tests run:
+  5,168 passed (2 slow), 27 skipped** (832 s); `-p lakehouse-store` → **1,045 run: 1,045 passed,
+  0 skipped** (143 s); `-p lakehouse-auth` → **179 run: 179 passed, 0 skipped** (59 s);
+  guard self-test → 8/0; `python3 ops/lint/check_intra_package_imports.py`,
+  `check_bare_iceberg_count.py`, `check_gate_groups.py`, `check_rust_embedded_paths.py` → all 0;
+  `git status` → clean.
+- Containers: `docker ps -aq` snapshotted before the first run; the 44 my runs started were removed
+  afterwards, nothing else. The shared labelled Postgres was left up.
+
+### Not verified
+
+- `lakehouse-bi`, `-embed`, `-iceberg`, `-notify` and every lib/bin unit-test binary: unchanged by
+  this slice, left to CI (the plan's verification section says so).
+- `cargo llvm-cov` / the Coverage workflow: not run locally. Written in `it.rs`'s doc instead.
+- `docker compose` is not touched; no compose command was run.
+- CI's compile and run times: the planner's, after the first PR run (`OPS-32-RESULT.md`, `## CI`).
+
+### Deviations from the plan's section 3a (all in `docs/plans/OPS-32-RESULT.md`)
+
+1. `CARGO_PROFILE_DEV_DEBUG` / `CARGO_PROFILE_TEST_DEBUG` **left unset**: the disk had 24 GB free,
+   below the 60 GB the section names, so its own fallback applies. **Sizes are not
+   CI-comparable; the ratios are.**
+2. `CARGO_INCREMENTAL` left at Cargo's default (`1`), not `0`: the flag is part of the unit hash, so
+   switching would have re-hashed and rebuilt ~250 GB on a 24 GB disk. Both sides ran with the same
+   setting.
+3. Measurement A is workspace-scoped (`--workspace --no-run` after touching
+   `lakehouse-api/src/lib.rs`), not `-p lakehouse-api`: the `-p` resolution needs 122 api test
+   binaries (~128 GB) beside the workspace copies (~142 GB). Same scope on both sides.
+4. The shared target directory filled three times; `debug/incremental` was deleted each time (36 GB,
+   7.5 GB, 33 GB), never `cargo clean`. The only other deletion was the partial output of a
+   `-p lakehouse-api` build that had failed for want of space and that this plan does not use.
+
+### MISMATCH (code as found vs. what the plan says)
+
+- **MISMATCH: the binary count.** The plan's inventory says 193 integration-and-unit binaries at
+  `7e8775fba`, from CI's own file count; `cargo nextest list --workspace --list-type binaries-only`
+  on this checkout lists **191** (122 + 41 + 8 + 4 integration + 16 lib/bin unit tests). Nothing was
+  missing from the tests themselves; the difference is how the two counts are taken. The plan's
+  "after" estimate of 28 is likewise **26** measured (2 fewer lib/bin unit binaries than assumed).
+  Recorded in `OPS-32-RESULT.md`; no test or target was changed to reach a number.
+- **No other mismatch.** The inventory held exactly: 122 `tests/*.rs` in `lakehouse-api` (119
+  modules, 113 with `mod common;`, one of them `identity_password`), 41 store files, 8 auth files,
+  `tests/common/mod.rs` with the `tls_proxy` include, the five `#[path]`-free `mod common;` files
+  further down, `query_history.rs`'s three `crate::filters::get_history` calls at `:738`, `:771`,
+  `:775`, and `permission_catalog.rs` / `pdf_real_gotenberg.rs`'s `--test` lines.
+- **One file the compiler rejected as D4 anticipated:** `query_history.rs`. Its `use crate::common;`
+  line was unused (every module in it already reaches the harness as `crate::common::…` from inside
+  the module), so that line is dropped, per D4, with a comment saying why. It is the only such file.
+
 ## 6. Review
