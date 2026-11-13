@@ -4,6 +4,8 @@ import type {
   PipelineDetail,
   PipelineList,
   PipelineRun,
+  PipelinePreview,
+  PipelinePreviewInput,
   PipelineSource,
   PipelineRunStep,
   PipelineRunLogsPage,
@@ -168,6 +170,12 @@ export const dagsterPipelineService: PipelineService = {
       { signal }
     );
     return { schedule: body.schedule ?? null, ticks: body.ticks ?? [], unavailable: body.unavailable ?? null };
+  },
+  // BLD-1 part 1 / D16. Through `sendJson`, so a 400 or 422 keeps the API's
+  // own sentence (`steps[1]: ...`), which the editor reads to select the
+  // step at fault (D7).
+  previewPipelineStep(input: PipelinePreviewInput, signal) {
+    return postJson<PipelinePreview>("/api/pipelines/preview", input, signal);
   },
   setTargetLag(id, targetLag, signal) {
     return sendJson<Pipeline>(

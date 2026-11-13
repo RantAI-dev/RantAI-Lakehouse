@@ -1,5 +1,10 @@
 import { describe, expect, it } from "bun:test"
-import { renderTransformDraft, transformErrorRowIndex } from "./transform-draft"
+import {
+  TRANSFORM_VERBS,
+  draftIsComplete,
+  emptyDraftFor,
+  renderTransformDraft,
+} from "./transform-draft"
 
 describe("renderTransformDraft", () => {
   it("renders dedupe as dedupe(key) — matches transform_grammar.rs's Dedupe arm", () => {
@@ -31,17 +36,21 @@ describe("renderTransformDraft", () => {
   })
 })
 
-describe("transformErrorRowIndex", () => {
-  it("extracts the failing row index from the server's transforms[N] message", () => {
-    expect(
-      transformErrorRowIndex("invalid transform at transforms[0]: unknown transform verb")
-    ).toBe(0)
-    expect(
-      transformErrorRowIndex("invalid transform at transforms[3]: cast type not allowed")
-    ).toBe(3)
+// BLD-1 part 1 S3-T2: the two helpers the editor's operation rows use moved
+// here from the component, so no rule lives in a component.
+describe("emptyDraftFor and draftIsComplete", () => {
+  it("starts each verb blank, with the first operator and cast type", () => {
+    expect(emptyDraftFor("filter")).toEqual({ verb: "filter", column: "", operator: "=", value: "" })
+    expect(emptyDraftFor("cast")).toEqual({ verb: "cast", column: "", type: "String" })
+    expect(TRANSFORM_VERBS.map((verb) => emptyDraftFor(verb).verb)).toEqual(TRANSFORM_VERBS)
   })
 
-  it("returns null for a message that does not name a transforms[N] index", () => {
-    expect(transformErrorRowIndex("database error")).toBeNull()
+  it("lets a draft be added only once its own required fields are filled", () => {
+    expect(draftIsComplete(emptyDraftFor("dedupe"))).toBe(false)
+    expect(draftIsComplete({ verb: "dedupe", key: "id" })).toBe(true)
+    expect(draftIsComplete({ verb: "filter", column: "status", operator: "=", value: " " })).toBe(false)
+    expect(draftIsComplete({ verb: "rename", from: "a", to: "" })).toBe(false)
+    expect(draftIsComplete({ verb: "cast", column: "amount", type: "Float64" })).toBe(true)
+    expect(draftIsComplete({ verb: "select", columns: "id,name" })).toBe(true)
   })
 })
