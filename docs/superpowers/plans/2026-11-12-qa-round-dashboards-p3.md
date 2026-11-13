@@ -1504,3 +1504,37 @@ T2; no other test changed.
   `BI-53-RESULT.md` lists those stages as *not measured*.
 - The print view's width and the R6 comment have no runtime check beyond
   `render-view.test.tsx`'s `style.width`; a real PDF is still the owner's acceptance run.
+
+### Round 2 (planner, 2026-11-13, at `a7636fed`)
+
+Read: the fix commit `899adfd7` (12 files, 45 insertions, 247 deletions). `main` had not
+moved, so there is no merge commit.
+
+- R1, R2: done. T2 is undone by a clean revert of `6a7fca68`: `src/lib/chart-bins.ts` and its
+  test are `main`'s again, `bin.rs` differs from `main` only by T1's `agg.rounded(...)`,
+  `add_bins` no longer sends `whole`, T2's engine test is gone and T1's stays. Row 7 of the
+  bins feature page and the changelog's clause are removed. `LH-BI-2-02` stays open on
+  `BI-55`.
+- R3: fixed. `render_ms` is measured from an `Instant` taken after the slot; `routes/render.rs`
+  calls the shared `millis`.
+- R4: fixed. The path is gone, the parenthesis is there, no number changed.
+- R6: fixed. The comment sits on a `const width` hoisted out of the JSX (a `//` line in a
+  JSX child position would be printed as text); the value and the test are unchanged.
+
+The developer's counts on `899adfd7`: `lakehouse-bi --lib` 638 passed, 4 ignored;
+`chart_numbers` 1; `dashboard_export` 11; `sec11_guard` 4; `route_auth` 94; clippy and fmt
+clean; `bun run test` 4234 pass, 1 skip, 0 fail (three fewer than round 1: T2's console
+tests left with T2). Not run by the planner; CI on the pull request decides.
+
+What this pull request leaves open, on purpose:
+
+- `BI-55`: `LH-BI-2-02` (a year column's bins: needs a bin of its own for the maximum) and
+  `LH-BI-1-08` (the Excel apostrophe, T3, held for the product owner). The follow-up slice
+  also takes the alert statement that still rounds an average (round 1, R7) and a sum of a
+  decimal column.
+- `BI-53`: the 45 seconds (measured from staging after this merge, then its own slice).
+  Nothing here was seen in a real PDF of a dashboard: `LH-BI-1-01`, `LH-BI-6-22` and
+  `LH-BI-6-23` are the proof, on staging.
+
+**No open BLOCKER.** The pull request is marked ready; it merges when CI is green on its
+head and it is up to date with `main`.
