@@ -1342,3 +1342,80 @@ and the Excel clause of the first changelog bullet. Row 12 of
 chart is as wide as its card" because T12 was built.
 
 ## 6. Review
+
+### Round 1 (planner, 2026-11-13, at `b11fe6f4`)
+
+Reviewed against sections 1 to 4 (an independent reviewer's notes, then the planner's
+rulings). The Rust code was read, not built, on the planner's machine; CI on the pull request
+(#503) is the run. The console was run in a clean checkout of the branch: `bun run
+typecheck` 0 errors; `bun run lint` 0 errors, 11 warnings; `bun run test` 4237 pass, 1 skip,
+0 fail across 389 files; the new tests fail against `origin/main`'s sources (16 of them),
+as intended. T1 and T4 to T13 match the plan. No existing test was loosened; the pinned
+statements changed are avg, min and max only, each to its exact new text; the 80 changed
+lines of `export_format_cases.jsonl` are IDR rows whose symbol becomes "Rp". Nothing of T3
+is in the diff. No reference is invented.
+
+**The planner's decision D5 was wrong, and T2 comes out of this pull request.**
+
+- **R1. BLOCKER: the last bar of a whole-number column is labelled as one value and holds
+  two.** For a year column over 2020 to 2024 the new floor makes the width 1; the bins are
+  `[2020, 2021)`, `[2021, 2022)`, `[2022, 2023)`, `[2023, 2024]`, because the maximum
+  belongs to the last bin (`bin_expr`, `BI-10`); the console then labels that bin "2023",
+  and a click on it lists 2023 and 2024. The developer measured exactly this on the engine
+  (four rows, 2023 twice) and said so. On `main` the same chart has five bars with ugly but
+  true labels ("2,020 – 2,020.5"). So T2 as planned replaces an ugly label by a wrong one,
+  for every whole-number column with a range of 1 to 10. The floor only matters for those
+  small ranges, so there is no part of T2 worth keeping without a bin of its own for the
+  maximum, and that needs a fourth scalar in the statement, a changed `bin_expr`, the same
+  exception in `bin_records_predicate` and in the console's last-bin rule, and new pinned
+  statements: a plan of its own. **Ruling: undo T2 completely** (rule 14: unsupported,
+  honestly, over works, approximately). `LH-BI-2-02` stays open on `BI-55`.
+  - Undo everything commit `6a7fca68` changed, and nothing else: the floor and `whole` in
+    `rust/crates/lakehouse-bi/src/bin.rs`, `add_bins` in
+    `rust/crates/lakehouse-api/src/routes/support.rs`, `binLabel`/`relabelBins` and the
+    `whole` field in `src/lib/chart-bins.ts`, the tests it added to
+    `src/lib/chart-bins.test.ts`, and its test in
+    `rust/crates/lakehouse-api/tests/chart_numbers.rs` (T1's test in that file stays).
+    Start from `git revert --no-commit 6a7fca68`; if a later commit touched the same lines,
+    resolve by hand so that the later commit's own change stays. Afterwards
+    `git diff origin/main...HEAD -- rust/crates/lakehouse-bi/src/bin.rs src/lib/chart-bins.ts src/lib/chart-bins.test.ts`
+    must show nothing that T2 added (say in the handoff what, if anything, is left and
+    which task it belongs to), and the pinned bin statements are again `main`'s.
+  - Documents (T13 wrote them): remove row 7 of the Decisions table in
+    `docs/core/features/bins-groups-hierarchies.md` (the whole row this branch added), and
+    in `CHANGELOG.md` remove from the `BI-55` entry the clause "automatic bins of a
+    whole-number column such as a year are never narrower than 1 and read "2020";" and
+    nothing else. If another document line of this branch speaks of whole-number bins,
+    remove that line too and name it in the handoff.
+- **R2. BLOCKER, closed by R1:** the engine test of the bins asserted `sum(n) == 5`, which
+  cannot fail, under a doc comment that said "five years, one per bin". It goes with T2.
+- **R3. SHOULD-FIX: `render_ms` counts the wait for a slot.** `routes/pdf_export.rs`: one
+  `Instant` is taken before `take_slot` and used for both lines; the plan says "`render_ms`
+  counts from the slot". After the slot is taken: `let rendering =
+  std::time::Instant::now();` and `render_ms` is measured from it. In `routes/render.rs`
+  call the existing `millis` helper where its body is written out again.
+- **R4. SHOULD-FIX: `docs/plans/BI-53-RESULT.md`.** Remove the checkout's path (a
+  measurement file names the machine by its architecture and CPU count, not by a path with
+  an account's name). Beside "The first minus the second, 245 ms, is the browser's start"
+  write "(one run each, and the two runs differ in orientation as well as in order)".
+- **R6. SHOULD-FIX (rule 13):** `src/features/dashboards/render-view.tsx`, where the print
+  view's width is set, gets a one-line comment:
+  `// QA LH-BI-1-01 F1, LH-BI-6-22, LH-BI-6-23 (BI-53, D17): laid out at the paper's width before a chart is drawn.`
+  and the doc of `paperContentWidth` (`src/lib/render-summary.ts`) names the same three
+  cases.
+- **R5. Note:** the handoff says "T9's `add_bins`"; it is T2's, and it leaves with T2.
+- **R7. For the planner (no change here):** `rust/crates/lakehouse-alerts/src/lib.rs`
+  (`mart_statement`) still writes `round({agg}(x))`, so an alert on an average is checked
+  against a whole number while the chart now shows decimals. It goes into the follow-up
+  slice with the bins (`BI-55`, part 2), together with a sum of a decimal column.
+
+All of this is ONE commit, `fix(review): round 1 of dashboards-p3: T2 is undone (R1, R2), R3, R4, R6`,
+after `main` is merged into the branch. Its body says why T2 is undone, in two sentences.
+
+The developer's handoff for this round, appended below this entry: the merge commit and the
+fix commit; what the revert had to resolve by hand; `cargo fmt --check`; `cargo clippy -p
+lakehouse-bi --all-targets -- -D warnings` and the same for `lakehouse-api`; `cargo test -p
+lakehouse-bi --lib` (quote the counts; the bin tests are `main`'s again); `cargo test -p
+lakehouse-api --test chart_numbers`; `--test dashboard_export`; `--test sec11_guard`;
+`--test route_auth`; `bun run typecheck`; `bun run lint`; `bun test src/lib
+src/features/dashboards`; `bun run test` once; each with its counts.
