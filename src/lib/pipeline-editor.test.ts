@@ -34,6 +34,7 @@ import {
   readableNames,
   readsAsYouAfterSave,
   removeItem,
+  saveBlockers,
   renameItem,
   setInputTable,
   sqlStepReads,
@@ -553,5 +554,25 @@ describe("what a SQL step names in a table position", () => {
     let free = editorStateFrom({ inputs: [{ name: "orders", zone: "bronze", table: "orders" }], steps: [] })
     free = setInputTable(free, "input-1", "orders_v2")
     expect(free.inputs[0]).toMatchObject({ name: "orders_v2" })
+  })
+})
+
+// BLD-1 part 1 S3 review R1-S3.
+describe("saveBlockers", () => {
+  it("says each reason Save is disabled, in the page's order, with where to go", () => {
+    let state = updateStep(stored(), "step-3", { transforms: [] })
+    state = renameItem(state, "input-2", "")
+    const problems = editorProblems(state, { ...OUTPUT, targetTable: "" })
+    expect(saveBlockers(state, problems, { name: "", scheduleOk: false })).toEqual([
+      { text: "Give the pipeline a name.", target: { kind: "name" } },
+      { text: "Input 2: Give it a name.", target: { kind: "input", id: "input-2" } },
+      { text: "Step paid: Add an operation, or remove this step.", target: { kind: "step", id: "step-3" } },
+      { text: "Output: Choose the output's table.", target: { kind: "output" } },
+      { text: "Schedule: choose one the orchestrator can run, or On demand only.", target: { kind: "schedule" } },
+    ])
+  })
+
+  it("is empty when the page can save", () => {
+    expect(saveBlockers(stored(), editorProblems(stored(), OUTPUT), { name: "x", scheduleOk: true })).toEqual([])
   })
 })

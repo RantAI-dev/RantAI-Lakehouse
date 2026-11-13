@@ -508,7 +508,6 @@ export function UnknownStepPane({
   index,
   count,
   problem,
-  invalid,
   onMove,
   onRemove,
 }: {

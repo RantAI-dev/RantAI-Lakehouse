@@ -952,6 +952,28 @@ describe("the pipeline editor of inputs and steps (BLD-1 part 1)", () => {
     expect(document.getElementById(item.getAttribute("aria-describedby") ?? "")?.textContent).toBe("Give it a name.")
   })
 
+  // BLD-1 part 1 S3 review R1-S3: a stored pipeline the API accepted can
+  // fail a rule only the page has; the page says so next to Save, and the
+  // line goes to the step.
+  it("says why Save is disabled, and goes to the step a reason is about", async () => {
+    const stored = existing()
+    stored.definition = {
+      ...stored.definition!,
+      steps: [{ name: "transformed", kind: "transform", reads: "orders_raw", transforms: [] }],
+    }
+    renderEditor(stored)
+    expect(saveButton(/save changes/i).disabled).toBe(true)
+    const reasons = screen.getByRole("status", { name: "Why it cannot be saved yet" })
+    fireEvent.click(within(reasons).getByRole("button", { name: "Step transformed: Add an operation, or remove this step." }))
+    expect(await screen.findByText("Step 1 · Form")).toBeTruthy()
+  })
+
+  it("says a new pipeline needs a name", async () => {
+    renderEditor()
+    const reasons = screen.getByRole("status", { name: "Why it cannot be saved yet" })
+    expect(within(reasons).getByRole("button", { name: "Give the pipeline a name." })).toBeTruthy()
+  })
+
   it("moves and removes a step, and renames a step's reader with its input", async () => {
     renderEditor(twoSteps())
     selectRail(/2\. by_stock/)

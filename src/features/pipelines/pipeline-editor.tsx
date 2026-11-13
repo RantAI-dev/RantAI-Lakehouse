@@ -34,6 +34,7 @@ import {
   errorItemId,
   errorTarget,
   hasProblems,
+  saveBlockers,
   moveStep,
   noStepLine,
   outputSourceLine,
@@ -53,6 +54,7 @@ import {
   type Column,
   type EditorSelection,
   type EditorState,
+  type SaveBlocker,
 } from "@/lib/pipeline-editor"
 import { cn } from "@/lib/utils"
 import { connectorService, lakehouseService, pipelineService } from "@/services"
@@ -326,7 +328,22 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
     setTab("build")
   }, [errorItem, saveError, sent])
 
-  const canSubmit = name.trim() !== "" && !hasProblems(problems) && schedule.trim() !== "" && isSchedulable(schedule)
+  const scheduleOk = schedule.trim() !== "" && isSchedulable(schedule)
+  const canSubmit = name.trim() !== "" && !hasProblems(problems) && scheduleOk
+  const blockers = saveBlockers(shownState, problems, { name, scheduleOk })
+  const nameRef = React.useRef<HTMLInputElement>(null)
+  function goTo(target: SaveBlocker["target"]) {
+    if (target.kind === "name") {
+      nameRef.current?.focus()
+      return
+    }
+    if (target.kind === "schedule") {
+      setTab("settings")
+      return
+    }
+    setTab("build")
+    setSelection(target)
+  }
 
   function select(next: EditorSelection) {
     setSelection(next)
@@ -602,6 +619,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
           <Label htmlFor="pipeline-name">Pipeline name</Label>
           <Input
             id="pipeline-name"
+            ref={nameRef}
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder="orders_hourly_rollup"
@@ -777,6 +795,26 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
           </div>
         </TabsContent>
       </Tabs>
+      {blockers.length > 0 && save.status !== "pending" ? (
+        // BLD-1 part 1 S3 review R1-S3: said beside the disabled button, each
+        // line taking the user to what it is about.
+        <div role="status" aria-label="Why it cannot be saved yet" className="flex flex-col gap-1 text-sm">
+          <p className="text-muted-foreground">{existing ? "It cannot be saved yet:" : "It cannot be created yet:"}</p>
+          <ul className="flex flex-col gap-0.5">
+            {blockers.map((blocker) => (
+              <li key={blocker.text}>
+                <button
+                  type="button"
+                  className="text-left text-amber-700 underline-offset-2 hover:underline dark:text-amber-400"
+                  onClick={() => goTo(blocker.target)}
+                >
+                  {blocker.text}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
       {readsAsYou ? (
         // D17a: said before the save, beside it, not after.
         <p role="status" className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-400">

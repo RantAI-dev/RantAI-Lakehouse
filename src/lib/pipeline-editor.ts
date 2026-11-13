@@ -451,6 +451,37 @@ export function hasProblems(problems: EditorProblems): boolean {
   return problems.output !== null || Object.keys(problems.items).length > 0
 }
 
+/** One reason the page cannot save yet, and where to go to fix it. */
+export type SaveBlocker = { text: string; target: EditorSelection | { kind: "name" } | { kind: "schedule" } }
+
+/**
+ * Why Save is disabled, in the order of the page, each with where to go
+ * (BLD-1 part 1 S3 review R1-S3). A stored pipeline the API accepts can
+ * fail a rule only this page has (a form step with no operation, several
+ * inputs and no step), and a missing name or schedule disabled Save with no
+ * word; the page now says each one next to the button.
+ */
+export function saveBlockers(
+  state: Pick<EditorState, "inputs" | "steps">,
+  problems: EditorProblems,
+  page: { name: string; scheduleOk: boolean }
+): SaveBlocker[] {
+  const out: SaveBlocker[] = []
+  if (page.name.trim() === "") out.push({ text: "Give the pipeline a name.", target: { kind: "name" } })
+  state.inputs.forEach((input, i) => {
+    const problem = problems.items[input.id]
+    if (problem) out.push({ text: `Input ${input.name.trim() || i + 1}: ${problem.message}`, target: { kind: "input", id: input.id } })
+  })
+  state.steps.forEach((step, i) => {
+    const problem = problems.items[step.id]
+    if (problem) out.push({ text: `Step ${step.name.trim() || i + 1}: ${problem.message}`, target: { kind: "step", id: step.id } })
+  })
+  if (problems.output) out.push({ text: `Output: ${problems.output.message}`, target: { kind: "output" } })
+  if (!page.scheduleOk)
+    out.push({ text: "Schedule: choose one the orchestrator can run, or On demand only.", target: { kind: "schedule" } })
+  return out
+}
+
 // ── what is sent ─────────────────────────────────────────────────────────
 
 /**
