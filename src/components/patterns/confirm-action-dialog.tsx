@@ -21,6 +21,9 @@ export function ConfirmActionDialog({
   impact,
   confirmLabel = "Confirm",
   confirming = false,
+  /** Keeps the confirm button disabled for a reason other than a request in
+   * flight (a value the dialog is still reading, `DATA-55`). */
+  confirmDisabled = false,
   destructive = false,
   onConfirm,
   children,
@@ -32,6 +35,7 @@ export function ConfirmActionDialog({
   impact?: string
   confirmLabel?: string
   confirming?: boolean
+  confirmDisabled?: boolean
   destructive?: boolean
   onConfirm: () => void
   children?: React.ReactNode
@@ -61,7 +65,7 @@ export function ConfirmActionDialog({
           <Button
             type="button"
             variant={destructive ? "destructive" : "default"}
-            disabled={confirming}
+            disabled={confirming || confirmDisabled}
             onClick={onConfirm}
           >
             {confirming ? "Working…" : confirmLabel}

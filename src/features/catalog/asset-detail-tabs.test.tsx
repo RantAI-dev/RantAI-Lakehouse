@@ -233,6 +233,7 @@ function stubApi({
   restoreRefusal,
   revokeRefusal,
   restore = { restorable: false, reason: "no dropped copy of this table is kept" },
+  drop,
   incidents = [],
   incidentsAfterRun,
   schedules = [],
@@ -264,6 +265,8 @@ function stubApi({
   revokeRefusal?: { status: number; error: string }
   /** What `GET .../restore` answers. */
   restore?: unknown
+  /** What `GET .../drop` answers (`DATA-55`); absent means "not stubbed" (404). */
+  drop?: unknown
   /** The quality incidents `GET /api/governance/quality/incidents` answers. */
   incidents?: unknown[]
   /** What it answers from the second read on (`DATA-54`): after a run. */
@@ -284,6 +287,12 @@ function stubApi({
     const method = init?.method ?? "GET"
     if (method === "PUT" && path.endsWith("/annotation")) {
       return annotationRefusal ? json({ error: annotationRefusal }, 400) : json({ ok: true })
+    }
+    // `DATA-55`: the drop status and the drop itself. Absent, it stays the
+    // file's "not stubbed" 404, as every other unlisted route.
+    if (path.endsWith("/api/catalog/demo-orders/drop")) {
+      if (drop === undefined) return json({ error: "not stubbed" }, 404)
+      return method === "POST" ? json({ ok: true, table: "bronze.demo_orders", rowCount: 1, droppedAt: "2026-11-13T08:00:00Z", expiresAt: "2026-11-20T08:00:00Z" }) : json(drop)
     }
     if (path.endsWith("/restore")) {
       if (method === "GET") return json(restore)
@@ -2098,6 +2107,27 @@ describe("Activity tab: a dropped table", () => {
     await waitFor(() => expect(toasts).toHaveBeenCalled())
     expect(toasts.mock.calls[0][0]).toBe("Failed to restore the table")
     expect(toasts.mock.calls[0][1]?.description).toContain("A dropped copy of this table has expired and cannot be restored.")
+  })
+})
+
+describe("Activity tab: dropping a table (DATA-55)", () => {
+  const DROPPABLE = { droppable: true, table: "bronze.demo_orders", keptDays: 7 }
+
+  it("offers Drop table on the Snapshots card for a table an upload made", async () => {
+    stubApi({ drop: DROPPABLE })
+    url.search = "tab=activity"
+    renderTabs()
+
+    expect(await screen.findByRole("button", { name: "Drop table" })).toBeTruthy()
+  })
+
+  it("offers no Drop table, and asks the API nothing about it, without governance:write", async () => {
+    const fetchSpy = stubApi({ permissions: ["catalog:read"], drop: DROPPABLE })
+    url.search = "tab=activity"
+    renderTabs()
+
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Drop table" })).toBeNull())
+    expect(fetchSpy.mock.calls.some((c) => String(c[0]).endsWith("/drop"))).toBe(false)
   })
 })
 
