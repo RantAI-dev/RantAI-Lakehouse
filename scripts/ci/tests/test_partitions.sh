@@ -166,6 +166,14 @@ for output, source in (
 if not re.search(r'--partition "count:\$\{PARTITION\}/\$\{TEST_PARTITIONS\}"', ci):
     problems.append("the nextest run does not partition count:PARTITION/TEST_PARTITIONS")
 
+# The ci-required sum check loops over the same count, not over three literals
+# (a fourth partition would otherwise never be read) and validates it first.
+if not re.search(r'for p in \$\(seq 1 "\$TEST_PARTITIONS"\); do', ci):
+    problems.append("the ci-required sum check does not loop over TEST_PARTITIONS")
+
+if not re.search(r'^\s*\[1-6\]\) ;;$', ci, re.M):
+    problems.append("the sum check does not refuse a partition count outside 1 to 6")
+
 if problems:
     sys.stderr.write("\n".join(problems) + "\n")
     sys.exit(1)
@@ -179,15 +187,86 @@ else
 fi
 
 # Negative test: a `changes` job that dropped an output is caught.
-(
-  tmp_ci="$ROOT/ci_missing_output.yml"
-  grep -vF 'test_partition_list: ${{ steps.partitions.outputs.test_partition_list }}' "$CI_YML" > "$tmp_ci"
-  if ! test_workflow_consistency "$tmp_ci" >/dev/null 2>&1; then
-    log_pass "the workflow check fails when changes does not expose the matrix list"
+tmp_ci="$ROOT/ci_missing_output.yml"
+grep -vF 'test_partition_list: ${{ steps.partitions.outputs.test_partition_list }}' "$CI_YML" > "$tmp_ci"
+if ! test_workflow_consistency "$tmp_ci" >/dev/null 2>&1; then
+  log_pass "the workflow check fails when changes does not expose the matrix list"
+else
+  log_fail "the workflow check did not fail when changes lost the matrix list output"
+fi
+
+# Negative test: a sum check that loops over a fixed count is caught.
+tmp_ci="$ROOT/ci_fixed_loop.yml"
+sed 's/for p in \$(seq 1 "\$TEST_PARTITIONS"); do/for p in 1 2 3; do/' "$CI_YML" > "$tmp_ci"
+if ! grep -qF 'for p in 1 2 3; do' "$tmp_ci"; then
+  log_fail "the negative fixture did not replace the sum loop"
+elif ! test_workflow_consistency "$tmp_ci" >/dev/null 2>&1; then
+  log_pass "the workflow check fails when the sum check loops over a fixed count"
+else
+  log_fail "the workflow check did not fail on a fixed count in the sum check"
+fi
+
+# The `ci-required` sum check itself, extracted from ci.yml and run against
+# fake partition counts: the loop bound must be the count `changes` chose, and
+# a missing partition, a partition that ran nothing and a total below the floor
+# must each fail. This is the check that notices a partition the matrix
+# dropped, or one that ran an empty archive.
+SUM_SCRIPT="$ROOT/sum_check.sh"
+if python3 - "$CI_YML" "$SUM_SCRIPT" <<'EOF'
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    ci = yaml.safe_load(f)
+for step in ci["jobs"]["ci-required"]["steps"]:
+    if str(step.get("name", "")).startswith("Check nextest partition sum"):
+        with open(sys.argv[2], "w") as out:
+            out.write(step["run"])
+        sys.exit(0)
+sys.exit(1)
+EOF
+then
+  log_pass "the ci-required sum check step is present and extractable"
+else
+  log_fail "the ci-required sum check step could not be extracted from ci.yml"
+fi
+
+# assert_sum <label> <expected exit> <counts dir entries...>; the count comes
+# from CASE_PARTITIONS and each entry is `N=<count>` (or `N=missing`).
+assert_sum() {
+  local label="$1" want="$2"
+  shift 2
+  local work counts entry
+  work="$(mktemp -d "$ROOT/sum.XXXXXX")"
+  counts="$work/counts"
+  mkdir -p "$counts"
+  for entry in "$@"; do
+    if [ "${entry#*=}" != "missing" ]; then
+      printf '%s\n' "${entry#*=}" > "$counts/partition-${entry%%=*}.txt"
+    fi
+  done
+  : > "$work/summary"
+  local rc=0
+  (
+    RUNNER_TEMP="$work" GITHUB_STEP_SUMMARY="$work/summary" \
+      TEST_PARTITIONS="${CASE_PARTITIONS-}" \
+      bash "$SUM_SCRIPT" >"$work/log" 2>&1
+  ) || rc=$?
+  if [ "$rc" = "$want" ]; then
+    log_pass "$label"
   else
-    log_fail "the workflow check did not fail when changes lost the matrix list output"
+    log_fail "$label (exit=$rc, want $want): $(tr '\n' ' ' < "$work/log")"
   fi
-)
+}
+
+CASE_PARTITIONS=3 assert_sum "the sum check passes for three full partitions" 0 1=3000 2=3000 3=3000
+CASE_PARTITIONS=4 assert_sum "the sum check expects the fourth partition it is told about" 1 1=2000 2=2000 3=2000
+CASE_PARTITIONS=4 assert_sum "the sum check passes for four partitions" 0 1=2000 2=2000 3=2000 4=2000
+CASE_PARTITIONS=2 assert_sum "the sum check fails when a partition's count is missing" 1 1=4000 2=missing
+CASE_PARTITIONS=3 assert_sum "the sum check fails when a partition ran zero tests" 1 1=3000 2=0 3=3000
+CASE_PARTITIONS=3 assert_sum "the sum check fails when the total is below the floor" 1 1=2000 2=2000 3=2000
+CASE_PARTITIONS= assert_sum "the sum check fails when the count is empty" 1 1=3000 2=3000 3=3000
+CASE_PARTITIONS=7 assert_sum "the sum check fails when the count is outside 1 to 6" 1 1=1000 2=1000 3=1000 4=1000 5=1000 6=1000 7=1000
 
 echo "=== Results: $PASS passed, $FAIL failed ==="
 if [ "$FAIL" -gt 0 ]; then

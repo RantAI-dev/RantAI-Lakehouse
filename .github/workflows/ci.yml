@@ -4358,16 +4358,20 @@ jobs:
           IMAGE_SMOKE_RESULT: ${{ needs.image-smoke.result }}
         run: ./scripts/ci/required_gate.sh
 
-      # REL-20 (D4): the three nextest partitions each upload their test
-      # count as their own artifact (`test-counts-{1,2,3}`, one file
-      # `partition-N.txt` each). Merge them and sum, failing the job if the
-      # total dropped below the floor. The floor is measured, not guessed:
-      # 9,935 tests ran on PR #397 (run 42197087127) while the API's unit
-      # tests still ran twice; REL-20 slice A removed the binary's copy
-      # (3,161 tests run there), keeping the 52 that existed only in it, so
-      # 9,935 - 3,161 + 52 = 6,826 (review R2). A dropped partition removes
-      # about a third of that, well below the floor. Raise it as tests are
-      # added; lower it only with a measured reason like this one.
+      # REL-20 (D4) / OPS-30: every partition uploads its test count as its own
+      # artifact (`test-counts-N`, one file `partition-N.txt` each). Merge them
+      # and sum, failing the job if a partition is missing, ran zero tests, or
+      # the total dropped below the floor. The loop bound is the same
+      # `test_partitions` count the matrix expanded, so a leg the matrix runs
+      # is always one this check expects (and one it expects is always a leg).
+      # The floor is measured, not guessed: 9,935 tests ran on PR #397 (run
+      # 42197087127) while the API's unit tests still ran twice; REL-20 slice A
+      # removed the binary's copy (3,161 tests run there), keeping the 52 that
+      # existed only in it, so 9,935 - 3,161 + 52 = 6,826 (review R2). A
+      # dropped partition removes about a third of that at M=3, well below the
+      # floor, and one lost test is caught by the per-partition zero check.
+      # Raise it as tests are added; lower it only with a measured reason like
+      # this one.
       # Same scope as the `test` job: only when it actually ran.
       - name: Download nextest partition counts (REL-20)
         if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true')
@@ -4379,16 +4383,35 @@ jobs:
 
       - name: Check nextest partition sum (REL-20)
         if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true')
+        env:
+          TEST_PARTITIONS: ${{ needs.changes.outputs.test_partitions }}
         run: |
           set -euo pipefail
+          # Fail closed: `changes` writes 1 to 6, and anything else means this
+          # check cannot say how many counts to expect.
+          case "$TEST_PARTITIONS" in
+            [1-6]) ;;
+            *)
+              echo "::error::test_partitions is '${TEST_PARTITIONS}', not a whole number from 1 to 6; cannot check the partition sum"
+              exit 1
+              ;;
+          esac
           total=0
-          for p in 1 2 3; do
+          for p in $(seq 1 "$TEST_PARTITIONS"); do
             f="$RUNNER_TEMP/counts/partition-$p.txt"
             if [ ! -f "$f" ]; then
               echo "::error::missing nextest count for partition $p"
               exit 1
             fi
             n=$(cat "$f")
+            if ! [[ "$n" =~ ^[0-9]+$ ]]; then
+              echo "::error::partition $p wrote '${n}', which is not a test count"
+              exit 1
+            fi
+            if [ "$n" -eq 0 ]; then
+              echo "::error::partition $p ran zero tests (the archive or the partition argument is wrong)"
+              exit 1
+            fi
             echo "partition $p: $n tests run"
             total=$((total + n))
           done
