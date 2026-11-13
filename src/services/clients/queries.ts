@@ -26,10 +26,10 @@ import type {
 import { historyQueryString } from "@/lib/history-query-params";
 import { readableErrorMessage } from "@/lib/notify-message";
 import { apiFetch } from "../http";
-import { ServiceError } from "../errors";
+import { ServiceError, deniedFor } from "../errors";
 import { chatAnswerFromBody } from "./chat-answer";
 import { RUN_ID_HEADER } from "@/lib/run-id";
-import { fileNameOf, refusalOf } from "@/lib/browser-file";
+import { fileNameOf } from "@/lib/browser-file";
 
 /**
  * QueryService is real — `run`/`estimate` execute SQL against ClickHouse
@@ -47,18 +47,19 @@ import { fileNameOf, refusalOf } from "@/lib/browser-file";
 
 /**
  * Map an error response body onto the ServiceError code its status implies.
- *
- * The message is the server's own sentence, with the API's own code
- * prefix (`permission_denied: `) taken off: the code is for the log,
- * the sentence is for the reader (`readableErrorMessage`, `QS-3` C6).
+ * A 401 or 403 goes through `deniedFor` (WEB-12), which names the permission
+ * and keeps the status. Every other code keeps the server's own sentence,
+ * with the API's own code prefix (`permission_denied: `) taken off: the code
+ * is for the log, the sentence is for the reader (`readableErrorMessage`,
+ * `QS-3` C6).
  */
-function errorFor(status: number, message: string): ServiceError {
-  const sentence = readableErrorMessage(message);
+function errorFor(status: number, body: { error?: string } | null, fallback: string): ServiceError {
+  const denied = deniedFor(status, body);
+  if (denied) return denied;
+  const sentence = readableErrorMessage(body?.error ?? fallback);
   if (status === 404) return new ServiceError("not_found", sentence);
   if (status === 400 || status === 409 || status === 422)
     return new ServiceError("invalid_request", sentence);
-  if (status === 401 || status === 403)
-    return new ServiceError("permission_denied", sentence);
   return new ServiceError("unavailable", sentence);
 }
 
@@ -72,7 +73,7 @@ async function send<T>(url: string, init: RequestInit, signal?: AbortSignal): Pr
   const res = await apiFetch(url, { ...init, signal });
   const json = await res.json().catch(() => null);
   if (!res.ok) {
-    throw errorFor(res.status, json?.error ?? `Query failed (${res.status})`);
+    throw errorFor(res.status, json, `Query failed (${res.status})`);
   }
   return json as T;
 }
@@ -140,7 +141,7 @@ async function deleteEmpty(url: string, signal?: AbortSignal): Promise<void> {
   const res = await apiFetch(url, { method: "DELETE", signal });
   if (!res.ok) {
     const json = await res.json().catch(() => null);
-    throw errorFor(res.status, json?.error ?? `Query failed (${res.status})`);
+    throw errorFor(res.status, json, `Query failed (${res.status})`);
   }
 }
 
@@ -175,6 +176,9 @@ async function postChat(
   });
   const json = await res.json().catch(() => null);
   if (!res.ok) {
+    // WEB-12: a refused assistant call is a refusal, not "AI Copilot could not answer".
+    const denied = deniedFor(res.status, json);
+    if (denied) throw denied;
     throw new ServiceError(
       "unavailable",
       json?.detail ?? json?.error ?? "AI Copilot could not answer. Try again."
@@ -278,7 +282,8 @@ async function download(
     { signal, cache: "no-store" }
   );
   if (!res.ok) {
-    throw errorFor(res.status, await refusalOf(res, "The download failed."));
+    const json = await res.json().catch(() => null);
+    throw errorFor(res.status, json, "The download failed.");
   }
   const blob = await res.blob();
   // The fallback name carries the format's own extension: a file named

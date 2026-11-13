@@ -1025,3 +1025,45 @@ describe("query parameters on the wire (QS-5)", () => {
     expect(versions[0]!.parameters).toEqual(DEFINITIONS)
   })
 })
+
+describe("refusals carry their status (WEB-12)", () => {
+  it("a refused saved query rejects with permission_denied, the status and the sentence", async () => {
+    stubFetch(() => json({ error: "permission_denied: query:read" }, 403))
+    await expect(clickhouseQueryService.getSaved("q-9")).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the query:read permission.",
+    })
+  })
+
+  it("a refused delete rejects with permission_denied, the status and the sentence", async () => {
+    stubFetch(() => json({ error: "permission_denied: query:write" }, 403))
+    await expect(clickhouseQueryService.deleteSaved("q-1")).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the query:write permission.",
+    })
+  })
+
+  it("a refused download keeps the server's sentence and gains its status", async () => {
+    stubFetch(() =>
+      json({ error: "permission_denied: Downloads are switched off for your role." }, 403),
+    )
+    await expect(
+      clickhouseQueryService.download("q-1", "csv", "7f0c0f0e-3c7e-4a3e-9d4f-0a1b2c3d4e5f"),
+    ).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "Downloads are switched off for your role.",
+    })
+  })
+
+  it("a refused question to AI Copilot rejects as permission_denied, not unavailable", async () => {
+    stubFetch(() => json({ error: "permission_denied: assistant:use" }, 403))
+    await expect(clickhouseQueryService.askQuestion("q")).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the assistant:use permission.",
+    })
+  })
+})
