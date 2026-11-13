@@ -153,6 +153,31 @@ impl wiremock::Respond for BackAfterUndrop {
     }
 }
 
+/// The keep's answer held until the test's own write is done: the window
+/// `DATA-55` review R3 closes between the drop's checks and its record. The
+/// drop cannot pass this call, so the load it must see is provably on record
+/// before it writes its own.
+struct HeldKeep {
+    entered: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl wiremock::Respond for HeldKeep {
+    fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+        self.entered
+            .lock()
+            .unwrap()
+            .send(())
+            .expect("the test is still waiting for the keep");
+        self.release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the test releases the keep");
+        ResponseTemplate::new(204)
+    }
+}
+
 fn token_file(name: &str) -> String {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join(name);
@@ -1789,4 +1814,96 @@ async fn a_table_is_listed_after_its_drop_and_gone_from_the_list_after_its_resto
         json!([]),
         "the list is empty once the table is back"
     );
+}
+
+/// `DATA-55` review R3: the drop writes its record first and asks again whether
+/// a load is running second, so a load that started between the two cannot pass
+/// its own check while the drop passes its earlier one. The load is marked
+/// `ingesting` while the drop waits on the keep, which is provably after
+/// `assess` and before the record; the drop is refused with D5's sentence, the
+/// catalog is not asked, the record goes, and the trail says `allowed` then
+/// `failed`.
+#[tokio::test]
+async fn a_drop_whose_upload_starts_loading_between_its_checks_is_a_409_and_leaves_no_record() {
+    let server = MockServer::start().await;
+    mount_row_count(&server, 3).await;
+    mount_registry(&server, "orders").await;
+    mount_drop(&server, ResponseTemplate::new(204), 0).await;
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    Mock::given(method("POST"))
+        .and(path("/management/v1/warehouse/wh-1/delete-profile"))
+        .respond_with(HeldKeep {
+            entered: std::sync::Mutex::new(entered_tx),
+            release: std::sync::Mutex::new(release_rx),
+        })
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    let tenant_id = Uuid::parse_str(CATALOG_TENANT).expect("a tenant id");
+    claim(&pool, CATALOG_TENANT, "orders").await;
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let writer_pool = pool.clone();
+    let writer = tokio::spawn(async move {
+        tokio::task::spawn_blocking(move || {
+            entered_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the drop asks to write the keep");
+        })
+        .await
+        .expect("the gate did not panic");
+        uploads::insert(
+            &writer_pool,
+            &NewUpload {
+                id: "up-loading",
+                original_filename: "stock.csv",
+                storage_key: "uploads/up-loading/up-loading.csv",
+                content_type: "text/csv",
+                size_bytes: 8,
+                sha256: "",
+                uploaded_by: "Seeded Uploader",
+                tenant_id,
+            },
+        )
+        .await
+        .expect("the upload is written");
+        let options = json!({ "encoding": "utf-8", "delimiter": ",", "headerRow": 0 });
+        uploads::mark_ingesting(
+            &writer_pool,
+            "up-loading",
+            &options,
+            "orders",
+            LoadMode::Replace,
+            None,
+        )
+        .await
+        .expect("the load is marked")
+        .expect("the upload is loadable");
+        release_tx.send(()).expect("the drop is waiting");
+    });
+
+    let (status, body) = call(&router, "POST", DROP, &cookie).await;
+    writer
+        .await
+        .expect("the load was marked while the drop waited");
+
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], json!(LOADING));
+    assert_eq!(deletes(&server).await, 0, "the catalog was not asked");
+    assert!(
+        uploads::dropped_table(&pool, "orders")
+            .await
+            .unwrap()
+            .is_none(),
+        "no record is left behind"
+    );
+    let outcomes: Vec<String> = sqlx::query_scalar(
+        "SELECT outcome FROM audit_event WHERE action = 'catalog.drop' ORDER BY at, id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(outcomes, vec!["allowed", "failed"]);
 }
