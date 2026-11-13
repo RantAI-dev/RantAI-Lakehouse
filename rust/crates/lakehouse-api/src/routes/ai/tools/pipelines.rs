@@ -1166,7 +1166,69 @@ mod t1_3_tests {
             "DAGSTER_URL".to_owned(),
             format!("{}/graphql", server.uri()),
         );
+        // BLD-1 part 1 / D4: a Bronze input is compiled through it.
+        env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
         AppState::new(Config::from_map(&env).expect("valid test Config"))
+    }
+
+    /// BLD-1 part 1 / D15: the assistant's `create_pipeline` takes `inputs`
+    /// and `steps`, so a SQL step the model writes is stored as the
+    /// definition (D1) — and, because the tool calls the CREATE route, the
+    /// whole save-time check (D2–D6, D9) applies to it with no second copy.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_pipeline_accepts_inputs_and_a_sql_step(pool: PgPool) {
+        let state = state_with_pg(&pool).await;
+        // A seeded Platform Admin: a real `app_user` (the `run_as` key) whose
+        // role is the `*:*` the save-time gate needs.
+        let user: Uuid =
+            sqlx::query_scalar("SELECT id FROM app_user WHERE email = 'fajar@meridian.example'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let tenant: Uuid =
+            sqlx::query_scalar("SELECT tenant_id FROM app_user_tenant WHERE user_id = $1 LIMIT 1")
+                .bind(user)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let principal = Principal {
+            id: PrincipalId::User(user),
+            tenant_ids: vec![tenant],
+            display_name: "Platform Admin".to_owned(),
+            permissions: PermissionSet::parse("*:*"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        };
+
+        let mut args = Map::new();
+        args.insert("name".to_owned(), json!("tool-sql-step"));
+        args.insert(
+            "inputs".to_owned(),
+            // R1-S6: an input zone the tool's own schema lists.
+            json!([{ "name": "orders", "zone": "silver", "table": "orders" }]),
+        );
+        args.insert(
+            "steps".to_owned(),
+            json!([{ "name": "projected", "kind": "sql", "sql": "SELECT * FROM orders" }]),
+        );
+        args.insert("targetZone".to_owned(), json!("silver"));
+        args.insert("targetTable".to_owned(), json!("tool_sql_out"));
+
+        let created = create_pipeline(&state, Some(&principal), &args).await;
+        assert_eq!(created["name"], "tool-sql-step", "{created}");
+        let id = created["id"].as_str().expect("the created pipeline's id");
+        let definition = lakehouse_store::pipelines::get_definition(&pool, id)
+            .await
+            .expect("get_definition")
+            .expect("the pipeline exists");
+        assert_eq!(definition.inputs.len(), 1);
+        assert_eq!(definition.inputs[0].name, "orders");
+        assert_eq!(definition.steps.len(), 1);
+        assert!(
+            !definition.steps[0].is_transform(),
+            "the step is the SQL one"
+        );
     }
 
     /// BLD-2 review R1 BLOCKER 1: the assistant tool refuses cross-tenant pipelines
@@ -1187,6 +1249,8 @@ mod t1_3_tests {
         let created = lakehouse_store::pipelines::create_pipeline(
             &pool,
             &lakehouse_store::pipelines::CreatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
                 name: "b-pipeline".to_owned(),
                 kind: "batch".to_owned(),
                 source_zone: "bronze".to_owned(),

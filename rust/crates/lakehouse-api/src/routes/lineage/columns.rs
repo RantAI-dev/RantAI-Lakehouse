@@ -1069,6 +1069,8 @@ mod tests {
             lakehouse_store::pipelines::create_pipeline(
                 pool,
                 &lakehouse_store::pipelines::CreatePipelineInput {
+                    inputs: Vec::new(),
+                    steps: Vec::new(),
                     name: "builds-probe".to_owned(),
                     kind: "batch".to_owned(),
                     source_zone: "silver".to_owned(),

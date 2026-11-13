@@ -104,6 +104,17 @@ pub enum StoreError {
     /// `sqlx::migrate!` failed to apply the migration set.
     #[error("migration failed")]
     Migration(#[source] sqlx::migrate::MigrateError),
+    /// A stored pipeline definition whose `inputs`, `steps` or `transforms`
+    /// column does not decode into the shape the store wrote there.
+    ///
+    /// BLD-1 part 1 review R1-B5: this used to be `unwrap_or_default()`,
+    /// which made an unreadable `steps` column compile to a plain
+    /// `SELECT * FROM <first input>` and overwrite the pipeline's output with
+    /// unfiltered rows (AGENTS.md principle 3). A definition this crate
+    /// cannot read is refused instead — 422, the status the orchestrator
+    /// treats as final, with this fixed sentence and never a serde message.
+    #[error("this pipeline's stored definition cannot be read")]
+    CorruptDefinition,
     /// `serde_json` failed to encode or decode a value this crate owns
     /// (a `pipeline_definition_version.snapshot`, the row that every
     /// `created`/`updated`/`restored`/`deleted` event captures). A
@@ -183,6 +194,9 @@ impl From<StoreError> for ApiError {
             // tell the caller the row is not there at all.
             StoreError::NotAllowed => Self::PermissionDenied(message),
             StoreError::NotFound => Self::NotFound(message),
+            // A stored definition the store cannot read is a refusal no retry
+            // changes: 422, with the fixed sentence above (R1-B5).
+            StoreError::CorruptDefinition => Self::Unprocessable(message),
             StoreError::Unavailable => Self::Unavailable(message),
             StoreError::Database(_) | StoreError::Migration(_) | StoreError::Serialization(_) => {
                 Self::Internal(message)

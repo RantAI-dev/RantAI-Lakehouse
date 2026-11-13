@@ -56,8 +56,20 @@ pub struct Pipeline {
     pub status: String,
     /// Who owns this pipeline.
     pub owner: String,
-    /// Source location (e.g. `"zone.table"`).
+    /// Source location (e.g. `"zone.table"`) — the FIRST input's.
+    ///
+    /// BLD-1 part 1 / D3: kept for every caller that predates `inputs`; the
+    /// target-lag readers use [`Self::input_tables`], which holds all of them.
     pub source: String,
+    /// BLD-1 part 1 / D11: every input's `<zone>.<table>` (migration `0140`),
+    /// written by [`definition_columns`]. This is what the target-lag readers
+    /// ask "which tables does this pipeline read?" — an old single-source row
+    /// is one entry here, and a pipeline with two inputs is two.
+    ///
+    /// Deliberately NOT on the wire: the definition already reports `inputs`
+    /// with their names, and this column is the readers' internal answer.
+    #[serde(skip)]
+    pub input_tables: Vec<String>,
     /// Target location.
     pub target: String,
     /// Ingress connector id, if any.
@@ -212,13 +224,231 @@ impl TargetLag {
     }
 }
 
+/// BLD-1 part 1 / D1: one table a pipeline reads, under the short name its
+/// steps call it by.
+///
+/// `name` is the identifier a step names it with, so it is an `Ident` of at
+/// most 48 characters (D2) — checked by the API's compiler, not here: this
+/// type is the storage shape, and the store writes what the route validated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineInput {
+    /// The name steps read this table by (unique across inputs and steps,
+    /// without regard to case — D2).
+    pub name: String,
+    /// Zone (`bronze`, `silver`, `gold`, …).
+    pub zone: String,
+    /// Table inside the zone.
+    pub table: String,
+}
+
+impl PipelineInput {
+    /// The `"<zone>.<table>"` location, the form `pipeline_definition.source`
+    /// and every `input_tables` entry use.
+    #[must_use]
+    pub fn location(&self) -> String {
+        format!("{}.{}", self.zone, self.table)
+    }
+}
+
+/// BLD-1 part 1 / D1: one named step. A step is a table, and a later step
+/// reads it by [`Self::name`].
+///
+/// The wire shape is D1's internally tagged union (`kind` is `"transform"`
+/// or `"sql"`), so one type carries both the API body and the stored
+/// `steps` JSONB column and no second mapping can drift.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum PipelineStep {
+    /// The five existing operations, applied to one input or earlier step.
+    Transform {
+        /// The step's name; later steps read it by this.
+        name: String,
+        /// The input or earlier step this reads.
+        reads: String,
+        /// Grammar-validated transform strings, in the order they run.
+        #[serde(default)]
+        transforms: Vec<String>,
+    },
+    /// One `SELECT` over the inputs and earlier steps (D5).
+    Sql {
+        /// The step's name; later steps read it by this.
+        name: String,
+        /// The SQL as written; the compiler checks it (D5).
+        sql: String,
+    },
+}
+
+impl PipelineStep {
+    /// The step's name, whichever kind it is.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Transform { name, .. } | Self::Sql { name, .. } => name,
+        }
+    }
+
+    /// Whether this step is a `transform` step (a `false` answer means SQL).
+    #[must_use]
+    pub fn is_transform(&self) -> bool {
+        matches!(self, Self::Transform { .. })
+    }
+}
+
+/// The tables a pipeline reads (BLD-1 part 1 / D11, D11a): its
+/// `input_tables`, or — for a row that predates migration `0140` and was never
+/// backfilled — its `source`, which is the answer every reader gave before.
+///
+/// One rule, called by every reader, so "a pipeline with no `input_tables`"
+/// cannot mean two different things in two places.
+#[must_use]
+pub fn input_tables_of(pipeline: &Pipeline) -> Vec<String> {
+    input_tables_or_source(&pipeline.input_tables, &pipeline.source)
+}
+
+/// [`input_tables_of`] for a row read as columns rather than as a
+/// [`Pipeline`] (the cycle walk reads `input_tables` and `source` in one
+/// query).
+#[must_use]
+pub fn input_tables_or_source(input_tables: &[String], source: &str) -> Vec<String> {
+    if input_tables.is_empty() {
+        vec![source.to_owned()]
+    } else {
+        input_tables.to_vec()
+    }
+}
+
+/// What one definition writes into the three legacy columns (D3, D13).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefinitionColumns {
+    /// `pipeline_definition.source`: the FIRST input's location.
+    pub source: String,
+    /// `pipeline_definition.transforms`: the transforms of a pipeline that is
+    /// one input and at most one `transform` step; empty otherwise (D3).
+    pub transforms: Vec<String>,
+    /// `pipeline_definition.input_tables`: every input's location, in order
+    /// (D11, the target-lag readers).
+    pub input_tables: Vec<String>,
+}
+
+/// BLD-1 part 1 / D3 + D13: the ONE place `source`, `transforms` and
+/// `input_tables` are derived from a definition.
+///
+/// Every write path calls this, so the legacy columns cannot describe a
+/// different pipeline than `inputs`/`steps` do. `transforms` is deliberately
+/// narrow (one input, at most one `transform` step): it is the field the
+/// pre-BLD-1 console and orchestrator read, and a wrong non-empty value there
+/// would make them run part of a multi-step pipeline as if it were the whole.
+#[must_use]
+pub fn definition_columns(inputs: &[PipelineInput], steps: &[PipelineStep]) -> DefinitionColumns {
+    let source = inputs
+        .first()
+        .map(PipelineInput::location)
+        .unwrap_or_default();
+    let transforms = match (inputs, steps) {
+        ([_one], []) => Vec::new(),
+        ([_one], [PipelineStep::Transform { transforms, .. }]) => transforms.clone(),
+        _ => Vec::new(),
+    };
+    DefinitionColumns {
+        source,
+        transforms,
+        input_tables: inputs.iter().map(PipelineInput::location).collect(),
+    }
+}
+
+/// BLD-1 part 1 / D3: today's three fields as D1's shape — one input named
+/// after the table (`input_1` when that is not a usable name), and, when
+/// there are transforms, one `transform` step named `transformed`
+/// (`transformed_1` when the input took that name).
+///
+/// This is the same rule migration `0140` backfills every existing row with;
+/// the migration's two SQL functions exist so the two answers can be compared
+/// rather than merely claimed to agree.
+#[must_use]
+pub fn legacy_definition(
+    source_zone: &str,
+    source_table: &str,
+    transforms: &[String],
+) -> (Vec<PipelineInput>, Vec<PipelineStep>) {
+    let name = if legacy_name_is_usable(source_table) {
+        source_table.to_owned()
+    } else {
+        "input_1".to_owned()
+    };
+    let input = PipelineInput {
+        name: name.clone(),
+        zone: source_zone.to_owned(),
+        table: source_table.to_owned(),
+    };
+    if transforms.is_empty() {
+        return (vec![input], Vec::new());
+    }
+    // BLD-1 part 1 review R1-B4: D2's names are unique without regard to
+    // case, so an input called `Transformed` would collide with a step named
+    // `transformed` and the compiler would refuse a pipeline that used to
+    // run. The suffix is chosen the way migration `0140` chooses it.
+    let step_name = if name.eq_ignore_ascii_case("transformed") {
+        "transformed_1"
+    } else {
+        "transformed"
+    };
+    (
+        vec![input],
+        vec![PipelineStep::Transform {
+            name: step_name.to_owned(),
+            reads: name,
+            transforms: transforms.to_vec(),
+        }],
+    )
+}
+
+/// D2's name rule, as a predicate: an [`crate::pipelines::PipelineInput`]'s
+/// table name is usable as an input name when it is a legal `Ident` of at
+/// most 48 characters that does not start with `__`.
+#[must_use]
+fn legacy_name_is_usable(candidate: &str) -> bool {
+    candidate.len() <= 48
+        && !candidate.starts_with("__")
+        && lakehouse_core::ident::Ident::new(candidate).is_ok()
+}
+
+/// BLD-1 part 1 / D13: the inputs and steps a version snapshot replays.
+///
+/// A snapshot written before this change has no `inputs`/`steps`, so it is
+/// turned into D1's shape by [`legacy_definition`] — exactly the rule the
+/// migration used for the live rows, so restoring an old version reproduces
+/// what that version's pipeline was.
+#[must_use]
+pub fn snapshot_definition(
+    snapshot: &PipelineDefinitionSnapshot,
+) -> (Vec<PipelineInput>, Vec<PipelineStep>) {
+    if snapshot.inputs.is_empty() {
+        return legacy_definition(
+            &snapshot.source_zone,
+            &snapshot.source_table,
+            &snapshot.transforms,
+        );
+    }
+    (snapshot.inputs.clone(), snapshot.steps.clone())
+}
+
 /// The full stored shape of an authored pipeline's definition, returned by
 /// `GET /api/pipelines/{id}` as `definition` (Correction 5 in this task's
 /// plan doc — the grand plan named this type without defining it).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthoredDefinition {
-    /// Source zone (e.g. `"bronze"`).
+    /// BLD-1 part 1 / D1: the tables this pipeline reads, by short name.
+    ///
+    /// Every row has at least one (the API refuses fewer); the field is a
+    /// list rather than an `Option` so the wire shape is one shape.
+    pub inputs: Vec<PipelineInput>,
+    /// BLD-1 part 1 / D1: the named steps, in the order they run; the last
+    /// one is the output.
+    pub steps: Vec<PipelineStep>,
+    /// Source zone (e.g. `"bronze"`). The first input's, kept for every
+    /// caller that predates `inputs` (D3).
     pub source_zone: String,
     /// Source table.
     pub source_table: String,
@@ -275,8 +505,11 @@ struct PipelineRow {
     /// union.
     target_lag_seconds: Option<i32>,
     target_lag_downstream: bool,
+    /// BLD-1 part 1 / D11: every input's location, read for the target-lag
+    /// readers.
+    input_tables: Vec<String>,
     /// BLD-1 / D1: `pipeline_definition.run_as` (migration `0076`), read
-    /// here so the `runnable`/`enforce` paths can decide whether this
+    /// here so the `runnable`/`compile` paths can decide whether this
     /// pipeline has an author at all without a separate read.
     run_as: Option<Uuid>,
 }
@@ -290,6 +523,11 @@ struct DefinitionRow {
     target: String,
     incremental_column: Option<String>,
     transforms: serde_json::Value,
+    /// BLD-1 part 1 / D1: the stored shape (migration `0140`). Decoded by
+    /// [`get_definition`], which falls back to [`legacy_definition`] for a
+    /// row that predates the columns and was not backfilled for some reason.
+    inputs: serde_json::Value,
+    steps: serde_json::Value,
     fbic_enabled: bool,
     connector_id: Option<String>,
     max_retries: i16,
@@ -304,6 +542,7 @@ impl From<PipelineRow> for Pipeline {
             status: row.status,
             owner: row.owner,
             source: row.source,
+            input_tables: row.input_tables,
             target: row.target,
             connector_id: row.connector_id,
             source_asset_id: row.source_asset_id,
@@ -343,7 +582,7 @@ impl From<PipelineRow> for Pipeline {
 const PIPELINE_COLUMNS: &str = "id, name, kind, status, owner, source, target, connector_id, \
      source_asset_id, target_asset_id, schedule, last_run_at, next_run_at, \
 freshness_lag_seconds, max_retries, description, depends_on, tenant_id, \
-     target_lag_seconds, target_lag_downstream, run_as";
+     target_lag_seconds, target_lag_downstream, input_tables, run_as";
 
 /// `RETURNING` clause for the transactional `create_pipeline` /
 /// `update_pipeline` / `delete_pipeline`-read paths. Wider than
@@ -354,7 +593,8 @@ freshness_lag_seconds, max_retries, description, depends_on, tenant_id, \
 const FULL_PIPELINE_COLUMNS: &str = "id, name, kind, status, owner, source, target, connector_id, \
      source_asset_id, target_asset_id, schedule, last_run_at, next_run_at, \
 freshness_lag_seconds, max_retries, description, depends_on, incremental_column, \
-     transforms, fbic_enabled, tenant_id, target_lag_seconds, target_lag_downstream, run_as";
+     transforms, inputs, steps, fbic_enabled, tenant_id, target_lag_seconds, \
+     target_lag_downstream, input_tables, run_as";
 
 /// The full editable state of a pipeline at one point in time. Persisted
 /// to `pipeline_definition_version.snapshot` (migration `0053`) inside
@@ -373,6 +613,16 @@ freshness_lag_seconds, max_retries, description, depends_on, incremental_column,
 pub struct PipelineDefinitionSnapshot {
     /// `pipeline_definition.kind`.
     pub kind: String,
+    /// BLD-1 part 1 / D1: the definition's inputs. `#[serde(default)]` so a
+    /// snapshot written before migration `0140` still reads; D3's rule turns
+    /// the empty list back into one input when it is restored
+    /// ([`snapshot_definition`]).
+    #[serde(default)]
+    pub inputs: Vec<PipelineInput>,
+    /// BLD-1 part 1 / D1: the definition's steps. Same default as
+    /// [`Self::inputs`], and for the same reason.
+    #[serde(default)]
+    pub steps: Vec<PipelineStep>,
     /// `pipeline_definition.source` split on the first `.`.
     pub source_zone: String,
     /// `pipeline_definition.source` split on the first `.`.
@@ -566,6 +816,11 @@ struct FullPipelineRow {
     depends_on: Vec<String>,
     incremental_column: Option<String>,
     transforms: serde_json::Value,
+    /// BLD-1 part 1 / D13: the stored shape, read here so the version
+    /// snapshot carries it and a restore replays what that version was.
+    inputs: serde_json::Value,
+    /// See [`Self::inputs`].
+    steps: serde_json::Value,
     fbic_enabled: bool,
     /// F2.3: `pipeline_definition.tenant_id` (migration `0042`), read
     /// here so the create/update/restore write paths can copy it onto
@@ -579,6 +834,8 @@ struct FullPipelineRow {
     /// the same pair.
     target_lag_seconds: Option<i32>,
     target_lag_downstream: bool,
+    /// BLD-1 part 1 / D11: every input's location (migration `0140`).
+    input_tables: Vec<String>,
     /// BLD-1 / D1: `pipeline_definition.run_as` (migration `0076`), read
     /// here so the create path can return the author it actually stored
     /// from the same `RETURNING` that built the `Pipeline`, instead of
@@ -595,6 +852,7 @@ impl From<FullPipelineRow> for Pipeline {
             status: row.status,
             owner: row.owner,
             source: row.source,
+            input_tables: row.input_tables,
             target: row.target,
             connector_id: row.connector_id,
             source_asset_id: row.source_asset_id,
@@ -625,14 +883,30 @@ impl From<FullPipelineRow> for Pipeline {
     }
 }
 
-impl From<&FullPipelineRow> for PipelineDefinitionSnapshot {
-    fn from(row: &FullPipelineRow) -> Self {
+impl TryFrom<&FullPipelineRow> for PipelineDefinitionSnapshot {
+    type Error = StoreError;
+
+    /// BLD-1 part 1 review R1-B5: this used `From` with `unwrap_or_default()`
+    /// on three columns, so a snapshot written for an unreadable row recorded
+    /// an EMPTY definition — which a restore would then write back. It fails
+    /// closed instead, with [`StoreError::CorruptDefinition`] (through the
+    /// `serde_json::Error` conversion).
+    fn try_from(row: &FullPipelineRow) -> Result<Self, StoreError> {
         let (source_zone, source_table) = split_zone_table(&row.source);
         let (target_zone, target_table) = split_zone_table(&row.target);
-        let transforms: Vec<String> =
-            serde_json::from_value(row.transforms.clone()).unwrap_or_default();
-        Self {
+        let transforms: Vec<String> = serde_json::from_value(row.transforms.clone())
+            .map_err(|_| StoreError::CorruptDefinition)?;
+        // BLD-1 part 1 / D13: the snapshot carries the new shape, decoded
+        // from the same row that produced the legacy fields, so the two
+        // cannot describe different pipelines.
+        let inputs: Vec<PipelineInput> = serde_json::from_value(row.inputs.clone())
+            .map_err(|_| StoreError::CorruptDefinition)?;
+        let steps: Vec<PipelineStep> =
+            serde_json::from_value(row.steps.clone()).map_err(|_| StoreError::CorruptDefinition)?;
+        Ok(Self {
             kind: row.kind.clone(),
+            inputs,
+            steps,
             source_zone,
             source_table,
             incremental_column: row.incremental_column.clone(),
@@ -647,7 +921,7 @@ impl From<&FullPipelineRow> for PipelineDefinitionSnapshot {
             depends_on: row.depends_on.clone(),
             name: row.name.clone(),
             status: row.status.clone(),
-        }
+        })
     }
 }
 
@@ -800,19 +1074,37 @@ pub async fn get_definition(
     id: &str,
 ) -> Result<Option<AuthoredDefinition>, StoreError> {
     let row: Option<DefinitionRow> = sqlx::query_as(
-        "SELECT source, target, incremental_column, transforms, fbic_enabled, connector_id, \
-         max_retries FROM pipeline_definition WHERE id = $1",
+        "SELECT source, target, incremental_column, transforms, inputs, steps, fbic_enabled, \
+         connector_id, max_retries FROM pipeline_definition WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|row| {
+    row.map(|row| -> Result<AuthoredDefinition, StoreError> {
         // Mirrors `create_pipeline`'s own `format!("{}.{}", zone, table)`
         // construction — split back into the two halves it came from.
         let (source_zone, source_table) = split_zone_table(&row.source);
         let (target_zone, target_table) = split_zone_table(&row.target);
-        let transforms: Vec<String> = serde_json::from_value(row.transforms).unwrap_or_default();
-        AuthoredDefinition {
+        // BLD-1 part 1 review R1-B5: a column this crate wrote and cannot
+        // read is a refusal, never an empty definition — an empty `steps`
+        // would compile to a plain copy and overwrite the output.
+        let transforms: Vec<String> =
+            serde_json::from_value(row.transforms).map_err(|_| StoreError::CorruptDefinition)?;
+        // A row written before migration `0140` (or one its backfill missed)
+        // has `[]`, and D3's rule is what turns it back into one input, so
+        // `inputs` is never empty on a readable pipeline.
+        let inputs: Vec<PipelineInput> =
+            serde_json::from_value(row.inputs).map_err(|_| StoreError::CorruptDefinition)?;
+        let steps: Vec<PipelineStep> =
+            serde_json::from_value(row.steps).map_err(|_| StoreError::CorruptDefinition)?;
+        let (inputs, steps) = if inputs.is_empty() {
+            legacy_definition(&source_zone, &source_table, &transforms)
+        } else {
+            (inputs, steps)
+        };
+        Ok(AuthoredDefinition {
+            inputs,
+            steps,
             source_zone,
             source_table,
             incremental_column: row.incremental_column,
@@ -822,8 +1114,9 @@ pub async fn get_definition(
             target_table,
             connector_id: row.connector_id,
             max_retries: row.max_retries,
-        }
-    }))
+        })
+    })
+    .transpose()
 }
 
 /// Split a `"<zone>.<table>"` location on its first `.`, matching
@@ -906,7 +1199,18 @@ pub struct CreatePipelineInput {
     /// `transform_grammar::parse_transform` at the route layer before this
     /// function is ever called — this store function does not re-validate
     /// them, it only persists the strings.
+    ///
+    /// BLD-1 part 1 / D3: this is the legacy field. It is ignored for
+    /// storage when [`Self::inputs`] is non-empty; the written `transforms`
+    /// column always comes from [`definition_columns`].
     pub transforms: Vec<String>,
+    /// BLD-1 part 1 / D1: the definition's inputs, as the route validated
+    /// them (D2–D6). Empty means "the legacy three fields describe this
+    /// pipeline" and [`legacy_definition`] turns them into D1's shape.
+    pub inputs: Vec<PipelineInput>,
+    /// BLD-1 part 1 / D1: the definition's steps. Used as given when
+    /// [`Self::inputs`] is non-empty.
+    pub steps: Vec<PipelineStep>,
     /// Whether file-based incremental capture is enabled (migration 0036).
     pub fbic_enabled: bool,
     /// Target zone.
@@ -990,7 +1294,15 @@ pub async fn create_pipeline(
     // `validate_depends_on`'s self-reference rule) pass `input.id =
     // Some(...)`; everyone else keeps the same id via `slug_id`.
     let id = input.id.clone().unwrap_or_else(|| slug_id(&input.name));
-    let source = format!("{}.{}", input.source_zone, input.source_table);
+    // BLD-1 part 1 / D3 + D13: ONE place derives the three legacy columns
+    // from the definition, whichever form the caller sent.
+    let (definition_inputs, definition_steps) = if input.inputs.is_empty() {
+        legacy_definition(&input.source_zone, &input.source_table, &input.transforms)
+    } else {
+        (input.inputs.clone(), input.steps.clone())
+    };
+    let columns = definition_columns(&definition_inputs, &definition_steps);
+    let source = columns.source;
     let target = format!("{}.{}", input.target_zone, input.target_table);
     let owner = input.owner.as_deref().unwrap_or(DEFAULT_OWNER);
     // `sla_ok`, `last_run_at`, `freshness_lag_seconds` are deliberately
@@ -1000,7 +1312,13 @@ pub async fn create_pipeline(
     // lost their defaults in `0048_pipeline_never_run.sql`, so omitting
     // them here inserts `NULL` — a freshly authored pipeline has honestly
     // never run, not a fabricated "just now".
-    let transforms = serde_json::to_value(&input.transforms).unwrap_or(serde_json::Value::Null);
+    // R1-B5: an encode failure is a `StoreError`, not a NULL column — a NULL
+    // would decode to "no definition" and read as a plain copy.
+    let transforms = serde_json::to_value(&columns.transforms)?;
+    // BLD-1 part 1 / D13: the new shape is written as it will be read, from
+    // the same `definition_*` values the legacy columns came from.
+    let inputs_json = serde_json::to_value(&definition_inputs)?;
+    let steps_json = serde_json::to_value(&definition_steps)?;
     // `max_retries` (migration 0051): a present input is bound as-is; an
     // absent input resolves to the migration's `DEFAULT 2` here so the
     // row carries the same value either way (the column has no other
@@ -1014,10 +1332,11 @@ pub async fn create_pipeline(
     let sql = format!(
         "INSERT INTO pipeline_definition (id, name, kind, status, owner, source, target, \
 schedule, description, incremental_column, fbic_enabled, transforms, \
+         inputs, steps, input_tables, \
          max_retries, tenant_id, depends_on, connector_id, target_lag_seconds, \
          target_lag_downstream, run_as) \
          VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-         $16, $17, $18) \
+         $16, $17, $18, $19, $20, $21) \
          RETURNING {FULL_PIPELINE_COLUMNS}"
     );
     let mut tx = pool.begin().await?;
@@ -1034,6 +1353,9 @@ schedule, description, incremental_column, fbic_enabled, transforms, \
         .bind(&input.incremental_column)
         .bind(input.fbic_enabled)
         .bind(&transforms)
+        .bind(&inputs_json)
+        .bind(&steps_json)
+        .bind(&columns.input_tables)
         .bind(max_retries)
         .bind(input.tenant_id)
         .bind(&input.depends_on)
@@ -1046,7 +1368,7 @@ schedule, description, incremental_column, fbic_enabled, transforms, \
         .bind(input.run_as)
         .fetch_one(&mut *tx)
         .await?;
-    let snapshot = PipelineDefinitionSnapshot::from(&row);
+    let snapshot = PipelineDefinitionSnapshot::try_from(&row)?;
     insert_definition_version(
         &mut tx,
         &row.id,
@@ -1089,7 +1411,15 @@ pub struct UpdatePipelineInput {
     pub incremental_column: Option<String>,
     /// Grammar-validated transform steps; validated at the route layer,
     /// exactly as for [`create_pipeline`].
+    ///
+    /// BLD-1 part 1 / D3: the legacy field; see
+    /// [`CreatePipelineInput::transforms`].
     pub transforms: Vec<String>,
+    /// BLD-1 part 1 / D1: the definition's inputs, as the route validated
+    /// them. Empty means "the legacy fields describe this pipeline".
+    pub inputs: Vec<PipelineInput>,
+    /// BLD-1 part 1 / D1: the definition's steps.
+    pub steps: Vec<PipelineStep>,
     /// Whether file-based incremental capture is enabled.
     pub fbic_enabled: bool,
     /// Target zone.
@@ -1129,6 +1459,34 @@ pub struct UpdatePipelineInput {
     /// (`validate_connector_source`), so this function never stores a
     /// connector the run would refuse.
     pub connector_id: ConnectorChange,
+    /// BLD-1 part 1 / D10 and D10a (`SEC-71`): what this write does to the
+    /// author. The route decides — `Set` when a person other than the author
+    /// changed what the pipeline reads, `Clear` when a service identity did,
+    /// `Keep` when the definition did not change.
+    pub run_as: RunAsChange,
+}
+
+/// What a write asks to do with `pipeline_definition.run_as` — the author a
+/// pipeline reads as (BLD-1 part 1 review R1-B9 / D10a).
+///
+/// Three states, for the same reason [`ConnectorChange`] has three: "leave
+/// the stored author alone", "clear it" and "set it" are three different
+/// writes, and `Option<Option<Uuid>>` says it in a shape the compiler's own
+/// lints refuse (`clippy::option_option`). It is not on the wire: the route
+/// decides, from who is calling and whether the definition changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RunAsChange {
+    /// The definition did not change, or the caller is already the author:
+    /// leave `run_as` as it is.
+    #[default]
+    Keep,
+    /// The caller changed what the pipeline reads and cannot be read as (a
+    /// service identity): clear it, so the pipeline does not run until an
+    /// administrator assigns an author.
+    Clear,
+    /// The caller changed what the pipeline reads and is a person: read as
+    /// them from now on.
+    Set(Uuid),
 }
 
 /// What a `PUT /api/pipelines/{id}` asked to do with a pipeline's connector
@@ -1224,9 +1582,19 @@ async fn update_pipeline_with_event(
     changed_by: Option<Uuid>,
     event: &str,
 ) -> Result<Option<Pipeline>, StoreError> {
-    let source = format!("{}.{}", input.source_zone, input.source_table);
+    // BLD-1 part 1 / D3 + D13: same single derivation as `create_pipeline`,
+    // so the legacy columns and the new shape cannot disagree after an edit.
+    let (definition_inputs, definition_steps) = if input.inputs.is_empty() {
+        legacy_definition(&input.source_zone, &input.source_table, &input.transforms)
+    } else {
+        (input.inputs.clone(), input.steps.clone())
+    };
+    let columns = definition_columns(&definition_inputs, &definition_steps);
+    let source = columns.source;
     let target = format!("{}.{}", input.target_zone, input.target_table);
-    let transforms = serde_json::to_value(&input.transforms).unwrap_or(serde_json::Value::Null);
+    let transforms = serde_json::to_value(&columns.transforms)?;
+    let inputs_json = serde_json::to_value(&definition_inputs)?;
+    let steps_json = serde_json::to_value(&definition_steps)?;
     // `max_retries` (migration 0051): `COALESCE($N, max_retries)` —
     // the route layer rejects out-of-range values with 400 first, so
     // the CHECK constraint here is defense in depth for whatever
@@ -1243,7 +1611,9 @@ async fn update_pipeline_with_event(
          description = $6, incremental_column = $7, fbic_enabled = $8, transforms = $9, \
 owner = COALESCE($10, owner), max_retries = COALESCE($11, max_retries), \
          depends_on = COALESCE($12, depends_on), \
-         connector_id = CASE WHEN $13 THEN $14 ELSE connector_id END \
+         connector_id = CASE WHEN $13 THEN $14 ELSE connector_id END, \
+         inputs = $15, steps = $16, input_tables = $17, \
+         run_as = CASE WHEN $18 THEN $19 ELSE run_as END \
          WHERE id = $1 RETURNING {FULL_PIPELINE_COLUMNS}"
     );
     // BLD-9 / decision 7: `connector_id` cannot use the `COALESCE` shape
@@ -1279,6 +1649,18 @@ owner = COALESCE($10, owner), max_retries = COALESCE($11, max_retries), \
         .bind(&input.depends_on)
         .bind(connector_set)
         .bind(&connector_value)
+        .bind(&inputs_json)
+        .bind(&steps_json)
+        .bind(&columns.input_tables)
+        // BLD-1 part 1 / D10 and D10a (`SEC-71`): a `Keep` binds the flag
+        // false and leaves the column alone; `Clear` binds a typed NULL and
+        // `Set` the caller, so the three states stay three writes (the same
+        // shape `connector_id` uses above).
+        .bind(!matches!(input.run_as, RunAsChange::Keep))
+        .bind(match input.run_as {
+            RunAsChange::Set(user_id) => Some(user_id),
+            RunAsChange::Keep | RunAsChange::Clear => None,
+        })
         .fetch_optional(&mut *tx)
         .await?;
     let Some(row) = row else {
@@ -1297,7 +1679,7 @@ owner = COALESCE($10, owner), max_retries = COALESCE($11, max_retries), \
             cycle.join(" -> ")
         )));
     }
-    let snapshot = PipelineDefinitionSnapshot::from(&row);
+    let snapshot = PipelineDefinitionSnapshot::try_from(&row)?;
     insert_definition_version(
         &mut tx,
         &row.id,
@@ -1353,7 +1735,7 @@ pub async fn delete_pipeline(
         tx.rollback().await?;
         return Ok(false);
     };
-    let snapshot = PipelineDefinitionSnapshot::from(&row);
+    let snapshot = PipelineDefinitionSnapshot::try_from(&row)?;
     let done = sqlx::query("DELETE FROM pipeline_definition WHERE id = $1")
         .bind(id)
         .execute(&mut *tx)
@@ -2222,7 +2604,7 @@ fn lag_reader_predicate(
         "p.tenant_id = {candidate_tenant} \
          AND p.id != {candidate_id} \
          AND (p.target_lag_seconds IS NOT NULL OR p.target_lag_downstream) \
-         AND (p.source = {candidate_target} OR EXISTS ( \
+         AND ({candidate_target} = ANY (p.input_tables) OR EXISTS ( \
                 SELECT 1 FROM unnest(p.depends_on) AS up(id) \
                 JOIN pipeline_definition u ON u.id = up.id \
                 WHERE u.tenant_id = {candidate_tenant} AND u.target = {candidate_target}))"
@@ -2337,7 +2719,9 @@ pub async fn upstream_downstream_pipelines_conn(
     let Some(tenant_id) = pipeline.tenant_id else {
         return Ok(Vec::new());
     };
-    let mut input_tables = vec![pipeline.source.clone()];
+    // BLD-1 part 1 / D11: every input this pipeline reads, not just the
+    // first.
+    let mut input_tables = input_tables_of(pipeline);
     for target in targets_for_conn(conn, Some(tenant_id), &pipeline.depends_on)
         .await?
         .into_values()
@@ -2502,8 +2886,11 @@ pub async fn find_target_lag_cycle_conn(
     .await?;
     let target_of: std::collections::HashMap<String, String> = targets.into_iter().collect();
 
-    let lag_rows = sqlx::query_as::<_, (String, String, Vec<String>)>(
-        "SELECT id, source, depends_on FROM pipeline_definition \
+    // BLD-1 part 1 / D11: a cycle can run through a SECOND input, so the walk
+    // reads every input's location; `source` is the fallback for a row that
+    // predates the column.
+    let lag_rows = sqlx::query_as::<_, (String, Vec<String>, String, Vec<String>)>(
+        "SELECT id, input_tables, source, depends_on FROM pipeline_definition \
          WHERE tenant_id = $1 AND (target_lag_seconds IS NOT NULL OR target_lag_downstream)",
     )
     .bind(tenant_id)
@@ -2511,10 +2898,12 @@ pub async fn find_target_lag_cycle_conn(
     .await?;
 
     let upstream_of = |id: &str| -> Vec<String> {
-        let Some((_, source, depends_on)) = lag_rows.iter().find(|(pid, ..)| pid == id) else {
+        let Some((_, input_tables, source, depends_on)) =
+            lag_rows.iter().find(|(pid, ..)| pid == id)
+        else {
             return Vec::new();
         };
-        let mut inputs = vec![source.clone()];
+        let mut inputs = input_tables_or_source(input_tables, source);
         for up in depends_on {
             if let Some(target) = target_of.get(up) {
                 inputs.push(target.clone());
@@ -2558,6 +2947,7 @@ mod tests {
             status: "draft".to_owned(),
             owner: "o".to_owned(),
             source: "s".to_owned(),
+            input_tables: vec!["s".to_owned()],
             target: "t".to_owned(),
             connector_id: None,
             source_asset_id: None,
@@ -2625,6 +3015,7 @@ mod tests {
             status: "draft".to_owned(),
             owner: "o".to_owned(),
             source: "s".to_owned(),
+            input_tables: vec!["s".to_owned()],
             target: "t".to_owned(),
             connector_id: None,
             source_asset_id: None,
@@ -2674,6 +3065,7 @@ mod tests {
             status: "ready".to_owned(),
             owner: "o".to_owned(),
             source: "s".to_owned(),
+            input_tables: vec!["s".to_owned()],
             target: "t".to_owned(),
             connector_id: None,
             source_asset_id: None,

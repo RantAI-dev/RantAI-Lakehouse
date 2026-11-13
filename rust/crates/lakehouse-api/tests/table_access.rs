@@ -892,10 +892,13 @@ async fn an_alert_owned_by_a_narrowed_user_records_not_found() {
 
 // ── Authored pipelines ──────────────────────────────────────────────────
 
-/// D5: an authored pipeline's enforce call reads as its author, so a narrowed
+/// D5: an authored pipeline's compile call reads as its author, so a narrowed
 /// author's hidden table is the tenant gate's not-found.
+///
+/// BLD-1 part 1 review R1-B2: the route is `.../compile` now — it compiles the
+/// stored definition (whose input is the hidden table) instead of taking SQL.
 #[tokio::test]
-async fn an_authored_pipeline_enforce_call_for_a_narrowed_author_is_not_found() {
+async fn an_authored_pipeline_compile_call_for_a_narrowed_author_is_not_found() {
     let ch = FakeCh::default();
     let server = ch.serve().await;
     let TestApp { router, pool } = app(&server).await;
@@ -906,9 +909,18 @@ async fn an_authored_pipeline_enforce_call_for_a_narrowed_author_is_not_found() 
     let pipeline = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            // BLD-1 part 1 review R1-B2: the run route compiles the stored
+            // definition, so the table the author may not read is the
+            // pipeline's input.
+            inputs: vec![pipelines::PipelineInput {
+                name: "source".to_owned(),
+                zone: "silver".to_owned(),
+                table: "orders".to_owned(),
+            }],
+            steps: Vec::new(),
             name: "gov7-enforce".to_owned(),
             kind: "batch".to_owned(),
-            source_zone: "bronze".to_owned(),
+            source_zone: "silver".to_owned(),
             source_table: "orders".to_owned(),
             target_zone: "silver".to_owned(),
             target_table: "orders_clean".to_owned(),
@@ -937,12 +949,9 @@ async fn an_authored_pipeline_enforce_call_for_a_narrowed_author_is_not_found() 
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!("/api/pipelines/runnable/{pipeline}/enforce"))
-                .header("content-type", "application/json")
+                .uri(format!("/api/pipelines/runnable/{pipeline}/compile"))
                 .header("cookie", admin)
-                .body(Body::from(
-                    json!({ "sql": "SELECT * FROM silver.orders" }).to_string(),
-                ))
+                .body(Body::empty())
                 .expect("build request"),
         )
         .await
