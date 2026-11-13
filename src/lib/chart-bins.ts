@@ -108,10 +108,16 @@ export function gridPayload(choice: string): GridDef | undefined {
 // ── what comes back ──────────────────────────────────────────────────────
 
 /** What a tile says of one binned column (`bins` on the payload). */
-export type BinMeta = { mode?: string; width?: unknown; min?: unknown; max?: unknown }
+export type BinMeta = { mode?: string; width?: unknown; min?: unknown; max?: unknown; whole?: unknown }
 
-/** A bin as the tile knows it: the width, and the data's maximum when the server said. */
-export type BinInfo = { width: number; max?: number }
+/**
+ * A bin as the tile knows it: the width, and the data's maximum when the
+ * server said.
+ *
+ * `whole`: every value of the column is a whole number, said by the server for
+ * an automatic and a counted bin (`BI-55`), so a bin of width 1 reads "2020".
+ */
+export type BinInfo = { width: number; max?: number; whole?: boolean }
 
 const finite = (v: unknown): number | null => {
   const n = typeof v === "string" ? Number(v) : v
@@ -132,7 +138,11 @@ export function binsOfTile(
     const width = finite(m.width)
     if (width !== null && width > 0) {
       const max = finite(m.max)
-      out[column] = max === null ? { width } : { width, max }
+      // QA LH-BI-2-02 (BI-55, D7): only "1" (or true) is a whole-number
+      // column; an absent or 0 answer adds no key.
+      const whole = m.whole === true || finite(m.whole) === 1
+      const info: BinInfo = max === null ? { width } : { width, max }
+      out[column] = whole ? { ...info, whole: true } : info
     }
   }
   const fixed: [string | undefined, BinDef | undefined][] = [
@@ -148,8 +158,13 @@ export function binsOfTile(
   return out
 }
 
-/** "500 – 1,000": the lower edge to the upper, with as many decimals as the edges need. */
-export function binLabel(lower: number, width: number): string {
+/**
+ * "500 – 1,000": the lower edge to the upper, with as many decimals as the
+ * edges need. A bin of width 1 over a whole-number column is its one value
+ * ("2020"), not a range of one (`BI-55`).
+ */
+export function binLabel(lower: number, width: number, whole = false): string {
+  if (whole && width === 1 && Number.isInteger(lower)) return String(lower)
   const upper = Math.round((lower + width) * 1e10) / 1e10
   const decimals = Math.max(decimalsFor([lower, upper]), decimalsOf(lower), decimalsOf(upper))
   return `${formatNumber(lower, decimals)} – ${formatNumber(upper, decimals)}`
@@ -170,7 +185,7 @@ export function relabelBins<R extends Record<string, unknown>>(rows: readonly R[
     for (const column of columns) {
       const lower = finite(row[column])
       if (lower !== null && row[column] !== "" && row[column] !== null) {
-        next = { ...next, [column]: binLabel(lower, bins[column].width) }
+        next = { ...next, [column]: binLabel(lower, bins[column].width, bins[column].whole) }
       }
     }
     return next

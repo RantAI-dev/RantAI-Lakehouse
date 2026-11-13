@@ -995,8 +995,9 @@ pub(crate) fn annotate_grain(
 }
 
 /// `BI-10`: what the tile of a binned chart carries so the console can label
-/// its bins: `bins: { <column>: { mode, width, min, max } }`, read by the
-/// statements the builder made over the same filtered relation as the bins,
+/// its bins: `bins: { <column>: { mode, width, min, max, whole? } }` (a
+/// `whole` key only when the read says the column holds whole numbers, `BI-55`),
+/// read by the statements the builder made over the same filtered relation as the bins,
 /// through the same role rewrite as the tile (the width of a viewer whose role
 /// filters rows comes from the rows that role may see). A read that fails or is
 /// refused leaves its column out: the tile then shows the bin's lower edges
@@ -1036,15 +1037,21 @@ async fn add_bins(
         match try_run_spec_sql(ch, gate, &read.sql, roles, placeholders, obligations).await {
             Ok(result) => {
                 let row = &result["rows"][0];
-                out.insert(
-                    read.column.clone(),
-                    json!({
-                        "mode": read.mode,
-                        "width": row["width"],
-                        "min": row["min"],
-                        "max": row["max"],
-                    }),
-                );
+                let mut entry = json!({
+                    "mode": read.mode,
+                    "width": row["width"],
+                    "min": row["min"],
+                    "max": row["max"],
+                });
+                // QA LH-BI-2-02 (BI-55, D7): `whole` only for an automatic or
+                // a counted bin, where the read computes it; a width bin and a
+                // histogram add no key.
+                if let Value::Object(map) = &mut entry
+                    && !row["whole"].is_null()
+                {
+                    map.insert("whole".to_owned(), row["whole"].clone());
+                }
+                out.insert(read.column.clone(), entry);
             }
             Err(SpecRunFailure::Clickhouse(err)) => {
                 let _logged = upstream_error::report_ch(&upstream_error::TILE, &err);
