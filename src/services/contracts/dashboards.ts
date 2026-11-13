@@ -234,7 +234,7 @@ export type DashboardService = {
   /** Deleted dashboards and charts the caller may see (`GET /api/dashboard/trash`). */
   listTrash(signal?: AbortSignal): Promise<TrashList>
   /** Bring one back (`POST /api/dashboard/trash/restore`). Needs `dashboard:write`. */
-  restoreFromTrash(kind: ItemKind, id: string, signal?: AbortSignal): Promise<RestoredItem>
+  restoreFromTrash(kind: TrashKind, id: string, signal?: AbortSignal): Promise<RestoredItem>
   /** The caller's personal space, created on first use. Needs `dashboard:write`. */
   ensurePersonalSpace(signal?: AbortSignal): Promise<DashboardFolder>
   /** The caller's favourites and recent dashboards and charts. */
@@ -255,6 +255,8 @@ export type DashboardService = {
 
 /** What a favourite, a recent item, a search hit or a trash entry points at. */
 export type ItemKind = "board" | "chart"
+/** What the trash holds: dashboards, charts and (`BI-18` part D) reports. */
+export type TrashKind = ItemKind | "report"
 
 /** One version of a dashboard (`lakehouse_bi::versions::VersionEntry`). */
 export type VersionEntry = {
@@ -286,7 +288,7 @@ export type RevertResult = {
 
 /** `lakehouse_bi::trash::TrashItem`. */
 export type TrashItem = {
-  kind: ItemKind
+  kind: TrashKind
   id: string
   name: string
   /** For a chart, the dashboard it was on. */
@@ -303,7 +305,7 @@ export type TrashItem = {
 export type TrashList = { items: TrashItem[]; retentionDays: number }
 
 export type RestoredItem = {
-  kind: ItemKind
+  kind: TrashKind
   id: string
   /** For a dashboard, how many charts came back with it. */
   charts: number
@@ -351,7 +353,8 @@ export type EmbedInfo = {
 export type FilterMode = "locked" | "editable" | "hidden"
 
 /** A chart of a dashboard, for the embed chart picker. */
-export type BoardChart = { id: string; title: string }
+/** `kind` lets a picker leave out the tiles that carry no data (`BI-18` part D). */
+export type BoardChart = { id: string; title: string; kind?: string }
 
 /**
  * One stored chart, as `GET /api/dashboard/specs` answers it (`WEB-7` D6).

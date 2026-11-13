@@ -3,12 +3,13 @@
 import * as React from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
-import { ChevronDown, Folder, FolderCog, LayoutGrid, Lock, PlusIcon, Rows3, Sigma, Trash2, Upload } from "lucide-react"
+import { ChevronDown, FileText, Folder, FolderCog, LayoutGrid, Lock, PlusIcon, Rows3, Sigma, Trash2, Upload } from "lucide-react"
 
 import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
 import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
+import { LineTabsList, type LineTab } from "@/components/patterns/line-tabs"
 import { PageHeader } from "@/components/patterns/page-header"
 import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
@@ -29,10 +30,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { Tabs, TabsContent } from "@/components/ui/tabs"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { useDataTable } from "@/hooks/use-data-table"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { useTableUrlState } from "@/hooks/use-table-url-state"
+import { useUrlTab } from "@/hooks/use-url-tab"
 import { useAuth } from "@/features/auth/auth-provider"
 import { filterDataClientSide } from "@/lib/data-table"
 import {
@@ -67,6 +70,7 @@ import { PRIVATE_HINT } from "./private-badge"
 import { FolderOptions } from "./folder-options"
 import { ImportDashboardDialog } from "./import-dashboard-dialog"
 import { ManageFoldersDialog, MoveBoardDialog } from "./folder-dialogs"
+import { ReportList } from "./report-list"
 import { forgetLastBoard } from "./last-board"
 import { TrashDialog } from "./trash-dialog"
 
@@ -74,6 +78,17 @@ import { TrashDialog } from "./trash-dialog"
 const NO_FOLDER = "__none__"
 
 type ViewMode = "gallery" | "table"
+
+/**
+ * The tabs of the Dashboards page (`BI-18` part D): the dashboards, the
+ * reports. The open one is in `?tab=`, so a report's "Reports" link lands on it.
+ */
+type ListTab = "dashboards" | "reports"
+const READER_TABS: readonly ListTab[] = ["dashboards", "reports"]
+const TAB_STRIP: Record<ListTab, LineTab> = {
+  dashboards: { value: "dashboards", label: "Dashboards", icon: LayoutGrid },
+  reports: { value: "reports", label: "Reports", icon: FileText },
+}
 const VIEW_STORAGE_KEY = "dashboards:list-view"
 
 /** Dialog buat/ubah nama + deskripsi sebuah dashboard. */
@@ -318,6 +333,9 @@ export function DashboardListPage() {
   const fileable = React.useMemo(() => folderChoices(folders, me), [folders, me])
   const reloadFolders = foldersState.reload
   const canFile = auth.hasPermission("dashboard:write")
+  const tabValues = READER_TABS
+  const [tab, setTab] = useUrlTab<ListTab>("tab", tabValues)
+  const listTabs = tabValues.map((t) => TAB_STRIP[t])
   // The personal space is created on first use: a writer with none yet opens it
   // once, then the folder list is read again.
   const spaceAsked = React.useRef(false)
@@ -556,126 +574,135 @@ export function DashboardListPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Dashboards"
-        description="Every dashboard in this workspace. Open one to edit its tiles, or create a new one."
+        description="Every dashboard and report in this workspace. Open one to read or edit it, or create a new one."
       />
 
-      {state.status === "loading" ? <LoadingSkeleton /> : null}
-      {state.status === "error" ? <ErrorState error={state.error} onRetry={reload} /> : null}
+      <Tabs value={tab} onValueChange={(v) => setTab(v as ListTab)} className="gap-4">
+        <LineTabsList tabs={listTabs} active={tab} />
+        <TabsContent value="dashboards" className="flex flex-col gap-4">
+          {state.status === "loading" ? <LoadingSkeleton /> : null}
+          {state.status === "error" ? <ErrorState error={state.error} onRetry={reload} /> : null}
 
-      {state.status === "success" && boards.length === 0 ? (
-        <EmptyState
-          title="No dashboards yet"
-          description="Create a dashboard to collect charts, KPIs and tables on one canvas."
-          action={newButton}
-        />
-      ) : null}
-
-      {state.status === "success" && boards.length > 0 ? (
-        <div className="space-y-4">
-          <ShortcutStrip label="Favourites" items={favourites} />
-          <ShortcutStrip label="Recent" items={recent.filter((r) => !favouriteIds.has(r.id))} />
-          <DataTableAdvancedToolbar
-            table={table}
-            onRefresh={reload}
-            trailing={
-              <div className="flex items-center gap-2">
-                {viewToggle}
-                <Button variant="outline" size="sm" render={<Link href="/dashboards/metrics" />}>
-                  <Sigma data-icon="inline-start" />
-                  Metrics
-                </Button>
-                {canFile ? (
-                  <Button variant="outline" size="sm" onClick={() => setFoldersOpen(true)}>
-                    <FolderCog data-icon="inline-start" />
-                    Folders
-                  </Button>
-                ) : null}
-                {/* BI-18 part C review fix (SHOULD-FIX) R18: the trash is for those who can restore. */}
-                {canFile ? (
-                  <Button variant="outline" size="sm" onClick={() => setTrashOpen(true)}>
-                    <Trash2 data-icon="inline-start" />
-                    Trash
-                  </Button>
-                ) : null}
-                {/* BI-19 part D (plan D14): a dashboard file in; the server asks for edit on the folder. */}
-                {canFile ? (
-                  <Button variant="outline" size="sm" onClick={() => setImportOpen(true)}>
-                    <Upload data-icon="inline-start" />
-                    Import…
-                  </Button>
-                ) : null}
-                {newButton}
-              </div>
-            }
-          >
-            <DataTableSearch placeholder="Search dashboards..." />
-          </DataTableAdvancedToolbar>
-
-          {visible.length === 0 ? (
+          {state.status === "success" && boards.length === 0 ? (
             <EmptyState
-              title="No matching dashboards"
-              description="No dashboard matches the current search or filters."
+              title="No dashboards yet"
+              description="Create a dashboard to collect charts, KPIs and tables on one canvas."
+              action={newButton}
             />
-          ) : view === "gallery" ? (
-            folders.length === 0 ? (
-              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                {visible.map((b) => (
-                  <BoardCard key={b.id} board={b} actions={actions} />
-                ))}
-              </div>
-            ) : (
-              <div className="flex flex-col gap-5">
-                {sections.map((section) => {
-                  const open = !collapsed.has(section.folderId)
-                  return (
-                    <section key={section.folderId || "none"} className="flex flex-col gap-2.5">
-                      <button
-                        type="button"
-                        aria-expanded={open}
-                        onClick={() => toggleSection(section.folderId)}
-                        className="flex w-fit items-center gap-2 rounded-md px-1 py-0.5 text-sm font-medium text-foreground transition-colors hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-                      >
-                        <ChevronDown
-                          className={cn("size-4 text-muted-foreground transition-transform", !open && "-rotate-90")}
-                          aria-hidden
-                        />
-                        {section.folderId ? (
-                          folders.find((f) => f.id === section.folderId)?.ownerId ? (
-                            <Lock className="size-4 text-muted-foreground" aria-hidden />
-                          ) : (
-                            <Folder className="size-4 text-muted-foreground" aria-hidden />
-                          )
-                        ) : null}
-                        {section.path || "No folder"}
-                        <span className="text-xs font-normal text-muted-foreground tabular-nums">
-                          {section.boards.length}
-                        </span>
-                      </button>
-                      {open ? (
-                        section.boards.length === 0 ? (
-                          <p className="px-1 text-xs text-muted-foreground">
-                            No dashboards in this folder.
-                          </p>
-                        ) : (
-                          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                            {section.boards.map((b) => (
-                              <BoardCard key={b.id} board={b} actions={actions} />
-                            ))}
-                          </div>
-                        )
-                      ) : null}
-                    </section>
-                  )
-                })}
-              </div>
-            )
-          ) : (
-            <div className="rounded-md border">
-              <DataTable table={table} />
+          ) : null}
+
+          {state.status === "success" && boards.length > 0 ? (
+            <div className="space-y-4">
+              <ShortcutStrip label="Favourites" items={favourites} />
+              <ShortcutStrip label="Recent" items={recent.filter((r) => !favouriteIds.has(r.id))} />
+              <DataTableAdvancedToolbar
+                table={table}
+                onRefresh={reload}
+                trailing={
+                  <div className="flex items-center gap-2">
+                    {viewToggle}
+                    <Button variant="outline" size="sm" render={<Link href="/dashboards/metrics" />}>
+                      <Sigma data-icon="inline-start" />
+                      Metrics
+                    </Button>
+                    {canFile ? (
+                      <Button variant="outline" size="sm" onClick={() => setFoldersOpen(true)}>
+                        <FolderCog data-icon="inline-start" />
+                        Folders
+                      </Button>
+                    ) : null}
+                    {/* BI-18 part C review fix (SHOULD-FIX) R18: the trash is for those who can restore. */}
+                    {canFile ? (
+                      <Button variant="outline" size="sm" onClick={() => setTrashOpen(true)}>
+                        <Trash2 data-icon="inline-start" />
+                        Trash
+                      </Button>
+                    ) : null}
+                    {/* BI-19 part D (plan D14): a dashboard file in; the server asks for edit on the folder. */}
+                    {canFile ? (
+                      <Button variant="outline" size="sm" onClick={() => setImportOpen(true)}>
+                        <Upload data-icon="inline-start" />
+                        Import…
+                      </Button>
+                    ) : null}
+                    {newButton}
+                  </div>
+                }
+              >
+                <DataTableSearch placeholder="Search dashboards..." />
+              </DataTableAdvancedToolbar>
+
+              {visible.length === 0 ? (
+                <EmptyState
+                  title="No matching dashboards"
+                  description="No dashboard matches the current search or filters."
+                />
+              ) : view === "gallery" ? (
+                folders.length === 0 ? (
+                  <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                    {visible.map((b) => (
+                      <BoardCard key={b.id} board={b} actions={actions} />
+                    ))}
+                  </div>
+                ) : (
+                  <div className="flex flex-col gap-5">
+                    {sections.map((section) => {
+                      const open = !collapsed.has(section.folderId)
+                      return (
+                        <section key={section.folderId || "none"} className="flex flex-col gap-2.5">
+                          <button
+                            type="button"
+                            aria-expanded={open}
+                            onClick={() => toggleSection(section.folderId)}
+                            className="flex w-fit items-center gap-2 rounded-md px-1 py-0.5 text-sm font-medium text-foreground transition-colors hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+                          >
+                            <ChevronDown
+                              className={cn("size-4 text-muted-foreground transition-transform", !open && "-rotate-90")}
+                              aria-hidden
+                            />
+                            {section.folderId ? (
+                              folders.find((f) => f.id === section.folderId)?.ownerId ? (
+                                <Lock className="size-4 text-muted-foreground" aria-hidden />
+                              ) : (
+                                <Folder className="size-4 text-muted-foreground" aria-hidden />
+                              )
+                            ) : null}
+                            {section.path || "No folder"}
+                            <span className="text-xs font-normal text-muted-foreground tabular-nums">
+                              {section.boards.length}
+                            </span>
+                          </button>
+                          {open ? (
+                            section.boards.length === 0 ? (
+                              <p className="px-1 text-xs text-muted-foreground">
+                                No dashboards in this folder.
+                              </p>
+                            ) : (
+                              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                                {section.boards.map((b) => (
+                                  <BoardCard key={b.id} board={b} actions={actions} />
+                                ))}
+                              </div>
+                            )
+                          ) : null}
+                        </section>
+                      )
+                    })}
+                  </div>
+                )
+              ) : (
+                <div className="rounded-md border">
+                  <DataTable table={table} />
+                </div>
+              )}
             </div>
-          )}
-        </div>
-      ) : null}
+          ) : null}
+        </TabsContent>
+        <TabsContent value="reports">
+          {/* BI-18 part D (T5): reports live in the same folders, under the same access. */}
+          <ReportList folders={folders} canWrite={canFile} />
+        </TabsContent>
+      </Tabs>
 
       <BoardFormDialog
         open={createOpen}

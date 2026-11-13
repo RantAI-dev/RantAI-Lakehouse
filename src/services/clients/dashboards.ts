@@ -350,14 +350,14 @@ export const clickhouseDashboardService: DashboardService = {
     await checkedWrite<{ ok: boolean }>(res)
   },
   async listBoardCharts(board, signal) {
-    const json = await request<{ charts?: { id: string; title?: string; board?: string }[] }>(
+    const json = await request<{ charts?: { id: string; title?: string; board?: string; kind?: string }[] }>(
       "/api/dashboard/specs",
       { cache: "no-store", signal },
       "The charts could not be loaded"
     )
     return (json.charts ?? [])
       .filter((c) => c.board === board)
-      .map((c) => ({ id: c.id, title: c.title ?? c.id }))
+      .map((c) => ({ id: c.id, title: c.title ?? c.id, kind: c.kind }))
   },
   // BI-19 part A. The server's sentences are ours, so they are shown as they come.
   async getPublicLink(board, signal) {
