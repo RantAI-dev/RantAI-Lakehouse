@@ -642,9 +642,10 @@ pub fn resolve(
     }
 }
 
-/// Why the dashboard's "Group dates by" left a chart as it was (`BI-50`,
-/// plan D10). The console shows one quiet mark and one sentence for it, so the
-/// server names the reason instead of leaving the tile looking untouched.
+/// Why the dashboard's "Group dates by" left a chart as it was (`BI-50`, QA
+/// `LH-BI-9-05`, plan D10). The console shows one quiet mark and one sentence
+/// for it, so the server names the reason instead of leaving the tile looking
+/// untouched.
 ///
 /// The type mirrors `GrainNotApplied` in `src/lib/grain-switch.ts`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

@@ -600,10 +600,10 @@ pub struct Resolved {
     pub value: ParamValue,
 }
 
-/// A parameter of this read whose value did not fit, and why (`BI-52`, plan
-/// D26). `name` is the definition's name, read from the store, never the
-/// request's text; `reason` is [`check_value`]'s sentence, which names the
-/// parameter and the rule and never repeats the value.
+/// A parameter of this read whose value did not fit, and why (`BI-52`, QA
+/// `LH-BI-11-05`, plan D26). `name` is the definition's name, read from the
+/// store, never the request's text; `reason` is [`check_value`]'s sentence,
+/// which names the parameter and the rule and never repeats the value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RefusedParam {
     /// The definition's name.

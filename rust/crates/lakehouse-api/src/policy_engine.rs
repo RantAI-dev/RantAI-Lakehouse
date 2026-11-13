@@ -806,9 +806,11 @@ impl<'a> PolicyEngineObligations<'a> {
     }
 
     /// Why a statement that already failed gave no rows, when the viewer's own
-    /// access explains it (`BI-51`, plan D16–D18): a table their roles do not
-    /// read, or a column the policy masks that the statement names. Called only
-    /// after a question has failed, to word its sentence without a reference.
+    /// access explains it (`BI-51`, QA `LH-BI-13-03`, plan D16–D18): a table
+    /// their roles do not read, or a column the policy masks that is among
+    /// `columns` — the columns the question itself names, never read out of the
+    /// statement. Called only after a question has failed, to word its sentence
+    /// without a reference.
     ///
     /// It never decides whether data may be read — the rewrite did that, before
     /// this runs. `None` means "cannot tell", so the caller keeps the sentence
@@ -851,9 +853,10 @@ impl<'a> PolicyEngineObligations<'a> {
 /// (`BI-51`, plan D16).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessCause {
-    /// The statement reads a table the viewer's roles or organisation do not
-    /// read: the tenant gate answered "not found", or the rewrite refused it
-    /// with [`EnforcementError::TableNotReadable`].
+    /// The statement reads a table the viewer's roles do not include (the
+    /// tenant gate is not seen by this function): the rewrite refused it with
+    /// [`EnforcementError::TableNotReadable`], or `access_cause` found the
+    /// same.
     HiddenTable,
     /// One of the statement's own columns is masked for the viewer's roles on
     /// a table it reads, so the engine refused what the rewrite produced.

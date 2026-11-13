@@ -1002,11 +1002,14 @@ pub(crate) fn annotate_grain(
 ///
 /// Nothing is added when the control changed the chart, when the chart already
 /// had that grain, or when it kept its own grain because the new one does not
-/// fit its column: that last case keeps `grainSkipped`. The dimension's kind is
-/// read from the columns this read already loaded, so a joined column, a
-/// calculated field or a pivot's field is not among them and the reason is the
-/// general `no_grain`. A tile that is not an object, or that carries no `rows`
-/// (it says its own error), is left alone.
+/// fit its column: that last case keeps `grainSkipped`. A chart this read could
+/// not rebuild (`built` is `None`) but whose definition has its own grain kept
+/// its stored statement, so the switch never decided its grain: it is left
+/// alone rather than told a reason the switch did not find (R5, rule 14). The
+/// dimension's kind is read from the columns this read already loaded, so a
+/// joined column, a calculated field or a pivot's field is not among them and
+/// the reason is the general `no_grain`. A tile that is not an object, or that
+/// carries no `rows` (it says its own error), is left alone.
 pub(crate) fn annotate_grain_switch(
     tile: &mut Value,
     chart: &store::StoredChartSpec,
@@ -1018,6 +1021,12 @@ pub(crate) fn annotate_grain_switch(
         return;
     };
     if !tile.contains_key("rows") {
+        return;
+    }
+    // R5 (rule 14): a chart that fell back to its stored statement was not
+    // rebuilt at this read, so the switch never saw its grain; "no date
+    // grouping of its own" would be a reason that is not true.
+    if built.is_none() && chart.def.grain.is_some() {
         return;
     }
     let column = own_columns(chart, columns.0, columns.1)

@@ -75,8 +75,8 @@ pub(crate) enum OnRefusal {
 ///
 /// `on_refusal` decides what a value that does not fit does: a 400 for the
 /// whole read, or the value in force plus an entry in [`Loaded::refused`]
-/// (`BI-52`, plan D23–D26). A name no definition has is a 400 for a strict
-/// read and ignored for a reported one (plan D25).
+/// (`BI-52`, QA `LH-BI-11-05`, plan D23–D26). A name no definition has is a
+/// 400 for a strict read and ignored for a reported one (plan D25).
 ///
 /// # Errors
 ///

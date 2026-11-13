@@ -852,9 +852,10 @@ async fn a_question_the_viewers_access_does_not_cover_says_so_without_a_referenc
     assert_eq!(tile["rows"].as_array().unwrap().len(), 2);
 }
 
-/// QA `LH-BI-13-03` (`BI-51`, plan D16, T7): exactly four shapes count as the
+/// QA `LH-BI-13-03` (`BI-51`, plan D16, T7): exactly three shapes count as the
 /// viewer's access — the gate's not-found, a hidden table, and a masked column
-/// the engine refused with a server code — and nothing else does.
+/// the engine refused with code 43 — and nothing else does. Another engine
+/// code is not access, even on a question that names a masked column (R1).
 #[test]
 fn only_the_gates_not_found_a_hidden_table_and_a_masked_column_the_engine_refused_count_as_access()
 {
@@ -892,6 +893,18 @@ fn only_the_gates_not_found_a_hidden_table_and_a_masked_column_the_engine_refuse
     ));
     assert!(!explains(
         &server("no code"),
+        Some(AccessCause::MaskedColumn)
+    ));
+    // R1 (BLOCKER): a masked column does not always make a question fail (a
+    // masked dimension still draws `***` groups), so another engine code is
+    // not the viewer's access and keeps the reference: a memory limit.
+    assert!(!explains(
+        &server("Code: 241. Memory limit exceeded"),
+        Some(AccessCause::MaskedColumn)
+    ));
+    // R1: nor is a missing table (code 60), on the same question.
+    assert!(!explains(
+        &server("Code: 60. Unknown table"),
         Some(AccessCause::MaskedColumn)
     ));
     assert!(!explains(

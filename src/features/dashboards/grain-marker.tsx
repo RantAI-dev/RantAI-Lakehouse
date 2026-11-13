@@ -9,7 +9,8 @@ import { GRAIN_LABELS, isGrain } from "@/lib/time-grain";
  * did not fit this chart's column, so it kept its own (like the skipped-filter
  * mark), the chart has more buckets than its limit, so only the latest
  * are shown, and — while the dashboard's control is in use — the grain does
- * not apply to this chart at all, with the reason in the tooltip (`BI-50`).
+ * not apply to this chart at all, with the reason in the tooltip (`BI-50`, QA
+ * `LH-BI-9-05`).
  */
 export function GrainMarkers({ skipped, truncated, limit, notApplied }: {
   readonly skipped?: string;

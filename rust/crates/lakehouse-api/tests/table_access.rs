@@ -619,17 +619,39 @@ fn layered_board_chart() -> Value {
 const MASKED_SUM_REFUSAL: &str = "Code: 43. DB::Exception: Illegal type String of argument for \
      aggregate function sum. (ILLEGAL_TYPE_OF_ARGUMENT)";
 
+/// How the fake answers a read of the second mart (`R2`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MartRead {
+    /// Only a statement that carries the mask's own rewrite
+    /// (`replaceRegexpOne`) is refused; any other read of the mart gets no
+    /// rows. A test on this mode fails when masking stops, which an
+    /// unconditional refusal would hide.
+    MaskedOnly,
+    /// Every read of the mart is refused, masked or not.
+    Always,
+}
+
 /// A `ClickHouse` serving the one combined chart: both marts' columns, the
 /// base question with one row, and a refusal for the second question's read.
 #[derive(Clone)]
 struct LayerFake {
     log: Arc<Mutex<Vec<String>>>,
+    mart_read: MartRead,
 }
 
 impl LayerFake {
     fn new() -> Self {
         Self {
             log: Arc::new(Mutex::new(Vec::new())),
+            mart_read: MartRead::Always,
+        }
+    }
+
+    /// R2: only the masked read of the second mart fails.
+    fn masked_only() -> Self {
+        Self {
+            log: Arc::new(Mutex::new(Vec::new())),
+            mart_read: MartRead::MaskedOnly,
         }
     }
 
@@ -712,9 +734,16 @@ impl Respond for LayerFake {
             return rows(&["database", "name", "engine", "create_table_query"], &[]);
         }
         // The second question's read: what the engine says when a mask turned
-        // the number into `***`.
+        // the number into `***`. R2: in `MaskedOnly` mode only a statement
+        // that carries the mask's rewrite is refused; a read without it gets
+        // no rows, so a change that stops masking shows up as a pass-through.
         if sql.contains(&format!("FROM serving.{LAYER_MART}")) {
-            return ResponseTemplate::new(500).set_body_string(MASKED_SUM_REFUSAL);
+            return match self.mart_read {
+                MartRead::MaskedOnly if !sql.contains("replaceRegexpOne") => rows(&[], &[]),
+                MartRead::MaskedOnly | MartRead::Always => {
+                    ResponseTemplate::new(500).set_body_string(MASKED_SUM_REFUSAL)
+                }
+            };
         }
         if sql.contains(&format!("FROM serving.{LAYER_BASE}")) {
             return rows(&["kota", "n"], &[json!({"kota": "A", "n": 1})]);
@@ -780,7 +809,7 @@ async fn a_question_on_a_table_the_viewers_role_does_not_read_is_marked_as_acces
 /// stay out of the entry.
 #[tokio::test]
 async fn a_question_that_sums_a_column_masked_for_the_viewer_is_marked_as_access() {
-    let fake = LayerFake::new();
+    let fake = LayerFake::masked_only();
     let server = fake.serve().await;
     let TestApp { router, pool } = app(&server).await;
     let user = narrowed(
@@ -830,6 +859,16 @@ async fn a_question_that_sums_a_column_masked_for_the_viewer_is_marked_as_access
     for needle in ["omzet", "Code: 43", "Illegal"] {
         assert!(!text.contains(needle), "{needle} leaked: {text}");
     }
+    // R2: the refusal was the masked read's own — the statement the rewrite
+    // produced carries `replaceRegexpOne` over the mart this question sums.
+    assert!(
+        fake.statements()
+            .iter()
+            .any(|sql| sql.contains("replaceRegexpOne")
+                && sql.contains(&format!("FROM serving.{LAYER_MART}"))),
+        "the masked read reached the engine: {:?}",
+        fake.statements()
+    );
 }
 
 /// QA `LH-BI-13-03` (`BI-51`, D16): an engine failure the viewer's access does

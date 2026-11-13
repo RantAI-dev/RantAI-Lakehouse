@@ -12,8 +12,8 @@ import { paramHint, type ParamControl, type ParamValue } from "@/lib/params";
  * change when the viewer leaves the field or presses Enter, so typing does not
  * reload every tile on each key. A value the server refuses is listed under
  * that parameter's control and the control returns to the value in force
- * (`BI-52`, plan D28); a refusal for a parameter the dashboard does not show is
- * listed after the controls.
+ * (`BI-52`, QA `LH-BI-11-05`, plan D28); a refusal for a parameter the
+ * dashboard does not show is listed after the controls.
  */
 export function ParamControls({
   controls, onChange, refusals,

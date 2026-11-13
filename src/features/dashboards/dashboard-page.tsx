@@ -334,15 +334,20 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       setData({ ...json, charts: (json.charts ?? []).map((c) => (c.def ? { ...c, def: normalizeDef(c.def) } : c)) });
       setLayout(json.layout ?? {});
       setPhone(json.phoneLayout);
-      // BI-52 (plan D28, D29): a refused value is shown on its parameter, and
-      // this answer also decides which names the address may keep.
+      // BI-52 (plan D28, D29; QA LH-BI-11-05): a refused value is shown on its
+      // parameter, and this answer also decides which names the address may
+      // keep.
       const refused = json.refusedParams ?? [];
       if (refused.length) setParamRefusals((prev) => {
         const next = { ...prev };
         for (const r of refused) next[r.name] = r.reason;
         return next;
       });
-      setParamAnswer({ sent: pValues, refused, applied: json.appliedParams });
+      // R3: a failed read of the definitions answers `appliedParams: {}` with
+      // `storeError`, which says nothing about the values; passed on as such,
+      // it would strip every one of them from the address. Undefined keeps
+      // them (QA LH-BI-11-05 (BI-52), review R3).
+      setParamAnswer({ sent: pValues, refused, applied: json.storeError ? undefined : json.appliedParams });
       return json;
     } catch (e) {
       // Stop is an answer, not an error: the tiles that were already on screen stay, and the page says "Stopped".

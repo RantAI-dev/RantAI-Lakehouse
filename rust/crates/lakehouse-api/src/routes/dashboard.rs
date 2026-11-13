@@ -651,6 +651,8 @@ async fn get_body(
                 let skipped = &filtered.skipped;
                 crate::routes::support::annotate_params(&mut val, c, values_ref);
                 crate::routes::support::annotate_grain(&mut val, &filtered, c);
+                // BI-50 (QA LH-BI-9-05): the mark a chart the dashboard's
+                // grain switch left unchanged carries, with its reason.
                 crate::routes::support::annotate_grain_switch(
                     &mut val,
                     c,
@@ -817,9 +819,10 @@ async fn get_body(
         "params": crate::routes::params::controls(&shown, &loaded.values),
         "defaultParams": crate::routes::params::saved_values(&loaded.defs, &shown),
         "appliedParams": loaded.values.values_json(),
-        // BI-52 (plan D26): the parameters whose requested value did not fit,
-        // with the fixed sentence; empty when there are none. Never on a read
-        // that refused the whole request (that one answers 400 before here).
+        // BI-52 (QA LH-BI-11-05, plan D26): the parameters whose requested
+        // value did not fit, with the fixed sentence; empty when there are
+        // none. Never on a read that refused the whole request (that one
+        // answers 400 before here).
         "refusedParams": loaded.refused,
         "boards": boards_out,
         "kpis": kpis_out,
@@ -8531,6 +8534,44 @@ mod time_grain {
         let line = &body["results"]["c_line"];
         assert_eq!(line["grainSkipped"], json!("hour"));
         assert!(line.get("grainNotApplied").is_none(), "{line}");
+    }
+
+    /// R5 (rule 14): a chart whose definition has a grain but which kept its
+    /// stored statement — this read could not rebuild it — carries no mark:
+    /// the switch never decided its grain, so "no date grouping of its own"
+    /// would be a reason it did not find.
+    #[tokio::test]
+    async fn a_chart_that_kept_its_stored_statement_says_nothing_about_its_grain() {
+        let server = MockServer::start().await;
+        mount_board_with(
+            &server,
+            "",
+            vec![json!({
+                "id": "c_stored", "board": "b1", "created_by": "ui",
+                "created_at": "2026-01-01 00:00:00",
+                "spec_json": json!({
+                    "spec": {
+                        "id": "c_stored", "title": "c_stored", "kind": "line", "mart": "",
+                        "sql": "SELECT day, visitors FROM serving.mart_a",
+                        "x": "day", "y": "visitors",
+                    },
+                    "def": {
+                        "title": "c_stored", "mart": "", "kind": "line",
+                        "dimension": "day", "measures": ["visitors"], "limit": 3,
+                        "order": "none", "grain": "day",
+                    },
+                    "hasYear": false,
+                }).to_string(),
+            })],
+            vec![json!({"table": "mart_a", "name": "day", "type": "Date"})],
+        )
+        .await;
+        let body = dashboard(&server, Some(Grain::Month), &TimeContext::default()).await;
+        let tile = &body["results"]["c_stored"];
+        assert!(
+            tile.get("grainNotApplied").is_none(),
+            "the chart kept its stored statement, so nothing calls its grain missing: {tile}"
+        );
     }
 
     /// The one `target` parameter (`BI-52`, plan T5): a number with default 30

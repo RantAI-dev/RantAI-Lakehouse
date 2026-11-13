@@ -110,6 +110,15 @@ pub(crate) trait LayerRunner {
 /// column, mask or policy.
 pub(crate) const NOT_AVAILABLE_WITH_YOUR_ACCESS: &str = "Not available with your access.";
 
+/// The engine's code for a refusal of a masked value inside a calculation
+/// (`ILLEGAL_TYPE_OF_ARGUMENT`): the rewrite turns a masked number into the
+/// text `***` (`sql_rewrite.rs`, the mask projection) and the aggregate then
+/// refuses the string. It is the one code QA `LH-BI-13-03` saw, and the only
+/// one treated as the viewer's access: a mask does not always make a question
+/// fail, so another code is added here only when a measurement shows a masked
+/// value produces it (principle 5).
+const ILLEGAL_TYPE_OF_ARGUMENT: u32 = 43;
+
 /// Why a question failed, when the viewer's own access is the reason
 /// (`BI-51`, plan D18). Serialized as `"access"` on the layer's entry; the type
 /// mirrors `LayerCell["cause"]` in `src/features/dashboards/combined-option.ts`.
@@ -152,31 +161,36 @@ impl LayerRunner for RoleRunner<'_> {
         columns: &[String],
         failure: &SpecRunFailure,
     ) -> bool {
-        // Only a refusal the access check can word is asked about: a gate's
-        // "not found" and a time limit are already their own sentences, and a
-        // second read of the policies would add nothing.
-        let cause = match failure {
-            SpecRunFailure::Refused(_) | SpecRunFailure::Clickhouse(_) => {
-                self.obligations
-                    .access_cause(
-                        sql,
-                        &sqlparser::dialect::ClickHouseDialect {},
-                        columns,
-                        self.roles,
-                    )
-                    .await
-            }
-            SpecRunFailure::Tile(_) | SpecRunFailure::Gated(_) => None,
+        // Only a refusal the access check can word is asked about (R4): a gate's
+        // "not found" and a time limit are already their own sentences, and an
+        // engine failure of any other code can never be the viewer's access
+        // (R1), so a second read of the policies would add nothing.
+        let asked = match failure {
+            SpecRunFailure::Refused(_) => true,
+            SpecRunFailure::Clickhouse(err) => err.server_code() == Some(ILLEGAL_TYPE_OF_ARGUMENT),
+            SpecRunFailure::Tile(_) | SpecRunFailure::Gated(_) => false,
+        };
+        let cause = if asked {
+            self.obligations
+                .access_cause(
+                    sql,
+                    &sqlparser::dialect::ClickHouseDialect {},
+                    columns,
+                    self.roles,
+                )
+                .await
+        } else {
+            None
         };
         explains(failure, cause)
     }
 }
 
-/// Whether `cause` explains `failure` (`BI-51`, plan D16): the gate's "not
-/// found" for a table the question reads is the viewer's organisation, a
-/// rewrite refusal only when the table is hidden, and an engine refusal only
-/// for a masked column with a server code. Everything else keeps the sentence
-/// and the reference it had.
+/// Whether `cause` explains `failure` (`BI-51`, QA `LH-BI-13-03`, plan D16):
+/// the gate's "not found" for a table the question reads is the viewer's
+/// organisation, a rewrite refusal only when the table is hidden, and an engine
+/// refusal only for a masked column whose code is [`ILLEGAL_TYPE_OF_ARGUMENT`].
+/// Everything else keeps the sentence and the reference it had.
 ///
 /// `pub(crate)` so the table in `routes::layers_rewrite` can pin all four
 /// variant rules in one place; nothing outside this crate sees it.
@@ -190,7 +204,8 @@ pub(crate) fn explains(
         SpecRunFailure::Gated(err) => matches!(err, lakehouse_core::ApiError::NotFound(_)),
         SpecRunFailure::Refused(_) => cause == Some(AccessCause::HiddenTable),
         SpecRunFailure::Clickhouse(err) => {
-            err.server_code().is_some() && cause == Some(AccessCause::MaskedColumn)
+            err.server_code() == Some(ILLEGAL_TYPE_OF_ARGUMENT)
+                && cause == Some(AccessCause::MaskedColumn)
         }
     }
 }

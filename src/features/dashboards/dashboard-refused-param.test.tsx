@@ -78,4 +78,41 @@ describe("DashboardPage and a refused parameter value (QA LH-BI-11-05)", () => {
     await waitFor(() => expect(replaced.length).toBeGreaterThan(0))
     expect(replaced.every((url) => !url.includes("p="))).toBe(true)
   })
+
+  // R3: the answer's `appliedParams` is `{}` when the read of the definitions
+  // failed (`storeError`), which is not an answer about the values at all. The
+  // address keeps what it had, as it did before this branch.
+  it("a failed read of the parameter definitions keeps the address's values", async () => {
+    spyOn(globalThis, "fetch").mockImplementation(((input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.includes("/api/auth/me")) {
+        return Promise.resolve(json({ id: "u1", name: "Analyst", email: null, roles: [], permissions: ["dashboard:read"], tenants: [] }))
+      }
+      if (path.startsWith("/api/dashboard?")) {
+        return Promise.resolve(json({
+          board: "b_1", boardName: "Quarterly Sales", boards: [{ id: "b_1", name: "Quarterly Sales" }],
+          charts: [], kpis: [], filterColumns: [], results: {}, layout: {}, canDownload: true,
+          params: [], appliedParams: {}, storeError: "database error",
+        }))
+      }
+      if (path.includes("/api/dashboard/folders")) return Promise.resolve(json([]))
+      if (path.includes("/api/dashboard/shortcuts")) return Promise.resolve(json({ favourites: [], recent: [] }))
+      return Promise.resolve(json({}))
+    }) as unknown as typeof fetch)
+
+    render(
+      <AuthProvider>
+        <TableProviders>
+          <DashboardPage boardId="b_1" />
+        </TableProviders>
+      </AuthProvider>,
+    )
+
+    // The page says the saved rows could not be read…
+    expect(await screen.findByText(/Could not load saved charts/)).toBeTruthy()
+    // …and the answer settles without writing the address: the value the
+    // viewer asked for is still there.
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(replaced).toEqual([])
+  })
 })

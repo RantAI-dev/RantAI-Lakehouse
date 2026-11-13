@@ -73,7 +73,8 @@ describe("a tile with more questions on its chart", () => {
     expect(screen.queryByText(/Occupancy:/)).toBeNull()
   })
 
-  it("says under the chart which question was cut off and nothing for one that was not (BI-13 review fix R1)", () => {    const cutCell: Rows = { ...CELL, layers: [{ ...CELL.layers![0], truncated: true }, { ...CELL.layers![0], label: "Beds" }] }
+  it("says under the chart which question was cut off and nothing for one that was not (BI-13 review fix R1)", () => {
+    const cutCell: Rows = { ...CELL, layers: [{ ...CELL.layers![0], truncated: true }, { ...CELL.layers![0], label: "Beds" }] }
     render(<TileBody spec={SPEC} cell={cutCell} dark={false} loading={false} />)
     expect(screen.getByText("Rooms: not every value is shown")).toBeTruthy()
     expect(screen.queryByText(/Beds: not every/)).toBeNull()
