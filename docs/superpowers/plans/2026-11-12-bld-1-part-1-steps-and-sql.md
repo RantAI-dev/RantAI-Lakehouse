@@ -1257,3 +1257,62 @@ two gates in `g3a-dagster` (the G7 case with two inputs and a SQL step; the
 author gate against the compile route) have never run to the end on it. The
 pull request stays a draft until that run is green; a failure there reopens
 the review.
+
+### S2, round 1 (reviewer, 2026-11-13)
+
+Reviewed `origin/main...30bc20a88` (10 files, +1073 −27) against D16 and
+S2-T1, S2-T2. `main` was merged into the branch with this entry (documents
+only; no conflict).
+
+What is right: the route is one small module over the compiler's `up_to`
+seam; it runs as the caller through `StatementGate` and
+`rewrite_sql_for_roles`; the wrapper reuses the dashboard preview's settings
+and `with_run_settings`; the column probe and the placeholder set were moved
+to `routes/support.rs` and shared, not copied; an engine failure goes through
+`ch_failure_for_author`, the function Query Studio uses, and the guard's new
+allowlist entry names that function and the reason (the same exception
+`query.rs` has; the guard's pattern is untouched); the policy row is asserted
+both ways.
+
+Accepted as reported in the handoff: the row query asks for 101 rows and
+answers 100, so `truncated` is exact; a table the caller may not read is 422
+here, as D16 and section 3 say; a timeout answers the engine's fixed
+sentence.
+
+**Re-run by the reviewer on `30bc20a88`**, in the developer's worktree, with
+`cargo-locked -j 2`: `cargo fmt --check` clean; `--test sec11_guard` 4
+passed; `--test pipeline_preview` **9 passed, 1 failed**. Not re-run by the
+reviewer: clippy, `route_auth`, the dashboard preview's tests (the handoff's
+counts stand unchecked). CI's full run on the head had not finished.
+
+#### BLOCKER
+
+- **R1-B1. `an_input_the_caller_may_not_read_is_refused_before_the_engine`
+  fails some of the time.** `tests/pipeline_preview.rs:396` asserts that the
+  mock engine received no request at all. In the reviewer's runs it failed
+  once when the whole file ran and once in three runs of that test alone;
+  the status and the sentence were right each time, and only the "received
+  nothing" assertion failed. A test that fails one run in three cannot go to
+  `main`, and what it asserts matters: the refusal for a table the caller may
+  not read must come before anything about that table is asked of the engine
+  (`SEC-50` says the same for the run route).
+  Find out first which request reaches the engine: print the bodies the mock
+  received on a failing run. Then one of two things is true, and each has its
+  own fix:
+  1. The request comes from the preview itself (the gate or the rewrite asks
+     the engine about the statement before the refusal is decided, depending
+     on a cache or on timing). That is a defect in the order of the route's
+     steps: fix the order so the refusal is decided first, and keep the
+     assertion as it is.
+  2. The request comes from something else the test app starts (a background
+     task, a warm-up, a health probe) and is not about the previewed table.
+     Then the assertion is wrong, not the route: assert what the test means,
+     that no request the engine received names the previewed table and none
+     is a `DESCRIBE` or the row query, and say in the test which other
+     request may arrive and why.
+  Do not remove the assertion and do not add a retry or a sleep. Run the
+  whole file 20 times in a row afterwards and quote the count in the
+  handoff (`for i in $(seq 20); do ... --test pipeline_preview; done`, each
+  through `cargo-locked`).
+
+No SHOULD-FIX.
