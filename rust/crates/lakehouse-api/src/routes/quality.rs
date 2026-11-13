@@ -950,6 +950,53 @@ async fn resolve(state: &AppState, asset: &str) -> Option<ReadSource> {
     }
 }
 
+/// The one sentence a table that is not there and one the caller's roles hide
+/// both get, so neither answer says which tables exist.
+///
+/// One function, not a literal at each site: `ensure_rule_table` gives it to a
+/// rule, and `routes::quality_schedules` gives the same sentence to a schedule
+/// that names the table instead of a rule on it (`GOV-15`).
+pub(crate) fn unreadable_table(asset: &str) -> ApiError {
+    ApiError::BadRequest(format!(
+        "\"{asset}\" is not a table you can read. Pick the table as \
+         silver.<table>, serving.<table> or bronze.<table>."
+    ))
+}
+
+/// What a person acting on quality rules, schedules or incidents may read.
+///
+/// The catalog's tenant rule runs first, so a caller outside the tenant that
+/// owns the shared catalog is answered the same way for every table and learns
+/// nothing about one; the role's table access runs second, so a table it hides
+/// is never asked about either. No principal is a system call (the scheduled
+/// and on-load passes), which `TableAccess` documents as not narrowed.
+///
+/// Consumers ([`ensure_rule_table`], `routes::quality_schedules`, the incident
+/// resolve) do not repeat these two steps by hand: one caller, one order, one
+/// answer (`GOV-15 (GOV-12 plan, section 4)`, `AGENTS.md` rule 4).
+///
+/// # Errors
+///
+/// [`ApiError::PermissionDenied`] (`403`) from the catalog's tenant rule, with
+/// the reason [`crate::routes::catalog::catalog_tenant_refusal`] gives; the
+/// errors of that function and of
+/// [`crate::routes::catalog::table_access_for`] otherwise.
+pub(crate) async fn quality_table_access(
+    state: &AppState,
+    principal: Option<&Principal>,
+    headers: &HeaderMap,
+) -> Result<crate::table_access::TableAccess, ApiError> {
+    let Some(principal) = principal else {
+        return Ok(crate::table_access::TableAccess::All);
+    };
+    if let Some(reason) =
+        crate::routes::catalog::catalog_tenant_refusal(state, principal, headers).await?
+    {
+        return Err(ApiError::PermissionDenied(reason.to_owned()));
+    }
+    crate::routes::catalog::table_access_for(state, principal).await
+}
+
 /// Refuses a quality rule written for a table that is not there, or that the
 /// author's roles do not let them read (QA `LH-DATA-14-01` F2, `DATA-54`).
 ///
@@ -982,12 +1029,7 @@ pub(crate) async fn ensure_rule_table(
     asset: &str,
 ) -> Result<(), ApiError> {
     let asset = asset.trim();
-    let refused = || {
-        ApiError::BadRequest(format!(
-            "\"{asset}\" is not a table you can read. Pick the table as \
-             silver.<table>, serving.<table> or bronze.<table>."
-        ))
-    };
+    let refused = || unreadable_table(asset);
     let Some((zone, table)) = asset.split_once('.') else {
         return Err(refused());
     };
@@ -1008,16 +1050,9 @@ pub(crate) async fn ensure_rule_table(
     // so the table check below cannot say which tables exist through it.
     // Access second, so a hidden table is never asked about either. No
     // principal (a system call) is not narrowed, as `TableAccess` documents.
-    if let Some(principal) = principal {
-        if let Some(reason) =
-            crate::routes::catalog::catalog_tenant_refusal(state, principal, headers).await?
-        {
-            return Err(ApiError::PermissionDenied(reason.to_owned()));
-        }
-        let access = crate::routes::catalog::table_access_for(state, principal).await?;
-        if !access.allows(&zone, table) {
-            return Err(refused());
-        }
+    let access = quality_table_access(state, principal, headers).await?;
+    if !access.allows(&zone, table) {
+        return Err(refused());
     }
     match zone.as_str() {
         "silver" | "serving" => {
