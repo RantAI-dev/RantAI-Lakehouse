@@ -199,8 +199,11 @@ describe("layoutFlow", () => {
   test("an edge inside one column drops straight down", () => {
     const layout = layoutFlow(
       [
-        { id: "t0", column: 1, kind: "transform", label: "x" },
-        { id: "t1", column: 1, kind: "transform", label: "y" },
+        // BLD-1 part 1 S3 review R1-S9: the `transform` node kind is gone
+        // (nothing produces it since a form step is one node); the test of
+        // an edge inside one column uses the kind that replaced it.
+        { id: "t0", column: 1, kind: "step", label: "x" },
+        { id: "t1", column: 1, kind: "step", label: "y" },
       ],
       [{ from: "t0", to: "t1" }]
     )

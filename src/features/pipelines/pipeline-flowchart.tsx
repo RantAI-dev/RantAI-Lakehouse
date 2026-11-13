@@ -5,15 +5,11 @@ import { useReducedMotion } from "motion/react"
 import {
   BoxIcon,
   CodeIcon,
-  CopyXIcon,
   DatabaseIcon,
-  FilterIcon,
   GlobeIcon,
   HardDriveIcon,
   LayersIcon,
   ListChecksIcon,
-  PencilLineIcon,
-  ReplaceIcon,
   SlidersHorizontalIcon,
 } from "lucide-react"
 import { formatDuration } from "@/lib/format"
@@ -32,25 +28,6 @@ function DataIcon({ label }: { label: string }) {
   // A bare `zone.table`, as an authored pipeline names its tables.
   if (/^\w+\.\w+$/.test(label)) return <DatabaseIcon className={cls} aria-hidden />
   return <BoxIcon className={cls} aria-hidden />
-}
-
-/** The icon of one of the five transform verbs. */
-function VerbIcon({ verb }: { verb: string }) {
-  const cls = "size-4"
-  switch (verb) {
-    case "dedupe":
-      return <CopyXIcon className={cls} aria-hidden />
-    case "filter":
-      return <FilterIcon className={cls} aria-hidden />
-    case "rename":
-      return <PencilLineIcon className={cls} aria-hidden />
-    case "cast":
-      return <ReplaceIcon className={cls} aria-hidden />
-    case "select":
-      return <ListChecksIcon className={cls} aria-hidden />
-    default:
-      return <BoxIcon className={cls} aria-hidden />
-  }
 }
 
 function NodeCard({
@@ -119,25 +96,6 @@ function NodeCard({
         </span>
         <span className="min-w-0">
           <span className="block truncate font-mono text-sm font-medium leading-5">{node.label}</span>
-          <span className="block truncate text-[11px] text-muted-foreground">{node.sublabel}</span>
-        </span>
-      </button>
-    )
-  }
-
-  if (node.kind === "transform") {
-    return (
-      <button
-        type="button"
-        style={style}
-        onClick={onSelect ? () => onSelect(node) : undefined}
-        className={cn(base, "border-border bg-card px-3 shadow-xs", ring)}
-      >
-        <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-primary/10 text-primary">
-          <VerbIcon verb={node.label} />
-        </span>
-        <span className="min-w-0">
-          <span className="block text-sm font-medium capitalize leading-5">{node.label}</span>
           <span className="block truncate text-[11px] text-muted-foreground">{node.sublabel}</span>
         </span>
       </button>

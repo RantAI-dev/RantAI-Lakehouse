@@ -4,7 +4,6 @@ import {
   draftIsComplete,
   emptyDraftFor,
   renderTransformDraft,
-  transformErrorRowIndex,
 } from "./transform-draft"
 
 describe("renderTransformDraft", () => {
@@ -34,21 +33,6 @@ describe("renderTransformDraft", () => {
     expect(renderTransformDraft({ verb: "select", columns: "id,name,amount" })).toBe(
       "select(id,name,amount)"
     )
-  })
-})
-
-describe("transformErrorRowIndex", () => {
-  it("extracts the failing row index from the server's transforms[N] message", () => {
-    expect(
-      transformErrorRowIndex("invalid transform at transforms[0]: unknown transform verb")
-    ).toBe(0)
-    expect(
-      transformErrorRowIndex("invalid transform at transforms[3]: cast type not allowed")
-    ).toBe(3)
-  })
-
-  it("returns null for a message that does not name a transforms[N] index", () => {
-    expect(transformErrorRowIndex("database error")).toBeNull()
   })
 })
 

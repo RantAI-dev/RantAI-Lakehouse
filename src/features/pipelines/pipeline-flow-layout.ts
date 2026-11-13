@@ -15,7 +15,7 @@ import type { EntityStatus } from "@/lib/status"
 import type { AuthoredDefinition, PipelineOpEdge, PipelineOpNode } from "@/services/contracts/pipelines"
 import { topoSortOps } from "./topo-sort-ops"
 
-export type FlowKind = "source" | "op" | "transform" | "step" | "sink"
+export type FlowKind = "source" | "op" | "step" | "sink"
 
 export type FlowNodeSpec = {
   id: string
@@ -24,7 +24,7 @@ export type FlowNodeSpec = {
   label: string
   sublabel?: string
   status?: EntityStatus
-  /** For an op, its name; for a transform, an input or a step, its index. Used to open the side panel. */
+  /** For an op, its name; for an input or a step, its index. Used to open the side panel. */
   ref?: string
   /** For a pipeline step: SQL, the form (BLD-1 part 1 D1), or a kind this console does not know (R1-S2). */
   stepKind?: "sql" | "transform" | "other"
@@ -45,7 +45,6 @@ const SIZE: Record<FlowKind, { w: number; h: number }> = {
   source: { w: 208, h: 58 },
   sink: { w: 208, h: 58 },
   op: { w: 224, h: 86 },
-  transform: { w: 216, h: 58 },
   step: { w: 216, h: 58 },
 }
 
@@ -59,7 +58,7 @@ export function layoutFlow(nodes: readonly FlowNodeSpec[], edges: readonly FlowE
   const columns = [...new Set(nodes.map((n) => n.column))].sort((a, b) => a - b)
   // Within a column, ops and transforms first, then data, so a job's
   // spine of ops lines up and its data hangs below.
-  const rank = (n: FlowNodeSpec) => (n.kind === "op" || n.kind === "transform" || n.kind === "step" ? 0 : 1)
+  const rank = (n: FlowNodeSpec) => (n.kind === "op" || n.kind === "step" ? 0 : 1)
   const byColumn = columns.map((c) =>
     nodes.filter((n) => n.column === c).sort((a, b) => rank(a) - rank(b))
   )
