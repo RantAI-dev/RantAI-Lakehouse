@@ -1312,7 +1312,7 @@ mod tests {
         let got = sql_of(&spec(ChartKind::Bar, "g", &["profit"]), &[]);
         assert_eq!(
             got.sql,
-            "SELECT g, round(sum(profit)) AS profit FROM \
+            "SELECT g, round(sum(profit), 6) AS profit FROM \
              (SELECT *, (v - w) AS profit FROM serving.mart_x) AS calc \
              GROUP BY g ORDER BY g LIMIT 20"
         );
@@ -1341,7 +1341,7 @@ mod tests {
             "{got}"
         );
         assert!(
-            got.starts_with("SELECT v2, profit, round(sum(v)) AS v FROM"),
+            got.starts_with("SELECT v2, profit, round(sum(v), 6) AS v FROM"),
             "{got}"
         );
     }
@@ -1763,7 +1763,7 @@ mod tests {
         dump("previous month", &prev.sql);
         assert!(
             prev.sql
-                .contains("LEFT JOIN (SELECT visit_date, round(sum(visitors)) AS __m0"),
+                .contains("LEFT JOIN (SELECT visit_date, round(sum(visitors), 6) AS __m0"),
             "{}",
             prev.sql
         );
