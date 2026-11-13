@@ -51,6 +51,7 @@ mod dashboard_folders;
 pub(crate) mod dashboard_organise;
 pub(crate) mod dashboard_reports;
 mod dashboard_sources;
+pub(crate) mod dashboard_templates;
 pub(crate) mod drill;
 mod embed;
 mod pdf_export;
@@ -251,6 +252,11 @@ fn route_timeout(path: &str) -> Duration {
         // BI-19 part D: an import checks and runs each of up to 200 charts, so it
         // gets the export deadline too.
         "/api/dashboard/chart-export" | "/api/dashboard/table-export" | "/api/dashboard/import" => {
+            EXPORT_REQUEST_TIMEOUT
+        }
+        // BI-18 part D (T3): starting from a template writes up to 200 charts,
+        // as an import does.
+        other if other.starts_with("/api/dashboard/templates/") && other.ends_with("/use") => {
             EXPORT_REQUEST_TIMEOUT
         }
         // QS-2: a download of a whole result writes a file that can be
@@ -1649,6 +1655,19 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/dashboard/reports/{id}/pdf",
             get(pdf_export::export_report_pdf),
+        )
+        // BI-18 part D (T3): dashboard templates.
+        .route(
+            "/api/dashboard/templates",
+            get(dashboard_templates::list).post(dashboard_templates::save),
+        )
+        .route(
+            "/api/dashboard/templates/{id}",
+            axum::routing::delete(dashboard_templates::delete),
+        )
+        .route(
+            "/api/dashboard/templates/{id}/use",
+            axum::routing::post(dashboard_templates::use_template),
         )
         .route("/api/dashboard/embed-info", get(dashboard::embed_info))
         .route("/api/embed/data", axum::routing::post(embed::data))
