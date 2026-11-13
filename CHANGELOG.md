@@ -51,6 +51,7 @@ once a first release is tagged.
 
 ### Changed
 
+- The pipeline preview answers an engine failure with the fixed sentence for its cause and ` Reference: <id>`, as Query Studio does, and no longer shows the engine's own text (backlog `BLD-1`; `LH-QS-2-08`, owner 2026-11-12 and 2026-11-13). The engine's text goes to the log under that reference.
 - The pipeline page no longer shows Kind and Incremental column (backlog `BLD-1`, decision 18; `BLD-12`). Nothing read them: every run rebuilds the output table. Stored values are kept and sent back unchanged when a pipeline is edited.
 - A pipeline with several inputs and no step is refused when saved, with "with more than one input, add a step that reads them" (backlog `BLD-1`). Before, the API accepted it and copied only the first input.
 - A `query:read` grant made from a table's page opens that table's page without `catalog:read` (backlog `GOV-11`; product owner 2026-11-12, `DEC-20`). It opens that table only — not the catalog list, not search, not another table's page — and masks, row filters and the role's table access apply as everywhere. The seeded **Data Engineer** role gains `catalog:read` (migration `0138`), so the role that edits catalog entries can open the Catalog and a table's page; a renamed or custom role is not changed.
@@ -59,6 +60,7 @@ once a first release is tagged.
 - Anyone with edit on a folder reads who it has been shared with: `GET /api/query/folders/{id}/access` answers at edit, and every rule in an access list now carries `granteeName` and `granteeEmail` (`null` outside the caller's organisation). The save sheet and the move dialog name who a chosen folder is shared with before the user confirms, and the share panel shows names instead of ids (backlog `QS-3`).
 - A run ended with Stop shows as Stopped in History (backlog `QS-2`, `QS-4`). The status `stopped` is a filter value in place of `cancelled`, and migration `0127` moves the rows already stored. The History page pages by number: `GET /api/query/history` takes `page` instead of `before` and answers `runs`, `total`, `page` and `pageSize`, 50 runs per page, and the pills read Completed, Failed, Stopped and Refused.
 - The revert confirmation button reads "Restore version N" (backlog `QS-3`), and the folder access list answers at edit with a sentence that says only someone who can edit the folder can see who it is shared with (backlog `QS-3`).
+- Query Studio shows a fixed sentence and a reference for an engine failure, on a run and on the cost estimate, in place of the engine's own text (backlog `QS-2`, `QS-1`; feature page `docs/core/features/no-raw-upstream-errors.md`). The raw text goes to the log under the same reference. The assistant's tools are unchanged, but **Fix with AI** now sends the model only the sentence and the reference.
 
 ### Fixed
 

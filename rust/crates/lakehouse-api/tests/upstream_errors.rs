@@ -243,15 +243,17 @@ async fn no_clickhouse_route_repeats_the_database_text() {
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    // SEC-11 query-author exception (product owner, 2026-10-10): the editor
-    // is the one route that shows its author the engine's diagnosis (the
-    // table the statement named included), minus the version suffix.
-    // `tests/query_author_exception.rs` pins this in full.
+    // Owner 2026-11-12, LH-QS-2-08: the editor no longer shows its author the
+    // engine's diagnosis (the SEC-11 query-author exception ended for the
+    // console). The body is the fixed sentence for the cause and a reference;
+    // the planted table name is in the log under that reference only.
+    // `tests/query_author_exception.rs` pins the sentences.
     assert!(
-        body.contains(MARKER),
-        "the author lost the diagnosis: {body}"
+        !body.contains(MARKER),
+        "the engine's text reached the console: {body}"
     );
     assert!(!body.contains("version 0.0.0"), "{body}");
+    assert!(!body.contains("DB::Exception"), "{body}");
     assert!(body.contains("Reference: "), "{body}");
 }
 

@@ -399,14 +399,19 @@ pub fn ch_error_as(ctx: &Context, err: &ChError, failed_as: FailedAs) -> ApiErro
 
 // ── The query-author exception (SEC-11, product owner decision 2026-10-10) ──
 //
-// Query Studio (`POST /api/query/run` and the editor's cost estimate) is the
-// one place the engine's own message may reach a response: the person who
-// wrote the statement, signed in and holding `query:read`, is entitled to the
-// engine's diagnosis of it. Tiles, public and embed links, SQL sources, the
-// assistant's tools and saved-query runs stay closed. Every function here
-// ends in `_for_author`, and `tests/sec11_guard.rs` flags any route line that
-// calls one outside its single allowlist entry for `query.rs`, so the
-// exception cannot spread by copy.
+// Ended for the console (owner 2026-11-12, LH-QS-2-08): Query Studio
+// (`POST /api/query/run` and the editor's cost estimate) answers an engine
+// failure with a fixed sentence and a reference, like every other route, and
+// the engine's text goes to the log under that reference (the `_for_console`
+// functions below).
+//
+// It still stands for the assistant: the model corrects its SQL from the
+// engine's trimmed diagnosis, so `routes::query::run_statement` (as the
+// assistant's `run_sql` and `run_saved_query` call it) and
+// `check_statement_would_run` (`propose_sql`) use the functions here that end
+// in `_for_author`. `tests/sec11_guard.rs` flags any route line that calls one
+// outside its single allowlist entry for `query.rs`, so the exception cannot
+// spread by copy.
 
 /// The longest diagnosis shown to the author, in characters.
 const MAX_DIAGNOSIS_CHARS: usize = 800;
@@ -534,9 +539,10 @@ fn author_message(ctx: &Context, raw: &str) -> (String, String) {
     )
 }
 
-/// The response message of [`ch_failure_for_author`], as text, for the callers
-/// that return the author's message as an `Err(String)`: the statement check
-/// behind `propose_sql` and the cost estimate's `estimate_body`.
+/// The response message of [`ch_failure_for_author`], as text, for the caller
+/// that returns the author's message as an `Err(String)`: the statement check
+/// behind the assistant's `propose_sql`. The console's cost estimate no longer
+/// uses it (owner 2026-11-12, LH-QS-2-08): see [`ch_message_for_console`].
 #[must_use]
 pub fn ch_message_for_author(ctx: &Context, err: &ChError) -> String {
     match err {
@@ -570,25 +576,29 @@ const fn clickhouse_statement_sentence(code: Option<u32>) -> &'static str {
 }
 
 /// A statement the engine refused, as the two messages that must not drift
-/// apart: what the response tells the author and what the History row keeps.
+/// apart: what the response tells the caller and what the History row keeps.
 ///
 /// Both carry the same `Reference: <id>`, so a History row, the response the
 /// author saw and the log line match.
 #[derive(Debug)]
 pub struct StatementFailure {
-    /// The response: for a statement error the author's diagnosis (see
-    /// [`ch_failure_for_author`]), for anything else the fixed message.
+    /// The response: for a statement error the author's diagnosis for the
+    /// assistant (see [`ch_failure_for_author`]) or the same sentence and
+    /// reference the row keeps for the console (see
+    /// [`ch_failure_for_console`]); for anything else the fixed message.
     pub response: ApiError,
     /// The History row's message: the cause as a fixed sentence, then the
     /// reference. No engine text, no catalog name (`AGENTS.md` principle 4).
     pub recorded: String,
 }
 
-/// [`ch_error`] for the person who wrote the statement, with the message
-/// History keeps beside it.
+/// [`ch_error`] for the assistant's paths, with the message History keeps
+/// beside it. The console uses [`ch_failure_for_console`] instead (owner
+/// 2026-11-12, LH-QS-2-08).
 ///
-/// A statement error (see [`is_statement_error`]) is shown to the author as
-/// the trimmed diagnosis and a reference at `422`. It is logged once, and
+/// A statement error (see [`is_statement_error`]) is shown to the assistant
+/// as the trimmed diagnosis and a reference at `422`, so the model can
+/// correct its SQL. It is logged once, and
 /// its reference goes into both messages; `recorded` is the sentence for its
 /// error code. Anything else (unreachable engine, timeout, a non-query
 /// failure) is the fixed message in both, exactly as [`ch_error`] gives it.
@@ -598,12 +608,39 @@ pub fn ch_failure_for_author(ctx: &Context, err: &ChError) -> StatementFailure {
         ChError::Server(text) if is_statement_error(text) => {
             statement_failure(ctx, text, clickhouse_statement_sentence(err.server_code()))
         }
-        _ => {
-            let response = ch_error(ctx, err);
-            let recorded = response.to_string();
-            StatementFailure { response, recorded }
-        }
+        _ => not_a_statement_error(ctx, err),
     }
+}
+
+/// An engine failure that is not the statement's own (unreachable engine,
+/// timeout, a non-query failure): the fixed message in both places, exactly
+/// as [`ch_error`] gives it.
+fn not_a_statement_error(ctx: &Context, err: &ChError) -> StatementFailure {
+    let response = ch_error(ctx, err);
+    let recorded = response.to_string();
+    StatementFailure { response, recorded }
+}
+
+/// [`ch_failure_for_author`] for the console (owner 2026-11-12, LH-QS-2-08):
+/// a statement error answers the sentence for its error code and the
+/// reference, the same text the History row keeps, and never the engine's
+/// text. The raw text is logged once under that reference. Anything else is
+/// the fixed message, as in [`ch_failure_for_author`].
+#[must_use]
+pub fn ch_failure_for_console(ctx: &Context, err: &ChError) -> StatementFailure {
+    match err {
+        ChError::Server(text) if is_statement_error(text) => {
+            console_statement_failure(ctx, text, clickhouse_statement_sentence(err.server_code()))
+        }
+        _ => not_a_statement_error(ctx, err),
+    }
+}
+
+/// [`ch_failure_for_console`]'s response, as text, for the cost estimate,
+/// which returns its failure as an `Err(String)` in the response body.
+#[must_use]
+pub fn ch_message_for_console(ctx: &Context, err: &ChError) -> String {
+    ch_failure_for_console(ctx, err).response.to_string()
 }
 
 /// The same for `Trino`'s `TrinoError::Query` (`raw` is the engine's
@@ -618,6 +655,26 @@ pub fn ch_failure_for_author(ctx: &Context, err: &ChError) -> StatementFailure {
 #[must_use]
 pub fn query_failure_for_author(ctx: &Context, raw: &str) -> StatementFailure {
     statement_failure(ctx, raw, STATEMENT_FAILED_SENTENCE)
+}
+
+/// [`query_failure_for_author`] for the console (owner 2026-11-12,
+/// LH-QS-2-08): `Trino` has no cause to name, so the response is
+/// [`STATEMENT_FAILED_SENTENCE`] and the reference, the same text the row
+/// keeps.
+#[must_use]
+pub fn query_failure_for_console(ctx: &Context, raw: &str) -> StatementFailure {
+    console_statement_failure(ctx, raw, STATEMENT_FAILED_SENTENCE)
+}
+
+/// Logs `raw` once; the response and the History row both say `sentence` and
+/// the one reference.
+fn console_statement_failure(ctx: &Context, raw: &str, sentence: &str) -> StatementFailure {
+    let reference = report(ctx, Class::Failed, &raw).reference().to_owned();
+    let recorded = format!("{sentence} Reference: {reference}");
+    StatementFailure {
+        response: ApiError::Unprocessable(recorded.clone()),
+        recorded,
+    }
 }
 
 /// Logs `raw` once and builds both messages around the one reference.
@@ -1255,6 +1312,71 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_console_response_is_the_recorded_sentence_and_the_raw_text_is_only_logged() {
+        // Owner 2026-11-12, LH-QS-2-08.
+        let (failure, log) =
+            with_captured_log(|| ch_failure_for_console(&DATABASE, &engine_statement_error(60)));
+        assert!(matches!(failure.response, ApiError::Unprocessable(_)));
+        let response = failure.response.to_string();
+        assert_eq!(response, failure.recorded);
+        assert!(
+            response.starts_with(
+                "This query reads a table that does not exist or that you cannot read. Reference: "
+            ),
+            "{response}"
+        );
+        for gone in ["Code:", "DB::Exception", "icecat_api", "UNKNOWN_TABLE"] {
+            assert!(!response.contains(gone), "{gone} in {response}");
+        }
+        assert!(
+            log.contains(reference_of(&response)),
+            "the raw error is logged under that reference: {log}"
+        );
+        assert!(
+            log.contains("DB::Exception"),
+            "the engine's text is in the log: {log}"
+        );
+        let occurrences = log
+            .match_indices("upstream request failed")
+            .fold(0_usize, |n, _| n + 1);
+        assert_eq!(occurrences, 1, "{log}");
+    }
+
+    #[test]
+    fn the_console_message_of_an_unnamed_code_is_the_default_sentence() {
+        let message = ch_message_for_console(&DATABASE, &engine_statement_error(999));
+        let reference = reference_of(&message).to_owned();
+        assert_eq!(
+            message,
+            format!("The engine could not run this statement. Reference: {reference}")
+        );
+    }
+
+    #[test]
+    fn the_console_keeps_an_outage_as_the_fixed_message() {
+        let down = ChError::Server("ClickHouse HTTP 503".to_owned());
+        let failure = ch_failure_for_console(&DATABASE, &down);
+        assert!(
+            failure
+                .recorded
+                .starts_with("The database request failed. Reference: "),
+            "{}",
+            failure.recorded
+        );
+        assert_eq!(failure.recorded, failure.response.to_string());
+    }
+
+    #[test]
+    fn a_trino_statement_error_answers_the_console_the_default_sentence() {
+        let raw = "line 1:15: Table 'icecat.api.orders' does not exist";
+        let failure = query_failure_for_console(&DATABASE, raw);
+        let response = failure.response.to_string();
+        assert_eq!(response, failure.recorded);
+        assert!(response.starts_with("The engine could not run this statement. Reference: "));
+        assert!(!response.contains("does not exist"), "{response}");
     }
 
     #[test]

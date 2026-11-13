@@ -1,11 +1,16 @@
-//! SEC-11, the query-author exception (product owner decision, 2026-10-10).
+//! SEC-11, the query-author exception, and the end of it for the console
+//! (owner 2026-11-12, LH-QS-2-08).
 //!
-//! Query Studio (`POST /api/query/run`, `POST /api/query/estimate`) shows the
-//! signed-in author the engine's diagnosis of their own statement, with the
-//! trailing version and any address trimmed and a reference id. Nothing else
-//! does: a dashboard tile, the public link and a signed embed that hit the
-//! very same engine error still answer with the fixed message. These tests
-//! pin both halves so the exception cannot spread through a shared function.
+//! Query Studio (`POST /api/query/run`, `POST /api/query/estimate`) used to
+//! show the signed-in author the engine's diagnosis of their own statement
+//! (product owner decision, 2026-10-10). It no longer does: an engine
+//! failure answers a fixed sentence by cause and a reference id, and the
+//! engine's own text goes to the log under that reference. A dashboard tile,
+//! the public link and a signed embed that hit the very same engine error
+//! still answer with their own fixed message. These tests pin both halves.
+//! The assistant keeps the trimmed diagnosis so the model can correct its
+//! SQL; its tests live with its tools (`routes/ai/tools/data.rs`,
+//! `tests/ai_sql_help.rs`).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -29,12 +34,7 @@ const ENGINE_ERROR: &str = "Code: 47. DB::Exception: Unknown identifier 'nope' i
 
 /// A `ClickHouse` that fails every query with a planted statement error.
 async fn failing_clickhouse() -> MockServer {
-    let ch = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(404).set_body_string(ENGINE_ERROR))
-        .mount(&ch)
-        .await;
-    ch
+    failing_clickhouse_with(ENGINE_ERROR).await
 }
 
 async fn app_with(env: &[(&str, String)]) -> TestApp {
@@ -82,34 +82,123 @@ async fn post_as_author(app: &TestApp, uri: &str, body: &str) -> (StatusCode, St
     .await
 }
 
-fn assert_trimmed_diagnosis(body: &str) {
-    assert!(body.contains("Unknown identifier 'nope'"), "{body}");
-    assert!(body.contains("UNKNOWN_IDENTIFIER"), "{body}");
-    assert!(body.contains("Reference: "), "{body}");
-    assert!(!body.contains("version 24.8"), "{body}");
+/// What an engine failure must look like to the console: the fixed sentence
+/// for its cause, then a reference id, and nothing of the engine's text.
+fn assert_fixed_sentence_and_reference(text: &str, sentence: &str) {
+    let reference = text
+        .strip_prefix(sentence)
+        .and_then(|rest| rest.strip_prefix(" Reference: "))
+        .unwrap_or_else(|| panic!("expected `{sentence} Reference: <id>`, got: {text}"));
     assert!(
-        !body.contains(HOST) && !body.contains("ch-internal"),
-        "{body}"
+        reference.len() == 10 && reference.chars().all(|c| c.is_ascii_hexdigit()),
+        "the reference is ten hex characters: {text}"
     );
-    assert!(!body.contains(ADDR), "{body}");
+    assert_no_engine_text(text);
+}
+
+fn assert_no_engine_text(body: &str) {
+    for engine_text in [
+        "Unknown identifier",
+        "UNKNOWN_IDENTIFIER",
+        "mismatched input",
+        "Syntax error",
+        "DB::Exception",
+        "Code: ",
+        "version 24.8",
+        "ch-internal",
+        HOST,
+        ADDR,
+    ] {
+        assert!(!body.contains(engine_text), "{engine_text} leaked: {body}");
+    }
+}
+
+/// A `ClickHouse` that fails every query with the given statement error.
+async fn failing_clickhouse_with(error: &str) -> MockServer {
+    let ch = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(404).set_body_string(error.to_owned()))
+        .mount(&ch)
+        .await;
+    ch
+}
+
+async fn run_error(error: &str, sql: &str) -> String {
+    let ch = failing_clickhouse_with(error).await;
+    let app = app_with(&[("CH_URL", ch.uri())]).await;
+    let (status, body) =
+        post_as_author(&app, "/api/query/run", &json!({ "sql": sql }).to_string()).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let json: Value = serde_json::from_str(&body).expect("json");
+    json["error"].as_str().expect("an error message").to_owned()
 }
 
 #[tokio::test]
-async fn the_author_sees_the_engines_diagnosis_of_their_own_statement() {
-    let ch = failing_clickhouse().await;
+async fn a_run_with_an_unknown_column_answers_its_sentence_and_a_reference() {
+    let shown = run_error(ENGINE_ERROR, "SELECT nope FROM serving.t").await;
+    assert_fixed_sentence_and_reference(&shown, "This query names a column that does not exist.");
+}
+
+#[tokio::test]
+async fn a_run_with_a_syntax_error_answers_its_sentence_and_a_reference() {
+    let shown = run_error(
+        "Code: 62. DB::Exception: Syntax error: failed at position 8 ('FORM'): FORM serving.t. Expected one of: FROM, ... (SYNTAX_ERROR) (version 24.8.1.1)",
+        "SELECT x FROM serving.t",
+    )
+    .await;
+    assert_fixed_sentence_and_reference(
+        &shown,
+        "The statement could not be read: check its syntax.",
+    );
+}
+
+#[tokio::test]
+async fn a_run_over_an_unknown_table_answers_its_sentence_and_a_reference() {
+    let shown = run_error(
+        "Code: 60. DB::Exception: Unknown table expression identifier 'serving.no_such_table' in scope SELECT * FROM serving.no_such_table. (UNKNOWN_TABLE) (version 24.8.1.1)",
+        "SELECT * FROM serving.no_such_table",
+    )
+    .await;
+    assert_fixed_sentence_and_reference(
+        &shown,
+        "This query reads a table that does not exist or that you cannot read.",
+    );
+    assert!(!shown.contains("no_such_table"), "{shown}");
+}
+
+#[tokio::test]
+async fn a_statement_error_without_a_named_cause_answers_the_default_sentence() {
+    let shown = run_error(
+        "Code: 999. DB::Exception: Something odd. (KEEPER_EXCEPTION) (version 24.8.1.1)",
+        "SELECT 1",
+    )
+    .await;
+    assert_fixed_sentence_and_reference(&shown, "The engine could not run this statement.");
+}
+
+#[tokio::test]
+async fn the_cost_estimate_of_a_syntax_error_answers_its_sentence_and_a_reference() {
+    let ch = failing_clickhouse_with(
+        "Code: 62. DB::Exception: Syntax error: failed at position 8 ('FORM'): FORM serving.t. (SYNTAX_ERROR) (version 24.8.1.1)",
+    )
+    .await;
     let app = app_with(&[("CH_URL", ch.uri())]).await;
     let (status, body) = post_as_author(
         &app,
-        "/api/query/run",
-        r#"{"sql":"SELECT nope FROM serving.t"}"#,
+        "/api/query/estimate",
+        r#"{"sql":"SELECT x FROM serving.t"}"#,
     )
     .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert_trimmed_diagnosis(&body);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let json: Value = serde_json::from_str(&body).expect("json");
+    assert_fixed_sentence_and_reference(
+        json["error"].as_str().expect("an error message"),
+        "The statement could not be read: check its syntax.",
+    );
 }
 
 #[tokio::test]
-async fn the_cost_estimate_shows_the_author_the_same_trimmed_diagnosis() {
+async fn the_cost_estimate_of_an_unknown_column_answers_its_sentence_and_a_reference() {
     let ch = failing_clickhouse().await;
     let app = app_with(&[("CH_URL", ch.uri())]).await;
     let (status, body) = post_as_author(
@@ -120,7 +209,10 @@ async fn the_cost_estimate_shows_the_author_the_same_trimmed_diagnosis() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let json: Value = serde_json::from_str(&body).expect("json");
-    assert_trimmed_diagnosis(json["error"].as_str().expect("an error message"));
+    assert_fixed_sentence_and_reference(
+        json["error"].as_str().expect("an error message"),
+        "This query names a column that does not exist.",
+    );
 }
 
 #[tokio::test]
