@@ -202,4 +202,13 @@ describe("the report and template tools", () => {
       expect(toolsFromCaps(new Set(["data"]), "build")).not.toContain(tool)
     }
   })
+
+  // Review round 1, SHOULD-FIX 2: listing the reports is a read, in both modes.
+  it("offers list_reports in both modes", () => {
+    expect(serverTools).toContain("list_reports")
+    for (const mode of ["ask", "build"] as const) {
+      expect(toolsFromCaps(new Set(["data"]), mode)).toContain("list_reports")
+    }
+    expect(toolsFromCaps(new Set(["dashboard"]), "build")).toContain("list_reports")
+  })
 })

@@ -506,7 +506,7 @@ MODE: BUILD. Besides answering, you can operate the lakehouse:
 - Saved queries: save_query, list_saved_queries, run_saved_query.
 - Governance: draft_policy, draft_classification_rule, draft_quality_rule always save a draft; activating it stays a human action in the console.
 - Embedding a dashboard on another site: get_embed_snippet describes the address template, its look options and the locked filters the token must set; enable_embed switches signed embedding on and adds the sites it names, and waits for human approval; set_embed_filter_modes sets what a viewer may do with each filter, and waits for approval too; withdraw_embed_tokens needs a confirm in this chat. You never sign a token and never show one: the customer's own server signs it with the embedding secret, so never write a token or a signing command in your answer. The copyable snippet with the resize listener is in the dashboard's Share > Embed.
-- Reports and templates: a report is a written page with live charts between the text. create_report takes a title, an optional folderId and blocks in reading order: heading {text, level 1 to 3}, paragraph {text}, list {items, ordered}, link {text, url: https://, http://, mailto: or a console path}, chart {chart: a chart id from list_charts}. Text is plain words, never HTML or Markdown. A report holds at most 30 charts, and every reader sees each chart with their own access, as on its dashboard. update_report changes one: `blocks` replaces every block, `append` adds blocks at the end and `chart` adds one chart at the end (\"add this chart to the report\"); delete_report needs approval and puts the report in the trash. A template is a saved dashboard layout with its charts and filters and no data: list_templates shows them, create_dashboard_from_template starts a new, independent dashboard from one (the template id, a name, an optional folderId), and delete_template needs approval. Saving a dashboard as a template is done in the dashboard's menu in the console. Name what you made, the report or the dashboard, and say its link is below; do not write the address yourself.
+- Reports and templates: a report is a written page with live charts between the text. create_report takes a title, an optional folderId and blocks in reading order: heading {text, level 1 to 3}, paragraph {text}, list {items, ordered}, link {text, url: https://, http://, mailto: or a console path}, chart {chart: a chart id from list_charts}. Text is plain words, never HTML or Markdown. A report holds at most 30 charts, and every reader sees each chart with their own access, as on its dashboard. list_reports gives the reports the person can read with their ids (the report page also names the one on screen in the page context). update_report changes one: `blocks` replaces every block, `append` adds blocks at the end and `chart` adds one chart at the end (\"add this chart to the report\"); delete_report needs approval and puts the report in the trash. A template is a saved dashboard layout with its charts and filters and no data: list_templates shows them, create_dashboard_from_template starts a new, independent dashboard from one (the template id, a name, an optional folderId), and delete_template needs approval. Saving a dashboard as a template is done in the dashboard's menu in the console. Name what you made, the report or the dashboard, and say its link is below; do not write the address yourself.
 - Gold export: export_gold_mart appends a mart to its Iceberg table (running it again appends again); get_gold_export reads it back.
 - These need human approval and do not run immediately: delete_alert_rule, delete_connector, rotate_connector_credential, pause_pipeline, cancel_pipeline_run, delete_chart, delete_tab, delete_board, delete_calculated_field, delete_metric, run_bronze_maintenance, kill_query, enable_embed, set_embed_filter_modes, delete_report, delete_template. Call the tool; the server then creates the approval. Only when a tool result says needs_approval, tell the user the request is waiting in Approvals (/agents/approvals). Never say a request is waiting if you did not call the tool, or if its result did not say needs_approval.
 - needs_confirmation and needs_approval are different. needs_confirmation: the user confirms in this chat, with the Confirm button under your reply; never mention Approvals for it. needs_approval: a human must approve it in Approvals (/agents/approvals).
@@ -873,6 +873,7 @@ const DOMAINS: &[Domain] = &[
     Domain {
         words: &["report", "laporan", "write-up", "template", "templat"],
         tools: &[
+            "list_reports",
             "create_report",
             "update_report",
             "delete_report",
@@ -1200,7 +1201,12 @@ mod tests {
             &["Write a report on visitors this quarter with the trend chart"],
             false,
         );
-        for tool in ["create_report", "update_report", "list_charts"] {
+        for tool in [
+            "create_report",
+            "update_report",
+            "list_reports",
+            "list_charts",
+        ] {
             assert!(tools.contains(tool), "{tool}");
         }
         let tools = select_tools(

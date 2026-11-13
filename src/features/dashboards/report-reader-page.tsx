@@ -12,9 +12,11 @@ import { PageHeader } from "@/components/patterns/page-header"
 import { Button } from "@/components/ui/button"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { useAuth } from "@/features/auth/auth-provider"
+import { useCopilot } from "@/features/copilot/use-copilot"
 import { folderPath } from "@/lib/folder-tree"
 import { formatRelativeTime } from "@/lib/format"
 import { notifyError, notifySuccess, withNotify } from "@/lib/notify"
+import { buildReportPageContext, chartCount } from "@/lib/report-blocks"
 import { dashboardReportService, dashboardService } from "@/services"
 import { downloadReportPdf } from "./chart-download"
 import { ReportBlocks } from "./report-blocks"
@@ -46,6 +48,25 @@ export function ReportReaderPage({ id }: { id: string }) {
       (signal) => dashboardReportService.deleteReport(id, signal),
     ),
   )
+
+  // BI-18 D review round 1, SHOULD-FIX 2: tell the assistant which report is on
+  // screen, as the dashboard page names its board, so it can change this one.
+  const { setPageContext } = useCopilot()
+  const shown = state.status === "success" ? state.data.report : null
+  React.useEffect(() => {
+    if (!shown) return
+    setPageContext({
+      key: "report-view",
+      title: `Reading "${shown.title}"`,
+      hint: "Ask about this report, or add a chart or a paragraph to it.",
+      suggest: {
+        ask: ["Summarize this report", "Which dashboards do these charts come from?"],
+        build: ["Add a paragraph that sums up the charts", "Add the trend chart to this report"],
+      },
+      system: buildReportPageContext({ id: shown.id, title: shown.title, chartCount: chartCount(shown.blocks) }),
+    })
+    return () => setPageContext(null)
+  }, [shown, setPageContext])
 
   if (state.status === "loading") return <LoadingSkeleton />
   if (state.status === "error") {

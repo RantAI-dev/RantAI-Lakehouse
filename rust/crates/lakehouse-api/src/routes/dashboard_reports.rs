@@ -210,22 +210,36 @@ pub async fn list(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
 ) -> ApiResult<ApiJson<Value>> {
-    let viewer = viewer_for(&state, &principal).await?;
-    let pool = pool_of(&state)?;
-    let (rows, truncated) = stored::list_live(pool)
-        .await
-        .map_err(|e| store_failure(&e))?;
-    let visible = visible_folders(&state, &viewer).await?;
-    let reports: Vec<Value> = rows
-        .iter()
-        .filter(|r| folder_readable(&viewer, &visible, &r.folder_id))
-        .map(summary_json)
-        .collect();
+    let (reports, truncated) = readable_reports(&state, &principal).await?;
     Ok(ApiJson(json!({
-        "reports": reports,
+        "reports": reports.iter().map(summary_json).collect::<Vec<_>>(),
         "truncated": truncated,
         "maxCharts": reports::MAX_CHARTS,
     })))
+}
+
+/// The live reports `principal` may read, and whether the store held more
+/// than one list reads. The one copy: the list route and the assistant's
+/// `list_reports` (review round 1, SHOULD-FIX 2) both call it.
+///
+/// # Errors
+///
+/// As [`list`].
+pub(crate) async fn readable_reports(
+    state: &AppState,
+    principal: &Principal,
+) -> Result<(Vec<ReportSummary>, bool), ApiError> {
+    let viewer = viewer_for(state, principal).await?;
+    let pool = pool_of(state)?;
+    let (rows, truncated) = stored::list_live(pool)
+        .await
+        .map_err(|e| store_failure(&e))?;
+    let visible = visible_folders(state, &viewer).await?;
+    let reports = rows
+        .into_iter()
+        .filter(|r| folder_readable(&viewer, &visible, &r.folder_id))
+        .collect();
+    Ok((reports, truncated))
 }
 
 // ── Saving ──────────────────────────────────────────────────────────────

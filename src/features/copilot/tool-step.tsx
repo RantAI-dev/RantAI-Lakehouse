@@ -109,6 +109,7 @@ export const TOOL_LABEL: Record<string, string> = {
   withdraw_embed_tokens: "Withdraw embed tokens",
   get_embed_snippet: "Describe embedding",
   // BI-18 part D: written reports and dashboard templates.
+  list_reports: "List reports",
   create_report: "Write report",
   update_report: "Change report",
   delete_report: "Delete report",

@@ -1,6 +1,7 @@
 //! The assistant's report and template tools (`BI-18` part D, T4; feature page
 //! `docs/core/features/reports-and-templates.md`, decisions R5 and T5, with
-//! `AI-9`'s templates half): `create_report`, `update_report`,
+//! `AI-9`'s templates half): `list_reports` (review round 1, SHOULD-FIX 2),
+//! `create_report`, `update_report`,
 //! `delete_report`, `list_templates`, `create_dashboard_from_template` and
 //! `delete_template`.
 //!
@@ -34,7 +35,8 @@ use crate::routes::dashboard_templates as templates;
 use crate::state::AppState;
 
 /// The tools this module answers.
-pub(super) const TOOLS: [&str; 6] = [
+pub(super) const TOOLS: [&str; 7] = [
+    "list_reports",
     "create_report",
     "update_report",
     "delete_report",
@@ -75,6 +77,7 @@ pub(super) async fn run(
         Err(refusal) => return refusal,
     };
     let result = match name {
+        "list_reports" => list_reports(state, principal).await,
         "create_report" => create_report(state, principal, args).await,
         "update_report" => update_report(state, principal, args).await,
         "delete_report" => delete_report(state, principal, args).await,
@@ -106,6 +109,35 @@ fn made(report: &lakehouse_store::dashboard_reports::Report) -> Value {
         },
         "url": report_url(&report.id),
     })
+}
+
+/// The most reports `list_reports` gives the model.
+const MAX_LISTED: usize = 100;
+
+/// `list_reports` (review round 1, SHOULD-FIX 2): the reports the person may
+/// read, through the list route's own function, so `update_report` has an id
+/// to name. A digest: id, title, folder, last saved and chart count, newest
+/// first, at most [`MAX_LISTED`], saying when there were more.
+async fn list_reports(state: &AppState, principal: &Principal) -> Result<Value, Value> {
+    let (reports, truncated) = reports::readable_reports(state, principal)
+        .await
+        .map_err(|e| error(&e))?;
+    let cut = truncated || reports.len() > MAX_LISTED;
+    let listed: Vec<Value> = reports
+        .iter()
+        .take(MAX_LISTED)
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "title": r.title,
+                "folderId": r.folder_id,
+                "updatedAt": r.updated_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+                "charts": r.chart_count,
+                "url": report_url(&r.id),
+            })
+        })
+        .collect();
+    Ok(json!({ "reports": listed, "truncated": cut }))
 }
 
 async fn create_report(
@@ -248,7 +280,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_module_answers_its_six_tools_and_no_scheduled_report_tool() {
+    fn the_module_answers_its_seven_tools_and_no_scheduled_report_tool() {
         for name in TOOLS {
             assert!(handles(name), "{name}");
         }

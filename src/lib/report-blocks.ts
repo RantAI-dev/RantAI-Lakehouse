@@ -98,3 +98,19 @@ export function blocksForSave(blocks: readonly ReportBlock[]): ReportBlock[] {
     return b
   })
 }
+
+/**
+ * What the report page tells the assistant (`BI-18` D review round 1,
+ * SHOULD-FIX 2), the way the dashboard page names its board: the report's id
+ * and title, so "add this chart to the report" can name the report. The title
+ * is the person's own text, quoted and cut at 200 characters; nothing else of
+ * the report is sent.
+ */
+export function buildReportPageContext(report: { id: string; title: string; chartCount: number }): string {
+  const title = JSON.stringify(report.title.slice(0, 200))
+  return [
+    `The user is reading the report ${title} (report id ${report.id}, ${report.chartCount} of ${MAX_REPORT_CHARTS} charts).`,
+    `To change this report, call update_report with id ${report.id}: \`chart\` adds one chart at the end, \`append\` adds blocks, \`blocks\` replaces them.`,
+    "list_reports lists the other reports the user can read.",
+  ].join(" ")
+}

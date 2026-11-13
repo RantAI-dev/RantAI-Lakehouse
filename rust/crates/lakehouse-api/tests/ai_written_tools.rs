@@ -315,3 +315,33 @@ async fn every_report_and_template_tool_needs_dashboard_write() {
     assert_eq!(reports(&app).await, 0);
     assert_eq!(approvals_for(&app, "delete_report").await, 0);
 }
+
+/// Review round 1, SHOULD-FIX 2: `list_reports` is a read, the reports the
+/// person may read with the ids `update_report` takes; a person with
+/// `dashboard:read` alone may list them, and nobody without it.
+#[tokio::test]
+async fn list_reports_gives_the_ids_update_report_takes() {
+    let (app, _ch) = app().await;
+    let writer = person(&app, WRITER).await;
+    let made = call(
+        &app,
+        &writer,
+        "create_report",
+        json!({ "title": "Weekly", "confirmed": true }),
+    )
+    .await;
+    let id = made["result"]["report"]["id"].as_str().unwrap().to_owned();
+
+    let reader = person(&app, "dashboard:read").await;
+    let listed = call(&app, &reader, "list_reports", json!({})).await;
+    assert_eq!(listed["outcome"], "executed", "{listed}");
+    let row = &listed["result"]["reports"][0];
+    assert_eq!(row["id"], id.as_str(), "{listed}");
+    assert_eq!(row["title"], "Weekly");
+    assert_eq!(row["url"], format!("/dashboards/reports/{id}"));
+    assert_eq!(listed["result"]["truncated"], false);
+
+    let nobody = person(&app, "query:read").await;
+    let refused = call(&app, &nobody, "list_reports", json!({})).await;
+    assert_eq!(refused["outcome"], "refused", "{refused}");
+}

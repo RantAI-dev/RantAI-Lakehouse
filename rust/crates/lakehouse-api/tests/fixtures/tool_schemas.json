@@ -6140,6 +6140,17 @@
   {
     "type": "function",
     "function": {
+      "name": "list_reports",
+      "description": "List the written reports the person can read: id, title, folder, when it was last saved and how many charts it holds, newest first. Use the id with update_report.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "create_report",
       "description": "Write a report: a page of headings, paragraphs, lists and links with live charts between them, picked from existing dashboards by chart id (list_charts). Each reader sees every chart with their own access, as on its dashboard. At most 30 charts. Needs a confirm in this chat.",
       "parameters": {

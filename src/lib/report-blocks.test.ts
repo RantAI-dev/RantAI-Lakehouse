@@ -4,6 +4,7 @@ import type { ReportBlock } from "@/services/contracts/dashboard-reports"
 import {
   MAX_REPORT_CHARTS,
   blocksForSave,
+  buildReportPageContext,
   canAddChart,
   chartCount,
   emptyBlock,
@@ -68,4 +69,14 @@ test("blocksForSave drops blank list lines and the dashboard of a chart, and kee
     { type: "chart", chart: "c_1" },
     p("<b>kept</b>"),
   ])
+})
+
+test("buildReportPageContext names the report's id and title for update_report", () => {
+  const text = buildReportPageContext({ id: "r1", title: 'Q3 "visitors"', chartCount: 2 })
+  assert.ok(text.includes("report id r1"), text)
+  assert.ok(text.includes('"Q3 \\"visitors\\""'), text)
+  assert.ok(text.includes("update_report with id r1"), text)
+  assert.ok(text.includes("2 of 30 charts"), text)
+  const long = buildReportPageContext({ id: "r2", title: "x".repeat(500), chartCount: 0 })
+  assert.ok(!long.includes("x".repeat(201)), "the title is cut at 200 characters")
 })

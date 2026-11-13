@@ -2003,6 +2003,13 @@ fn report_blocks_schema(description: &str) -> Value {
     })
 }
 
+fn list_reports_schema() -> Value {
+    json!({ "type": "function", "function": {
+        "name": "list_reports",
+        "description": "List the written reports the person can read: id, title, folder, when it was last saved and how many charts it holds, newest first. Use the id with update_report.",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
 fn create_report_schema() -> Value {
     json!({ "type": "function", "function": {
         "name": "create_report",
@@ -2874,6 +2881,14 @@ pub static TOOLS: &[ToolSpec] = &[
     // permission of their routes. Writing is a confirm in the chat; deleting a
     // report or a template is an approval, as deleting a dashboard is. Listing
     // the templates is a read, but the route it mirrors needs `dashboard:write`.
+    // Review round 1, SHOULD-FIX 2: the reports the person may read, so the
+    // assistant has an id for `update_report`. A read, as `list_boards` is.
+    ToolSpec {
+        name: "list_reports",
+        schema: list_reports_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
     ToolSpec {
         name: "create_report",
         schema: create_report_schema,
@@ -2958,6 +2973,9 @@ pub enum Reach {
 pub static DASHBOARD_SCOPED: &[(&str, Reach)] = &[
     // Reads: the handler reads through `viewer_for` / `viewer_for_write`.
     ("list_boards", Reach::Anywhere),
+    // BI-18 D review round 1, SHOULD-FIX 2: its handler lists through the
+    // caller's own viewer, as `list_boards` does.
+    ("list_reports", Reach::Anywhere),
     ("list_charts", Reach::Anywhere),
     ("list_sql_sources", Reach::Anywhere),
     ("suggest_join", Reach::Anywhere),
@@ -3106,8 +3124,9 @@ mod tests {
         // (`AI-10`, with `RPT-1`) + `set_cache_rule` (`BI-4` part B)
         // + `list_maps` (`BI-16` part C2, `AI-5`) + `list_dashboard_comments`
         // (`BI-37` D8) + the four signed-embed tools (`BI-26` slice 2)
-        // + the six report and template tools (`BI-18` part D, T4).
-        assert_eq!(tool_schemas().len(), 121);
+        // + the six report and template tools (`BI-18` part D, T4)
+        // + `list_reports` (`BI-18` D review round 1, SHOULD-FIX 2).
+        assert_eq!(tool_schemas().len(), 122);
     }
 
     /// `RPT-1` (with `AI-10`): the report tools have the console's permission,
@@ -3131,6 +3150,10 @@ mod tests {
     /// of their routes, writing is a confirmation and deleting an approval.
     #[test]
     fn the_report_and_template_tools_have_the_risk_and_permission_of_their_routes() {
+        // Review round 1, SHOULD-FIX 2: the listing is a read, as `list_boards`.
+        let list = find("list_reports").expect("registered tool");
+        assert_eq!(list.risk, Risk::Read);
+        assert_eq!(list.permission, "dashboard:read");
         for (name, risk) in [
             ("create_report", Risk::WriteLow),
             ("update_report", Risk::WriteLow),
