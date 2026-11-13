@@ -2117,3 +2117,86 @@ run, so no container of mine was left behind and none was removed.
   `200`, one `409` with `ALREADY_DROPPED`, one `DELETE`, exactly one record, the trail's first
   entry `allowed` and exactly one `executed`.
 - No other mismatch: every other ruling matched the code as it was.
+
+### Round 3 (planner, 2026-11-13, at `430a0009`)
+
+A third independent reading, of round 2's three commits only, then the planner's rulings.
+Read, not built; CI on the pull request (#501) is the run.
+
+| Round 2 | Closed? |
+| --- | --- |
+| S1 (healing) | Yes: the guarded removal, the 120-second grace, the second arm gone; in all three interleavings the record stays and the second actor is refused |
+| S2 (bounds) | Yes: every await on the catalog inside both tasks has a bound |
+| S3, S4, S5, S8, S9 | Yes (both abort tests fail without the spawn, by reading; both S5 tests fail if their arm removed the record) |
+| S6 | Partly: U4 |
+| S7 | Yes for the sites named; commit E made others untrue: U5 |
+
+The developer's MISMATCH (the two-drops test holds the first drop in flight with a delayed
+`DELETE` where the ruling said two requests at once) is accepted: it is the stronger test,
+because the second request provably arrives inside the stretch.
+
+**No BLOCKER.** Five SHOULD-FIX. U1 and U2 are rare, and both end in the state this
+feature must never reach (a dropped table with no record), so they are fixed before the
+merge. ONE commit, `fix(review): a drop and a restore remove only their own record (U1 to U5)`.
+
+- **U1. The stretch between the record and the `DELETE` has a step with no bound.** The
+  second load check (`loading_into_now` in `DropJob::run`) settles ended loads, which can
+  read the object store and wait on the database with no bound of ours. If more than the
+  grace passes there, a read heals the true record and the `DELETE` still goes out. Fix:
+  1. Wrap the second load check in `tokio::time::timeout` with a named constant
+     (`LOAD_CHECK_TIMEOUT`, 30 seconds). An elapsed bound goes where the check's `Err` goes
+     today: the record stands, `failed`, **no `DELETE`**. The sentence, for both the error
+     and the timeout (use the existing error arm's sentence if it has one of its own;
+     otherwise this fixed one, *proposed, not yet signed*): `The loads into this table
+     could not be checked, so nothing was dropped. Try again shortly.` (`503`).
+  2. The task's own removals (the definite 4xx; the load found by the second check) remove
+     ONLY this attempt's record: the same guarded delete with `dropped_at` equal to the
+     record this task wrote and no grace (a sibling store function with only `bronze_table
+     = $1 AND dropped_at = $2`, or the existing one with a grace of 0: choose the clearer;
+     do not write the SQL twice).
+  3. `HEAL_GRACE`'s doc states the real sum: 30 (the load check) + 15 + 10 + 10 = 65
+     seconds of bounds, and says that the database calls in the stretch have the pool's own
+     limits, not ours.
+  4. One test: the second load check does not return inside its bound → no `DELETE`, the
+     record kept, `allowed` then `failed`. If it cannot be arranged without a hook in
+     product code, do not add a hook: say so in the handoff, and test the store function
+     of item 2 instead (a record with another `dropped_at` is not removed).
+- **U2. The restore's removal can delete a newer drop's record.** `finish_restore` removes
+  whatever record the name has when the undrop's answer arrives; if the answer is slow and a
+  second person drops the table in those seconds (the old record is past its grace, so a
+  read heals it and a new one is written), the new record is deleted and that drop's
+  `DELETE` goes out. Fix: read the record (`dropped_table`) before the undrop is sent, carry
+  its `dropped_at` in `RestoreJob`, and in `finish_restore` remove only a record with that
+  `dropped_at` (item 2's function). No record was read, or the read failed: remove nothing
+  and log one line; a leftover is healed by the next read. One test: the undrop answers
+  late, the record's `dropped_at` is changed while it is in flight (an `UPDATE` in the
+  test), and the record is still there afterwards.
+- **U3. The restore's "the table exists" path has no test.** Two tests: `POST …/restore`
+  with a fresh record and an existing table → `409` with the "exists again" sentence, the
+  record PRESENT; the same with the record backdated ten minutes → `409`, the record gone.
+- **U4 (rule 2). Two tests lost an assertion.** The rewritten second-arm test and the S3
+  test no longer assert that the first audit entry is `allowed`. Add
+  `assert_eq!(outcomes[0].0, "allowed");` (or the file's own form) to both.
+- **U5 (rule 1). Comments commit E made untrue.** `settle_not_dropped`'s doc still describes
+  the withdrawn arm ("keeps the record unless the catalog says the table is still there"):
+  an unknown outcome always keeps the record. `catalog_restore.rs` module doc: the record is
+  cleared for a table that exists only past the grace. The three "believed only while the
+  table is absent" comments (`catalog_drop.rs`, `catalog_restore.rs`, `routes/uploads.rs`):
+  a young record is believed while the table exists too. `OUTCOME_CHECK_TIMEOUT`'s doc: the
+  undrop is bounded by `UNDROP_TIMEOUT` in the route, not by the client. The store test's
+  comment "A newer drop of the same name" above a row with an OLDER time: "a different
+  record".
+
+Accepted and written down (no change): a stall longer than the pool's own limits inside
+the stretch, and a `DELETE` the catalog applies after the client gave up and after the
+grace, can still leave a dropped table without a record; the feature page's limit line of
+round 2 says so. Only a real catalog shows how it treats a soft-deleted table's name; the
+G9 gate step on CI is the proof of the main path.
+
+The developer's handoff for this round, appended below this entry: the commit; every
+command with its counts (`cargo fmt --check`; clippy for `lakehouse-api` and
+`lakehouse-store`, all targets, `-D warnings`; `cargo test -p lakehouse-store --test
+uploads`; `cargo test -p lakehouse-api --test catalog_restore`; `--test upload_routes`;
+`--test sec11_guard`; `--test route_auth`; both repo lints); each new test by name with the
+failure line seen before its fix; whether U1's timeout test could be arranged; anything
+*not verified*; every MISMATCH.
