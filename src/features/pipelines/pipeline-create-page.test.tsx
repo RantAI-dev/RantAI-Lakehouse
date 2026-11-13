@@ -974,6 +974,27 @@ describe("the pipeline editor of inputs and steps (BLD-1 part 1)", () => {
     expect(within(reasons).getByRole("button", { name: "Give the pipeline a name." })).toBeTruthy()
   })
 
+  // BLD-1 part 1 S3 review R1-S11 (R1-B2): a rename typed through the empty
+  // name, on the page, keeps the form step reading the input.
+  it("keeps a form step reading its input through a rename typed through the empty name", async () => {
+    renderEditor(existing())
+    const name = screen.getByLabelText("Name in this pipeline")
+    for (const typed of ["orders_ra", "o", "", "s", "sales"]) fireEvent.change(name, { target: { value: typed } })
+    const step = screen.getByRole("button", { name: /1\. transformed/ })
+    expect(step.textContent).toContain("reads sales")
+
+    const body = await saveAndRead("PUT")
+    expect(body.steps).toEqual([{ name: "transformed", kind: "transform", reads: "sales", transforms: ["dedupe(id)"] }])
+  })
+
+  // R1-S7: the no-rows sentence is said once.
+  it("says once that a preview returned no rows", async () => {
+    previewAnswer = { status: 200, body: { columns: [{ name: "id", type: "Int64" }], rows: [], truncated: false } }
+    renderEditor(existing())
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }))
+    expect(await screen.findAllByText("It returned no rows.")).toHaveLength(1)
+  })
+
   it("moves and removes a step, and renames a step's reader with its input", async () => {
     renderEditor(twoSteps())
     selectRail(/2\. by_stock/)
