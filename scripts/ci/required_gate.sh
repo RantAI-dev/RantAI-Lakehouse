@@ -7,13 +7,22 @@
 # all required checks succeeded or were legitimately skipped based on change scope.
 #
 # Inputs:
-#   EVENT_NAME            github.event_name (push or pull_request)
+#   EVENT_NAME            github.event_name (push, pull_request, schedule or
+#                         workflow_dispatch). A push and a pull request are
+#                         gated by the scope alone (OPS-24 D1); the nightly
+#                         run and a manual run require every job whatever the
+#                         scope says (OPS-24 D3, R3).
 #   SCOPE_RUST            "true" if rust changed
 #   SCOPE_FRONTEND        "true" if frontend changed
 #   SCOPE_DAGSTER         "true" if dagster changed
 #   SCOPE_STACK           "true" if stack/ops changed
 #   SCOPE_DOCS_ONLY       "true" if docs only
 #   SCOPE_ALL             "true" if all jobs forced
+#   PUSH_PROVEN           "true" when a push was proven to repeat a passed
+#                         pull request (OPS-24 D4). It excuses the acceptance
+#                         jobs and `image-smoke` on a `push` only; it never
+#                         excuses the Rust jobs, the Dagster jobs, `images` or
+#                         anything on another event (D6).
 #   CHANGES_RESULT        result of `changes` job
 #   REPO_LINTS_RESULT     result of `repo-lints` job
 #   FRONTEND_RESULT       result of `verify` job
@@ -61,6 +70,12 @@ run_gate() {
   local scope_stack="${SCOPE_STACK:-false}"
   local scope_docs_only="${SCOPE_DOCS_ONLY:-false}"
   local scope_all="${SCOPE_ALL:-false}"
+  # OPS-24 D6: the proof excuses a gate only on the event `push`. Any other
+  # value of PUSH_PROVEN -- unset, empty, a typo -- is "not proven".
+  local push_proven="false"
+  if [ "$event_name" = "push" ] && [ "${PUSH_PROVEN:-false}" = "true" ]; then
+    push_proven="true"
+  fi
 
   echo "=== Scope Evaluation ==="
   echo "EVENT_NAME:           $event_name"
@@ -70,6 +85,17 @@ run_gate() {
   echo "SCOPE_STACK:          $scope_stack"
   echo "SCOPE_DOCS_ONLY:      $scope_docs_only"
   echo "SCOPE_ALL:            $scope_all"
+  echo "PUSH_PROVEN:          $push_proven"
+
+  # OPS-24 D3, R3: the nightly run and a manual run have no base commit, so
+  # their scope is `all=true`. This makes "every job is required" explicit for
+  # those two events instead of depending on that scope output; a partial or
+  # empty scope on either event is still required to have run everything.
+  local event_requires_all="false"
+  if [ "$event_name" = "schedule" ] || [ "$event_name" = "workflow_dispatch" ]; then
+    event_requires_all="true"
+    echo "EVENT_REQUIRES_ALL:   true (the ${event_name} run requires every job)"
+  fi
 
   local failures=0
 
@@ -107,7 +133,12 @@ run_gate() {
 
   # Determine required flags based on scope
   local req_all="false"
-  if [ "$event_name" = "push" ] || [ "$scope_all" = "true" ]; then
+  # OPS-24 D1: the event no longer requires anything by itself; the scope does.
+  # A push and a pull request are gated identically, and `all=true` (a workflow
+  # or fixture change, an unreadable base, the nightly run) is what forces
+  # every job. R3: the nightly run and a manual run require every job even if
+  # their scope output says otherwise.
+  if [ "$scope_all" = "true" ] || [ "$event_requires_all" = "true" ]; then
     req_all="true"
   fi
 
@@ -131,6 +162,15 @@ run_gate() {
     req_acceptance="true"
   fi
 
+  # OPS-24 D5, D6: a push proven to repeat a passed pull request does not need
+  # the acceptance jobs or `image-smoke`. Only the event `push` together with
+  # the proof excuses a gate; a failed or cancelled gate is still an error
+  # whatever the proof says (see `check_job` above).
+  local req_gates="$req_acceptance"
+  if [ "$push_proven" = "true" ]; then
+    req_gates="false"
+  fi
+
   # Frontend
   check_job "verify" "${FRONTEND_RESULT:-skipped}" "$req_frontend"
 
@@ -146,31 +186,31 @@ run_gate() {
   check_job "dagster-loader-tests" "${DAGSTER_LOADER_TESTS_RESULT:-skipped}" "$req_dagster"
 
   # Acceptance
-  check_job "g1-rustfs" "${G1_RUSTFS_RESULT:-skipped}" "$req_acceptance"
-  check_job "g2-seaweedfs" "${G2_SEAWEEDFS_RESULT:-skipped}" "$req_acceptance"
-  check_job "g3a-dagster" "${G3A_DAGSTER_RESULT:-skipped}" "$req_acceptance"
-  check_job "g3-maintenance" "${G3_MAINTENANCE_RESULT:-skipped}" "$req_acceptance"
-  check_job "g4-cdc" "${G4_CDC_RESULT:-skipped}" "$req_acceptance"
-  check_job "g4-mysql" "${G4_MYSQL_RESULT:-skipped}" "$req_acceptance"
-  check_job "g4-mssql" "${G4_MSSQL_RESULT:-skipped}" "$req_acceptance"
-  check_job "g4-mongo" "${G4_MONGO_RESULT:-skipped}" "$req_acceptance"
-  check_job "g4-oracle" "${G4_ORACLE_RESULT:-skipped}" "$req_acceptance"
-  check_job "g10-sso" "${G10_SSO_RESULT:-skipped}" "$req_acceptance"
-  check_job "g6-ingest" "${G6_INGEST_RESULT:-skipped}" "$req_acceptance"
-  check_job "g6-ingest-other" "${G6_INGEST_OTHER_RESULT:-skipped}" "$req_acceptance"
-  check_job "g6-oracle" "${G6_ORACLE_RESULT:-skipped}" "$req_acceptance"
-  check_job "g9-upload" "${G9_UPLOAD_RESULT:-skipped}" "$req_acceptance"
-  check_job "g6-alerts" "${G6_ALERTS_RESULT:-skipped}" "$req_acceptance"
-  check_job "g6-ops" "${G6_OPS_RESULT:-skipped}" "$req_acceptance"
-  check_job "g6-credentials" "${G6_CREDENTIALS_RESULT:-skipped}" "$req_acceptance"
-  check_job "g6-secret-managers" "${G6_SECRET_MANAGERS_RESULT:-skipped}" "$req_acceptance"
-  check_job "g6-oauth" "${G6_OAUTH_RESULT:-skipped}" "$req_acceptance"
-  check_job "g6-discovery-scale" "${G6_DISCOVERY_SCALE_RESULT:-skipped}" "$req_acceptance"
-  check_job "g6-saas-a" "${G6_SAAS_A_RESULT:-skipped}" "$req_acceptance"
-  check_job "g6-saas-b" "${G6_SAAS_B_RESULT:-skipped}" "$req_acceptance"
-  check_job "gold-export" "${GOLD_EXPORT_RESULT:-skipped}" "$req_acceptance"
-  check_job "g8-governance" "${G8_GOVERNANCE_RESULT:-skipped}" "$req_acceptance"
-  check_job "g8-time-travel" "${G8_TIME_TRAVEL_RESULT:-skipped}" "$req_acceptance"
+  check_job "g1-rustfs" "${G1_RUSTFS_RESULT:-skipped}" "$req_gates"
+  check_job "g2-seaweedfs" "${G2_SEAWEEDFS_RESULT:-skipped}" "$req_gates"
+  check_job "g3a-dagster" "${G3A_DAGSTER_RESULT:-skipped}" "$req_gates"
+  check_job "g3-maintenance" "${G3_MAINTENANCE_RESULT:-skipped}" "$req_gates"
+  check_job "g4-cdc" "${G4_CDC_RESULT:-skipped}" "$req_gates"
+  check_job "g4-mysql" "${G4_MYSQL_RESULT:-skipped}" "$req_gates"
+  check_job "g4-mssql" "${G4_MSSQL_RESULT:-skipped}" "$req_gates"
+  check_job "g4-mongo" "${G4_MONGO_RESULT:-skipped}" "$req_gates"
+  check_job "g4-oracle" "${G4_ORACLE_RESULT:-skipped}" "$req_gates"
+  check_job "g10-sso" "${G10_SSO_RESULT:-skipped}" "$req_gates"
+  check_job "g6-ingest" "${G6_INGEST_RESULT:-skipped}" "$req_gates"
+  check_job "g6-ingest-other" "${G6_INGEST_OTHER_RESULT:-skipped}" "$req_gates"
+  check_job "g6-oracle" "${G6_ORACLE_RESULT:-skipped}" "$req_gates"
+  check_job "g9-upload" "${G9_UPLOAD_RESULT:-skipped}" "$req_gates"
+  check_job "g6-alerts" "${G6_ALERTS_RESULT:-skipped}" "$req_gates"
+  check_job "g6-ops" "${G6_OPS_RESULT:-skipped}" "$req_gates"
+  check_job "g6-credentials" "${G6_CREDENTIALS_RESULT:-skipped}" "$req_gates"
+  check_job "g6-secret-managers" "${G6_SECRET_MANAGERS_RESULT:-skipped}" "$req_gates"
+  check_job "g6-oauth" "${G6_OAUTH_RESULT:-skipped}" "$req_gates"
+  check_job "g6-discovery-scale" "${G6_DISCOVERY_SCALE_RESULT:-skipped}" "$req_gates"
+  check_job "g6-saas-a" "${G6_SAAS_A_RESULT:-skipped}" "$req_gates"
+  check_job "g6-saas-b" "${G6_SAAS_B_RESULT:-skipped}" "$req_gates"
+  check_job "gold-export" "${GOLD_EXPORT_RESULT:-skipped}" "$req_gates"
+  check_job "g8-governance" "${G8_GOVERNANCE_RESULT:-skipped}" "$req_gates"
+  check_job "g8-time-travel" "${G8_TIME_TRAVEL_RESULT:-skipped}" "$req_gates"
 
   # Shared images and their smoke test. Required exactly when the acceptance
   # jobs are: `images` has the same `if:` as they do and is what they consume.
@@ -178,8 +218,11 @@ run_gate() {
   # `needs: images` is then SKIPPED, not failed, and a skip alone would read
   # as "not required"; but each of them is required here, so a skip is an
   # error on its own, and `images` failing is reported by name as well.
+  # OPS-24 D5: `images` stays required on a proven push too, because it is the
+  # only writer of the image layer cache the pull requests read; only
+  # `image-smoke` is excused there.
   check_job "images" "${IMAGES_RESULT:-skipped}" "$req_acceptance"
-  check_job "image-smoke" "${IMAGE_SMOKE_RESULT:-skipped}" "$req_acceptance"
+  check_job "image-smoke" "${IMAGE_SMOKE_RESULT:-skipped}" "$req_gates"
 
   if [ "$failures" -gt 0 ]; then
     echo "ci-required gate FAILED: $failures check(s) did not meet requirements."
