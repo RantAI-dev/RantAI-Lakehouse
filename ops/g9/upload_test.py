@@ -1251,6 +1251,128 @@ def step_long_table_name(api, state: dict) -> None:
     print(f"[g9] long name: {table} holds 4 rows after a replace and an append, its versions name the uploader")
 
 
+# DATA-55 D11: the API's own sentence for a load into a dropped table's name.
+# It is a copy of `TABLE_DROPPED` in `routes/uploads.rs` on purpose: a gate
+# proves the deployed stack, so it must read the sentence as text, and this
+# line is where the two are kept in step.
+TABLE_DROPPED = (
+    "That table was dropped and can still be restored. "
+    "Restore it from its page in the Catalog, or choose another name."
+)
+
+
+def step_drop_and_restore(api, state: dict) -> None:
+    """A table an upload made is dropped from the console, kept by the catalog,
+    restored from its page, and its name is closed while it can be restored
+    (`DATA-55`, QA `LH-DATA-15-06`, `TC-1731`).
+
+    What this proves that no unit test can: that the catalog's admin identity
+    may drop a table the `dlt` principal created (D3 — the identity is the one
+    every other call of the feature uses), that the warehouse's delete profile
+    really keeps it so the existing restore brings it back with its rows, and
+    that a load into the name is refused in between."""
+    table = f"g9_drop_{secrets.token_hex(4)}"
+    slug = table.replace("_", "-")
+    upload_id = _upload_one(api, "drop_me.csv", "id,name\n1,a\n2,b\n", state)
+    body = {"bronzeTable": table, "mode": "replace", "encoding": "utf-8", "delimiter": ",", "headerRow": 0}
+    _expect(
+        api.post(f"{API_URL}/api/uploads/{upload_id}/ingest", json=body, timeout=60),
+        200,
+        f"POST .../ingest into {table}",
+    )
+    settled = _settle(api, upload_id, f"the load into {table}")
+    if settled.get("status") != "ingested" or settled.get("rows") != 2:
+        raise G9Failure(
+            f"the load into {table} should be `ingested` with 2 rows, "
+            f"it is {settled.get('status')!r}: {settled.get('error')!r}"
+        )
+    counted: list[int] = []
+
+    def holds() -> bool:
+        counted.append(count_rows(api, table))
+        return counted[-1] == 2
+
+    try:
+        _wait_for(f"{QUERY_DB}.`bronze.{table}` holds 2 rows", holds, VISIBLE_TIMEOUT_S, retry_failures=True)
+    except G9Failure as exc:
+        raise G9Failure(f"{exc}; the last count was {counted[-1] if counted else 'never read'}") from exc
+
+    def droppable() -> dict | None:
+        resp = api.get(f"{API_URL}/api/catalog/{slug}/drop?withRowCount=true", timeout=30)
+        _expect(resp, 200, f"GET /api/catalog/{slug}/drop")
+        answer = resp.json()
+        return answer if answer.get("droppable") else None
+
+    ready = _wait_for(f"{slug} can be dropped", droppable, VISIBLE_TIMEOUT_S, retry_failures=True)
+    if ready.get("table") != f"bronze.{table}":
+        raise G9Failure(f"the drop status should name bronze.{table}, it names {ready.get('table')!r}")
+    if ready.get("rowCount") != 2:
+        raise G9Failure(f"the drop status should count 2 rows, it counts {ready.get('rowCount')!r}")
+
+    dropped = _expect(
+        api.post(f"{API_URL}/api/catalog/{slug}/drop", timeout=120),
+        200,
+        f"POST /api/catalog/{slug}/drop",
+    ).json()
+    if dropped.get("rowCount") != 2 or not dropped.get("expiresAt"):
+        raise G9Failure(f"the drop should answer 2 rows and an expiry, it answered {dropped}")
+    refused = api.post(f"{API_URL}/api/catalog/{slug}/drop", timeout=60)
+    if refused.status_code != 409:
+        raise G9Failure(f"a second drop should be 409, it is {refused.status_code}: {refused.text[:300]}")
+
+    listed = _expect(api.get(f"{API_URL}/api/catalog/dropped/tables", timeout=30), 200, "GET /api/catalog/dropped/tables").json()
+    if not any(row.get("assetId") == slug for row in listed.get("tables") or []):
+        raise G9Failure(f"the dropped list should hold {slug}, it holds {listed}")
+
+    # D11: the name is closed while it can be restored.
+    again = api.post(f"{API_URL}/api/uploads/{upload_id}/ingest", json=body, timeout=60)
+    if again.status_code != 409 or (again.json() or {}).get("error") != TABLE_DROPPED:
+        raise G9Failure(
+            f"a load into the dropped name should be 409 with {TABLE_DROPPED!r}, "
+            f"it is {again.status_code}: {again.text[:300]}"
+        )
+
+    def restorable() -> dict | None:
+        resp = api.get(f"{API_URL}/api/catalog/{slug}/restore", timeout=30)
+        _expect(resp, 200, f"GET /api/catalog/{slug}/restore")
+        answer = resp.json()
+        return answer if answer.get("restorable") else None
+
+    _wait_for(f"{slug} can be restored", restorable, VISIBLE_TIMEOUT_S, retry_failures=True)
+    _expect(
+        api.post(f"{API_URL}/api/catalog/{slug}/restore", timeout=120),
+        200,
+        f"POST /api/catalog/{slug}/restore",
+    )
+
+    after = _expect(api.get(f"{API_URL}/api/catalog/dropped/tables", timeout=30), 200, "GET /api/catalog/dropped/tables").json()
+    if any(row.get("assetId") == slug for row in after.get("tables") or []):
+        raise G9Failure(f"{slug} should be gone from the dropped list after its restore, it is there")
+
+    def visible() -> bool:
+        return api.get(f"{API_URL}/api/lakehouse/tables/bronze/{table}", timeout=30).status_code == 200
+
+    _wait_for(f"/api/lakehouse/tables/bronze/{table} answers again", visible, VISIBLE_TIMEOUT_S, retry_failures=True)
+    restored: list[int] = []
+
+    def back() -> bool:
+        restored.append(count_rows(api, table))
+        return restored[-1] == 2
+
+    try:
+        # How long ClickHouse needs to see a restored table again was not
+        # measured; 120 s is the plan's bound, not a measurement.
+        _wait_for(f"{QUERY_DB}.`bronze.{table}` holds 2 rows again", back, 120, retry_failures=True)
+    except G9Failure as exc:
+        raise G9Failure(f"{exc}; the last count was {restored[-1] if restored else 'never read'}") from exc
+
+    _delete_upload(api, upload_id, state)
+    print(
+        f"[g9] drop and restore: {table} was dropped, refused a new load while it could be "
+        f"restored, and came back with 2 rows"
+    )
+
+
 def step_create_pipeline_over_uploaded_table(api, requests, table: str, silver_table: str) -> str:
     """Author a `bronze.<table>` -> `silver.<silver_table>` pipeline whose
     `dependsOn` names `file_ingest_job`, exactly the body the console's
@@ -1697,6 +1819,7 @@ def main() -> int:
         step_new_formats(api, table, state)
         step_several_files(api, table, state)
         step_long_table_name(api, state)
+        step_drop_and_restore(api, state)
         step_folders(api, table, state)
         step_feeds_a_pipeline(api, requests, table, upload_id, using, expected, state)
     except (G9Failure, requests.RequestException) as exc:
