@@ -122,8 +122,9 @@ export function ZoneField({
 /**
  * One column: a `Select` over the source table's schema when the table is
  * known, and the same text input as before when it is not (`columns ===
- * null`). `label` is also the control's accessible name, because the form's
- * `Field` wrapper has no `htmlFor` of its own.
+ * null`). `label` is also the control's accessible name: a call site may
+ * pass no `id`, and then the `Label` names no control (BLD-1 part 1 S3
+ * review R1-S8).
  */
 export function ColumnField({
   id,

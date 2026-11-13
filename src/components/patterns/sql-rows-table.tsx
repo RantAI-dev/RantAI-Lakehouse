@@ -7,9 +7,11 @@ import { cn } from "@/lib/utils"
  * The columns and first rows a SQL run returned, shared by the dashboard's
  * SQL source (`features/dashboards/sql-source-panel.tsx`, the chart
  * builder's Preview pane) and the pipeline editor's preview (BLD-1 part 1
- * D17). They moved here from the dashboard panel unchanged so two features
- * can use them; `noRowsText` is the one addition, because a pipeline input
- * is a table and not "the SQL".
+ * D17). They moved here from the dashboard panel so two features can use
+ * them. Two additions, each defaulting to the dashboard's words: the
+ * no-rows sentence (`noRowsText`; a pipeline input is a table, not "the
+ * SQL", and `null` on the chips leaves the sentence to the table) and the
+ * stale sentence (`staleText`). BLD-1 part 1 S3 review R1-S8.
  *
  * The shape is structural: a dashboard's `SqlSourcePreview` and a pipeline
  * preview turned into records (`lib/pipeline-editor.ts` `previewAsRecords`)

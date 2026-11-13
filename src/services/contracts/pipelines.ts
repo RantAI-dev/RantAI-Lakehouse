@@ -57,8 +57,10 @@ export type Pipeline = {
    * does not run: an administrator must assign an author through
    * `PUT /api/pipelines/{id}/run-as`.
    *
-   * Only ever set on an authored pipeline, and never changed by editing
-   * the pipeline.
+   * Only ever set on an authored pipeline. It changes when an
+   * administrator assigns an author (`assignRunAs`), and when someone else
+   * saves a change to the inputs or steps (BLD-1 part 1 D10, decision 14:
+   * it then reads as that person; BLD-1 part 1 S3 review R1-S8).
    */
   runAs?: string
   /**
@@ -284,23 +286,20 @@ export type PipelineRunLogsPage = {
 }
 
 /**
- * `POST /api/pipelines`'s body. BLD-1 part 1 / D3: the API takes either
- * `inputs` and `steps` or the form of before (`sourceZone`, `sourceTable`,
- * `transforms`) and refuses both at once (400). The console sends `inputs`
- * and `steps` only (D17); the old fields stay here for the assistant's
- * builder dialog and any other caller of the old form.
+ * `POST /api/pipelines`'s body. BLD-1 part 1 / D3: the API also takes the
+ * form of before (`sourceZone`, `sourceTable`, `transforms`) and refuses
+ * both forms at once (400). The console sends `inputs` and `steps` only
+ * (D17), so the old fields are not on this type (BLD-1 part 1 S3 review
+ * R1-S8, R1-S9).
  */
 export type CreatePipelineInput = {
   name: string
   kind: PipelineKind
-  /** BLD-1 part 1 / D1: 1 to 5 inputs. Not together with `sourceZone`/`sourceTable`/`transforms`. */
-  inputs?: PipelineInput[]
+  /** BLD-1 part 1 / D1: 1 to 5 inputs. */
+  inputs: PipelineInput[]
   /** BLD-1 part 1 / D1: 0 to 20 steps; none means a plain copy of the one input. */
-  steps?: PipelineStep[]
-  sourceZone?: string
-  sourceTable?: string
+  steps: PipelineStep[]
   incrementalColumn?: string
-  transforms?: string[]
   fbicEnabled?: boolean
   targetZone: string
   targetTable: string
@@ -341,17 +340,14 @@ export type UpdatePipelineInput = {
    * the pipeline reads as and `inputs` or `steps` differ from the stored
    * ones, the pipeline reads as the caller from then on.
    */
-  inputs?: PipelineInput[]
-  steps?: PipelineStep[]
+  inputs: PipelineInput[]
+  steps: PipelineStep[]
   /**
-   * The form of before. D3a: on `PUT` it is accepted only while the stored
-   * definition is one input and at most one `transform` step (409
-   * otherwise).
+   * Off the page (decision 18) but still stored: the store writes the
+   * column from this field with no COALESCE, so an edit sends the stored
+   * value back (BLD-1 part 1 S3 review R1-B1).
    */
-  sourceZone?: string
-  sourceTable?: string
   incrementalColumn?: string
-  transforms?: string[]
   fbicEnabled?: boolean
   targetZone: string
   targetTable: string
@@ -461,8 +457,9 @@ export interface PipelineService {
   setTargetLag(id: string, targetLag: TargetLag | null, signal?: AbortSignal): Promise<Pipeline>
   /**
    * `PUT /api/pipelines/{id}/run-as` — assign the user this pipeline reads
-   * as (BLD-1 / D2). The only way `runAs` changes after create, and it is
-   * the way out of the "no author, so no run" state.
+   * as (BLD-1 / D2). The way out of the "no author, so no run" state. The
+   * other way `runAs` changes is an edit of the inputs or steps by someone
+   * else (BLD-1 part 1 D10, R1-S8).
    *
    * Platform Admin only (`identity:write`): deciding whose permissions
    * every future run of a row is governed by is a governance decision, not
