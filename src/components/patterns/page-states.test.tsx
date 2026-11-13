@@ -35,7 +35,10 @@ describe("ErrorState", () => {
     )
 
     expect(screen.getByText("You don't have access")).toBeTruthy()
+    expect(screen.getByText("This needs the connector:manage permission. Ask a workspace admin.")).toBeTruthy()
     expect(screen.queryByText("Request could not be processed")).toBeNull()
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull()
+    expect(document.body.textContent ?? "").not.toMatch(/permission_denied/)
   })
 
   it("a refusal that names nothing keeps the general sentence", () => {

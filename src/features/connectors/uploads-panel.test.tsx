@@ -273,8 +273,7 @@ describe("UploadsPanel", () => {
     expect(await screen.findByText("You don't have access")).toBeDefined()
   })
 
-  // QA LH-DATA-9-20 (WEB-11): the tab said "Request could not be processed"
-  // and did not name the permission.
+  // QA LH-DATA-9-20 (WEB-11): the tab said "You don't have access" but did not name the missing permission.
   it("names the missing permission on the Uploaded files tab", async () => {
     stubFetch(() => json({ error: "permission_denied: connector:manage" }, 403))
     render(<UploadsPanel />)

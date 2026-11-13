@@ -71,7 +71,15 @@ async function failure(res: Response, fallback?: (status: number) => string): Pr
   const body: unknown = await res.json().catch(() => null)
   // QA TC-1734, LH-DATA-17-05, LH-DATA-18-03 (WEB-11): the file's row showed "permission_denied: connector:manage".
   const denied = deniedFor(res.status, body)
-  if (denied) return denied
+  if (denied) {
+    // WEB-11 review R1: a 401 or 403 that is not the API's JSON came from a proxy
+    // in front of it, so the file never reached the service; keep that sentence.
+    const fromApi =
+      typeof body === "object" && body !== null && typeof (body as { error?: unknown }).error === "string"
+    return fromApi || fallback === undefined
+      ? denied
+      : new ServiceError("permission_denied", fallback(res.status), res.status)
+  }
   const sentence =
     typeof body === "object" && body !== null && "error" in body ? (body as { error: unknown }).error : null
   const message =

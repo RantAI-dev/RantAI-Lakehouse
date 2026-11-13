@@ -404,6 +404,15 @@ describe("uploadService errors", () => {
     expect((await rejection(uploadService.create(new File(["x"], "a.csv")))).message).toBe("The file is empty.")
   })
 
+  it("keeps the \"did not reach the service\" sentence for a 403 that is not the API's", async () => {
+    stubFetch(() => new Response("<html>403 Forbidden</html>", { status: 403 }))
+    const err = await rejection(uploadService.create(new File(["x"], "a.csv")))
+    expect(err.code).toBe("permission_denied")
+    expect(err.status).toBe(403)
+    expect(err.message).toContain("did not reach the service")
+    expect(err.message).toContain("50 MB")
+  })
+
   it("refuses a delete with the API's sentence and keeps its status", async () => {
     stubFetch(() => json({ error: "This upload is being loaded, so it cannot be deleted yet." }, 409))
     const err = await rejection(uploadService.remove("up-1"))
