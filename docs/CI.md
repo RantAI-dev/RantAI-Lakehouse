@@ -47,6 +47,63 @@ can be started by hand (`workflow_dispatch`): it has no base commit, so every jo
 (D3). Setting the repository variable `CI_PUSH_FULL` to `true` makes every push run
 everything again.
 
+### A push that repeats a passed pull request
+
+A push whose diff was already tested by a pull request does not run that test again
+(`OPS-24` D4–D6). `scripts/ci/detect_push_proof.sh`, run by `changes`, calls a push
+**proven** when all of the following hold for the pushed commit `H`:
+
+1. the event is `push`, and the push's scope needs the Rust tests or the acceptance
+   jobs (otherwise there is nothing to skip);
+2. a pull-request head `P` is found: `H`'s second parent when `H` is a merge commit;
+   otherwise the head of the one merged pull request whose `merge_commit_sha` is `H`
+   and whose base is `main`, read from the API, fetched as `refs/pull/<n>/head` and
+   checked to be that exact commit (most merges here are squash merges, so the
+   merge-commit rule alone would miss most pushes);
+3. `H`'s first parent is an ancestor of `P`: the branch held `main`'s tip when it was
+   merged, so the run that tested `P` tested `H`'s tree;
+4. `H`'s tree equals `P`'s tree;
+5. the most recently completed `ci-required` check run on `P`, made by GitHub Actions,
+   is a success, and none is still running;
+6. in that same check suite, the job that stands for each group the push needs
+   succeeded: `Rust · fmt` for the Rust group, `Images · build lakehouse-api + dagster
+   once` for the acceptance group. The gate script makes a group all-or-nothing, so
+   one job of the group plus a green `ci-required` proves the group, which closes the
+   case where the pull-request run had a narrower scope than the push.
+
+Anything else is **not proven** — an error, an empty answer, a failed API call, an
+unexpected value — and then every job in scope runs, as before. A proven push still
+runs `changes`, `repo-lints`, the console and Dagster unit jobs when in scope, `fmt`,
+`clippy`, `build`, `msrv`, `images` and one leg of `test` in its cheapest form: it
+restores the cache and compiles (`cargo nextest run --no-run`) only when the restore
+was not an exact hit. It skips the nextest runs, the doctest step, the test-count
+check, the 25 gate jobs and `image-smoke`. `images` keeps running because it is the
+only writer of the image layer cache the pull requests read.
+
+`ci-required` treats the skipped jobs as follows (`OPS-24` D6):
+
+| Jobs | "skipped" is accepted when |
+|---|---|
+| `changes`, `repo-lints` | never |
+| `verify` | neither `frontend` nor `all` |
+| `fmt`, `clippy`, `build`, `msrv`, `test` | neither `rust` nor `all` (a proven push does not excuse them) |
+| `dagster-unit-tests`, `dagster-loader-tests` | neither `dagster` nor `all` |
+| `images` | none of `rust`, `dagster`, `stack`, `all` (a proven push does not excuse it) |
+| the 25 gate jobs and `image-smoke` | none of `rust`, `dagster`, `stack`, `all`; **or** the event is `push` and the push is proven |
+
+| Result | Required | Not required |
+|---|---|---|
+| `success` | pass | pass |
+| `skipped` (or empty) | **fail** | pass |
+| `failure`, `cancelled` | **fail** | **fail** |
+| anything else | **fail** | **fail** |
+
+The proof is read on the event `push` only: on a pull request, a scheduled run or a
+manual run it is ignored, and `ci-required` gates exactly as it does without it. The
+nightly run of D3 and `CI_PUSH_FULL=true` are the backstops that still run every
+gate.
+
+
 Downstream jobs execute according to scope:
 - **`repo-lints`**: Runs unconditionally on all pushes and PRs. Folds the static lints (parity corpus secrets, R11 bare iceberg count, compose init readiness, Dagster intra-package imports, connector gate coverage (`SRC-9`: every supported connector type has a gate in `ops/gates/coverage.json`, or an explicit waiver that the output lists)) and the unit tests of the connector gate tooling into one fast job.
 - **`verify`**: Runs if `frontend` or `all` is true.
@@ -67,7 +124,7 @@ token a fork PR is given. One job asks for more, and only to read: `changes` add
 on a push to `main` to read the merged pull request's check runs (`OPS-24` D7). On a
 pull request the script returns before any API call.
 
-At the end of the pipeline, **`ci-required`** runs with `if: always()`, checks every job result against the detected scope, and fails if any required job failed, cancelled, or was skipped when the scope indicated it should have run. Both the scope detection script (`scripts/ci/detect_change_scope.sh`) and the gate script (`scripts/ci/required_gate.sh`) have accompanying self-tests that run in CI before the scripts are executed.
+At the end of the pipeline, **`ci-required`** runs with `if: always()`, checks every job result against the detected scope, and fails if any required job failed, cancelled, or was skipped when the scope indicated it should have run, except the acceptance jobs and the test runs of a push proven to repeat a passed pull request (below). Both the scope detection script (`scripts/ci/detect_change_scope.sh`) and the gate script (`scripts/ci/required_gate.sh`) have accompanying self-tests that run in CI before the scripts are executed.
 
 ## Images: built once per run
 
@@ -141,6 +198,8 @@ The repository's Actions cache is capped at 10 GB and was at 9.9 GB when PR 2 wa
   'refs/heads/main'`. PRs restore `main`'s cache and do not store their own (PR #88 stored a
   980 MB copy of `build`'s). The `fmt` job has no cache step at all: `cargo fmt --check`
   compiles nothing.
+- On a proven push the cache writers still run: `clippy`, `build`, `msrv`, one leg of
+  `test` (it compiles only when its cache is not current) and `images`.
 
 If `images` is cold on `main` more often than on a Cargo.lock change, the cache is being
 evicted: reduce what `rust-cache` stores before anything else (CI-SPEED-PLAN §9).
