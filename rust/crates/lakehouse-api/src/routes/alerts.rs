@@ -2246,7 +2246,7 @@ mod tests {
                 })))
                 .mount(&server)
                 .await;
-            // `current_value`'s `SELECT round(sum(v)) FROM serving.<mart>`
+            // `current_value`'s `SELECT round(sum(v), 6) FROM serving.<mart>`
             // — a value far over the rule's threshold of 10, so it fires.
             Mock::given(method("POST"))
                 .and(body_string_contains("FROM serving."))

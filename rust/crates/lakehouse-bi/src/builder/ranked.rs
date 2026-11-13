@@ -27,7 +27,7 @@
 //!   that is literally `Other` is the same text, so the flag, not the label, is
 //!   what tells them apart; it is returned as the `__other` column.
 //! - The measures are aliased `__m<i>` inside and renamed outside:
-//!   `round(sum(v)) AS v` beside a window over `sum(v)` would make the engine
+//!   `round(sum(v), 6) AS v` beside a window over `sum(v)` would make the engine
 //!   read the second `v` as the first (error 184, the same measurement as in
 //!   [`super::staged`]).
 //! - With a breakdown the groups are ranked by the *dimension's* total, so the

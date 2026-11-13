@@ -3620,7 +3620,7 @@ mod tests {
         );
         assert_eq!(
             mart_statement("mart_x", "amount", "sum").unwrap(),
-            "SELECT round(sum(amount)) AS v FROM serving.mart_x"
+            "SELECT round(sum(amount), 6) AS v FROM serving.mart_x"
         );
         assert_eq!(
             mart_statement("mart_x", "amount", "count").unwrap(),
@@ -3648,7 +3648,7 @@ mod tests {
         assert_eq!(seen[0].0.as_deref(), Some("u_de"));
         assert_eq!(
             seen[0].1,
-            "SELECT round(sum(amount)) AS v FROM serving.mart_x"
+            "SELECT round(sum(amount), 6) AS v FROM serving.mart_x"
         );
     }
 

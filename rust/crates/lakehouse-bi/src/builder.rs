@@ -977,7 +977,7 @@ impl QueryBuilder<Ready> {
 
     /// The measures' select list, and when the engine would read one measure's
     /// result name as a column another measure aggregates, the list that
-    /// renames them outside. `round(sum(v)) AS v` beside `round(avg(v), 6) AS
+    /// renames them outside. `round(sum(v), 6) AS v` beside `round(avg(v), 6) AS
     /// avg_v` fails with error 184 (the second `v` is read as the first
     /// alias, an aggregate inside an aggregate; measured on `ClickHouse` 26.8),
     /// so such a chart aggregates under `__m<i>` names in an inner select and
@@ -1144,7 +1144,7 @@ fn kpi_value(from: &Relation, measure: &Ident, agg: Aggregate) -> String {
 /// the goal as `g`, in one row so one filter narrows both.
 ///
 /// With a goal the two aggregates are computed under `__m0` and `__m1` in an
-/// inner select and renamed outside: `round(sum(x)) AS v, round(sum(v)) AS g`
+/// inner select and renamed outside: `round(sum(x), 6) AS v, round(sum(v), 6) AS g`
 /// would read the second `v` as the first alias (engine error 184, the same
 /// clash [`QueryBuilder`] avoids for its measures). Without a goal it is
 /// exactly [`build_kpi_sql`].
@@ -3383,7 +3383,7 @@ mod tests {
         let sql = sql_with_filters(&spec, &[2024], &[], &cols);
         assert!(
             sql.starts_with(
-                "SELECT round(sum(jumlah)) AS v FROM serving.mart_wisman WHERE tahun IN (2024)"
+                "SELECT round(sum(jumlah), 6) AS v FROM serving.mart_wisman WHERE tahun IN (2024)"
             ),
             "{sql}"
         );
@@ -3585,7 +3585,7 @@ mod tests {
         assert_eq!(
             sql,
             format!(
-                "SELECT round(sum(n)) AS v FROM (\nSELECT 1 AS n\n) AS src{SQL_SOURCE_SETTINGS}"
+                "SELECT round(sum(n), 6) AS v FROM (\nSELECT 1 AS n\n) AS src{SQL_SOURCE_SETTINGS}"
             )
         );
     }
@@ -3686,7 +3686,7 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT lat, lon, place, round(sum(visitors)) AS visitors FROM serving.mart_x \
+            "SELECT lat, lon, place, round(sum(visitors), 6) AS visitors FROM serving.mart_x \
              WHERE tahun IN (2024) AND lat IS NOT NULL AND lon IS NOT NULL \
              GROUP BY lat, lon, place ORDER BY visitors DESC, lat, lon LIMIT 5000"
         );
@@ -3716,7 +3716,7 @@ mod tests {
         let cols = mart_cols(&[("mart_x", &["tahun", "lat", "lon", "visitors"])]);
         let sql = sql_with_filters(&spec, &[2024], &[], &cols);
         assert!(
-            sql.starts_with("SELECT lat, lon, round(sum(visitors)) AS visitors FROM serving.mart_x WHERE tahun IN (2024) AND lat IS NOT NULL"),
+            sql.starts_with("SELECT lat, lon, round(sum(visitors), 6) AS visitors FROM serving.mart_x WHERE tahun IN (2024) AND lat IS NOT NULL"),
             "{sql}"
         );
     }
@@ -4179,7 +4179,7 @@ mod tests {
         );
         assert_eq!(
             got,
-            "SELECT kab, round(sum(visitors)) AS visitors FROM \
+            "SELECT kab, round(sum(visitors), 6) AS visitors FROM \
              (SELECT * FROM serving.mart_x WHERE visitors >= 2000) AS flt \
              GROUP BY kab ORDER BY kab LIMIT 20"
         );
@@ -4200,7 +4200,7 @@ mod tests {
         );
         assert_eq!(
             got,
-            "SELECT kab, round(sum(visitors)) AS visitors FROM serving.mart_x \
+            "SELECT kab, round(sum(visitors), 6) AS visitors FROM serving.mart_x \
              WHERE kab IN ('a') GROUP BY kab ORDER BY kab LIMIT 20"
         );
     }
@@ -4388,7 +4388,7 @@ mod tests {
         let got = sql_with_filters_report(&spec, &[], &[], &dated(ColumnKind::Date));
         assert_eq!(
             got.sql,
-            "SELECT * FROM (SELECT d, round(sum(v)) AS v FROM \
+            "SELECT * FROM (SELECT d, round(sum(v), 6) AS v FROM \
              (SELECT date_trunc('month', d) AS d, v FROM serving.mart_x) AS bkt \
              GROUP BY d ORDER BY d DESC LIMIT 21) ORDER BY d"
         );
@@ -4440,7 +4440,7 @@ mod tests {
         let sql = sql_with_filters(&spec, &[], &[f], &dated(ColumnKind::Date));
         assert_eq!(
             sql,
-            "SELECT * FROM (SELECT d, round(sum(v)) AS v FROM \
+            "SELECT * FROM (SELECT d, round(sum(v), 6) AS v FROM \
              (SELECT date_trunc('month', d) AS d, v FROM \
              (SELECT * FROM serving.mart_x WHERE (d >= toDate32('2026-01-01') AND d <= toDate32('2026-03-31'))) AS flt) AS bkt \
              GROUP BY d ORDER BY d DESC LIMIT 21) ORDER BY d"
@@ -4472,7 +4472,7 @@ mod tests {
         let got = sql_with_filters_report(&spec, &[], &[], &dated(ColumnKind::DateTime));
         assert_eq!(
             got.sql,
-            "SELECT d, g, round(sum(v)) AS v FROM \
+            "SELECT d, g, round(sum(v), 6) AS v FROM \
              (SELECT date_trunc('quarter', toTimeZone(d, 'Asia/Jakarta')) AS d, g, v FROM serving.mart_x) AS bkt \
              WHERE (isNull(g), ifNull(toString(g), '')) IN (SELECT isNull(g), ifNull(toString(g), '') FROM (SELECT date_trunc('quarter', toTimeZone(d, 'Asia/Jakarta')) AS d, g, v FROM serving.mart_x) AS bkt \
              GROUP BY g ORDER BY sum(v) DESC, g LIMIT 8) GROUP BY d, g ORDER BY d, g"
@@ -4673,7 +4673,7 @@ mod tests {
     #[test]
     fn a_heatmap_a_sankey_and_a_sunburst_keep_their_statements_and_their_second_column_is_not_capped()
      {
-        let expected = "SELECT kab, cat, round(sum(visitors)) AS visitors FROM serving.mart_x \
+        let expected = "SELECT kab, cat, round(sum(visitors), 6) AS visitors FROM serving.mart_x \
              WHERE cat IN ('a') AND kab IN (SELECT kab FROM serving.mart_x WHERE cat IN ('a') \
              GROUP BY kab ORDER BY sum(visitors) DESC LIMIT 20) GROUP BY kab, cat ORDER BY kab, cat";
         for kind in [ChartKind::Heatmap, ChartKind::Sankey, ChartKind::Sunburst] {
@@ -4723,7 +4723,7 @@ mod tests {
         let got = sql_with_filters_report(&spec, &[], &[], &dated(ColumnKind::Date));
         assert_eq!(
             got.sql,
-            "SELECT d, round(sum(v)) AS v FROM \
+            "SELECT d, round(sum(v), 6) AS v FROM \
              (SELECT date_trunc('month', d) AS d, v FROM serving.mart_x) AS bkt \
              GROUP BY d ORDER BY v DESC LIMIT 20"
         );
@@ -5150,7 +5150,7 @@ mod tests {
         );
         assert_eq!(
             filtered.sql,
-            "SELECT kab, round(sum(visitors)) AS visitors FROM serving.mart_x \
+            "SELECT kab, round(sum(visitors), 6) AS visitors FROM serving.mart_x \
              WHERE cat IN ('a') GROUP BY kab ORDER BY kab LIMIT 20"
         );
         let mut by_cat = stored_spec(ChartKind::Bar, "mart_x", "kab", &["visitors"]);
@@ -5167,7 +5167,7 @@ mod tests {
         // charts saved before it, which is what D14 asks for.
         assert_eq!(
             got.sql,
-            "SELECT kab, cat, round(sum(visitors)) AS visitors FROM serving.mart_x \
+            "SELECT kab, cat, round(sum(visitors), 6) AS visitors FROM serving.mart_x \
              WHERE cat IN ('a') AND (isNull(cat), ifNull(toString(cat), '')) IN (SELECT isNull(cat), ifNull(toString(cat), '') FROM serving.mart_x WHERE cat IN ('a') \
              GROUP BY cat ORDER BY sum(visitors) DESC, cat LIMIT 20) AND kab IN (SELECT kab FROM \
              serving.mart_x WHERE cat IN ('a') AND (isNull(cat), ifNull(toString(cat), '')) IN (SELECT isNull(cat), ifNull(toString(cat), '') FROM serving.mart_x WHERE \
@@ -5203,14 +5203,14 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT kab, round(sum(visitors)) AS visitors, round(avg(stay), 6) AS avg_stay, \
+            "SELECT kab, round(sum(visitors), 6) AS visitors, round(avg(stay), 6) AS avg_stay, \
              round(max(stay), 6) AS max_stay FROM serving.mart_x GROUP BY kab ORDER BY kab LIMIT 20"
         );
     }
 
     #[test]
     fn a_measure_beside_another_aggregation_of_its_column_is_renamed_outside_the_aggregate() {
-        // `round(sum(visitors)) AS visitors` next to `avg(visitors)` makes the
+        // `round(sum(visitors), 6) AS visitors` next to `avg(visitors)` makes the
         // engine read the second `visitors` as the first alias (error 184,
         // measured on ClickHouse 26.8), so the aggregates carry inner names.
         let sql = bi6_sql(
@@ -5220,7 +5220,7 @@ mod tests {
         assert_eq!(
             sql,
             "SELECT kab, __m0 AS visitors, __m1 AS avg_visitors FROM \
-             (SELECT kab, round(sum(visitors)) AS __m0, round(avg(visitors), 6) AS __m1 \
+             (SELECT kab, round(sum(visitors), 6) AS __m0, round(avg(visitors), 6) AS __m1 \
              FROM serving.mart_x GROUP BY kab) ORDER BY avg_visitors DESC LIMIT 5"
         );
     }
@@ -5241,7 +5241,7 @@ mod tests {
         // plain
         assert_eq!(
             bi6_sql(own, &dash),
-            "SELECT kab, round(sum(visitors)) AS visitors FROM serving.mart_x \
+            "SELECT kab, round(sum(visitors), 6) AS visitors FROM serving.mart_x \
              WHERE kab NOT IN ('x') AND kab IN ('a','b') GROUP BY kab ORDER BY kab LIMIT 20"
         );
         // with a breakdown: the same predicates in the kept-groups subquery and outside it
@@ -5353,7 +5353,7 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT * FROM (SELECT d, round(sum(visitors)) AS visitors FROM \
+            "SELECT * FROM (SELECT d, round(sum(visitors), 6) AS visitors FROM \
              (SELECT date_trunc('month', d) AS d, visitors FROM serving.mart_x) AS bkt \
              GROUP BY d ORDER BY d DESC LIMIT 7) ORDER BY d DESC"
         );
@@ -5369,7 +5369,7 @@ mod tests {
         // dimension's own guard still keeps its own top 5, over them.
         assert_eq!(
             sql,
-            "SELECT kab, cat, __m0 AS visitors FROM (SELECT kab, cat, round(sum(visitors)) AS __m0, \
+            "SELECT kab, cat, __m0 AS visitors FROM (SELECT kab, cat, round(sum(visitors), 6) AS __m0, \
              sum(sum(visitors)) OVER (PARTITION BY kab) AS __t FROM serving.mart_x \
              WHERE (isNull(cat), ifNull(toString(cat), '')) IN (SELECT isNull(cat), ifNull(toString(cat), '') FROM serving.mart_x GROUP BY cat \
              ORDER BY sum(visitors) DESC, cat LIMIT 5) AND kab IN (SELECT kab FROM serving.mart_x \
@@ -5391,7 +5391,7 @@ mod tests {
             sql,
             format!(
                 "SELECT __d AS kab, __m0 AS visitors, __o AS __other FROM \
-                 (SELECT __d, __o, round(sum(visitors)) AS __m0, __m0 AS __t FROM \
+                 (SELECT __d, __o, round(sum(visitors), 6) AS __m0, __m0 AS __t FROM \
                  (SELECT *, toUInt8(NOT (__k IN (SELECT __k FROM {base} GROUP BY __k \
                  ORDER BY sum(visitors) DESC, __k LIMIT 5))) AS __o, \
                  if(__o = 1, 'Other', __k) AS __d FROM {base}) GROUP BY __o, __d) \
@@ -5445,7 +5445,7 @@ mod tests {
         let plain = table(r#"{"groupings":[{"column":"kab"},{"column":"cat"}]}"#);
         assert_eq!(
             sql_with_filters_report(&plain, &[], &[], &bi6_cols()).sql,
-            "SELECT kab, cat, round(sum(visitors)) AS visitors FROM serving.mart_x \
+            "SELECT kab, cat, round(sum(visitors), 6) AS visitors FROM serving.mart_x \
              GROUP BY kab, cat ORDER BY kab, cat LIMIT 20"
         );
         let grained = table(
@@ -5459,7 +5459,7 @@ mod tests {
                 &bi6_cols()
             )
             .sql,
-            "SELECT d, cat, round(sum(visitors)) AS visitors FROM \
+            "SELECT d, cat, round(sum(visitors), 6) AS visitors FROM \
              (SELECT date_trunc('month', d) AS d, cat, visitors FROM \
              (SELECT * FROM serving.mart_x WHERE cat IN ('a')) AS flt) AS bkt \
              GROUP BY d, cat ORDER BY visitors DESC, d, cat LIMIT 20"
@@ -5475,7 +5475,7 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT * FROM (SELECT * FROM (SELECT kab, round(sum(visitors)) AS visitors FROM \
+            "SELECT * FROM (SELECT * FROM (SELECT kab, round(sum(visitors), 6) AS visitors FROM \
              serving.mart_x WHERE cat IN ('a') GROUP BY kab) WHERE visitors > 1000) \
              ORDER BY visitors DESC, kab LIMIT 7 \
              SETTINGS max_rows_to_group_by = 10000, group_by_overflow_mode = 'throw'"
@@ -5486,7 +5486,7 @@ mod tests {
             &[],
         );
         assert!(
-            summed.contains("SELECT kab, __s0 AS max_visitors FROM (SELECT kab, round(max(visitors), 6) AS __s0 FROM (SELECT kab, round(sum(visitors)) AS visitors FROM serving.mart_x GROUP BY kab) GROUP BY kab)"),
+            summed.contains("SELECT kab, __s0 AS max_visitors FROM (SELECT kab, round(max(visitors), 6) AS __s0 FROM (SELECT kab, round(sum(visitors), 6) AS visitors FROM serving.mart_x GROUP BY kab) GROUP BY kab)"),
             "{summed}"
         );
         assert!(summed.contains("ORDER BY kab LIMIT 7"), "{summed}");
@@ -5507,7 +5507,7 @@ mod tests {
         // those same rows.
         assert!(
             got.sql.starts_with(
-                "SELECT stay, round(sum(visitors)) AS visitors FROM (SELECT round(least(floor(toFloat64(stay) / __bw_stay)"
+                "SELECT stay, round(sum(visitors), 6) AS visitors FROM (SELECT round(least(floor(toFloat64(stay) / __bw_stay)"
             ),
             "{}",
             got.sql
