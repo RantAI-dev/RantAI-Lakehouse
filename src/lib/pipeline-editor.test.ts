@@ -91,7 +91,7 @@ describe("editorStateFrom", () => {
     })
     expect(state.inputs).toHaveLength(1)
     expect(state.steps).toEqual([
-      { id: "step-2", kind: "transform", name: "transformed", reads: "orders_raw", transforms: ["dedupe(id)"] },
+      { id: "step-2", kind: "transform", name: "transformed", reads: { id: "input-1" }, transforms: ["dedupe(id)"] },
     ])
   })
 })
@@ -158,7 +158,7 @@ describe("adding, removing, renaming and reordering", () => {
     const sql = addStep(stored(), "sql")
     expect(sql.state.steps[2]).toEqual({ id: String(sql.id), kind: "sql", name: "step_3", sql: "SELECT *\nFROM by_country" })
     const form = addStep(editorStateFrom({ inputs: STORED.inputs, steps: [] }), "transform")
-    expect(form.state.steps[0]).toEqual({ id: String(form.id), kind: "transform", name: "step_1", reads: "customers", transforms: [] })
+    expect(form.state.steps[0]).toEqual({ id: String(form.id), kind: "transform", name: "step_1", reads: { id: "input-2" }, transforms: [] })
   })
 
   it("never gives a new item the id of one that was removed", () => {
@@ -172,9 +172,40 @@ describe("adding, removing, renaming and reordering", () => {
   it("renames an item, and a form step that read the old name reads the new one", () => {
     const state = renameItem(stored(), "input-1", "all_orders")
     expect(state.inputs[0].name).toBe("all_orders")
-    expect(state.steps[0]).toMatchObject({ reads: "all_orders" })
+    expect(definitionBody(state.inputs, state.steps).steps[0]).toMatchObject({ reads: "all_orders" })
     // The SQL step's text is the user's: it is not rewritten.
     expect(state.steps[1]).toMatchObject({ sql: STORED.steps[1].kind === "sql" ? STORED.steps[1].sql : "" })
+  })
+
+  // BLD-1 part 1 S3 review R1-B2: a rename typed one character at a time
+  // passes through the empty name; the reader followed the text before and
+  // was left reading "" from then on.
+  it("keeps a form step reading its input through a rename typed through the empty name", () => {
+    let state = stored()
+    for (const typed of ["order", "ord", "o", "", "s", "sa", "sales"]) state = renameItem(state, "input-1", typed)
+    expect(state.steps[0]).toMatchObject({ reads: { id: "input-1" } })
+    expect(definitionBody(state.inputs, state.steps).steps[0]).toMatchObject({ reads: "sales" })
+    expect(editorProblems(state, OUTPUT).items["step-3"]).toBeUndefined()
+  })
+
+  it("says so when a reorder puts a form step before the step it reads", () => {
+    const base = addStep(stored(), "transform")
+    const readsByCountry = base.state
+    expect(readsByCountry.steps[2]).toMatchObject({ reads: { id: "step-4" } })
+    const moved = moveStep(readsByCountry, String(base.id), -1)
+    expect(editorProblems(moved, OUTPUT).items[String(base.id)]).toBe(
+      "This step reads a step that comes after it; reorder the steps."
+    )
+  })
+
+  it("writes a stored reads that names no item back as it was, and flags it", () => {
+    const state = editorStateFrom({
+      inputs: [{ name: "orders", zone: "bronze", table: "orders" }],
+      steps: [{ name: "s", kind: "transform", reads: "gone", transforms: ["dedupe(id)"] }],
+    })
+    expect(state.steps[0]).toMatchObject({ reads: { name: "gone" } })
+    expect(definitionBody(state.inputs, state.steps).steps[0]).toMatchObject({ reads: "gone" })
+    expect(editorProblems(state, OUTPUT).items["step-2"]).toBe("Choose an input or an earlier step for this step to read.")
   })
 
   it("moves a step up and down, and does nothing past either end", () => {
@@ -215,12 +246,12 @@ describe("editorProblems", () => {
   it("puts each problem on the item it is about", () => {
     let state = stored()
     state = renameItem(state, "input-2", "Orders")
-    state = updateStep(state, "step-3", { reads: "by_country" })
+    state = updateStep(state, "step-3", { reads: { id: "step-4" } })
     state = updateStep(state, "step-4", { sql: "   " })
     const problems = editorProblems(state, OUTPUT)
     expect(problems.items["input-2"]).toBe("Another input or step already has this name.")
     // A step after it is not readable: reads names an input or an EARLIER step.
-    expect(problems.items["step-3"]).toBe("Choose an input or an earlier step for this step to read.")
+    expect(problems.items["step-3"]).toBe("This step reads a step that comes after it; reorder the steps.")
     expect(problems.items["step-4"]).toBe("Write the step's SELECT.")
   })
 
@@ -372,9 +403,10 @@ describe("columns and completion", () => {
     const state = stored()
     const paid = state.steps[0]
     if (paid.kind !== "transform") throw new Error("fixture")
-    expect(columnsRead(paid, state.inputs, columns, {})).toEqual(["id", "status"])
-    expect(columnsRead({ ...paid, reads: "customers" }, state.inputs, columns, {})).toBeNull()
-    expect(columnsRead({ ...paid, reads: "x" }, state.inputs, columns, { x: [{ name: "n", type: "UInt8" }] })).toEqual(["n"])
+    expect(columnsRead(paid, columns, {})).toEqual(["id", "status"])
+    expect(columnsRead({ ...paid, reads: { id: "input-2" } }, columns, {})).toBeNull()
+    expect(columnsRead({ ...paid, reads: { id: "step-9" } }, columns, { "step-9": [{ name: "n", type: "UInt8" }] })).toEqual(["n"])
+    expect(columnsRead({ ...paid, reads: { name: "gone" } }, columns, {})).toBeNull()
   })
 
   it("completes a SQL step with the inputs and the earlier steps, and the inputs' columns", () => {

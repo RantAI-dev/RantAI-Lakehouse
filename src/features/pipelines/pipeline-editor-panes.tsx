@@ -18,6 +18,7 @@ import {
   type EditorInput,
   type EditorState,
   type EditorStep,
+  type StepRead,
 } from "@/lib/pipeline-editor"
 import { formatSql } from "@/lib/sql-format"
 import { lakehouseService } from "@/services"
@@ -281,6 +282,7 @@ export function TransformStepPane({
   index,
   count,
   readable,
+  readsName,
   columns,
   readsStep,
   failedTransform,
@@ -295,7 +297,10 @@ export function TransformStepPane({
   step: Extract<EditorStep, { kind: "transform" }>
   index: number
   count: number
-  readable: string[]
+  /** The inputs and earlier steps it may read, by id (R1-B2). */
+  readable: { id: string; name: string }[]
+  /** The name of what it reads now, for the sentences below. */
+  readsName: string
   columns: string[] | null
   /** Whether it reads a step (whose columns are known only once that step is previewed). */
   readsStep: boolean
@@ -304,7 +309,7 @@ export function TransformStepPane({
   failedMessageId?: string
   problem: React.ReactNode
   onRename: (name: string) => void
-  onChange: (patch: { reads?: string; transforms?: string[] }) => void
+  onChange: (patch: { reads?: StepRead; transforms?: string[] }) => void
   onMove: (delta: -1 | 1) => void
   onRemove: () => void
 }) {
@@ -315,15 +320,16 @@ export function TransformStepPane({
         <NameField id={`step-name-${step.id}`} value={step.name} onChange={onRename} />
         <div className="space-y-1.5">
           <Label htmlFor={`step-reads-${step.id}`}>Reads</Label>
-          {/* D6a: an input or an earlier step, by its exact name. */}
+          {/* D6a: an input or an earlier step. The value is the item's id,
+              so the choice follows a rename (R1-B2). */}
           <SelectField
             id={`step-reads-${step.id}`}
             className="w-full"
             aria-label="Reads"
-            value={step.reads}
+            value={"id" in step.reads ? step.reads.id : ""}
             placeholder="Choose an input or an earlier step"
-            options={readable.map((name) => ({ value: name, label: name }))}
-            onValueChange={(reads) => onChange({ reads })}
+            options={readable.map((item) => ({ value: item.id, label: item.name }))}
+            onValueChange={(id) => onChange({ reads: { id } })}
           />
         </div>
       </div>
@@ -331,7 +337,7 @@ export function TransformStepPane({
         transforms={step.transforms}
         onChange={(transforms) => onChange({ transforms })}
         columns={columns}
-        columnsNote={readsStep ? `Preview ${step.reads} to pick from its columns; until then, type them.` : undefined}
+        columnsNote={readsStep ? `Preview ${readsName} to pick from its columns; until then, type them.` : undefined}
         failedIndex={failedTransform}
         failedMessage={failedMessage}
         failedMessageId={failedMessageId}

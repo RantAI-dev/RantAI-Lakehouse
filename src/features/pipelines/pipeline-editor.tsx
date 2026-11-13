@@ -38,7 +38,8 @@ import {
   previewAsRecords,
   previewBody,
   previewKey,
-  readableNames,
+  readableItems,
+  readsName,
   readsAsYouAfterSave,
   removeItem,
   renameItem,
@@ -222,7 +223,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
   // of a form step that reads it.
   const stepColumns = React.useMemo(() => {
     const out: Record<string, Column[] | null> = {}
-    for (const step of editor.steps) out[step.name] = results[step.id]?.data.columns ?? null
+    for (const step of editor.steps) out[step.id] = results[step.id]?.data.columns ?? null
     return out
   }, [editor.steps, results])
 
@@ -394,9 +395,10 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
             key={step.id}
             {...common}
             step={step}
-            readable={readableNames(shownState, index)}
-            columns={columnsRead(step, inputs, inputColumns, stepColumns)}
-            readsStep={editor.steps.some((other) => other.name === step.reads)}
+            readable={readableItems(shownState, index)}
+            readsName={readsName(shownState, step.reads)}
+            columns={columnsRead(step, inputColumns, stepColumns)}
+            readsStep={editor.steps.some((other) => "id" in step.reads && other.id === step.reads.id)}
             failedTransform={errorItem === step.id && saveTarget?.kind === "step" ? saveTarget.transform : null}
             failedMessage={errorItem === step.id ? saveError : null}
             failedMessageId={errorMessageId}
@@ -567,7 +569,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                     key={step.id}
                     icon={step.kind === "sql" ? <CodeIcon aria-hidden /> : <ListChecksIcon aria-hidden />}
                     label={`${index + 1}. ${step.name || "Unnamed step"}`}
-                    detail={step.kind === "sql" ? "SQL" : `Form · reads ${step.reads || "…"}`}
+                    detail={step.kind === "sql" ? "SQL" : `Form · reads ${readsName(shownState, step.reads) || "…"}`}
                     selected={selection.kind === "step" && selection.id === step.id}
                     flagged={errorItem === step.id || Boolean(problems.items[step.id])}
                     describedBy={errorItem === step.id ? errorMessageId : undefined}

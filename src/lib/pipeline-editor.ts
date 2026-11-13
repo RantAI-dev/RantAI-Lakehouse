@@ -40,8 +40,18 @@ export const MAX_SQL_CHARS = 20_000
 
 export type EditorInput = { id: string; name: string; zone: string; table: string }
 
+/**
+ * What a form step reads: the item, by its id. BLD-1 part 1 S3 review
+ * R1-B2: following the item rather than the text of its name means a
+ * rename (even through an empty name), a reorder or a removal needs no text
+ * matching; the name is written only when the body is built.
+ * `{ name }` holds a stored `reads` that names no input or step, written
+ * back as it was so a save does not invent a different one.
+ */
+export type StepRead = { id: string } | { name: string }
+
 export type EditorStep =
-  | { id: string; kind: "transform"; name: string; reads: string; transforms: string[] }
+  | { id: string; kind: "transform"; name: string; reads: StepRead; transforms: string[] }
   | { id: string; kind: "sql"; name: string; sql: string }
 
 /**
@@ -74,11 +84,20 @@ export function editorStateFrom(def: Pick<AuthoredDefinition, "inputs" | "steps"
   if (!def) return { inputs: [{ id: "input-1", name: "", zone: "bronze", table: "" }], steps: [], seq: 1 }
   let seq = 0
   const inputs = def.inputs.map((input) => ({ id: `input-${++seq}`, name: input.name, zone: input.zone, table: input.table }))
-  const steps: EditorStep[] = def.steps.map((step) =>
-    step.kind === "sql"
-      ? { id: `step-${++seq}`, kind: "sql", name: step.name, sql: step.sql }
-      : { id: `step-${++seq}`, kind: "transform", name: step.name, reads: step.reads, transforms: [...step.transforms] }
-  )
+  const stepIds = def.steps.map(() => `step-${++seq}`)
+  // A stored `reads` names an item exactly (D6a); it is resolved to that
+  // item's id once, here.
+  const byName = new Map<string, string>()
+  def.inputs.forEach((input, i) => byName.set(input.name, inputs[i].id))
+  def.steps.forEach((step, i) => {
+    if (!byName.has(step.name)) byName.set(step.name, stepIds[i])
+  })
+  const steps: EditorStep[] = def.steps.map((step, i) => {
+    const id = stepIds[i]
+    if (step.kind === "sql") return { id, kind: "sql", name: step.name, sql: step.sql }
+    const readId = byName.get(step.reads)
+    return { id, kind: "transform", name: step.name, reads: readId ? { id: readId } : { name: step.reads }, transforms: [...step.transforms] }
+  })
   return { inputs, steps, seq }
 }
 
@@ -141,14 +160,31 @@ export function suggestInputName(table: string, others: readonly string[]): stri
 }
 
 /**
- * The names a step may read: every input, then every step before it, in
- * order. Exact names, case included (D6a); blank names are left out because
- * nothing can read them.
+ * The items a step may read: every input, then every step before it, in
+ * order (D6a). Items with a blank name are left out: nothing can read them.
  */
-export function readableNames(state: EditorState, stepIndex: number): string[] {
+export function readableItems(
+  state: Pick<EditorState, "inputs" | "steps">,
+  stepIndex: number
+): { id: string; name: string }[] {
   return [...state.inputs, ...state.steps.slice(0, Math.max(0, stepIndex))]
-    .map((item) => item.name)
-    .filter((name) => name.trim() !== "")
+    .filter((item) => item.name.trim() !== "")
+    .map((item) => ({ id: item.id, name: item.name }))
+}
+
+/** The names a step may read, exactly as written, case included (D6a). */
+export function readableNames(state: Pick<EditorState, "inputs" | "steps">, stepIndex: number): string[] {
+  return readableItems(state, stepIndex).map((item) => item.name)
+}
+
+/**
+ * The name a form step's `reads` is written as: the read item's current
+ * name, or the stored text when it named no item; `""` when the item it read
+ * was removed.
+ */
+export function readsName(state: Pick<EditorState, "inputs" | "steps">, reads: StepRead): string {
+  if ("name" in reads) return reads.name
+  return [...state.inputs, ...state.steps].find((item) => item.id === reads.id)?.name ?? ""
 }
 
 // ── changes ──────────────────────────────────────────────────────────────
@@ -180,12 +216,12 @@ export function addStep(state: EditorState, kind: EditorStep["kind"]): { state: 
   const [id, next] = nextId(state, "step")
   const names = [...state.inputs, ...state.steps].map((item) => item.name)
   const name = firstFree(`step_${state.steps.length + 1}`, names)
-  const previous = readableNames(state, state.steps.length)
-  const reads = previous[previous.length - 1] ?? ""
+  const previous = readableItems(state, state.steps.length)
+  const last = previous[previous.length - 1]
   const step: EditorStep =
     kind === "sql"
-      ? { id, kind: "sql", name, sql: reads ? `SELECT *\nFROM ${reads}` : "SELECT *\nFROM " }
-      : { id, kind: "transform", name, reads, transforms: [] }
+      ? { id, kind: "sql", name, sql: last ? `SELECT *\nFROM ${last.name}` : "SELECT *\nFROM " }
+      : { id, kind: "transform", name, reads: last ? { id: last.id } : { name: "" }, transforms: [] }
   return { state: { ...next, steps: [...next.steps, step] }, id }
 }
 
@@ -198,21 +234,16 @@ export function removeItem(state: EditorState, id: string): EditorState {
 }
 
 /**
- * Renames an input or a step. A `transform` step that read the old name
- * exactly now reads the new one, so a rename does not break the pipeline
- * behind it. The text of a SQL step is the user's and is not rewritten: if
- * it names the old name, the check says so on that step.
+ * Renames an input or a step. A form step reads its item by id, so it
+ * follows the rename with nothing to rewrite (R1-B2). The text of a SQL
+ * step is the user's and is not rewritten: if it names the old name, the
+ * page says so on that step.
  */
 export function renameItem(state: EditorState, id: string, name: string): EditorState {
-  const old = [...state.inputs, ...state.steps].find((item) => item.id === id)?.name
-  if (old === undefined) return state
   return {
     ...state,
     inputs: state.inputs.map((input) => (input.id === id ? { ...input, name } : input)),
-    steps: state.steps.map((step) => {
-      const renamed = step.id === id ? { ...step, name } : step
-      return renamed.kind === "transform" && old !== "" && renamed.reads === old ? { ...renamed, reads: name } : renamed
-    }),
+    steps: state.steps.map((step) => (step.id === id ? { ...step, name } : step)),
   }
 }
 
@@ -248,7 +279,7 @@ export function setInputTable(state: EditorState, id: string, table: string): Ed
 export function updateStep(
   state: EditorState,
   id: string,
-  patch: { reads?: string; transforms?: string[]; sql?: string }
+  patch: { reads?: StepRead; transforms?: string[]; sql?: string }
 ): EditorState {
   return {
     ...state,
@@ -306,10 +337,13 @@ export function editorProblems(state: EditorState, output: OutputSettings): Edit
     if (problem) items[input.id] = problem
   })
   state.steps.forEach((step, index) => {
-    const readable = readableNames(state, index)
     let problem = nameProblem(step.name, otherNames(state, step.id))
     if (!problem && step.kind === "transform") {
-      if (!readable.includes(step.reads)) problem = "Choose an input or an earlier step for this step to read."
+      const reads = step.reads
+      const later = "id" in reads && state.steps.slice(index).some((other) => other.id === reads.id)
+      if (later) problem = "This step reads a step that comes after it; reorder the steps."
+      else if (!("id" in reads) || !readableItems(state, index).some((item) => item.id === reads.id))
+        problem = "Choose an input or an earlier step for this step to read."
       // BLD-10 D2: an empty form step is a copy that was not chosen.
       else if (step.transforms.length === 0) problem = "Add an operation, or remove this step."
     }
@@ -350,12 +384,13 @@ export function definitionBody(inputs: readonly EditorInput[], steps: readonly E
   inputs: PipelineInput[]
   steps: PipelineStep[]
 } {
+  const state = { inputs: [...inputs], steps: [...steps] }
   return {
     inputs: inputs.map((input) => ({ name: input.name.trim(), zone: input.zone.trim(), table: input.table.trim() })),
     steps: steps.map((step) =>
       step.kind === "sql"
         ? { name: step.name.trim(), kind: "sql", sql: step.sql }
-        : { name: step.name.trim(), kind: "transform", reads: step.reads.trim(), transforms: [...step.transforms] }
+        : { name: step.name.trim(), kind: "transform", reads: readsName(state, step.reads).trim(), transforms: [...step.transforms] }
     ),
   }
 }
@@ -478,17 +513,16 @@ export type Column = { name: string; type: string }
 /**
  * The columns a `transform` step's pickers offer: those of what it reads.
  * An input's come from the lakehouse (`getTableDetail`); a step's come from
- * its last preview, when it has one. `null` when they are not known, and the
- * fields stay free text.
+ * its last preview, when it has one. Both maps are keyed by item id. `null`
+ * when they are not known, and the fields stay free text.
  */
 export function columnsRead(
   step: Extract<EditorStep, { kind: "transform" }>,
-  inputs: readonly EditorInput[],
   inputColumns: Readonly<Record<string, Column[] | null>>,
   stepColumns: Readonly<Record<string, Column[] | null>>
 ): string[] | null {
-  const input = inputs.find((candidate) => candidate.name === step.reads)
-  const columns = input ? inputColumns[input.id] : stepColumns[step.reads]
+  if (!("id" in step.reads)) return null
+  const columns = inputColumns[step.reads.id] ?? stepColumns[step.reads.id]
   return columns && columns.length > 0 ? columns.map((column) => column.name) : null
 }
 
