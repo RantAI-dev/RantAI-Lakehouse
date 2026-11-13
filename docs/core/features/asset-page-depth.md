@@ -35,6 +35,10 @@ its version history does not say who made a version. Read from the code on
 4. With the governance permission: restore a dropped Iceberg table within the
    retention window.
 5. Read each version's author in the history where the author is recorded.
+6. With the governance permission *(proposed, not yet signed)*: drop a table
+   that a file upload made, from the table's page, after a confirmation that
+   names the table and its row count, and restore it from the same page
+   within 7 days (`DATA-55`, `DEC-21`).
 
 ## Not included
 
@@ -42,11 +46,13 @@ its version history does not say who made a version. Read from the code on
 - Restore of ClickHouse tables (they keep no Iceberg metadata to restore from).
 - Usage of dashboards counted as table reads (today's counter does not count
   them; that does not change here).
+- Dropping a table made by a connector or a pipeline (`DEC-21`).
 
 ## Asking the assistant
 
 Not part of the dashboards assistant. AI work for the Data module is handed to
-the AI team in `AI-16`.
+the AI team in `AI-16`. The assistant has no tool that drops or restores a
+table (`DATA-55`).
 
 ## Decisions
 
@@ -63,6 +69,15 @@ reported, not quietly lowered.
 | 4 | Who may restore, and what restore does. | `governance:write`. Restore re-registers a dropped Iceberg table from its retained metadata, within 7 days of the drop (the spec's number). The product must not purge a dropped table's metadata before the window ends; if the catalog has already purged it, the page says so with the reason instead of pretending. ClickHouse tables: not restorable, said in the UI. | 2026-10-14 |
 | 5 | Version history author. | The author shown is the principal recorded when the write was committed through this product's loader; versions committed by anything else say "unknown" rather than a guess. Writing the principal is a loader change owned by the orchestration team — coordinated at the end of this item (it touches the flow Phase 1's `SRC-11` is rebuilding). | 2026-10-14 |
 | 6 | Entity relationship diagram. | Dropped from this item (the spec proposed the drop); `BACKLOG.md` keeps an entry if the owner wants it later. | 2026-10-14 |
+| 7 | Which tables can be dropped from the console. | A table made by a file upload, with the 7-day restore. Tables made by a connector or a pipeline are out of scope. | 2026-11-12 (`DEC-21`) |
+| 8 | Who may drop. | `governance:write`, the permission that restores (decision 4), so whoever can drop can also restore. The person must belong to the tenant whose upload made the table, and their roles must be allowed to read it. | *(proposed, not yet signed)* |
+| 9 | Where. | The table's page, Activity tab, Snapshots card: Drop table while the table exists, Restore once it is dropped. The Catalog lists the dropped tables with the days each has left; the list links to the page and does not restore. | *(proposed, not yet signed)* |
+| 10 | What the confirmation says. | The table's name and its row count, counted when the dialog opens. When the rows cannot be counted the dialog says so; it never shows 0 for an unknown count. It also says the table can be restored for 7 days and that what reads it will fail until then. | *(proposed, not yet signed)* |
+| 11 | What a drop leaves alone. | Everything but the table: its uploaded files, its entry in the Catalog, and the pipelines, quality rules, saved queries, dashboards, marks and grants that name it. Those that read it fail until it is restored. | *(proposed, not yet signed)* |
+| 12 | The table's name during the 7 days. | Closed: a new load into it is refused with a sentence that says to restore the table or choose another name. After the 7 days the name takes a new load. | *(proposed, not yet signed)* |
+| 13 | The audit trail. | A drop and a restore are each written before they happen (`allowed`) and again when they end (`executed` or `failed`), with who, which table and, for a drop, its row count. If the first entry cannot be written, nothing is dropped or restored. | *(proposed, not yet signed)* |
+
+**Added 2026-11-12 (`DATA-55`).** Row 7 is the product owner's decision `DEC-21`; rows 8 to 13 are proposed and not yet signed.
 
 ## Limits to tell a customer
 
@@ -77,6 +92,13 @@ reported, not quietly lowered.
 - A version written by a file upload names the person who started the load, as "<name> (file upload)", with the name they had then; a version written by a connector's replace or append names the connector's run. A merge load and every version written before 2026-11-12 say "unknown" (`DATA-52`).
 - Frequent users are shown by name. A person who no longer exists is "Unknown user", and all such people share one row. A person of another tenant is "Unknown user" too: a name is only shown to someone who shares a tenant with that person. A caller with a service token is shown by the service identity's own name, in its own row.
 - A table whose Iceberg table is no longer there shows no row count (`DATA-54`).
+- Only a table that a file upload made can be dropped from the console, and only by someone of the tenant whose upload made it. A connector's table and a pipeline's table cannot (`DATA-55`, `DEC-21`).
+- A dropped table can be restored for 7 days from its page. After that it cannot come back. Whether the catalog then removes its files from storage was not measured.
+- Dropping a table deletes nothing else. Its uploaded files stay, and so does its entry in the Catalog, also after the 7 days. Pipelines, quality rules, saved queries and dashboards that read it fail until it is restored.
+- While a dropped table can still be restored, a file cannot be loaded into its name.
+- A table with a load in progress cannot be dropped until the load ends.
+- The row count in the confirmation is counted at that moment and can take up to 30 seconds on a large table; when it cannot be counted the dialog says so.
+- Dropping needs the restore to be configured on the install (the catalog's admin token). Without it nothing can be dropped.
 
 ## Spec rows
 
@@ -87,6 +109,7 @@ reported, not quietly lowered.
 | Access: grant and revoke from the asset | **Met in code** |
 | Restore: dropped table within 7 days | **Partly met** (soft delete on every warehouse and undrop route built; only drops after soft-delete profile applied; Bronze Iceberg only) |
 | History: version time, operation and author | **Partly met** (author is read and shown; a merge load, and versions written before 2026-11-12, say "unknown") |
+| Drop: a table made by an upload, from its page | **Built, not proven against the catalog** (`DATA-55`; the proof is the G9 gate) |
 
 ## Acceptance checklist
 
@@ -105,6 +128,13 @@ them with the decisions above.
 | `DATA-15-AC7` | Try to restore a table dropped before the window, or a ClickHouse table | An honest refusal with the reason | Pass 2026-10-23 (product owner) |
 | `DATA-15-AC8` | Load a table through the pipeline, then read its history | The new version names the pipeline principal as author; an old version says "unknown" | Pass 2026-10-23 (product owner) |
 | `DATA-15-AC9` | As a user without the permission, call the restore route | 403; nothing changes | Pass 2026-10-23 (product owner) |
+| `DATA-15-AC10` | As `governance:write`, open the page of a table an upload made, Activity tab, and press Drop table | A dialog names the table and its row count (or says the rows could not be counted) and says it can be restored for 7 days | |
+| `DATA-15-AC11` | Confirm the drop | The page says the table was dropped and until when it can be restored; the Catalog lists it under Dropped tables with the days left; the audit trail names who dropped which table and its row count | |
+| `DATA-15-AC12` | Press Restore on the same page | The table is back with the same row count and can be queried; it is gone from Dropped tables | |
+| `DATA-15-AC13` | Open the page of a table a connector made, and of a Silver table | No Drop table; calling the drop route answers "Only a table made by a file upload can be dropped here." | |
+| `DATA-15-AC14` | Without `governance:write`, open an uploaded table's page and call the drop route | No Drop table; 403; nothing changes | |
+| `DATA-15-AC15` | While the table is dropped, load a file into its name | Refused with the sentence that says to restore it or choose another name | |
+| `DATA-15-AC16` | Start a load into an uploaded table and try to drop it while it loads | Refused: a file is being loaded into this table | |
 
 **Acceptor** (not the Owner): product owner (held in the base) **Date:** 2026-10-23 **Build:** main 0e5498d2
 
