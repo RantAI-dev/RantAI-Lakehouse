@@ -232,6 +232,14 @@ jobs:
       - name: Check every file compiled into Rust from outside rust/ sets the rust scope (OPS-24)
         run: python3 ops/lint/check_rust_embedded_paths.py
 
+      # OPS-32 D6: `autotests = false` makes a crate build only the `[[test]]`
+      # targets its manifest names, so a `tests/<name>.rs` nobody declared in a
+      # root silently stops running — green, with those tests gone, and no count
+      # check in this file is fine-grained enough to see one file disappear. The
+      # self-test runs first: a guard that cannot fail proves nothing.
+      - name: Check every Rust test file is compiled into a test binary (OPS-32)
+        run: bash ./scripts/ci/tests/test_check_test_modules.sh && ./scripts/ci/check_test_modules.sh
+
       # A dangling `from dispar_orchestrate.X import Y` is an ImportError at
       # code-location load, which takes down EVERY job in the location — the
       # visible symptom is G3a failing with "'bronze_ingest_job' not in
