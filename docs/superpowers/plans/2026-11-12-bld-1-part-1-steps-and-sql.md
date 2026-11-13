@@ -1320,3 +1320,139 @@ two gates in `g3a-dagster` (the G7 case with two inputs and a SQL step; the
 author gate against the compile route) have never run to the end on it. The
 pull request stays a draft until that run is green; a failure there reopens
 the review.
+
+### S3, round 1 (reviewer, 2026-11-13)
+
+Reviewed `origin/main...87017487a` (24 files, +3798 −1381) against D17, D17a
+and S3-T1 to S3-T5, and against the API on `main`.
+
+**Re-run by the reviewer on `87017487a`**, in the developer's worktree:
+`bun run typecheck` exit 0; `bun run lint` 0 errors, 11 warnings (the 11 on
+`main`); under the lock, `bun test src/features/pipelines/` 143 pass, 0 fail;
+`bun test src/lib/pipeline-editor.test.ts src/lib/transform-draft.test.ts
+src/components/patterns/sql-rows-table.test.tsx
+src/services/clients/pipelines.test.ts` 62 pass, 0 fail. Not re-run by the
+reviewer: `src/lib/` as a whole, `src/services/` as a whole,
+`src/features/dashboards/` (the handoff's counts stand unchecked); CI runs
+the whole suite. **Not verified by anyone: how the page looks in a browser,
+and the page against a running API.**
+
+What is right: the rules are pure functions in `src/lib` with their own
+tests; saves send only `inputs` and `steps`; the limits and the name rule
+equal the compiler's; a preview's answer is filed by item and by the body
+sent, a second run aborts the first, and an old answer cannot land on
+another item; `useService` and `useServiceAction` throughout, no hand-rolled
+fetch, no mock of a service, no native select; the connector entry, its
+table list and both trigger switches behave as on `main`; the moved
+`SqlRowsTable` and `SqlColumnChips` leave the dashboard panel as it was; 21
+of the 22 old tests are carried over and the handoff maps each.
+
+Accepted as reported: the FBIC row leaves the editor (the body still sends
+`fbicEnabled`; the read view keeps its row; `BLD-10` allowed hiding it); the
+pipeline's name sits above the tabs; D17a's sentence is also said for a
+pipeline with no author; a second input beside a connector is refused on the
+page (D12); the read view's edges for a SQL step are a drawing aid.
+
+#### BLOCKER
+
+- **R1-B1. Every edit erases the stored incremental column, and the comment
+  says it does not.** `pipeline-editor.tsx:243`: "the incremental column is
+  not sent, which the API reads as 'leave it alone'". The API writes
+  `incremental_column = $7` with no `COALESCE`
+  (`lakehouse-store/src/pipelines.rs:1611`), so an edit of the schedule alone
+  sets the column to NULL. Decision 18 took the field off the page, not out
+  of the row. Send the stored `incrementalColumn` back unchanged on edit, as
+  the stored `kind` is, correct the comment, and turn the test at
+  `pipeline-create-page.test.tsx:754` round: it pins the loss.
+- **R1-B2. Clearing a name and typing a new one detaches every form step
+  that read it.** `src/lib/pipeline-editor.ts:214` follows a rename only
+  while `old !== ""`. Backspacing `orders_raw` to nothing moves each reader's
+  `reads` to `""`; the next keystroke no longer follows. A form step's
+  `reads` must follow the item it reads, not the text of its name: hold the
+  read item's id in the editor's state and write the name when the body is
+  built. Test: a rename typed one character at a time through the empty
+  string keeps the reader attached.
+- **R1-B3. A test was carried over without what it asserted.** Old "BLD-10:
+  no transform shown as a plain copy on Review" switched the plain copy on
+  and asserted the summary. The new test (`:592`) asserts a line the rail
+  shows for any pipeline with no step, and passes when the copy was never
+  chosen. Assert what the old one did: with the plain copy switched on, the
+  page says the output is a copy of the input, and with it off it does not
+  (rule 2).
+
+#### SHOULD-FIX
+
+- **R1-S1. Changing an input's table renames the input under a SQL step.**
+  `pipeline-editor.ts:243`: the name follows the table while it still equals
+  the suggestion. Input `orders`, step `SELECT * FROM orders`; the table
+  becomes `orders_v2`, the name with it, and the SQL now names something
+  that is not an input, which the page does not say until the server refuses
+  the save. Let the name follow the table only while no step reads it (no
+  form step reads it and no SQL step's text names it). And flag on the page,
+  as a hint, a SQL step that names something after `FROM` or `JOIN` that is
+  neither an input, an earlier step nor a `WITH` name of its own; the server
+  stays the authority.
+- **R1-S2. A step of a kind the console does not know crashes the editor and
+  the read view.** `contracts/pipelines.ts:174` is a closed union
+  (`CODE-STANDARD.md` 4.2 asks for `| string`); `pipeline-editor.ts:78`
+  treats anything not `"sql"` as a form step and spreads `transforms`;
+  `pipeline-flow-layout.ts:192` tokenises an undefined `sql`. Part 2 adds
+  kinds. An unknown step is shown as one the page cannot edit, is kept
+  exactly as stored when the pipeline is saved, and is drawn in the read
+  view with its name and kind.
+- **R1-S3. The page does not say why Save is disabled.** A stored pipeline
+  the API accepts can fail a rule only the page has (a form step with no
+  operation, several inputs with no step), and a missing pipeline name or
+  schedule disables Save with no word. Next to the button, say what is
+  missing and where, and select the item on a click.
+- **R1-S4. On a pipeline fed by a connector, the page reports a change
+  nobody made.** `pipeline-editor.tsx:137`: while the connector's tables
+  load, or when that read fails, the first input's table is empty, so D17a's
+  sentence shows and the input is flagged. Until the tables are loaded, keep
+  the stored input as it is and count no change.
+- **R1-S5. A preview's refusal is not put on the item it names.** The client
+  comment (`clients/pipelines.ts:174`) says the editor reads it; the editor
+  prints the text. An input is previewed alone, so a refusal about the third
+  input says `inputs[0]`; a step preview sends every input, so one unfinished
+  input blocks every step's preview. Map the path in the answer back to the
+  item of the body that was sent and select or mark it; leave an input with
+  no table out of a preview body; mark an old refusal stale after an edit,
+  as an old answer is.
+- **R1-S6. Each keystroke in one table name re-reads the columns of every
+  input.** `pipeline-editor.tsx:175`: one read keyed on all inputs. Read per
+  input, and only when that input's zone or table changed.
+- **R1-S7. Words on the page that are not true.** The Output pane says "No
+  steps: the output is a copy of the input." with several inputs or with the
+  copy not chosen, and its preview hint says "Give it a name first" where no
+  name is missing; "It returned no rows." appears twice in the preview; a
+  refused operation's red row moves to another row when an earlier one is
+  removed.
+- **R1-S8. Comments that are not true (rule 1).**
+  `contracts/pipelines.ts:60` and `:453` (the author never changes on edit:
+  false since D10); `:279` (the old fields kept "for the assistant's builder
+  dialog": nothing in the console sends them); `sql-rows-table.tsx:11` (one
+  addition: there are two); `pipeline-editor.ts:545` (an edge it draws is one
+  the step has: not for `EXTRACT(x FROM paid)`); "five-step form" in
+  `pipeline-reupload-trigger.ts:5` and `pipeline-connector-trigger.ts:7`;
+  "`Field` wrapper" in `pipeline-pickers.tsx:111`.
+- **R1-S9. Leftovers.** `parseTransformDraft` and `transformErrorRowIndex`
+  have no caller outside tests; the flowchart's `transform` node kind is no
+  longer produced; `sourceZone`, `sourceTable` and `transforms` were made
+  optional on the create and update inputs although the console never sends
+  them (remove them from those types; `AGENTS.md`: remove consumers rather
+  than optional a field).
+- **R1-S10. Accessibility.** `aria-describedby` on a rail item points at an
+  element that exists only while that item's pane is open; a hint from the
+  page's own rules has no id and is not tied to its field; the table label
+  has no target while the connector's tables load; `aria-invalid` sits on an
+  `<li>`.
+- **R1-S11. Tests for what was found:** the highlight of
+  `steps[i].transforms[j]`; R1-B2's rename; R1-S1's table change with a SQL
+  step; R1-S2's unknown step kind in the editor and in the read view; R1-S4.
+
+#### For the API, not for this developer
+
+- D1 says a pipeline with no step has exactly one input. The compiler does
+  not refuse several inputs with no step; it copies the first. The page's
+  own rule ("With more than one input, add a step that reads them") is
+  right; the compiler gets the same rule in S2's fix round, so the two agree.
