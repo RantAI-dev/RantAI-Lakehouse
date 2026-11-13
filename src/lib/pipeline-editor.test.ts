@@ -32,6 +32,7 @@ import {
   removeItem,
   renameItem,
   setInputTable,
+  sqlStepReads,
   stepCompletion,
   suggestInputName,
   updateStep,
@@ -390,5 +391,22 @@ describe("columns and completion", () => {
     expect(cache.customers).toBeUndefined()
     // The first step reads no step.
     expect(stepCompletion(stored(), 0, columns).tables.map((table) => table.reference)).toEqual(["orders", "customers"])
+  })
+})
+
+describe("sqlStepReads (the pipeline page's edges)", () => {
+  const names = ["orders", "customers", "paid"]
+
+  it("reads the names after FROM and JOIN, as written, once each", () => {
+    expect(
+      sqlStepReads("SELECT * FROM paid AS p LEFT JOIN customers c ON p.customer_id = c.id JOIN paid q ON 1=1", names)
+    ).toEqual(["paid", "customers"])
+    expect(sqlStepReads("SELECT * FROM `orders`", names)).toEqual(["orders"])
+  })
+
+  it("does not take a name in a string, a comment, another case, or a qualified name", () => {
+    expect(sqlStepReads("SELECT 'FROM orders' AS t -- FROM customers\nFROM paid", names)).toEqual(["paid"])
+    expect(sqlStepReads("SELECT * FROM ORDERS", names)).toEqual([])
+    expect(sqlStepReads("SELECT * FROM bronze.orders", names)).toEqual([])
   })
 })

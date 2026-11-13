@@ -6,15 +6,16 @@
  * order, then what they write. The reads and writes are what each op
  * declares in its own code (`op_metadata.source_metadata`), so the chart
  * labels them "declared". An authored pipeline is drawn as its stored
- * definition: source table, the transforms in order, target table. The
- * layout is columns left to right; nodes that share a column are stacked,
- * and an edge inside one column (a transform chain) runs top to bottom.
+ * definition (BLD-1 part 1 D17): its inputs, its steps, its output table.
+ * The layout is columns left to right; nodes that share a column are
+ * stacked, and an edge inside one column runs top to bottom.
  */
+import { sqlStepReads } from "@/lib/pipeline-editor"
 import type { EntityStatus } from "@/lib/status"
 import type { AuthoredDefinition, PipelineOpEdge, PipelineOpNode } from "@/services/contracts/pipelines"
 import { topoSortOps } from "./topo-sort-ops"
 
-export type FlowKind = "source" | "op" | "transform" | "sink"
+export type FlowKind = "source" | "op" | "transform" | "step" | "sink"
 
 export type FlowNodeSpec = {
   id: string
@@ -23,8 +24,10 @@ export type FlowNodeSpec = {
   label: string
   sublabel?: string
   status?: EntityStatus
-  /** For an op, its name; for a transform, its index. Used to open the side panel. */
+  /** For an op, its name; for a transform, an input or a step, its index. Used to open the side panel. */
   ref?: string
+  /** For a pipeline step: whether it is SQL or the form (BLD-1 part 1 D1). */
+  stepKind?: "sql" | "transform"
 }
 
 export type FlowEdgeSpec = { from: string; to: string }
@@ -43,6 +46,7 @@ const SIZE: Record<FlowKind, { w: number; h: number }> = {
   sink: { w: 208, h: 58 },
   op: { w: 224, h: 86 },
   transform: { w: 216, h: 58 },
+  step: { w: 216, h: 58 },
 }
 
 /** Sized so a two-op job (read, op, op, write) fits the content width of a 1440 px screen. */
@@ -55,7 +59,7 @@ export function layoutFlow(nodes: readonly FlowNodeSpec[], edges: readonly FlowE
   const columns = [...new Set(nodes.map((n) => n.column))].sort((a, b) => a - b)
   // Within a column, ops and transforms first, then data, so a job's
   // spine of ops lines up and its data hangs below.
-  const rank = (n: FlowNodeSpec) => (n.kind === "op" || n.kind === "transform" ? 0 : 1)
+  const rank = (n: FlowNodeSpec) => (n.kind === "op" || n.kind === "transform" || n.kind === "step" ? 0 : 1)
   const byColumn = columns.map((c) =>
     nodes.filter((n) => n.column === c).sort((a, b) => rank(a) - rank(b))
   )
@@ -151,40 +155,77 @@ export function dagsterFlow(
   return { nodes, edges }
 }
 
-/** An authored pipeline: source table, each transform in order (one column, top to bottom), target table. */
+/**
+ * An authored pipeline (BLD-1 part 1 D17): its inputs in the first column,
+ * each step one column right of the right-most thing it reads, and the
+ * output table right of the last step, which is what it writes.
+ *
+ * An edge says what a step reads: a form step's `reads`, and a SQL step's
+ * names after `FROM` and `JOIN` (`sqlStepReads`, a drawing aid that leaves
+ * out what it cannot place rather than guess). With no step the output is a
+ * copy of the one input, and the chart says so (BLD-10 D3).
+ */
 export function authoredFlow(
   def: AuthoredDefinition,
   describe: (raw: string) => { verb: string; detail: string } | null
 ): { nodes: FlowNodeSpec[]; edges: FlowEdgeSpec[] } {
-  const source: FlowNodeSpec = {
-    id: "source",
-    column: 0,
-    kind: "source",
-    label: `${def.sourceZone}.${def.sourceTable}`,
-    sublabel: def.incrementalColumn ? `incremental on ${def.incrementalColumn}` : "full read",
-  }
-  const transforms: FlowNodeSpec[] = def.transforms.map((raw, i) => {
-    const t = describe(raw)
-    return {
-      id: `t${i}`,
-      column: 1,
-      kind: "transform",
-      label: t ? t.verb : "transform",
-      sublabel: t ? t.detail : raw,
+  const nodes: FlowNodeSpec[] = []
+  const edges: FlowEdgeSpec[] = []
+  /** Each name's node and column, as the definition reaches it. */
+  const placed = new Map<string, { id: string; column: number }>()
+  def.inputs.forEach((input, i) => {
+    const id = `input:${i}`
+    nodes.push({
+      id,
+      column: 0,
+      kind: "source",
+      label: `${input.zone}.${input.table}`,
+      sublabel: input.name !== input.table ? `read as ${input.name}` : undefined,
       ref: String(i),
-    }
+    })
+    placed.set(input.name, { id, column: 0 })
   })
+  def.steps.forEach((step, i) => {
+    const id = `step:${i}`
+    const known = [...placed.keys()]
+    const reads =
+      step.kind === "transform" ? (known.includes(step.reads) ? [step.reads] : []) : sqlStepReads(step.sql, known)
+    const column = 1 + Math.max(0, ...reads.map((name) => placed.get(name)?.column ?? 0))
+    const operations = step.kind === "transform" ? step.transforms.map((raw) => describe(raw)?.verb ?? "transform") : []
+    nodes.push({
+      id,
+      column,
+      kind: "step",
+      label: step.name,
+      sublabel:
+        step.kind === "sql"
+          ? "SQL"
+          : operations.length > 0
+            ? operations.join(", ")
+            : "no operation",
+      ref: String(i),
+      stepKind: step.kind,
+    })
+    for (const name of reads) {
+      const from = placed.get(name)
+      if (from) edges.push({ from: from.id, to: id })
+    }
+    placed.set(step.name, { id, column })
+  })
+  // The output is what the last step returns; with no step, the one input.
+  const last = def.steps.length > 0 ? nodes[nodes.length - 1] : null
+  const writer = last ?? (def.inputs.length === 1 ? nodes[0] : null)
   const target: FlowNodeSpec = {
     id: "target",
-    column: transforms.length > 0 ? 2 : 1,
+    column: (writer?.column ?? 0) + 1,
     kind: "sink",
     label: `${def.targetZone}.${def.targetTable}`,
-    // BLD-10 D3: a pipeline with no transform copies its source as is.
-    // The chart says so, rather than leaving a reader to guess what an
-    // empty middle column means.
-    sublabel: transforms.length > 0 ? undefined : "plain copy of the source",
+    // BLD-10 D3: a pipeline with no step copies its input as is. The chart
+    // says so, rather than leaving a reader to guess what an empty middle
+    // means.
+    sublabel: last === null ? "plain copy of the source" : undefined,
   }
-  const chain = [source, ...transforms, target]
-  const edges = chain.slice(1).map((n, i) => ({ from: chain[i].id, to: n.id }))
-  return { nodes: chain, edges }
+  nodes.push(target)
+  if (writer) edges.push({ from: writer.id, to: target.id })
+  return { nodes, edges }
 }

@@ -4,6 +4,7 @@ import * as React from "react"
 import { useReducedMotion } from "motion/react"
 import {
   BoxIcon,
+  CodeIcon,
   CopyXIcon,
   DatabaseIcon,
   FilterIcon,
@@ -92,6 +93,27 @@ function NodeCard({
           </span>
           <span className="line-clamp-2 text-xs font-medium leading-4 [overflow-wrap:anywhere]">{node.label}</span>
           {node.sublabel ? <span className="block truncate text-[10px] text-muted-foreground">{node.sublabel}</span> : null}
+        </span>
+      </button>
+    )
+  }
+
+  if (node.kind === "step") {
+    // BLD-1 part 1 D17: a step of an authored pipeline, named as the
+    // pipeline names it; its kind is the icon and the line under it.
+    return (
+      <button
+        type="button"
+        style={style}
+        onClick={onSelect ? () => onSelect(node) : undefined}
+        className={cn(base, "border-border bg-card px-3 shadow-xs", ring)}
+      >
+        <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-primary/10 text-primary">
+          {node.stepKind === "sql" ? <CodeIcon className="size-4" aria-hidden /> : <ListChecksIcon className="size-4" aria-hidden />}
+        </span>
+        <span className="min-w-0">
+          <span className="block truncate font-mono text-sm font-medium leading-5">{node.label}</span>
+          <span className="block truncate text-[11px] text-muted-foreground">{node.sublabel}</span>
         </span>
       </button>
     )

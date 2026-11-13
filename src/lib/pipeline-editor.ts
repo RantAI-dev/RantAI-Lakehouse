@@ -19,6 +19,7 @@
  */
 
 import type { ColumnState, CompletionTable } from "./sql-completion"
+import { tokenizeSql } from "./sql-text"
 import type { DataLayer } from "./status"
 import type {
   AuthoredDefinition,
@@ -529,4 +530,36 @@ export function stepCompletion(
     tables.push({ id: name, label: `${name} (step)`, reference: name, layer: "silver", names: [name] })
   }
   return { tables, columns }
+}
+
+// ── what a SQL step reads, for drawing (D17 read view) ───────────────────
+
+/**
+ * The names of `names` a SQL step reads right after a `FROM` or a `JOIN`,
+ * in the order it first names them. The pipeline page draws an edge for
+ * each; it is a drawing aid, not a check (the API's `StepReads` walk is
+ * the check, D6a). It reads the text through the console's one scanner, so
+ * a name inside a string or a comment is not taken; it compares as written,
+ * case included, as the API does; and it leaves out what it cannot place
+ * without a parser (a second table after a comma in `FROM a, b`), so an
+ * edge it draws is one the step has and none is invented.
+ */
+export function sqlStepReads(sql: string, names: readonly string[]): string[] {
+  const tokens = tokenizeSql(sql).filter((token) => token.kind !== "comment")
+  const out: string[] = []
+  tokens.forEach((token, i) => {
+    const previous = tokens[i - 1]
+    if (!previous || previous.kind !== "word" || !/^(FROM|JOIN)$/i.test(previous.text)) return
+    // A backtick- or double-quoted name is the name inside the quotes.
+    const name =
+      token.kind === "word"
+        ? token.text
+        : token.kind === "quoted" && /^[`"]/.test(token.text)
+          ? token.text.slice(1, -1)
+          : null
+    // `zone.table` is not a step's name (D6a refuses it); skip a qualified one.
+    if (name === null || tokens[i + 1]?.text === ".") return
+    if (names.includes(name) && !out.includes(name)) out.push(name)
+  })
+  return out
 }

@@ -49,7 +49,10 @@ describe("dagsterFlow", () => {
 })
 
 describe("authoredFlow", () => {
-  test("source, the transforms stacked in one column, then target", () => {
+  // BLD-1 part 1 D17: a pipeline is inputs, steps and an output, so a form
+  // step is one node (its operations are listed in its panel), where the
+  // chart of before drew one node per transform.
+  test("an input, one form step, then the target", () => {
     const { nodes, edges } = authoredFlow(
       {
         // BLD-1 part 1 / D3: the API returns both forms of the definition.
@@ -66,13 +69,57 @@ describe("authoredFlow", () => {
       },
       describeTransform
     )
-    expect(nodes.map((n) => [n.id, n.column])).toEqual([
-      ["source", 0],
-      ["t0", 1],
-      ["t1", 1],
-      ["target", 2],
+    expect(nodes.map((n) => [n.id, n.column, n.label])).toEqual([
+      ["input:0", 0, "silver.events"],
+      ["step:0", 1, "transformed"],
+      ["target", 2, "gold.events_clean"],
     ])
-    expect(edges.map((e) => `${e.from}>${e.to}`)).toEqual(["source>t0", "t0>t1", "t1>target"])
+    expect(nodes[1].sublabel).toBe("dedupe, select")
+    expect(edges.map((e) => `${e.from}>${e.to}`)).toEqual(["input:0>step:0", "step:0>target"])
+  })
+
+  test("two inputs and a SQL step: each step sits right of what it reads, edges from what it names", () => {
+    const { nodes, edges } = authoredFlow(
+      {
+        inputs: [
+          { name: "orders", zone: "bronze", table: "orders_raw" },
+          { name: "customers", zone: "bronze", table: "customers" },
+        ],
+        steps: [
+          { name: "paid", kind: "transform", reads: "orders", transforms: ["filter(status = 'paid')"] },
+          {
+            name: "by_country",
+            kind: "sql",
+            sql: "SELECT c.country, sum(p.amount) FROM paid AS p LEFT JOIN customers AS c ON p.customer_id = c.id GROUP BY 1",
+          },
+        ],
+        sourceZone: "bronze",
+        sourceTable: "orders_raw",
+        incrementalColumn: null,
+        transforms: [],
+        fbicEnabled: false,
+        targetZone: "silver",
+        targetTable: "sales_by_country",
+        connectorId: null,
+      },
+      describeTransform
+    )
+    expect(nodes.map((n) => [n.id, n.column])).toEqual([
+      ["input:0", 0],
+      ["input:1", 0],
+      ["step:0", 1],
+      ["step:1", 2],
+      ["target", 3],
+    ])
+    // An input read under another name says so.
+    expect(nodes[0].sublabel).toBe("read as orders")
+    expect(nodes[3]).toMatchObject({ kind: "step", stepKind: "sql", sublabel: "SQL" })
+    expect(edges.map((e) => `${e.from}>${e.to}`)).toEqual([
+      "input:0>step:0",
+      "step:0>step:1",
+      "input:1>step:1",
+      "step:1>target",
+    ])
   })
 
   // BLD-10 D3: a pipeline with no transform copies its source as is. The
@@ -94,12 +141,14 @@ describe("authoredFlow", () => {
       },
       describeTransform
     )
+    // The input's node id is `input:0` since BLD-1 part 1 D17 (it was
+    // `source` when a pipeline had one source); the layout is the same.
     expect(nodes.map((n) => [n.id, n.column])).toEqual([
-      ["source", 0],
+      ["input:0", 0],
       ["target", 1],
     ])
     expect(nodes.find((n) => n.id === "target")?.sublabel).toBe("plain copy of the source")
-    expect(edges.map((e) => `${e.from}>${e.to}`)).toEqual(["source>target"])
+    expect(edges.map((e) => `${e.from}>${e.to}`)).toEqual(["input:0>target"])
   })
 })
 

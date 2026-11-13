@@ -216,22 +216,27 @@ export function DagsterDefinition({
 }
 
 /**
- * An authored pipeline as a flowchart: source table, each transform in
- * order, target table. Below it, the selected step and the stored
- * definition itself: the exact record the engine reads, since an authored
- * pipeline has no code of its own. Its transforms are the strings
- * `transform_grammar::parse_transform` accepted when it was saved.
+ * An authored pipeline as a flowchart (BLD-1 part 1 D17): its inputs, its
+ * steps and its output table. Below it, the selected item — an input's
+ * table, a SQL step's SQL in `CodeView`, a form step's operations — and the
+ * stored definition itself: the exact record the API compiles into the one
+ * statement a run executes (D8), since an authored pipeline has no code of
+ * its own.
  */
 export function AuthoredFlow({ pipeline }: { pipeline: PipelineDetail }) {
   const def = pipeline.definition
-  const [selected, setSelected] = React.useState<string>("source")
+  const [selected, setSelected] = React.useState<string>("input:0")
   const flow = React.useMemo(() => (def ? authoredFlow(def, describeTransform) : null), [def])
   if (!def || !flow) {
     return <EmptyState title="No definition stored" description="This authored pipeline has no stored definition to show." />
   }
   const node = flow.nodes.find((n) => n.id === selected) ?? flow.nodes[0]
-  const transformIndex = node.kind === "transform" && node.ref !== undefined ? Number(node.ref) : null
-  const assetId = node.id === "source" ? pipeline.sourceAssetId : node.id === "target" ? pipeline.targetAssetId : undefined
+  const index = node.ref !== undefined ? Number(node.ref) : null
+  const input = node.kind === "source" && index !== null ? def.inputs[index] : undefined
+  const step = node.kind === "step" && index !== null ? def.steps[index] : undefined
+  // The catalog links the pipeline's first input and its target (`source`
+  // and `target` of the row); other inputs have no asset id on this read.
+  const assetId = node.id === "input:0" ? pipeline.sourceAssetId : node.id === "target" ? pipeline.targetAssetId : undefined
 
   return (
     <div className="flex flex-col gap-4">
@@ -240,20 +245,63 @@ export function AuthoredFlow({ pipeline }: { pipeline: PipelineDetail }) {
         edges={flow.edges}
         selectedId={node.id}
         onSelect={(n) => setSelected(n.id)}
-        dataCaption={{ source: "source table", sink: "target table" }}
+        dataCaption={{ source: "input", sink: "output table" }}
       />
+      {def.steps.some((s) => s.kind === "sql") ? (
+        <p className="text-xs text-muted-foreground">
+          A SQL step&apos;s edges are the names it reads after <span className="font-mono">FROM</span> and{" "}
+          <span className="font-mono">JOIN</span>; open the step to see all of its SQL.
+        </p>
+      ) : null}
       <div className="grid gap-4 lg:grid-cols-[minmax(0,22rem)_minmax(0,1fr)]">
         <section className="flex flex-col gap-3 self-start rounded-xl border border-border bg-card p-4 text-sm">
-          {transformIndex !== null ? (
+          {step ? (
             <>
-              <PanelTitle>Transform {transformIndex + 1} of {def.transforms.length}</PanelTitle>
-              <p className="font-medium capitalize">{node.label}</p>
-              <p className="text-muted-foreground">{node.sublabel}</p>
-              <code className="rounded-md bg-muted/50 px-2 py-1 font-mono text-xs">{def.transforms[transformIndex]}</code>
+              <PanelTitle>
+                Step {(index ?? 0) + 1} of {def.steps.length} · {step.kind === "sql" ? "SQL" : "Form"}
+              </PanelTitle>
+              <p className="font-mono font-medium">{step.name}</p>
+              {step.kind === "transform" ? (
+                <>
+                  <p className="text-muted-foreground">
+                    Reads <span className="font-mono text-foreground">{step.reads}</span>
+                  </p>
+                  {step.transforms.length === 0 ? (
+                    <p className="text-muted-foreground">No operation.</p>
+                  ) : (
+                    <ol className="flex flex-col gap-1.5">
+                      {step.transforms.map((raw, i) => {
+                        const t = describeTransform(raw)
+                        return (
+                          <li key={`${i}:${raw}`} className="flex flex-col gap-0.5">
+                            <span className="capitalize">{t ? `${t.verb}: ${t.detail}` : "transform"}</span>
+                            <code className="rounded-md bg-muted/50 px-2 py-1 font-mono text-xs">{raw}</code>
+                          </li>
+                        )
+                      })}
+                    </ol>
+                  )}
+                </>
+              ) : (
+                <CodeView text={step.sql} language="sql" />
+              )}
+            </>
+          ) : input ? (
+            <>
+              <PanelTitle>Input {(index ?? 0) + 1} of {def.inputs.length}</PanelTitle>
+              <p className="font-mono">{node.label}</p>
+              <p className="text-muted-foreground">
+                Steps read it as <span className="font-mono text-foreground">{input.name}</span>
+              </p>
+              {assetId ? (
+                <Link href={`/data/assets/${assetId}`} className="text-xs text-primary hover:underline">
+                  Open in the catalog
+                </Link>
+              ) : null}
             </>
           ) : (
             <>
-              <PanelTitle>{node.id === "source" ? "Source table" : "Target table"}</PanelTitle>
+              <PanelTitle>Output table</PanelTitle>
               <p className="font-mono">{node.label}</p>
               {assetId ? (
                 <Link href={`/data/assets/${assetId}`} className="text-xs text-primary hover:underline">
@@ -263,9 +311,12 @@ export function AuthoredFlow({ pipeline }: { pipeline: PipelineDetail }) {
             </>
           )}
           <dl className="mt-1 grid grid-cols-2 gap-x-4 gap-y-2 border-t border-border pt-3 text-xs">
+            {/* Decision 18: every run rebuilds the output (`BLD-12`); a
+                stored incremental column is read by nothing, so it is not
+                presented as how the pipeline loads. */}
             <dt className="text-muted-foreground">Load</dt>
-            <dd>{def.incrementalColumn ? `Incremental on ${def.incrementalColumn}` : "Full reload each run"}</dd>
-            {/* BLD-10 D3: the same name the form uses, and the same truth.
+            <dd>Every run rebuilds the output table</dd>
+            {/* BLD-10 D3: the same name the form used, and the same truth.
                 FBIC does nothing in this version, so the row says that --
                 and says what is stored, so a pipeline stored with it on is
                 not mistaken for one that would use it. */}
@@ -283,8 +334,9 @@ export function AuthoredFlow({ pipeline }: { pipeline: PipelineDetail }) {
             <PanelTitle>Stored definition</PanelTitle>
           </div>
           <p className="text-xs text-muted-foreground">
-            The record the engine reads. An authored pipeline has no code of its own: the generic job in{" "}
-            <code className="font-mono text-[11px]">authored_factory.py</code> reads this and builds its SQL from the transforms.
+            The record a run is made from. An authored pipeline has no code of its own: before each run the
+            orchestrator asks the API to compile this record into one statement, checked as the person the
+            pipeline reads as, and runs that statement.
           </p>
           <CodeView text={JSON.stringify(def, null, 2)} language="plain" />
         </section>
