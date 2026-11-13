@@ -470,6 +470,7 @@ estimate (S, M, L), which the base has no field for.
 | `REL-25` | Task | A flaky test on `main`: `a_pdf_failure_is_logged_for_the_operator_and_the_record_stays_fixed` in `lakehouse-api --test report_runner` fails when the binary runs its tests in one process (5 of 5 runs on `main` at `75010df8` on the ARM64 build machine, 23 passed and 1 failed) and passes alone; CI passes because `nextest` runs one process per test. The test captures tracing output, which other tests in the same process write to. Give it its own capture, so `cargo test` passes too. Shipped in #492 (2026-11-12): one process-wide subscriber and a capture per thread, with a test that fails on the old per-thread subscriber when run alone or under `nextest` | Delivery | P3 | Done | #492 | Found by the `SRC-39` developer run, 2026-11-12 |
 | `SRC-43` | Task | A connector run record can stay "running" for good after its run was stopped: when the run route cancels an overdue run and the store then fails before the record is closed, that request answers 5xx, and the next request sees the run as cancelled in the orchestrator, so nothing closes the record. It needs two failures in a row and loses no rows; the history shows a run as going that is not. Close a `running` record whose orchestrator run has ended, when the run list is read or by the failure sensor | Data | P3 | Done | #496 | #485 review, round 2 (R2), 2026-11-12 |
 | `OPS-31` | Task | Split the API's route table and policy table by feature (`routes/mod.rs`, `policy.rs`, `tests/route_auth.rs`), with a snapshot test proving no route or policy changed. Planned 2026-11-13 and shelved: on the last 20 Rust pull requests it saves no CI gate job (each also touched another shared file); its gain is fewer merge conflicts | Operations | P3 | Todo |  | Plan drafted, not merged |
+| `OPS-32` | Task | One integration-test binary per Rust crate (`tests/it.rs`, `autotests = false`), so CI links 26 test binaries instead of 191; a guard (`scripts/ci/check_test_modules.sh`) fails a new test file that is not a module of `it`. Measured on its own CI run: test compile per partition 3m26s to 4m22s (was 7 to 9 minutes), all 7,680 tests passed | Operations | P1 | Done | #521 | Product owner 2026-11-13; plan `superpowers/plans/2026-11-13-one-test-binary.md` |
 
 ## Dependencies
 
@@ -544,6 +545,7 @@ set by the product owner and are left empty until they are.
 | `OPS-22` | 2026-11-13 | 2026-11-13 (#502) | |
 | `OPS-24` | 2026-11-13 | 2026-11-13 (#506) | |
 | `OPS-25` | 2026-11-13 | 2026-11-13 (#509) | |
+| `OPS-32` | 2026-11-13 | 2026-11-13 (#521) | |
 | `BI-49` | 2026-11-13 | 2026-11-13 (#504) | |
 | `BI-50` | 2026-11-13 | 2026-11-13 (#504) | |
 | `BI-51` | 2026-11-13 | 2026-11-13 (#504) | |
