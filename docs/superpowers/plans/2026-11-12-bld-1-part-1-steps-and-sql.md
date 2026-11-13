@@ -1583,3 +1583,43 @@ page (D12); the read view's edges for a SQL step are a drawing aid.
   not refuse several inputs with no step; it copies the first. The page's
   own rule ("With more than one input, add a step that reads them") is
   right; the compiler gets the same rule in S2's fix round, so the two agree.
+
+### S3, round 2 (reviewer, 2026-11-13)
+
+Reviewed the fix round, `229885ea3..33882bd7f` (15 commits by the developer;
+`main` merged at `e0bbddd3a`), against the fourteen findings of round 1.
+
+**Closed, read in the code:** R1-B1 (an edit sends the stored
+`incrementalColumn` back, `pipeline-editor.tsx:256`), R1-B2 (a form step
+holds the id of what it reads, `StepRead` in `src/lib/pipeline-editor.ts`;
+the name is written when the body is built), R1-S2 (the step type is
+widened; `knownStep` guards the two kinds the page edits; another kind is
+kept as stored). **Closed as reported in the handoff, not each read line by
+line by the reviewer:** R1-B3 and R1-S1, R1-S3 to R1-S11. The developer's
+two notes are accepted: the name of an input still stops following its table
+once a form step reads it, and a preview's refusal marks the item and offers
+a button to it instead of moving the selection.
+
+`SelectField` gained one prop, `aria-describedby`. It names a sentence, not
+a style, so the component stays the data-only wrapper `WEB-9` made it.
+
+**Re-run by the reviewer on `33882bd7f`**, in the developer's worktree:
+`bun run typecheck` exit 0; `bun run lint` 0 errors, 11 warnings (the 11 on
+`main`); under the lock, `bun test src/features/pipelines/` 154 pass, 0 fail;
+`bun test src/lib/pipeline-editor.test.ts src/lib/transform-draft.test.ts
+src/components/patterns/ src/services/clients/pipelines.test.ts
+src/services/contracts/pipelines.test.ts` 109 pass, 0 fail. Not re-run by
+the reviewer: `src/lib/` and `src/services/` as a whole,
+`src/features/dashboards/` (the handoff's counts stand unchecked). CI runs
+the whole console suite.
+
+**No open BLOCKER and no open SHOULD-FIX.**
+
+**Before merge:** S2 (#500, the preview route) merges first, because this
+page calls it; then `main` is merged into this branch (the plan file needs
+both slices' entries kept) and CI's full run must be green on the head.
+
+**Not verified by anyone:** how the editor and the read view look in a
+browser, in either theme, and the page against a running API (every save,
+preview and refusal was tested against a stubbed `fetch`). The product owner
+looks at it; `BLD-1-AC1` to `AC14` on the feature page are the checklist.
