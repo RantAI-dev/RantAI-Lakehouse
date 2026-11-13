@@ -548,6 +548,11 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/pipelines",                        Policy::RequiresPermission("pipeline:read")),
     ("POST", "/api/pipelines",                        Policy::RequiresPermission("pipeline:write")),
     ("POST", "/api/pipelines/generate",               Policy::RequiresPermission("pipeline:write")),
+    // BLD-1 part 1 / D16: the first rows of one input or step of a definition
+    // that is not saved yet. `pipeline:write`, because it is the editor's own
+    // preview and not a read of a stored pipeline; nothing is stored, and the
+    // statement runs as the CALLER (decision 13), never as a pipeline's author.
+    ("POST", "/api/pipelines/preview",                Policy::RequiresPermission("pipeline:write")),
     ("GET",  "/api/pipelines/{id}",                    Policy::RequiresPermission("pipeline:read")),
     ("PUT",  "/api/pipelines/{id}",                    Policy::RequiresPermission("pipeline:write")),
     ("PUT",  "/api/pipelines/{id}/target-lag",         Policy::RequiresPermission("pipeline:write")),

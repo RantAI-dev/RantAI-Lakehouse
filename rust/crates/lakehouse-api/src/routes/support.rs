@@ -286,6 +286,54 @@ pub(crate) enum SpecRunFailure {
 /// for the security team.
 pub(crate) const REGION_OF_REFUSED: &str = "RegionOf is not available to you: your role has a data policy, and the region lookup cannot be checked against it yet. Ask an administrator, or use a column that already holds the region.";
 
+/// The `{{principal_id}}`/`{{principal_tenant_ids}}` values the policy rewrite
+/// expands for `principal` — one function, because the dashboard preview and
+/// the pipeline preview (BLD-1 part 1 / D16) rewrite a caller's statement with
+/// the same placeholder set and a third copy would be the drift `AGENTS.md`
+/// rule 4 names.
+#[must_use]
+pub(crate) fn placeholders_for(
+    principal: &lakehouse_auth::Principal,
+) -> crate::sql_rewrite::PlaceholderValues {
+    crate::sql_rewrite::PlaceholderValues {
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_tenant_ids: principal
+            .tenant_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+    }
+}
+
+/// The columns `rewritten` returns, via `DESCRIBE` — no rows are read.
+///
+/// The column probe the dashboard preview owns and the pipeline preview
+/// reuses (BLD-1 part 1 / D16), rather than a second `DESCRIBE` written for the
+/// new route. A `ClickHouse` failure comes back as the engine's own
+/// [`ChError`], because the two callers answer it differently: the dashboard
+/// preview fixes the sentence, the pipeline preview reports it the way Query
+/// Studio does.
+///
+/// # Errors
+///
+/// The engine's own [`ChError`] from the `DESCRIBE`.
+pub(crate) async fn describe_columns(
+    ch: &ChClient,
+    rewritten: &str,
+) -> Result<Vec<lakehouse_bi::sources::SourceColumn>, ChError> {
+    let sql = format!("DESCRIBE (SELECT * FROM (\n{rewritten}\n))");
+    let rows = ch.rows(&sql, None).await?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            Some(lakehouse_bi::sources::SourceColumn {
+                name: row.get("name")?.as_str()?.to_owned(),
+                ty: row.get("type")?.as_str()?.to_owned(),
+            })
+        })
+        .collect())
+}
+
 /// [`crate::policy_engine::enforcement_error_message`], with the sentence
 /// above for a refused `dictGet*` call in a statement that does a `RegionOf`
 /// lookup (it names a `console.geo_dict_` dictionary); every other refusal
