@@ -3,6 +3,8 @@ import test from "node:test"
 
 import {
   GRAINS,
+  breakdownGrainChoices,
+  labelSeriesBuckets,
   bucketFiltersDashboard,
   bucketLabel,
   bucketListsRecords,
@@ -11,6 +13,7 @@ import {
   columnKindOfType,
   grainChoices,
   grainFits,
+  limitAfterBreakdownPick,
   limitAfterGrainPick,
   limitHasEffect,
   switchChoices,
@@ -131,10 +134,51 @@ test("choosing a truncation lifts an untouched limit to the grained maximum and 
   assert.equal(limitAfterGrainPick("", 20, false), 20)
 })
 
+// `BI-46` review round 1, R7: beside a breakdown the limit counts breakdown
+// values, not buckets, so a grain pick must not lift the untouched default to
+// the grained maximum — and adding a breakdown to a grained chart takes an
+// untouched 1000 back to the default.
+test("a breakdown keeps the untouched limit at the default whatever grain is picked", () => {
+  assert.equal(limitAfterGrainPick("month", 20, false, true), 20, "the limit counts breakdown values")
+  assert.equal(limitAfterGrainPick("month", 1000, false, true), 1000, "a saved value stays as it is")
+  assert.equal(limitAfterBreakdownPick(1000, false), 20, "a grain pick's 1000 becomes the default")
+  assert.equal(limitAfterBreakdownPick(1000, true), 1000, "the person set it")
+  assert.equal(limitAfterBreakdownPick(20, false), 20)
+  assert.equal(limitAfterBreakdownPick(50, false), 50)
+})
+
 test("the limit field is hidden for a part ordered by bucket and shown otherwise", () => {
   assert.equal(limitHasEffect("hour_of_day", "none"), false)
   assert.equal(limitHasEffect("day_of_week", "none"), false)
   assert.equal(limitHasEffect("hour_of_day", "desc"), true, "top N keeps its limit")
   assert.equal(limitHasEffect("month", "none"), true)
   assert.equal(limitHasEffect("", "none"), true)
+})
+
+// ── BI-46 (QA LH-BI-6-01): a grain on a date breakdown, and what the limit counts ──
+
+test("a date breakdown on a line chart is offered day to year", () => {
+  assert.deepEqual(breakdownGrainChoices("line", "date"), ["day", "week", "month", "quarter", "year"])
+  assert.deepEqual(breakdownGrainChoices("bar", "datetime"), ["day", "week", "month", "quarter", "year"])
+})
+
+test("a text breakdown and a pie are offered none", () => {
+  assert.deepEqual(breakdownGrainChoices("line", "text"), [])
+  assert.deepEqual(breakdownGrainChoices("line", "number"), [])
+  // A pie draws slices, not a series, so the server takes no period there.
+  assert.deepEqual(breakdownGrainChoices("pie", "date"), [])
+  assert.deepEqual(breakdownGrainChoices("heatmap", "date"), [])
+})
+
+test("the limit has an effect beside a breakdown even on a date part", () => {
+  assert.equal(limitHasEffect("day_of_week", "none"), false)
+  assert.equal(limitHasEffect("day_of_week", "none", true), true)
+  assert.equal(limitHasEffect("month", "none", true), true)
+})
+
+test("series buckets are labelled like the axis", () => {
+  const rows = [{ m: "2026-03-01", v: 3 }, { m: "2026-04-01", v: 4 }]
+  assert.deepEqual(labelSeriesBuckets(rows, "m", "month"), [{ m: "Mar 2026", v: 3 }, { m: "Apr 2026", v: 4 }])
+  // A row without the column, and another column, are left alone.
+  assert.deepEqual(labelSeriesBuckets([{ v: 1 }], "m", "month"), [{ v: 1 }])
 })

@@ -378,3 +378,23 @@ test("a measure row with a joined column reads 'max of rooms' (phase 2 QA R14, R
   assert.equal(measureLabel({ column: "mart_demo_province_capacity__rooms", aggregate: "" }, new Set()), "rooms")
   assert.equal(measureLabel({ column: "mart_demo_province_capacity__rooms", aggregate: "" }, new Set(), "avg"), "avg of rooms")
 })
+
+// ── BI-46 (QA LH-BI-6-01): the period of a date breakdown ────────────────
+
+test("the payload carries the breakdown grain only with a breakdown on a bar, hbar, line or area", () => {
+  const draft = { ...emptyShapeDraft(), breakdownGrain: "month" as const }
+  const withBreakdown = { kind: "line", rowsMode: false, grained: false, breakdown: true }
+  assert.equal(shapePayload(draft, withBreakdown).breakdownGrain, "month")
+  // No breakdown to group, or a kind whose second column is not a series.
+  assert.equal(shapePayload(draft, { ...withBreakdown, breakdown: false }).breakdownGrain, undefined)
+  assert.equal(shapePayload(draft, { ...withBreakdown, kind: "pie" }).breakdownGrain, undefined)
+  assert.equal(shapePayload(emptyShapeDraft(), withBreakdown).breakdownGrain, undefined)
+})
+
+test("a saved breakdown grain reads back into the draft", () => {
+  const draft = shapeDraftFromDef({ breakdownGrain: "quarter" })
+  assert.equal(draft.breakdownGrain, "quarter")
+  // Anything that is not one of the five the server takes is no grouping.
+  assert.equal(shapeDraftFromDef({ breakdownGrain: "day_of_week" }).breakdownGrain, "")
+  assert.equal(emptyShapeDraft().breakdownGrain, "")
+})

@@ -176,6 +176,11 @@ export const clickhouseDashboardService: DashboardService = {
       const json = (await res.json().catch(() => null)) as { error?: string } | null
       throw new ServiceError(codeFor(res.status), json?.error ?? "Failed to save chart", res.status)
     }
+    // `BI-48`: the route answers `{ ok, chart }`; a tile's Duplicate places the
+    // new tile below the original by this id. An answer without one is `""`:
+    // the chart exists, and the caller saves no layout for it.
+    const json = (await res.json().catch(() => null)) as { chart?: { id?: unknown } } | null
+    return { id: typeof json?.chart?.id === "string" ? json.chart.id : "" }
   },
   /**
    * The marts, by name (`WEB-7` D7). The route answers rows with them; the

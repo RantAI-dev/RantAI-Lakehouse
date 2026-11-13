@@ -429,7 +429,35 @@ impl ChartInput {
     /// rebuilt from its definition at read time, like a grained one.
     #[must_use]
     pub fn uses_shaping(&self) -> bool {
-        self.measures.has_own_aggregates() || self.shape.is_used()
+        // `BI-46` (plan D14; QA `LH-BI-6-01`): a chart whose limit keeps the
+        // breakdown's top values is rebuilt from its definition on every read,
+        // like a grained one, so the rule reaches charts saved before it — with
+        // or without a dashboard filter. `finish_shaping` builds the stored
+        // statement from the same builder, so the two cannot disagree.
+        self.measures.has_own_aggregates() || self.shape.is_used() || self.caps_breakdown()
+    }
+
+    /// Whether the chart's limit keeps the breakdown's top values (`BI-46`,
+    /// plan D12): a bar, hbar, line or area chart with a breakdown, where the
+    /// second column is a series and the N values with the largest total of
+    /// the chart's measure are kept.
+    #[must_use]
+    pub fn caps_breakdown(&self) -> bool {
+        self.kind.breakdown_is_series()
+            && self
+                .breakdown
+                .as_ref()
+                .is_some_and(|breakdown| !breakdown.is_empty())
+    }
+
+    /// Whether a grained chart of this definition keeps the LATEST buckets
+    /// (`BI-46`, plan D12): only when its limit is not the breakdown's. A
+    /// chart with a breakdown keeps every period; its budget is the
+    /// breakdown's, and a relative date filter is how it narrows to recent
+    /// periods.
+    #[must_use]
+    pub fn keeps_latest_buckets(&self, grain: crate::grain::Grain) -> bool {
+        !self.caps_breakdown() && crate::grain::cuts_to_latest(grain, &self.effective_order())
     }
 
     /// The fixed limit, or `None` when the chart has none or takes it from a
@@ -3889,6 +3917,9 @@ fn grained_chart_sql(
         limit: crate::grain::effective_limit(grain, input.order, input.limit),
         // A chart with a sort is saved by `finish_shaping`, which rebuilds it.
         sort: None,
+        // `BI-46` (plan D12, D14): so is a chart whose limit caps its
+        // breakdown, so this path never sees one; it keeps every bucket.
+        cap_breakdown: false,
     };
     crate::builder::grained_sql(from, Vec::new(), &chart, input.column, time).ok_or_else(|| {
         BiError::Validation("a grain needs a date or timestamp dimension.".to_owned())
@@ -7950,6 +7981,54 @@ mod tests {
             serde_json::json!(["visitors", {"column": "stay", "aggregate": "avg"}])
         );
         assert!(spec.def.uses_shaping());
+    }
+
+    /// `BI-46` (plan D12, D14; QA `LH-BI-6-01`): a bar chart with a breakdown
+    /// is marked as shaped — it is rebuilt on every read — and the statement it
+    /// is saved with already holds the breakdown cap, so the stored statement
+    /// and the read agree.
+    #[test]
+    fn a_bar_chart_with_a_breakdown_is_saved_with_the_capped_statement() {
+        let spec = bi6_save(&serde_json::json!({
+            "kind": "bar", "breakdown": "cat", "limit": 3,
+        }))
+        .unwrap();
+        assert!(spec.def.caps_breakdown());
+        assert!(spec.def.uses_shaping(), "rebuilt on every read (D14)");
+        assert!(
+            spec.spec.sql.contains(
+                "(isNull(cat), ifNull(toString(cat), '')) IN \
+                 (SELECT isNull(cat), ifNull(toString(cat), '') FROM ("
+            ),
+            "{}",
+            spec.spec.sql
+        );
+        assert!(
+            spec.spec
+                .sql
+                .contains("GROUP BY cat ORDER BY sum(visitors) DESC, cat LIMIT 3)"),
+            "{}",
+            spec.spec.sql
+        );
+    }
+
+    /// `BI-46` (plan D12) review round 1, R5: the exact statement a chart with
+    /// no breakdown is saved with — today's one, byte for byte, not just a
+    /// statement that happens to lack a cap.
+    #[test]
+    fn a_chart_without_a_breakdown_is_saved_with_the_statement_it_always_had() {
+        let spec = bi6_save(&serde_json::json!({
+            "kind": "bar", "breakdown": serde_json::Value::Null, "limit": 3,
+        }))
+        .unwrap();
+        assert!(!spec.def.caps_breakdown());
+        assert_eq!(
+            spec.spec.sql,
+            "SELECT place, round(sum(visitors)) AS visitors FROM (\n\
+             SELECT place, cat, d, visitors, stay FROM serving.mart_x\n\
+             ) AS src GROUP BY place ORDER BY visitors DESC LIMIT 3 SETTINGS \
+             max_result_rows = 2000, result_overflow_mode = 'break', max_execution_time = 60"
+        );
     }
 
     #[test]

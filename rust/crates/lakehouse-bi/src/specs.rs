@@ -114,6 +114,17 @@ impl ChartKind {
             Self::Text | Self::Heading | Self::Divider | Self::Section | Self::Image | Self::Web
         )
     }
+
+    /// Whether this kind draws its breakdown as a series (`BI-46`, plan D12;
+    /// QA `LH-BI-6-01`): bar, hbar, line and area, where the second column is
+    /// one line or one stack per value and the chart's limit keeps the N
+    /// breakdown values with the largest total. A heatmap's second column is
+    /// an axis, a sankey's a target and a sunburst's a ring, so they keep
+    /// their own statements.
+    #[must_use]
+    pub fn breakdown_is_series(self) -> bool {
+        matches!(self, Self::Bar | Self::Hbar | Self::Line | Self::Area)
+    }
 }
 
 /// Numeric display format for a chart or KPI value.

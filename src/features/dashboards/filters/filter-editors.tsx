@@ -12,12 +12,18 @@ import {
 } from "@/lib/dashboard-filter-state";
 import type { FilterDef, FilterKind, RelativeUnit } from "@/services/clients/bi-store";
 import { ValueList } from "./value-list";
+import type { OwnSource } from "./use-filter-values";
 
 export type EditorProps = {
   board: string;
   column: string;
   /** The board's other filters, which narrow value lists. */
   others: FilterDef[];
+  /**
+   * `BI-47`: the chart's own mart (with its joins) or saved SQL source, whose
+   * values the list reads; absent for a dashboard filter, which asks by board.
+   */
+  source?: OwnSource;
   /** The filter being edited; a fresh one for a column that has none yet. */
   initial: FilterDef;
   /** Commit; the caller closes the popover. */
@@ -43,7 +49,7 @@ const TEXT_OPS = [
   ["contains", "contains"], ["not_contains", "does not contain"], ["starts_with", "starts with"], ["ends_with", "ends with"],
 ] as const;
 
-export function TextEditor({ board, column, others, initial, onApply }: EditorProps) {
+export function TextEditor({ board, column, others, initial, onApply, source }: EditorProps) {
   const isText = ["contains", "not_contains", "starts_with", "ends_with"].includes(opOf(initial));
   const [tab, setTab] = React.useState<string>(isText ? "text" : "values");
   const [values, setValues] = React.useState<FilterDef>(isText ? { column, values: [] } : initial);
@@ -56,7 +62,7 @@ export function TextEditor({ board, column, others, initial, onApply }: EditorPr
         <TabsTrigger value="text">Text</TabsTrigger>
       </TabsList>
       <TabsContent value="values">
-        <ValueList board={board} column={column} others={others} draft={values} onDraft={setValues} />
+        <ValueList board={board} column={column} others={others} draft={values} onDraft={setValues} source={source} />
       </TabsContent>
       <TabsContent value="text">
         <div className="flex flex-col gap-2">
@@ -91,7 +97,7 @@ const NUMBER_MODES = [
   ["between", "between"], ["eq", "equal to"], ["ne", "not equal to"], ["gt", "greater than"], ["lt", "less than"],
 ] as const;
 
-export function NumberEditor({ board, column, others, initial, onApply }: EditorProps) {
+export function NumberEditor({ board, column, others, initial, onApply, source }: EditorProps) {
   const pick = filterToNumberPick(initial);
   const isList = !pick && ["in", "not_in"].includes(opOf(initial)) && initial.values.length > 0;
   const [tab, setTab] = React.useState<string>(isList ? "values" : "compare");
@@ -124,7 +130,7 @@ export function NumberEditor({ board, column, others, initial, onApply }: Editor
         </div>
       </TabsContent>
       <TabsContent value="values">
-        <ValueList board={board} column={column} others={others} draft={list} onDraft={setList} />
+        <ValueList board={board} column={column} others={others} draft={list} onDraft={setList} source={source} />
       </TabsContent>
       <ApplyRow disabled={!current || !isActiveFilter(current)} onApply={() => current && onApply(current)} />
     </Tabs>
