@@ -10,7 +10,7 @@ use lakehouse_test_support as _;
 
 use lakehouse_store::StoreError;
 use lakehouse_store::quality::{
-    IncidentKind, Resolution, ScheduleMode, StatusFilter, freshness_resolved_since, list,
+    IncidentKind, Resolution, ScheduleMode, StatusFilter, freshness_resolved_since, get, list,
     list_schedules, load_summaries, load_summary, mark_stale_for_rule, purge_loads, put_schedule,
     recent_loads, record_failure, record_load, resolve, resolve_for_rule,
 };
@@ -212,6 +212,33 @@ async fn resolving_needs_a_reason_and_frees_the_slot_for_a_new_incident(
             .len(),
         1
     );
+    Ok(())
+}
+
+/// `GOV-15` (`GOV-12` plan, section 4): the API reads an incident before it
+/// resolves one, so a table the caller may not read can be refused first. An
+/// id that is not there and one that is not a UUID are both `None`, as
+/// [`resolve`] treats them.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_incident_is_read_by_its_id_and_an_unknown_or_malformed_id_is_none(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let opened = record_failure(
+        &pool,
+        "silver.orders",
+        Some("r1"),
+        IncidentKind::Check,
+        "bad",
+    )
+    .await
+    .unwrap();
+
+    let found = get(&pool, &opened.id).await.unwrap().expect("its own id");
+    assert_eq!(found.id, opened.id);
+    assert_eq!(found.asset, "silver.orders");
+    assert_eq!(found.status, "open");
+    assert_eq!(get(&pool, &Uuid::nil().to_string()).await.unwrap(), None);
+    assert_eq!(get(&pool, "not-a-uuid").await.unwrap(), None);
     Ok(())
 }
 

@@ -1738,6 +1738,150 @@ async fn a_schedule_on_a_table_the_role_may_not_read_is_refused_with_the_rule_se
     assert_eq!(code, StatusCode::NO_CONTENT);
 }
 
+/// `GOV-15` (`GOV-12` plan, section 4): a person outside the tenant that owns
+/// the shared catalog cannot resolve an incident, whether it exists or not,
+/// and the refusal closes nothing. The two answers are equal, so a resolve
+/// says nothing about which incident ids exist.
+#[tokio::test]
+async fn a_caller_outside_the_catalog_tenant_cannot_resolve_an_incident_and_it_stays_open() {
+    let (router, pool, _ch) = app().await;
+    let admin_cookie = admin(&pool).await;
+    let id = rule(&pool, "g15_incident", "email not null >= 90%").await;
+    call(
+        &router,
+        &admin_cookie,
+        "POST",
+        &format!("/api/governance/quality/{id}/run"),
+        None,
+    )
+    .await;
+    let incident = incidents(&router, &admin_cookie, "open").await[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let unknown = "00000000-0000-4000-8000-000000000000";
+
+    let cookie = outsider(&pool).await;
+    let (code, on_incident) = call(
+        &router,
+        &cookie,
+        "POST",
+        &format!("/api/governance/quality/incidents/{incident}/resolve"),
+        Some(json!({"resolution": "x"})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{on_incident}");
+    let (code, on_unknown) = call(
+        &router,
+        &cookie,
+        "POST",
+        &format!("/api/governance/quality/incidents/{unknown}/resolve"),
+        Some(json!({"resolution": "x"})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{on_unknown}");
+    assert_eq!(
+        on_incident, on_unknown,
+        "the tenant refusal is the same for every incident, so it names none"
+    );
+
+    assert_eq!(
+        incidents(&router, &admin_cookie, "open").await.len(),
+        1,
+        "a refused resolve closes nothing"
+    );
+    assert_eq!(audit_events(&pool, "quality.incident_resolve").await, 0);
+}
+
+/// `GOV-15` (`GOV-12` plan, section 4): an incident on a table the caller's
+/// role does not read is not on their list, so resolving it answers 404
+/// exactly as an unknown incident does; their own table's incident still
+/// resolves.
+#[tokio::test]
+async fn an_incident_on_a_table_the_role_may_not_read_cannot_be_resolved_and_reads_as_not_found() {
+    let (router, pool, _ch) = app().await;
+    let admin_cookie = admin(&pool).await;
+    let hidden = rule_on(
+        &pool,
+        "g15_hidden_incident",
+        "silver.customers",
+        "email not null >= 90%",
+    )
+    .await;
+    call(
+        &router,
+        &admin_cookie,
+        "POST",
+        &format!("/api/governance/quality/{hidden}/run"),
+        None,
+    )
+    .await;
+    let open = incidents(&router, &admin_cookie, "open").await;
+    let incident = open
+        .iter()
+        .find(|row| row["asset"] == "silver.customers")
+        .and_then(|row| row["id"].as_str())
+        .expect("the failing rule opened an incident on its table")
+        .to_owned();
+    let unknown = "00000000-0000-4000-8000-000000000000";
+
+    let cookie = narrowed(&pool).await;
+    let (code, hidden_body) = call(
+        &router,
+        &cookie,
+        "POST",
+        &format!("/api/governance/quality/incidents/{incident}/resolve"),
+        Some(json!({"resolution": "x"})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{hidden_body}");
+    let (_, unknown_body) = call(
+        &router,
+        &cookie,
+        "POST",
+        &format!("/api/governance/quality/incidents/{unknown}/resolve"),
+        Some(json!({"resolution": "x"})),
+    )
+    .await;
+    assert_eq!(hidden_body, unknown_body, "reads as an unknown incident");
+    assert!(
+        incidents(&router, &admin_cookie, "open")
+            .await
+            .iter()
+            .any(|row| row["id"] == incident.as_str()),
+        "a refused resolve closes nothing"
+    );
+    assert_eq!(audit_events(&pool, "quality.incident_resolve").await, 0);
+
+    // Their own table's incident still resolves.
+    let visible = rule(&pool, "g15_visible_incident", "email not null >= 90%").await;
+    call(
+        &router,
+        &admin_cookie,
+        "POST",
+        &format!("/api/governance/quality/{visible}/run"),
+        None,
+    )
+    .await;
+    let open = incidents(&router, &admin_cookie, "open").await;
+    let own = open
+        .iter()
+        .find(|row| row["asset"] == "silver.orders")
+        .and_then(|row| row["id"].as_str())
+        .expect("the rule on silver.orders opened its own incident")
+        .to_owned();
+    let (code, resolved) = call(
+        &router,
+        &cookie,
+        "POST",
+        &format!("/api/governance/quality/incidents/{own}/resolve"),
+        Some(json!({"resolution": "fixed"})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{resolved}");
+    assert_eq!(resolved["status"], "resolved");
+}
+
 /// QA `LH-DATA-14-01` F2 (`DATA-54`): a rewrite that changes the table is
 /// checked, and a refusal leaves the rule on its old table. A rewrite that
 /// keeps the table is not checked, so a rule on a dropped table can still be
