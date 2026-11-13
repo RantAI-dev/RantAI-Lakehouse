@@ -2200,3 +2200,114 @@ uploads`; `cargo test -p lakehouse-api --test catalog_restore`; `--test upload_r
 `--test sec11_guard`; `--test route_auth`; both repo lints); each new test by name with the
 failure line seen before its fix; whether U1's timeout test could be arranged; anything
 *not verified*; every MISMATCH.
+
+### Round 3, developer's handoff
+
+Developer agent, 2026-11-13. Branch `fix/qa-round-data-p4`. `main` had not moved (`origin/main`
+is `9d2c27dd`, already merged by `f43af8b3`), so there is no merge commit this round. One commit:
+
+- `6d1f49c3` — `fix(review): a drop and a restore remove only their own record (U1 to U5)`
+
+The five findings, as built:
+
+- **U1.** `LOAD_CHECK_TIMEOUT` (30 s) wraps the second load check in `DropJob::run`. An elapsed
+  bound and a failed check both keep the record, write `failed` and answer `503` with
+  `LOAD_CHECK_FAILED`; no `DELETE` goes out. The error arm had no sentence of its own (it
+  returned the store's error), so both use the fixed one, as the ruling says. The two removals
+  the task itself makes (a definite refusal; the load the second check finds) call
+  `uploads::forget_table_drop_at(pool, table, record.dropped_at)` — the task's own record, no
+  grace, values bound. `HEAL_GRACE`'s doc now gives the real sum, 30 + 15 + 10 + 10 = 65
+  seconds of our bounds, and says the database calls in the stretch have the pool's limits.
+- **U2.** `POST …/restore` reads `uploads::dropped_table` in the handler, before the task and
+  the undrop, and carries `dropped_at` in `RestoreJob`; `finish_restore` calls the same
+  `forget_table_drop_at` and so removes only that record. No record read, or a failed read:
+  nothing is removed and one `tracing::warn!` says so.
+- **U3.** Two tests of `POST …/restore` against a table that exists.
+- **U4.** `assert_eq!(outcomes[0].0, "allowed");` in the two tests named.
+- **U5.** The withdrawn arm in `settle_not_dropped`'s doc; `catalog_restore.rs`'s module doc
+  (past the grace, and only the record read); the "believed only while the table is absent"
+  sentences in `catalog_drop.rs` (module doc, `assess`, `dropped_now`), `catalog_restore.rs`
+  (`table_exists`) and `routes/uploads.rs` (`ensure_table_free`) — and the two test docs that
+  carried the same sentence (`catalog_restore.rs`, `upload_routes.rs`), which the ruling did
+  not name; `OUTCOME_CHECK_TIMEOUT`'s doc now names `UNDROP_TIMEOUT` and `DROP_TABLE_TIMEOUT`
+  as the undrop's and the `DELETE`'s bounds; the store test's comment now says "a different
+  record".
+
+**Tests added or changed, by name**
+
+- `lakehouse-store`, `tests/uploads.rs`:
+  `forgetting_a_drop_removes_the_record_it_read_and_no_other` (replaces
+  `forgetting_a_drop_removes_it_and_says_whether_there_was_one`, which tested the function the
+  other two named here replaced): the record read is removed, an absent one is not an error,
+  and a record written afterwards for a second drop of the same name is NOT removed.
+  `healing_a_drop_removes_only_a_record_older_than_the_grace_and_unchanged_since_it_was_read`
+  changed only in the U5 comment and its last message.
+- `lakehouse-api`, `tests/catalog_restore.rs`:
+  `a_restore_leaves_a_record_written_while_its_undrop_was_in_flight` (U2);
+  `a_restore_of_a_table_that_exists_leaves_a_fresh_record` (U3);
+  `a_restore_of_a_table_that_exists_clears_a_record_past_its_grace` (U3);
+  and the `outcomes[0].0 == "allowed"` assertion in
+  `a_catalog_that_answers_500_and_a_table_that_still_exists_keeps_the_record_and_says_the_outcome_is_not_known`
+  and `a_catalog_that_lists_a_deleted_table_that_still_exists_says_the_outcome_is_not_known`
+  (U4). No existing assertion was loosened.
+
+**Seen to fail before the fix**
+
+U2's test, with the fix's `src/` withheld (the repo's HEAD code, only the tests applied):
+`cargo test -p lakehouse-api --test catalog_restore a_restore_leaves_a_record_written_while_its_undrop_was_in_flight`
+→ `1 failed`:
+`panicked at crates/lakehouse-api/tests/catalog_restore.rs:2077:5: the record written while the undrop was in flight stays: the restore read another one`
+— the old `finish_restore` removed the record by name, so the second drop's record went.
+
+U3's two tests cannot be seen to fail: they pass at `362382ff` and still pass
+(`2 passed`), because round 2's S1 commit already guards that removal. They are the missing
+coverage U3 asks for, not a bug; see MISMATCH 1.
+
+The store test cannot be run against the old function — it names the new one, which did not
+exist — so it was not seen to fail; its new assertions are the two the ruling asks for.
+
+**U1's timeout test: not arranged, no hook added**
+
+It cannot be arranged without a hook in product code. Every call `settle_loading_upload` makes
+is already bounded (`SETTLE_CALL_TIMEOUT`, 5 s, on the orchestrator and on the results read), so
+reaching 30 s needs several `ingesting` rows against stand-ins that each stall, and the test
+would take longer than 30 real seconds even when it does not flake; `tokio::time::pause` would
+race the real HTTP stand-ins. Per the ruling, no hook was added; the store test above covers
+item 2 instead. The timeout arm itself is read, not run.
+
+**Commands, with their counts** (from `rust/`, foreground, `CARGO_TARGET_DIR` shared)
+
+- `cargo fmt --check` — clean.
+- `cargo clippy -p lakehouse-api --all-targets -- -D warnings` — clean, 0 warnings.
+- `cargo clippy -p lakehouse-store --all-targets -- -D warnings` — clean, 0 warnings.
+- `cargo test -p lakehouse-store --test uploads` — 70 passed, 0 failed.
+- `cargo test -p lakehouse-api --test catalog_restore` — 59 passed, 0 failed (56 before, 3 new).
+- `cargo test -p lakehouse-api --test upload_routes` — 181 passed, 0 failed (126.28 s).
+- `cargo test -p lakehouse-api --test sec11_guard` — 4 passed, 0 failed.
+- `cargo test -p lakehouse-api --test route_auth` — 96 passed, 0 failed.
+- `python3 ops/lint/check_bare_iceberg_count.py` — R11 guard clean;
+  `python3 ops/lint/check_intra_package_imports.py` — all imports resolve.
+- `git status` before the commit: the seven edited files and nothing generated.
+
+**Not verified**
+
+- No workspace-wide build or test (`cargo test --workspace` was not run, per the brief); the two
+  crates above and their dependencies were compiled. A grep over `rust/` finds no other use of
+  the removed `forget_table_drop`, so no other crate should have seen it change — not proven by
+  compiling them.
+- The `LOAD_CHECK_TIMEOUT` arm is read, not run (above).
+- No compose, no console, no Python, no Docker, and the G9 gate step were run; nothing in this
+  commit touches them.
+
+**MISMATCH**
+
+1. **U3's tests pass before the fix.** The brief asks that U3's be seen to fail; they cannot,
+   because `362382ff` already carries round 2's S1 guard and U3 adds coverage only. Their
+   failure lines are therefore not available; the run at HEAD is `2 passed`.
+2. **`forget_table_drop` is gone, not merely unused.** Once every removal is guarded (U1's two
+   and U2's one) it had no caller left, and keeping an exported removal that deletes any record
+   for a name is the footgun this round is about. It is replaced by `forget_table_drop_at`, and
+   its store test by the one above. This is one step past the five's letter; reported here.
+3. **U5's three comments carried the same sentence in two test files too.** Corrected as well
+   (`tests/catalog_restore.rs`, `tests/upload_routes.rs`); the ruling named only the three
+   product sites.
