@@ -393,24 +393,27 @@ async fn an_input_the_caller_may_not_read_is_refused_before_the_engine() {
         json!("Table not found or not available to your organisation: silver.orders"),
         "{answer}"
     );
-    // BLD-1 part 1 S2 review R1-B1: this used to assert that the engine
-    // received nothing at all, and it failed some of the time on the
-    // reviewer's runs. The route itself asks the engine nothing before the
-    // refusal: the tenant gate reads Postgres, and
+    // BLD-1 part 1 S2 review R1-B1 and R2-S1. What this test asserts, and
+    // why: nothing about the PREVIEWED TABLE may reach the engine before the
+    // refusal — not a compiled read of `silver.orders`, not a `DESCRIBE` of
+    // it, not the row query wrapping it (all three carry the name). The
+    // route cannot send such a request: the tenant gate reads Postgres, and
     // `rewrite_sql_for_roles` refuses at `table_access` BEFORE
-    // `prefetch_for_tables` can read `system.columns`/`system.tables`. A
-    // request that still arrives is another test process's: every mock here
-    // binds an ephemeral port, and a request such a process had queued in a
-    // background task (the column-lineage build pass reads `ClickHouse` after
-    // its route has answered) can land on whichever server binds that port
-    // next — this one. Such a request is never about this preview, and its
-    // shape alone (a `DESCRIBE`, an `AS step` wrapper) does not attribute it:
-    // another preview test's probe looks the same.
+    // `prefetch_for_tables` can ask `ClickHouse` for
+    // `system.columns`/`system.tables`, so the probe and the row query are
+    // never reached.
     //
-    // So the test asserts what it means: nothing the engine received names the
-    // PREVIEWED TABLE — not a compiled read of it, not a `DESCRIBE` of it, not
-    // the row query wrapping it (all three carry the name). Any other request
-    // is printed, so a failure names exactly what arrived.
+    // The earlier form of this assertion said "the engine received nothing at
+    // all". It failed twice in the reviewer's runs on 2026-11-13 while the
+    // status and the sentence stayed right. That stray request was never
+    // captured, and the failure did not reproduce here in 230 runs (40 of the
+    // test alone, 120 of it alone through the binary in parallel, 70 of the
+    // whole file). Why it arrived is UNKNOWN: a request from another test
+    // process on a reused ephemeral port is one guess, not a finding. The
+    // shape alone (`DESCRIBE`, `AS step LIMIT`) cannot attribute a request
+    // either — another preview test's probe looks the same — so the assertion
+    // is about the table name, and it prints every request the engine received
+    // (method, url, body) so the next occurrence can be identified.
     let received: Vec<String> = engine
         .received_requests()
         .await
