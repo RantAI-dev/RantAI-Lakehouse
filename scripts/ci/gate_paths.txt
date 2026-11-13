@@ -1,0 +1,288 @@
+# Which acceptance gates a changed file can affect (OPS-25).
+#
+# This is the only place gate membership is written. `scripts/ci/detect_change_scope.sh`
+# reads it to select gate groups for a pull request, `scripts/ci/required_gate.sh`
+# reads the `group` lines to know when a skipped gate is acceptable, and
+# `ops/lint/check_gate_groups.py` checks both against `.github/workflows/ci.yml`.
+#
+# Format, one entry per line, `#` starts a comment and blank lines are ignored:
+#
+#   group <name> <job> [<job>...]   the jobs of one gate group (one line per group)
+#   path <pattern> <groups>         the files that select that group
+#
+# <groups> is a comma list of group names, `all` (every group) or `none` (no gate).
+# Patterns are bash `[[ $file == $pattern ]]` globs, so `*` also matches `/`
+# (one pattern covers a whole tree: `ops/g4/*` is `ops/g4` and everything below it).
+#
+# THE FIRST MATCHING `path` LINE WINS. Specific lines therefore come before the
+# catch-alls: `rust/crates/lakehouse-iceberg/tests/g1_*` before `rust/crates/*/tests/*`,
+# the `ops/g6` exceptions before `ops/g6/*`, and every `ops/*`/`rust/*` rule before
+# the shared `all` lines at the end.
+#
+# A changed file that matches no `path` line selects every group: an unknown path
+# means everything (fail closed, OPS-25 D2/D5). It is logged as
+# `Unmapped file: <path> (selecting every gate group)`.
+#
+# A pull request runs only the gates its files can affect. Every gate still runs
+# in the nightly full run and on `workflow_dispatch`; that run is the backstop
+# that catches a gate a pull request did not run. The owner accepted that `main`
+# may be red until then (docs/CI.md, "Gates by path").
+
+# ── Gate groups (OPS-25 D1) ───────────────────────────────────────────────
+# Each of the 25 gate jobs belongs to exactly one group. `images` and
+# `image-smoke` are not in a group: their `if:` is unchanged, so a change that
+# selects no group but needs the API or Dagster still builds both images and
+# proves the API starts.
+group storage g1-rustfs g2-seaweedfs
+group pipelines g3a-dagster g3-maintenance gold-export
+group cdc g4-cdc g4-mysql g4-mongo g4-oracle g4-mssql
+group ingest g6-ingest g6-ingest-other g6-oracle g6-ops g6-discovery-scale
+group saas g6-saas-a g6-saas-b
+group secrets g6-credentials g6-secret-managers g6-oauth g10-sso
+group alerts g6-alerts
+group upload g9-upload
+group governance g8-governance g8-time-travel
+
+# ── No gate can load these (OPS-25 D4) ────────────────────────────────────
+# Integration tests and benches, the parity corpus (`Repo lints` checks it),
+# `lakehouse-test-support` (a dev-dependency only), `lakehousectl` (not in any
+# image), the assistant, Dagster's unit tests, and the tooling directories no
+# gate mounts or runs.
+# G1's own integration test is the API's storage gate, so it comes first.
+path rust/crates/lakehouse-iceberg/tests/g1_* storage
+path rust/crates/*/tests/* none
+path rust/crates/*/benches/* none
+path rust/tests/* none
+path rust/crates/lakehouse-test-support/* none
+path rust/crates/lakehousectl/* none
+path rust/crates/lakehouse-llm/* none
+path rust/crates/lakehouse-api/src/routes/ai/* none
+path rust/crates/lakehouse-api/src/routes/knowledge.rs none
+path rust/crates/lakehouse-store/src/chat_term.rs none
+path rust/crates/lakehouse-store/src/assistant_settings.rs none
+path rust/crates/lakehouse-store/src/knowledge.rs none
+path dagster/dispar_orchestrate/test_* none
+path dagster/dispar_orchestrate/conftest.py none
+path ops/lint/* none
+path ops/release/* none
+path ops/ai_eval/* none
+path ops/bench/* none
+path ops/geo/* none
+path ops/demo/* none
+path ops/forecast/* none
+
+# ── The console (OPS-25 D4) ───────────────────────────────────────────────
+# No gate builds or starts the console image (`images` builds the API and
+# Dagster only), so a console-only change selects no gate group. Two paths the
+# console owns are compiled into Rust and do change gate behaviour:
+# `src/lib/dashboard-specs.ts` and `public/geo/*` are read by
+# `lakehouse-bi/src/formula/compile.rs`, which the governance and alert gates
+# exercise.
+path src/lib/dashboard-specs.ts governance,alerts
+path public/geo/* governance,alerts
+path src/* none
+path public/* none
+path package.json none
+path bun.lock none
+path bunfig.toml none
+path tsconfig.json none
+path next.config.ts none
+path eslint.config.mjs none
+path postcss.config.mjs none
+path components.json none
+path Dockerfile.frontend none
+
+# ── storage: G1's Lakekeeper test and G2's tenant provisioning ────────────
+path ops/g2/* storage
+path ops/seaweedfs/* storage
+
+# ── cdc: change capture through Kafka Connect (ops/g4) ────────────────────
+path ops/g4/* cdc
+path rust/crates/lakehouse-api/src/cdc_* cdc
+path rust/crates/lakehouse-api/src/kafka_connect.rs cdc
+path rust/crates/lakehouse-api/src/capture_lag.rs cdc
+path rust/crates/lakehouse-api/src/routes/capture_lag.rs cdc
+path rust/crates/lakehouse-store/src/cdc.rs cdc
+path rust/crates/lakehouse-store/src/capture_lag.rs cdc
+path dagster/dispar_orchestrate/cdc_apply.py cdc
+
+# ── saas: business-app connectors against the vendor stubs (ops/g6) ───────
+path ops/g6/docker-compose.g6-saas.override.yml saas
+path ops/g6/saas_stub* saas
+path ops/g6/Dockerfile.saas_stub saas
+path ops/g6/g6_saas_test.py saas
+path ops/g6/test_saas_gate_* saas
+path rust/crates/lakehouse-store/src/saas_vendors.rs saas
+path dagster/dispar_orchestrate/adapters/saas.py saas
+path dagster/dispar_orchestrate/saas/* saas
+# The SaaS connectors' OAuth half is shared with the secrets gates: SRC-12's
+# OAuth gate signs in through the same routes.
+path rust/crates/lakehouse-api/src/connector_probe/saas.rs secrets,saas
+path rust/crates/lakehouse-api/src/connector_oauth.rs secrets,saas
+path rust/crates/lakehouse-api/src/routes/connector_oauth.rs secrets,saas
+path rust/crates/lakehouse-store/src/connector_oauth.rs secrets,saas
+
+# ── secrets: credentials at rest, managers, OAuth sign-in, SSO ────────────
+# The vendor modules only: `mod.rs`, `refs.rs`, `secret_manager.py` and
+# `secret_resolver.py` resolve every connector's `secretRef` and stay shared.
+path ops/g6/docker-compose.src12* secrets
+path ops/g6/src12_* secrets
+path ops/g10/* secrets
+path ops/sso/* secrets
+path rust/crates/lakehouse-api/src/secret_manager/aws.rs secrets
+path rust/crates/lakehouse-api/src/secret_manager/azure.rs secrets
+path rust/crates/lakehouse-api/src/secret_manager/gcp.rs secrets
+path rust/crates/lakehouse-api/src/secret_manager/vault.rs secrets
+path dagster/dispar_orchestrate/secret_manager_* secrets
+
+# ── alerts: alert delivery and the alerting side of a dashboard ──────────
+path rust/crates/lakehouse-notify/* alerts
+path rust/crates/lakehouse-api/src/webhook_guard.rs alerts
+path rust/crates/lakehouse-store/src/alert_delivery.rs alerts
+# The alert-delivery test module is imported by SRC-11's connector-operations
+# test and SRC-12's OAuth test, so it moves all three gates.
+path ops/g6/src17_* alerts,ingest,secrets
+# The alert feature itself: `/api/alerts/run` is called by the CDC and Gold
+# export gates (`ops/g4/g4_test.py`, `ops/gold_export/gold_export_test.py`) and
+# by the ingest gate.
+path rust/crates/lakehouse-alerts/* alerts,cdc,ingest,pipelines
+path rust/crates/lakehouse-api/src/routes/alerts.rs alerts,cdc,ingest,pipelines
+path rust/crates/lakehouse-api/src/routes/load_alerts.rs alerts,cdc,ingest,pipelines
+path rust/crates/lakehouse-api/src/routes/chart_alerts.rs alerts,cdc,ingest,pipelines
+path rust/crates/lakehouse-api/src/routes/notifications.rs alerts,cdc,ingest,pipelines
+path rust/crates/lakehouse-store/src/alert_state.rs alerts,cdc,ingest,pipelines
+path rust/crates/lakehouse-store/src/email_settings.rs alerts,cdc,ingest,pipelines
+path dagster/dispar_orchestrate/alerts_run.py alerts,cdc,ingest,pipelines
+
+# ── upload: file upload (ops/g9); the ingest gate loads files too ─────────
+path ops/g9/* upload
+path rust/crates/lakehouse-api/src/upload_* upload,ingest
+path rust/crates/lakehouse-api/src/routes/uploads.rs upload,ingest
+path rust/crates/lakehouse-api/src/routes/uploads/* upload,ingest
+path rust/crates/lakehouse-store/src/uploads.rs upload,ingest
+path rust/crates/lakehouse-store/src/upload_folders.rs upload,ingest
+path dagster/dispar_orchestrate/file_ingest.py upload,ingest
+path dagster/dispar_orchestrate/upload_types.py upload,ingest
+path dagster/dispar_orchestrate/parquet_ingest.py upload,ingest
+
+# ── pipelines: Dagster + dlt ingest, authored pipelines, maintenance, Gold ─
+path ops/g3/* pipelines
+path ops/g3a/* pipelines
+path ops/g7/* pipelines
+path ops/gold_export/* pipelines
+path rust/crates/lakehouse-api/src/pipeline_compile.rs pipelines
+path rust/crates/lakehouse-api/src/transform_grammar.rs pipelines
+path rust/crates/lakehouse-api/src/routes/authored_pipelines.rs pipelines
+path rust/crates/lakehouse-api/src/routes/pipeline_preview.rs pipelines
+path rust/crates/lakehouse-store/src/maintenance_policy.rs pipelines
+path dagster/dispar_orchestrate/maintenance.py pipelines
+path dagster/dispar_orchestrate/authored_* pipelines
+# Gold export reads and writes the catalog, and the governance gate exports
+# Gold too, so these move both. `routes/catalog_governance.rs` and
+# `routes/catalog_query.rs` are not listed: they stay shared.
+path rust/crates/lakehouse-api/src/gold_* pipelines,governance
+path rust/crates/lakehouse-api/src/routes/gold.rs pipelines,governance
+path rust/crates/lakehouse-store/src/gold_publication.rs pipelines,governance
+path dagster/dispar_orchestrate/gold_export.py pipelines,governance
+path rust/crates/lakehouse-api/src/routes/catalog.rs pipelines,governance
+path rust/crates/lakehouse-api/src/routes/catalog_search.rs pipelines,governance
+path rust/crates/lakehouse-api/src/routes/catalog_profile.rs pipelines,governance
+path rust/crates/lakehouse-api/src/routes/catalog_grants.rs pipelines,governance
+path rust/crates/lakehouse-api/src/routes/catalog_restore.rs pipelines,governance
+path rust/crates/lakehouse-api/src/routes/catalog_source.rs pipelines,governance
+path rust/crates/lakehouse-api/src/bronze_stats_cache.rs pipelines,governance
+path rust/crates/lakehouse-api/src/catalog_search_cache.rs pipelines,governance
+
+# ── governance: masking, time travel, and the BI side both gates read ─────
+path ops/g8/* governance
+path ops/trino/* governance
+path rust/crates/lakehouse-trino/* governance
+# `lakehouse-alerts` depends on `lakehouse-bi`, so a BI change moves both gates.
+path rust/crates/lakehouse-bi/* governance,alerts
+path rust/crates/lakehouse-embed/* governance,alerts
+path rust/crates/lakehouse-api/src/routes/dashboard* governance,alerts
+path rust/crates/lakehouse-api/src/routes/embed.rs governance,alerts
+path rust/crates/lakehouse-api/src/routes/layout_tabs.rs governance,alerts
+path rust/crates/lakehouse-api/src/routes/metrics.rs governance,alerts
+path rust/crates/lakehouse-api/src/routes/metrics_rewrite.rs governance,alerts
+path rust/crates/lakehouse-api/src/routes/calc_fields.rs governance,alerts
+path rust/crates/lakehouse-api/src/routes/hierarchies.rs governance,alerts
+path rust/crates/lakehouse-api/src/routes/drill.rs governance,alerts
+path rust/crates/lakehouse-api/src/routes/maps.rs governance,alerts
+path rust/crates/lakehouse-api/src/routes/params.rs governance,alerts
+path rust/crates/lakehouse-api/src/routes/param_rewrite.rs governance,alerts
+path rust/crates/lakehouse-api/src/routes/layers.rs governance,alerts
+path rust/crates/lakehouse-api/src/routes/layers_rewrite.rs governance,alerts
+path rust/crates/lakehouse-api/src/routes/bin_rewrite.rs governance,alerts
+path rust/crates/lakehouse-api/src/routes/chart_shapes_rewrite.rs governance,alerts
+path rust/crates/lakehouse-api/src/routes/type_b_rewrite.rs governance,alerts
+path rust/crates/lakehouse-api/src/routes/join_rewrite.rs governance,alerts
+path rust/crates/lakehouse-api/src/routes/organise_paths.rs governance,alerts
+path rust/crates/lakehouse-api/src/routes/render.rs governance,alerts
+path rust/crates/lakehouse-api/src/routes/pdf_export.rs governance,alerts
+path rust/crates/lakehouse-api/src/routes/report_runner.rs governance,alerts
+path rust/crates/lakehouse-api/src/routes/reports.rs governance,alerts
+path rust/crates/lakehouse-api/src/routes/home.rs governance,alerts
+path rust/crates/lakehouse-api/src/routes/overview.rs governance,alerts
+path rust/crates/lakehouse-api/src/routes/public_links.rs governance,alerts
+path rust/crates/lakehouse-api/src/routes/saved_queries.rs governance,alerts
+path rust/crates/lakehouse-api/src/tile_pool.rs governance,alerts
+path rust/crates/lakehouse-api/src/result_cache.rs governance,alerts
+path rust/crates/lakehouse-api/src/result_cache/* governance,alerts
+path rust/crates/lakehouse-api/src/pdf.rs governance,alerts
+path rust/crates/lakehouse-api/src/export.rs governance,alerts
+path rust/crates/lakehouse-api/src/csv_export.rs governance,alerts
+path rust/crates/lakehouse-api/src/csv_safe.rs governance,alerts
+path rust/crates/lakehouse-store/src/dashboard_* governance,alerts
+path rust/crates/lakehouse-store/src/home_layout.rs governance,alerts
+path rust/crates/lakehouse-store/src/geo_map.rs governance,alerts
+path rust/crates/lakehouse-store/src/report_* governance,alerts
+path rust/crates/lakehouse-store/src/reporting_settings.rs governance,alerts
+path rust/crates/lakehouse-store/src/public_links.rs governance,alerts
+path rust/crates/lakehouse-store/src/semantic.rs governance,alerts
+path rust/crates/lakehouse-store/src/saved_query_access.rs governance,alerts
+path rust/crates/lakehouse-store/src/overview.rs governance,alerts
+
+# ── The rest of ops/g6, after every ops/g6 line above ────────────────────
+path ops/g6/src11_* ingest,secrets
+path ops/g6/src13_* ingest
+path ops/g6/g6_oracle_test.py ingest
+# The Oracle gate and the ingest gate share the Oracle override and its TLS proxy.
+path ops/g6/docker-compose.g6-oracle.override.yml cdc,ingest
+path ops/g6/oracle-tls-proxy.conf cdc,ingest
+# `ops/g6/g6_ingest_matrix_test.py` and `docker-compose.g6.override.yml` are
+# used by all five `ops/g6` groups.
+path ops/g6/* cdc,ingest,saas,secrets,alerts
+
+# ── Shared: any change here can change any gate (OPS-25 D3) ──────────────
+# One binary serves every gate (`cargo build -p lakehouse-api`, rust/Dockerfile),
+# and 21 of the 25 gates create connectors, run pipelines and read back through
+# the routes below, so these are shared even though one feature looks like its
+# only user:
+#   - docker-compose.yml, .env.example (the stack every gate starts);
+#   - .github/* (the workflows), scripts/* (including scripts/ci/*);
+#   - rust/migrations/* (the schema every gate reads), rust/Cargo.toml,
+#     rust/Cargo.lock, every crate's Cargo.toml, rust/Dockerfile,
+#     rust/entrypoint.api.sh, rust/rust-toolchain.toml;
+#   - dagster/Dockerfile, dagster/pyproject.toml, dagster/dagster.yaml,
+#     dagster/dispar_orchestrate/definitions.py and every Dagster module not
+#     listed above;
+#   - ops/fixtures/*, ops/gates/* (the gate registry and the log helper every
+#     gate calls), ops/oidc-mock/* (built by most gates), ops/smtp-ca/* (mounted
+#     into the API), ops/backups/* (mounted into ClickHouse), ops/init-env.sh;
+#   - in the API: lib.rs, main.rs, state.rs, config.rs, policy.rs
+#     (POLICY_TABLE), policy_engine.rs, sql_rewrite.rs, routes/mod.rs (the
+#     router), routes/support.rs, routes/auth.rs, routes/identity.rs,
+#     routes/connectors.rs, routes/pipelines.rs, routes/query.rs,
+#     routes/governance.rs, upstream_error.rs; and all of lakehouse-core,
+#     lakehouse-store/src/ except the modules listed above, lakehouse-auth,
+#     lakehouse-iceberg/src/, lakehouse-clickhouse, lakehouse-dagster;
+#   - any other ops/* or rust/* path.
+path docker-compose.yml all
+path .env.example all
+path .github/* all
+path scripts/* all
+path rust/migrations/* all
+path dagster/* all
+path ops/* all
+path rust/* all
