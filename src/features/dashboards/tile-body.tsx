@@ -9,7 +9,7 @@ import type { TileFailure } from "@/services/contracts/dashboards";
 import { MiniMarkdown } from "@/features/copilot/mini-markdown";
 import { EChart } from "./echart";
 import { buildOption, clusterNote, fmtInt, forecastNote, withReferenceLines } from "./chart-option";
-import { buildCombinedOption, cutLayers, failedLayers } from "./combined-option";
+import { NOT_AVAILABLE_WITH_YOUR_ACCESS, buildCombinedOption, cutLayers, failedLayers, unavailableLayers } from "./combined-option";
 import { takesLayers, type LayerDef } from "@/lib/chart-layers";
 import { GeoChart } from "./geo-chart";
 import type { MapLoader } from "./echarts-maps";
@@ -407,6 +407,10 @@ function CombinedBody({
   const option = withReferenceLines(styled.option, cell.referenceLines, false, dark);
   const failed = failedLayers(layers);
   const cut = cutLayers(layers);
+  // BI-51 (QA LH-BI-13-03): the questions the viewer's access does not cover,
+  // in one muted line the legend cannot replace (it can be hidden and read
+  // with a pointer only).
+  const unavailable = unavailableLayers(layers);
   const click = onDataClick
     ? (hit: Parameters<ChartClickHandler>[0], pos: { x: number; y: number }) => {
         const owner = combined.owners[hit.seriesIndex ?? -1] ?? -1;
@@ -431,6 +435,15 @@ function CombinedBody({
       {cut.length ? (
         <p className="px-1 pt-1 text-[11px] text-muted-foreground" aria-label="Questions that were cut off">
           {cut.map((label) => `${label}: not every value is shown`).join(" · ")}
+        </p>
+      ) : null}
+      {unavailable.length ? (
+        <p
+          className="truncate px-1 pt-1 text-[11px] text-muted-foreground"
+          aria-label="Questions not available with your access"
+          title={`${NOT_AVAILABLE_WITH_YOUR_ACCESS}: ${unavailable.join(", ")}`}
+        >
+          {NOT_AVAILABLE_WITH_YOUR_ACCESS}: {unavailable.join(", ")}
         </p>
       ) : null}
       {failed.length ? (

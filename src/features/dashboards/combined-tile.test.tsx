@@ -48,8 +48,32 @@ describe("a tile with more questions on its chart", () => {
     expect(screen.getByText("ab12cd")).toBeTruthy()
   })
 
-  it("says under the chart which question was cut off and nothing for one that was not (BI-13 review fix R1)", () => {
-    const cutCell: Rows = { ...CELL, layers: [{ ...CELL.layers![0], truncated: true }, { ...CELL.layers![0], label: "Beds" }] }
+  // QA LH-BI-13-03 (BI-51): a question the viewer's access does not cover is
+  // named in one muted line, never in the red list with a reference.
+  it("a question outside the viewer's access is named in one muted line and not among the questions that could not be drawn", () => {
+    const access: Rows["layers"] = [
+      { label: "Occupancy", draw: "line", axis: "right", source: "s_1", dimension: "month", columns: [], rows: [], error: "Not available with your access.", cause: "access" },
+    ]
+    render(<TileBody spec={SPEC} cell={{ ...CELL, layers: access }} dark={false} loading={false} />)
+    const line = screen.getByLabelText("Questions not available with your access")
+    expect(line.textContent).toBe("Not available with your access: Occupancy")
+    expect(line.getAttribute("title")).toBe("Not available with your access: Occupancy")
+    expect(screen.queryByLabelText("Questions that could not be drawn")).toBeNull()
+    cleanup()
+
+    // A failure for another reason keeps its sentence and its reference.
+    const both: Rows["layers"] = [
+      ...access!,
+      { label: "Beds", draw: "line", axis: "right", source: "mart_beds", dimension: "month", columns: [], rows: [], error: "This chart could not be loaded.", errorId: "ff99ee" },
+    ]
+    render(<TileBody spec={SPEC} cell={{ ...CELL, layers: both }} dark={false} loading={false} />)
+    expect(screen.getByText("Beds:")).toBeTruthy()
+    expect(screen.getByText("This chart could not be loaded.")).toBeTruthy()
+    expect(screen.getByText("ff99ee")).toBeTruthy()
+    expect(screen.queryByText(/Occupancy:/)).toBeNull()
+  })
+
+  it("says under the chart which question was cut off and nothing for one that was not (BI-13 review fix R1)", () => {    const cutCell: Rows = { ...CELL, layers: [{ ...CELL.layers![0], truncated: true }, { ...CELL.layers![0], label: "Beds" }] }
     render(<TileBody spec={SPEC} cell={cutCell} dark={false} loading={false} />)
     expect(screen.getByText("Rooms: not every value is shown")).toBeTruthy()
     expect(screen.queryByText(/Beds: not every/)).toBeNull()
