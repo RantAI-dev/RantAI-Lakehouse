@@ -22,7 +22,7 @@
 //! (and its siblings) for why each of the three genuinely can only ever
 //! create a non-active record with today's schema.
 
-use axum::extract::{Path, State};
+use axum::extract::State;
 use lakehouse_auth::Principal;
 use serde_json::{Map, Value, json};
 
@@ -30,8 +30,12 @@ use super::{api_result_to_value, arg_str, response_to_value};
 use crate::state::AppState;
 
 async fn governance_kind(state: &AppState, kind: &str) -> Value {
+    // No principal: these tools read kinds that name no table, and the
+    // convention `ensure_rule_table` has is that a call with no person is not
+    // narrowed (`GOV-15` D7).
     response_to_value(
-        crate::routes::governance::get(State(state.clone()), Path(kind.to_owned())).await,
+        crate::routes::governance::read_kind(state, None, &axum::http::HeaderMap::new(), kind)
+            .await,
     )
     .await
 }
@@ -44,8 +48,21 @@ pub(super) async fn list_classification_rules(state: &AppState) -> Value {
     governance_kind(state, "classification").await
 }
 
-pub(super) async fn list_quality_rules(state: &AppState) -> Value {
-    governance_kind(state, "quality").await
+pub(super) async fn list_quality_rules(state: &AppState, principal: Option<&Principal>) -> Value {
+    response_to_value(
+        // The tool has no request headers of its own, so the tenant rule reads
+        // the person's own tenant — the same convention `draft_quality_rule`
+        // follows below. Refused for a person outside the tenant, and narrowed
+        // to the tables their roles read (`GOV-15` D7).
+        crate::routes::governance::read_kind(
+            state,
+            principal,
+            &axum::http::HeaderMap::new(),
+            "quality",
+        )
+        .await,
+    )
+    .await
 }
 
 pub(super) async fn get_cdc_health(state: &AppState) -> Value {

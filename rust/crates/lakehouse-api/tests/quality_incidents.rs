@@ -1440,6 +1440,151 @@ async fn a_permitted_caller_still_edits_and_deletes_rules_including_one_whose_ta
     );
 }
 
+/// `GOV-15` (`GOV-12` plan, section 4): a person outside the tenant that owns
+/// the shared catalog cannot read the rule list at all — the same refusal the
+/// incident list beside it gives — and the refusal queries nothing.
+#[tokio::test]
+async fn a_caller_outside_the_catalog_tenant_cannot_list_the_rules() {
+    let (router, pool, ch) = app().await;
+    rule(&pool, "g15_listed", "email not null >= 90%").await;
+    let cookie = outsider(&pool).await;
+    let before = sent_to_clickhouse(&ch).await.len();
+
+    let (code, rules) = call(&router, &cookie, "GET", "/api/governance/quality", None).await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{rules}");
+    let (code, listed) = call(
+        &router,
+        &cookie,
+        "GET",
+        "/api/governance/quality/incidents",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{listed}");
+    assert_eq!(
+        rules, listed,
+        "the rule list refuses as the list beside it does"
+    );
+    assert_eq!(
+        sent_to_clickhouse(&ch).await.len(),
+        before,
+        "a refused list queries nothing"
+    );
+}
+
+/// `GOV-15` (`GOV-12` plan, section 4): the rule list hides a row the way the
+/// catalog list hides a table — every row when the caller reads every table,
+/// otherwise only the rows on tables their role reads, a row naming no table
+/// included in the hiding (D6).
+#[tokio::test]
+async fn the_rule_list_hides_rules_on_tables_the_role_may_not_read() {
+    let (router, pool, ch) = app().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("_silver_meta.quality"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [
+                {"name": "tabel", "type": "String"},
+                {"name": "cek", "type": "String"},
+                {"name": "verdict", "type": "String"},
+                {"name": "nilai", "type": "String"},
+                {"name": "at", "type": "String"},
+            ],
+            "data": [
+                {"tabel": "silver.orders", "cek": "row_count", "verdict": "pass",
+                 "nilai": "1", "at": "2026-11-13 00:00:00"},
+                {"tabel": "silver.customers", "cek": "row_count", "verdict": "pass",
+                 "nilai": "1", "at": "2026-11-13 00:00:00"},
+                {"tabel": "orders", "cek": "row_count", "verdict": "pass",
+                 "nilai": "1", "at": "2026-11-13 00:00:00"},
+            ],
+            "rows": 3,
+        })))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+    rule(&pool, "g15_visible", "email not null >= 90%").await;
+    rule_on(
+        &pool,
+        "g15_hidden_rule",
+        "silver.customers",
+        "email not null >= 90%",
+    )
+    .await;
+
+    let cookie = narrowed(&pool).await;
+    let (code, body) = call(&router, &cookie, "GET", "/api/governance/quality", None).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let mut narrowed_assets: Vec<&str> = body["quality"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["asset"].as_str())
+        .collect();
+    narrowed_assets.sort_unstable();
+    assert_eq!(
+        narrowed_assets,
+        ["silver.orders", "silver.orders"],
+        "only the rows on a table the role reads, observed and authored"
+    );
+
+    let cookie = admin(&pool).await;
+    let (code, body) = call(&router, &cookie, "GET", "/api/governance/quality", None).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let rows = body["quality"].as_array().unwrap();
+    // Three observed, two authored, and the two `0004_seed_governance.sql`
+    // seeds — every row there is.
+    assert_eq!(
+        rows.len(),
+        7,
+        "a caller who reads every table sees them all"
+    );
+    let assets: Vec<&str> = rows
+        .iter()
+        .filter_map(|row| row["asset"].as_str())
+        .collect();
+    assert!(assets.contains(&"silver.customers"), "{assets:?}");
+    assert!(assets.contains(&"orders"), "{assets:?}");
+}
+
+/// `GOV-15` (`GOV-12` plan, section 4), D7: the assistant reads the rule list
+/// as the person behind the chat, so a table their role hides is not in the
+/// tool's answer either.
+#[tokio::test]
+async fn the_assistant_lists_only_the_rules_on_tables_the_person_may_read() {
+    let (router, pool, _ch) = app().await;
+    rule(&pool, "g15_ai_visible", "email not null >= 90%").await;
+    rule_on(
+        &pool,
+        "g15_ai_hidden",
+        "silver.customers",
+        "email not null >= 90%",
+    )
+    .await;
+    let user = create_assistant_principal(&pool, "governance:write,governance:read").await;
+    narrow_to_orders(&pool, user).await;
+    common::in_the_catalog_tenant(&pool, user).await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let (code, body) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/ai/tool",
+        Some(json!({"tool": "list_quality_rules", "args": {}, "mode": "ask"})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], "executed", "{body}");
+    let mut assets: Vec<&str> = body["result"]["quality"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["asset"].as_str())
+        .collect();
+    assets.sort_unstable();
+    assert_eq!(assets, ["silver.orders"], "the tool reads as the person");
+}
+
 /// QA `LH-DATA-14-01` F2 (`DATA-54`): a rewrite that changes the table is
 /// checked, and a refusal leaves the rule on its old table. A rewrite that
 /// keeps the table is not checked, so a rule on a dropped table can still be

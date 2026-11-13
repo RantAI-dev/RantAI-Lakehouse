@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 
-use crate::error::ApiResult;
+use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
 use crate::routes::catalog::NOT_IN_PRIMARY;
 use crate::routes::lakehouse::{is_unknown_table_error, is_unknown_table_or_database_error};
@@ -115,15 +115,58 @@ enum GovError {
 }
 
 /// `GET /api/governance/{kind}`.
-pub async fn get(State(state): State<AppState>, Path(kind): Path<String>) -> Response {
-    match Kind::parse(&kind) {
+///
+/// The quality list names rules of every table; it is narrowed by the
+/// catalog's tenant rule and the caller's table access, as
+/// [`read_kind`] does (`GOV-15`).
+pub async fn get(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    Path(kind): Path<String>,
+) -> Response {
+    read_kind(&state, Some(&principal), &headers, &kind).await
+}
+
+/// The `{kind}` dispatch as one person reads it.
+///
+/// The route is one caller; the assistant's tools are the other, with the
+/// person behind the chat and no request headers of their own. A quality list
+/// is narrowed by the catalog's tenant rule and by the caller's table access
+/// (`GOV-15 (GOV-12 plan, section 4)`), because every row is a rule on a
+/// table; no other kind names tables, so no other kind is gated or filtered
+/// (`GOV-15` scope). No principal is a system call and is not narrowed, which
+/// [`crate::routes::quality::quality_table_access`] documents.
+pub(crate) async fn read_kind(
+    state: &AppState,
+    principal: Option<&Principal>,
+    headers: &HeaderMap,
+    kind: &str,
+) -> Response {
+    let parsed = Kind::parse(kind);
+    // The gate runs before `run`, so a caller the catalog refuses causes no
+    // `ClickHouse` query at all (`GOV-15` D8).
+    let narrowing = if parsed == Kind::Quality {
+        match crate::routes::quality::quality_table_access(state, principal, headers).await {
+            Ok(access) => Some(access),
+            Err(err) => return ApiRejection(err).into_response(),
+        }
+    } else {
+        None
+    };
+    match parsed {
         Kind::Unknown => (
             StatusCode::BAD_REQUEST,
             ApiJson(json!({ "error": format!("unknown kind: {kind}") })),
         )
             .into_response(),
-        parsed => match run(&state, parsed).await {
-            Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
+        parsed => match run(state, parsed).await {
+            Ok(mut body) => {
+                if let Some(access) = narrowing {
+                    retain_readable_rules(&access, &mut body);
+                }
+                (StatusCode::OK, ApiJson(body)).into_response()
+            }
             // Every branch shares one outer `catch (e)` returning
             // `{ error: String(e) }` at 503.
             Err(err) => (
@@ -133,6 +176,30 @@ pub async fn get(State(state): State<AppState>, Path(kind): Path<String>) -> Res
                 .into_response(),
         },
     }
+}
+
+/// Drops every quality row whose `asset` the caller's table access hides, in
+/// place — the rule [`crate::routes::catalog::retain_visible`] applies to the
+/// catalog's own rows (`GOV-15` D6).
+///
+/// `retain_visible` itself cannot be called: it reads a row's `tableKey` or
+/// dotted `id`, while a quality row's key is its `asset` (an authored rule's
+/// `id` is a UUID, an observed row's `q-<n>`). A row with no `asset` string is
+/// hidden from a narrowed caller, as is an `asset` with no schema: nothing
+/// proves the grant covers it (fail closed).
+fn retain_readable_rules(access: &crate::table_access::TableAccess, body: &mut Value) {
+    if access.is_all() {
+        return;
+    }
+    let Some(rows) = body.get_mut("quality").and_then(Value::as_array_mut) else {
+        return;
+    };
+    rows.retain(|row| {
+        row.get("asset")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|asset| access.allows_key(asset))
+    });
 }
 
 /// A fixed, classified message for a failed governance read. The raw
