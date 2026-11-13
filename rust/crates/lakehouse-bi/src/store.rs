@@ -6312,7 +6312,7 @@ mod tests {
             "avg",
         )
         .unwrap();
-        assert!(sql.contains("round(avg(visitors)) AS visitors"), "{sql}");
+        assert!(sql.contains("round(avg(visitors), 6) AS visitors"), "{sql}");
         assert!(sql.ends_with("LIMIT 5000"), "{sql}");
     }
 
@@ -7965,7 +7965,7 @@ mod tests {
             ChartY::Multi(vec!["visitors".to_owned(), "avg_stay".to_owned()])
         );
         assert!(
-            spec.spec.sql.contains("round(avg(stay)) AS avg_stay"),
+            spec.spec.sql.contains("round(avg(stay), 6) AS avg_stay"),
             "{}",
             spec.spec.sql
         );
@@ -8543,7 +8543,7 @@ mod tests {
             rooms
                 .spec
                 .sql
-                .contains("round(avg(capacity__rooms)) AS capacity__rooms"),
+                .contains("round(avg(capacity__rooms), 6) AS capacity__rooms"),
             "{}",
             rooms.spec.sql
         );

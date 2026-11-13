@@ -34,6 +34,7 @@ use super::{QueryBuilder, Ready, add_settings, parse_iso_date, parse_number};
 use crate::filters::ColumnKind;
 use crate::grain::Grain;
 use crate::shape::{MAX_STEPS, Step, StepCondition, Summarise};
+use crate::specs::Aggregate;
 
 /// Most conditions in one filter step, and measures in one summarise step.
 const MAX_CONDITIONS: usize = 10;
@@ -204,7 +205,12 @@ fn summarise(
         aggs.push(if agg == "count" {
             format!("count() AS __s{i}")
         } else {
-            format!("round({agg}({})) AS __s{i}", m.column)
+            // QA LH-BI-6-04 (BI-55, D4); `agg` was checked against the five
+            // words above, so the lossy parse cannot change it.
+            format!(
+                "{} AS __s{i}",
+                Aggregate::from_str_lossy(&agg).rounded(&m.column)
+            )
         });
         names.push(ident);
     }

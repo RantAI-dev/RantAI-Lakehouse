@@ -595,7 +595,8 @@ pub fn grid_points_sql(
     let value = if agg == Aggregate::Count {
         format!("count() AS {measure}")
     } else {
-        format!("round({agg}({measure})) AS {measure}")
+        // QA LH-BI-6-04 (BI-55, D4).
+        format!("{} AS {measure}", agg.rounded(measure.as_str()))
     };
     format!(
         "SELECT __cy AS {lat}, __cx AS {lon}, {value}, count() AS cell_points, max(__cs) AS cell_size \
