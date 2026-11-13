@@ -517,6 +517,27 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           df -h /
 
+      # OPS-24 D13: the three images the tests start, pulled once here with a
+      # retry around the PULL only (a registry 502 was what failed a run; no
+      # test is ever retried). The tags are the ones the tests name:
+      # postgres:16-alpine (`lakehouse-test-support/src/lib.rs:279`),
+      # clickhouse/clickhouse-server:26.8 (`testcontainers-modules`' default
+      # repository with the tests' `.with_tag("26.8")`) and
+      # axllent/mailpit:v1.33.0 (`lakehouse-api/tests/email_settings_route.rs:52-53`).
+      # A tag that drifts only loses the retry: the test still pulls its own.
+      # The step ends with `docker images`, so it cannot fail the job.
+      - name: Pull the test images (the pull is retried, a test never is)
+        if: needs.changes.outputs.proven != 'true'
+        run: |
+          for image in postgres:16-alpine clickhouse/clickhouse-server:26.8 axllent/mailpit:v1.33.0; do
+            for attempt in 1 2 3; do
+              if docker pull --quiet "$image"; then break; fi
+              echo "pull of $image failed (attempt $attempt of 3)"
+              sleep $((attempt * 10))
+            done
+          done
+          docker images --format '{{.Repository}}:{{.Tag}}' | sort
+
       # Save on `main` only; see the `clippy` job's `Cache cargo` step.
       - name: Cache cargo
         id: cache
@@ -567,6 +588,28 @@ jobs:
           cargo nextest run --workspace --locked --profile ci --color never \
             --partition "count:${{ matrix.partition }}/3" 2>&1 | tee nextest.log
           exit "${PIPESTATUS[0]}"
+        working-directory: rust
+
+      # OPS-24 (T5, measured for slice S2): a measurement, not a check. It
+      # prints the disk this job really used (the plan's §0.1 says 86 GB were
+      # free before "Free runner disk") and the size an archive of the test
+      # binaries would have, which is the number S2 starts from. No line of it
+      # may fail the job.
+      - name: Report disk and test binary sizes (OPS-24, measured for slice S2)
+        if: always() && matrix.partition == 1 && needs.changes.outputs.proven != 'true'
+        run: |
+          set +e   # a measurement: no line of it may fail the job
+          df -h / || true
+          du -sh target 2>/dev/null || true
+          find target/debug/deps -maxdepth 1 -type f -executable ! -name '*.so' -printf '%s %p\n' 2>/dev/null \
+            | sort -rn > "$RUNNER_TEMP/bins.txt" || true
+          awk '{s+=$1; n++} END {printf "test binaries: count=%d total_gib=%.2f\n", n, s/1073741824}' "$RUNNER_TEMP/bins.txt" || true
+          largest="$(head -1 "$RUNNER_TEMP/bins.txt" | cut -d' ' -f2-)"
+          if [ -n "$largest" ]; then
+            raw=$(stat -c %s "$largest"); packed=$(zstd -3 -T0 -c "$largest" | wc -c)
+            echo "largest binary: raw=$raw zstd3=$packed"
+          fi
+          true
         working-directory: rust
 
       # REL-20 (D3): nextest does not run doctests, so `cargo test --doc`
