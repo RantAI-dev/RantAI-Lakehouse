@@ -16,6 +16,8 @@
 //!   written, and [`resolve`], which decides what a chart's grain is *right
 //!   now* once the dashboard's own switch and the column's current type are
 //!   known.
+//! - [`switch_skip`], which says why the dashboard's switch left a chart as it
+//!   was, for the tile's quiet mark (`BI-50`).
 //!
 //! # Why `date_trunc` and not `toStartOfMonth`
 //!
@@ -640,6 +642,67 @@ pub fn resolve(
     }
 }
 
+/// Why the dashboard's "Group dates by" left a chart as it was (`BI-50`,
+/// plan D10). The console shows one quiet mark and one sentence for it, so the
+/// server names the reason instead of leaving the tile looking untouched.
+///
+/// The type mirrors `GrainNotApplied` in `src/lib/grain-switch.ts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwitchSkip {
+    /// This type of chart takes no date grouping at all: a KPI, a table, a
+    /// scatter, a map, and every other kind [`Grain::kind_takes`] refuses.
+    Kind,
+    /// The chart groups by a part of the date (day of week, hour of day, …),
+    /// which the control never replaces.
+    Part,
+    /// The chart's dimension is a column that is not a date or a timestamp.
+    NotADate,
+    /// The chart has no date grouping of its own for the control to change: a
+    /// date dimension drawn as stored, or a dimension whose kind is unknown.
+    NoGrain,
+}
+
+/// Why the dashboard's grain left a chart as it was, or `None` when it did
+/// change the chart (`BI-50`, plan D10).
+///
+/// `built` is the grain the chart's statement was built with
+/// (`FilteredSql::grain`); `column` is the kind of its dimension's column when
+/// the caller knows it. A chart the switch did not change is marked only while
+/// a grain was requested: with no dashboard grain there is no control in play.
+///
+/// A chart that kept its own grain because the requested one does not fit its
+/// column is not marked here: that case keeps the older `grainSkipped`
+/// (`Resolution::skipped`).
+#[must_use]
+pub fn switch_skip(
+    kind: ChartKind,
+    built: Option<Grain>,
+    column: Option<ColumnKind>,
+    requested: Option<Grain>,
+) -> Option<SwitchSkip> {
+    // No dashboard grain, no control: every chart is as its own definition says.
+    requested?;
+    if kind.is_static() {
+        return None;
+    }
+    // Day is taken by every kind that takes any grain, so it answers "does this
+    // kind group dates at all" in one call.
+    if !Grain::Day.kind_takes(kind) {
+        return Some(SwitchSkip::Kind);
+    }
+    match built {
+        // The switch replaced it, it already was that grain, or the requested
+        // grain did not fit the column and `Resolution::skipped` says so.
+        Some(g) if g.is_truncation() => None,
+        Some(_) => Some(SwitchSkip::Part),
+        None => match column {
+            Some(ColumnKind::Date | ColumnKind::DateTime) | None => Some(SwitchSkip::NoGrain),
+            Some(ColumnKind::Number | ColumnKind::Text) => Some(SwitchSkip::NotADate),
+        },
+    }
+}
+
 /// The limit a grained chart is built with: 1 to [`MAX_GRAIN_LIMIT`]
 /// (default 20; 366 for a calendar), where other charts keep 1 to 100.
 #[must_use]
@@ -1005,6 +1068,89 @@ mod tests {
         assert_eq!((r.effective, r.skipped), (Some(Grain::Month), None));
         let r = resolve(Some("month"), line, date, Some(Grain::DayOfWeek));
         assert_eq!(r.effective, Some(Grain::Month), "a part is never a switch");
+    }
+
+    /// QA `LH-BI-9-05` (`BI-50`, plan D10): the reason a chart the dashboard's
+    /// grain did not change carries, one assert per rule.
+    #[test]
+    fn the_switch_says_why_it_left_a_chart_as_it_was() {
+        let month = Some(Grain::Month);
+        assert_eq!(
+            switch_skip(
+                ChartKind::Line,
+                Some(Grain::Month),
+                Some(ColumnKind::Date),
+                month
+            ),
+            None,
+            "the switch replaced it"
+        );
+        assert_eq!(
+            switch_skip(
+                ChartKind::Line,
+                Some(Grain::DayOfWeek),
+                Some(ColumnKind::Date),
+                month
+            ),
+            Some(SwitchSkip::Part)
+        );
+        assert_eq!(
+            switch_skip(ChartKind::Bar, None, Some(ColumnKind::Text), month),
+            Some(SwitchSkip::NotADate)
+        );
+        assert_eq!(
+            switch_skip(ChartKind::Bar, None, Some(ColumnKind::Number), month),
+            Some(SwitchSkip::NotADate)
+        );
+        assert_eq!(
+            switch_skip(ChartKind::Bar, None, Some(ColumnKind::Date), month),
+            Some(SwitchSkip::NoGrain)
+        );
+        assert_eq!(
+            switch_skip(ChartKind::Bar, None, None, month),
+            Some(SwitchSkip::NoGrain)
+        );
+        assert_eq!(
+            switch_skip(ChartKind::Kpi, None, None, month),
+            Some(SwitchSkip::Kind)
+        );
+        assert_eq!(
+            switch_skip(ChartKind::Table, None, Some(ColumnKind::Date), month),
+            Some(SwitchSkip::Kind)
+        );
+        assert_eq!(
+            switch_skip(ChartKind::Kpi, Some(Grain::Month), None, month),
+            Some(SwitchSkip::Kind),
+            "a KPI that compares periods is not the control's"
+        );
+        assert_eq!(
+            switch_skip(ChartKind::Text, None, None, month),
+            None,
+            "a static tile takes no grain and is not marked"
+        );
+        assert_eq!(
+            switch_skip(ChartKind::Bar, None, Some(ColumnKind::Text), None),
+            None,
+            "no dashboard grain, no control"
+        );
+        assert_eq!(
+            switch_skip(
+                ChartKind::Calendar,
+                Some(Grain::Day),
+                Some(ColumnKind::Date),
+                month
+            ),
+            None,
+            "a calendar keeps day and the switch is a truncation it never takes"
+        );
+        assert_eq!(
+            serde_json::to_value(SwitchSkip::NotADate).unwrap(),
+            json!("not_a_date")
+        );
+        assert_eq!(
+            serde_json::to_value(SwitchSkip::NoGrain).unwrap(),
+            json!("no_grain")
+        );
     }
 
     #[test]
