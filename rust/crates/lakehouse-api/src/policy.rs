@@ -775,6 +775,9 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",    "/api/dashboard/reports/{id}", Policy::RequiresAuth),
     ("PUT",    "/api/dashboard/reports/{id}", Policy::RequiresPermission("dashboard:write")),
     ("DELETE", "/api/dashboard/reports/{id}", Policy::RequiresPermission("dashboard:write")),
+    // BI-18 part D (T2, R3): a report as a PDF, like `GET /api/dashboard/export/pdf`:
+    // read access and the download switch, checked in the handler, audited.
+    ("GET",    "/api/dashboard/reports/{id}/pdf", Policy::RequiresAuth),
     // BI-19 B2: the Share dialog's embed state and sample token: `manage` on the
     // dashboard, in the handler.
     ("GET",    "/api/dashboard/embed-info",   Policy::RequiresAuth),

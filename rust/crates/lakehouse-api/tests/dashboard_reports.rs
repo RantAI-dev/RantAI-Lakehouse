@@ -19,12 +19,13 @@ use std::sync::{Arc, Mutex};
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use common::{TestApp, session_cookie_for_user, spin_up_with_env};
+use lakehouse_embed::{RenderClaims, sign_render, unix_now};
 use lakehouse_store::governance::{self, CreatePolicyInput};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
-use wiremock::matchers::method;
+use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTemplate};
 
 /// The owner of the personal space `p_owner`, fixed so the stand-in can answer
@@ -191,6 +192,9 @@ impl Respond for FakeCh {
 struct Fixture {
     app: TestApp,
     fake: FakeCh,
+    /// The writer's and the reader's user ids, for a render token.
+    writer_id: Uuid,
+    reader_id: Uuid,
     /// `dashboard:read` and `dashboard:write`; owns the personal space.
     owner: String,
     /// `dashboard:read` and `dashboard:write`.
@@ -232,6 +236,10 @@ async fn person(pool: &PgPool, id: Uuid, role: &str, permissions: &str) -> Uuid 
 }
 
 async fn fixture() -> Fixture {
+    fixture_with(&[]).await
+}
+
+async fn fixture_with(extra: &[(&str, &str)]) -> Fixture {
     let fake = FakeCh {
         log: Arc::new(Mutex::new(Vec::new())),
     };
@@ -240,13 +248,16 @@ async fn fixture() -> Fixture {
         .respond_with(fake.clone())
         .mount(&ch)
         .await;
-    let env: HashMap<String, String> = HashMap::from([
+    let mut env: HashMap<String, String> = HashMap::from([
         ("CH_URL".to_owned(), ch.uri()),
         (
             "CATALOG_TENANT_ID".to_owned(),
             common::CATALOG_TENANT.to_owned(),
         ),
     ]);
+    for (key, value) in extra {
+        env.insert((*key).to_owned(), (*value).to_owned());
+    }
     let app = spin_up_with_env(&env).await;
     let rw = "dashboard:read,dashboard:write";
     let owner = person(&app.pool, OWNER.parse().unwrap(), "Report Owner", rw).await;
@@ -260,6 +271,8 @@ async fn fixture() -> Fixture {
     .await
     .unwrap();
     Fixture {
+        writer_id: writer,
+        reader_id: reader,
         owner: session_cookie_for_user(&app.pool, owner).await,
         writer: session_cookie_for_user(&app.pool, writer).await,
         reader: session_cookie_for_user(&app.pool, reader).await,
@@ -796,4 +809,197 @@ async fn a_reader_is_refused_every_report_write() {
     let (status, read) = call(&f.app, "GET", &uri, &f.reader, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(read["report"]["title"], "Theirs");
+}
+
+// ── T2: the print path ──────────────────────────────────────────────────
+
+const RENDER_SECRET: &str = "test-render-secret-not-real";
+
+fn report_token(user: Uuid, report: &str) -> String {
+    let iat = (unix_now() - 5.0).floor();
+    sign_render(
+        &RenderClaims {
+            aud: "render".to_owned(),
+            board: String::new(),
+            chart: None,
+            report: Some(report.to_owned()),
+            principal: user.to_string(),
+            filters: None,
+            params: None,
+            grain: None,
+            paper: "a4".to_owned(),
+            orientation: "portrait".to_owned(),
+            exp: iat + 120.0,
+            iat,
+            jti: Uuid::new_v4().to_string(),
+        },
+        RENDER_SECRET,
+    )
+}
+
+async fn render_data(f: &Fixture, token: &str) -> (StatusCode, Value) {
+    call(
+        &f.app,
+        "POST",
+        "/api/render/data",
+        "",
+        Some(json!({ "token": token })),
+    )
+    .await
+}
+
+/// `BI-18D-AC5` (decision R3): the print view's data is the report with its
+/// blocks in order and every chart read as the person the token names, and
+/// the first page's facts.
+#[tokio::test]
+async fn a_report_token_reads_the_report_in_order_as_the_person_it_names() {
+    let f = fixture_with(&[("RENDER_TOKEN_SECRET", RENDER_SECRET)]).await;
+    let (_, made) = create(
+        &f,
+        &f.writer,
+        json!({ "title": "Printed", "blocks": [
+            { "type": "heading", "text": "One", "level": 1 },
+            chart("c_two"),
+            { "type": "paragraph", "text": "Two" },
+            chart("c_one"),
+        ] }),
+    )
+    .await;
+    let id = made["report"]["id"].as_str().unwrap().to_owned();
+    let (status, body) = render_data(&f, &report_token(f.reader_id, &id)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let kinds: Vec<&str> = body["report"]["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["heading", "chart", "paragraph", "chart"]);
+    assert_eq!(body["charts"]["c_two"]["spec"]["id"], "c_two");
+    assert_eq!(body["charts"]["c_one"]["spec"]["id"], "c_one");
+    assert_eq!(body["render"]["requestedBy"], "Report Reader person");
+    assert_eq!(body["render"]["report"], id.as_str());
+    // Nothing of a dashboard: the token names no board.
+    assert!(
+        body.get("layout").is_none() && body.get("results").is_none(),
+        "{body}"
+    );
+}
+
+/// A report token for a report the person cannot read, or an unknown one, is
+/// the one sentence every refused token gets.
+#[tokio::test]
+async fn a_report_token_for_a_report_the_person_cannot_read_is_refused() {
+    let f = fixture_with(&[("RENDER_TOKEN_SECRET", RENDER_SECRET)]).await;
+    let (_, mine) = create(
+        &f,
+        &f.owner,
+        json!({ "title": "Draft", "folderId": "p_owner" }),
+    )
+    .await;
+    let mine = mine["report"]["id"].as_str().unwrap().to_owned();
+    for report in [mine, Uuid::new_v4().to_string(), "nope".to_owned()] {
+        let (status, body) = render_data(&f, &report_token(f.writer_id, &report)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{report}: {body}");
+        assert_eq!(body["error"], "render token is invalid or expired");
+    }
+}
+
+/// `GET /api/dashboard/reports/{id}/pdf`: the renderer opens the console's
+/// report print view with a token for this report and this person, the file
+/// comes back named after the report, and the download is audited.
+#[tokio::test]
+async fn the_report_pdf_opens_the_report_print_view_and_is_audited() {
+    let gotenberg = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/forms/chromium/convert/url"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"%PDF-1.7 fake".to_vec()))
+        .mount(&gotenberg)
+        .await;
+    let uri = gotenberg.uri();
+    let f = fixture_with(&[
+        ("RENDER_TOKEN_SECRET", RENDER_SECRET),
+        ("GOTENBERG_URL", uri.as_str()),
+        ("CONSOLE_INTERNAL_URL", "http://console.test:3000"),
+    ])
+    .await;
+    let (_, made) = create(
+        &f,
+        &f.writer,
+        json!({ "title": "Q3 / visitors", "blocks": [chart("c_one")] }),
+    )
+    .await;
+    let id = made["report"]["id"].as_str().unwrap().to_owned();
+
+    let resp = f
+        .app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/dashboard/reports/{id}/pdf?paper=letter&orientation=landscape"
+                ))
+                .header("cookie", &f.reader)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "application/pdf");
+    let disposition = resp.headers()["content-disposition"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        disposition.starts_with("attachment; filename=\"Q3-visitors-"),
+        "{disposition}"
+    );
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&bytes[..], b"%PDF-1.7 fake");
+
+    let sent = gotenberg.received_requests().await.unwrap();
+    assert_eq!(sent.len(), 1);
+    let form = String::from_utf8_lossy(&sent[0].body).into_owned();
+    let marker = "http://console.test:3000/render/report/";
+    let at = form.find(marker).expect("the report print view is opened");
+    let token: String = form[at + marker.len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .collect();
+    let claims = lakehouse_embed::verify_render(&token, RENDER_SECRET, unix_now()).unwrap();
+    assert_eq!(claims.report.as_deref(), Some(id.as_str()));
+    assert_eq!(claims.board, "");
+    assert_eq!(claims.principal, f.reader_id.to_string());
+    assert_eq!(claims.paper, "letter");
+
+    let (action, args): (String, Value) = sqlx::query_as(
+        "SELECT action, args FROM audit_event WHERE action = 'dashboard.report_pdf'",
+    )
+    .fetch_one(&f.app.pool)
+    .await
+    .unwrap();
+    assert_eq!(action, "dashboard.report_pdf");
+    assert_eq!(args["report"], id.as_str());
+
+    // A report the person cannot read is the report's 404, and nothing is printed.
+    let (_, mine) = create(
+        &f,
+        &f.owner,
+        json!({ "title": "Draft", "folderId": "p_owner" }),
+    )
+    .await;
+    let mine = mine["report"]["id"].as_str().unwrap().to_owned();
+    let (status, said) = call(
+        &f.app,
+        "GET",
+        &format!("/api/dashboard/reports/{mine}/pdf"),
+        &f.reader,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(said["error"], "report not found.");
+    assert_eq!(gotenberg.received_requests().await.unwrap().len(), 1);
 }

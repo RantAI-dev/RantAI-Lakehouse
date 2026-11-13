@@ -3088,7 +3088,7 @@ async fn history_trash_personal_space_favourites_and_search_have_the_right_permi
     }
 }
 
-/// `BI-18` part D (T1, feature R2 and `BI-18D-AC8`): reading reports is
+/// `BI-18` part D (T1 and T2, feature R2 and `BI-18D-AC8`): reading reports (and their PDF) is
 /// "signed in" at the router and `dashboard:read` (or a rule) in the handler;
 /// writing them needs `dashboard:write` at the router. Asserted both ways for
 /// every route: the right principal gets past the gate, the one holding only
@@ -3133,6 +3133,12 @@ async fn report_routes_need_dashboard_read_to_read_and_dashboard_write_to_write(
             "/api/dashboard/reports/{id}",
             format!("/api/dashboard/reports/{id}"),
             "dashboard:write",
+        ),
+        (
+            "GET",
+            "/api/dashboard/reports/{id}/pdf",
+            format!("/api/dashboard/reports/{id}/pdf"),
+            "dashboard:read",
         ),
     ] {
         assert_eq!(

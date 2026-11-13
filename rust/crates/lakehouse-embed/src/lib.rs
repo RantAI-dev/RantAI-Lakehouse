@@ -300,6 +300,13 @@ pub struct RenderClaims {
     /// token when the person can no longer see it. Absent for a dashboard PDF.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chart: Option<String>,
+    /// `BI-18` part D (T2): set for a report's PDF. The token is then good for
+    /// this one report and nothing else: `board` is empty, the data route
+    /// (`routes::render`) answers with the report read as the person, and a
+    /// token naming a report the person can no longer read is refused.
+    /// Absent for a dashboard PDF and a chart image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<String>,
     /// The person who asked (`app_user.id`): the data is read as them.
     pub principal: String,
     /// The dashboard's filters, as the JSON list `GET /api/dashboard` takes in
@@ -635,6 +642,7 @@ mod tests {
             aud: RENDER_AUDIENCE.to_owned(),
             board: "b_test".to_owned(),
             chart: None,
+            report: None,
             principal: "7d1e1c52-2f6b-4f3a-9c58-0c5d1d3f9a11".to_owned(),
             filters: Some(r#"[{"column":"region","values":["north"]}]"#.to_owned()),
             params: Some(r#"{"p":1}"#.to_owned()),

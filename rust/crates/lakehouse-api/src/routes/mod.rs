@@ -259,6 +259,10 @@ fn route_timeout(path: &str) -> Duration {
             crate::query_limits::BOARD_DEADLINE_CAP
         }
         "/api/dashboard/export/pdf" => PDF_REQUEST_TIMEOUT,
+        // BI-18 part D (T2): a report's PDF waits for the same slot and renderer.
+        other if other.starts_with("/api/dashboard/reports/") && other.ends_with("/pdf") => {
+            PDF_REQUEST_TIMEOUT
+        }
         // RPT-1: "Send now" makes the PDF and the chart files in the request,
         // so it gets the longest export deadline.
         other if other.starts_with("/api/reports/subscriptions/") && other.ends_with("/send") => {
@@ -1640,6 +1644,11 @@ pub fn router(state: AppState) -> Router {
             get(dashboard_reports::get)
                 .put(dashboard_reports::update)
                 .delete(dashboard_reports::delete),
+        )
+        // BI-18 part D (T2): a report as a server-made PDF.
+        .route(
+            "/api/dashboard/reports/{id}/pdf",
+            get(pdf_export::export_report_pdf),
         )
         .route("/api/dashboard/embed-info", get(dashboard::embed_info))
         .route("/api/embed/data", axum::routing::post(embed::data))
