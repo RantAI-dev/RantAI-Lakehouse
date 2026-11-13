@@ -181,6 +181,9 @@ export function measureLimits(kind: string, rowsMode = false): { min: number; ma
   if (rowsMode) return { min: 0, max: 0, own: false }
   switch (kind) {
     case "bar": case "hbar": case "line": case "area": case "table":
+    // BI-49 (QA LH-BI-6-25): a radar is a grouped kind like them, so it
+    // compares one to six measures, each with an aggregate of its own.
+    case "radar":
       return { min: 1, max: 6, own: true }
     case "stacked":
       return { min: 2, max: 6, own: true }

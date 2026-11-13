@@ -171,6 +171,9 @@ pub enum Aggregate {
 }
 
 impl Aggregate {
+    /// The decimals an average, a minimum and a maximum keep (`BI-55`).
+    pub const DECIMAL_SCALE: u8 = 6;
+
     /// The lowercase `ClickHouse` function name this aggregate renders as
     /// (`count` renders as `count()`, callers handle that specially).
     #[must_use]
@@ -181,6 +184,28 @@ impl Aggregate {
             Self::Max => "max",
             Self::Min => "min",
             Self::Count => "count",
+        }
+    }
+
+    /// The statement fragment this aggregate writes for `operand`, rounded
+    /// per `BI-55` (QA `LH-BI-6-04`).
+    ///
+    /// `sum` and `count` stay whole numbers: a sum of a decimal column is
+    /// left rounded to a whole number in this slice (a `BI-55` follow-up
+    /// names it), and a count is whole by construction. `avg`, `min` and
+    /// `max` keep [`Aggregate::DECIMAL_SCALE`] decimals: enough for a percent
+    /// shown with four decimals, and it cuts the tail of a binary fraction
+    /// (`1466.1833333333334`). `round(x, 6)` of a whole number is that number
+    /// in `ClickHouse`, so a minimum or a maximum of whole numbers stays
+    /// whole.
+    #[must_use]
+    pub fn rounded(self, operand: &str) -> String {
+        match self {
+            Self::Count => "count()".to_owned(),
+            Self::Sum => format!("round(sum({operand}))"),
+            Self::Avg | Self::Max | Self::Min => {
+                format!("round({self}({operand}), {})", Self::DECIMAL_SCALE)
+            }
         }
     }
 
@@ -498,6 +523,17 @@ mod tests {
             serde_json::to_string(&ChartSource::Builtin).unwrap(),
             "\"builtin\""
         );
+    }
+
+    // QA LH-BI-6-04 (BI-55, D4): an average, a minimum and a maximum keep six
+    // decimals; a sum and a count stay whole numbers.
+    #[test]
+    fn a_sum_is_a_whole_number_and_an_average_a_minimum_and_a_maximum_keep_six_decimals() {
+        assert_eq!(Aggregate::Sum.rounded("v"), "round(sum(v))");
+        assert_eq!(Aggregate::Avg.rounded("v"), "round(avg(v), 6)");
+        assert_eq!(Aggregate::Max.rounded("v"), "round(max(v), 6)");
+        assert_eq!(Aggregate::Min.rounded("v"), "round(min(v), 6)");
+        assert_eq!(Aggregate::Count.rounded("v"), "count()");
     }
 
     // `charts()`/`kpis()`/`spec_sql()` all read the process-wide

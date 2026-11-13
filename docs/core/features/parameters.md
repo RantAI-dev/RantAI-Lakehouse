@@ -36,6 +36,7 @@ visitors to revenue without an editor making a second chart.
 | 4 | A dashboard shows a parameter's control when an editor adds it to that dashboard; charts that use a parameter not shown there take its default | Planner default | Owner to confirm at QA |
 | 5 | A parameter that switches a chart's column offers only the columns its editor listed; nothing else can be chosen, by any route | Security posture | 2026-10-11 |
 | 6 | A number parameter may carry a minimum and maximum; a value outside them is refused, not clamped silently | Planner default | Owner to confirm at QA |
+| 7 | A value in the dashboard's address that does not fit its parameter is refused for that parameter alone: the dashboard is drawn with the value the parameter has without it (the dashboard's saved value, else the default), the refusal is shown on the parameter's control, and the value is taken out of the address. A PDF, a scheduled report and an alert still refuse the whole read | Planner default (QA round, `BI-52`) | changed 2026-11-12 (`BI-52`), *(proposed, not yet signed)* |
 
 ## Limits to tell a customer
 

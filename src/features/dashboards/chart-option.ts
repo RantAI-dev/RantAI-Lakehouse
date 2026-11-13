@@ -120,7 +120,10 @@ export function buildOption(
         const o = p as { name: string; value: number; percent: number };
         return `${escapeHtml(o.name)}<br/><b>${fmtInt(o.value)}</b> (${o.percent}%)`;
       } },
-      legend: { bottom: 0, textStyle: { color: axis, fontSize: 11, ...LEGEND_TEXT }, tooltip: { show: true }, icon: "circle" },
+      // QA LH-BI-6-39 (BI-55, D6): the pie's legend was the only category
+      // legend without a pager, so twenty entries wrapped upward from the
+      // bottom over the chart and past the canvas. It pages like the rose's.
+      legend: { bottom: 0, type: "scroll", textStyle: { color: axis, fontSize: 11, ...LEGEND_TEXT }, tooltip: { show: true }, icon: "circle" },
       series: [
         {
           type: "pie",
@@ -193,14 +196,24 @@ export function buildOption(
   }
 
   if (spec.kind === "radar") {
-    const maxVal = Math.max(1, ...rows.map((r) => num(r[y0])));
+    // BI-49 (QA LH-BI-6-25): every measure shares one radial scale — the
+    // largest drawn value among them, times 1.1 — so comparing shapes never
+    // hides how large the numbers are. A second measure is a second shape and
+    // a legend entry; one measure keeps the option it always had.
+    const maxVal = Math.max(1, ...rows.flatMap((r) => yArr.map((c) => num(r[c]))));
+    const multiple = yArr.length > 1;
     return { ...base, grid: undefined,
+      ...(multiple ? {
+        legend: { bottom: 0, type: "scroll", textStyle: { color: axis, fontSize: 11, ...LEGEND_TEXT },
+          tooltip: { show: true }, icon: "circle", data: yArr.map((c) => labelOf(c)) },
+      } : {}),
       tooltip: { ...base.tooltip, trigger: "item" },
       radar: { indicator: rows.map((r) => ({ name: categoryLabel(r[spec.x]), max: maxVal * 1.1 })),
+        ...(multiple ? { center: ["50%", "46%"], radius: "62%" } : {}),
         axisName: { color: axis, fontSize: 10 }, splitLine: { lineStyle: { color: split } },
         splitArea: { show: false }, axisLine: { lineStyle: { color: split } } },
       series: [{ type: "radar", symbolSize: 4, areaStyle: { opacity: 0.12 }, lineStyle: { width: 2 },
-        data: [{ value: rows.map((r) => num(r[y0])), name: String(y0) }] }],
+        data: yArr.map((c) => ({ value: rows.map((r) => num(r[c])), name: labelOf(c) })) }],
     } as EChartsOption;
   }
 

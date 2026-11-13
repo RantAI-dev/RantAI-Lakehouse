@@ -21,6 +21,14 @@
 //! so even the list of SQL sources a layer needs is read here, once, and its
 //! failure is the failure of the layers that need it, not of the board.
 //!
+//! A layer that failed because of the viewer's own access (`BI-51`, plan D16,
+//! D18) is the one exception to the reference: its `error` is
+//! [`NOT_AVAILABLE_WITH_YOUR_ACCESS`] and it carries `cause: "access"` with no
+//! `errorId`, because the reference would send the viewer to an operator for
+//! something that is their own access. The engine's text is still logged under
+//! its reference by `upstream_error::report_ch`. A question whose access
+//! cannot be told apart keeps the sentence and the reference it had.
+//!
 //! # What the base decides
 //!
 //! The base question's sort and limit decide which dimension values the chart
@@ -85,6 +93,41 @@ pub(crate) async fn layer_sources<'a>(
 pub(crate) trait LayerRunner {
     /// Run `sql` as the viewer.
     async fn run(&self, sql: &str) -> Result<Value, SpecRunFailure>;
+
+    /// Whether the viewer's own access explains `failure` (`BI-51`, plan D17):
+    /// asked only after a statement already failed, over the columns the
+    /// question itself names, so a sentence can say so without a reference.
+    async fn access_is_the_cause(
+        &self,
+        sql: &str,
+        columns: &[String],
+        failure: &SpecRunFailure,
+    ) -> bool;
+}
+
+/// QA `LH-BI-13-03` (`BI-51`, plan D18): what a question whose access does not
+/// cover it says, in place of the engine's reference sentence. It names no
+/// column, mask or policy.
+pub(crate) const NOT_AVAILABLE_WITH_YOUR_ACCESS: &str = "Not available with your access.";
+
+/// The engine's code for a refusal of a masked value inside a calculation
+/// (`ILLEGAL_TYPE_OF_ARGUMENT`): the rewrite turns a masked number into the
+/// text `***` (`sql_rewrite.rs`, the mask projection) and the aggregate then
+/// refuses the string. It is the one code QA `LH-BI-13-03` saw, and the only
+/// one treated as the viewer's access: a mask does not always make a question
+/// fail, so another code is added here only when a measurement shows a masked
+/// value produces it (principle 5).
+const ILLEGAL_TYPE_OF_ARGUMENT: u32 = 43;
+
+/// Why a question failed, when the viewer's own access is the reason
+/// (`BI-51`, plan D18). Serialized as `"access"` on the layer's entry; the type
+/// mirrors `LayerCell["cause"]` in `src/features/dashboards/combined-option.ts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LayerCause {
+    /// The viewer's roles or organisation do not cover what the question
+    /// reads (a hidden table, or a masked column it computes on).
+    Access,
 }
 
 /// The viewer's roles, placeholders and the policy obligations: the same
@@ -111,6 +154,86 @@ impl LayerRunner for RoleRunner<'_> {
         )
         .await
     }
+
+    async fn access_is_the_cause(
+        &self,
+        sql: &str,
+        columns: &[String],
+        failure: &SpecRunFailure,
+    ) -> bool {
+        // Only a refusal the access check can word is asked about (R4): a gate's
+        // "not found" and a time limit are already their own sentences, and an
+        // engine failure of any other code can never be the viewer's access
+        // (R1), so a second read of the policies would add nothing.
+        let asked = match failure {
+            SpecRunFailure::Refused(_) => true,
+            SpecRunFailure::Clickhouse(err) => err.server_code() == Some(ILLEGAL_TYPE_OF_ARGUMENT),
+            SpecRunFailure::Tile(_) | SpecRunFailure::Gated(_) => false,
+        };
+        let cause = if asked {
+            self.obligations
+                .access_cause(
+                    sql,
+                    &sqlparser::dialect::ClickHouseDialect {},
+                    columns,
+                    self.roles,
+                )
+                .await
+        } else {
+            None
+        };
+        explains(failure, cause)
+    }
+}
+
+/// Whether `cause` explains `failure` (`BI-51`, QA `LH-BI-13-03`, plan D16):
+/// the gate's "not found" for a table the question reads is the viewer's
+/// organisation, a rewrite refusal only when the table is hidden, and an engine
+/// refusal only for a masked column whose code is [`ILLEGAL_TYPE_OF_ARGUMENT`].
+/// Everything else keeps the sentence and the reference it had.
+///
+/// `pub(crate)` so the table in `routes::layers_rewrite` can pin all four
+/// variant rules in one place; nothing outside this crate sees it.
+pub(crate) fn explains(
+    failure: &SpecRunFailure,
+    cause: Option<crate::policy_engine::AccessCause>,
+) -> bool {
+    use crate::policy_engine::AccessCause;
+    match failure {
+        SpecRunFailure::Tile(_) => false,
+        SpecRunFailure::Gated(err) => matches!(err, lakehouse_core::ApiError::NotFound(_)),
+        SpecRunFailure::Refused(_) => cause == Some(AccessCause::HiddenTable),
+        SpecRunFailure::Clickhouse(err) => {
+            err.server_code() == Some(ILLEGAL_TYPE_OF_ARGUMENT)
+                && cause == Some(AccessCause::MaskedColumn)
+        }
+    }
+}
+
+/// The columns the question itself names (`BI-51`, plan D17): its dimension,
+/// the column of every measure and the column of every own filter. Empty names
+/// are left out.
+fn layer_columns(layer: &LayerDef) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if !layer.dimension.is_empty() {
+        out.push(layer.dimension.clone());
+    }
+    out.extend(
+        layer
+            .measures
+            .entries()
+            .map(|(column, _)| column.to_owned())
+            .filter(|column| !column.is_empty()),
+    );
+    out.extend(
+        layer
+            .filters
+            .iter()
+            .flatten()
+            .map(|f| f.column.clone())
+            .filter(|column| !column.is_empty()),
+    );
+    out
 }
 
 /// What a board read gives the layers of its tiles.
@@ -341,7 +464,29 @@ async fn ask<R: LayerRunner>(
     if filtered.sql.is_empty() {
         return Err(plain("this question's definition is invalid."));
     }
-    let mut answer = ctx.runner.run(&filtered.sql).await.map_err(failure_of)?;
+    let mut answer = match ctx.runner.run(&filtered.sql).await {
+        Ok(answer) => answer,
+        Err(failure) => {
+            // QA LH-BI-13-03 (BI-51, plan D18): a failure the viewer's own
+            // access explains says so, without the engine's reference. The
+            // engine's text is still logged under that reference by
+            // `failure_of`'s `report_ch`.
+            let access = ctx
+                .runner
+                .access_is_the_cause(&filtered.sql, &layer_columns(layer), &failure)
+                .await;
+            let mut spoken = failure_of(failure);
+            if access {
+                spoken.insert(
+                    "error".to_owned(),
+                    Value::String(NOT_AVAILABLE_WITH_YOUR_ACCESS.to_owned()),
+                );
+                spoken.remove("errorId");
+                spoken.insert("cause".to_owned(), json!(LayerCause::Access));
+            }
+            return Err(spoken);
+        }
+    };
     annotate_grain(&mut answer, &filtered, &chart);
     let Value::Object(mut answer) = answer else {
         return Err(plain("this question could not be read."));

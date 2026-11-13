@@ -47,6 +47,7 @@ definition for.
 - Comparisons need the metric's date column.
 - Certification is not available until `DATA-12`.
 - An alert rule on a metric is evaluated with the fixed viewer role that every alert rule runs with, not with the access of whoever wrote the rule (a rule has no owner); a metric that role cannot read makes the rule fail with a stated reason instead of firing.
+- A person without `metric:write` reads the list of metrics and segments; the buttons to define or change one are not shown to them.
 
 ## Acceptance checklist
 

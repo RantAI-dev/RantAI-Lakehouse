@@ -45,6 +45,12 @@ test("the number of measures follows the kind and a fixed role takes no own aggr
   assert.deepEqual(measureLimits("table", true), { min: 0, max: 0, own: false })
 })
 
+// QA LH-BI-6-25 (BI-49): a radar compares measures like the other grouped
+// kinds do; the server already saves it with several (plan D8).
+test("a radar takes one to six measures, each with its own aggregate", () => {
+  assert.deepEqual(measureLimits("radar"), { min: 1, max: 6, own: true })
+})
+
 test("the sort control offers the three orders, then each grouping and measure both ways", () => {
   const options = sortOptions(["kab"], [{ name: "avg_stay", label: "avg of stay" }])
   assert.deepEqual(options.map((o) => o.value), [

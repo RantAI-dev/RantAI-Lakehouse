@@ -14,6 +14,10 @@
 //! migration's CHECK constraints repeat the closed lists, so a caller that
 //! skipped the enums still cannot store free text in a class column.
 //!
+//! A run whose end was never reported is closed from the orchestrator's own
+//! final status by [`settle_run`], [`settle_cancelled_run`] and
+//! [`end_timed_out_run`].
+//!
 //! # Idempotence
 //!
 //! The orchestrator may post a report twice (a timeout it did not see the
@@ -704,6 +708,36 @@ pub async fn settle_run(
         (RunStatus::Failed, EndReason::TableFailed)
     };
     match end_run(pool, connector_id, run_id, status, reason, at).await {
+        Ok(_) | Err(StoreError::NotFound) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Settle a run that is still `running` and that the orchestrator ended as
+/// cancelled before the run's limit (`SRC-43` (#485 review, round 2 (R2))). The record has no word for
+/// cancelled, so it is `failed` with the reason `other` — never
+/// `table_failed`, which would invent a cause. A run with no record and a
+/// run that already ended are left alone, as [`settle_run`].
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on a failed statement.
+pub async fn settle_cancelled_run(
+    pool: &PgPool,
+    connector_id: &str,
+    run_id: &str,
+    at: OffsetDateTime,
+) -> Result<(), StoreError> {
+    match end_run(
+        pool,
+        connector_id,
+        run_id,
+        RunStatus::Failed,
+        EndReason::Other,
+        at,
+    )
+    .await
+    {
         Ok(_) | Err(StoreError::NotFound) => Ok(()),
         Err(err) => Err(err),
     }

@@ -34,6 +34,7 @@ for the whole deployment.
 - A grain switch for viewers of an embed or public link: they see the saved grain (`BI-26`).
 - A time zone per user or per tenant: one setting for the deployment.
 - The built-in dashboard's tiles, which are fixed SQL.
+- The mark of decision 10 on an embed or a public link, and on the built-in dashboard's tiles.
 
 ## Asking the assistant
 
@@ -55,6 +56,7 @@ monthly." (`AI-3-AC1`). The AI team reviews this part.
 | 7 | First day of the week is Monday or Sunday, no other day | Planner default | Owner, 2026-10-11 |
 | 8 | Date filters made in `BI-18` part A ("this month", "last 7 days", a day range on a timestamp column) follow the same time zone and week start, so a filter and a chart never disagree about where a month begins | Planner default | Owner, 2026-10-11 |
 | 9 | The dashboard control offers day, week, month, quarter, year, plus hour and minute only when every grained chart is on a timestamp column | Planner default | Owner, 2026-10-11 |
+| 10 | While the dashboard control groups dates, each chart it does not change carries a quiet mark that says why: its type takes no date grouping, it groups by a part of the date, its dimension is not a date, or it has no date grouping of its own | Planner default (QA round, `BI-50`) | changed 2026-11-12 (`BI-50`), *(proposed, not yet signed)* |
 
 ## Limits to tell a customer
 

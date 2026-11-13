@@ -7,6 +7,7 @@ import { Plus } from "lucide-react"
 import { PageHeader } from "@/components/patterns/page-header"
 import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
+import { useAuth } from "@/features/auth/auth-provider"
 import { useService } from "@/hooks/use-service"
 import { metricService } from "@/services"
 import type { Metric } from "@/services/contracts/metrics"
@@ -15,11 +16,14 @@ import { SegmentsDialog } from "./segments-dialog"
 
 /**
  * Reusable metrics (BI-2): the list, with what each is computed from and how many charts use it.
- * Anyone who can see dashboards can read it; defining and changing need `metric:write`, which the
- * server decides (a refusal is shown in plain words in the editor).
+ * Anyone who can see dashboards can read it; defining and changing need `metric:write`
+ * (`BI-54`, QA `LH-BI-2-05`), which the server decides. Without it the page is a list to read:
+ * no "New metric", no editor on a row, and one sentence saying who may change them. The route
+ * keeps `dashboard:read` (nav-config), so a reader can still open the page.
  */
 export function MetricsPage() {
   const state = useService((signal) => metricService.list(signal), [])
+  const canWrite = useAuth().hasPermission("metric:write")
   const [editing, setEditing] = React.useState<Metric | "new" | null>(null)
   const [segmentsOpen, setSegmentsOpen] = React.useState(false)
   const metrics = state.data ?? []
@@ -33,10 +37,13 @@ export function MetricsPage() {
           <div className="flex items-center gap-2">
             <Button variant="outline" size="sm" render={<Link href="/dashboards/browse" />}>Dashboards</Button>
             <Button variant="outline" size="sm" onClick={() => setSegmentsOpen(true)}>Segments</Button>
-            <Button size="sm" onClick={() => setEditing("new")}><Plus data-icon="inline-start" />New metric</Button>
+            {canWrite ? <Button size="sm" onClick={() => setEditing("new")}><Plus data-icon="inline-start" />New metric</Button> : null}
           </div>
         }
       />
+      {!canWrite ? (
+        <p className="text-xs text-muted-foreground">You can read metrics and segments. Defining or changing one needs the metric:write permission.</p>
+      ) : null}
       {state.status === "loading" ? <LoadingSkeleton /> : null}
       {state.status === "error" ? <ErrorState error={state.error} onRetry={state.reload} /> : null}
       {state.status === "success" && metrics.length === 0 ? (
@@ -55,9 +62,13 @@ export function MetricsPage() {
             </thead>
             <tbody>
               {metrics.map((m) => (
-                <tr key={m.id} className="cursor-pointer border-t border-border hover:bg-muted/30" onClick={() => setEditing(m)}>
+                <tr key={m.id} className={canWrite ? "cursor-pointer border-t border-border hover:bg-muted/30" : "border-t border-border"} onClick={canWrite ? () => setEditing(m) : undefined}>
                   <td className="px-3 py-2">
-                    <button type="button" className="text-left font-medium hover:underline" onClick={() => setEditing(m)}>{m.label || m.name}</button>
+                    {canWrite ? (
+                      <button type="button" className="text-left font-medium hover:underline" onClick={() => setEditing(m)}>{m.label || m.name}</button>
+                    ) : (
+                      <span className="text-left font-medium">{m.label || m.name}</span>
+                    )}
                     <div className="font-mono text-xs text-muted-foreground">{m.name}</div>
                   </td>
                   <td className="max-w-md px-3 py-2 text-muted-foreground"><span className="line-clamp-2">{m.description}</span></td>
@@ -75,7 +86,7 @@ export function MetricsPage() {
         existing={editing === "new" ? undefined : (editing ?? undefined)}
         onChanged={() => { setEditing(null); state.reload() }}
       />
-      <SegmentsDialog open={segmentsOpen} onOpenChange={setSegmentsOpen} />
+      <SegmentsDialog open={segmentsOpen} onOpenChange={setSegmentsOpen} canWrite={canWrite} />
     </div>
   )
 }

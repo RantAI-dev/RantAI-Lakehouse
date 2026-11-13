@@ -995,5 +995,21 @@
     "turns": ["How do I embed this dashboard on our site?"],
     "expect_tool": {"name": "get_embed_snippet", "args_contains": {"board": "{board}"}},
     "forbid": ["[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}"]
+  },
+  {
+    "id": "chart_radar_two_measures",
+    "mode": "build",
+    "confirm": true,
+    "note": "BI-49 (QA LH-BI-6-25): a radar compares two measures of one source on one scale; the server already saved several, the console drew only the first until this slice.",
+    "setup": [
+      {"name": "src", "method": "POST", "path": "/api/dashboard/sources", "body": {"title": "Eval Radar Two Measures", "sql": "SELECT negara, sum(jumlah) AS kunjungan, count() AS baris FROM serving.mart_wisman GROUP BY negara"}, "id_at": "source.id"}
+    ],
+    "turns": ["Draw a radar chart from the saved source \"Eval Radar Two Measures\" that compares kunjungan and baris per country (negara)."],
+    "expect_tool": {"name": "create_chart", "args_contains": {"sqlSource": "{src}", "kind": "radar"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"sqlSource": "{src}", "kind": "radar"}, "count": 1},
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"sqlSource": "{src}", "kind": "radar", "def.measures": "kunjungan"}, "count": 1},
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"sqlSource": "{src}", "kind": "radar", "def.measures": "baris"}, "count": 1}
+    ]
   }
 ]

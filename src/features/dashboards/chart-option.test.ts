@@ -79,6 +79,31 @@ test("a horizontal bar with several measures reverses every series with its cate
   assert.deepEqual((option.yAxis as { data: string[] }).data, ["b", "a"])
 })
 
+// QA LH-BI-6-25 (BI-49): a radar compares measures on one shared scale and
+// names each in the legend, instead of drawing only the first.
+test("a radar draws one shape per measure on one shared scale and names each in the legend", () => {
+  const rows = [{ kota: "X", a: 10, b: 2000 }, { kota: "Y", a: 30, b: 1000 }]
+  const option = buildOption({ kind: "radar", x: "kota", y: ["a", "b"] }, rows, false)
+  const series = option.series as { data: { name: string; value: number[] }[] }[]
+  assert.equal(series.length, 1)
+  assert.deepEqual(series[0].data.map((d) => d.name), ["a", "b"])
+  assert.deepEqual(series[0].data.map((d) => d.value), [[10, 30], [2000, 1000]])
+  const radar = option.radar as { indicator: { max: number }[] }
+  assert.deepEqual(radar.indicator.map((i) => i.max), [2200, 2200])
+  const legend = option.legend as { data: string[] }
+  assert.deepEqual(legend.data, ["a", "b"])
+})
+
+test("a radar with one measure has no legend and keeps the scale of its own values", () => {
+  const rows = [{ kota: "X", a: 10 }, { kota: "Y", a: 30 }]
+  const option = buildOption({ kind: "radar", x: "kota", y: "a" }, rows, false)
+  const series = option.series as { data: { value: number[] }[] }[]
+  assert.equal(series[0].data.length, 1)
+  const radar = option.radar as { indicator: { max: number }[] }
+  assert.deepEqual(radar.indicator.map((i) => i.max), [33, 33])
+  assert.equal("legend" in option, false)
+})
+
 test("a combo and a stacked bar name their series and axes by the label", () => {
   const rows = [{ c: "a", visitors: 10, avg_stay: 2 }]
   const labels = { avg_stay: "avg of stay" }
@@ -210,4 +235,15 @@ test("a pie names a NULL slice (No value) and a breakdown names a NULL series (N
   assert.deepEqual((pie.series as { data: { name: string }[] }[])[0].data.map((d) => d.name), ["(No value)", "Bali"])
   const stacked = buildOption({ kind: "bar", x: "x", y: "v", series: "g" }, [{ x: "Bali", g: null, v: 1 }, { x: "Bali", g: "A", v: 2 }], false)
   assert.deepEqual((stacked.series as { name: string }[]).map((s) => s.name).sort(), ["(No value)", "A"])
+})
+
+// QA LH-BI-6-39 (BI-55, D6): a donut over many categories cut its legend off;
+// it pages like the rose and the funnel do.
+test("a donut's legend pages when its entries do not fit, like a rose's and a funnel's", () => {
+  const rows = Array.from({ length: 25 }, (_, i) => ({ x: `c${i}`, v: i + 1 }))
+  for (const kind of ["pie", "rose", "funnel"] as const) {
+    const option = buildOption({ kind, x: "x", y: "v" }, rows, false)
+    const legend = option.legend as { type?: string }
+    assert.equal(legend.type, "scroll", `${kind}: the legend pages`)
+  }
 })

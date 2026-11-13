@@ -189,6 +189,29 @@
   }
 }
 
+/* BI-53 (QA LH-BI-1-01 F1, LH-BI-6-22, LH-BI-6-23): a chart is a canvas sized
+   when it is created, and the print rules above only apply under @media print,
+   so a chart created before print media is in force is the width of the screen
+   layout — half of its card, or wider than the card and cut at its edge. The
+   print view is therefore stacked in every medium, not only under @media print.
+   These two rules repeat the print rules above (`.dash-canvas` and `.dash-tile`)
+   and must stay the same as them; the browser's own Print of the dashboard page
+   still uses those. */
+[data-render-view] .dash-canvas {
+  position: static !important;
+  height: auto !important;
+  min-height: 0 !important;
+}
+[data-render-view] .dash-tile {
+  position: static !important;
+  left: auto !important; top: auto !important;
+  width: 100% !important; height: 360px !important;
+  margin: 0 0 12px 0 !important;
+  break-inside: avoid;
+  box-shadow: none !important;
+  transition: none !important;
+}
+
 /* Pipeline detail: the vitals strip's staggered entrance. */
 @keyframes vital-in {
   from {

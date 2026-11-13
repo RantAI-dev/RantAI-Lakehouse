@@ -51,13 +51,16 @@ Part 2:
 | 7 | Top N of the breakdown on a bar, hbar, line or area chart: the limit keeps the N breakdown values with the largest total of the measure over the chart's filtered rows; the others are left out. A dimension with a time grain keeps every period | Owner, QA round 2026-11-12 (`BI-46`) | Accepted by the owner, 2026-11-12 (`BI-46`) |
 | 8 | A dimension without a grain keeps its own top N, counted over the rows of the kept breakdown values | Planner default (open question 1) | *(proposed, not yet signed)* |
 | 9 | A date breakdown can be grouped by day, week, month, quarter or year | Planner default (`BI-46`) | *(proposed, not yet signed)* |
+| 10 | A radar chart takes one to six measures, each with its own aggregation, and draws one shape per measure on one shared scale; it has no breakdown | Planner default (QA round, `BI-49`) | changed 2026-11-12 (`BI-49`), *(proposed, not yet signed)* |
 
 ## Limits to tell a customer
 
+- A sum is a whole number. An average, a minimum and a maximum keep up to six decimals; with no number format a value shows about four significant digits (1,466; 146.6; 14.66), and with decimals set it shows exactly those. A chart saved before this rule, with an average, a minimum or a maximum for the whole chart, shows whole numbers until it is saved again, unless a dashboard filter applies to it. *(proposed, not yet signed; `BI-55`)*
 - A second step works on the summarised result, so it can use only the columns and measures of the step before it.
 - A chart with steps or an "Other" group is rebuilt from its definition on every read; it cannot be edited as SQL.
 - A chart with a time grain and a breakdown shows every period (up to the chart row limit); to keep only recent periods, add a relative date filter to the chart.
 - The value list of a chart filter reads the chart's own table or SQL source only; while a SQL source is new or edited and not saved, no list is offered.
+- On a radar chart every measure shares one scale, so a measure with much smaller numbers is drawn near the centre.
 
 ## Acceptance checklist
 

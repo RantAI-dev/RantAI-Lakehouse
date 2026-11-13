@@ -116,6 +116,7 @@ async fn dashboard(server: &MockServer, filters: &str) -> Value {
         params: None,
         fresh: None,
         only: None,
+        strict_params: false,
     };
     let parsed = parse_filters_param(q.filters.as_deref()).expect("valid filters");
     let state = crate::state::AppState::without_a_database();
@@ -653,6 +654,7 @@ mod verify {
             params: None,
             fresh: None,
             only: None,
+            strict_params: false,
         };
         let obligations = PolicyEngineObligations::new(None, ch);
         let state = crate::state::AppState::without_a_database();

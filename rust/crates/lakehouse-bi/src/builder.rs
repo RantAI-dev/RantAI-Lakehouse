@@ -976,7 +976,7 @@ impl QueryBuilder<Ready> {
 
     /// The measures' select list, and when the engine would read one measure's
     /// result name as a column another measure aggregates, the list that
-    /// renames them outside. `round(sum(v)) AS v` beside `round(avg(v)) AS
+    /// renames them outside. `round(sum(v)) AS v` beside `round(avg(v), 6) AS
     /// avg_v` fails with error 184 (the second `v` is read as the first
     /// alias, an aggregate inside an aggregate; measured on `ClickHouse` 26.8),
     /// so such a chart aggregates under `__m<i>` names in an inner select and
@@ -1051,11 +1051,10 @@ impl QueryBuilder<Ready> {
         } else if self.measure_aggregate(measure) == Aggregate::Count {
             "count()".to_owned()
         } else {
-            format!(
-                "round({}({}))",
-                self.measure_aggregate(measure),
-                measure.column
-            )
+            // QA LH-BI-6-04 (BI-55, D4): an average, a minimum and a maximum
+            // keep six decimals.
+            self.measure_aggregate(measure)
+                .rounded(measure.column.as_str())
         }
     }
 
@@ -1134,7 +1133,8 @@ fn kpi_value(from: &Relation, measure: &Ident, agg: Aggregate) -> String {
     } else if agg == Aggregate::Count {
         "count()".to_owned()
     } else {
-        format!("round({agg}({measure}))")
+        // QA LH-BI-6-04 (BI-55, D4).
+        agg.rounded(measure.as_str())
     }
 }
 
@@ -1436,7 +1436,8 @@ pub fn build_points_sql(
     let value = if agg == Aggregate::Count {
         format!("count() AS {measure}")
     } else {
-        format!("round({agg}({measure})) AS {measure}")
+        // QA LH-BI-6-04 (BI-55, D4).
+        format!("{} AS {measure}", agg.rounded(measure.as_str()))
     };
     let (label_select, label_group) = label.map_or_else(
         || (String::new(), String::new()),
@@ -5188,8 +5189,8 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT kab, round(sum(visitors)) AS visitors, round(avg(stay)) AS avg_stay, \
-             round(max(stay)) AS max_stay FROM serving.mart_x GROUP BY kab ORDER BY kab LIMIT 20"
+            "SELECT kab, round(sum(visitors)) AS visitors, round(avg(stay), 6) AS avg_stay, \
+             round(max(stay), 6) AS max_stay FROM serving.mart_x GROUP BY kab ORDER BY kab LIMIT 20"
         );
     }
 
@@ -5205,7 +5206,7 @@ mod tests {
         assert_eq!(
             sql,
             "SELECT kab, __m0 AS visitors, __m1 AS avg_visitors FROM \
-             (SELECT kab, round(sum(visitors)) AS __m0, round(avg(visitors)) AS __m1 \
+             (SELECT kab, round(sum(visitors)) AS __m0, round(avg(visitors), 6) AS __m1 \
              FROM serving.mart_x GROUP BY kab) ORDER BY avg_visitors DESC LIMIT 5"
         );
     }
@@ -5300,7 +5301,7 @@ mod tests {
         .sql;
         assert_eq!(
             sql,
-            "SELECT kab, round(avg(stay)) AS avg_stay FROM \
+            "SELECT kab, round(avg(stay), 6) AS avg_stay FROM \
              (SELECT * FROM serving.mart_x WHERE avg_stay >= 3) AS flt \
              GROUP BY kab ORDER BY kab LIMIT 20"
         );
@@ -5411,7 +5412,7 @@ mod tests {
             sql.contains("ORDER BY avg(stay) DESC, __k LIMIT 3"),
             "{sql}"
         );
-        assert!(sql.contains("round(avg(stay)) AS __m0"), "{sql}");
+        assert!(sql.contains("round(avg(stay), 6) AS __m0"), "{sql}");
         assert!(sql.contains("__m0 AS avg_stay"), "{sql}");
     }
 
@@ -5471,7 +5472,7 @@ mod tests {
             &[],
         );
         assert!(
-            summed.contains("SELECT kab, __s0 AS max_visitors FROM (SELECT kab, round(max(visitors)) AS __s0 FROM (SELECT kab, round(sum(visitors)) AS visitors FROM serving.mart_x GROUP BY kab) GROUP BY kab)"),
+            summed.contains("SELECT kab, __s0 AS max_visitors FROM (SELECT kab, round(max(visitors), 6) AS __s0 FROM (SELECT kab, round(sum(visitors)) AS visitors FROM serving.mart_x GROUP BY kab) GROUP BY kab)"),
             "{summed}"
         );
         assert!(summed.contains("ORDER BY kab LIMIT 7"), "{summed}");

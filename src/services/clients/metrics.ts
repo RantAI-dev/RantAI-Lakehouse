@@ -1,28 +1,29 @@
 import type { Metric, MetricCheck, MetricService, MetricUsage, Segment } from "../contracts/metrics"
 import { apiFetch } from "../http"
-import { ServiceError } from "../errors"
+import { ServiceError, deniedFor } from "../errors"
 
 /**
  * MetricService over `/api/dashboard/metrics` and `/api/dashboard/segments`. A
  * non-OK answer becomes a `ServiceError` carrying the server's sentence (already
- * fixed and free of database text); 403 says plainly that defining a metric
- * needs the permission (BI-2-AC5).
+ * fixed and free of database text). A 401 or 403 goes through `deniedFor`
+ * (`errors.ts`), so the refusal names the permission the server named — the
+ * same wording for a metric and for a segment (BI-54, QA `LH-BI-2-05`), which
+ * the client's own "metrics" sentence used to get wrong for a segment.
  */
 
 async function call<T>(url: string, init: RequestInit, fallback: string): Promise<T> {
   const res = await apiFetch(url, init)
   const json = await res.json().catch(() => null)
   if (!res.ok) {
+    const denied = deniedFor(res.status, json)
+    if (denied) throw denied
     const kind =
-      res.status === 401 || res.status === 403
-        ? "permission_denied"
-        : res.status === 404
-          ? "not_found"
-          : res.status >= 500
-            ? "unavailable"
-            : "invalid_request"
-    const message = res.status === 403 ? "You do not have permission to define or change metrics (metric:write)." : (json?.error ?? fallback)
-    throw new ServiceError(kind, message)
+      res.status === 404
+        ? "not_found"
+        : res.status >= 500
+          ? "unavailable"
+          : "invalid_request"
+    throw new ServiceError(kind, json?.error ?? fallback)
   }
   return json as T
 }

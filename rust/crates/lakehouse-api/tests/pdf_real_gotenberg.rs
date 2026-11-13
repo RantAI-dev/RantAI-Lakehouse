@@ -159,3 +159,94 @@ async fn render_png_against_real_gotenberg() {
     assert_eq!(width, 2400, "1200 CSS px at a scale of 2");
     assert_eq!(height, 600, "the box is 300 CSS px tall");
 }
+
+/// `BI-53` (QA `LH-BI-1-01` F1, `LH-BI-6-22`, `LH-BI-6-23`): what the renderer
+/// itself says about its window, its media and how long a conversion takes.
+///
+/// The page reports `window.innerWidth`, the width of a full-width box and
+/// `matchMedia("print").matches` at load and again 1.5 s later, so the two
+/// moments a chart could be created in are both seen. The test asserts that
+/// each conversion returned a PDF and that both reports arrived; it asserts
+/// **nothing** about the numbers, because reading them is the purpose: they go
+/// to `docs/plans/BI-53-RESULT.md`, and T12 of the plan is gated on them.
+#[tokio::test]
+#[ignore = "needs a Gotenberg container, see the module notes"]
+async fn the_renderer_reports_its_window_its_media_and_how_long_a_conversion_takes() {
+    use std::sync::{Arc, Mutex};
+
+    const PROBE_PAGE: &str = "<!doctype html><html><body style=\"margin:0\"><div id=\"box\" style=\"width:100%;height:10px\"></div><script>
+function report(stage) {
+  var box = document.getElementById('box').getBoundingClientRect().width;
+  return fetch('/probe?stage=' + stage + '&w=' + window.innerWidth + '&box=' + box + '&print=' + window.matchMedia('print').matches);
+}
+report('start').then(function () { setTimeout(function () { report('later').then(function () { window.__lakehouseRenderReady = true; }); }, 1500); });
+</script></body></html>";
+
+    let gotenberg = std::env::var("GOTENBERG_TEST_URL").expect("GOTENBERG_TEST_URL");
+    let host = std::env::var("GOTENBERG_TEST_PAGE_HOST")
+        .unwrap_or_else(|_| "host.docker.internal".to_owned());
+    let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&lines);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).unwrap_or(0);
+            let head = String::from_utf8_lossy(&request[..read]).into_owned();
+            let first = head.lines().next().unwrap_or("").to_owned();
+            if let Ok(mut all) = seen.lock() {
+                all.push(first.clone());
+            }
+            if first.contains("/probe?") {
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            } else {
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{PROBE_PAGE}",
+                    PROBE_PAGE.len()
+                );
+            }
+        }
+    });
+
+    for (orientation, label) in [
+        (Orientation::Landscape, "landscape"),
+        (Orientation::Portrait, "portrait"),
+    ] {
+        let before = lines.lock().unwrap().len();
+        let started = Instant::now();
+        let pdf = convert_url(
+            &gotenberg,
+            &format!("http://{host}:{port}/probe"),
+            (Paper::A4, orientation),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("Gotenberg made a PDF");
+        let elapsed = started.elapsed();
+        assert!(
+            pdf.starts_with(b"%PDF"),
+            "not a PDF: {:?}",
+            &pdf[..pdf.len().min(16)]
+        );
+        let probes: Vec<String> = lines.lock().unwrap()[before..]
+            .iter()
+            .filter(|line| line.contains("/probe?"))
+            .cloned()
+            .collect();
+        println!(
+            "A4 {label}: {} ms for the conversion, {} reports",
+            elapsed.as_millis(),
+            probes.len()
+        );
+        for probe in &probes {
+            println!("  {probe}");
+        }
+        assert_eq!(probes.len(), 2, "two reports for {label}: {probes:?}");
+    }
+}

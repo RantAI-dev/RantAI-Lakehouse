@@ -103,12 +103,12 @@ async fn call(
     )
 }
 
-async fn rule(pool: &PgPool, name: &str, threshold: &str) -> String {
+async fn rule_on(pool: &PgPool, name: &str, asset: &str, threshold: &str) -> String {
     create_quality_rule(
         pool,
         &CreateQualityRuleInput {
             name: name.to_owned(),
-            asset: "silver.orders".to_owned(),
+            asset: asset.to_owned(),
             dimension: "completeness".to_owned(),
             threshold: threshold.to_owned(),
             severity: "high".to_owned(),
@@ -117,6 +117,10 @@ async fn rule(pool: &PgPool, name: &str, threshold: &str) -> String {
     .await
     .unwrap()
     .id
+}
+
+async fn rule(pool: &PgPool, name: &str, threshold: &str) -> String {
+    rule_on(pool, name, "silver.orders", threshold).await
 }
 
 /// A session for a principal who may run a rule, change one and resolve an
@@ -789,6 +793,339 @@ async fn a_caller_outside_the_catalog_tenant_is_refused_before_the_table_is_aske
     assert_eq!(
         stored, 0,
         "a caller outside the catalog tenant stores nothing"
+    );
+}
+
+/// `GOV-12` (#493 review, round 1 (R3)): a person outside the tenant that owns
+/// the shared catalog cannot run an existing rule by hand, whether its table
+/// is there or not, and the refusal measures and records nothing. The two
+/// answers are equal, so a run says nothing about which tables exist.
+#[tokio::test]
+async fn a_caller_outside_the_catalog_tenant_cannot_run_a_rule_and_nothing_is_measured() {
+    let (router, pool, ch) = app().await;
+    let present = rule(&pool, "g12_present", "email not null >= 90%").await;
+    let missing = rule_on(&pool, "g12_missing", "silver.no_such_table", "rows >= 1").await;
+    let outsider =
+        create_principal_with_permissions(&pool, "governance:write,governance:read").await;
+    // Seeded tenant 2, not the one the catalog names.
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(outsider)
+        .bind(
+            "11111111-1111-4111-8111-000000000002"
+                .parse::<uuid::Uuid>()
+                .unwrap(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    let cookie = session_cookie_for_user(&pool, outsider).await;
+    let last_run = "SELECT last_status || '|' || last_run_at::text \
+                    FROM quality_rule WHERE id::text = $1";
+    let before_present: String = sqlx::query_scalar(last_run)
+        .bind(&present)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let before_missing: String = sqlx::query_scalar(last_run)
+        .bind(&missing)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let (code, on_present) = call(
+        &router,
+        &cookie,
+        "POST",
+        &format!("/api/governance/quality/{present}/run"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{on_present}");
+    let (code, on_missing) = call(
+        &router,
+        &cookie,
+        "POST",
+        &format!("/api/governance/quality/{missing}/run"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{on_missing}");
+    assert_eq!(
+        on_present, on_missing,
+        "the tenant refusal is the same for every table, so it names none"
+    );
+
+    let sent = sent_to_clickhouse(&ch).await;
+    assert!(
+        !sent.iter().any(|b| b.contains("countIf(isNotNull")),
+        "a refused run measures nothing"
+    );
+    assert!(
+        !sent
+            .iter()
+            .any(|b| b.contains("INSERT INTO console.quality_run")),
+        "a refused run records nothing"
+    );
+    for table in ["orders", "no_such_table"] {
+        assert!(
+            !sent
+                .iter()
+                .any(|b| b.contains("system.columns") && b.contains(table)),
+            "{table} was not asked about"
+        );
+    }
+    let incidents_open: i64 = sqlx::query_scalar("SELECT count(*) FROM quality_incident")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(incidents_open, 0, "a refused run opens no incident");
+    let after_present: String = sqlx::query_scalar(last_run)
+        .bind(&present)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let after_missing: String = sqlx::query_scalar(last_run)
+        .bind(&missing)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        before_present, after_present,
+        "a refused run writes nothing"
+    );
+    assert_eq!(
+        before_missing, after_missing,
+        "a refused run writes nothing"
+    );
+}
+
+/// `GOV-12` (#493 review, round 1 (R3)): a person whose role does not read the
+/// rule's table cannot run it, and nothing is measured or recorded; their own
+/// table still runs.
+#[tokio::test]
+async fn a_caller_whose_role_does_not_read_the_rules_table_cannot_run_it() {
+    let (router, pool, ch) = app().await;
+    let hidden = rule_on(
+        &pool,
+        "g12_customers",
+        "silver.customers",
+        "email not null >= 90%",
+    )
+    .await;
+    let own = rule(&pool, "g12_orders", "email not null >= 70%").await;
+    let user = create_principal_with_permissions(&pool, "governance:write,governance:read").await;
+    narrow_to_orders(&pool, user).await;
+    common::in_the_catalog_tenant(&pool, user).await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+    let last_run = "SELECT last_status || '|' || last_run_at::text \
+                    FROM quality_rule WHERE id::text = $1";
+    let before: String = sqlx::query_scalar(last_run)
+        .bind(&hidden)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let (code, refused) = call(
+        &router,
+        &cookie,
+        "POST",
+        &format!("/api/governance/quality/{hidden}/run"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("is not a table you can read"),
+        "{refused}"
+    );
+
+    let sent = sent_to_clickhouse(&ch).await;
+    assert!(
+        !sent.iter().any(|b| b.contains("countIf(isNotNull")),
+        "a refused run measures nothing"
+    );
+    assert!(
+        !sent
+            .iter()
+            .any(|b| b.contains("INSERT INTO console.quality_run")),
+        "a refused run records nothing"
+    );
+    assert!(
+        !sent
+            .iter()
+            .any(|b| b.contains("system.columns") && b.contains("customers")),
+        "the role's refusal asks about no table"
+    );
+    let incidents_open: i64 = sqlx::query_scalar("SELECT count(*) FROM quality_incident")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(incidents_open, 0, "a refused run opens no incident");
+    let after: String = sqlx::query_scalar(last_run)
+        .bind(&hidden)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(before, after, "a refused run writes nothing");
+
+    let (code, run) = call(
+        &router,
+        &cookie,
+        "POST",
+        &format!("/api/governance/quality/{own}/run"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{run}");
+    assert_eq!(run["status"], "passed", "their own table still runs");
+}
+
+/// `GOV-12` (#493 review, round 1 (R3)): "not there" and "not yours" are one
+/// sentence and one status, so a run cannot be used to find out which tables
+/// exist. The two refusals come from different branches: the narrowed
+/// caller's hidden table is refused by the role's access, and an unrestricted
+/// caller's missing one by the existence check.
+#[tokio::test]
+async fn running_a_rule_answers_the_same_for_a_table_that_is_not_there_and_one_the_caller_may_not_read()
+ {
+    let (router, pool, ch) = app().await;
+    let id = rule_on(
+        &pool,
+        "g12_customers",
+        "silver.customers",
+        "email not null >= 90%",
+    )
+    .await;
+    let narrowed =
+        create_principal_with_permissions(&pool, "governance:write,governance:read").await;
+    narrow_to_orders(&pool, narrowed).await;
+    common::in_the_catalog_tenant(&pool, narrowed).await;
+    let cookie = session_cookie_for_user(&pool, narrowed).await;
+
+    let (code_hidden, hidden) = call(
+        &router,
+        &cookie,
+        "POST",
+        &format!("/api/governance/quality/{id}/run"),
+        None,
+    )
+    .await;
+    assert_eq!(code_hidden, StatusCode::BAD_REQUEST, "{hidden}");
+    let sent = sent_to_clickhouse(&ch).await;
+    assert!(
+        !sent
+            .iter()
+            .any(|b| b.contains("system.columns") && b.contains("customers")),
+        "the role's refusal asks about no table"
+    );
+
+    // The stand-in answers no columns for the table that is not there.
+    Mock::given(method("POST"))
+        .and(body_string_contains("system.columns"))
+        .and(body_string_contains("customers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [], "data": [], "rows": 0,
+        })))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+    let admin_cookie = admin(&pool).await;
+    let (code_missing, missing) = call(
+        &router,
+        &admin_cookie,
+        "POST",
+        &format!("/api/governance/quality/{id}/run"),
+        None,
+    )
+    .await;
+    assert_eq!(code_missing, StatusCode::BAD_REQUEST, "{missing}");
+    assert_eq!(
+        code_hidden, code_missing,
+        "a hidden table and a missing one read alike"
+    );
+    assert_eq!(
+        hidden, missing,
+        "a hidden table and a missing one read alike"
+    );
+}
+
+/// `GOV-12` (#493 review, round 1 (R3)): the gate does not shut out a person
+/// who may read the rule's table — the run still measures, records and opens
+/// its incident.
+#[tokio::test]
+async fn a_permitted_caller_still_runs_a_rule_and_gets_its_value() {
+    let (router, pool, ch) = app().await;
+    let id = rule(&pool, "g12_permitted", "email not null >= 90%").await;
+    let user = create_principal_with_permissions(&pool, "governance:write,governance:read").await;
+    common::in_the_catalog_tenant(&pool, user).await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let (code, run) = call(
+        &router,
+        &cookie,
+        "POST",
+        &format!("/api/governance/quality/{id}/run"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{run}");
+    assert_eq!(run["status"], "failed");
+    assert!(
+        run["value"].as_str().unwrap().contains("75.0% not null"),
+        "{run}"
+    );
+    let sent = sent_to_clickhouse(&ch).await;
+    assert!(
+        sent.iter()
+            .any(|b| b.contains("INSERT INTO console.quality_run")),
+        "a permitted run records its verdict"
+    );
+    let open = incidents(&router, &cookie, "open").await;
+    assert_eq!(open.len(), 1, "a failed run opens one incident");
+}
+
+/// `GOV-12` (#493 review, round 1 (R3)): a table the engine did not answer
+/// about is a 503 that says so — a check that cannot be made is not a
+/// refusal — and the run measures nothing.
+#[tokio::test]
+async fn running_a_rule_whose_table_cannot_be_checked_is_a_503_and_measures_nothing() {
+    let (router, pool, ch) = app().await;
+    let id = rule_on(&pool, "g12_broken", "silver.broken_table", "rows >= 1").await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("system.columns"))
+        .and(body_string_contains("broken_table"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("Code: 999. DB::Exception"))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+    let cookie = admin(&pool).await;
+
+    let (code, body) = call(
+        &router,
+        &cookie,
+        "POST",
+        &format!("/api/governance/quality/{id}/run"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(
+        body["error"], "The table could not be checked. Try again.",
+        "a check that could not be made says so, in a fixed sentence"
+    );
+    let sent = sent_to_clickhouse(&ch).await;
+    assert!(
+        !sent.iter().any(|b| b.contains("countIf(isNotNull")),
+        "a run whose table cannot be checked measures nothing"
+    );
+    assert!(
+        !sent
+            .iter()
+            .any(|b| b.contains("INSERT INTO console.quality_run")),
+        "a run whose table cannot be checked records nothing"
     );
 }
 

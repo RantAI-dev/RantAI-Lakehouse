@@ -35,6 +35,10 @@
 //! quality verdict is about the data, not about what one role may see of
 //! it. Only aggregates come back — a count, a percentage — never rows.
 //!
+//! Who may start a check by hand is decided first, by the catalog's tenant
+//! rule and the caller's table access (`GOV-12`); the scheduled and on-load
+//! checks have no caller and are not narrowed.
+//!
 //! Verdicts are appended to `console.quality_run`, a `ClickHouse` table
 //! this module owns and creates on first use (the same arrangement as
 //! `gold_export_history`); the latest one per rule is what the Data
@@ -1109,19 +1113,32 @@ async fn evaluate(state: &AppState, rule: &QualityRule, run_by: &str) -> Result<
 /// `POST /api/governance/quality/{id}/run` — evaluate one authored rule
 /// now, record the verdict, and return it.
 ///
+/// A run by hand is a person's, so the catalog's tenant rule and the
+/// caller's table access are checked before anything is measured or
+/// recorded (`GOV-12`). The scheduled and on-load passes call `evaluate`
+/// directly and are the system's, so they are not narrowed.
+///
 /// # Errors
 ///
 /// - `403` without `governance:write` (`GOV-10`, `DEC-17`; the policy gate).
 /// - `404` when no rule has that id.
+/// - `403` when the caller is outside the tenant that owns the shared
+///   catalog ([`crate::routes::catalog::catalog_tenant_refusal`]) — the same
+///   answer whatever the table, for every rule whose asset is a table key; an
+///   asset that is not one is the `400` below for everyone.
 /// - `400` when the rule cannot be evaluated as written: a threshold
 ///   outside the grammar (the message is [`GRAMMAR_HINT`]), an `asset`
 ///   that is not a readable `silver.`/`serving.`/`bronze.` table, or a
-///   column the table does not have.
-/// - `503` when the store or the check query fails. The query error
-///   itself is logged, not returned.
+///   column the table does not have. A table that is not there and one the
+///   caller's role does not read are the same `400` with one sentence, so a
+///   run cannot say which tables exist.
+/// - `503` when the store or the check query fails, or when the table
+///   cannot be checked because the engine or the catalog did not answer.
+///   The query error itself is logged, not returned.
 pub async fn run_rule(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<ApiJson<Value>> {
     let rules = lakehouse_store::governance::list_quality_rules(pool(&state)?).await?;
@@ -1129,6 +1146,12 @@ pub async fn run_rule(
         .iter()
         .find(|r| r.id == id)
         .ok_or_else(|| ApiError::NotFound("Quality rule not found".to_owned()))?;
+    // GOV-12 (#493 review, round 1 (R3)): a run by hand is a person's, so the
+    // catalog's tenant rule and the role's table access apply before anything
+    // is measured or written. The scheduled and on-load passes call `evaluate`
+    // directly and are the system's, so they keep working whatever a role may
+    // read.
+    ensure_rule_table(&state, Some(&principal), &headers, &rule.asset).await?;
     let verdict = evaluate(&state, rule, &principal.display_name)
         .await
         .map_err(|err| match err {

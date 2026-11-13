@@ -8,6 +8,7 @@ import { ErrorWithReference } from "@/components/error-reference";
 import { Input } from "@/components/ui/input";
 import { RowsTable } from "@/components/patterns/rows-table";
 import { useService } from "@/hooks/use-service";
+import { displayColumnFull } from "@/lib/chart-joins";
 import { SkippedFiltersMarker } from "./filters/skipped-marker";
 import { fetchRecordsPage, hasNextPage, pageRange, splitReference, type RecordsRequest } from "./records";
 
@@ -23,6 +24,8 @@ export type DrillTarget = {
   chart?: string;
   /** BI-13: the index of the chart's other question the click was on; `mart`, `sqlSource` and `column` are then that question's own. */
   layer?: number;
+  /** BI-55: the legend name of the question the records belong to, for the panel's second line. */
+  question?: string;
 };
 
 /** The menu at the cursor after clicking a data point: filter by it, or see its rows. */
@@ -57,7 +60,7 @@ export function DrillMenu({
         style={{ left: Math.min(drill.x, w - 250), top: Math.min(drill.y, h - 170) }}
       >
         <p className="truncate px-2 py-1 text-[11px] text-muted-foreground">
-          {drill.column}: <span className="font-medium text-foreground">{drill.label ?? drill.name}</span>
+          {displayColumnFull(drill.column)}: <span className="font-medium text-foreground">{drill.label ?? drill.name}</span>
         </p>
         {onFilter ? (
           <button role="menuitem" onClick={onFilter} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted">
@@ -141,6 +144,7 @@ function RecordsContent({ request }: { readonly request: RecordsRequest }) {
     <DialogContent className="max-h-[85vh] overflow-hidden sm:max-w-3xl">
       <DialogHeader>
         <DialogTitle className="flex items-center gap-2"><Table2 className="size-4" /> Records · {request.title}</DialogTitle>
+        {request.question ? <p className="text-xs text-muted-foreground">Question: {request.question}</p> : null}
       </DialogHeader>
       {inDetail ? (
         <RecordDetail
@@ -158,7 +162,12 @@ function RecordsContent({ request }: { readonly request: RecordsRequest }) {
               <ErrorWithReference message={failure.message} errorId={failure.errorId} />
             </p>
           ) : page && page.rows.length ? (
-            <RowsTable columns={page.columns} rows={page.rows} onRowClick={setSelected} />
+            <RowsTable
+              columns={page.columns}
+              labels={Object.fromEntries(page.columns.map((c) => [c, displayColumnFull(c)]))}
+              rows={page.rows}
+              onRowClick={setSelected}
+            />
           ) : (
             <p className="py-8 text-center text-sm text-muted-foreground">No records found.</p>
           )}
@@ -210,7 +219,7 @@ function RecordDetail({
         <dl className="max-h-[60vh] overflow-auto rounded-md border border-border text-sm">
           {columns.map((c) => (
             <div key={c} className="grid grid-cols-[minmax(8rem,12rem)_1fr] gap-3 border-b border-border/40 px-3 py-1.5 last:border-0">
-              <dt className="break-words font-medium text-muted-foreground">{c}</dt>
+              <dt className="break-words font-medium text-muted-foreground">{displayColumnFull(c)}</dt>
               <dd className="whitespace-pre-wrap break-words">{record[c] == null ? "—" : String(record[c])}</dd>
             </div>
           ))}

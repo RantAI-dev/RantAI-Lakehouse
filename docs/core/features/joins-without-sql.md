@@ -43,6 +43,7 @@ needs a SQL source written by someone who may write SQL.
 - Joining on columns that are not unique in the joined table multiplies rows and so sums; the builder warns but cannot know the data.
 - Only equals conditions are fast; a join on comparisons alone is refused.
 - A join is not remembered between charts.
+- A joined column reads `table.column` in the record list and in the header of a downloaded raw table; on a chart and in a table tile it reads by the column's own name. *(proposed, not yet signed; `BI-55`)*
 
 ## Acceptance checklist
 

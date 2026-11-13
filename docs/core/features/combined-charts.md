@@ -33,7 +33,7 @@ drawn on one chart.
 | --- | --- | --- | --- |
 | 1 | Up to five questions on one chart | Spec *(proposed)* | Owner to confirm at QA |
 | 2 | Questions are matched on the values of the dimension: dates by the chart's time grain, text by exact spelling. A value one question lacks is a gap for that question, not a zero | Planner default | Owner to confirm at QA |
-| 3 | Each question is asked on its own, with its own permissions; one that fails shows its reason in the legend and the others still draw | Planner default | Owner to confirm at QA |
+| 3 | Each question is asked on its own, with its own permissions; one that fails shows its reason in the legend and the others still draw. A question the viewer's access does not cover (a table their role or organisation does not read, or a masked column the question computes on) is listed in the legend, greyed, as "not available with your access"; no column, mask or policy is named (`BI-51`). | Planner default | changed 2026-11-12 (`BI-51`), *(proposed, not yet signed)* |
 | 4 | A dashboard filter applies to every question that has the filtered column | Planner default (as tiles today) | Owner to confirm at QA |
 | 5 | The chart's sort and limit follow the first question; the others supply values for the kept dimension values | Planner default | Owner to confirm at QA |
 
@@ -41,6 +41,7 @@ drawn on one chart.
 
 - Two questions line up only where their dimension values are spelled the same.
 - A combined chart costs one query per question.
+- A masked column that a question reaches through a join, a calculated field, a metric or a SQL source that renames it is not recognised as an access matter: that question shows the general failure sentence with a reference. Only the engine's refusal of a masked value in a calculation is recognised; any other failure keeps its reference. *(proposed, not yet signed)*
 
 ## Acceptance checklist
 
