@@ -1975,7 +1975,11 @@ pub const NO_TENANT_REASON: &str = "This pipeline belongs to no tenant. An admin
 ///
 /// An upstream failure keeps its own status: a database that cannot be
 /// read is not a refusal, it is an outage, and it must stay retryable.
-fn gate_refusal_as_unprocessable(err: ApiError) -> ApiError {
+///
+/// BLD-1 part 1 / D16: the pipeline preview answers the gate's refusals this
+/// same way (its contract is a 422 for "refused by the gate"), and the console
+/// must not have to read two statuses for one class of refusal.
+pub(crate) fn gate_refusal_as_unprocessable(err: ApiError) -> ApiError {
     match err {
         // The gate's own refusals, every one of them a fixed sentence
         // written in this repository: a table out of reach, a tenant the
