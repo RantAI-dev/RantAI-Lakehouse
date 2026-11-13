@@ -1917,3 +1917,203 @@ openfga`; `cargo test -p lakehouse-api --test catalog_restore`; `--test upload_r
 lint`; `bun test src/features/catalog`); each new test by name with the failure line seen
 before its fix; the spawn's bite check (S4); S8's corrected sentence; anything *not
 verified*; every MISMATCH.
+
+### Round 2, developer's handoff
+
+Developer agent, 2026-11-13. Branch `fix/qa-round-data-p4`, pushed after each commit.
+`main` was merged twice (it moved between them), and no rebase, force-push or
+`--ours`/`--theirs` was used.
+
+#### Merges
+
+| Merge | What |
+| --- | --- |
+| `639cc9a5` | Merge remote-tracking branch 'origin/main' into fix/qa-round-data-p4 — clean, no conflict; `ls rust/migrations \| tail -4` ended at `0141_upload_table_drop.sql`, so **the migration keeps the number `0141`**: `main` added no `0141` of its own |
+| `f43af8b3` | Merge remote-tracking branch 'origin/main' into fix/qa-round-data-p4 — `CHANGELOG.md` conflicted, the only file; both sides' entries are kept, main's first, then this branch's; no other file conflicted; `ls rust/migrations \| tail -3` → `0139`, `0140`, `0141` (still exactly one `0141`) |
+
+#### Commits
+
+| Commit | Title |
+| --- | --- |
+| `ef3e5185` | fix(review): a record is healed only when its drop cannot be in flight (S1, S2, S3) |
+| `686ee8a0` | test(review): the spawn and the fail-closed arms are tested (S4, S5, S6) |
+| `63a7dcb5` | docs(review): comments and names after round 2 (S7, S9) |
+| `f43af8b3` | Merge remote-tracking branch 'origin/main' into fix/qa-round-data-p4 |
+| `<this commit>` | docs(plan): handoff for review round 2 of data-p4 |
+
+The migration's number is **`0141`**, unchanged: `rust/migrations/0141_upload_table_drop.sql`.
+
+#### What each commit does
+
+**Commit E.** `uploads::heal_table_drop(pool, table, dropped_at, grace_seconds)` removes a
+record only when it is older than the grace and still carries the `dropped_at` the caller
+read, both values bound in one `DELETE`. `HEAL_GRACE` is 120 seconds (`pub(super)` in
+`catalog_drop.rs`, with the doc the plan asks for: the `DELETE`'s fifteen, the two outcome
+checks' ten each, and margin). `dropped_now` uses it when the table exists; the restore's
+`Assessment::Exists` path uses it through one `clear_stale_record` helper; the drop's own
+removals for a definite refusal stay plain `forget_table_drop`. Round 1's second arm is gone
+with `NOT_DROPPED`, and its test is rewritten to the third arm. `settle_unknown_outcome` now
+asks the bounded `table_exists` after `Found` (S3) and, for every other answer, keeps the
+record and answers D5's sentence. `bounded_table_exists` bounds the presence check with
+`OUTCOME_CHECK_TIMEOUT` (S2), and `RestoreJob::run` bounds `undrop_table` with
+`UNDROP_TIMEOUT` (fifteen seconds), an elapsed bound becoming `OpenfgaError::Transport` and
+so the mirror case. Both tasks' docs say every catalog `.await` in them is bounded.
+
+**Commit F.** Tests only: S4's two abort tests, S5's two tests, S6's tightenings (all added
+or more exact assertions; nothing loosened).
+
+**Commit G.** S7's doc corrections, S9's renames (`DropJob`, `RestoreJob`) and the one
+`settle_claim_failed` helper in `routes/uploads.rs` (three call sites, behaviour unchanged),
+and the feature page's limit line with its *(proposed, not yet signed)*.
+
+#### Tests added or rewritten, with the failure seen before the fix
+
+**Commit E**
+
+- `healing_a_drop_removes_only_a_record_older_than_the_grace_and_unchanged_since_it_was_read`
+  (`tests/uploads.rs`, store). Before: `error[E0432]: unresolved import
+  lakehouse_store::uploads::heal_table_drop` at `crates/lakehouse-store/tests/uploads.rs:39:83`
+  — the function did not exist yet. A young record stays, an old one goes, and a record
+  replaced since the read stays (a newer `dropped_at`, still past the grace, so only the
+  equality guard can keep it).
+- `two_drops_of_a_table_that_still_exists_are_one_drop_one_conflict_and_keep_the_record`
+  (S1 (i)). Before: `catalog_restore.rs:2568`, `left: 200`, the body
+  `{"ok":true,"table":"bronze.orders","rowCount":3,…}` — the second drop healed the record
+  and dropped too. (Seen in the test's first form at `catalog_restore.rs:2290` and re-checked
+  in its committed form at HEAD with the two product files of `ef3e5185^` checked out.)
+- `a_load_whose_table_is_dropped_between_its_checks_keeps_the_record_when_the_table_still_exists`
+  (S1 (ii), `tests/upload_routes.rs`). Before: `upload_routes.rs:3233`, `left: 200`, the body
+  `{"upload":{…,"status":"ingesting",…,"runId":"run-2"},"runId":"run-2"}` — the load launched
+  over a record that was still true.
+- `a_fresh_record_of_a_table_that_exists_is_not_healed_by_the_status_read` (S1 (iii)).
+  Before: `catalog_restore.rs:1485`, `left: true`,
+  `{"droppable":true,"table":"bronze.orders","keptDays":7}`.
+- `a_catalog_that_lists_a_deleted_table_that_still_exists_says_the_outcome_is_not_known`
+  (S3). Before: `catalog_restore.rs:1271`, `left: 200`, `{"ok":true,…}` — `Found` was taken
+  as proof.
+- Rewritten, not added:
+  `a_catalog_that_answers_500_and_a_table_that_still_exists_removes_the_record_and_says_nothing_was_dropped`
+  becomes
+  `a_catalog_that_answers_500_and_a_table_that_still_exists_keeps_the_record_and_says_the_outcome_is_not_known`
+  (S1 item 5). Before the rewrite: `catalog_restore.rs:1221`, `left: "The catalog did not
+  answer and the table was not dropped. Try again shortly."`.
+- Backdated, assertions unchanged: `a_stale_record_of_a_table_that_exists_is_removed_by_the_next_status_read`
+  and `a_stale_record_of_a_table_that_exists_is_removed_by_the_next_load_and_the_load_goes_through`
+  each gain `UPDATE upload_table_drop SET dropped_at = now() - interval '10 minutes'`, with a
+  comment saying why (healing waits out `HEAL_GRACE`).
+- The first arm's test,
+  `a_catalog_that_answers_500_and_lists_the_table_as_deleted_keeps_the_record_and_answers_a_drop`,
+  gains `mount_missing_table`: S3 makes "the table is gone" part of its rule, and without the
+  stand-in the presence check could not answer. It failed at `catalog_restore.rs:1147`,
+  `left: 503 right: 200`, until the stand-in was mounted.
+
+**Commit F**
+
+- `a_drop_whose_caller_goes_away_mid_call_still_gets_its_ending` (S4). It passes against the
+  spawn commit A shipped; its bite is the check below.
+- `a_restore_whose_caller_goes_away_mid_call_still_gets_its_ending` (S4, restore). Same.
+- `a_catalog_that_answers_500_with_nothing_listed_and_no_table_keeps_the_record_and_says_the_outcome_is_not_known`
+  (S5). It pins an arm commit E created; it passes at once and was not seen to fail, because
+  before E this case already ended in the same third arm.
+- `a_deleted_list_that_never_ends_keeps_the_record_and_says_the_outcome_is_not_known` (S5).
+  Same: a `next-page-token` on every page, twenty pages, `CouldNotTell`.
+- S6's tightenings are added or more exact assertions, so none of them fails first: the two
+  two-drops tests (exact refused sentence, exactly one record, first entry `allowed`, exactly
+  one `executed`, no `failed`), the tenant-gate, unknown-id and warehouse tests
+  (`assert_nothing_written`: no `catalog.drop` entry, no record), the lookup-fails test's
+  first entry, the list's left-out row (`t_000`, the oldest, absent; `t_001` and `t_100`
+  present), and the no-answer test's "no upstream text in the body".
+
+#### The spawn's bite check (S4)
+
+Done once, locally, never committed: in `catalog_drop.rs`'s `drop_table`, `let handle =
+tokio::spawn(async move { job.run().await });` was replaced by `std::future::ready(Ok(job.run().await))`,
+so the audited stretch ran inside the handler. `cargo test -p lakehouse-api --test
+catalog_restore a_drop_whose_caller_goes_away` then failed at `catalog_restore.rs:1468` with
+`left: ["allowed"]` — the trail stays at the entry the handler wrote before it was dropped,
+never reaching `executed`. The spawn was put back; `git diff` on that file is empty against
+`ef3e5185`.
+
+#### S8's corrected sentence
+
+The round 1 handoff lists the load-side test of R3 under commit B. It is in **commit A**
+(`115c0e14`), together with the route change it pins:
+`a_load_whose_table_is_dropped_between_its_checks_is_409_and_settles_its_claim` is in
+`tests/upload_routes.rs` at `115c0e14`. Commit B (`dc470d7f`) adds **one** test, not two
+(`a_drop_whose_upload_starts_loading_between_its_checks_is_a_409_and_leaves_no_record`, in
+`tests/catalog_restore.rs`). Nothing claimed as tested is untested.
+
+#### Commands run, with their real counts
+
+Merge `639cc9a5`: `git merge origin/main` clean; `ls rust/migrations | tail -4` → `0138`,
+`0139`, `0140`, `0141`; `cargo fmt --check` clean; `cargo clippy -p lakehouse-api
+--all-targets -- -D warnings` clean.
+
+Commit E (`ef3e5185`):
+- `cargo fmt --check` clean (after one `cargo fmt` for an import wrap); `cargo clippy -p
+  lakehouse-store --all-targets -- -D warnings` and `-p lakehouse-api` clean.
+- `cargo test -p lakehouse-store --test uploads` — **70 passed, 0 failed** (69 before this
+  commit).
+- `cargo test -p lakehouse-auth --test openfga` — **18 passed, 0 failed**.
+- `cargo test -p lakehouse-api --test catalog_restore` — **52 passed, 0 failed** (51 before
+  this commit's tests, plus the rewritten arm).
+- `cargo test -p lakehouse-api --test upload_routes` — **181 passed, 0 failed** (180 before).
+- `cargo test -p lakehouse-api --test sec11_guard` — **4 passed, 0 failed**.
+- `cargo test -p lakehouse-api --test route_auth` — **96 passed, 0 failed** (95 before: one
+  test of this branch, plus `tls_proxy`; main's `pipeline_preview` added the ninety-sixth).
+- `python3 ops/lint/check_bare_iceberg_count.py` → "R11 guard: no bare count() against a
+  Bronze Iceberg table found."; `check_intra_package_imports.py` → "OK: all intra-package
+  dispar_orchestrate imports resolve".
+
+Commit F (`686ee8a0`):
+- `cargo fmt --check` clean; `cargo clippy -p lakehouse-api --all-targets -- -D warnings`
+  clean.
+- `catalog_restore` **56 passed, 0 failed**; `upload_routes` **181 passed**; `sec11_guard`
+  **4 passed**; `route_auth` **96 passed**; `uploads` (store) **70 passed**; `openfga` (auth)
+  **18 passed**; 0 failed in each; both repo lints pass.
+
+Commit G (`63a7dcb5`):
+- `cargo fmt --check` clean; `cargo clippy` for `lakehouse-auth`, `lakehouse-store` and
+  `lakehouse-api`, all targets, `-D warnings`: clean.
+- `catalog_restore` **56 passed**; `upload_routes` **181 passed**; `sec11_guard` **4
+  passed**; `route_auth` **96 passed**; `uploads` (store) **70 passed**; `openfga` (auth)
+  **18 passed**; 0 failed in each; both repo lints pass.
+- `bun install --frozen-lockfile` → 779 installs across 753 packages, no changes; `bun run
+  typecheck` clean; `bun run lint` → **0 errors, 11 warnings** (the same eleven as round 1,
+  none in a file this round touched); `bun test src/features/catalog` → **402 pass, 0 fail,
+  1,275 expect() calls, 16 files**.
+
+Merge `f43af8b3`, after resolving `CHANGELOG.md`:
+- `ls rust/migrations | tail -3` → `0139`, `0140`, `0141`; `cargo fmt --check` clean; `cargo
+  clippy -p lakehouse-api --all-targets -- -D warnings` clean.
+- `catalog_restore` **56 passed, 0 failed**; `upload_routes` **181 passed**; `sec11_guard`
+  **4 passed**; `route_auth` **96 passed**; both repo lints pass.
+- `bun run typecheck` clean; `bun run lint` → 0 errors, 11 warnings; `bun test
+  src/features/catalog` → **402 pass, 0 fail**.
+
+`docker ps -a` before the first test run showed ten containers (nine `clickhouse-server:26.8`
+and one `postgres:16-alpine`) that were already there; the same ten were there after the last
+run, so no container of mine was left behind and none was removed.
+
+#### Not verified
+
+- The restore's abort test (`a_restore_whose_caller_goes_away_mid_call_still_gets_its_ending`)
+  was not given its own bite check: the plan asks for the replacement of the spawn once, and
+  that was done on the drop's. The two are the same shape in the two handlers.
+- The two S5 tests were not seen to fail: they pin arms commit E created, and both cases
+  already ended in the third arm before E.
+- `cargo test --workspace` was not run, by the plan's rule; only the scoped suites above.
+- No real catalog was asked (the G9 step of T8 is the proof there): whether `Lakekeeper`
+  answers "not found" to a load of a soft-deleted table, and whether it applies a `DELETE`
+  whose client gave up, are as unestablished as the Round 2 entry says.
+- `docker compose config` / `up` was not run: no compose file changed.
+
+#### MISMATCH
+
+- **MISMATCH (S1 (i)):** the two drops are not a `tokio::join!` of two calls. With the
+  `DELETE` answered late (a 3-second delay on the stand-in), the first drop is held in flight
+  while the second runs, which is the stretch the ruling is about and is deterministic; a
+  true join can pass or fail by luck. The assertions are the ones S1 (i) and S6 ask for: one
+  `200`, one `409` with `ALREADY_DROPPED`, one `DELETE`, exactly one record, the trail's first
+  entry `allowed` and exactly one `executed`.
+- No other mismatch: every other ruling matched the code as it was.
