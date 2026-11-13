@@ -240,10 +240,14 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
           ? pipelineService.updatePipeline(
               existing.id,
               {
-                // Decision 18: the stored kind goes back unchanged, and the
-                // incremental column is not sent, which the API reads as
-                // "leave it alone".
+                // Decision 18 took kind and the incremental column off the
+                // page, not out of the row: both go back exactly as stored.
+                // BLD-1 part 1 S3 review R1-B1: the store writes
+                // `incremental_column` from the body with no COALESCE
+                // (`lakehouse-store/src/pipelines.rs`, `update`), so leaving
+                // it out would erase it on every save.
                 kind: existing.kind,
+                incrementalColumn: def?.incrementalColumn ?? undefined,
                 ...body.definition,
                 fbicEnabled,
                 targetZone: body.targetZone,

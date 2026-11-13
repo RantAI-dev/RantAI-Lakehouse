@@ -751,14 +751,18 @@ describe("the pipeline editor of inputs and steps (BLD-1 part 1)", () => {
     }
   })
 
-  it("sends the stored kind back on an edit, and no incremental column (decision 18)", async () => {
+  // BLD-1 part 1 S3 review R1-B1: the API overwrites the column with what it
+  // is given, so an edit sends the stored value back; the field is off the
+  // page (decision 18), not out of the row.
+  it("sends the stored kind and incremental column back on an edit, unchanged (decision 18)", async () => {
     renderEditor(existing({ kind: "incremental" }))
 
     const body = await saveAndRead("PUT")
     expect(body.kind).toBe("incremental")
+    expect(body.incrementalColumn).toBe("updated_at")
     expect(body.inputs).toEqual([{ name: "orders_raw", zone: "bronze", table: "orders_raw" }])
     expect(body.steps).toEqual([{ name: "transformed", kind: "transform", reads: "orders_raw", transforms: ["dedupe(id)"] }])
-    for (const old of ["sourceZone", "sourceTable", "transforms", "incrementalColumn"]) {
+    for (const old of ["sourceZone", "sourceTable", "transforms"]) {
       expect(Object.keys(body)).not.toContain(old)
     }
   })
