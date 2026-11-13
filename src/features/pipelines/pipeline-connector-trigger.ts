@@ -4,7 +4,8 @@
  *
  * Pure, like [`./pipeline-reupload-trigger`] and for the same reason -- the
  * rule is enumerated here, cheaply, instead of being spread through the
- * five-step form. This module owns exactly one upstream, `ingest_job`, and
+ * pipeline editor (`pipeline-editor.tsx`; BLD-1 part 1 S3 review R1-S8).
+ * This module owns exactly one upstream, `ingest_job`, and
  * touches nothing else in the stored chain.
  *
  * - The switch is offered only for a Bronze source with a connector: a
