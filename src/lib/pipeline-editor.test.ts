@@ -24,6 +24,8 @@ import {
   isUsableName,
   moveStep,
   nameProblem,
+  noStepLine,
+  outputSourceLine,
   previewAsRecords,
   previewBody,
   previewKey,
@@ -440,5 +442,22 @@ describe("sqlStepReads (the pipeline page's edges)", () => {
     expect(sqlStepReads("SELECT 'FROM orders' AS t -- FROM customers\nFROM paid", names)).toEqual(["paid"])
     expect(sqlStepReads("SELECT * FROM ORDERS", names)).toEqual([])
     expect(sqlStepReads("SELECT * FROM bronze.orders", names)).toEqual([])
+  })
+})
+
+describe("the lines said for a pipeline with no step (R1-B3, R1-S7)", () => {
+  it("says the output is a copy only for one input with the copy chosen", () => {
+    expect(noStepLine(1, true)).toBe("No steps: the output is a copy of the input.")
+    expect(noStepLine(1, false)).toBe("No steps yet.")
+    expect(noStepLine(2, true)).toBe("No steps yet: with several inputs, add one that reads them.")
+  })
+
+  it("says what the output is written from", () => {
+    expect(outputSourceLine(stored(), false)).toBe("Written from the last step, by_country.")
+    const one = editorStateFrom({ inputs: [STORED.inputs[0]], steps: [] })
+    expect(outputSourceLine(one, true)).toBe("A copy of orders, unchanged.")
+    expect(outputSourceLine(one, false)).toBe("No step yet: add one, or choose to copy the input as it is.")
+    const two = editorStateFrom({ inputs: STORED.inputs, steps: [] })
+    expect(outputSourceLine(two, true)).toBe("No step yet: with several inputs, the output is what a step returns.")
   })
 })

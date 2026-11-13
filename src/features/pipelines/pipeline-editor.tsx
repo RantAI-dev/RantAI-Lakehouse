@@ -35,6 +35,8 @@ import {
   errorTarget,
   hasProblems,
   moveStep,
+  noStepLine,
+  outputSourceLine,
   previewAsRecords,
   previewBody,
   previewKey,
@@ -424,7 +426,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
         targetTable={targetTable}
         zones={zoneNames}
         zoneNote={zoneNote}
-        writtenFrom={last ? last.name || null : inputs.length === 1 ? inputs[0].name || null : null}
+        writtenFrom={outputSourceLine({ inputs, steps: editor.steps }, plainCopy)}
         plainCopy={plainCopy}
         plainCopyAllowed={editor.steps.length === 0}
         problem={
@@ -562,7 +564,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
               </RailGroup>
               <RailGroup title={`Steps · ${editor.steps.length} of ${MAX_STEPS}`}>
                 {editor.steps.length === 0 ? (
-                  <p className="px-2 text-xs text-muted-foreground">No steps: the output is a copy of the input.</p>
+                  <p className="px-2 text-xs text-muted-foreground">{noStepLine(editor.inputs.length, plainCopy)}</p>
                 ) : null}
                 {editor.steps.map((step, index) => (
                   <RailItem

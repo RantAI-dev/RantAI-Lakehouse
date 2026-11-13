@@ -370,6 +370,26 @@ export function editorProblems(state: EditorState, output: OutputSettings): Edit
   return { items, output: outputProblem }
 }
 
+/**
+ * The rail's line under Steps when there is none, true for the state it is
+ * said in. BLD-1 part 1 S3 review R1-B3, R1-S7: it said "the output is a
+ * copy of the input" for any pipeline with no step, chosen or not, and with
+ * several inputs.
+ */
+export function noStepLine(inputCount: number, plainCopy: boolean): string {
+  if (inputCount > 1) return "No steps yet: with several inputs, add one that reads them."
+  return plainCopy ? "No steps: the output is a copy of the input." : "No steps yet."
+}
+
+/** The Output pane's line saying what the output is written from (R1-S7). */
+export function outputSourceLine(state: Pick<EditorState, "inputs" | "steps">, plainCopy: boolean): string {
+  const last = state.steps[state.steps.length - 1]
+  if (last) return last.name.trim() ? `Written from the last step, ${last.name.trim()}.` : "Written from the last step."
+  if (state.inputs.length > 1) return "No step yet: with several inputs, the output is what a step returns."
+  const input = state.inputs[0]?.name.trim() || "the input"
+  return plainCopy ? `A copy of ${input}, unchanged.` : "No step yet: add one, or choose to copy the input as it is."
+}
+
 export function hasProblems(problems: EditorProblems): boolean {
   return problems.output !== null || Object.keys(problems.items).length > 0
 }

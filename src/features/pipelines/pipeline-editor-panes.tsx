@@ -454,8 +454,8 @@ export function OutputPane({
   targetTable: string
   zones: string[] | null
   zoneNote?: string
-  /** The last step's name, or the one input's when there is no step. */
-  writtenFrom: string | null
+  /** What the output is written from, said for the state it is in (`outputSourceLine`). */
+  writtenFrom: string
   plainCopy: boolean
   /** Only with no step is there anything to copy as it is. */
   plainCopyAllowed: boolean
@@ -468,9 +468,7 @@ export function OutputPane({
     <div className="flex flex-col gap-4">
       <div>
         <p className="font-mono text-[11px] uppercase tracking-[0.14em] text-muted-foreground">Output</p>
-        <p className="text-sm">
-          Written from <span className="font-mono font-semibold">{writtenFrom ?? "…"}</span>
-        </p>
+        <p className="text-sm">{writtenFrom}</p>
       </div>
       <div className="grid gap-3 sm:grid-cols-2">
         {/* WEB-8 D8: the zone is one the lakehouse lists. The table stays

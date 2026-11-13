@@ -589,10 +589,22 @@ describe("FBIC and the plain copy in the pipeline editor (BLD-10)", () => {
     expect(plainCopySwitch().getAttribute("aria-disabled")).toBe("true")
   })
 
-  it("says that a pipeline with no step is a plain copy of its input", async () => {
+  // BLD-1 part 1 S3 review R1-B3: what the old Review step asserted, with the
+  // plain copy switched on and then off. The line must not be said for a copy
+  // nobody chose.
+  it("says the output is a copy of the input only while the plain copy is switched on", async () => {
     renderEditor()
     await fillWithoutStep()
-    expect(screen.getByText("No steps: the output is a copy of the input.")).toBeTruthy()
+    const copyLine = () => screen.queryByText("No steps: the output is a copy of the input.")
+    expect(copyLine()).toBeNull()
+
+    fireEvent.click(plainCopySwitch())
+    await waitFor(() => expect(copyLine()).not.toBeNull())
+    expect(screen.getByText("A copy of orders_raw, unchanged.")).toBeTruthy()
+
+    fireEvent.click(plainCopySwitch())
+    await waitFor(() => expect(copyLine()).toBeNull())
+    expect(screen.queryByText("A copy of orders_raw, unchanged.")).toBeNull()
   })
 
   it("sends fbicEnabled false on a create, because nothing runs it", async () => {
