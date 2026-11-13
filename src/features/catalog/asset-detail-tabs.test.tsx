@@ -2146,7 +2146,7 @@ describe("Access tab: grants", () => {
     )
   })
 
-  it("shows the server's refusal in its own words, without a prefix", async () => {
+  it("shows the server's reason for a refused grant, without the code", async () => {
     stubApi({ grantRefusal: { status: 403, error: "permission_denied: you cannot grant access to yourself" } })
     url.search = "tab=access"
     renderTabs()
@@ -2154,7 +2154,9 @@ describe("Access tab: grants", () => {
     const card = (await screen.findByText("Grants")).closest("[data-slot=card]") as HTMLElement
     fireEvent.change(within(card).getByLabelText("E-mail of the user"), { target: { value: "me@meridian.example" } })
     fireEvent.click(within(card).getByRole("button", { name: "Grant" }))
-    expect((await within(card).findByRole("alert")).textContent).toBe("you cannot grant access to yourself")
+    expect((await within(card).findByRole("alert")).textContent).toBe(
+      "You don't have access. Reason given: you cannot grant access to yourself."
+    )
   })
 
   it("revokes after a confirmation", async () => {

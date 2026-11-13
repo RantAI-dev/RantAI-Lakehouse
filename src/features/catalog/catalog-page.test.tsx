@@ -248,3 +248,31 @@ describe("the Catalog's namespace row", () => {
     expect(await screen.findByText("Orders Silver")).toBeTruthy()
   })
 })
+
+describe("the Catalog's refusal", () => {
+  // QA LH-DATA-12-09 F1/F2, TC-1724 F1 (WEB-11): a refusal is not an outage,
+  // and it is shown at once — the skeleton used to stay through the retries.
+  it('shows "You don\'t have access" at once for a 403, with the permission, and asks once', async () => {
+    const listCalls: string[] = []
+    mock.restore()
+    spyOn(globalThis, "fetch").mockImplementation((async (
+      input: RequestInfo | URL
+    ) => {
+      const target = String(input)
+      if (target.startsWith("/api/catalog/query")) {
+        listCalls.push(target)
+        return json({ error: "permission_denied: catalog:read" }, 403)
+      }
+      if (target.startsWith("/api/catalog")) return json({ assets: [], namespaces: [NAMESPACE] })
+      return json({ error: "not stubbed" }, 404)
+    }) as unknown as typeof fetch)
+    renderPage()
+
+    expect(await screen.findByText("You don't have access")).toBeTruthy()
+    expect(
+      screen.getByText("This needs the catalog:read permission. Ask a workspace admin.")
+    ).toBeTruthy()
+    expect(screen.queryByText("Service unavailable")).toBeNull()
+    expect(listCalls).toHaveLength(1)
+  })
+})

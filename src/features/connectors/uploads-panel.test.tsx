@@ -273,6 +273,16 @@ describe("UploadsPanel", () => {
     expect(await screen.findByText("You don't have access")).toBeDefined()
   })
 
+  // QA LH-DATA-9-20 (WEB-11): the tab said "You don't have access" but did not name the missing permission.
+  it("names the missing permission on the Uploaded files tab", async () => {
+    stubFetch(() => json({ error: "permission_denied: connector:manage" }, 403))
+    render(<UploadsPanel />)
+    expect(await screen.findByText("You don't have access")).toBeDefined()
+    expect(
+      screen.getByText("This needs the connector:manage permission. Ask a workspace admin.")
+    ).toBeDefined()
+  })
+
   it("shows the API's sentence for an unavailable list, with Retry", async () => {
     stubFetch(() => json({ error: "database error" }, 500))
     render(<UploadsPanel />)

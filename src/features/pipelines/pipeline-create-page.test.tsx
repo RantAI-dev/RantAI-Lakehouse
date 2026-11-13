@@ -727,6 +727,17 @@ describe("the pipeline editor of inputs and steps (BLD-1 part 1)", () => {
     expect((await screen.findByRole("alert")).textContent).toBe("inputs[0]: a zone and a table must be plain names")
   })
 
+  // BLD-1-AC11, WEB-11: the shared refusal sentence, and no item selected
+  // for it, because it names none.
+  it("shows the shared sentence when the person may not preview", async () => {
+    previewAnswer = { status: 403, body: { error: "permission_denied: pipeline:write" } }
+    renderEditor(existing())
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }))
+    expect((await screen.findByRole("alert")).textContent).toBe(
+      "You don't have access. This needs the pipeline:write permission."
+    )
+  })
+
   it("creates with inputs, steps and kind batch, and none of the fields of before (D3, decision 18)", async () => {
     renderEditor()
     await fillNewPipeline()

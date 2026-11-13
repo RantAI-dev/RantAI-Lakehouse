@@ -72,6 +72,8 @@ describe("clickhouseAssetService.getAsset", () => {
     const err = await clickhouseAssetService.getAsset("silver.orders").catch((e) => e)
     expect(err).toBeInstanceOf(ServiceError)
     expect(err.code).toBe("permission_denied")
+    expect(err.status).toBe(403)
+    expect(err.message).toBe("You don't have access. This needs the catalog:read permission.")
   })
 
   it("throws unavailable on a 503 and keeps the API's sentence", async () => {
@@ -91,6 +93,49 @@ describe("clickhouseAssetService.getAsset", () => {
     stubFetch(() => new Response("bad gateway", { status: 502 }))
     const err = await clickhouseAssetService.getAsset("silver.orders").catch((e) => e)
     expect(err.code).toBe("unavailable")
+  })
+})
+
+describe("clickhouseAssetService.listAssetsPage", () => {
+  // QA LH-DATA-12-09, TC-1724 (WEB-11): the Catalog said "Service unavailable"
+  // with Retry for a missing permission.
+  it("throws permission_denied with the sentence that names the permission on a 403", async () => {
+    stubFetch(() => json({ error: "permission_denied: catalog:read" }, 403))
+    const err = await clickhouseAssetService
+      .listAssetsPage({ page: 1, pageSize: 50 })
+      .catch((e) => e)
+    expect(err).toBeInstanceOf(ServiceError)
+    expect(err.code).toBe("permission_denied")
+    expect(err.status).toBe(403)
+    expect(err.message).toBe("You don't have access. This needs the catalog:read permission.")
+  })
+
+  it("still calls a 400 a bad request and a 500 an outage", async () => {
+    stubFetch(() => json({ error: "unknown field" }, 400))
+    const bad = await clickhouseAssetService
+      .listAssetsPage({ page: 1, pageSize: 50 })
+      .catch((e) => e)
+    expect(bad.code).toBe("invalid_request")
+
+    stubFetch(() => json({ error: "The catalog did not answer." }, 500))
+    const down = await clickhouseAssetService
+      .listAssetsPage({ page: 1, pageSize: 50 })
+      .catch((e) => e)
+    expect(down.code).toBe("unavailable")
+  })
+})
+
+describe("clickhouseAssetService.grantAccess", () => {
+  it("gives the server's reason for a grant it refuses", async () => {
+    stubFetch(() => json({ error: "permission_denied: you cannot grant access to yourself" }, 403))
+    const err = await clickhouseAssetService
+      .grantAccess("silver.orders", { email: "me@meridian.example", permission: "lineage:read" })
+      .catch((e) => e)
+    expect(err).toBeInstanceOf(ServiceError)
+    expect(err.code).toBe("permission_denied")
+    expect(err.message).toBe(
+      "You don't have access. Reason given: you cannot grant access to yourself."
+    )
   })
 })
 

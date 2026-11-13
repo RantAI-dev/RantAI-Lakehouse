@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, mock } from "bun:test"
 import { ServiceError } from "../errors"
+import type { CreatePipelineInput } from "../contracts/pipelines"
 import { dagsterPipelineService } from "./pipelines"
 
 const originalFetch = global.fetch
@@ -141,5 +142,69 @@ describe("dagsterPipelineService.previewPipelineStep", () => {
 
     expect(err.code).toBe("invalid_request")
     expect(err.message).toBe("inputs[0]: you may not read this table")
+  })
+
+  // BLD-1-AC11 and WEB-11: a caller without `pipeline:write` is refused with
+  // the shared sentence (`deniedFor`), not the API's code.
+  it("throws permission_denied with the shared sentence on a 403", async () => {
+    stubFetch(() => json({ error: "permission_denied: pipeline:write" }, 403))
+
+    const err = await rejection(dagsterPipelineService.previewPipelineStep(body))
+
+    expect(err.code).toBe("permission_denied")
+    expect(err.status).toBe(403)
+    expect(err.message).toBe("You don't have access. This needs the pipeline:write permission.")
+  })
+})
+
+// QA TC-1734 F3, LH-DATA-19-03, LH-BLD-2-03 F1 (WEB-11): a refusal is not an
+// outage and not the API's code.
+describe("dagsterPipelineService.listPipelines", () => {
+  it("listPipelines throws permission_denied on a 403 and does not answer an empty list", async () => {
+    stubFetch(() => json({ error: "permission_denied: pipeline:read" }, 403))
+
+    const err = await rejection(dagsterPipelineService.listPipelines())
+    expect(err.code).toBe("permission_denied")
+    expect(err.status).toBe(403)
+    expect(err.message).toBe("You don't have access. This needs the pipeline:read permission.")
+  })
+
+  it("listPipelines still answers the 503 body, so the page can say the orchestrator was not reached", async () => {
+    stubFetch(() => json({ pipelines: [], error: "The orchestrator did not answer." }, 503))
+
+    const res = await dagsterPipelineService.listPipelines()
+    expect(res.error).toBe("The orchestrator did not answer.")
+    expect(res.pipelines).toEqual([])
+  })
+})
+
+describe("dagsterPipelineService.getPipeline", () => {
+  it("getPipeline throws permission_denied on a 403, not unavailable", async () => {
+    stubFetch(() => json({ error: "permission_denied: pipeline:read" }, 403))
+
+    const err = await rejection(dagsterPipelineService.getPipeline("pl-1"))
+    expect(err.code).toBe("permission_denied")
+    expect(err.status).toBe(403)
+    expect(err.message).toBe("You don't have access. This needs the pipeline:read permission.")
+  })
+})
+
+describe("dagsterPipelineService refusals on a write", () => {
+  it("setTargetLag throws permission_denied with the sentence on a 403", async () => {
+    stubFetch(() => json({ error: "permission_denied: pipeline:write" }, 403))
+
+    const err = await rejection(dagsterPipelineService.setTargetLag("pl-1", { kind: "lag", minutes: 7 }))
+    expect(err.code).toBe("permission_denied")
+    expect(err.status).toBe(403)
+    expect(err.message).toBe("You don't have access. This needs the pipeline:write permission.")
+  })
+
+  it("createPipeline throws the sentence, not the API's code, on a 403", async () => {
+    stubFetch(() => json({ error: "permission_denied: pipeline:write" }, 403))
+
+    const err = await rejection(dagsterPipelineService.createPipeline({} as CreatePipelineInput))
+    expect(err.code).toBe("permission_denied")
+    expect(err.message).toBe("You don't have access. This needs the pipeline:write permission.")
+    expect(err.message).not.toContain("permission_denied")
   })
 })
