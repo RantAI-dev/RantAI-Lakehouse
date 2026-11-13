@@ -30,6 +30,8 @@ export type SelectFieldProps = {
   size?: "sm" | "default"
   "aria-label"?: string
   "aria-invalid"?: boolean
+  /** The id of a sentence about this choice, e.g. why it is refused. */
+  "aria-describedby"?: string
 }
 
 /**
@@ -52,6 +54,7 @@ export function SelectField({
   size,
   "aria-label": ariaLabel,
   "aria-invalid": ariaInvalid,
+  "aria-describedby": ariaDescribedBy,
 }: SelectFieldProps) {
   const entries = options.flatMap((option) => ("options" in option ? option.options : [option]))
   const items = entries.map((option) => ({
@@ -76,6 +79,7 @@ export function SelectField({
         size={size}
         aria-label={ariaLabel}
         aria-invalid={ariaInvalid}
+        aria-describedby={ariaDescribedBy}
       >
         <SelectValue placeholder={placeholder} />
       </SelectTrigger>
