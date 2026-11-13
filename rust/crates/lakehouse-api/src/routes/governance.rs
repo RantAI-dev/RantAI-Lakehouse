@@ -134,8 +134,10 @@ pub async fn get(
 /// person behind the chat and no request headers of their own. A quality list
 /// is narrowed by the catalog's tenant rule and by the caller's table access
 /// (`GOV-15 (GOV-12 plan, section 4)`), because every row is a rule on a
-/// table; no other kind names tables, so no other kind is gated or filtered
-/// (`GOV-15` scope). No principal is a system call and is not narrowed, which
+/// table. The other kinds are not narrowed by this change — classification
+/// and maintenance rows do name tables, but the plan's scope is the quality
+/// rules (`GOV-15`); narrowing them is a separate item. No principal is a
+/// system call and is not narrowed, which
 /// [`crate::routes::quality::quality_table_access`] documents.
 pub(crate) async fn read_kind(
     state: &AppState,
@@ -180,7 +182,9 @@ pub(crate) async fn read_kind(
 
 /// Drops every quality row whose `asset` the caller's table access hides, in
 /// place — the rule [`crate::routes::catalog::retain_visible`] applies to the
-/// catalog's own rows (`GOV-15` D6).
+/// catalog's own rows (`GOV-15` D6) — and gives the kept observed rows
+/// positional ids from the kept order, so an id says nothing about hidden rows
+/// (`GOV-15`, review round 1 (R1)).
 ///
 /// `retain_visible` itself cannot be called: it reads a row's `tableKey` or
 /// dotted `id`, while a quality row's key is its `asset` (an authored rule's
@@ -200,6 +204,21 @@ fn retain_readable_rules(access: &crate::table_access::TableAccess, body: &mut V
             .map(str::trim)
             .is_some_and(|asset| access.allows_key(asset))
     });
+    // The kept observed rows take their positional ids from the kept order
+    // (`q-0`, `q-1`, …): an id from the list before the filter would tell the
+    // caller how many hidden rows sorted before a visible one (`GOV-15`,
+    // review round 1 (R1)). An authored rule's id is a UUID and is left alone.
+    for (index, row) in rows
+        .iter_mut()
+        .filter(|row| {
+            row.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.starts_with("q-"))
+        })
+        .enumerate()
+    {
+        row["id"] = json!(format!("q-{index}"));
+    }
 }
 
 /// A fixed, classified message for a failed governance read. The raw

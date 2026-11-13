@@ -238,9 +238,10 @@ pub async fn resolve_incident(
         None => {
             return Err(ApiError::NotFound("Quality incident not found".to_owned()).into());
         }
-        // GOV-15 (GOV-12 plan, section 4): an incident on a table the role does
-        // not read is not on the caller's list, so it answers as an unknown
-        // incident (D5).
+        // GOV-15 (GOV-12 plan, section 4): resolving is refused for an
+        // incident on a table the caller's role does not read, and it reads as
+        // an unknown id (the same 404). The incident list itself is not
+        // narrowed by role (D5).
         Some(incident) if !access.allows_key(incident.asset.trim()) => {
             return Err(ApiError::NotFound("Quality incident not found".to_owned()).into());
         }

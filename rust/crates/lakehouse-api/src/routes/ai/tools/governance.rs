@@ -30,9 +30,11 @@ use super::{api_result_to_value, arg_str, response_to_value};
 use crate::state::AppState;
 
 async fn governance_kind(state: &AppState, kind: &str) -> Value {
-    // No principal: these tools read kinds that name no table, and the
-    // convention `ensure_rule_table` has is that a call with no person is not
-    // narrowed (`GOV-15` D7).
+    // No principal: this serves the kinds this change does not narrow —
+    // classification and maintenance rows do name tables, but the plan's
+    // scope is the quality rules (`GOV-15`), and narrowing those kinds is a
+    // separate item. A call with no person is not narrowed, the convention
+    // `ensure_rule_table` has (`GOV-15` D7).
     response_to_value(
         crate::routes::governance::read_kind(state, None, &axum::http::HeaderMap::new(), kind)
             .await,

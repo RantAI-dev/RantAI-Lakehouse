@@ -66,7 +66,9 @@ reported, not quietly lowered.
   the same rule: a person outside the tenant that owns the catalog is refused,
   and a rule or incident on a table the person's role does not read answers as
   one that does not exist. The rule list shows only the rules on tables the
-  person may read; the assistant's list does too. Changed 2026-11-13
+  person may read; the assistant's list does too. The incident list, the
+  schedule list and a rule's run history are still shown in full; narrowing
+  them by role is a separate item. Changed 2026-11-13
   (`GOV-15`), *(proposed, not yet signed)*.
 - On-load checks start when the orchestrator reports the finished load, not
   when the load ends: QA saw about 36 seconds on staging (`LH-DATA-14-05`). The

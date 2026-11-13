@@ -1489,12 +1489,14 @@ async fn the_rule_list_hides_rules_on_tables_the_role_may_not_read() {
                 {"name": "nilai", "type": "String"},
                 {"name": "at", "type": "String"},
             ],
+            // In the order the query's `ORDER BY tabel, cek` returns them, so
+            // the hidden rows sort before the one `silver.orders` keeps.
             "data": [
-                {"tabel": "silver.orders", "cek": "row_count", "verdict": "pass",
+                {"tabel": "orders", "cek": "row_count", "verdict": "pass",
                  "nilai": "1", "at": "2026-11-13 00:00:00"},
                 {"tabel": "silver.customers", "cek": "row_count", "verdict": "pass",
                  "nilai": "1", "at": "2026-11-13 00:00:00"},
-                {"tabel": "orders", "cek": "row_count", "verdict": "pass",
+                {"tabel": "silver.orders", "cek": "row_count", "verdict": "pass",
                  "nilai": "1", "at": "2026-11-13 00:00:00"},
             ],
             "rows": 3,
@@ -1525,6 +1527,16 @@ async fn the_rule_list_hides_rules_on_tables_the_role_may_not_read() {
         narrowed_assets,
         ["silver.orders", "silver.orders"],
         "only the rows on a table the role reads, observed and authored"
+    );
+    let first_observed = body["quality"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with("q-")))
+        .expect("the observed row on silver.orders is kept");
+    assert_eq!(
+        first_observed["id"], "q-0",
+        "the kept observed rows are renumbered, so an id says nothing about hidden rows"
     );
 
     let cookie = admin(&pool).await;
