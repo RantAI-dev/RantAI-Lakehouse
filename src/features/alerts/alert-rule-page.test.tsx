@@ -340,7 +340,7 @@ describe("a refusal on the alert rule page (LH-SRC-7-10)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Create" }))
 
     expect(
-      await screen.findByText("This account does not have permission. Ask a workspace admin.")
+      await screen.findByText("You don't have access. This needs the alert:write permission.")
     ).toBeTruthy()
     expect(document.body.textContent).not.toMatch(/permission_denied/)
   })
