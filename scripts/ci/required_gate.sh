@@ -60,7 +60,22 @@
 #   G8_TIME_TRAVEL_RESULT result of `g8-time-travel` job
 #   IMAGES_RESULT         result of `images` job (builds the shared images)
 #   IMAGE_SMOKE_RESULT    result of `image-smoke` job (/health on the API image)
+#   SELECTED_GATE_GROUPS  the gate groups this run selected: `none`, or the
+#                         selected groups between commas (`,cdc,`), from
+#                         `changes.outputs.gate_groups` (OPS-25 D7). A gate
+#                         job's group is not in it -> a skipped job is
+#                         accepted. An unset, empty or malformed value, or a
+#                         map that does not place the job in a group, requires
+#                         every gate job (fail closed).
+#   GATE_PATHS_FILE       the gate path map: its `group` lines say which group
+#                         each gate job belongs to (OPS-25 D2). Defaults to
+#                         `gate_paths.txt` next to this script.
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# OPS-25 D7: the map the scope script also reads, so "which group is this job
+# in?" has one answer in the whole pipeline.
+GATE_PATHS="${GATE_PATHS_FILE:-${SCRIPT_DIR}/gate_paths.txt}"
 
 run_gate() {
   local event_name="${EVENT_NAME:-}"
@@ -171,6 +186,83 @@ run_gate() {
     req_gates="false"
   fi
 
+  # OPS-25 D7: a gate job is required when its group was selected. The value
+  # `changes` writes is `none` or `,<groups>,`; anything else -- unset, empty,
+  # a bare `cdc`, a value from another job -- requires every gate, so a broken
+  # selection can only make the gate stricter.
+  local selected_groups="${SELECTED_GATE_GROUPS:-}"
+  local selected_groups_ok="false"
+  if [ "$selected_groups" = "none" ] || [[ "$selected_groups" =~ ^,([a-z]+,)+$ ]]; then
+    selected_groups_ok="true"
+  fi
+  if [ "$selected_groups_ok" = "true" ]; then
+    echo "SELECTED_GATE_GROUPS: ${selected_groups}"
+  else
+    echo "SELECTED_GATE_GROUPS: '${selected_groups}' is neither 'none' nor a comma list; every gate job is required"
+  fi
+
+  # OPS-25 D2: the job-to-group lines of the map, read once. A job that is not
+  # in any `group` line, or an unreadable map, is required (D7): the gate must
+  # not go green because the map lost a line.
+  declare -A job_group=()
+  local gate_paths_readable="false"
+  if [ -r "$GATE_PATHS" ]; then
+    gate_paths_readable="true"
+    local map_line map_job
+    local -a map_fields
+    while IFS= read -r map_line || [ -n "$map_line" ]; do
+      map_line="${map_line%$'\r'}"
+      case "$map_line" in
+        '' | '#'*) continue ;;
+      esac
+      read -r -a map_fields <<< "$map_line"
+      if [ "${map_fields[0]:-}" != "group" ] || [ "${#map_fields[@]}" -lt 3 ]; then
+        continue
+      fi
+      for map_job in "${map_fields[@]:2}"; do
+        job_group[$map_job]="${map_fields[1]}"
+      done
+    done < "$GATE_PATHS"
+  else
+    echo "WARNING: gate path map ${GATE_PATHS} is unreadable; every gate job is required"
+  fi
+
+  # The D7 table in one place. `req_gate_for` prints its decision on stdout
+  # (check_job compares it) and the trace line on stderr, so a command
+  # substitution cannot capture the log line as if it were the answer.
+  req_gate_for() {
+    local job="$1"
+    local group="${job_group[$1]:-}"
+    local selected_for_job="unknown"
+    local required="false"
+
+    if [ -n "$group" ] && [ "$gate_paths_readable" = "true" ] && [ "$selected_groups_ok" = "true" ]; then
+      case "$selected_groups" in
+        none) selected_for_job="false" ;;
+        *",${group},"*) selected_for_job="true" ;;
+        *) selected_for_job="false" ;;
+      esac
+    fi
+
+    if [ "$req_gates" != "true" ]; then
+      # Nothing gates this run's acceptance jobs (a proven push, or no scope).
+      required="false"
+    elif [ "$req_all" = "true" ]; then
+      # The nightly run, a manual run, `all=true`: every gate, whatever the
+      # selection says.
+      required="true"
+    elif [ "$selected_for_job" = "false" ]; then
+      required="false"
+    else
+      # Selected, or unknown (no group line, unreadable map, malformed value):
+      # required (fail closed).
+      required="true"
+    fi
+
+    echo "Job [${job}]: group=${group:-unknown}, selected=${selected_for_job}" >&2
+    printf '%s\n' "$required"
+  }
+
   # Frontend
   check_job "verify" "${FRONTEND_RESULT:-skipped}" "$req_frontend"
 
@@ -186,31 +278,31 @@ run_gate() {
   check_job "dagster-loader-tests" "${DAGSTER_LOADER_TESTS_RESULT:-skipped}" "$req_dagster"
 
   # Acceptance
-  check_job "g1-rustfs" "${G1_RUSTFS_RESULT:-skipped}" "$req_gates"
-  check_job "g2-seaweedfs" "${G2_SEAWEEDFS_RESULT:-skipped}" "$req_gates"
-  check_job "g3a-dagster" "${G3A_DAGSTER_RESULT:-skipped}" "$req_gates"
-  check_job "g3-maintenance" "${G3_MAINTENANCE_RESULT:-skipped}" "$req_gates"
-  check_job "g4-cdc" "${G4_CDC_RESULT:-skipped}" "$req_gates"
-  check_job "g4-mysql" "${G4_MYSQL_RESULT:-skipped}" "$req_gates"
-  check_job "g4-mssql" "${G4_MSSQL_RESULT:-skipped}" "$req_gates"
-  check_job "g4-mongo" "${G4_MONGO_RESULT:-skipped}" "$req_gates"
-  check_job "g4-oracle" "${G4_ORACLE_RESULT:-skipped}" "$req_gates"
-  check_job "g10-sso" "${G10_SSO_RESULT:-skipped}" "$req_gates"
-  check_job "g6-ingest" "${G6_INGEST_RESULT:-skipped}" "$req_gates"
-  check_job "g6-ingest-other" "${G6_INGEST_OTHER_RESULT:-skipped}" "$req_gates"
-  check_job "g6-oracle" "${G6_ORACLE_RESULT:-skipped}" "$req_gates"
-  check_job "g9-upload" "${G9_UPLOAD_RESULT:-skipped}" "$req_gates"
-  check_job "g6-alerts" "${G6_ALERTS_RESULT:-skipped}" "$req_gates"
-  check_job "g6-ops" "${G6_OPS_RESULT:-skipped}" "$req_gates"
-  check_job "g6-credentials" "${G6_CREDENTIALS_RESULT:-skipped}" "$req_gates"
-  check_job "g6-secret-managers" "${G6_SECRET_MANAGERS_RESULT:-skipped}" "$req_gates"
-  check_job "g6-oauth" "${G6_OAUTH_RESULT:-skipped}" "$req_gates"
-  check_job "g6-discovery-scale" "${G6_DISCOVERY_SCALE_RESULT:-skipped}" "$req_gates"
-  check_job "g6-saas-a" "${G6_SAAS_A_RESULT:-skipped}" "$req_gates"
-  check_job "g6-saas-b" "${G6_SAAS_B_RESULT:-skipped}" "$req_gates"
-  check_job "gold-export" "${GOLD_EXPORT_RESULT:-skipped}" "$req_gates"
-  check_job "g8-governance" "${G8_GOVERNANCE_RESULT:-skipped}" "$req_gates"
-  check_job "g8-time-travel" "${G8_TIME_TRAVEL_RESULT:-skipped}" "$req_gates"
+  check_job "g1-rustfs" "${G1_RUSTFS_RESULT:-skipped}" "$(req_gate_for g1-rustfs)"
+  check_job "g2-seaweedfs" "${G2_SEAWEEDFS_RESULT:-skipped}" "$(req_gate_for g2-seaweedfs)"
+  check_job "g3a-dagster" "${G3A_DAGSTER_RESULT:-skipped}" "$(req_gate_for g3a-dagster)"
+  check_job "g3-maintenance" "${G3_MAINTENANCE_RESULT:-skipped}" "$(req_gate_for g3-maintenance)"
+  check_job "g4-cdc" "${G4_CDC_RESULT:-skipped}" "$(req_gate_for g4-cdc)"
+  check_job "g4-mysql" "${G4_MYSQL_RESULT:-skipped}" "$(req_gate_for g4-mysql)"
+  check_job "g4-mssql" "${G4_MSSQL_RESULT:-skipped}" "$(req_gate_for g4-mssql)"
+  check_job "g4-mongo" "${G4_MONGO_RESULT:-skipped}" "$(req_gate_for g4-mongo)"
+  check_job "g4-oracle" "${G4_ORACLE_RESULT:-skipped}" "$(req_gate_for g4-oracle)"
+  check_job "g10-sso" "${G10_SSO_RESULT:-skipped}" "$(req_gate_for g10-sso)"
+  check_job "g6-ingest" "${G6_INGEST_RESULT:-skipped}" "$(req_gate_for g6-ingest)"
+  check_job "g6-ingest-other" "${G6_INGEST_OTHER_RESULT:-skipped}" "$(req_gate_for g6-ingest-other)"
+  check_job "g6-oracle" "${G6_ORACLE_RESULT:-skipped}" "$(req_gate_for g6-oracle)"
+  check_job "g9-upload" "${G9_UPLOAD_RESULT:-skipped}" "$(req_gate_for g9-upload)"
+  check_job "g6-alerts" "${G6_ALERTS_RESULT:-skipped}" "$(req_gate_for g6-alerts)"
+  check_job "g6-ops" "${G6_OPS_RESULT:-skipped}" "$(req_gate_for g6-ops)"
+  check_job "g6-credentials" "${G6_CREDENTIALS_RESULT:-skipped}" "$(req_gate_for g6-credentials)"
+  check_job "g6-secret-managers" "${G6_SECRET_MANAGERS_RESULT:-skipped}" "$(req_gate_for g6-secret-managers)"
+  check_job "g6-oauth" "${G6_OAUTH_RESULT:-skipped}" "$(req_gate_for g6-oauth)"
+  check_job "g6-discovery-scale" "${G6_DISCOVERY_SCALE_RESULT:-skipped}" "$(req_gate_for g6-discovery-scale)"
+  check_job "g6-saas-a" "${G6_SAAS_A_RESULT:-skipped}" "$(req_gate_for g6-saas-a)"
+  check_job "g6-saas-b" "${G6_SAAS_B_RESULT:-skipped}" "$(req_gate_for g6-saas-b)"
+  check_job "gold-export" "${GOLD_EXPORT_RESULT:-skipped}" "$(req_gate_for gold-export)"
+  check_job "g8-governance" "${G8_GOVERNANCE_RESULT:-skipped}" "$(req_gate_for g8-governance)"
+  check_job "g8-time-travel" "${G8_TIME_TRAVEL_RESULT:-skipped}" "$(req_gate_for g8-time-travel)"
 
   # Shared images and their smoke test. Required exactly when the acceptance
   # jobs are: `images` has the same `if:` as they do and is what they consume.
