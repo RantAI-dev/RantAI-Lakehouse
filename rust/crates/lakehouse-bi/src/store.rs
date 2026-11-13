@@ -8004,7 +8004,7 @@ mod tests {
             spec.spec.sql
         );
         assert!(
-            spec.spec.sql.contains("round(avg(stay)) AS avg_stay"),
+            spec.spec.sql.contains("round(avg(stay), 6) AS avg_stay"),
             "{}",
             spec.spec.sql
         );
