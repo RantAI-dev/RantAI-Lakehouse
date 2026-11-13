@@ -877,6 +877,122 @@ is the one with `0140`.
   `dagster/` (the merge brought `main`'s changes, which its own CI covered).
 - `cargo test --workspace`: not run here.
 
+### Handoff S2 (developer, 2026-11-13)
+
+Branch `feat/bld-1-steps-preview`, base `origin/main` at `be2c92910` (S1's
+merge, PR #481). Rust only; no migration, no dependency change, no `src/`,
+`dagster/`, compose or CI change.
+
+**Commits**
+
+| Commit | Subject |
+| --- | --- |
+| `264380ad6` | feat(pipelines): preview one input or step as the caller (S2-T1) |
+| `0dfed1599` | feat(pipelines): a preview's limits and the query/run error form (S2-T2) |
+| (this commit) | docs(plan): BLD-1 part 1 S2 handoff |
+
+**What was built.** `POST /api/pipelines/preview` in the new
+`routes/pipeline_preview.rs`, `pipeline:write` in `POLICY_TABLE` (deny by
+default would otherwise answer 500), its own `pipeline_preview_router()`
+merged into `pipelines_router()` so that function stays under
+`clippy::too_many_lines`, and asserted both ways in `tests/route_auth.rs`.
+The handler parses `{ inputs, steps, upTo }`, requires `upTo`, compiles
+through `pipeline_compile::compile(inputs, steps, Some(upTo), catalog_db)`,
+runs the tenant gate as `GateActor::Caller` and then
+`policy_engine::rewrite_sql_for_roles` (decision 13: as the person looking,
+never as any pipeline's author), probes the columns, and runs
+`SELECT * FROM (<rewritten>) AS step LIMIT 101 SETTINGS max_result_rows =
+101, result_overflow_mode = 'break', max_execution_time = 30`. The response
+is `{ columns: [{name, type}], rows, truncated }`, rows as arrays in column
+order, at most 100 of them.
+
+**Reuse, and what moved (AGENTS.md rule 4).** `placeholders_for` and the
+`DESCRIBE` column probe moved from `routes/dashboard_sources.rs` to
+`routes/support.rs`; the dashboard preview calls them and its behaviour and
+its 7 unit tests and `dashboard_tenant_scope.rs` (13) are unchanged. The
+gate's 404/422-to-422 rule is `authored_pipelines::gate_refusal_as_unprocessable`,
+made `pub(crate)` rather than copied; the rewrite's refusal sentence is
+`policy_engine::enforcement_error_message`, as the save path uses it. The
+settings text is `lakehouse_bi::builder::SQL_SOURCE_SETTINGS` swapped by
+`with_run_settings`, not a second `SETTINGS` string. The
+`ClickHouse` error path is `upstream_error::ch_failure_for_author` — the
+function `POST /api/query/run` itself uses. One `tests/sec11_guard.rs`
+allowlist entry was added with its reason (the query-author exception,
+spec rule 7); no existing entry or test was changed or weakened.
+
+**Verification, run on the final commit (`0dfed1599`), in the foreground.**
+
+```
+cd rust && cargo fmt --check                                  # clean
+cargo-locked clippy -j 2 -p lakehouse-api --all-targets -- -D warnings
+                                                              # clean
+cargo-locked test -j 2 -p lakehouse-api --lib -- pipeline_compile sql_guard
+                                                              # 61 passed, 0 failed
+cargo-locked test -j 2 -p lakehouse-api --lib -- preview      # 30 passed, 0 failed
+cargo-locked test -j 2 -p lakehouse-api --test pipeline_preview \
+  --test route_auth --test sec11_guard --test pipeline_compile_route \
+  --test pipeline_definition_save --test dashboard_tenant_scope
+                        # 10, 95, 4, 24, 14, 13 passed; 0 failed in each
+python3 ops/lint/check_intra_package_imports.py               # OK
+python3 ops/lint/check_bare_iceberg_count.py                  # R11 guard: none found
+```
+
+On the T1 commit (`264380ad6`), the same scoped set: `--test
+pipeline_preview` 8 passed, `--test route_auth` 95, `--test sec11_guard` 4,
+`--lib -- preview_tests` 7, `--test dashboard_tenant_scope` 13.
+
+The route tests are in `tests/pipeline_preview.rs` and cover S2-T1's and
+S2-T2's checks: `upTo` an input answers that table's rows (and the compiled
+text reads Bronze through `icecat_api.`); `upTo` a step answers that step;
+a column masked for the caller is masked in the statement the engine runs
+and in the returned rows; an input the caller may not read is a 422 with the
+fixed sentence and NOTHING reaches `ClickHouse`; a `DROP TABLE` step is a
+400 whose message starts `steps[0]: `; a caller without `pipeline:write` is
+403; 101 rows answer 100 with `truncated: true`; the row query carries the
+limits; and a `ClickHouse` statement failure answers `422` with the same
+text `POST /api/query/run` gives for it (compared up to the reference id).
+
+**Mismatch between plan and code (for the planner)**
+
+1. **D16's wrapper is `LIMIT 100`; the built wrapper is `LIMIT 101`.** The
+   S2-T1 check requires "more than 100 rows gives 100 and `truncated: true`",
+   and `ClickHouse` reports only the rows it returned, so `LIMIT 100` cannot
+   tell a cut from an exact fit. One more row is asked and 100 answered —
+   the rule Query Studio already follows ("one row more than the route keeps
+   is asked for, so `truncated` stays honest"). The `SETTINGS` cap is 101 for
+   the same reason.
+2. **A table the caller may not read is a 422 here, and a 404 everywhere
+   else.** S2-T1's check and section 3's contract say 422, so the gate's own
+   404 refusal (`SEC-20`) and the rewrite's `TableNotReadable` (`GOV-7` D5,
+   which `routes::support::enforcement_refusal` answers 404) are answered
+   422 with the same fixed sentence. That is the save path's rule (D9), but
+   it differs from Query Studio and the dashboard preview, which keep the
+   404. No sentence changes, so nothing about a hidden table leaks; the
+   console must not read this route's 422 as "bad definition" when the
+   message is an access sentence. If the planner wants the 404 instead, it
+   is one `map_err` and one test assertion.
+3. Not a mismatch, noted for the review: a preview that hits its 30 second
+   limit answers the engine's fixed failure sentence (`ch_error`'s), not
+   Query Studio's "stopped after N seconds, the limit for your role", because
+   that sentence names a configured limit and the preview's 30 seconds is
+   decision 17's own.
+
+**Not verified, with the reason**
+
+- **A preview of a Bronze input through the catalog database on a running
+  stack: not verified.** The wiremock proof pins that the compiled text is
+  `` SELECT * FROM icecat_api.`bronze.<table>` ``, but no `ClickHouse` was
+  asked. Running it needs the full stack (`docker compose --profile '*'`), a
+  loaded Bronze table and `ICEBERG_QUERY_DB`; none was brought up here.
+- No browser or console check: S3 owns the page, and nothing in `src/` was
+  touched.
+- A real `ClickHouse`'s `DESCRIBE` over a masked subquery, and its
+  `max_execution_time` behaviour at 30 s: wiremock only.
+- `cargo test --workspace`, the full workspace clippy run and the acceptance
+  gates: not run here (the brief scopes local runs); CI runs them on the
+  pull request.
+- The Python suite was not run: no `dagster/` file changed.
+
 ## 7. Review
 
 
