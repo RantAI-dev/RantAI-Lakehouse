@@ -1315,6 +1315,7 @@ async fn a_catalog_that_answers_500_and_a_lookup_that_fails_keeps_the_record_and
     .await
     .unwrap();
     assert_eq!(outcomes.len(), 2, "one entry before and one after");
+    assert_eq!(outcomes[0].0, "allowed", "the entry before the catalog");
     assert_eq!(outcomes[1].0, "failed");
     assert_eq!(
         outcomes[1].1.as_deref(),
@@ -1360,6 +1361,10 @@ async fn a_catalog_that_does_not_answer_within_the_clients_bound_keeps_the_recor
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["error"], json!(UNKNOWN));
     assert!(
+        !body.to_string().contains(MARKER),
+        "upstream text reached the response: {body}"
+    );
+    assert!(
         uploads::dropped_table(&pool, "orders")
             .await
             .unwrap()
@@ -1373,6 +1378,269 @@ async fn a_catalog_that_does_not_answer_within_the_clients_bound_keeps_the_recor
     .await
     .unwrap();
     assert_eq!(outcomes, vec!["allowed", "failed"]);
+}
+
+/// Poll the trail until `action` has at least `expected` entries, or five
+/// seconds pass (`DATA-55` review S4): the spawned task outlives the handler a
+/// test aborts, so its closing entry arrives after the abort.
+async fn wait_for_outcomes(pool: &sqlx::PgPool, action: &str, expected: usize) -> Vec<String> {
+    let mut outcomes = Vec::new();
+    for _ in 0..100 {
+        outcomes =
+            sqlx::query_scalar("SELECT outcome FROM audit_event WHERE action = $1 ORDER BY at, id")
+                .bind(action)
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        if outcomes.len() >= expected {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    outcomes
+}
+
+/// Nothing of the drop was written: no `catalog.drop` entry and no record
+/// (`DATA-55` review S6), so a refusal that never reached the drop left the
+/// trail and the name untouched.
+async fn assert_nothing_written(pool: &sqlx::PgPool) {
+    let audited: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_event WHERE action = 'catalog.drop'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(audited, 0, "no audit entry was written");
+    let recorded: i64 = sqlx::query_scalar("SELECT count(*) FROM upload_table_drop")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(recorded, 0, "no record was written");
+}
+
+/// How many undrops the server received: the restore's own call.
+async fn undrops(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/management/v1/warehouse/wh-1/deleted-tabulars/undrop")
+        .count()
+}
+
+/// `DATA-55` review S4: the audited stretch of a drop runs in a task the
+/// handler only waits for. A caller that goes away mid-drop must not stop the
+/// record from getting its ending: the handler is aborted while the catalog is
+/// answering, and the trail still reaches `allowed` then `executed`, with the
+/// record kept.
+#[tokio::test]
+async fn a_drop_whose_caller_goes_away_mid_call_still_gets_its_ending() {
+    let server = MockServer::start().await;
+    mount_row_count(&server, 3).await;
+    mount_registry(&server, "orders").await;
+    mount_drop(
+        &server,
+        ResponseTemplate::new(204).set_delay(Duration::from_millis(1500)),
+        1,
+    )
+    .await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    claim(&pool, CATALOG_TENANT, "orders").await;
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let handler_router = router.clone();
+    let handler = tokio::spawn(async move { call(&handler_router, "POST", DROP, &cookie).await });
+    let mut in_flight = false;
+    for _ in 0..200 {
+        if deletes(&server).await == 1 {
+            in_flight = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(in_flight, "the drop reached the catalog");
+    handler.abort();
+    assert!(
+        handler.await.is_err(),
+        "the handler was dropped mid-call, as a disconnect drops it"
+    );
+
+    assert_eq!(
+        wait_for_outcomes(&pool, "catalog.drop", 2).await,
+        vec!["allowed", "executed"],
+        "the task wrote both entries after its handler was gone"
+    );
+    assert!(
+        uploads::dropped_table(&pool, "orders")
+            .await
+            .unwrap()
+            .is_some(),
+        "the record of the drop stays"
+    );
+}
+
+/// `DATA-55` review S4, the restore: same rule, same proof. The handler is
+/// aborted while the undrop is being answered, and the trail still reaches
+/// `allowed` then `executed`, with the record cleared.
+#[tokio::test]
+async fn a_restore_whose_caller_goes_away_mid_call_still_gets_its_ending() {
+    let server = MockServer::start().await;
+    mount_registry(&server, "orders").await;
+    mount_missing_table(&server).await;
+    mount_warehouse(&server).await;
+    mount_dropped(&server, "2099-01-01T00:00:00Z").await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/management/v1/warehouse/wh-1/deleted-tabulars/undrop",
+        ))
+        .respond_with(ResponseTemplate::new(204).set_delay(Duration::from_millis(1500)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    let tenant_id = Uuid::parse_str(CATALOG_TENANT).expect("a tenant id");
+    uploads::record_table_drop(
+        &pool,
+        &NewTableDrop {
+            bronze_table: "orders",
+            tenant_id,
+            asset_id: "orders",
+            dropped_by: "Ada Lovelace",
+            row_count: Some(1),
+            kept_seconds: 604_800,
+        },
+    )
+    .await
+    .unwrap()
+    .expect("the drop is recorded");
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let handler_router = router.clone();
+    let handler =
+        tokio::spawn(async move { call(&handler_router, "POST", RESTORE, &cookie).await });
+    let mut in_flight = false;
+    for _ in 0..200 {
+        if undrops(&server).await == 1 {
+            in_flight = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(in_flight, "the restore reached the catalog");
+    handler.abort();
+    assert!(
+        handler.await.is_err(),
+        "the handler was dropped mid-call, as a disconnect drops it"
+    );
+
+    assert_eq!(
+        wait_for_outcomes(&pool, "catalog.restore", 2).await,
+        vec!["allowed", "executed"],
+        "the task wrote both entries after its handler was gone"
+    );
+    assert!(
+        uploads::dropped_table(&pool, "orders")
+            .await
+            .unwrap()
+            .is_none(),
+        "the record is cleared by the restore that happened"
+    );
+}
+
+/// `DATA-55` review S5: the arm "not listed as deleted, and the table is
+/// absent" — a `DELETE` that did not answer, no deleted copy, and no table. The
+/// drop may have happened and may still be applied by the catalog, so the
+/// record is kept, `failed` names the reason in our own words, and D5's "not
+/// known" sentence answers.
+#[tokio::test]
+async fn a_catalog_that_answers_500_with_nothing_listed_and_no_table_keeps_the_record_and_says_the_outcome_is_not_known()
+ {
+    const MARKER: &str = "planted-upstream-marker";
+    let server = MockServer::start().await;
+    mount_row_count(&server, 3).await;
+    mount_registry(&server, "orders").await;
+    mount_drop(
+        &server,
+        ResponseTemplate::new(500).set_body_string(MARKER),
+        1,
+    )
+    .await;
+    mount_nothing_deleted(&server).await;
+    mount_missing_table(&server).await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    claim(&pool, CATALOG_TENANT, "orders").await;
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let (status, body) = call(&router, "POST", DROP, &cookie).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"], json!(UNKNOWN));
+    assert!(!body.to_string().contains(MARKER), "{body}");
+    assert!(
+        uploads::dropped_table(&pool, "orders")
+            .await
+            .unwrap()
+            .is_some(),
+        "nothing is known, so the name stays closed"
+    );
+    let outcomes: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT outcome, detail FROM audit_event WHERE action = 'catalog.drop' ORDER BY at, id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(outcomes.len(), 2, "one entry before and one after");
+    assert_eq!(outcomes[0].0, "allowed");
+    assert_eq!(outcomes[1].0, "failed");
+    assert_eq!(outcomes[1].1.as_deref(), Some("the outcome is not known"));
+}
+
+/// `DATA-55` review S5: a deleted list that never ends — a next-page token on
+/// every page — tells nothing either, so the record is kept and the same
+/// sentence answers.
+#[tokio::test]
+async fn a_deleted_list_that_never_ends_keeps_the_record_and_says_the_outcome_is_not_known() {
+    const MARKER: &str = "planted-upstream-marker";
+    let server = MockServer::start().await;
+    mount_row_count(&server, 3).await;
+    mount_registry(&server, "orders").await;
+    mount_drop(
+        &server,
+        ResponseTemplate::new(500).set_body_string(MARKER),
+        1,
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/management/v1/warehouse/wh-1/deleted-tabulars"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "tabulars": [], "next-page-token": "more",
+        })))
+        .mount(&server)
+        .await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    claim(&pool, CATALOG_TENANT, "orders").await;
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let (status, body) = call(&router, "POST", DROP, &cookie).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"], json!(UNKNOWN));
+    assert!(!body.to_string().contains(MARKER), "{body}");
+    assert!(
+        uploads::dropped_table(&pool, "orders")
+            .await
+            .unwrap()
+            .is_some(),
+        "the list could not be read to its end, so the name stays closed"
+    );
+    let outcomes: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT outcome, detail FROM audit_event WHERE action = 'catalog.drop' ORDER BY at, id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(outcomes.len(), 2, "one entry before and one after");
+    assert_eq!(outcomes[0].0, "allowed");
+    assert_eq!(outcomes[1].0, "failed");
+    assert_eq!(outcomes[1].1.as_deref(), Some("the outcome is not known"));
 }
 
 /// `DATA-55` review R2, the kept-record rule, as narrowed by review S1: a
@@ -2096,6 +2364,7 @@ async fn the_tenant_gate_refuses_the_drop_and_its_two_reads_without_reaching_the
     assert_eq!(body["tables"], json!([]), "and nothing else: {body}");
 
     assert_eq!(deletes(&server).await, 0, "the catalog was not asked");
+    assert_nothing_written(&pool).await;
 }
 
 /// `DATA-55` D5 row 2 (review R5): an id the registry does not hold is the same
@@ -2117,6 +2386,7 @@ async fn an_unknown_asset_id_is_a_404_on_the_drop_status_and_on_its_post() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(body["error"], json!("Asset not found"));
     assert_eq!(deletes(&server).await, 0, "the catalog was not asked");
+    assert_nothing_written(&pool).await;
 }
 
 /// `DATA-55` D5 row 8 (review R5): the warehouse cannot be looked up — an error
@@ -2139,6 +2409,7 @@ async fn a_drop_whose_warehouse_cannot_be_looked_up_is_503_and_asks_the_catalog_
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["error"], json!(UNREACHABLE));
     assert_eq!(deletes(&failing).await, 0, "the catalog was not asked");
+    assert_nothing_written(&pool).await;
 
     let empty = MockServer::start().await;
     mount_registry(&empty, "orders").await;
@@ -2155,6 +2426,7 @@ async fn a_drop_whose_warehouse_cannot_be_looked_up_is_503_and_asks_the_catalog_
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["error"], json!(UNREACHABLE));
     assert_eq!(deletes(&empty).await, 0, "the catalog was not asked");
+    assert_nothing_written(&pool).await;
 }
 
 /// `DATA-55` D8 step 2 and review R5/R7: a record that cannot be written is the
@@ -2217,7 +2489,40 @@ async fn two_drops_of_one_table_at_the_same_moment_are_one_drop_and_one_conflict
         .filter(|s| **s == StatusCode::CONFLICT)
         .count();
     assert_eq!((dropped, refused), (1, 1), "{statuses:?} {bodies:?}");
+    let refusal = bodies
+        .iter()
+        .zip(statuses.iter())
+        .find(|(_, status)| **status == StatusCode::CONFLICT)
+        .map(|(body, _)| body)
+        .expect("one refusal");
+    assert_eq!(
+        refusal["error"],
+        json!(ALREADY_DROPPED),
+        "the refused drop names the drop on record"
+    );
     assert_eq!(deletes(&server).await, 1, "the catalog was asked once");
+    let recorded: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM upload_table_drop WHERE bronze_table = 'orders'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(recorded, 1, "exactly one record is left");
+    let outcomes: Vec<String> = sqlx::query_scalar(
+        "SELECT outcome FROM audit_event WHERE action = 'catalog.drop' ORDER BY at, id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(outcomes.first().map(String::as_str), Some("allowed"));
+    assert_eq!(
+        outcomes.iter().filter(|o| *o == "executed").count(),
+        1,
+        "the drop that went out has its ending: {outcomes:?}"
+    );
+    assert!(
+        !outcomes.iter().any(|o| o == "failed"),
+        "nothing failed: {outcomes:?}"
+    );
 }
 
 /// `DATA-55` review S1: a drop's record is true from the insert until the
@@ -2273,6 +2578,24 @@ async fn two_drops_of_a_table_that_still_exists_are_one_drop_one_conflict_and_ke
             .unwrap()
             .is_some(),
         "the record of the drop that went out is still there"
+    );
+    let recorded: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM upload_table_drop WHERE bronze_table = 'orders'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(recorded, 1, "exactly one record is left");
+    let outcomes: Vec<String> = sqlx::query_scalar(
+        "SELECT outcome FROM audit_event WHERE action = 'catalog.drop' ORDER BY at, id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(outcomes.first().map(String::as_str), Some("allowed"));
+    assert_eq!(
+        outcomes.iter().filter(|o| *o == "executed").count(),
+        1,
+        "the drop that went out has its ending: {outcomes:?}"
     );
 }
 
@@ -2365,9 +2688,18 @@ async fn the_dropped_list_stops_at_one_hundred_rows() {
 
     let (status, body) = call(&router, "GET", "/api/catalog/dropped/tables", &cookie).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        body["tables"].as_array().expect("a list").len(),
-        100,
-        "at most 100 rows: {body}"
+    let tables = body["tables"].as_array().expect("a list");
+    assert_eq!(tables.len(), 100, "at most 100 rows: {body}");
+    // `DATA-55` review S6: the list is newest first, so the row left out is the
+    // OLDEST one — `t_000`, written first.
+    let listed: Vec<&str> = tables
+        .iter()
+        .map(|row| row["table"].as_str().expect("a table name"))
+        .collect();
+    assert!(
+        !listed.contains(&"bronze.t_000"),
+        "the oldest row is the one left out: {body}"
     );
+    assert!(listed.contains(&"bronze.t_100"), "the newest is listed");
+    assert!(listed.contains(&"bronze.t_001"), "the hundredth is listed");
 }
