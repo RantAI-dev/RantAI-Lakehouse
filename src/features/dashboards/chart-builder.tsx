@@ -66,7 +66,8 @@ import { withPreviewDef } from "@/lib/preview-spec";
 import { suggestChartTitle } from "@/lib/chart-title";
 import { guessCoordinateColumns, pointLimit } from "@/lib/geo-points";
 import {
-  GRAIN_LABELS, columnKindOfType, grainChoices, isGrain, isTruncation, limitAfterGrainPick, limitHasEffect, type ColumnKind, type Grain,
+  BREAKDOWN_GRAINS, GRAIN_LABELS, breakdownGrainChoices, columnKindOfType, grainChoices, isGrain, isTruncation, limitAfterBreakdownPick, limitAfterGrainPick,
+  limitHasEffect, takesBreakdownGrain, type ColumnKind, type Grain,
 } from "@/lib/time-grain";
 import { cn } from "@/lib/utils";
 import { MapPicker } from "./map-picker";
@@ -79,6 +80,7 @@ import { JoinsSection, type JoinTableInfo } from "./joins-section";
 import { LayersSection } from "./layers-section";
 import { layerDraftsFromDef, layerProblems, layersPayload, takesLayers, type LayerDraft } from "@/lib/chart-layers";
 import { displayColumnFull, joinsPayload, pairsFromSuggestions, type JoinDraft, type JoinPairDef } from "@/lib/chart-joins";
+import type { OwnSource } from "./filters/use-filter-values";
 import { AccordionSection, ColumnLabel, FoldSection, columnItems, focusFirstEmpty } from "./builder-sections";
 import { missingSection, sectionSummaries, type SectionNumber } from "@/lib/section-summary";
 import { readKindListPref, writeKindListPref } from "@/lib/kind-list-pref";
@@ -595,7 +597,9 @@ export function ChartBuilder({
     // A grouped chart reads best in date order; the editor can still change it.
     if (next && !grain && shape.sortChoice === "order:desc") setSortChoice("order:none");
     // BI-9 review fix (SHOULD-FIX) R2: a day-grained chart should not open at 20 days.
-    setLimit((l) => limitAfterGrainPick(next, l, limitTouched));
+    // `BI-46` review round 1, R7: beside a breakdown the limit counts breakdown
+    // values, so the untouched 20 stays 20.
+    setLimit((l) => limitAfterGrainPick(next, l, limitTouched, capsBreakdown));
     setGrain(next);
   }
   // Latitude and longitude can be any column the source returns (numbers are
@@ -610,6 +614,17 @@ export function ChartBuilder({
     setLon((l) => l || guessed.lon || "");
   }, [isPoints, fields, coordinateColumns]);
   const canBreakdown = kind === "bar" || kind === "hbar" || kind === "line" || kind === "area" || needsBreakdown || isGantt;
+  // `BI-46` (QA `LH-BI-6-01`): a date or timestamp breakdown on a bar, hbar,
+  // line or area chart can be grouped by a period, and on those charts the
+  // limit keeps the N breakdown values with the largest total.
+  const breakdownKind = breakdown ? fields?.kinds?.[breakdown] : undefined;
+  const breakdownGrainOptions = React.useMemo(() => breakdownGrainChoices(kind, breakdownKind), [kind, breakdownKind]);
+  // `BI-46` review round 1, R4: a chart whose measure is a table calculation
+  // gets no breakdown cap on the server — its windows run over the whole
+  // grouped result — so the limit keeps the label such a chart always had, and
+  // does not promise a cut that does not happen.
+  const measureIsTableCalc = (fields?.calculated ?? []).some((f) => f.level === "table" && f.name === measure);
+  const capsBreakdown = !!breakdown && takesBreakdownGrain(kind) && !measureIsTableCalc;
   // BI-10: a number column can be the dimension or the breakdown when it is put in bins; a table does
   // that per grouping, a pivot on its first number row or column field.
   const onSqlSource = choice?.kind === "sql" || source === NEW_SQL_CHOICE;
@@ -618,7 +633,7 @@ export function ChartBuilder({
     kind, rowsMode, grained: !!(grain && grainOptions.includes(grain)), breakdown: canBreakdown && !!breakdown,
     other: shape.other, steps: shape.steps.length, layers: layers.length,
     multiGrouped: isGroupedTable && shape.groupings.length > 1,
-    limitHasEffect: limitHasEffect(grain, isCalendar ? "none" : order),
+    limitHasEffect: limitHasEffect(grain, isCalendar ? "none" : order, capsBreakdown),
     hasSource: !!choice || source === NEW_SQL_CHOICE,
   });
   const binKind = takesBin(kind, rowsMode) && !isGroupedTable && !isPivot && rules.bins;
@@ -644,7 +659,18 @@ export function ChartBuilder({
   }
   function pickBreakdown(column: string) {
     setBreakdown(column);
-    setShape((d) => ({ ...d, breakdownBin: binKind && column && isNumber(column) ? d.breakdownBin ?? startingBin : null }));
+    const pickedKind = column ? fields?.kinds?.[column] : undefined;
+    // `BI-46` review round 1, R7: from here the limit counts breakdown values,
+    // so an untouched grained maximum (1000) that a grain pick left behind goes
+    // back to the default 20. A limit the person set is kept.
+    const capsAfterPick = !!column && takesBreakdownGrain(kind) && !(fields?.calculated ?? []).some((f) => f.level === "table" && f.name === measure);
+    if (capsAfterPick) setLimit((l) => limitAfterBreakdownPick(l, limitTouched));
+    setShape((d) => ({
+      ...d,
+      breakdownBin: binKind && column && isNumber(column) ? d.breakdownBin ?? startingBin : null,
+      // `BI-46`: a period only cuts a date or timestamp; another column drops it.
+      breakdownGrain: pickedKind === "date" || pickedKind === "datetime" ? d.breakdownGrain : "",
+    }));
   }
   const pivotNumberField = isPivot ? [...tableDraft.pivotRows, ...tableDraft.pivotColumns].find((c) => isNumber(c)) : undefined;
   const mLabels = isSingle ? ["Measure"] : MEASURE_LABELS[kind] ?? ["Measure (Y)"];
@@ -924,10 +950,23 @@ export function ChartBuilder({
     ...(takesMetrics ? (fields?.metrics ?? []).map((m) => metricColumn(m.name)) : []),
   ];
   // Columns a filter or a grouping may name: the source's, with its per-row calculated fields.
+  // `BI-47` (plan D11): a dashboard parameter slot (`{ukuran}`) is a dimension,
+  // a breakdown and a measure, never a filter or grouping column — the server
+  // has no column to list its values from.
   const columnChoices = React.useMemo<ColumnChoice[]>(() => {
-    const names = [...new Set([...(fields?.dimensions ?? []), ...(fields?.measures ?? [])])].filter((n) => !wholeMeasure.has(n));
+    const names = [...new Set([...(fields?.dimensions ?? []), ...(fields?.measures ?? [])])]
+      .filter((n) => !wholeMeasure.has(n) && !slotParam(n));
     return names.map((name) => ({ name, kind: fields?.kinds?.[name] ?? "text" }));
   }, [fields, wholeMeasure]);
+  // `BI-47` (QA `LH-BI-6-01`): a filter's value list reads the chart's OWN
+  // relation, not every mart that has the column. SQL that is new or edited and
+  // not saved has no list (the saved text would show the old values), and a
+  // chart with no source chosen has none either.
+  const filterSource: OwnSource = heldPreview || !choice
+    ? { unsaved: true }
+    : choice.kind === "sql"
+      ? { sqlSource: choice.id }
+      : { mart: choice.name, joins: joinsPayload(shape.joins).joins };
   // The chart's grouped result, and (BI-6 part 2) what is left after its steps: the sort names the last one's columns.
   const baseResult: ResultColumns = {
     groups: (isGroupedTable ? shape.groupings : [{ column: dimension } as { column: string; grain?: string }]).filter((g) => g.column).map((g) => {
@@ -1247,10 +1286,31 @@ export function ChartBuilder({
     </div>
   ) : null;
 
+  // `BI-46` (plan D20): the period a date or timestamp breakdown is grouped by.
+  const breakdownGrainPicker = breakdownGrainOptions.length > 0 ? (
+    <div className="grid gap-1.5">
+      <Label>Group the breakdown by</Label>
+      <Select
+        value={shape.breakdownGrain || NO_GRAIN} items={GRAIN_ITEMS}
+        onValueChange={(v) => setShape((d) => ({
+          ...d,
+          breakdownGrain: v && v !== NO_GRAIN && (BREAKDOWN_GRAINS as readonly string[]).includes(v) ? (v as Grain) : "",
+        }))}
+      >
+        <SelectTrigger className="w-full" aria-label="Group the breakdown by"><SelectValue /></SelectTrigger>
+        <SelectContent>
+          <SelectItem value={NO_GRAIN}>No grouping</SelectItem>
+          {breakdownGrainOptions.map((g) => <SelectItem key={g} value={g}>{GRAIN_LABELS[g]}</SelectItem>)}
+        </SelectContent>
+      </Select>
+    </div>
+  ) : null;
+
   // Phase 2 QA R15: which conditional controls the dimension and the breakdown bring (they sit in a row below the fields).
   const binDimension = !isGroupedTable && !!binKind && isNumber(dimension);
   const dimensionExtras = !isGroupedTable && (!!grainPicker || binDimension);
-  const breakdownExtras = canBreakdown && !!binKind && !!breakdown && isNumber(breakdown);
+  const breakdownBinPicker = canBreakdown && !!binKind && !!breakdown && isNumber(breakdown);
+  const breakdownExtras = !!breakdownGrainPicker || breakdownBinPicker;
 
   const formFields = (
     // Phase 2 QA R14, the cause of the sideways scroll: a grid with no column template has one `auto`
@@ -1491,8 +1551,11 @@ export function ChartBuilder({
                   ) : null}
                   {breakdownExtras ? (
                     <div className="grid content-start gap-3 sm:col-start-2">
-                      <BinPicker label="Group the breakdown in" value={shape.breakdownBin} sqlSource={onSqlSource} aria="Group the breakdown in bins"
-                        onChange={(breakdownBin) => setShape((d) => ({ ...d, breakdownBin }))} />
+                      {breakdownGrainPicker}
+                      {breakdownBinPicker ? (
+                        <BinPicker label="Group the breakdown in" value={shape.breakdownBin} sqlSource={onSqlSource} aria="Group the breakdown in bins"
+                          onChange={(breakdownBin) => setShape((d) => ({ ...d, breakdownBin }))} />
+                      ) : null}
                     </div>
                   ) : null}
                 </div>
@@ -1598,7 +1661,9 @@ export function ChartBuilder({
                   </div>
                 )}
                 {rules.limit ? <div className="grid gap-1.5">
-                  <Label>{grain ? "Buckets (max 1000, latest kept)" : isCalendar ? "Days (max 366)" : "Limit (Top N)"}</Label>
+                  <Label>{capsBreakdown
+                    ? (grain ? "Breakdown values (Top N)" : "Limit (Top N, dimension and breakdown)")
+                    : grain ? "Buckets (max 1000, latest kept)" : isCalendar ? "Days (max 366)" : "Limit (Top N)"}</Label>
                   {limitParamName ? null : (
                     <Input type="number" min={1} max={maxLimit} value={limit} onChange={(e) => { setLimitTouched(true); setLimit(Math.max(1, Math.min(maxLimit, Number(e.target.value) || 20))); }} />
                   )}
@@ -1626,7 +1691,7 @@ export function ChartBuilder({
               </div>
             ) : null}
 
-            {rules.filters ? <ChartFilters value={shape.filters} onChange={(filters) => setShape((d) => ({ ...d, filters }))} columns={columnChoices} disabled={!fields} segments={fields?.segments ?? []} /> : null}
+            {rules.filters ? <ChartFilters value={shape.filters} onChange={(filters) => setShape((d) => ({ ...d, filters }))} columns={columnChoices} disabled={!fields} segments={fields?.segments ?? []} source={filterSource} /> : null}
           </AccordionSection>
 
           <FoldSection number={4} title="More options" open={moreOpen} onOpenChange={setMoreOpen} panelRef={(n) => { panelRefs.current[4] = n; }}>

@@ -12,7 +12,9 @@
 //!    functions and sensitive `system.*` reads. Nothing reaches
 //!    `ClickHouse` before this succeeds, not even the column probe.
 //! 3. Execution with `lakehouse_bi::builder::SQL_SOURCE_SETTINGS` (2 000
-//!    rows, 30 s).
+//!    rows, 60 s) for a stored source's own reads; the preview's row read and
+//!    a chart's statement run under the administrator's query limits
+//!    (`BI-45`; defaults 2,000 rows and 60 seconds).
 //!
 //! The preview can also draw a chart over the SQL before it is saved
 //! (`chart` in the body): the chart is validated against the probed columns
@@ -41,7 +43,10 @@ use serde_json::{Value, json};
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::policy_engine::PolicyEngineObligations;
-use crate::routes::support::{SpecRunFailure, render_stored_spec, try_run_spec_sql};
+use crate::routes::support::{
+    SpecRunFailure, failure_as_api_error, render_stored_spec, run_statement_limited,
+    try_run_spec_sql,
+};
 use crate::sql_guard::check_sql_source;
 use crate::state::AppState;
 use crate::upstream_error;
@@ -513,10 +518,13 @@ async fn preview_for_roles(
     };
     let sql =
         format!("SELECT * FROM (\n{rewritten}\n) AS src LIMIT {PREVIEW_ROWS}{SQL_SOURCE_SETTINGS}");
-    let result = ch
-        .query(&sql, None)
+    // QA `LH-BI-5-01` (`BI-45`, plan D6): the row read runs under the
+    // caller's limit too, through the one sender, so a source the engine
+    // stopped is the limit's sentence (422) instead of the fixed "The SQL
+    // source failed to run." — and no chart statement starts after it.
+    let result = run_statement_limited(ch, &sql)
         .await
-        .map_err(|err| classify_ch_error(&err))?;
+        .map_err(|failure| failure_as_api_error(failure, classify_ch_error))?;
     let mut out = json!({
         "columns": columns,
         "rows": result.data,
@@ -836,6 +844,96 @@ mod preview_tests {
             // SEC-11: the fixed message now carries a reference id after it.
             matches!(err, ApiError::Unprocessable(ref m) if m.starts_with("The SQL source failed to run. Reference: ")),
             "{err:?}"
+        );
+    }
+
+    /// QA `LH-BI-5-01` (`BI-45`, plan D3): the row read of a SQL source
+    /// preview used to go out with no limit at all — `ch.query(&sql, None)` —
+    /// so a source the engine stopped for its time limit answered the fixed
+    /// "The SQL source failed to run." instead of the limit's sentence, and
+    /// the request carried no `max_execution_time`. This is the reproduction:
+    /// it is red until the row read runs through `run_statement_limited`.
+    #[tokio::test]
+    async fn the_row_read_of_a_sql_source_preview_carries_the_callers_time_limit_and_says_the_limit_sentence()
+     {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("DESCRIBE"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(describe_body()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("AS src LIMIT 50"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(
+                "Code: 159. DB::Exception: planted-marker Timeout exceeded (TIMEOUT_EXCEEDED)",
+            ))
+            .mount(&server)
+            .await;
+
+        let err = run(&server, json!({ "sql": SQL })).await.unwrap_err();
+
+        let ApiError::Unprocessable(message) = &err else {
+            panic!("a statement the limit ended is a 422, not {err:?}");
+        };
+        // A test runs outside a request, so the limits are the defaults.
+        assert_eq!(
+            message, "This chart stopped after 60 seconds, the limit for this install.",
+            "{err:?}"
+        );
+        assert!(!message.contains("planted-marker"), "{message}");
+        let requests = server.received_requests().await.unwrap();
+        let read = requests
+            .iter()
+            .find(|r| String::from_utf8_lossy(&r.body).contains("AS src LIMIT 50"))
+            .expect("the row read was sent");
+        let settings: std::collections::HashMap<_, _> =
+            read.url.query_pairs().into_owned().collect();
+        assert_eq!(
+            settings.get("max_execution_time").map(String::as_str),
+            Some("60"),
+            "the row read carried no time limit: {}",
+            read.url
+        );
+    }
+
+    /// QA `LH-BI-5-01` (`BI-45`, plan D6): when the row read of the source is
+    /// what the limit ended, the preview answers that sentence and never runs
+    /// the chart's own statement — the second statement would be the second
+    /// wait the case saw, and its answer would replace the sentence.
+    #[tokio::test]
+    async fn a_chart_is_not_run_when_the_row_read_of_its_sql_source_hit_the_time_limit() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("DESCRIBE"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(describe_body()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("AS src LIMIT 50"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(
+                "Code: 159. DB::Exception: planted-marker Timeout exceeded (TIMEOUT_EXCEEDED)",
+            ))
+            .mount(&server)
+            .await;
+
+        let err = run(&server, json!({ "sql": SQL, "chart": chart(&json!({})) }))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &err,
+                ApiError::Unprocessable(message)
+                    if message == "This chart stopped after 60 seconds, the limit for this install."
+            ),
+            "{err:?}"
+        );
+        assert!(
+            sent(&server)
+                .await
+                .iter()
+                .all(|body| !body.contains("sum(")),
+            "the chart's statement ran after its source's row read was stopped"
         );
     }
 }

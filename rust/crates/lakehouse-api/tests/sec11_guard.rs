@@ -180,6 +180,13 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "the tenant gate's own fixed sentence (SEC-20's 404 or D6's 422), written in this repository",
     ),
     (
+        // `BI-45` (QA `LH-BI-5-01`): the assistant's reply for a save the gate
+        // refused. The same gate error `run_spec_sql` shows in its tile above.
+        "support.rs",
+        "SpecRunFailure::Gated(err) => json!({ \"error\": err.to_string() }),",
+        "the tenant gate's own fixed sentence (SEC-20's 404 or D6's 422), written in this repository",
+    ),
+    (
         "quality.rs",
         "Invalid request body: {err}",
         "serde error over the caller's own request body",

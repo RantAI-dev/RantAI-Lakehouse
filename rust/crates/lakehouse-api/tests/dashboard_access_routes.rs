@@ -675,6 +675,116 @@ async fn a_rule_only_person_cannot_read_any_mart_through_records_or_values() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// QA `LH-BI-6-01` (`BI-47`, plan D9): a value list that names a mart or a
+/// SQL source reads that relation, so it needs `dashboard:read` — refused for
+/// a person who holds only a rule, even beside a board they were given, which
+/// alone would be answered.
+#[tokio::test]
+async fn a_person_without_dashboard_read_cannot_name_a_mart_for_a_value_list() {
+    let (router, pool, _ch) = app().await;
+    let guest = create_principal_with_permissions(&pool, "query:read").await;
+    replace_item(&pool, "board", "b1", &[view_for(guest)], false, None)
+        .await
+        .unwrap();
+    let cookie = session_cookie_for_user(&pool, guest).await;
+    for uri in [
+        "/api/dashboard/values?column=province&mart=mart_x&board=b1",
+        "/api/dashboard/values?column=province&source=s_1&board=b1",
+    ] {
+        let (status, body) = send(&router, &cookie, "GET", uri, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+    }
+    // The board the person was given still answers on its own: the new check
+    // comes before the board one and does not replace it.
+    let (status, body) = send(
+        &router,
+        &cookie,
+        "GET",
+        "/api/dashboard/values?column=province&board=b1",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// `GOV-7` D6 setup: the one role of `user` reads only the listed tables.
+async fn narrow_to(pool: &PgPool, user: Uuid, tables: &[(&str, &str)]) {
+    let (role_id,): (Uuid,) =
+        sqlx::query_as("SELECT role_id FROM app_user_role WHERE user_id = $1")
+            .bind(user)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    sqlx::query("UPDATE role SET read_scope = 'listed' WHERE id = $1")
+        .bind(role_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    for (schema, table) in tables {
+        sqlx::query(
+            "INSERT INTO role_read_grant (role_id, schema_name, table_name) VALUES ($1, $2, $3)",
+        )
+        .bind(role_id)
+        .bind(*schema)
+        .bind(*table)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+}
+
+/// `BI-47` review round 1, R10: the value list of a chart's own mart runs the
+/// table-access check through the handler, so a mart the caller's roles hide
+/// is the unknown-mart 404 — and so is a visible mart joined to a hidden one,
+/// which `/fields` refuses the same way. Before, the check lived above
+/// `values_for_roles` with no test of its own: it could be deleted with every
+/// test green.
+#[tokio::test]
+async fn a_hidden_mart_or_a_join_to_one_is_the_unknown_mart_for_a_value_list() {
+    let (router, pool, _ch) = app().await;
+    let reader = create_principal_with_permissions(&pool, "dashboard:read").await;
+    narrow_to(&pool, reader, &[("serving", "mart_visible")]).await;
+    let cookie = session_cookie_for_user(&pool, reader).await;
+
+    // The mart the roles hide is the unknown-mart answer.
+    let (status, body) = get(
+        &router,
+        &cookie,
+        "/api/dashboard/values?column=province&mart=mart_x",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(
+        body["error"], "Gold mart 'mart_x' not found in serving.",
+        "{body}"
+    );
+
+    // The visible mart, joined to the hidden one, is the same answer: a list
+    // read through the hidden table would be a lie.
+    let joins = "%5B%7B%22mart%22%3A%22mart_x%22%2C%22type%22%3A%22left%22%2C%22on%22%3A%5B%7B%22left%22%3A%22kab%22%2C%22op%22%3A%22%3D%22%2C%22right%22%3A%22kab%22%7D%5D%7D%5D";
+    let (status, body) = get(
+        &router,
+        &cookie,
+        &format!("/api/dashboard/values?column=province&mart=mart_visible&joins={joins}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(
+        body["error"], "Gold mart 'mart_x' not found in serving.",
+        "{body}"
+    );
+
+    // The visible mart alone is answered (an empty list here: the stand-in
+    // reports no columns), so the check is not "everything is a 404".
+    let (status, body) = get(
+        &router,
+        &cookie,
+        "/api/dashboard/values?column=province&mart=mart_visible",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
 /// R2: a drill of a chart the caller cannot see is the unknown-chart answer,
 /// and any other preview still needs `dashboard:read`.
 #[tokio::test]

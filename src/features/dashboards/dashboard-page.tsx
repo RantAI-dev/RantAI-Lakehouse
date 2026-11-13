@@ -29,7 +29,7 @@ import { extractViewFiltersFromChat } from "@/lib/dashboard-view-filter-from-cha
 import { canDrill, drillTarget, offersTileRecords, type ChartClickHandler, type ClickSpec } from "@/lib/chart-click";
 import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
 import {
-  TAB_PARAM, addTab, bottomOfTab, defaultTileHeight, deleteTab, filtersOnTab, isSingleValueChart, isStaticKind, moveTab, moveTileToTab, placeUnboxed, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, type TabEdit,
+  TAB_PARAM, addTab, bottomOfTab, defaultTileHeight, deleteTab, filtersOnTab, isSingleValueChart, isStaticKind, moveTab, moveTileToTab, placeCopyBelow, placeUnboxed, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, type TabEdit,
 } from "@/lib/dashboard-tabs";
 import type { BoardTab, LayoutMap, PhoneTile } from "@/services";
 import type { ChartClick, FilterDef, FilterField } from "@/services/clients/bi-store";
@@ -665,6 +665,41 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     }, 600);
   }, [board]);
 
+  // `BI-48` (QA `LH-BI-6-40`): a chart's copy is a new chart on the same
+  // dashboard from the stored definition, titled "<title> (copy)", placed
+  // directly below the original on its tab and the same size. The save is the
+  // console's own create (`POST /api/dashboard/specs`, `D17`), so the server
+  // applies every check of a new chart; the layout save is awaited, not the
+  // debounced `persistLayout`, because the copy must land where the page drew
+  // it before the reload.
+  //
+  // `BI-48` review round 1, R6: the chart and its place are two writes, and a
+  // failure of the second is not a failed duplicate. The armed layout timer is
+  // cleared first — it would fire with the layout of a moment ago and take the
+  // copy's box away — and a layout failure still reloads, because the chart
+  // exists on the server whatever happened to its box.
+  async function duplicateChart(spec: ChartCard) {
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    let id = "";
+    try {
+      ({ id } = await dashboardService.saveChart({ ...spec.def, title: `${spec.title} (copy)`, board }, false));
+    } catch (e) {
+      notifyFailure("The chart was not duplicated", writeError(e));
+      return;
+    }
+    if (id) {
+      try {
+        await dashboardService.saveBoardLayout(board, placeCopyBelow(tabs, shownLayout, chartIds, spec.id, id));
+      } catch (e) {
+        // The copy was made; only its box was not. Saying "not duplicated"
+        // here would invite a second copy of a chart that exists.
+        await load();
+        notifyFailure("The copy was made, but its place was not saved", writeError(e));
+        return;
+      }
+    }
+    await load();
+  }
   async function removeChart(id: string) {
     setRemoveBusy(true);
     try {
@@ -1063,6 +1098,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       // `WEB-7` D6: editing a chart is its own page, carrying the parameter
       // values the dashboard shows so its preview matches this one.
       onEdit: () => router.push(chartEditHref(board, spec.id, data?.appliedParams)),
+      onDuplicate: () => void duplicateChart(spec),
       onDelete: () => setRemoving({ id: spec.id, title: spec.title }),
     });
     const menu: TileMenuItem[] = [

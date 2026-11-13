@@ -332,6 +332,10 @@ fn with_shape_properties(mut schema: Value) -> Value {
             "description": "table only: the columns a grouped table is grouped by (1 to 5), instead of dimension" },
         "bin": bin_schema("group the number `dimension` (or a pivot's first number row or column field) in ranges, for example visitors in bins of 500; the result value is each bin's lower edge. bar, hbar, line, area, stacked, combo, pie, rose, funnel, treemap, radar, waterfall, grouped table, pivot; not with a grain"),
         "breakdownBin": bin_schema("the same for a number `breakdown`"),
+        // `BI-46` (`QA LH-BI-6-01` review round 1, R9): no description here.
+        // Every description of this schema is stripped before the kept ones are
+        // restored, so the sentence lives in `KEPT_CHART_DESCRIPTIONS` only.
+        "breakdownGrain": { "type": "string", "enum": ["day", "week", "month", "quarter", "year"] },
         "grid": { "type": "object", "properties": {
             "size": { "type": ["string", "number"], "description": "auto, or the cell size in degrees: 0.01, 0.1, 1 or 10" } },
             "required": ["size"],
@@ -597,6 +601,14 @@ const KEPT_CHART_DESCRIPTIONS: &[(&str, &str)] = &[
         "/function/parameters/properties/grain",
         "how to group a date or timestamp `dimension` (describe_mart gives the column's kind); a calendar chart takes day only",
     ),
+    // `BI-46` (`QA LH-BI-6-01` review round 1, R9): the model saw only the
+    // field's name and its five values, so "a date or timestamp breakdown;
+    // bar, hbar, line and area only; not with a bin" reached it only as a
+    // refusal after a wrong call.
+    (
+        "/function/parameters/properties/breakdownGrain",
+        "group a date or timestamp `breakdown` by this period; bar, hbar, line and area only; not with a bin",
+    ),
     (
         "/function/parameters/properties/measures",
         "the columns to aggregate (numbers): a column name, {column, aggregate} for a column with its own aggregate (its result is named <aggregate>_<column>), or {metric: name}",
@@ -639,7 +651,7 @@ const KEPT_CHART_DESCRIPTIONS: &[(&str, &str)] = &[
     ),
     (
         "/function/parameters/properties/limit",
-        "the number of groups to show; with `sort` it keeps the first N in that order",
+        "the number of groups to show; with `sort` it keeps the first N in that order; on a bar, hbar, line or area chart with a breakdown it keeps that many breakdown values, the ones with the largest total",
     ),
 ];
 
@@ -3351,6 +3363,7 @@ mod tests {
             "joins",
             "bin",
             "breakdownBin",
+            "breakdownGrain",
             "grid",
         ] {
             assert!(
@@ -3381,6 +3394,7 @@ mod tests {
             "joins",
             "bin",
             "breakdownBin",
+            "breakdownGrain",
             "grid",
         ] {
             assert!(
@@ -3628,6 +3642,14 @@ mod tests {
             assert_eq!(node["description"], json!(description), "{pointer}");
         }
         let properties = &schema["function"]["parameters"]["properties"];
+        // `BI-46` review round 1, R9: the model sees only a name and five
+        // values without this, and learns the rule from a refusal.
+        assert!(
+            properties["breakdownGrain"]["description"]
+                .as_str()
+                .is_some_and(|text| text.contains("not with a bin")),
+            "breakdownGrain must say what it is for"
+        );
         for field in [
             "joins",
             "layers",
