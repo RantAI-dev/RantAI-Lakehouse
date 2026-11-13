@@ -33,14 +33,19 @@ To reduce CI feedback latency on targeted changes (such as docs-only or frontend
 
 | Scope | Triggered By |
 |---|---|
-| `rust` | `rust/**`, `src/lib/dashboard-specs.ts`, `docker-compose.yml` |
+| `rust` | `rust/**`, `src/lib/dashboard-specs.ts`, `docker-compose.yml`, `.env.example` |
 | `frontend` | `src/**`, `public/**`, `package.json`, `bun.lock`, `bunfig.toml`, `tsconfig.json`, `next.config.ts`, `eslint.config.mjs`, `postcss.config.mjs`, `components.json`, `Dockerfile.frontend` |
 | `dagster` | `dagster/**` |
 | `stack` | `docker-compose.yml`, `ops/**` (except `ops/fixtures/**`), `scripts/**` (except `scripts/ci/**`), `.env.example` |
 | `docs_only` | True when every changed file is under `docs/**`, `GTM/**`, or is a root `*.md`, `LICENSE` or `NOTICE` |
 | `all` | `.github/**`, `ops/fixtures/**`, `scripts/ci/**`, an unreadable base SHA, or any file unclassified by the rules above (fails safe) |
 
-On a `push` to `main`, all jobs run unconditionally.
+A `push` to `main` follows the same scopes as a pull request (`OPS-24` D1): the diff
+is the push's own (`github.event.before` to the pushed commit). Every push has its own
+run and none waits for another (D2). One full run starts every night at 19:23 UTC and
+can be started by hand (`workflow_dispatch`): it has no base commit, so every job runs
+(D3). Setting the repository variable `CI_PUSH_FULL` to `true` makes every push run
+everything again.
 
 Downstream jobs execute according to scope:
 - **`repo-lints`**: Runs unconditionally on all pushes and PRs. Folds the static lints (parity corpus secrets, R11 bare iceberg count, compose init readiness, Dagster intra-package imports, connector gate coverage (`SRC-9`: every supported connector type has a gate in `ops/gates/coverage.json`, or an explicit waiver that the output lists)) and the unit tests of the connector gate tooling into one fast job.

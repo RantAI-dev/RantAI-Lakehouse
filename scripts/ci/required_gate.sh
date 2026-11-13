@@ -7,7 +7,9 @@
 # all required checks succeeded or were legitimately skipped based on change scope.
 #
 # Inputs:
-#   EVENT_NAME            github.event_name (push or pull_request)
+#   EVENT_NAME            github.event_name (push, pull_request, schedule or
+#                         workflow_dispatch). The event no longer makes any job
+#                         required by itself; the scope does (OPS-24 D1).
 #   SCOPE_RUST            "true" if rust changed
 #   SCOPE_FRONTEND        "true" if frontend changed
 #   SCOPE_DAGSTER         "true" if dagster changed
@@ -107,7 +109,11 @@ run_gate() {
 
   # Determine required flags based on scope
   local req_all="false"
-  if [ "$event_name" = "push" ] || [ "$scope_all" = "true" ]; then
+  # OPS-24 D1: the event no longer requires anything by itself; the scope does.
+  # A push and a pull request are gated identically, and `all=true` (a workflow
+  # or fixture change, an unreadable base, the nightly run) is what forces
+  # every job.
+  if [ "$scope_all" = "true" ]; then
     req_all="true"
   fi
 

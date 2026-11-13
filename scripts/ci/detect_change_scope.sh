@@ -6,8 +6,13 @@
 #
 # Required environment variables:
 #   GITHUB_OUTPUT   — GitHub Actions output file (optional for local testing)
-#   EVENT_NAME      — github.event_name (push or pull_request)
+#   EVENT_NAME      — github.event_name: push, pull_request, schedule or
+#                     workflow_dispatch. The last two have no base commit, so
+#                     the base rule below forces all=true for them.
 #   BASE_SHA        — base commit SHA to diff against
+#   FORCE_ALL       — "true" forces all=true on a push (repository variable
+#                     CI_PUSH_FULL, the switch back to "a push runs
+#                     everything"); OPS-24 D8. Ignored on other events.
 set -euo pipefail
 
 EVENT="${EVENT_NAME:-}"
@@ -16,9 +21,12 @@ BASE="${BASE_SHA:-}"
 echo "Event: ${EVENT:-unknown}"
 echo "Base SHA: ${BASE:-none}"
 
-# On push to main, run everything regardless of scope.
-if [ "$EVENT" = "push" ]; then
-  echo "Push event: forcing all=true."
+# A push follows the same change scope as a pull request (OPS-24 D1): the diff
+# is the push's own (`github.event.before` to the pushed commit). FORCE_ALL=true
+# (repository variable CI_PUSH_FULL) is the switch back to "a push runs
+# everything" (OPS-24 D8).
+if [ "$EVENT" = "push" ] && [ "${FORCE_ALL:-}" = "true" ]; then
+  echo "Push event with CI_PUSH_FULL=true: forcing all=true."
   if [ -n "${GITHUB_OUTPUT:-}" ]; then
     {
       echo "rust=true"
@@ -100,11 +108,15 @@ while IFS= read -r file; do
   # Any file outside the docs-only set means docs_only is false
   docs_only=false
 
-  # Rust: rust/**, src/lib/dashboard-specs.ts, docker-compose.yml
+  # Rust: rust/**, src/lib/dashboard-specs.ts, docker-compose.yml, .env.example
   # Note: docker-compose.yml is embedded via include_str! in
   # rust/crates/lakehouse-store/src/cdc.rs:1131 for demo_connector_compose_properties.
+  # .env.example is embedded via include_str! in
+  # rust/crates/lakehousectl/src/secrets.rs:66, so a change to it changes the
+  # installer's build; the `stack` rule below keeps covering it as well
+  # (OPS-24 D1).
   if [[ "$file" == rust/* ]] || [[ "$file" == "src/lib/dashboard-specs.ts" ]] || \
-     [[ "$file" == "docker-compose.yml" ]]; then
+     [[ "$file" == "docker-compose.yml" ]] || [[ "$file" == ".env.example" ]]; then
     rust=true
     classified=true
   fi

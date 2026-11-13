@@ -91,7 +91,8 @@ run_case() {
 
   (
     cd "$REPO_DIR"
-    EVENT_NAME="pull_request" \
+    EVENT_NAME="${CASE_EVENT:-pull_request}" \
+    FORCE_ALL="${CASE_FORCE_ALL:-}" \
     BASE_SHA="$BASE_SHA" \
     GITHUB_OUTPUT="$output" \
     bash "$SCRIPT" >/dev/null
@@ -172,7 +173,10 @@ assert_case "ops/g6/test.py is stack-only" "false" "false" "false" "true" "false
 # SRC-9 task 7: the upload gate's own files select the acceptance jobs (g9-upload) through stack.
 assert_case "ops/g9/upload_test.py is stack-only" "false" "false" "false" "true" "false" "false" "ops/g9/upload_test.py"
 assert_case "scripts/compose.sh is stack-only" "false" "false" "false" "true" "false" "false" "scripts/compose.sh"
-assert_case ".env.example is stack-only" "false" "false" "false" "true" "false" "false" ".env.example"
+# OPS-24 D1: .env.example is compiled into lakehousectl
+# (rust/crates/lakehousectl/src/secrets.rs:66, include_str!), so it sets rust
+# as well as stack. Wider than before, not weaker.
+assert_case ".env.example sets rust and stack" "true" "false" "false" "true" "false" "false" ".env.example"
 
 # Cross-cutting fixture tests
 assert_case "ops/fixtures forces all" "true" "true" "true" "true" "false" "true" "ops/fixtures/upload_load_failure_reasons.json"
@@ -190,23 +194,13 @@ assert_case "unclassified file forces all" "true" "true" "true" "true" "false" "
 assert_case "docs + rust sets rust and clears docs_only" "true" "false" "false" "false" "false" "false" "docs/test.md" "rust/crates/lib.rs"
 assert_case "frontend + dagster sets both" "false" "true" "true" "false" "false" "false" "src/components/button.tsx" "dagster/pipeline.py"
 
-# Push event test
-(
-  output="$REPO_DIR/github_output_push"
-  : > "$output"
-  cd "$REPO_DIR"
-  EVENT_NAME="push" \
-  BASE_SHA="$BASE_SHA" \
-  GITHUB_OUTPUT="$output" \
-  bash "$SCRIPT" >/dev/null
-  a="$(grep "^all=" "$output" | cut -d= -f2)"
-  r="$(grep "^rust=" "$output" | cut -d= -f2)"
-  if [ "$a" = "true" ] && [ "$r" = "true" ]; then
-    log_pass "push event forces all=true"
-  else
-    log_fail "push event did not force all=true"
-  fi
-)
+# Push event tests (OPS-24 D1, D8): a push follows the scope like a pull
+# request, and only CI_PUSH_FULL=true (FORCE_ALL) widens it.
+CASE_EVENT=push assert_case "a documents-only push is documents-only" "false" "false" "false" "false" "true" "false" "docs/test.md"
+CASE_EVENT=push assert_case "a Rust push sets rust only" "true" "false" "false" "false" "false" "false" "rust/crates/lib.rs"
+CASE_EVENT=push assert_case "a workflow push forces all" "true" "true" "true" "true" "false" "true" ".github/workflows/ci.yml"
+CASE_EVENT=push CASE_FORCE_ALL=true assert_case "a documents-only push with CI_PUSH_FULL=true forces all" "true" "true" "true" "true" "false" "true" "docs/test.md"
+CASE_FORCE_ALL=true assert_case "CI_PUSH_FULL does not widen a pull request" "false" "false" "false" "false" "true" "false" "docs/test.md"
 
 # Move test: file moved from rust/ into docs/ must set rust=true
 test_rename_rust_to_docs() {
@@ -311,6 +305,42 @@ test_empty_diff
     log_pass "unreadable base SHA forces all=true"
   else
     log_fail "unreadable base SHA did not force all=true"
+  fi
+)
+
+# A push whose base commit is unreadable fails closed (OPS-24 D1): with the
+# scope following the push's own diff, a diff that cannot be read must run
+# everything.
+(
+  output="$REPO_DIR/github_output_push_badbase"
+  : > "$output"
+  cd "$REPO_DIR"
+  EVENT_NAME="push" \
+  BASE_SHA="0000000000000000000000000000000000000000" \
+  GITHUB_OUTPUT="$output" \
+  bash "$SCRIPT" >/dev/null
+  a="$(grep "^all=" "$output" | cut -d= -f2)"
+  if [ "$a" = "true" ]; then
+    log_pass "a push with an unreadable base forces all=true"
+  else
+    log_fail "a push with an unreadable base did not force all=true"
+  fi
+)
+
+# A scheduled run has no base commit at all, so every job runs (OPS-24 D3).
+(
+  output="$REPO_DIR/github_output_schedule"
+  : > "$output"
+  cd "$REPO_DIR"
+  EVENT_NAME="schedule" \
+  BASE_SHA="" \
+  GITHUB_OUTPUT="$output" \
+  bash "$SCRIPT" >/dev/null
+  a="$(grep "^all=" "$output" | cut -d= -f2)"
+  if [ "$a" = "true" ]; then
+    log_pass "a scheduled run forces all=true"
+  else
+    log_fail "a scheduled run did not force all=true"
   fi
 )
 
