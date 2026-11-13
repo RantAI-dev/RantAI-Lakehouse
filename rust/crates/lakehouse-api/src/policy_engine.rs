@@ -261,6 +261,44 @@ pub fn enforcement_error_message(err: &EnforcementError) -> String {
     }
 }
 
+/// A statement a narrowed principal may not read, as [`hidden_read`] finds it
+/// (`GOV-7` D5, `BI-51` plan D19): one table its roles do not include, or a
+/// statement that lists objects and so names no table to answer for.
+enum HiddenRead {
+    /// `schema.table`, named by the statement, that the roles do not read.
+    Table(String),
+    /// The statement lists objects (`SHOW TABLES` and the like).
+    Listing,
+}
+
+/// Which part of a narrowed principal's access a statement runs into, or
+/// `None` for a statement every table of which its roles read.
+///
+/// A narrowed principal reads only what its roles name. `gate_targets` is the
+/// tenant gate's own resolver (one parse, one collector, rule 4): the tables
+/// the statement names, or the fact that it lists objects without naming one.
+/// A listing, and a statement whose sources cannot be resolved to concrete
+/// `schema.table` names, are refused rather than passed — no per-table answer
+/// exists (D5). An unparseable statement is left to the rewrite's own
+/// `Unparseable`.
+fn hidden_read<D: Dialect>(
+    sql: &str,
+    dialect: &D,
+    access: &crate::table_access::TableAccess,
+) -> Option<HiddenRead> {
+    if access.is_all() {
+        return None;
+    }
+    match sql_rewrite::gate_targets(sql, dialect) {
+        Some(sql_rewrite::GateTargets::Tables(named)) => named
+            .into_iter()
+            .find(|table| !access.allows_key(table))
+            .map(HiddenRead::Table),
+        Some(sql_rewrite::GateTargets::ListsObjects) => Some(HiddenRead::Listing),
+        None => None,
+    }
+}
+
 /// The one shared rewrite path Query Studio (`routes::query::run`, WS7
 /// item C2), dashboards/embeds (WS7 item D1), and Gold export (WS7 item
 /// D2) all go through — never a parallel, simplified masking primitive
@@ -311,24 +349,11 @@ pub async fn rewrite_sql_for_roles<D: Dialect + Sync>(
     // path (which would answer "no policy", not "hidden").
     let access = obligations_source.table_access(roles).await?;
     if !access.is_all() {
-        // A narrowed principal reads only what its roles name. `gate_targets`
-        // is the tenant gate's own resolver (one parse, one collector, rule
-        // 4): the tables the statement names, or the fact that it lists
-        // objects without naming one. A listing, and a statement whose
-        // sources cannot be resolved to concrete `schema.table` names, are
-        // refused rather than passed — no per-table answer exists (D5). An
-        // unparseable statement is left to the rewrite's own `Unparseable`.
-        match sql_rewrite::gate_targets(sql, dialect) {
-            Some(sql_rewrite::GateTargets::Tables(named)) => {
-                for table in named {
-                    if !access.allows_key(&table) {
-                        return Err(EnforcementError::TableNotReadable(table));
-                    }
-                }
+        match hidden_read(sql, dialect, &access) {
+            Some(HiddenRead::Table(table)) => {
+                return Err(EnforcementError::TableNotReadable(table));
             }
-            Some(sql_rewrite::GateTargets::ListsObjects) => {
-                return Err(EnforcementError::Unresolvable);
-            }
+            Some(HiddenRead::Listing) => return Err(EnforcementError::Unresolvable),
             None => {}
         }
     }
@@ -779,6 +804,60 @@ impl<'a> PolicyEngineObligations<'a> {
             PrefetchedViews(views),
         ))
     }
+
+    /// Why a statement that already failed gave no rows, when the viewer's own
+    /// access explains it (`BI-51`, plan D16–D18): a table their roles do not
+    /// read, or a column the policy masks that the statement names. Called only
+    /// after a question has failed, to word its sentence without a reference.
+    ///
+    /// It never decides whether data may be read — the rewrite did that, before
+    /// this runs. `None` means "cannot tell", so the caller keeps the sentence
+    /// it had. A masked column reached through a join (`table__column`), a
+    /// calculated field, a metric or a reassigning SQL source is not
+    /// recognised: such a statement keeps its reference.
+    pub async fn access_cause<D: Dialect + Sync>(
+        &self,
+        sql: &str,
+        dialect: &D,
+        columns: &[String],
+        roles: &[String],
+    ) -> Option<AccessCause> {
+        let tables = sql_rewrite::referenced_tables(sql, dialect)?;
+        let access = self.table_access(roles).await.ok()?;
+        if matches!(
+            hidden_read(sql, dialect, &access),
+            Some(HiddenRead::Table(_))
+        ) {
+            return Some(AccessCause::HiddenTable);
+        }
+        let (obligations, _views) = self.prefetch_for_tables(&tables, roles).await.ok()?;
+        for table in &tables {
+            let Some(found) = obligations.obligations_for(table, roles) else {
+                continue;
+            };
+            if found
+                .mask
+                .iter()
+                .any(|masked| columns.iter().any(|c| c.eq_ignore_ascii_case(masked)))
+            {
+                return Some(AccessCause::MaskedColumn);
+            }
+        }
+        None
+    }
+}
+
+/// Why a failed statement gave no rows that the viewer's access explains
+/// (`BI-51`, plan D16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessCause {
+    /// The statement reads a table the viewer's roles or organisation do not
+    /// read: the tenant gate answered "not found", or the rewrite refused it
+    /// with [`EnforcementError::TableNotReadable`].
+    HiddenTable,
+    /// One of the statement's own columns is masked for the viewer's roles on
+    /// a table it reads, so the engine refused what the rewrite produced.
+    MaskedColumn,
 }
 
 /// The sync `sql_rewrite::ObligationsSource` adapter over what
@@ -1079,6 +1158,50 @@ mod tests {
             assert!(
                 sql.contains("replaceRegexpOne(toString(`email`)"),
                 "sql={sql}"
+            );
+            Ok(())
+        }
+
+        /// QA `LH-BI-13-03` (`BI-51`, plan D17, T6): the cause is found only
+        /// when a column the statement itself names is masked for the viewer's
+        /// roles; another column, or a role the policy does not name, gives
+        /// `None` ("cannot tell", so the caller keeps its reference).
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_mask_on_a_column_the_statement_names_is_the_cause_and_another_column_is_not(
+            pool: PgPool,
+        ) -> sqlx::Result<()> {
+            seed(&pool).await;
+            let server = clickhouse().await;
+            let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+            let db = Ident::new("icecat_api").unwrap();
+            let source = PolicyEngineObligations::new(Some(&pool), &ch).with_iceberg_db(Some(&db));
+            let sql = "SELECT sum(email) FROM icecat_api.`bronze.orders`";
+            let dialect = sqlparser::dialect::ClickHouseDialect {};
+            let analyst = ["Analyst".to_owned()];
+            assert_eq!(
+                source
+                    .access_cause(sql, &dialect, &["email".to_owned()], &analyst)
+                    .await,
+                Some(AccessCause::MaskedColumn)
+            );
+            assert_eq!(
+                source
+                    .access_cause(sql, &dialect, &["id".to_owned()], &analyst)
+                    .await,
+                None
+            );
+            // A seeded role the policy does not name reads every table and
+            // carries no mask, so nothing explains the failure.
+            assert_eq!(
+                source
+                    .access_cause(
+                        sql,
+                        &dialect,
+                        &["email".to_owned()],
+                        &["Data Scientist".to_owned()]
+                    )
+                    .await,
+                None
             );
             Ok(())
         }
