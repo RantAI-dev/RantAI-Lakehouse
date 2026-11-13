@@ -10,7 +10,7 @@
 | Priority | In `BACKLOG.md`, the one place it is kept |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Held in the base; not the Owner. |
-| Plan | Reads as its author: `docs/superpowers/plans/2026-10-15-bld-1-run-as-author.md` (merged). Part 1: `docs/superpowers/plans/2026-11-12-bld-1-part-1-steps-and-sql.md`. The text form (the last slice of part 1) and parts 2 and 3 are not written yet. |
+| Plan | Reads as its author: `docs/superpowers/plans/2026-10-15-bld-1-run-as-author.md` (merged). Part 1: `docs/superpowers/plans/2026-11-12-bld-1-part-1-steps-and-sql.md`. The text form, the last slice of part 1: `docs/superpowers/plans/2026-11-13-bld-1-part-1-pipeline-as-text.md` (planned, not started). Parts 2 and 3 are not written yet. |
 | Started | 2026-10-15 |
 | Shipped | |
 | Evidence | PR #173 (a pipeline reads as its author); PR #481 (part 1, S1: inputs and steps, the compiler, the check at save, the run route, the assistant); PR #500 (part 1, S2: the preview of a step); PR #499 (part 1, S3: the editor in the console) |
