@@ -109,7 +109,13 @@ function NodeCard({
         className={cn(base, "border-border bg-card px-3 shadow-xs", ring)}
       >
         <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-primary/10 text-primary">
-          {node.stepKind === "sql" ? <CodeIcon className="size-4" aria-hidden /> : <ListChecksIcon className="size-4" aria-hidden />}
+          {node.stepKind === "sql" ? (
+            <CodeIcon className="size-4" aria-hidden />
+          ) : node.stepKind === "transform" ? (
+            <ListChecksIcon className="size-4" aria-hidden />
+          ) : (
+            <BoxIcon className="size-4" aria-hidden />
+          )}
         </span>
         <span className="min-w-0">
           <span className="block truncate font-mono text-sm font-medium leading-5">{node.label}</span>

@@ -808,6 +808,22 @@ describe("the pipeline editor of inputs and steps (BLD-1 part 1)", () => {
     ).toBeTruthy()
   })
 
+  // BLD-1 part 1 S3 review R1-S2: shown, not editable, saved back as stored.
+  it("shows a step of a kind it does not know, and saves it back exactly as stored", async () => {
+    const join = { name: "joined", kind: "join", left: "orders_raw", on: [["id", "id"]] }
+    const stored = existing()
+    stored.definition = { ...stored.definition!, steps: [join] }
+    renderEditor(stored)
+
+    selectRail(/1\. joined/)
+    expect(await screen.findByText("Step 1 · join")).toBeTruthy()
+    expect(screen.getByText(/cannot edit yet/)).toBeTruthy()
+    expect(screen.queryByLabelText("Name in this pipeline")).toBeNull()
+
+    const body = await saveAndRead("PUT")
+    expect(body.steps).toEqual([join])
+  })
+
   it("moves and removes a step, and renames a step's reader with its input", async () => {
     renderEditor(twoSteps())
     selectRail(/2\. by_stock/)

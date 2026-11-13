@@ -122,6 +122,28 @@ describe("authoredFlow", () => {
     ])
   })
 
+  // BLD-1 part 1 S3 review R1-S2: a kind this console does not know is drawn
+  // with its name and kind and no edge in; the output still follows it.
+  test("a step of a kind this console does not know is drawn with its name and kind", () => {
+    const { nodes, edges } = authoredFlow(
+      {
+        inputs: [{ name: "orders", zone: "bronze", table: "orders" }],
+        steps: [{ name: "joined", kind: "join", left: "orders" }],
+        sourceZone: "bronze",
+        sourceTable: "orders",
+        incrementalColumn: null,
+        transforms: [],
+        fbicEnabled: false,
+        targetZone: "silver",
+        targetTable: "joined",
+        connectorId: null,
+      },
+      describeTransform
+    )
+    expect(nodes[1]).toMatchObject({ id: "step:0", label: "joined", sublabel: "join, not shown here", stepKind: "other" })
+    expect(edges.map((e) => `${e.from}>${e.to}`)).toEqual(["step:0>target"])
+  })
+
   // BLD-10 D3: a pipeline with no transform copies its source as is. The
   // target moves into column 1 and says so, so an empty middle is not a
   // puzzle for the reader.

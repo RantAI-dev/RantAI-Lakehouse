@@ -26,7 +26,9 @@ import type {
   PipelineInput,
   PipelinePreview,
   PipelinePreviewInput,
+  PipelineSqlStep,
   PipelineStep,
+  PipelineTransformStep,
 } from "@/services/contracts/pipelines"
 
 /** Decision 4; `pipeline_compile::MAX_INPUTS`. */
@@ -50,9 +52,34 @@ export type EditorInput = { id: string; name: string; zone: string; table: strin
  */
 export type StepRead = { id: string } | { name: string }
 
+/**
+ * A step being edited. `unknown` is a stored step of a kind this console
+ * does not know (R1-S2): it keeps the stored object as it was, is shown and
+ * can be moved or removed, and is sent back unchanged.
+ */
 export type EditorStep =
   | { id: string; kind: "transform"; name: string; reads: StepRead; transforms: string[] }
   | { id: string; kind: "sql"; name: string; sql: string }
+  | { id: string; kind: "unknown"; name: string; stored: PipelineStep }
+
+/**
+ * A stored step as one of the two kinds this console knows, or `null`.
+ * The fields are checked, not only `kind`: the API may add kinds (part 2),
+ * and a step whose fields are not the ones its kind has is not edited as
+ * if they were (R1-S2).
+ */
+export function knownStep(step: PipelineStep): PipelineTransformStep | PipelineSqlStep | null {
+  const fields = step as Record<string, unknown>
+  if (step.kind === "sql" && typeof fields.sql === "string") return step as PipelineSqlStep
+  if (
+    step.kind === "transform" &&
+    typeof fields.reads === "string" &&
+    Array.isArray(fields.transforms) &&
+    (fields.transforms as unknown[]).every((t) => typeof t === "string")
+  )
+    return step as PipelineTransformStep
+  return null
+}
 
 /**
  * The definition being edited. `seq` hands out ids: it only grows, so an
@@ -92,8 +119,10 @@ export function editorStateFrom(def: Pick<AuthoredDefinition, "inputs" | "steps"
   def.steps.forEach((step, i) => {
     if (!byName.has(step.name)) byName.set(step.name, stepIds[i])
   })
-  const steps: EditorStep[] = def.steps.map((step, i) => {
+  const steps: EditorStep[] = def.steps.map((stored, i) => {
     const id = stepIds[i]
+    const step = knownStep(stored)
+    if (step === null) return { id, kind: "unknown", name: stored.name, stored }
     if (step.kind === "sql") return { id, kind: "sql", name: step.name, sql: step.sql }
     const readId = byName.get(step.reads)
     return { id, kind: "transform", name: step.name, reads: readId ? { id: readId } : { name: step.reads }, transforms: [...step.transforms] }
@@ -211,7 +240,7 @@ export function addInput(state: EditorState, hasConnector = false): { state: Edi
  * else the first input), so a new step continues the pipeline; a SQL step
  * starts as `SELECT *` from that name.
  */
-export function addStep(state: EditorState, kind: EditorStep["kind"]): { state: EditorState; id: string | null } {
+export function addStep(state: EditorState, kind: "transform" | "sql"): { state: EditorState; id: string | null } {
   if (!canAddStep(state)) return { state, id: null }
   const [id, next] = nextId(state, "step")
   const names = [...state.inputs, ...state.steps].map((item) => item.name)
@@ -237,13 +266,14 @@ export function removeItem(state: EditorState, id: string): EditorState {
  * Renames an input or a step. A form step reads its item by id, so it
  * follows the rename with nothing to rewrite (R1-B2). The text of a SQL
  * step is the user's and is not rewritten: if it names the old name, the
- * page says so on that step.
+ * page says so on that step. A step of an unknown kind keeps its stored
+ * name (R1-S2).
  */
 export function renameItem(state: EditorState, id: string, name: string): EditorState {
   return {
     ...state,
     inputs: state.inputs.map((input) => (input.id === id ? { ...input, name } : input)),
-    steps: state.steps.map((step) => (step.id === id ? { ...step, name } : step)),
+    steps: state.steps.map((step) => (step.id === id && step.kind !== "unknown" ? { ...step, name } : step)),
   }
 }
 
@@ -288,6 +318,7 @@ export function updateStep(
       if (step.kind === "transform") {
         return { ...step, reads: patch.reads ?? step.reads, transforms: patch.transforms ?? step.transforms }
       }
+      if (step.kind === "unknown") return step
       return { ...step, sql: patch.sql ?? step.sql }
     }),
   }
@@ -337,6 +368,9 @@ export function editorProblems(state: EditorState, output: OutputSettings): Edit
     if (problem) items[input.id] = problem
   })
   state.steps.forEach((step, index) => {
+    // A step of an unknown kind is not edited here, so nothing about it is
+    // the page's to check; the API checks it on save (R1-S2).
+    if (step.kind === "unknown") return
     let problem = nameProblem(step.name, otherNames(state, step.id))
     if (!problem && step.kind === "transform") {
       const reads = step.reads
@@ -407,10 +441,13 @@ export function definitionBody(inputs: readonly EditorInput[], steps: readonly E
   const state = { inputs: [...inputs], steps: [...steps] }
   return {
     inputs: inputs.map((input) => ({ name: input.name.trim(), zone: input.zone.trim(), table: input.table.trim() })),
-    steps: steps.map((step) =>
-      step.kind === "sql"
-        ? { name: step.name.trim(), kind: "sql", sql: step.sql }
-        : { name: step.name.trim(), kind: "transform", reads: readsName(state, step.reads).trim(), transforms: [...step.transforms] }
+    steps: steps.map((step): PipelineStep =>
+      step.kind === "unknown"
+        ? // R1-S2: exactly as stored.
+          step.stored
+        : step.kind === "sql"
+          ? { name: step.name.trim(), kind: "sql", sql: step.sql }
+          : { name: step.name.trim(), kind: "transform", reads: readsName(state, step.reads).trim(), transforms: [...step.transforms] }
     ),
   }
 }

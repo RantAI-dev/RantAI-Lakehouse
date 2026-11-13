@@ -6,6 +6,7 @@ import { ChevronDownIcon, FileCode2Icon, InfoIcon } from "lucide-react"
 import { CodeView } from "@/components/patterns/code-view"
 import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { useService } from "@/hooks/use-service"
+import { knownStep } from "@/lib/pipeline-editor"
 import { describeTransform } from "@/lib/transform-draft"
 import { cn } from "@/lib/utils"
 import { pipelineService } from "@/services"
@@ -233,7 +234,8 @@ export function AuthoredFlow({ pipeline }: { pipeline: PipelineDetail }) {
   const node = flow.nodes.find((n) => n.id === selected) ?? flow.nodes[0]
   const index = node.ref !== undefined ? Number(node.ref) : null
   const input = node.kind === "source" && index !== null ? def.inputs[index] : undefined
-  const step = node.kind === "step" && index !== null ? def.steps[index] : undefined
+  const stored = node.kind === "step" && index !== null ? def.steps[index] : undefined
+  const step = stored ? knownStep(stored) : null
   // The catalog links the pipeline's first input and its target (`source`
   // and `target` of the row); other inputs have no asset id on this read.
   const assetId = node.id === "input:0" ? pipeline.sourceAssetId : node.id === "target" ? pipeline.targetAssetId : undefined
@@ -255,13 +257,24 @@ export function AuthoredFlow({ pipeline }: { pipeline: PipelineDetail }) {
       ) : null}
       <div className="grid gap-4 lg:grid-cols-[minmax(0,22rem)_minmax(0,1fr)]">
         <section className="flex flex-col gap-3 self-start rounded-xl border border-border bg-card p-4 text-sm">
-          {step ? (
+          {stored ? (
             <>
               <PanelTitle>
-                Step {(index ?? 0) + 1} of {def.steps.length} · {step.kind === "sql" ? "SQL" : "Form"}
+                Step {(index ?? 0) + 1} of {def.steps.length} ·{" "}
+                {step === null ? stored.kind : step.kind === "sql" ? "SQL" : "Form"}
               </PanelTitle>
-              <p className="font-mono font-medium">{step.name}</p>
-              {step.kind === "transform" ? (
+              <p className="font-mono font-medium">{stored.name}</p>
+              {step === null ? (
+                // BLD-1 part 1 S3 review R1-S2: a kind this console does not
+                // know. What is stored is shown as it is; nothing is guessed.
+                <>
+                  <p className="text-muted-foreground">
+                    A step of kind <span className="font-mono text-foreground">{stored.kind}</span>, which this console
+                    cannot show yet. Its stored record:
+                  </p>
+                  <CodeView text={JSON.stringify(stored, null, 2)} language="plain" />
+                </>
+              ) : step.kind === "transform" ? (
                 <>
                   <p className="text-muted-foreground">
                     Reads <span className="font-mono text-foreground">{step.reads}</span>

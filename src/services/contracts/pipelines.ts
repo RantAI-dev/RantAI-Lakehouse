@@ -163,17 +163,28 @@ export type PipelineInput = {
   table: string
 }
 
+/** A step that applies the five existing operations to the one input or earlier step it `reads`. */
+export type PipelineTransformStep = { name: string; kind: "transform"; reads: string; transforms: string[] }
+
+/** A step that is one `SELECT` over the inputs and earlier steps (D5, at most 20,000 characters). */
+export type PipelineSqlStep = { name: string; kind: "sql"; sql: string }
+
+/**
+ * A step of a kind this console does not know (`CODE-STANDARD.md` 4.2's
+ * `| string` widening; BLD-1 part 2 adds kinds). Its other fields are not
+ * known here, so the console shows it, does not edit it, and sends it back
+ * exactly as stored (BLD-1 part 1 S3 review R1-S2). Tell the kinds apart
+ * with `knownStep` (`lib/pipeline-editor.ts`), not with `kind` alone: a
+ * `string` kind also matches `"sql"`.
+ */
+export type PipelineOtherStep = { name: string; kind: string; [field: string]: unknown }
+
 /**
  * BLD-1 part 1 / D1: one named step, a table later steps read by `name`.
  * Mirrors `lakehouse_store::pipelines::PipelineStep`, serde's internally
- * tagged union on `kind`: a `transform` step applies the five existing
- * operations to the one input or earlier step it `reads`; a `sql` step is
- * one `SELECT` over the inputs and earlier steps (D5, at most 20,000
- * characters). The last step is the output.
+ * tagged union on `kind`. The last step is the output.
  */
-export type PipelineStep =
-  | { name: string; kind: "transform"; reads: string; transforms: string[] }
-  | { name: string; kind: "sql"; sql: string }
+export type PipelineStep = PipelineTransformStep | PipelineSqlStep | PipelineOtherStep
 
 /**
  * An authored pipeline's stored definition, exactly the fields

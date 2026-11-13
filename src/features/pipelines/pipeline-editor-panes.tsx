@@ -3,6 +3,7 @@
 import * as React from "react"
 import Link from "next/link"
 import { ArrowDownIcon, ArrowUpIcon, Trash2Icon, WandSparklesIcon } from "lucide-react"
+import { CodeView } from "@/components/patterns/code-view"
 import { SelectField } from "@/components/patterns/select-field"
 import { SqlEditor } from "@/components/sql-editor"
 import { Button } from "@/components/ui/button"
@@ -249,7 +250,7 @@ function StepHeader({
     <div className="flex items-start justify-between gap-3">
       <div>
         <p className="font-mono text-[11px] uppercase tracking-[0.14em] text-muted-foreground">
-          Step {index + 1} · {step.kind === "sql" ? "SQL" : "Form"}
+          Step {index + 1} · {step.kind === "sql" ? "SQL" : step.kind === "transform" ? "Form" : step.stored.kind}
         </p>
         <p className="font-mono text-sm font-semibold">{step.name || "Unnamed step"}</p>
       </div>
@@ -426,6 +427,40 @@ export function SqlStepPane({
           {length.toLocaleString("en-US")} of {MAX_SQL_CHARS.toLocaleString("en-US")} characters
         </p>
       </div>
+      {problem}
+    </div>
+  )
+}
+
+/**
+ * A step of a kind this console does not know (BLD-1 part 1 S3 review
+ * R1-S2; part 2 adds kinds). It is shown, it can be moved or removed as a
+ * step of the pipeline, and it is saved back exactly as stored; nothing in
+ * it is edited here, because its fields are not known here.
+ */
+export function UnknownStepPane({
+  step,
+  index,
+  count,
+  problem,
+  onMove,
+  onRemove,
+}: {
+  step: Extract<EditorStep, { kind: "unknown" }>
+  index: number
+  count: number
+  problem: React.ReactNode
+  onMove: (delta: -1 | 1) => void
+  onRemove: () => void
+}) {
+  return (
+    <div className="flex flex-col gap-4">
+      <StepHeader step={step} index={index} count={count} onMove={onMove} onRemove={onRemove} />
+      <p className="text-sm text-muted-foreground">
+        This step is of kind <span className="font-mono text-foreground">{step.stored.kind}</span>, which this console
+        cannot edit yet. It is saved back exactly as it is stored.
+      </p>
+      <CodeView text={JSON.stringify(step.stored, null, 2)} language="plain" />
       {problem}
     </div>
   )

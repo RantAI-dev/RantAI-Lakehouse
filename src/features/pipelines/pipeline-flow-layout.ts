@@ -10,7 +10,7 @@
  * The layout is columns left to right; nodes that share a column are
  * stacked, and an edge inside one column runs top to bottom.
  */
-import { sqlStepReads } from "@/lib/pipeline-editor"
+import { knownStep, sqlStepReads } from "@/lib/pipeline-editor"
 import type { EntityStatus } from "@/lib/status"
 import type { AuthoredDefinition, PipelineOpEdge, PipelineOpNode } from "@/services/contracts/pipelines"
 import { topoSortOps } from "./topo-sort-ops"
@@ -26,8 +26,8 @@ export type FlowNodeSpec = {
   status?: EntityStatus
   /** For an op, its name; for a transform, an input or a step, its index. Used to open the side panel. */
   ref?: string
-  /** For a pipeline step: whether it is SQL or the form (BLD-1 part 1 D1). */
-  stepKind?: "sql" | "transform"
+  /** For a pipeline step: SQL, the form (BLD-1 part 1 D1), or a kind this console does not know (R1-S2). */
+  stepKind?: "sql" | "transform" | "other"
 }
 
 export type FlowEdgeSpec = { from: string; to: string }
@@ -185,32 +185,44 @@ export function authoredFlow(
     })
     placed.set(input.name, { id, column: 0 })
   })
-  def.steps.forEach((step, i) => {
+  def.steps.forEach((stored, i) => {
     const id = `step:${i}`
     const known = [...placed.keys()]
+    // BLD-1 part 1 S3 review R1-S2: a step of a kind this console does not
+    // know is drawn with its name and kind and no edge in, because what it
+    // reads is not knowable here.
+    const step = knownStep(stored)
     const reads =
-      step.kind === "transform" ? (known.includes(step.reads) ? [step.reads] : []) : sqlStepReads(step.sql, known)
+      step === null
+        ? []
+        : step.kind === "transform"
+          ? known.includes(step.reads)
+            ? [step.reads]
+            : []
+          : sqlStepReads(step.sql, known)
     const column = 1 + Math.max(0, ...reads.map((name) => placed.get(name)?.column ?? 0))
-    const operations = step.kind === "transform" ? step.transforms.map((raw) => describe(raw)?.verb ?? "transform") : []
+    const operations = step?.kind === "transform" ? step.transforms.map((raw) => describe(raw)?.verb ?? "transform") : []
     nodes.push({
       id,
       column,
       kind: "step",
-      label: step.name,
+      label: stored.name,
       sublabel:
-        step.kind === "sql"
-          ? "SQL"
-          : operations.length > 0
-            ? operations.join(", ")
-            : "no operation",
+        step === null
+          ? `${stored.kind}, not shown here`
+          : step.kind === "sql"
+            ? "SQL"
+            : operations.length > 0
+              ? operations.join(", ")
+              : "no operation",
       ref: String(i),
-      stepKind: step.kind,
+      stepKind: step?.kind ?? "other",
     })
     for (const name of reads) {
       const from = placed.get(name)
       if (from) edges.push({ from: from.id, to: id })
     }
-    placed.set(step.name, { id, column })
+    placed.set(stored.name, { id, column })
   })
   // The output is what the last step returns; with no step, the one input.
   const last = def.steps.length > 0 ? nodes[nodes.length - 1] : null

@@ -288,6 +288,23 @@ describe("the pipeline page's flow of inputs and steps (BLD-1 part 1)", () => {
     expect(document.body.textContent).toContain("GROUP BY c.country")
   })
 
+  // BLD-1 part 1 S3 review R1-S2: a kind the console does not know does not
+  // crash the page; it is shown as stored.
+  it("shows a step of a kind this console does not know with its kind and stored record", async () => {
+    search = "tab=definition"
+    const unknown: PipelineDetail = {
+      ...withSteps,
+      definition: { ...withSteps.definition!, steps: [{ name: "joined", kind: "join", left: "orders" }] },
+    }
+    stubApi({ status: () => "completed", pipeline: unknown })
+    renderPage()
+
+    const chart = await screen.findByRole("group", { name: "Pipeline flowchart" })
+    within(chart).getByText("joined").closest("button")?.click()
+    expect(await screen.findByText("Step 1 of 1 · join")).toBeTruthy()
+    expect(document.body.textContent).toContain('"left": "orders"')
+  })
+
   it("lists a form step's operations and what it reads", async () => {
     search = "tab=definition"
     stubApi({ status: () => "completed", pipeline: withSteps })

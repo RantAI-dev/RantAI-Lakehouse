@@ -3,7 +3,7 @@
 import * as React from "react"
 import Link from "next/link"
 import { useRouter, useSearchParams } from "next/navigation"
-import { AlertCircleIcon, CodeIcon, DatabaseIcon, ListChecksIcon, PlayIcon, PlusIcon, TableIcon } from "lucide-react"
+import { AlertCircleIcon, BoxIcon, CodeIcon, DatabaseIcon, ListChecksIcon, PlayIcon, PlusIcon, TableIcon } from "lucide-react"
 import { FormPage } from "@/components/patterns/form-page"
 import { EmptyState } from "@/components/patterns/page-states"
 import { SelectField } from "@/components/patterns/select-field"
@@ -56,7 +56,15 @@ import { cn } from "@/lib/utils"
 import { connectorService, lakehouseService, pipelineService } from "@/services"
 import type { Pipeline, PipelineDetail, PipelinePreview, PipelinePreviewInput } from "@/services/contracts/pipelines"
 import { connectorLoadTriggerOn, withConnectorLoadTrigger } from "./pipeline-connector-trigger"
-import { InputPane, OutputPane, PaneProblem, SqlStepPane, TransformStepPane, type ConnectorSource } from "./pipeline-editor-panes"
+import {
+  InputPane,
+  OutputPane,
+  PaneProblem,
+  SqlStepPane,
+  TransformStepPane,
+  UnknownStepPane,
+  type ConnectorSource,
+} from "./pipeline-editor-panes"
 import { isSchedulable, PipelineScheduleField } from "./pipeline-schedule-field"
 import { BRONZE_ZONE, reuploadTriggerOn, showsReuploadSwitch, withReuploadTrigger } from "./pipeline-reupload-trigger"
 
@@ -406,7 +414,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
             failedMessageId={errorMessageId}
             onChange={(patch) => setEditor((prev) => updateStep(prev, step.id, patch))}
           />
-        ) : (
+        ) : step.kind === "sql" ? (
           <SqlStepPane
             key={step.id}
             {...common}
@@ -415,11 +423,12 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
             inputColumns={inputColumns}
             onSql={(sql) => setEditor((prev) => updateStep(prev, step.id, { sql }))}
           />
+        ) : (
+          <UnknownStepPane key={step.id} {...common} step={step} />
         )
     }
   }
   if (pane === null) {
-    const last = editor.steps[editor.steps.length - 1]
     pane = (
       <OutputPane
         targetZone={targetZone}
@@ -569,9 +578,24 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                 {editor.steps.map((step, index) => (
                   <RailItem
                     key={step.id}
-                    icon={step.kind === "sql" ? <CodeIcon aria-hidden /> : <ListChecksIcon aria-hidden />}
+                    icon={
+                      step.kind === "sql" ? (
+                        <CodeIcon aria-hidden />
+                      ) : step.kind === "transform" ? (
+                        <ListChecksIcon aria-hidden />
+                      ) : (
+                        <BoxIcon aria-hidden />
+                      )
+                    }
                     label={`${index + 1}. ${step.name || "Unnamed step"}`}
-                    detail={step.kind === "sql" ? "SQL" : `Form · reads ${readsName(shownState, step.reads) || "…"}`}
+                    detail={
+                      step.kind === "sql"
+                        ? "SQL"
+                        : step.kind === "transform"
+                          ? `Form · reads ${readsName(shownState, step.reads) || "…"}`
+                          : // R1-S2: a kind this console does not know.
+                            `${step.stored.kind} · not editable here`
+                    }
                     selected={selection.kind === "step" && selection.id === step.id}
                     flagged={errorItem === step.id || Boolean(problems.items[step.id])}
                     describedBy={errorItem === step.id ? errorMessageId : undefined}

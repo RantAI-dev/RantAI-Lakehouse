@@ -22,6 +22,7 @@ import {
   errorTarget,
   hasProblems,
   isUsableName,
+  knownStep,
   moveStep,
   nameProblem,
   noStepLine,
@@ -459,5 +460,26 @@ describe("the lines said for a pipeline with no step (R1-B3, R1-S7)", () => {
     expect(outputSourceLine(one, false)).toBe("No step yet: add one, or choose to copy the input as it is.")
     const two = editorStateFrom({ inputs: STORED.inputs, steps: [] })
     expect(outputSourceLine(two, true)).toBe("No step yet: with several inputs, the output is what a step returns.")
+  })
+})
+
+// BLD-1 part 1 S3 review R1-S2: part 2 adds step kinds; a kind this console
+// does not know is kept exactly as stored.
+describe("a step of a kind this console does not know", () => {
+  const join = { name: "joined", kind: "join", left: "orders", right: "customers", on: [["id", "id"]] }
+
+  it("is told apart by its fields, not its kind alone", () => {
+    expect(knownStep(join)).toBeNull()
+    expect(knownStep({ name: "x", kind: "sql" })).toBeNull()
+    expect(knownStep({ name: "x", kind: "sql", sql: "SELECT 1" })).toEqual({ name: "x", kind: "sql", sql: "SELECT 1" })
+  })
+
+  it("is sent back exactly as stored, cannot be renamed, and is readable by later steps", () => {
+    const state = editorStateFrom({ inputs: STORED.inputs, steps: [join, STORED.steps[1]] })
+    expect(state.steps[0]).toEqual({ id: "step-3", kind: "unknown", name: "joined", stored: join })
+    expect(renameItem(state, "step-3", "other").steps[0]).toBe(state.steps[0])
+    expect(definitionBody(state.inputs, state.steps).steps[0]).toBe(join)
+    expect(readableNames(state, 1)).toContain("joined")
+    expect(editorProblems(state, OUTPUT).items["step-3"]).toBeUndefined()
   })
 })
