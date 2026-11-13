@@ -269,3 +269,34 @@ Full block on `1d5f1d57` (the Rust code is identical to `a101bd07`, where the Ru
     mine and I left them alone.
 
 ## 7. Review (planner appends)
+
+### Review, round 1 (planner, Opus, 2026-11-14)
+
+Read: the route policy rows, both migrations, `dashboard_reports.rs` (list, read, chart reads),
+`render.rs` (the report token), `pdf_export::export_report_pdf`, `dashboard_templates.rs` (save)
+and `dashboard_file.rs` for comparison. The report read is right: chart blocks are read as the
+reader through `payload_for`, a chart the reader cannot see is "not available" without a query, and
+the report token names one report and reads it as the person now. The console was not reviewed in
+this round; it goes to the owner's QA on a preview stack.
+
+- **BLOCKER 1, saving a template skips the download switch (answers open question 5).** A template
+  holds what the dashboard file of `BI-19` part D holds, and that export follows the per-role
+  download switch (owner decision Q-D1, `dashboard_file.rs`, after the visibility check). Saving a
+  template asks only for `View` on the board, so a role with downloads off can copy the same content
+  out through a template. Fix: saving a template runs the same checks as the dashboard file export,
+  in the same order (the board visible, else the same 404; then `require_download`), and also needs
+  `Edit` on the source dashboard, because the template is then listed to every `dashboard:write`
+  holder, including people who cannot see that dashboard. Tests: a role with downloads off gets the
+  download refusal; a person with `View` but not `Edit` on the board gets 403; a hidden board is the
+  same 404 for both.
+- **SHOULD-FIX 2, the assistant cannot find a report to edit (answers open question 2).** R5 says
+  the assistant edits reports, and `update_report` needs an id the chat has no way to learn. Add a
+  read tool `list_reports` (the reports the person can read: id, title, folder, updated), and have
+  the report page send its report id and title as page context, the way the dashboard page sends
+  its board. Regenerate `tool_schemas.json`.
+- **Accepted as built:**
+  - question 1, `list_templates` as a read that still needs `dashboard:write`;
+  - question 3, "report not found." matches the board's not-found sentence (`BI-18D-AC3`);
+  - question 4, the extra input limits and list caps. The planner adds them to the feature page's
+    limits.
+- **Verification:** the reviewer re-runs the full block on the final commit before the PR.
