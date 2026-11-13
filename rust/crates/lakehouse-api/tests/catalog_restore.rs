@@ -286,13 +286,24 @@ async fn a_table_dropped_inside_its_window_is_reported_restorable_and_undropped(
 
     let (status, body) = call(&router, "POST", RESTORE, &cookie).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let audited: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM audit_event WHERE action = 'catalog.restore' AND resource_id = 'orders'",
+    // `DATA-55` D8: two entries now, `allowed` before the undrop and `executed`
+    // after it. The count changed because the trail must never be wrong: an
+    // `executed` written before the catalog answered could be false.
+    let allowed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_event WHERE action = 'catalog.restore' \
+         AND resource_id = 'orders' AND outcome = 'allowed'",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(audited, 1);
+    let executed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_event WHERE action = 'catalog.restore' \
+         AND resource_id = 'orders' AND outcome = 'executed'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((allowed, executed), (1, 1));
 }
 
 #[tokio::test]
@@ -1094,4 +1105,160 @@ async fn without_the_admin_client_nothing_is_dropped() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["error"], json!(NOT_SET_UP));
     assert_eq!(deletes(&server).await, 0);
+}
+
+/// `DATA-55` D8: a restore of a table dropped from the console clears the
+/// record of its drop, so the name is free for a new load again.
+#[tokio::test]
+async fn restoring_a_table_dropped_from_the_console_clears_its_record() {
+    let server = MockServer::start().await;
+    mount_registry(&server, "orders").await;
+    mount_missing_table(&server).await;
+    mount_warehouse(&server).await;
+    mount_dropped(&server, "2099-01-01T00:00:00Z").await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/management/v1/warehouse/wh-1/deleted-tabulars/undrop",
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    let tenant_id = Uuid::parse_str(CATALOG_TENANT).expect("a tenant id");
+    uploads::record_table_drop(
+        &pool,
+        &NewTableDrop {
+            bronze_table: "orders",
+            tenant_id,
+            asset_id: "orders",
+            dropped_by: "Ada Lovelace",
+            row_count: Some(1),
+            kept_seconds: 604_800,
+        },
+    )
+    .await
+    .unwrap()
+    .expect("the drop is recorded");
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let (status, body) = call(&router, "POST", RESTORE, &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        uploads::dropped_table(&pool, "orders")
+            .await
+            .unwrap()
+            .is_none(),
+        "the record is gone after the restore"
+    );
+}
+
+/// `DATA-55` D8: a restore whose `allowed` entry cannot be written does not
+/// happen, and the catalog is not asked.
+#[tokio::test]
+async fn a_restore_is_refused_when_its_audit_entry_cannot_be_written() {
+    let server = MockServer::start().await;
+    mount_registry(&server, "orders").await;
+    mount_missing_table(&server).await;
+    mount_warehouse(&server).await;
+    mount_dropped(&server, "2099-01-01T00:00:00Z").await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/management/v1/warehouse/wh-1/deleted-tabulars/undrop",
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    refuse_drop_audit(&pool, "catalog.restore").await;
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let (status, body) = call(&router, "POST", RESTORE, &cookie).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(
+        body["error"],
+        json!("The restore could not be written to the audit trail, so nothing was restored.")
+    );
+}
+
+/// `DATA-55` D8: a failed undrop keeps the record the drop wrote, so the name
+/// stays closed and the table stays restorable, and the trail says `failed`.
+#[tokio::test]
+async fn a_failed_undrop_keeps_the_record_and_writes_a_failed_audit_entry() {
+    let server = MockServer::start().await;
+    mount_registry(&server, "orders").await;
+    mount_missing_table(&server).await;
+    mount_warehouse(&server).await;
+    mount_dropped(&server, "2099-01-01T00:00:00Z").await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/management/v1/warehouse/wh-1/deleted-tabulars/undrop",
+        ))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    let tenant_id = Uuid::parse_str(CATALOG_TENANT).expect("a tenant id");
+    uploads::record_table_drop(
+        &pool,
+        &NewTableDrop {
+            bronze_table: "orders",
+            tenant_id,
+            asset_id: "orders",
+            dropped_by: "Ada Lovelace",
+            row_count: Some(1),
+            kept_seconds: 604_800,
+        },
+    )
+    .await
+    .unwrap()
+    .expect("the drop is recorded");
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let (status, body) = call(&router, "POST", RESTORE, &cookie).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        uploads::dropped_table(&pool, "orders")
+            .await
+            .unwrap()
+            .is_some(),
+        "the table is still dropped"
+    );
+    let outcomes: Vec<String> = sqlx::query_scalar(
+        "SELECT outcome FROM audit_event WHERE action = 'catalog.restore' ORDER BY at, id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(outcomes, vec!["allowed", "failed"]);
+}
+
+/// `DATA-55` D5: a caller whose roles may not read the table cannot restore
+/// it, and learns nothing beyond the unknown asset's 404.
+#[tokio::test]
+async fn a_caller_whose_role_does_not_read_the_table_cannot_restore_it() {
+    let server = MockServer::start().await;
+    mount_registry(&server, "orders").await;
+    mount_missing_table(&server).await;
+    mount_warehouse(&server).await;
+    mount_dropped(&server, "2099-01-01T00:00:00Z").await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/management/v1/warehouse/wh-1/deleted-tabulars/undrop",
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    let user = create_principal_with_permissions(&pool, "catalog:read, governance:write").await;
+    in_the_catalog_tenant(&pool, user).await;
+    narrow(&pool, user, &[("finance", "*")]).await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let (status, body) = call(&router, "POST", RESTORE, &cookie).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], json!("Asset not found"));
 }

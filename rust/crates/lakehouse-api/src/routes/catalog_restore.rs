@@ -21,6 +21,17 @@
 //! the dropped copy `Lakekeeper` lists and the clock, so every answer is
 //! unit-tested without a server. Nothing `Lakekeeper` says reaches a
 //! response: its failures are logged and answered with fixed sentences.
+//!
+//! # The audit trail, and the record (`DATA-55` D8)
+//!
+//! The drop route (`DATA-55`) makes this restore reachable from the console,
+//! so the restore now follows the same order as the drop: `catalog.restore`
+//! with outcome `allowed` is written BEFORE the undrop (a restore that cannot
+//! be audited does not happen), then the catalog is asked, then `executed` or
+//! `failed` is written. The record of the drop (`upload_table_drop`) is
+//! cleared on both ends of a restore: when the undrop succeeds, and when the
+//! table turns out to exist again anyway — a table that is there is not
+//! dropped, whatever a leftover record says.
 
 use std::sync::Arc;
 
@@ -32,11 +43,14 @@ use lakehouse_auth::Principal;
 use lakehouse_auth::openfga::{DeletedTableLookup, LakekeeperAdminClient, OpenfgaError};
 use lakehouse_core::ApiError;
 use lakehouse_iceberg::rest::{self, RestError};
+use lakehouse_store::audit::NewAuditEvent;
+use lakehouse_store::uploads;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::catalog::{annotation_pool, catalog_tenant_refusal, validate_annotation_id};
+use super::catalog_drop::{audit_after, audit_first};
 use super::catalog_profile::bronze_table_name;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
@@ -56,6 +70,9 @@ const COULD_NOT_TELL: &str =
     "could not tell whether a dropped copy of this table is kept (the deleted list is too long)";
 const EXPIRED: &str = "the 7-day window to restore this table has passed";
 const UNREACHABLE: &str = "the catalog could not be asked about this table; try again shortly";
+/// The `allowed` audit entry could not be written; nothing was restored (D8).
+const NOT_AUDITED_RESTORE: &str =
+    "The restore could not be written to the audit trail, so nothing was restored.";
 
 /// What can be done about the asset's table.
 #[derive(Debug, PartialEq, Eq)]
@@ -193,6 +210,35 @@ async fn inspect(
     ))
 }
 
+/// The audit record of one restore, mirrored on `routes::uploads::
+/// upload_audit_event`: `resource_kind` is `catalog`, paired with the asset's
+/// id, and `args` names the table and until when it had been restorable
+/// (`DATA-15` F4). `principal_kind` comes from [`Principal::kind_for_audit`],
+/// never a literal `"user"` (a service identity restores too).
+fn restore_event(
+    principal: &Principal,
+    id: &str,
+    table: &str,
+    was_restorable_until: &str,
+    outcome: &str,
+    detail: Option<&str>,
+) -> NewAuditEvent {
+    NewAuditEvent {
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        action: "catalog.restore".to_owned(),
+        resource_kind: Some("catalog".to_owned()),
+        resource_id: Some(id.to_owned()),
+        args: Some(json!({ "table": table, "wasRestorableUntil": was_restorable_until })),
+        outcome: outcome.to_owned(),
+        detail: detail.map(str::to_owned),
+        run_id: None,
+        approval_id: None,
+        session_id: None,
+    }
+}
+
 /// `GET /api/catalog/{id}/restore` — see the module doc.
 ///
 /// # Errors
@@ -244,10 +290,12 @@ pub async fn status(
 ///
 /// # Errors
 ///
-/// `403` with the tenant gate's reason; `404` when nothing is restorable (or
-/// the asset has no restorable kind of table); `409` when a table of that
-/// name exists again; `410` when the 7-day window has passed; `503` when
-/// restore is not configured or `Lakekeeper` cannot be asked.
+/// `403` with the tenant gate's reason; `404` when the asset is unknown, when
+/// the caller's roles may not read it, or when nothing is restorable (or the
+/// asset has no restorable kind of table); `409` when a table of that name
+/// exists again; `410` when the 7-day window has passed; `503` when restore
+/// is not configured, the audit entry cannot be written, or `Lakekeeper`
+/// cannot be asked.
 pub async fn restore(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -258,6 +306,9 @@ pub async fn restore(
         return Err(ApiError::PermissionDenied(reason.to_owned()).into());
     }
     validate_annotation_id(&id)?;
+    // GOV-7 D6: a hidden asset's restore answers the same 404 as an unknown
+    // id, exactly as the status read above does.
+    crate::routes::catalog::ensure_asset_readable(&state, &principal, &id).await?;
     let pool = annotation_pool(&state)?;
     let (admin, table) = match target(&state, &id).await? {
         Target::Ready { admin, table } => (admin, table),
@@ -274,6 +325,11 @@ pub async fn restore(
     let (assessment, warehouse) = inspect(&state, &admin, &table).await?;
     let (tabular, expires_at) = match assessment {
         Assessment::Exists => {
+            // D8: a table that is there is not dropped, whatever a leftover
+            // record says. Best effort: the 409 below is the same either way.
+            if let Err(err) = uploads::forget_table_drop(pool, &table).await {
+                tracing::warn!(?err, %table, "restore: a leftover drop record could not be cleared");
+            }
             return Err(ApiError::Conflict(
                 "a table of that name exists again; it was recreated by a later load".to_owned(),
             )
@@ -292,30 +348,40 @@ pub async fn restore(
         Assessment::Restorable { id, expires_at, .. } => (id, expires_at),
     };
     let warehouse = warehouse.ok_or_else(|| ApiError::Unavailable(UNREACHABLE.to_owned()))?;
-    admin
-        .undrop_table(&warehouse, &tabular)
-        .await
-        .map_err(|err| match err {
+    // D8: the `allowed` entry first, or the restore does not happen.
+    audit_first(
+        pool,
+        restore_event(&principal, &id, &table, &expires_at, "allowed", None),
+        NOT_AUDITED_RESTORE,
+    )
+    .await?;
+    if let Err(err) = admin.undrop_table(&warehouse, &tabular).await {
+        let (detail, refusal) = match err {
             // A race with a load that recreated the table between the check
             // and the undrop.
-            OpenfgaError::Rejected => ApiError::Conflict(
-                "the catalog refused the restore; a table of that name may exist again".to_owned(),
+            OpenfgaError::Rejected => (
+                "the catalog refused the restore",
+                ApiError::Conflict(
+                    "the catalog refused the restore; a table of that name may exist again"
+                        .to_owned(),
+                ),
             ),
-            other => admin_unavailable(&other),
-        })?;
-    let _ = lakehouse_store::audit::insert(
+            other => ("the catalog did not answer", admin_unavailable(&other)),
+        };
+        audit_after(
+            pool,
+            restore_event(&principal, &id, &table, &expires_at, "failed", Some(detail)),
+        )
+        .await;
+        return Err(refusal.into());
+    }
+    // The table is back, so it is not dropped any more (D8).
+    if let Err(err) = uploads::forget_table_drop(pool, &table).await {
+        tracing::warn!(?err, %table, "restore: the record of the drop could not be cleared");
+    }
+    audit_after(
         pool,
-        lakehouse_store::audit::NewAuditEvent {
-            principal_id: Some(principal.id.uuid().to_string()),
-            principal_kind: Some("user".to_owned()),
-            actor_label: Some(principal.display_name.clone()),
-            action: "catalog.restore".to_owned(),
-            resource_kind: Some("catalog".to_owned()),
-            resource_id: Some(id),
-            args: Some(json!({ "table": table, "wasRestorableUntil": expires_at })),
-            outcome: "executed".to_owned(),
-            ..Default::default()
-        },
+        restore_event(&principal, &id, &table, &expires_at, "executed", None),
     )
     .await;
     Ok(ApiJson(json!({ "ok": true })))
