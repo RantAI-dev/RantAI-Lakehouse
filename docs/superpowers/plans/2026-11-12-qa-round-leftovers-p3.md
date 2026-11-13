@@ -911,3 +911,58 @@ with its counts (`cargo fmt --check`; `cargo clippy -p lakehouse-api --all-targe
 warnings`; `cargo test -p lakehouse-api --test ingest_run`; `--test quality_incidents`;
 `--test sec11_guard`; `--test route_auth`; `--lib only_success_failure_and_canceled_end_a_run`),
 the count R3 saw, and the result of merging `main` (conflicts, if any, by file).
+
+### Round 1, developer's handoff
+
+Developer, 2026-11-13, on the ARM64 build machine, checkout
+`/home/rismana/rantai/lakehouse-agents-2`, `CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-2`
+and `CARGO_BUILD_JOBS=6` in every shell that ran cargo.
+
+#### Commits
+
+- `9effb862` — "Merge remote-tracking branch 'origin/main' into
+  fix/qa-round-leftovers-p3". `origin/main` had moved to `eaebacf2` (BLD-1 part 1 S1 plus its
+  document commit). **No conflict**: git merged it with no conflicted file. The branch had
+  nothing of its own in the files `main` touched there (`pipelines.rs`, `pipeline_compile.rs`,
+  the pipeline test files, migration `0140`, `sql_guard.rs`, `route_auth.rs`, `sec11_guard.rs`).
+  After the merge, from `rust/`: `cargo fmt --check` clean; `cargo clippy -p lakehouse-api
+  --all-targets -- -D warnings` and `cargo clippy -p lakehouse-store --all-targets -- -D
+  warnings` both finished without a warning.
+- `6b3b842c` — "fix(review): round 1 of leftovers-p3 (R1, R2, R3, R4, R6)". Four files:
+  `routes/load_alerts.rs` (R1, R6b), `tests/ingest_run.rs` (R2, R3),
+  `routes/quality.rs` (R4), `routes/connector_runs.rs` (R6a). R5 and R7 needed no change.
+  No assertion of an existing test changed and no test, lint or allowlist was weakened.
+
+#### Checks (foreground, from `rust/`, on `6b3b842c`)
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` | clean |
+| `cargo clippy -p lakehouse-api --all-targets -- -D warnings` | finished, no warning |
+| `cargo test -p lakehouse-api --lib only_success_failure_and_canceled_end_a_run` | 1 passed, 0 failed, 3623 filtered out |
+| `cargo test -p lakehouse-api --test ingest_run` | 38 passed, 0 failed |
+| `cargo test -p lakehouse-api --test quality_incidents` | 19 passed, 0 failed |
+| `cargo test -p lakehouse-api --test sec11_guard` | 4 passed, 0 failed |
+| `cargo test -p lakehouse-api --test route_auth` | 94 passed, 0 failed |
+
+`ingest_run` and `quality_incidents` keep their one extra test from `src/tls_proxy.rs`, as
+section 3a says. `sec11_guard` is 4 here: `main` removed one of its tests in the merge
+(`tests/sec11_guard.rs`, 5 lines, in `be2c9291`'s slice), not this branch.
+
+**R3: count was 2.** The reads do overlap with the 300 ms answer: both asked the orchestrator
+before either closed the record, and the test passes with the assertion unweakened.
+
+#### Not verified
+
+- `cargo test --workspace` was not run (section 3a forbids it); CI on the pull request runs it.
+- The rest of the section 3 block above (`--test connector_run`, the other four `--lib`
+  filters, the two `ops/lint` scripts) was **not** re-run for this round: no file they cover
+  changed after `e54b1a27`, and R1 to R6 touch docs, one test file and no query.
+- Nothing under `dagster/` or `docker-compose.yml` was touched, so neither was run.
+
+#### Docker
+
+`docker ps -a` before the first integration test showed one container that was already
+there and is not mine to remove: `24d7d1d1667e` `postgres:16-alpine`, up 7 hours,
+`0.0.0.0:33908->5432/tcp`, name `upbeat_engelbart`. It is still there after the runs; the
+test harness starts nothing of its own here, so this round started and removed no container.
