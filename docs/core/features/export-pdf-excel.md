@@ -45,6 +45,7 @@ A chart's data downloads only as CSV, only from a raw table, and only up to
 | 9 | Downloads stay governed by `dashboard:read`. An administrator can switch them off per role in Admin > Settings ("Roles that may not download"); a user whose every role is switched off cannot download, and the menu items are hidden. Nothing changes until an administrator chooses. | Planner |
 | 10 | Every download (PDF, Excel, CSV) is written to the audit log before the file is sent, as the CSV export does today; with the audit log down, the download is refused. | Planner |
 | 11 | The assistant's export tool returns a download link to the same export the menu uses; the file is made when the person opens it, with their permissions. Nothing is stored. | Planner |
+| 12 | The PDF is printed in the light theme, whatever theme the dashboard has; a chart image keeps the dashboard's theme. The print view is laid out at the paper's printable width, so a chart is as wide as its card on the page | Planner default (QA round, `BI-53`), *(proposed, not yet signed)* |
 
 ## Owner decisions at the phase 4 QA (2026-10-23)
 

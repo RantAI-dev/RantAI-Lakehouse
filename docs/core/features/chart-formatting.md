@@ -69,6 +69,7 @@ Planner defaults, all confirmed by the product owner on 2026-10-17 (phase 3 QA).
 - A logarithmic axis cannot show zero or negative values.
 - The default chart palette is the one every chart used before, and it does not reach the 3:1 contrast on a light background: its sky, amber, lime and orange are below it. The four new palettes do. The default is kept as it is so that no saved chart changes colour (the owner's choice).
 - On a raw table, a colour range is read over the rows of the page (50 at a time), not over every row of the table.
+- A rupiah amount shows "Rp" in both number locales. Any other currency shows what the locale gives it, which is its code where the locale has no symbol for it (SGD in the English locale). *(proposed, not yet signed; `BI-55`)*
 
 ## Asking the assistant
 

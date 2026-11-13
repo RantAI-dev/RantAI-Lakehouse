@@ -40,6 +40,7 @@ cities on the same chart.
 | 4 | A hierarchy has two to six levels, belongs to one table, and needs `dashboard:write` to define | Planner default | Owner to confirm at QA |
 | 5 | Drilling down is a viewer's own, temporary view: it does not change the saved chart and is not shared in the URL | Planner default | Owner to confirm at QA |
 | 6 | Grid cells are square in degrees: 0.01, 0.1, 1 or 10, or automatic | Planner default | Owner to confirm at QA |
+| 7 | Automatic and counted bins of a column whose values are all whole numbers are never narrower than 1, and a bin of width 1 over such a column reads as its one value ("2020"), not as a range | Planner default (QA round, `BI-55`) | *(proposed, not yet signed)* |
 
 ## Limits to tell a customer
 
