@@ -8,7 +8,7 @@ import type {
   GoldPublication,
 } from "../contracts/gold"
 import { apiFetch } from "../http"
-import { ServiceError } from "../errors"
+import { ServiceError, deniedFor } from "../errors"
 
 /**
  * GoldService is real — every method calls `lakehouse-api`'s `/api/gold/*`
@@ -20,7 +20,12 @@ import { ServiceError } from "../errors"
 async function getJson<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await apiFetch(url, init)
   const json = await res.json()
-  if (!res.ok) throw new ServiceError("unavailable", json?.error ?? `Request failed (${res.status})`)
+  if (!res.ok) {
+    // QA TC-1724 (WEB-12): a refusal goes through deniedFor.
+    const denied = deniedFor(res.status, json)
+    if (denied) throw denied
+    throw new ServiceError("unavailable", json?.error ?? `Request failed (${res.status})`)
+  }
   return json as T
 }
 
@@ -28,6 +33,9 @@ async function postJson<T>(url: string, signal?: AbortSignal): Promise<T> {
   const res = await apiFetch(url, { method: "POST", signal })
   const json = await res.json()
   if (!res.ok) {
+    // QA TC-1724 (WEB-12): a refusal goes through deniedFor.
+    const denied = deniedFor(res.status, json)
+    if (denied) throw denied
     const kind = res.status === 404 ? "not_found" : res.status >= 500 ? "unavailable" : "invalid_request"
     throw new ServiceError(kind, json?.error ?? `Request failed (${res.status})`)
   }
@@ -43,7 +51,10 @@ async function putJson<T>(url: string, body: unknown, signal?: AbortSignal): Pro
   })
   const json = await res.json()
   if (!res.ok) {
-    const kind = res.status === 404 ? "not_found" : res.status === 403 ? "permission_denied" : res.status >= 500 ? "unavailable" : "invalid_request"
+    // QA TC-1724 (WEB-12): a refusal goes through deniedFor.
+    const denied = deniedFor(res.status, json)
+    if (denied) throw denied
+    const kind = res.status === 404 ? "not_found" : res.status >= 500 ? "unavailable" : "invalid_request"
     throw new ServiceError(kind, json?.error ?? `Request failed (${res.status})`, res.status)
   }
   return json as T
