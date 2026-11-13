@@ -966,7 +966,9 @@ fn parse_chart_input(body: &Bytes) -> Result<ChartInput, ApiError> {
 /// # Errors
 ///
 /// 400 on an unparseable body or a `lakehouse_bi` validation/`ClickHouse`
-/// failure, matching the `TypeScript`'s single `catch` around both.
+/// failure, matching the `TypeScript`'s single `catch` around both; 422 with
+/// the limit's sentence when the chart's own statement ended at the caller's
+/// time limit (`BI-45`, plan D5), in which case nothing is stored.
 pub async fn specs_create(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1005,14 +1007,19 @@ pub async fn specs_create(
     )
     .await
     .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
-    store::insert_chart(&state.clickhouse, &spec)
+    // QA `LH-BI-5-01` (`BI-45`, plan D5): the statement is checked under the
+    // caller's limit, and a limit that ends it is a 422 with the sentence
+    // instead of a stored chart.
+    crate::routes::support::insert_chart_checked(&state.clickhouse, &spec)
         .await
-        .map_err(|err| {
-            upstream_error::ch_error_as(
-                &upstream_error::DATABASE,
-                &err,
-                upstream_error::FailedAs::BadRequest,
-            )
+        .map_err(|failure| {
+            crate::routes::support::failure_as_api_error(failure, |err| {
+                upstream_error::ch_error_as(
+                    &upstream_error::DATABASE,
+                    err,
+                    upstream_error::FailedAs::BadRequest,
+                )
+            })
         })?;
     place_new_chart(&state.clickhouse, &spec.board, &spec.spec.id).await;
     snapshot(&state.clickhouse, &spec.board, &principal).await;
@@ -1227,7 +1234,9 @@ pub async fn specs_preview(
 /// # Errors
 ///
 /// 400 on an unparseable body, a missing `id`, or a validation/`ClickHouse`
-/// failure.
+/// failure; 422 with the limit's sentence when the chart's own statement ended
+/// at the caller's time limit (`BI-45`, plan D5), in which case the stored
+/// chart is left as it was.
 pub async fn specs_update(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1283,13 +1292,20 @@ pub async fn specs_update(
     let spec = store::spec_from_input(ch, &input, ChartSource::Ui, "ui", Some(id), &time)
         .await
         .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
-    store::insert_chart(ch, &spec).await.map_err(|err| {
-        upstream_error::ch_error_as(
-            &upstream_error::DATABASE,
-            &err,
-            upstream_error::FailedAs::BadRequest,
-        )
-    })?;
+    // QA `LH-BI-5-01` (`BI-45`, plan D5): as a create, the statement runs once
+    // under the caller's limit first; a limit that ends it is a 422 with the
+    // sentence and the old chart stays as it was.
+    crate::routes::support::insert_chart_checked(ch, &spec)
+        .await
+        .map_err(|failure| {
+            crate::routes::support::failure_as_api_error(failure, |err| {
+                upstream_error::ch_error_as(
+                    &upstream_error::DATABASE,
+                    err,
+                    upstream_error::FailedAs::BadRequest,
+                )
+            })
+        })?;
     // The board it left changed too, when the edit moved it.
     if old_board != spec.board {
         snapshot(ch, &old_board, &principal).await;
@@ -2350,6 +2366,34 @@ async fn mark_marts(state: &AppState, body: &mut Value) {
     crate::routes::catalog::apply_serving_certification(state, marts, "name").await;
 }
 
+/// The joins of a mart relation, parsed, with every table the caller's roles
+/// hide refused as the unknown mart (`GOV-7` D6) — the one place `/fields` and
+/// `/values` parse `joins` and check the tables (`QA LH-BI-6-01` review round
+/// 1, R10: both had a copy, and `/values` parsed the same text twice).
+///
+/// # Errors
+///
+/// 400 for text that is not a JSON list of joins; 404 for the mart or a
+/// joined table the caller's roles hide.
+fn checked_joins(
+    access: &crate::table_access::TableAccess,
+    mart: &str,
+    raw: Option<&str>,
+) -> Result<Vec<lakehouse_bi::joins::JoinSpec>, ApiError> {
+    let joins: Vec<lakehouse_bi::joins::JoinSpec> =
+        match raw.map(str::trim).filter(|text| !text.is_empty()) {
+            Some(text) => serde_json::from_str(text)
+                .map_err(|_| ApiError::BadRequest("joins is invalid".to_owned()))?,
+            None => Vec::new(),
+        };
+    for table in std::iter::once(mart).chain(joins.iter().map(|j| j.mart.as_str())) {
+        if !access.allows_key(&serving_key(table)) {
+            return Err(mart_not_found(table));
+        }
+    }
+    Ok(joins)
+}
+
 /// `?joins=` branch of [`fields`] (`BI-7`): the columns of the flat relation a
 /// mart and its joins make, with their types, split like a mart's own. Schema
 /// metadata only, exactly like the mart's own answer: it names the same
@@ -2362,15 +2406,7 @@ async fn joined_fields_body(
     mart: &str,
     raw: &str,
 ) -> Result<Value, ApiError> {
-    let joins: Vec<lakehouse_bi::joins::JoinSpec> = serde_json::from_str(raw)
-        .map_err(|_| ApiError::BadRequest("joins is invalid".to_owned()))?;
-    // `GOV-7` D6: a join names its tables, so every one of them is checked
-    // before any column metadata is read.
-    for table in std::iter::once(mart).chain(joins.iter().map(|j| j.mart.as_str())) {
-        if !access.allows_key(&serving_key(table)) {
-            return Err(mart_not_found(table));
-        }
-    }
+    let joins = checked_joins(access, mart, Some(raw))?;
     let base = strip_non_ident(mart.strip_prefix("serving.").unwrap_or(mart));
     let ident = lakehouse_core::ident::Ident::new(base.clone())
         .map_err(|_| ApiError::BadRequest("invalid mart".to_owned()))?;
@@ -4301,9 +4337,24 @@ pub struct ValuesQuery {
     /// sources included. Absent: every `serving` mart with the column.
     #[serde(default)]
     board: Option<String>,
+    /// QA `LH-BI-6-01` (`BI-47`, plan D8): the chart's own mart — the values
+    /// are read from this mart (with `joins`) and from nothing else, and
+    /// `board` is then ignored. Naming it needs `dashboard:read` (`D9`).
+    #[serde(default)]
+    mart: Option<String>,
+    /// With `mart`: the chart's joins as a JSON list (`BI-7`), so the values
+    /// are read from the flat relation the chart reads, not the mart alone.
+    #[serde(default)]
+    joins: Option<String>,
+    /// The id of the saved SQL source the chart reads (`D8`): the values are
+    /// read from that source and from nothing else; `board` is then ignored.
+    /// Naming it needs `dashboard:read` (`D9`).
+    #[serde(default)]
+    source: Option<String>,
     /// The dashboard's other active filters (JSON list), applied to every
-    /// relation that has their column so the list narrows. Only read with
-    /// `board`; the filter on `column` itself is ignored.
+    /// relation that has their column so the list narrows — with `board`, and
+    /// with the chart's own `mart`/`source` too; the filter on `column`
+    /// itself is ignored.
     #[serde(default)]
     filters: Option<String>,
 }
@@ -4316,6 +4367,9 @@ impl ValuesQuery {
             column: Some(column.to_owned()),
             q: None,
             board: Some(board.to_owned()),
+            mart: None,
+            joins: None,
+            source: None,
             filters: Some(filters),
         }
     }
@@ -4331,7 +4385,10 @@ const VALUES_SEARCH_MAX_CHARS: usize = 200;
 
 /// `GET /api/dashboard/values?column=` — the distinct values of `column`
 /// (the dashboard filter picker): across every `serving` mart that has it,
-/// or, with `board`, across the relations that board's charts read.
+/// with `board` across the relations that board's charts read, and with
+/// `mart` (and its `joins`) or `source` across that one chart's own relation
+/// and nothing else (`BI-47`, QA `LH-BI-6-01`). Naming a mart or a source needs
+/// `dashboard:read`, and a mart the caller's roles hide is a 404.
 ///
 /// Unlike `/fields` (schema metadata only), this reads DATA, so it goes
 /// through `policy_engine::rewrite_sql_for_roles` for the caller's roles
@@ -4348,6 +4405,25 @@ pub async fn values(
 ) -> ApiResult<ApiJson<Value>> {
     // BI-19 part B1 (plan D8): the entry check and the caller's rules first.
     let viewer = viewer_for(&state, &principal).await?;
+    // QA `LH-BI-6-01` (`BI-47`, plan D9): naming a mart or a SQL source reads
+    // that relation's data, so it needs `dashboard:read` — refused before
+    // anything is read, whatever `board` says (fail closed).
+    let own_mart = q.mart.as_deref().map(str::trim).filter(|m| !m.is_empty());
+    let own_source = q.source.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if (own_mart.is_some() || own_source.is_some()) && !principal.has("dashboard:read") {
+        return Err(ApiError::PermissionDenied("dashboard:read".to_owned()).into());
+    }
+    // `GOV-7` D6: the mart and every table its joins name are checked against
+    // the caller's roles before any value is read, as `/fields` does — one
+    // parse and one check (`checked_joins`), and the parsed list goes on to the
+    // read (`QA LH-BI-6-01` review round 1, R10).
+    let own_joins = match own_mart {
+        Some(mart) => {
+            let access = crate::routes::catalog::table_access_for(&state, &principal).await?;
+            checked_joins(&access, mart, q.joins.as_deref())?
+        }
+        None => Vec::new(),
+    };
     // BI-19 B1 review R4: without `board` this lists the values of any mart or
     // SQL source, so somebody who holds only a rule must name a dashboard the
     // resolved viewer sees (404 like an unknown one otherwise; the built-in
@@ -4382,6 +4458,7 @@ pub async fn values(
     values_for_roles(
         &state.clickhouse,
         q,
+        &own_joins,
         (&principal.role_names, &viewer),
         &placeholders,
         &obligations,
@@ -4442,15 +4519,84 @@ fn values_statement(selects: &[String], settings: &str, limit: usize) -> String 
     )
 }
 
+/// The relation one value list reads (`BI-47`, plan D8), and how the union
+/// of several of them names it.
+struct ValueRelation {
+    /// Tells this relation apart from another chart's in the union.
+    key: String,
+    /// The `FROM` of the picker's `SELECT`.
+    from: String,
+    /// The relation's columns, for "does it have the column" and for the
+    /// filter predicates.
+    cols: RelationColumns,
+}
+
+/// Whose relation a value list reads: the chart's saved SQL source or its
+/// mart with its joins.
+enum ValueOwner<'a> {
+    /// A saved SQL source, through the gate a tile's source passed.
+    Source(&'a lakehouse_bi::sources::SqlSource),
+    /// A mart, read as `serving.<mart>` with the chart's joins (`BI-7`).
+    Mart {
+        /// The mart name, with or without the `serving.` prefix.
+        mart: &'a str,
+        /// The chart's joins, already parsed.
+        joins: &'a [lakehouse_bi::joins::JoinSpec],
+    },
+}
+
+/// The relation a value list reads for a chart's own definition (`BI-47`, plan
+/// D8; QA `LH-BI-6-01`) — the single owner of that decision, for the board's
+/// loop and for the chart's own `mart`/`source` branch alike.
+///
+/// A source goes through the same `check_sql_source` gate a tile's source
+/// passed when it was saved and is wrapped as the tile wraps it
+/// ([`lakehouse_bi::builder::Relation::render`]), so the later role rewrite
+/// governs it identically. A mart is read as `serving.<mart>`, its joins
+/// included, and `None` when that relation has no column of its own (a mart
+/// the store does not list).
+///
+/// # Errors
+///
+/// `BadRequest("invalid mart")` or the join planner's own sentence, the
+/// shapes `/fields` refuses; the board's loop skips those charts.
+fn value_relation(
+    owner: &ValueOwner<'_>,
+    mart_cols: &HashMap<String, RelationColumns>,
+) -> Result<Option<ValueRelation>, ApiError> {
+    match owner {
+        ValueOwner::Source(source) => {
+            let sql = check_sql_source(&source.sql)
+                .map_err(|refusal| ApiError::BadRequest(refusal.message().to_owned()))?;
+            Ok(Some(ValueRelation {
+                key: format!("s:{}", source.id),
+                from: lakehouse_bi::builder::Relation::Sql(sql).render(),
+                cols: source.column_kinds(),
+            }))
+        }
+        ValueOwner::Mart { mart, joins } => {
+            let base = mart.strip_prefix("serving.").unwrap_or(mart);
+            let ident = lakehouse_core::ident::Ident::new(base.to_owned())
+                .map_err(|_| ApiError::BadRequest("invalid mart".to_owned()))?;
+            let joined = lakehouse_bi::joins::chart_relation(&ident, joins, mart_cols)
+                .map_err(ApiError::BadRequest)?;
+            if joined.cols.is_empty() {
+                return Ok(None);
+            }
+            let joins_key = serde_json::to_string(joins).unwrap_or_default();
+            Ok(Some(ValueRelation {
+                key: format!("m:{mart}:{joins_key}"),
+                from: joined.from.render(),
+                cols: joined.cols,
+            }))
+        }
+    }
+}
+
 /// The relations a board's charts read that have `column`, as `SELECT`s for
 /// [`values_statement`], and whether one is a SQL source (which brings the
-/// source `SETTINGS` caps along).
-///
-/// A mart is read as `serving.<mart>`; a source goes through the same
-/// `check_sql_source` gate a tile's source passed when it was saved and is
-/// wrapped as the tile wraps it ([`lakehouse_bi::builder::Relation::render`]),
-/// so the later role rewrite governs it identically. A source the gate
-/// refuses is left out, never run.
+/// source `SETTINGS` caps along). Each chart's relation comes from
+/// [`value_relation`]; a source the gate refuses is left out, never run.
 async fn board_value_selects(
     ch: &ChClient,
     board: &str,
@@ -4477,44 +4623,29 @@ async fn board_value_selects(
     let mut has_source = false;
     let mut seen: HashSet<String> = HashSet::new();
     for c in on_board {
-        let (key, from, cols) = if let Some(id) = c.def.sql_source.as_deref() {
-            let Some(source) = sources.get(id) else {
-                continue;
-            };
-            let Ok(sql) = check_sql_source(&source.sql) else {
-                continue;
-            };
-            let from = lakehouse_bi::builder::Relation::Sql(sql).render();
-            (format!("s:{id}"), from, source.column_kinds())
-        } else {
-            let mart = c.def.mart.as_str();
-            let Ok(ident) = lakehouse_core::ident::Ident::new(mart.to_owned()) else {
-                continue;
-            };
+        let owner = match c.def.sql_source.as_deref() {
+            Some(id) => match sources.get(id) {
+                Some(source) => ValueOwner::Source(source),
+                None => continue,
+            },
             // BI-7: a joined chart's values come from its flat relation.
-            let Ok(joined) =
-                lakehouse_bi::joins::chart_relation(&ident, c.def.shape.joins_list(), &mart_cols)
-            else {
-                continue;
-            };
-            if joined.cols.is_empty() {
-                continue;
-            }
-            let joins_key = serde_json::to_string(c.def.shape.joins_list()).unwrap_or_default();
-            (
-                format!("m:{mart}:{joins_key}"),
-                joined.from.render(),
-                joined.cols,
-            )
+            None => ValueOwner::Mart {
+                mart: c.def.mart.as_str(),
+                joins: c.def.shape.joins_list(),
+            },
         };
-        if !cols.contains_key(column) || !seen.insert(key) {
+        let Some(relation) = value_relation(&owner, &mart_cols).ok().flatten() else {
+            continue;
+        };
+        if !relation.cols.contains_key(column) || !seen.insert(relation.key) {
             continue;
         }
         has_source |= c.def.sql_source.is_some();
-        let outcome = lakehouse_bi::builder::filter_predicates(&cols, &[], other_filters, time);
+        let outcome =
+            lakehouse_bi::builder::filter_predicates(&relation.cols, &[], other_filters, time);
         selects.push(values_select(
             column,
-            &from,
+            &relation.from,
             search,
             outcome.predicates,
             &outcome.columns,
@@ -4523,12 +4654,75 @@ async fn board_value_selects(
     Ok((selects, has_source))
 }
 
+/// The one `SELECT` of a value list read from a chart's own relation (`BI-47`,
+/// plan D8; QA `LH-BI-6-01`), and the `SETTINGS` text it needs, or `None` when
+/// the relation is unknown or has no such column (the answer is then the empty
+/// list).
+///
+/// `mart`/`source` are the picker's own parameters and `joins` is that mart's
+/// list, already parsed and checked against the caller's roles by
+/// [`checked_joins`] (`QA LH-BI-6-01` review round 1, R10); `source` is looked
+/// up through [`crate::routes::dashboard_sources::visible_source`], the one
+/// visibility check (`BI-19` B2).
+///
+/// # Errors
+///
+/// 404 for a source that does not exist or sits in a folder the caller cannot
+/// see, or a mart name that is not an identifier (400);
+/// [`classify_dashboard_ch_error`] for a store failure.
+async fn own_value_selects(
+    ch: &ChClient,
+    (mart, source, joins): (Option<&str>, Option<&str>, &[lakehouse_bi::joins::JoinSpec]),
+    (column, search): (&str, Option<&str>),
+    other_filters: Vec<FilterDef>,
+    (viewer, time): (&Viewer, &TimeContext),
+) -> Result<Option<(String, &'static str)>, ApiError> {
+    let relation = if let Some(id) = source {
+        let source = crate::routes::dashboard_sources::visible_source(ch, viewer, id).await?;
+        value_relation(&ValueOwner::Source(&source), &HashMap::new())?
+    } else {
+        let mart = mart.unwrap_or_default();
+        let mart_cols = mart_columns(ch)
+            .await
+            .map_err(|err| classify_dashboard_ch_error(&err))?;
+        value_relation(&ValueOwner::Mart { mart, joins }, &mart_cols)?
+    };
+    let Some(relation) = relation.filter(|relation| relation.cols.contains_key(column)) else {
+        return Ok(None);
+    };
+    let others: Vec<FilterDef> = other_filters
+        .into_iter()
+        .filter(|f| f.column != column)
+        .collect();
+    let outcome = lakehouse_bi::builder::filter_predicates(&relation.cols, &[], &others, time);
+    let settings = if source.is_some() {
+        lakehouse_bi::builder::SQL_SOURCE_SETTINGS
+    } else {
+        ""
+    };
+    Ok(Some((
+        values_select(
+            column,
+            &relation.from,
+            search,
+            outcome.predicates,
+            &outcome.columns,
+        ),
+        settings,
+    )))
+}
+
 /// [`values`]' body, taking roles and placeholders explicitly so the
 /// enforcement path can be tested against a mock `ClickHouse` and a real
 /// policy row.
+///
+/// `joins` is the mart's list, already parsed and checked by [`checked_joins`]
+/// in the handler (`QA LH-BI-6-01` review round 1, R10); empty for every other
+/// branch.
 async fn values_for_roles(
     ch: &ChClient,
     q: ValuesQuery,
+    joins: &[lakehouse_bi::joins::JoinSpec],
     (roles, viewer): (&[String], &Viewer),
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     obligations: &PolicyEngineObligations<'_>,
@@ -4538,6 +4732,7 @@ async fn values_for_roles(
     values_with_limit(
         ch,
         q,
+        joins,
         (roles, viewer),
         (placeholders, obligations, time),
         VALUES_LIMIT,
@@ -4551,6 +4746,7 @@ async fn values_for_roles(
 pub(crate) async fn values_with_limit(
     ch: &ChClient,
     q: ValuesQuery,
+    joins: &[lakehouse_bi::joins::JoinSpec],
     (roles, viewer): (&[String], &Viewer),
     (placeholders, obligations, time): (
         &crate::sql_rewrite::PlaceholderValues,
@@ -4573,7 +4769,28 @@ pub(crate) async fn values_with_limit(
     let linked = parse_filters_param(q.filters.as_deref())?.unwrap_or_default();
     let empty = || json!({ "column": column, "values": Vec::<String>::new(), "truncated": false });
 
-    let (selects, settings) = if let Some(board) = q.board.as_deref().filter(|b| !b.is_empty()) {
+    // QA `LH-BI-6-01` (`BI-47`, plan D8): with a mart or a source the list
+    // comes from that chart's own relation and from nothing else; `board` is
+    // not read in this branch. The filters narrow it as on a board.
+    let own_mart = q.mart.as_deref().map(str::trim).filter(|m| !m.is_empty());
+    let own_source = q.source.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let (selects, settings) = if own_mart.is_some() || own_source.is_some() {
+        let others: Vec<FilterDef> = linked.into_iter().filter(|f| f.column != column).collect();
+        let own = own_value_selects(
+            ch,
+            (own_mart, own_source, joins),
+            (&column, search),
+            others,
+            (viewer, time),
+        )
+        .await?;
+        // An unknown/empty relation, or one without that column, lists
+        // nothing: a list read from somewhere else would be a lie.
+        let Some((select, settings)) = own else {
+            return Ok(empty());
+        };
+        (vec![select], settings)
+    } else if let Some(board) = q.board.as_deref().filter(|b| !b.is_empty()) {
         let others: Vec<FilterDef> = linked.into_iter().filter(|f| f.column != column).collect();
         let (selects, has_source) =
             board_value_selects(ch, board, (&column, search), &others, (time, viewer)).await?;
@@ -4976,7 +5193,7 @@ fn slot_json(text: &str) -> Value {
 }
 
 fn push_shape_fields(def: &ChartInput, out: &mut Vec<(&'static str, Value)>) {
-    const NAMES: [&str; 13] = [
+    const NAMES: [&str; 14] = [
         "filters",
         "sort",
         "other",
@@ -4985,6 +5202,9 @@ fn push_shape_fields(def: &ChartInput, out: &mut Vec<(&'static str, Value)>) {
         "joins",
         "bin",
         "breakdownBin",
+        // `BI-46` review round 1, R8: a date breakdown grouped by a period is
+        // part of the chart; without it the file describes one series per day.
+        "breakdownGrain",
         "grid",
         "referenceLines",
         "layers",
@@ -5463,6 +5683,15 @@ mod tests {
             chart_def_fields(&binned).into_iter().collect();
         assert_eq!(fields["bin"], json!({"mode": "width", "width": 500}));
         assert_eq!(fields["breakdownBin"]["count"], 10);
+        // `BI-46` review round 1, R8: a date breakdown's grain is part of the
+        // chart; an export without it describes one series per day.
+        assert!(!keys(&plain).contains(&"breakdownGrain"));
+        let grained = def(json!({
+            "dimension": "kab", "breakdown": "d", "breakdownGrain": "month",
+        }));
+        let fields: std::collections::HashMap<_, _> =
+            chart_def_fields(&grained).into_iter().collect();
+        assert_eq!(fields["breakdownGrain"], json!("month"));
         let mapped = def(json!({
             "kind": "pointmap", "lat": "a", "lon": "b", "grid": {"size": "auto"},
         }));
@@ -6064,6 +6293,7 @@ mod values_enforcement {
                 column: Some("email".to_owned()),
                 ..ValuesQuery::default()
             },
+            &[],
             (
                 &["Analyst".to_owned()],
                 &lakehouse_bi::access::Viewer::system(),
@@ -6093,6 +6323,320 @@ mod values_enforcement {
             "every DISTINCT read must be the masked rewrite: {distinct_queries:?}"
         );
         Ok(())
+    }
+
+    /// QA `LH-BI-6-01` (`BI-47`, plan D8): a filter's value list reads the
+    /// chart's own mart and no other, even when another mart holds a column of
+    /// the same name. Before this, `mart` was ignored and the list was read
+    /// over every mart that has the column.
+    #[tokio::test]
+    async fn the_values_of_a_charts_own_mart_are_read_from_that_mart_and_no_other() {
+        let server = MockServer::start().await;
+        // Two marts hold `province`; only `mart_a` is named.
+        Mock::given(method("POST"))
+            .and(body_string_contains(
+                "SELECT table, name, type FROM system.columns",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [
+                    {"name": "table", "type": "String"},
+                    {"name": "name", "type": "String"},
+                    {"name": "type", "type": "String"},
+                ],
+                "data": [
+                    {"table": "mart_a", "name": "province", "type": "String"},
+                    {"table": "mart_a", "name": "visitors", "type": "UInt64"},
+                    {"table": "mart_b", "name": "province", "type": "String"},
+                ],
+                "rows": 3,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("DISTINCT"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [{"name": "v", "type": "String"}],
+                "data": [{"v": "Bali"}],
+                "rows": 1,
+            })))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(None, &ch);
+        let state = crate::state::AppState::without_a_database();
+
+        let body = values_for_roles(
+            &ch,
+            ValuesQuery {
+                column: Some("province".to_owned()),
+                mart: Some("mart_a".to_owned()),
+                ..ValuesQuery::default()
+            },
+            &[],
+            (&[], &lakehouse_bi::access::Viewer::system()),
+            &PlaceholderValues::none(),
+            &obligations,
+            &lakehouse_bi::grain::TimeContext::default(),
+            &crate::routes::query::StatementGate::unrestricted(&state),
+        )
+        .await
+        .expect("a named mart answers its values");
+
+        assert_eq!(body["values"], serde_json::json!(["Bali"]));
+        let reads: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| b.contains("DISTINCT"))
+            .collect();
+        assert_eq!(reads.len(), 1, "{reads:?}");
+        assert!(reads[0].contains("serving.mart_a"), "{}", reads[0]);
+        assert!(!reads[0].contains("mart_b"), "{}", reads[0]);
+    }
+
+    /// QA `LH-BI-6-01` (`BI-47`, plan D8): with a SQL source the list wraps
+    /// that source's statement and reads no other table.
+    #[tokio::test]
+    async fn the_values_of_a_charts_sql_source_are_read_from_that_source() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM console.bi_source FINAL"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [{"name": "id", "type": "String"}],
+                "data": [{
+                    "id": "s_1",
+                    "title": "src",
+                    "sql": "SELECT province, channel FROM serving.mart_a",
+                    "columns_json": serde_json::json!([
+                        {"name": "province", "type": "String"},
+                        {"name": "channel", "type": "String"},
+                    ]).to_string(),
+                    "folder_id": "",
+                    "created_by": "u",
+                    "updated_at": "2026-01-01 00:00:00",
+                }],
+                "rows": 1,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("DISTINCT"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [{"name": "v", "type": "String"}],
+                "data": [{"v": "Bali"}],
+                "rows": 1,
+            })))
+            .mount(&server)
+            .await;
+        // The store's bootstrap DDL: nothing this test reads.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("Ok."))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(None, &ch);
+        let state = crate::state::AppState::without_a_database();
+
+        let body = values_for_roles(
+            &ch,
+            ValuesQuery {
+                column: Some("province".to_owned()),
+                source: Some("s_1".to_owned()),
+                ..ValuesQuery::default()
+            },
+            &[],
+            (&[], &lakehouse_bi::access::Viewer::system()),
+            &PlaceholderValues::none(),
+            &obligations,
+            &lakehouse_bi::grain::TimeContext::default(),
+            &crate::routes::query::StatementGate::unrestricted(&state),
+        )
+        .await
+        .expect("a named source answers its values");
+
+        assert_eq!(body["values"], serde_json::json!(["Bali"]));
+        let reads: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| b.contains("DISTINCT"))
+            .collect();
+        assert_eq!(reads.len(), 1, "{reads:?}");
+        let read = &reads[0];
+        assert!(
+            read.contains("SELECT province, channel FROM serving.mart_a"),
+            "the source's own statement is what the list reads: {read}"
+        );
+        assert!(read.contains(") AS src"), "{read}");
+        // The only table the statement names is the source's own.
+        assert!(
+            !read.contains("serving.mart_b") && !read.contains("FROM serving.mart_a WHERE"),
+            "{read}"
+        );
+    }
+
+    /// QA `LH-BI-6-01` (`BI-47`, plan D8): naming the chart's mart does not
+    /// take the masks and row filters away — the values are the masked ones,
+    /// as on a board.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_masked_viewer_gets_the_masked_values_of_the_charts_own_mart(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        governance::create_policy(
+            &pool,
+            &CreatePolicyInput {
+                name: "values-own-mart-masking-test".to_owned(),
+                kind: "Row filter".to_owned(),
+                subjects: "Analyst".to_owned(),
+                resources: "serving.mart_x".to_owned(),
+                effect: "Permit with obligation".to_owned(),
+                conditions: Some(
+                    r#"{"roles":["Analyst"],"table":"serving.mart_x","mask":["email"]}"#.to_owned(),
+                ),
+                activate: true,
+                owner: None,
+            },
+        )
+        .await
+        .expect("seeding the governing policy must succeed");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains(
+                "SELECT table, name, type FROM system.columns",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [
+                    {"name": "table", "type": "String"},
+                    {"name": "name", "type": "String"},
+                    {"name": "type", "type": "String"},
+                ],
+                "data": [{"table": "mart_x", "name": "email", "type": "String"}],
+                "rows": 1,
+            })))
+            .mount(&server)
+            .await;
+        // The policy engine's column resolution.
+        Mock::given(method("POST"))
+            .and(body_string_contains("default_kind"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [
+                    {"name": "name", "type": "String"},
+                    {"name": "default_kind", "type": "String"},
+                    {"name": "default_expression", "type": "String"},
+                ],
+                "data": [{"name": "email", "default_kind": "", "default_expression": ""}],
+                "rows": 1,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("replaceRegexpOne"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [{"name": "v", "type": "String"}],
+                "data": [{"v": "***"}],
+                "rows": 1,
+            })))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+        let state = crate::state::AppState::without_a_database();
+
+        let body = values_for_roles(
+            &ch,
+            ValuesQuery {
+                column: Some("email".to_owned()),
+                mart: Some("mart_x".to_owned()),
+                ..ValuesQuery::default()
+            },
+            &[],
+            (
+                &["Analyst".to_owned()],
+                &lakehouse_bi::access::Viewer::system(),
+            ),
+            &PlaceholderValues::none(),
+            &obligations,
+            &lakehouse_bi::grain::TimeContext::default(),
+            &crate::routes::query::StatementGate::unrestricted(&state),
+        )
+        .await
+        .expect("masked values still answer");
+
+        assert_eq!(body["values"], serde_json::json!(["***"]));
+        let reads: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| b.contains("DISTINCT"))
+            .collect();
+        assert_ne!(reads, [] as [std::string::String; 0]);
+        for sql in &reads {
+            assert!(
+                sql.contains("replaceRegexpOne(toString(`email`)"),
+                "the named mart's values are masked: {sql}"
+            );
+        }
+        Ok(())
+    }
+
+    /// QA `LH-BI-6-01` (`BI-47`, plan D8): a column the chart's own relation
+    /// does not have gives an empty list, and nothing is read for it.
+    #[tokio::test]
+    async fn a_column_the_charts_own_relation_does_not_have_gives_an_empty_list() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains(
+                "SELECT table, name, type FROM system.columns",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [
+                    {"name": "table", "type": "String"},
+                    {"name": "name", "type": "String"},
+                    {"name": "type", "type": "String"},
+                ],
+                "data": [{"table": "mart_a", "name": "visitors", "type": "UInt64"}],
+                "rows": 1,
+            })))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(None, &ch);
+        let state = crate::state::AppState::without_a_database();
+
+        let body = values_for_roles(
+            &ch,
+            ValuesQuery {
+                column: Some("province".to_owned()),
+                mart: Some("mart_a".to_owned()),
+                ..ValuesQuery::default()
+            },
+            &[],
+            (&[], &lakehouse_bi::access::Viewer::system()),
+            &PlaceholderValues::none(),
+            &obligations,
+            &lakehouse_bi::grain::TimeContext::default(),
+            &crate::routes::query::StatementGate::unrestricted(&state),
+        )
+        .await
+        .expect("an absent column is an empty list, not an error");
+
+        assert_eq!(body["values"], serde_json::json!([]));
+        assert_eq!(body["truncated"], serde_json::json!(false));
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| !String::from_utf8_lossy(&r.body).contains("DISTINCT")),
+            "nothing was read for a column the relation does not have"
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -6164,6 +6708,7 @@ mod values_enforcement {
                 q: Some("secret".to_owned()),
                 ..ValuesQuery::default()
             },
+            &[],
             (
                 &["Analyst".to_owned()],
                 &lakehouse_bi::access::Viewer::system(),
@@ -6806,6 +7351,7 @@ mod typed_filters {
         values_for_roles(
             &ch,
             q,
+            &[],
             (&[], &lakehouse_bi::access::Viewer::system()),
             &PlaceholderValues::none(),
             &obligations,

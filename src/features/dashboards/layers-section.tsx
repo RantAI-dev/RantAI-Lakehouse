@@ -14,6 +14,7 @@ import { moveItem } from "@/lib/table-draft";
 import { columnKindOfType, type ColumnKind } from "@/lib/time-grain";
 import { apiFetch } from "@/services/http";
 import { ChartFilters, MeasureRows, type ColumnChoice } from "./chart-shape-section";
+import type { OwnSource } from "./filters/use-filter-values";
 
 /**
  * The chart builder's "More questions" section (`BI-13`): up to four more
@@ -48,6 +49,19 @@ type Props = {
 };
 
 const columnLabel = (name: string) => <ColumnLabel reference={columnRef(name)} />;
+
+
+/**
+ * `BI-47`: the source one question reads, for its filter value lists — its own
+ * mart with its joins, or its saved SQL source. A question with no source yet
+ * (or SQL not saved) has no list: see [`ownSourceOf`]( ./filters/use-filter-values).
+ */
+function layerSource(layer: LayerDraft): OwnSource {
+  const choice = decodeSourceChoice(layer.source);
+  if (!choice) return { unsaved: true };
+  if (choice.kind === "sql") return { sqlSource: choice.id };
+  return layer.joins.length ? { mart: choice.name, joins: layer.joins } : { mart: choice.name };
+}
 
 export function LayersSection({ layers, onChange, baseKind, grained, marts, sqlSources, ownDraw, ownAxis, onOwnChange, blocked, disabled }: Props) {
   const [loaded, setLoaded] = React.useState<Record<string, SourceFields>>({});
@@ -168,7 +182,7 @@ export function LayersSection({ layers, onChange, baseKind, grained, marts, sqlS
                   disabled={disabled || !fields} placeholder={fields ? "pick a column" : "loading"} wholeMeasure={new Set<string>()}
                   fieldLabel={columnLabel}
                 />
-                <ChartFilters value={layer.filters} onChange={(filters) => set(i, { filters })} columns={fields?.columns ?? []} disabled={disabled || !fields} />
+                <ChartFilters value={layer.filters} onChange={(filters) => set(i, { filters })} columns={fields?.columns ?? []} disabled={disabled || !fields} source={layerSource(layer)} />
               </>
             ) : null}
             <div className="grid gap-1.5">

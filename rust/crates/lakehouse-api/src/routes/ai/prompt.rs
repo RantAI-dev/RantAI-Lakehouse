@@ -511,7 +511,7 @@ MODE: BUILD. Besides answering, you can operate the lakehouse:
 - needs_confirmation and needs_approval are different. needs_confirmation: the user confirms in this chat, with the Confirm button under your reply; never mention Approvals for it. needs_approval: a human must approve it in Approvals (/agents/approvals).
 - When a tool result says needs_confirmation, call no other tool that needs the drafted object (a chart, a board or a tab that does not exist yet, a calculated field): reply with ONE short sentence that names the draft the result is for (a chart, a board, a tab or a calculated field). Write a last line `NEXT: <the remaining steps, in one sentence>` only when the request needs another object after the draft, or another change to the drafted object (its cache rule, its format, its tab): for example a chart on the board being drafted, the charts moved to the tab being drafted, or the cache rule of the chart just drafted; never for confirming, saving or publishing the draft itself, and never when the draft is the whole request. Do not repeat the arguments and do not ask the user to type a confirmation: the console shows the preview with a confirm button. A user message that starts with `Confirmed and saved:` lists the objects that now exist: never draft them again; do only the step after `Continue:`; when nothing is left, answer in one sentence and call no tool.
 - A chart draft, and a created or updated chart, has `definition`: describe the chart only by what it lists, because a top N, a bin or a filter it does not list was not made. When a tool refused a call, say so in your first sentence, in plain words, and never present a workaround as what the person asked for. When a refusal says bins are for numbers and names the number columns, call ask_user with those columns as the options; when it says the source has no number column to bin, say that and ask nothing. \"Top N of X by Y\" is dimension X, breakdown Y, sort descending on the measure, limit N.
-- A chart's `limit` counts values of its dimension only and never cuts a breakdown; with a time grain on the dimension and the chart ordered by that date, it keeps the latest periods; ordered by a measure, it keeps the top periods. For \"top N of Y over time\" choose one and tell the person which: (a) a chart with dimension Y, sort descending and limit N, with no time axis; (b) a time chart with a filter on the N values of Y found first with a query, saying the list is fixed at today's top N. Never answer \"top N\" for a chart whose `definition` does not show that limit on that column. Never state a number of bins, rows, series or categories that no tool result gave; describe a bin by its width or count as `definition` states it. When update_chart changes the grain, a measure, its aggregation or a filter, send in the same call a `title` and `subtitle` that match the new content, or `subtitle: null` when no subtitle fits. To explain a calculated field, call list_calculated_fields, which explains the formula in plain words, and run no SQL for it.");
+- A chart's `limit` on a bar, hbar, line or area chart with a breakdown keeps the N breakdown values with the largest total; a time grain on the dimension then keeps every period, and a dimension without a grain keeps its own top N as well. Without a breakdown, `limit` counts values of the dimension, and with a time grain ordered by that date it keeps the latest periods. For \"top N of Y over time\" use the date as the dimension with a grain, Y as the breakdown and limit N. Never answer \"top N\" for a chart whose `definition` does not show that limit on that column. Never state a number of bins, rows, series or categories that no tool result gave; describe a bin by its width or count as `definition` states it. When update_chart changes the grain, a measure, its aggregation or a filter, send in the same call a `title` and `subtitle` that match the new content, or `subtitle: null` when no subtitle fits. To explain a calculated field, call list_calculated_fields, which explains the formula in plain words, and run no SQL for it.");
 
 /// Tools offered on every turn: the data tools, and the read-only listings
 /// a general question about the platform needs.
@@ -1423,20 +1423,25 @@ mod tests {
         );
     }
 
-    /// The QA of 2026-11-07: a limit counts a dimension's values, never a
-    /// breakdown, so "top N of Y over time" has two honest shapes and the
-    /// model says which it made; it states no count a tool did not give; it
-    /// renames a chart when its content changes; it explains a calculated
-    /// field with `list_calculated_fields`. The chart rules are Build mode
-    /// only: the Ask prompt carries its own calculated-field sentence (plan
-    /// 72) and has no chart to describe.
+    /// The QA of 2026-11-07 and of 2026-11-12 (`BI-46`): a limit on a bar,
+    /// hbar, line or area chart with a breakdown keeps the N breakdown values
+    /// with the largest total, so "top N of Y over time" is the date with a
+    /// grain, Y as the breakdown and limit N; without a breakdown it counts the
+    /// dimension's values, keeping the latest periods for a date ordered by
+    /// itself. The model states no count a tool did not give, renames a chart
+    /// when its content changes, and explains a calculated field with
+    /// `list_calculated_fields`. The chart rules are Build mode only: the Ask
+    /// prompt carries its own calculated-field sentence (plan 72) and has no
+    /// chart to describe.
     #[test]
     fn the_build_prompt_says_what_a_limit_counts_and_four_rules_for_what_the_model_states() {
         for clause in [
-            // A limit counts dimension values; a grain makes it the latest periods.
-            "A chart's `limit` counts values of its dimension only and never cuts a breakdown; with a time grain on the dimension and the chart ordered by that date, it keeps the latest periods; ordered by a measure, it keeps the top periods.",
-            // The two shapes of "top N of Y over time", and that the person is told.
-            "For \"top N of Y over time\" choose one and tell the person which: (a) a chart with dimension Y, sort descending and limit N, with no time axis; (b) a time chart with a filter on the N values of Y found first with a query, saying the list is fixed at today's top N.",
+            // `BI-46`: a limit beside a breakdown keeps the breakdown's top N.
+            "A chart's `limit` on a bar, hbar, line or area chart with a breakdown keeps the N breakdown values with the largest total; a time grain on the dimension then keeps every period, and a dimension without a grain keeps its own top N as well.",
+            // Without a breakdown it counts dimension values, latest periods first.
+            "Without a breakdown, `limit` counts values of the dimension, and with a time grain ordered by that date it keeps the latest periods.",
+            // "Top N of Y over time" is the date with a grain, Y as the breakdown.
+            "For \"top N of Y over time\" use the date as the dimension with a grain, Y as the breakdown and limit N.",
             "Never answer \"top N\" for a chart whose `definition` does not show that limit on that column.",
             // No count the tools did not give.
             "Never state a number of bins, rows, series or categories that no tool result gave; describe a bin by its width or count as `definition` states it.",
@@ -1457,7 +1462,7 @@ mod tests {
         // The top-N sentence keeps its wording; the new rules follow it.
         let top_n = "\"Top N of X by Y\" is dimension X, breakdown Y, sort descending on the measure, limit N.";
         let at = SYSTEM_BUILD_SUFFIX.find(top_n);
-        let limit_rule = SYSTEM_BUILD_SUFFIX.find("A chart's `limit` counts values");
+        let limit_rule = SYSTEM_BUILD_SUFFIX.find("A chart's `limit` on a bar, hbar, line or area");
         assert!(
             at.is_some() && limit_rule > at,
             "the limit rule follows the top-N sentence"

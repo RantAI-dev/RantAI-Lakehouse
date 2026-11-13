@@ -224,8 +224,11 @@ const PDF_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 + 70 + 10);
 /// | route                          | TS `maxDuration` |
 /// |---------------------------------|------------------|
 /// | `/api/ai/chat`                  | 120              |
+/// | `/api/ai/tool`                  | 60 (review round 1 R3: the longest configured limit + 15, like a save — the assistant's confirmed saves run under the limit here, see [`deadline_for`]) |
 /// | `/api/alerts/run`               | 60               |
 /// | `/api/query/run`                | 60 (BI-5: the longest configured limit + 15, see [`deadline_for`]) |
+/// | `/api/dashboard/specs`, `/api/dashboard/specs/preview` | 60 (BI-45: the longest configured limit + 15, see [`deadline_for`]) |
+/// | `/api/dashboard/sources/preview` | 60 (BI-45: twice the longest configured limit + 15, see [`deadline_for`]) |
 /// | board routes (`/api/dashboard`, `/api/embed/*`, `/api/public/dashboard/*`, `/api/render/data`) | 60 (BI-5: an outer cap of 35 minutes, see [`deadline_for`]) |
 /// | `/api/query/run/{id}/download`   | no TS handler (QS-2: an outer cap of 35 minutes, see [`crate::query_limits::BOARD_DEADLINE_CAP`]) |
 /// | everything else (no export)     | [`DEFAULT_REQUEST_TIMEOUT`] (60) |
@@ -267,8 +270,28 @@ fn route_timeout(path: &str) -> Duration {
 
 /// The routes whose queries run under the administrator's time limit
 /// (`BI-5`): their deadline follows the limit instead of the fixed 60 s.
+///
+/// `BI-45` (QA `LH-BI-5-01`): saving a chart and previewing one run its
+/// statement under the limit too, so these three join it — without that, the
+/// fixed 60-second deadline fires before the default limit can be reported.
+/// `GET`/`DELETE` on `/api/dashboard/specs` share the path and so the bound;
+/// they send no long statement, so the longer bound changes nothing for them.
+///
+/// `/api/ai/tool` joins them (`BI-45` review round 1, R3): the assistant drafts
+/// `create_chart`, `update_chart`, `format_chart` and `move_chart`, and the
+/// Confirm button executes the draft through this route, which awaits
+/// `tools::run_tool` in the request task. With the fixed 60-second deadline the
+/// default limit (60 s) could never be reported there: the engine answered
+/// `TIMEOUT_EXCEEDED` after the route had already ended in "request timeout",
+/// and the tool's `{ "error": <sentence>, "limit": … }` never reached the
+/// model or the person.
 fn limit_bearing(path: &str) -> bool {
-    path == "/api/query/run" || is_board_path(path)
+    path == "/api/query/run"
+        || path == "/api/dashboard/specs"
+        || path == "/api/dashboard/specs/preview"
+        || path == "/api/dashboard/sources/preview"
+        || path == "/api/ai/tool"
+        || is_board_path(path)
 }
 
 /// The routes that answer a whole board: tiles run six at a time, so one can
@@ -297,9 +320,20 @@ fn is_board_path(path: &str) -> bool {
 /// middleware gives `/api/query/run` the limit plus 15 s, and a board route
 /// the 35-minute cap as an outer bound, leaving the handler's own deadline
 /// (`query_limits::board_deadline`) the one that decides.
+///
+/// `BI-45` (QA `LH-BI-5-01`): the SQL source preview runs its source TWICE
+/// with a chart — the row read, then the chart's own statement — so its
+/// deadline is twice the longest limit plus the margin; with one limit it
+/// would cut the second statement before the limit could be reported.
+///
+/// `BI-45` review round 1 R3: `/api/ai/tool` takes the same limit plus margin
+/// as a save, because the assistant's confirmed saves run there.
 fn deadline_for(path: &str, longest: Option<Duration>) -> Duration {
     match longest {
         Some(_) if is_board_path(path) => crate::query_limits::BOARD_DEADLINE_CAP,
+        Some(longest) if path == "/api/dashboard/sources/preview" => longest
+            .saturating_mul(2)
+            .saturating_add(crate::query_limits::DEADLINE_MARGIN),
         Some(longest) if limit_bearing(path) => {
             longest.saturating_add(crate::query_limits::DEADLINE_MARGIN)
         }
@@ -2091,6 +2125,35 @@ mod tests {
         assert_eq!(
             deadline_for("/api/query/run", longest),
             Duration::from_secs(315)
+        );
+        // BI-45: the console's save and both previews wait for the limit.
+        for path in ["/api/dashboard/specs", "/api/dashboard/specs/preview"] {
+            assert_eq!(
+                deadline_for(path, longest),
+                Duration::from_secs(315),
+                "{path}"
+            );
+            assert_eq!(deadline_for(path, None), route_timeout(path), "{path}");
+        }
+        // BI-45 review round 1 R3: the assistant's confirmed save runs here,
+        // so it waits on its statement's limit too.
+        assert_eq!(
+            deadline_for("/api/ai/tool", longest),
+            Duration::from_secs(315)
+        );
+        assert_eq!(
+            deadline_for("/api/ai/tool", None),
+            route_timeout("/api/ai/tool")
+        );
+        // Twice the limit: the source preview runs its source again for the
+        // chart.
+        assert_eq!(
+            deadline_for("/api/dashboard/sources/preview", longest),
+            Duration::from_secs(615)
+        );
+        assert_eq!(
+            deadline_for("/api/dashboard/sources/preview", None),
+            route_timeout("/api/dashboard/sources/preview")
         );
         for board in [
             "/api/dashboard",
