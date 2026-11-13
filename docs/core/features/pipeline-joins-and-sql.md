@@ -10,10 +10,10 @@
 | Priority | In `BACKLOG.md`, the one place it is kept |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Held in the base; not the Owner. |
-| Plan | Reads as its author: `docs/superpowers/plans/2026-10-15-bld-1-run-as-author.md` (merged). Part 1: `docs/superpowers/plans/2026-11-12-bld-1-part-1-steps-and-sql.md`. Parts 2 and 3 not written yet. |
+| Plan | Reads as its author: `docs/superpowers/plans/2026-10-15-bld-1-run-as-author.md` (merged). Part 1: `docs/superpowers/plans/2026-11-12-bld-1-part-1-steps-and-sql.md`. The text form (the last slice of part 1) and parts 2 and 3 are not written yet. |
 | Started | 2026-10-15 |
 | Shipped | |
-| Evidence | PR #173 (a pipeline reads as its author); PR #481 (part 1, S1: inputs and steps, the compiler, the check at save, the run route, the assistant) |
+| Evidence | PR #173 (a pipeline reads as its author); PR #481 (part 1, S1: inputs and steps, the compiler, the check at save, the run route, the assistant); PR #500 (part 1, S2: the preview of a step); PR #499 (part 1, S3: the editor in the console) |
 
 ## Problem
 
@@ -127,7 +127,8 @@ reviews that part.
   the pipeline writes when that person is not the author.
 - Changing the inputs or steps of someone else's pipeline makes it read as you from then on. An administrator who does this makes the output unmasked; the editor says so before saving.
 - A pipeline with a SQL step, several inputs or more than one step has no column lineage yet (`DATA-57`). Table lineage shows every input.
-- Until the new editor ships, the console cannot make or edit a pipeline with SQL steps; the API and the assistant can.
+- The editor has not been checked in a browser by anyone yet, nor against a running API; the acceptance checklist below is that check.
+- The text form of a pipeline (capability 8) is not built yet.
 - No Python.
 
 ## Acceptance checklist
