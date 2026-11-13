@@ -26,6 +26,7 @@ mod capture_lag;
 // catalog search copy at start-up (`DATA-41` D4), so it names
 // `catalog::spawn_startup_search_copy`.
 pub(crate) mod catalog;
+mod catalog_drop;
 mod catalog_governance;
 mod catalog_grants;
 mod catalog_profile;
@@ -757,6 +758,10 @@ fn catalog_access_router() -> Router<AppState> {
             "/api/catalog/{id}/restore",
             get(catalog_restore::status).post(catalog_restore::restore),
         )
+        // `DATA-55` (QA `LH-DATA-15-06`, `TC-1731`): drop a table a file upload
+        // made, keeping the catalog's soft delete so the restore above can
+        // bring it back.
+        .route("/api/catalog/{id}/drop", get(catalog_drop::status))
 }
 
 /// The `/api/overview/alerts/*` sub-router (Task 2.6), split out for the
