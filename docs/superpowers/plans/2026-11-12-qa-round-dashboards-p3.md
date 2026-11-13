@@ -1419,3 +1419,88 @@ lakehouse-bi --lib` (quote the counts; the bin tests are `main`'s again); `cargo
 lakehouse-api --test chart_numbers`; `--test dashboard_export`; `--test sec11_guard`;
 `--test route_auth`; `bun run typecheck`; `bun run lint`; `bun test src/lib
 src/features/dashboards`; `bun run test` once; each with its counts.
+
+### Round 1, developer's handoff
+
+**Merge and fix commits.**
+
+- Merge of `main`: none written. `git fetch origin` left `origin/main` at `43d36f55`, which
+  is already the merge base of the branch and an ancestor of `HEAD` (`git rev-list --count
+  HEAD..origin/main` = 0); `git merge origin/main` said "Already up to date." and there was
+  nothing to merge, so there is no merge commit and no conflict to resolve. The step A
+  checks ran on `58649f30` (the review commit) and the push was a no-op
+  ("Everything up-to-date").
+- Fix commit: `899adfd7` — `fix(review): round 1 of dashboards-p3: T2 is undone (R1, R2), R3, R4, R6`.
+- Handoff commit: the one that adds this section, `docs(plan): handoff for review round 1 of dashboards-p3`.
+
+**What the revert had to resolve by hand.**
+
+- Nothing. `git revert --no-commit 6a7fca68` applied cleanly, and
+  `git log 6a7fca68..HEAD -- <the five files>` is empty, so no later commit touched those
+  lines. The revert removed the `fr` column, the `greatest(…, if(fr = 0, 1, 0))` floor,
+  `WidthRule::is_nice`, the `whole AS whole` read, its `bin.rs` test, the `whole` key in
+  `add_bins`, and the `chart-bins.ts`/`chart-bins.test.ts` changes; those two console files
+  are byte for byte `main`'s again. T1's test in `chart_numbers.rs` stays; T2's test and its
+  `default.bi55_years` fixture are gone. `whole` has no reader left: `grep -rn '"whole"' src/ rust/ dagster/`
+  finds nothing, and the three files R1 names keep only the English word in older comments
+  (`bin.rs:305`, `support.rs` doc lines), none of them T2's.
+- `git diff origin/main...HEAD -- rust/crates/lakehouse-bi/src/bin.rs src/lib/chart-bins.ts src/lib/chart-bins.test.ts`
+  shows one hunk, and it is not T2's: `bin.rs:595` (`grid_points_sql`) uses
+  `agg.rounded(measure)` with the `LH-BI-6-04 (BI-55, D4)` mark — T1's change. Nothing else
+  is left.
+- Documents: row 7 of the Decisions table in `docs/core/features/bins-groups-hierarchies.md`
+  is removed, and the `BI-55` changelog entry loses only the clause "automatic bins of a
+  whole-number column such as a year are never narrower than 1 and read "2020";". No other
+  line of this branch speaks of whole-number bins: `grep` over `docs/`, `CHANGELOG.md`,
+  `src/` and `rust/` finds only the plan's own T2 section and the pre-existing
+  `chart-builder-questions.md:57` (T1's sum rule) and `bin.rs:305` (a width parse), none of
+  them about bins of a whole column.
+
+**R3, R4, R6.**
+
+- R3: `make_pdf` keeps `started` for `slot_wait_ms` and takes
+  `let rendering = std::time::Instant::now();` after `take_slot`; `render_ms` uses it, with
+  the R3 mark at the line. `pdf_export::millis` became `pub(crate)` and
+  `routes/render.rs` calls it for `payload_ms` instead of repeating its body. The
+  `slot_wait_ms`/`render_ms` lines are unchanged as log keys, so the plan's stage names in
+  `BI-53-RESULT.md` still match.
+- R4: the machine line reads "ARM64 (`aarch64`), 20 CPUs." with no path; the 245 ms sentence
+  carries "(one run each, and the two runs differ in orientation as well as in order)". No
+  number changed.
+- R6: the one-line comment sits above a `const width = paperContentWidth(…)` in
+  `render-view.tsx` (a `//` comment in that spot of the JSX tree would print as text), and
+  the box's style uses `width`; its value and the test are unchanged. `paperContentWidth`'s
+  doc names `LH-BI-1-01` F1, `LH-BI-6-22` and `LH-BI-6-23`.
+- R5 needed nothing (the plan's own sentence is the fix). T3 stays not built.
+
+**Commands, run in the foreground on `899adfd7`, `CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-4
+CARGO_BUILD_JOBS=6`.**
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` (from `rust/`) | clean, no diff |
+| `cargo clippy -p lakehouse-bi --all-targets -- -D warnings` | `Finished` in 7.11 s, 0 warnings |
+| `cargo clippy -p lakehouse-api --all-targets -- -D warnings` | `Finished` in 1 m 12 s, 0 warnings |
+| `cargo test -p lakehouse-bi --lib` | 638 passed, 0 failed, 4 ignored |
+| `cargo test -p lakehouse-api --test chart_numbers` | 1 passed, 0 failed (T1's only; T2's is gone) |
+| `cargo test -p lakehouse-api --test dashboard_export` | 11 passed, 0 failed |
+| `cargo test -p lakehouse-api --test sec11_guard` | 4 passed, 0 failed |
+| `cargo test -p lakehouse-api --test route_auth` | 94 passed, 0 failed |
+| `bun install --frozen-lockfile` | 779 installs, 753 packages, no changes |
+| `bun run typecheck` | 0 errors |
+| `bun run lint` | 0 errors, 11 warnings (the same 11 as before this round) |
+| `bun test src/lib src/features/dashboards` | 1971 pass, 1 skip, 0 fail, 4361 expect() calls, 209 files |
+| `bun run test` | 4234 pass, 1 skip, 0 fail, 13035 expect() calls, 389 files |
+
+`bun run test` is 3 lower than the review's 4237 because T2's three console tests left with
+T2; no other test changed.
+
+**Not verified.**
+
+- `cargo test` is not run in full on the branch: the block above is the scoped set of step C
+  (rules: no `cargo test --workspace`). CI on the pull request is the full run.
+- The `render_ms`/`slot_wait_ms` split is not seen in a live log: it needs a running stack
+  and Gotenberg, which the build machine does not start (D18), the same reason
+  `BI-53-RESULT.md` lists those stages as *not measured*.
+- The print view's width and the R6 comment have no runtime check beyond
+  `render-view.test.tsx`'s `style.width`; a real PDF is still the owner's acceptance run.
