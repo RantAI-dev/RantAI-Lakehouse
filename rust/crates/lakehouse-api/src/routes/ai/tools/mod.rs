@@ -418,9 +418,12 @@ async fn require_chart_call_allowed(
     let scope = scope_for_write(state, principal).await?;
     // `AI-6`: a chart call that names a map that does not exist is refused
     // here, so the draft and the save refuse it with one sentence. It runs
-    // after the writer check (nobody without `dashboard:write` learns which
-    // maps exist) and before the board checks (the map catalogue needs no
-    // dashboard).
+    // after the writer check (a caller with neither `dashboard:read` nor a
+    // rule is refused there) and before the board checks (the map catalogue
+    // needs no dashboard). The uploaded maps it names are the ones
+    // `list_maps` already shows any assistant caller, so nothing new is
+    // disclosed.
+    // (PR #524 security review)
     maps::require_known_map(state, name, args).await?;
     if name == "create_chart" {
         require_edit_on(state, &scope, &arg_str(args, "board")).await?;
