@@ -103,18 +103,6 @@ fn classify_ch_error(err: &ChError) -> ApiError {
     upstream_error::ch_error(&SQL_SOURCE, err)
 }
 
-/// The placeholder values (`{{principal_id}}` and friends) of `principal`.
-fn placeholders_for(principal: &Principal) -> crate::sql_rewrite::PlaceholderValues {
-    crate::sql_rewrite::PlaceholderValues {
-        principal_id: Some(principal.id.uuid().to_string()),
-        principal_tenant_ids: principal
-            .tenant_ids
-            .iter()
-            .map(ToString::to_string)
-            .collect(),
-    }
-}
-
 /// Steps 1 and 2 of the module posture: the lexical gate, then the policy
 /// rewrite for `principal`. Returns `(normalized, rewritten)`: the text to
 /// store and the text that may be executed now.
@@ -128,7 +116,7 @@ async fn checked_and_rewritten(
     check_and_rewrite(
         sql,
         &principal.role_names,
-        &placeholders_for(principal),
+        &crate::routes::support::placeholders_for(principal),
         &obligations,
         gate,
     )
@@ -164,21 +152,15 @@ async fn check_and_rewrite(
 }
 
 /// The columns `rewritten` returns, via `DESCRIBE` (no rows are read).
+///
+/// The probe itself is [`crate::routes::support::describe_columns`], shared
+/// with the pipeline preview (BLD-1 part 1 / D16); this wrapper keeps the
+/// dashboard preview's own fixed sentence for an engine failure and for a
+/// statement that returns nothing.
 async fn probe_columns(ch: &ChClient, rewritten: &str) -> Result<Vec<SourceColumn>, ApiError> {
-    let sql = format!("DESCRIBE (SELECT * FROM (\n{rewritten}\n))");
-    let rows = ch
-        .rows(&sql, None)
+    let columns = crate::routes::support::describe_columns(ch, rewritten)
         .await
         .map_err(|err| classify_ch_error(&err))?;
-    let columns: Vec<SourceColumn> = rows
-        .iter()
-        .filter_map(|r| {
-            Some(SourceColumn {
-                name: r.get("name")?.as_str()?.to_owned(),
-                ty: r.get("type")?.as_str()?.to_owned(),
-            })
-        })
-        .collect();
     if columns.is_empty() {
         return Err(ApiError::Unprocessable(
             "the SQL source returns no columns.".to_owned(),
@@ -465,7 +447,7 @@ pub async fn preview(
         ),
         &obligations,
         &principal.role_names,
-        &placeholders_for(&principal),
+        &crate::routes::support::placeholders_for(&principal),
         body,
         &time,
     )
