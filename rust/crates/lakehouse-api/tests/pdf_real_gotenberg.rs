@@ -7,7 +7,7 @@
 //!   --add-host=host.docker.internal:host-gateway gotenberg/gotenberg:8.37.0 \
 //!   gotenberg --api-timeout=70s --log-level=warn
 //! GOTENBERG_TEST_URL=http://127.0.0.1:13331 cargo test -p lakehouse-api \
-//!   --test pdf_real_gotenberg -- --ignored
+//!   --test it pdf_real_gotenberg:: -- --ignored
 //! docker stop bi1-gotenberg-scratch
 //! ```
 //!
