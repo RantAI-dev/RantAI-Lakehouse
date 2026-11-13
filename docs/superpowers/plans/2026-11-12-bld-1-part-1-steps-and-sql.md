@@ -1077,6 +1077,12 @@ test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
 (finished between 4.53 s and 6.43 s). That is 20 of 20, none failed.
 
+### Handoff S2, fix round 2 (developer, 2026-11-13)
+
+- **Commits:** `2c15ea883` `test(pipelines): the preview test's comment says what is known (S2 review R2-S1)` — the comment above the assertion only, rewritten to say what is known (what the test asserts and why; the gate is Postgres and the rewrite refuses at `table_access` before its prefetch; the "received nothing at all" form failed twice in the reviewer's runs on 2026-11-13, the stray request was never captured and did not reproduce in 230 runs; a request from another test process on a reused port is a guess, not a finding; the assertion prints everything received). The assertion and every other line are unchanged. `42932cdb4` `Merge remote-tracking branch 'origin/main' into feat/bld-1-steps-preview` — no conflict.
+- **Counts on `42932cdb4`:** `cargo fmt --check` clean; `cargo-locked clippy -j 2 -p lakehouse-api --all-targets -- -D warnings` clean; `--test pipeline_preview` 10 passed, `--test sec11_guard` 4 passed, `--test route_auth` 95 passed, 0 failed in each.
+- **What the merge touched:** 31 files, +2063 −91: 27 under `src/` (the console's WEB-11 round), `CHANGELOG.md`, the new plan `docs/superpowers/plans/2026-11-12-qa-round-web-11.md`, and `docs/core/features/pages-per-role.md`. No Rust and no `dagster/` file, so the branch's Rust is exactly what round 1 verified. No new migration: `0140` (this feature's) is still the highest, and this slice adds none.
+
 ## 7. Review
 
 
