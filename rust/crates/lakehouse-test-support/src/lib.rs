@@ -380,13 +380,53 @@ fn is_sweepable(name: &str) -> bool {
 struct Sweeper {
     /// The databases that had no connection on the previous pass.
     idle_seen_last_pass: BTreeSet<String>,
+    /// `None`: every database on the server. That is the sweep of a test
+    /// process (`start_sweep`), whose passes are `SWEEP_INTERVAL` apart.
+    /// `Some`: only the databases with exactly these names (`OPS-22`, see
+    /// [`Sweeper::only`]).
+    only: Option<BTreeSet<String>>,
 }
 
 impl Sweeper {
-    /// A sweeper that has not run a pass yet.
+    /// A sweeper that has not run a pass yet, and that looks at every
+    /// database on the server.
+    ///
+    /// It is the server-wide sweeper, built by `start_sweep`. A test builds
+    /// it once, to assert that scope, and never runs two passes with it:
+    /// `OPS-22`, two passes with no time between them would drop every test
+    /// database that is idle at that instant, another test's included (see
+    /// [`Sweeper::only`]).
     fn new() -> Self {
         Self {
             idle_seen_last_pass: BTreeSet::new(),
+            only: None,
+        }
+    }
+
+    /// A sweeper that looks only at the databases with these names.
+    ///
+    /// `OPS-22`: this crate's tests run two passes with no time between
+    /// them. With the server-wide rule those two passes dropped every test
+    /// database on the shared server that had no backend at that instant:
+    /// the databases of the other tests of this binary (CI runs 43250741080,
+    /// 43344075791, 43349333080) and the database of a running
+    /// `#[sqlx::test]` of another binary (CI run 43033910245). `cargo
+    /// nextest` gives every test a process of its own, so an in-process
+    /// turn token cannot keep them apart. A test's sweeper is therefore
+    /// given the names the test created and never sees another database.
+    #[cfg(test)]
+    fn only(names: &[&str]) -> Self {
+        Self {
+            idle_seen_last_pass: BTreeSet::new(),
+            only: Some(names.iter().map(|name| (*name).to_owned()).collect()),
+        }
+    }
+
+    /// Whether this sweeper may look at the database with this name.
+    fn in_scope(&self, name: &str) -> bool {
+        match &self.only {
+            None => true,
+            Some(names) => names.contains(name),
         }
     }
 
@@ -430,7 +470,8 @@ impl Sweeper {
         for row in rows {
             let name: String = row.try_get("name")?;
             let busy: bool = row.try_get("busy")?;
-            if is_sweepable(&name) && !busy {
+            // OPS-22: a test's sweeper sees only the test's own databases.
+            if is_sweepable(&name) && self.in_scope(&name) && !busy {
                 idle_now.insert(name);
             }
         }
@@ -748,7 +789,7 @@ mod tests {
         create_database(&lakehouse_name).await;
         create_database(&sqlx_name).await;
 
-        let mut sweeper = Sweeper::new();
+        let mut sweeper = Sweeper::only(&[lakehouse_name.as_str(), sqlx_name.as_str()]);
         sweeper
             .pass(&database_url())
             .await
@@ -794,7 +835,7 @@ mod tests {
         let _cleanup = Cleanup::new(&[name.as_str()]);
         create_database(&name).await;
 
-        let mut sweeper = Sweeper::new();
+        let mut sweeper = Sweeper::only(&[name.as_str()]);
         sweeper
             .pass(&database_url())
             .await
@@ -831,7 +872,7 @@ mod tests {
             .await
             .expect("connect to the new test database");
 
-        let mut sweeper = Sweeper::new();
+        let mut sweeper = Sweeper::only(&[name.as_str()]);
         sweeper
             .pass(&database_url())
             .await
@@ -864,7 +905,10 @@ mod tests {
         let _cleanup = Cleanup::new(&[name.as_str()]);
         create_database(&name).await;
 
-        let mut sweeper = Sweeper::new();
+        // The scope holds the `untouched_db_…` name on purpose: only
+        // `is_sweepable` keeps this database, which is what the test is
+        // about (`OPS-22`).
+        let mut sweeper = Sweeper::only(&[name.as_str()]);
         sweeper
             .pass(&database_url())
             .await
@@ -914,7 +958,7 @@ mod tests {
         let _cleanup = Cleanup::new(&[name.as_str()]);
         create_database(&name).await;
 
-        let mut sweeper = Sweeper::new();
+        let mut sweeper = Sweeper::only(&[name.as_str()]);
         let candidates = sweeper
             .pass(&database_url())
             .await
@@ -930,6 +974,124 @@ mod tests {
         );
 
         drop_database(&name).await;
+    }
+
+    #[test]
+    fn the_sweep_of_a_test_process_looks_at_every_database_and_a_tests_sweep_only_at_its_own() {
+        // OPS-22: the scope is for this crate's tests only. The sweep of a
+        // test process must still see every leftover database (`OPS-13`).
+        let server_wide = Sweeper::new();
+        assert!(server_wide.in_scope("_sqlx_test_anything"));
+        assert!(server_wide.in_scope("lakehouse_api_test_anything"));
+
+        let scoped = Sweeper::only(&["lakehouse_api_test_mine"]);
+        assert!(scoped.in_scope("lakehouse_api_test_mine"));
+        assert!(!scoped.in_scope("lakehouse_api_test_theirs"));
+        assert!(!scoped.in_scope("_sqlx_test_anything"));
+    }
+
+    #[tokio::test]
+    async fn the_two_passes_of_another_test_between_this_tests_passes_take_nothing_from_it() {
+        // OPS-22, CI runs 43250741080, 43344075791 and 43349333080: another
+        // test of this binary ran its two passes between this test's two
+        // passes and dropped this test's database, so this test's second
+        // pass no longer found it. The interleaving is built here on purpose.
+        let mine = format!("_sqlx_test_{}", unique_suffix());
+        let theirs = format!("lakehouse_api_test_{}", unique_suffix());
+        let _cleanup = Cleanup::new(&[mine.as_str(), theirs.as_str()]);
+        create_database(&mine).await;
+        create_database(&theirs).await;
+
+        let mut my_sweeper = Sweeper::only(&[mine.as_str()]);
+        let mut their_sweeper = Sweeper::only(&[theirs.as_str()]);
+        my_sweeper
+            .pass(&database_url())
+            .await
+            .expect("run this test's first pass");
+        their_sweeper
+            .pass(&database_url())
+            .await
+            .expect("run the other test's first pass");
+        let their_candidates = their_sweeper
+            .pass(&database_url())
+            .await
+            .expect("run the other test's second pass");
+        let my_candidates = my_sweeper
+            .pass(&database_url())
+            .await
+            .expect("run this test's second pass");
+
+        assert!(
+            my_candidates.contains(&mine),
+            "a database is still picked by its own test after another test's two passes"
+        );
+        assert!(
+            !their_candidates.contains(&mine),
+            "another test's sweep never picks this test's database"
+        );
+        assert!(
+            their_candidates.contains(&theirs),
+            "the other test's sweep picks its own database"
+        );
+        assert!(
+            !my_candidates.contains(&theirs),
+            "this test's sweep never picks the other test's database"
+        );
+        assert!(
+            !database_exists(&mine).await,
+            "this test's database is gone"
+        );
+        assert!(
+            !database_exists(&theirs).await,
+            "the other test's database is gone"
+        );
+
+        drop_database(&mine).await;
+        drop_database(&theirs).await;
+    }
+
+    #[tokio::test]
+    async fn the_two_passes_of_a_test_leave_the_idle_database_of_another_test_alone() {
+        // OPS-22, CI run 43033910245: the two passes of a test of this crate
+        // dropped the database of a running `#[sqlx::test]` of another
+        // binary (Postgres `3D000`). `theirs` stands for that database at a
+        // moment it has no backend: sqlx creates it before it connects to
+        // it, and its pool closes an idle connection after one second.
+        let mine = format!("lakehouse_api_test_{}", unique_suffix());
+        let theirs = format!("_sqlx_test_{}", unique_suffix());
+        let _cleanup = Cleanup::new(&[mine.as_str(), theirs.as_str()]);
+        create_database(&mine).await;
+        create_database(&theirs).await;
+
+        let mut sweeper = Sweeper::only(&[mine.as_str()]);
+        sweeper
+            .pass(&database_url())
+            .await
+            .expect("run the first sweep pass");
+        let candidates = sweeper
+            .pass(&database_url())
+            .await
+            .expect("run the second sweep pass");
+
+        assert!(
+            !candidates.contains(&theirs),
+            "a test's sweep never picks the idle database of another test"
+        );
+        assert!(
+            database_exists(&theirs).await,
+            "the idle database of another test survives a test's two passes"
+        );
+        assert!(
+            candidates.contains(&mine),
+            "the test's own database is picked after two passes"
+        );
+        assert!(
+            !database_exists(&mine).await,
+            "the test's own database is gone"
+        );
+
+        drop_database(&theirs).await;
+        drop_database(&mine).await;
     }
 
     #[test]
