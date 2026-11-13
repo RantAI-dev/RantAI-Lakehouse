@@ -1609,3 +1609,42 @@ mutation-tested.
 **MISMATCH.** None. R5's code was shaped as the finding describes (`built` is
 `filtered.grain`, and `switch_skip` answers `NoGrain` for a `None` built with no column kind),
 so the guard went in where R5 says.
+
+### Round 2 (planner, 2026-11-13, at `13107bc0`)
+
+Read: the fix commit `0f40c62c` (16 files, 249 insertions, 74 deletions).
+
+- R1: fixed. `explains` and the question to the policy take only the engine's code 43, a
+  named constant whose doc says where the number comes from and that another code is added
+  only when measured. The table test has the rows for 241 and 60 and failed before the
+  change (the developer quotes it). The feature page's limit says so, *(proposed, not yet
+  signed)*.
+- R4: fixed, in the same `match`: an engine failure of any other code no longer reads the
+  policy again.
+- R2: fixed. `LayerFake` has a mode; the mask test answers the refusal only to a statement
+  that carries the mask and asserts that such a statement arrived.
+- R3: fixed. A store error leaves the address's parameter values; its test failed first.
+- R5: fixed. A chart that fell back to its stored statement and has its own grain is left
+  alone; one test in `mod time_grain`.
+- R6, R7, R8, R10, R11: fixed. `policy_engine.rs` changed in comments only: no line of code
+  in it changed in this round.
+- R9: the four lines are in the developer's handoff.
+
+No existing assertion was loosened. The developer's counts on `0f40c62c`: `--lib
+layers_rewrite` 8 pass, 7 ignored; `--lib time_grain` 19; `--test table_access` 17;
+`sec11_guard` 4; `route_auth` 94; clippy and fmt clean; `bun run test` 4239 pass, 1 skip, 0
+fail on the clean run. Not run by the planner; CI on the pull request decides. The developer
+merged no `main`: it had not moved when the round started; the branch is behind `main` now
+and is updated before the merge.
+
+**A test that failed and is not this branch's.** One full console run failed twice on
+`SchemaBrowser > keeps the table's name unknown on a Trino tab until its detail loads`
+(`src/features/queries/schema-browser.test.tsx:360`, `Received: "SELECT * FROM
+undefined.undefined"`), then the file passed 20 of 20 alone. This branch does not touch
+that file. It is the second sighting today (the first was on the `WEB-11` branch); the
+planner files its backlog row.
+
+**No open BLOCKER.** The pull request is marked ready. It merges when CI is green on its
+head, it is up to date with `main`, and the AI team has reviewed the assistant's part (one
+standard request, the page context) or the product owner has waived that review for this
+pull request.
