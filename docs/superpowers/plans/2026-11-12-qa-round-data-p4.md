@@ -1761,3 +1761,159 @@ Two deviations from the commit grouping, both mine to report:
   to split it — a rebase or force-push is not allowed on this branch.
 - The restore's second mirror test passes before the fix as well; it pins the
   branch the review kept, as written above.
+
+### Round 2 (planner, 2026-11-13, at `f3c0875e`)
+
+A second independent reading of round 1's four commits, then the planner's rulings. The Rust
+code was read, not built; CI on the pull request (#501) is the run. Console, run in a clean
+checkout: `bun run typecheck` clean; `bun run lint` 0 errors, 11 warnings; `bun run test`
+4235 pass, 1 skip, 0 fail across 390 files; both repo lints pass. No existing assertion was
+weakened; the handoff's counts match the files.
+
+| Round 1 | Closed? |
+| --- | --- |
+| R1 (cancellation) | Partly: the 15-second bound is right and production uses it; the spawned stretch is right for drop and restore; S2 and S4 below |
+| R2 (unknown outcome) | No: the three arms are as ruled, but **the healing rule the planner wrote is unsafe** (S1) |
+| R3 (load and drop) | No: both second checks exist, and healing defeats the load's (S1) |
+| R5 (missing tests) | Yes; S6 tightens some |
+| R6, R7, R9 | Yes; S7 for comments commit A made untrue |
+| R10 | One site left (S7) |
+
+Two BLOCKERs. S1 is a hole in round 1's ruling, not a deviation by the developer.
+
+**Commit E, `fix(review): a record is healed only when its drop cannot be in flight (S1, S2, S3)`**
+
+- **S1. BLOCKER: healing removes the record of a drop that is in flight.** The drop writes
+  its record first and sends the catalog's `DELETE` afterwards. From the insert until the
+  catalog has applied the `DELETE` the table exists and the record is true. Round 1's rule
+  ("a record for a table that exists is stale: remove it") lets anything that reads the
+  record in that stretch remove it: a load (both checks pass again, R3 is open), a second
+  `POST …/drop` (it ends with the table dropped and no record), or just opening the table's
+  Activity tab (`GET …/drop`). The tests did not see it because none of their stand-ins says
+  "the table exists" during a drop. **The rule is replaced:**
+  1. `lakehouse-store/src/uploads.rs`: a new function beside `forget_table_drop`, for
+     healing only, e.g. `heal_table_drop(pool, table, dropped_at, grace_seconds) ->
+     Result<bool, StoreError>`: `DELETE FROM upload_table_drop WHERE bronze_table = $1 AND
+     dropped_at = $2 AND dropped_at <= now() - ($3::bigint * interval '1 second')`, values
+     bound, returning whether a row went. `$2` is the `dropped_at` of the record just read,
+     so a newer record is never removed. A store test: a young record is not removed; an old
+     one is; a record replaced since the read is not.
+  2. `catalog_drop.rs`: a named constant `HEAL_GRACE` of **120 seconds**, with a doc that
+     says it must exceed the longest stretch a drop can be in flight (the `DELETE`'s 15
+     seconds, the outcome checks' two 10 seconds, and margin). In `dropped_now`, when the
+     table exists: call the new function with the record's own `dropped_at`; a row went →
+     one `tracing::warn!`, "not dropped"; no row went (the record is young, or was replaced)
+     → **the record stands** ("dropped").
+  3. `catalog_restore.rs`, where `POST …/restore` finds "the table exists" and clears the
+     record before answering 409: use the same guarded removal. The restore's own success
+     path (the undrop worked, or the mirror case found the table back) keeps the plain
+     `forget_table_drop`: there the task knows its outcome.
+  4. `Drop`'s own removals for a definite refusal (a 4xx, the load found by the second
+     check) stay plain: the task knows its outcome.
+  5. **Round 1's second arm is withdrawn** (the planner's ruling again): after a `Transport`
+     or `Server` from the `DELETE`, "not listed as deleted and the table exists" does NOT
+     remove the record any more, because a `DELETE` whose client gave up may still be applied
+     by the catalog. It goes to the third arm: keep the record, `failed` with "the outcome is
+     not known", `503` with D5's sentence. If the table is still there after the grace, the
+     next read heals the record. The sentence round 1 introduced for that arm, `The catalog
+     did not answer and the table was not dropped. Try again shortly.`, is removed with its
+     constant; its test is rewritten to expect the third arm (the commit body says why: the
+     planner withdrew the arm).
+  6. Tests, each with the Iceberg stand-in saying what a real catalog says before the
+     `DELETE` lands, "the table exists" (`mount_existing_iceberg_table` or the file's own
+     helper): (i) two `POST …/drop` at once: one `200`, one `409` with the already-dropped
+     sentence, one `DELETE`, the record PRESENT afterwards; (ii) the load-side test of R3
+     with the catalog reachable and the table existing: T6's `409`, the record still there,
+     nothing launched; (iii) `GET …/drop` with a fresh record and an existing table:
+     `droppable: false`, record kept. The two existing healing tests backdate their record
+     (`UPDATE upload_table_drop SET dropped_at = now() - interval '10 minutes'`), with a
+     comment saying why. Each of (i), (ii), (iii) must be seen to FAIL before the fix.
+- **S2. BLOCKER: a catalog call inside the spawned task has no bound.** In
+  `settle_unknown_outcome`, `table_exists` is awaited bare; the Iceberg client has no request
+  timeout and the task is no longer cut by the route's deadline, so a hanging catalog leaves
+  `allowed` with no ending (R1's own symptom). Wrap it in `tokio::time::timeout(OUTCOME_CHECK_TIMEOUT, …)`;
+  only a definite answer counts, everything else keeps the record. The same for the
+  restore: `Restore::run` awaits `undrop_table` with no bound inside its task; wrap that call
+  in `tokio::time::timeout` (a named constant, 15 seconds, as the drop's) and treat an
+  elapsed bound as `OpenfgaError::Transport`, which goes to the mirror case. Every `.await`
+  on the catalog inside either task has a bound after this; say so in each task's doc.
+- **S3. SHOULD-FIX: "listed as deleted" is taken as proof.** After a `Transport`/`Server`,
+  `Found` writes `executed` without asking whether the table is gone; an older deleted copy
+  of the same name would make a failed `DELETE` read as a drop. On `Found`, ask the bounded
+  `table_exists`: only "the table is not there" is "the drop happened"; `Found` and the
+  table exists is "the answers do not agree": the third arm. One test: 500, listed as
+  deleted, the table exists → `503`, D5's sentence, record kept, `allowed` then `failed`.
+
+After commit E the unknown-outcome rule is, in full: **deleted AND gone → `executed`, 200,
+record kept; anything else → record kept, `failed` ("the outcome is not known"), 503.**
+Nothing but a definite 4xx, the second load check, or healing after the grace removes a
+record.
+
+**Commit F, `test(review): the spawn and the fail-closed arms are tested (S4, S5, S6)`**
+
+- **S4.** Nothing tests R1's spawn: with `job.run().await` in its place every test passes.
+  One test per route: the catalog stand-in answers the `DELETE` (the undrop) after 1.5
+  seconds; the `POST` runs in a spawned test task; poll until the stand-in has received the
+  call; `abort()` the test task (the handler is dropped mid-call); then poll up to five
+  seconds for the audit outcomes `allowed` then `executed` and assert the record's state
+  (present after the drop, cleared after the restore). To see it bite, replace the spawn by
+  a plain `.await` once, see the trail stay at `allowed`, and put it back; say so in the
+  handoff.
+- **S5.** The arm "not listed as deleted, and the table is absent or cannot be asked" has no
+  test: `DELETE` answers 500, nothing is listed as deleted, the table is missing → `503`
+  with D5's sentence, record kept, `allowed` then `failed` with "the outcome is not known".
+  A second test for a deleted list that never ends (a next-page token on every page), same
+  expectations.
+- **S6.** Tighten, without loosening anything: the two-drops test asserts the refused
+  answer's exact sentence, that exactly one record is left, and the audit outcomes; the
+  tenant-gate, unknown-id and warehouse tests assert that no `catalog.drop` entry and no
+  record were written; the test that asserts the second entry is `failed` also asserts the
+  first is `allowed`; the list-stops-at-100 test asserts WHICH row is left out (the oldest);
+  the no-answer-within-the-bound test asserts the body holds no upstream text.
+
+**Commit G, `docs(review): comments and names after round 2 (S7, S9)`**
+
+- **S7 (rule 1, R10).** `dropped_now`'s `# Errors`: only the read returns an error (a failed
+  removal is logged). `Restore::run`'s `# Errors`: the record's clearing does not return an
+  error; the 503 of the first audit entry is missing. `OUTCOME_CHECK_TIMEOUT`'s doc: true
+  after S2; check it. `drop_table`'s `# Errors`: list the 503s that exist after commit E
+  (including "dropping is not set up"). `status` and `list`: a database failure is the
+  store's 500 "database error", not a 503; 503 is "no pool configured". `openfga.rs`,
+  `drop_table`'s doc: add `(QA LH-DATA-15-06, TC-1731)`.
+- **S9.** Rename the struct `Drop` to `DropJob` and `Restore` to `RestoreJob` (a struct named
+  `Drop` shadows the prelude's trait in that module). The "settle the claim as failed" block
+  in `routes/uploads.rs` is written three times: make it one private helper and call it from
+  the three places (rule 4). The two `INTERRUPTED` sentences stay as they are; the planner
+  lists them below.
+- Feature page, `docs/core/features/asset-page-depth.md`, at the end of "Limits to tell a
+  customer", one line: "- If the catalog does not answer a drop, the table stays marked as
+  dropped until the product can tell: for up to two minutes a table that was not dropped
+  can read as dropped, and a load into its name is refused. A drop the catalog applies later
+  than that is not recorded. *(proposed, not yet signed)*".
+
+**For the planner, not the developer.**
+
+- **S8.** The handoff of round 1 lists the load-side test of R3 under commit B; it is in
+  commit A (`dc470d7f` adds one test, not two). Nothing claimed as tested is untested. The
+  developer corrects the sentence in this round's handoff.
+- The two sentences shown when the spawned work itself breaks (a join error) are new text
+  on screen that D5 does not list. They are fixed and ours; they are added to D5 by this
+  entry as *(proposed, not yet signed)*: the drop's and the restore's `INTERRUPTED`
+  constants, as written in the code.
+- Not established by reading, and only a real catalog shows: that the catalog answers "not
+  found" to the load of a soft-deleted table (the healing rule and the restore rest on it;
+  the G9 gate step of T8 is the proof); whether the catalog applies a `DELETE` whose client
+  gave up; whether anything between the API and the catalog answers 408 or 429 itself (every
+  4xx is a definite refusal here). A spawned task is not awaited by a graceful shutdown once
+  its request has gone: accepted, the record and the `allowed` entry then stand, and the
+  healing rule or a restore settles them.
+
+The developer's handoff for this round, appended below this entry: the merge commit (if
+`main` moved) and the three commits; every command with its counts (`cargo fmt --check`;
+clippy for `lakehouse-api`, `lakehouse-store`, `lakehouse-auth`, all targets, `-D warnings`;
+`cargo test -p lakehouse-store --test uploads`; `cargo test -p lakehouse-auth --test
+openfga`; `cargo test -p lakehouse-api --test catalog_restore`; `--test upload_routes`;
+`--test sec11_guard`; `--test route_auth`; both repo lints; `bun run typecheck`; `bun run
+lint`; `bun test src/features/catalog`); each new test by name with the failure line seen
+before its fix; the spawn's bite check (S4); S8's corrected sentence; anything *not
+verified*; every MISMATCH.
