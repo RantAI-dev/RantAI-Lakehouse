@@ -966,3 +966,27 @@ before either closed the record, and the test passes with the assertion unweaken
 there and is not mine to remove: `24d7d1d1667e` `postgres:16-alpine`, up 7 hours,
 `0.0.0.0:33908->5432/tcp`, name `upbeat_engelbart`. It is still there after the runs; the
 test harness starts nothing of its own here, so this round started and removed no container.
+
+### Round 2 (planner, 2026-11-13, at `7230334d`)
+
+Read: the fix commit `6b3b842c` (four files, 45 insertions, 20 deletions) and the merge of
+`main` (`9effb862`, no conflict).
+
+- R1: fixed. The doc of `close_run_record` now says a `CANCELED` run stopped before its limit
+  closes as `other`, and that "Run now" cancels only a run already past its limit.
+- R2: fixed. The second read's whole answer is compared with the first, and the stored
+  record's end time is asserted.
+- R3: fixed. The run-status answer takes 300 ms and the test asserts two status requests; the
+  developer's run saw 2, so the two reads do overlap and "closed once, one line" is now about
+  the row lock.
+- R4: fixed, as worded.
+- R6: fixed, both parts.
+- R5, R7: no change was asked.
+
+No existing assertion changed in the fix commit. The developer's counts on `6b3b842c`:
+`ingest_run` 38, `quality_incidents` 19, `sec11_guard` 4, `route_auth` 94 (one more than
+before the merge: `main` added a route test), clippy and fmt clean. Not run by the planner;
+CI on the pull request is the run that decides.
+
+**No open BLOCKER.** The pull request is marked ready; it merges when CI is green on its
+head and it is up to date with `main`.
