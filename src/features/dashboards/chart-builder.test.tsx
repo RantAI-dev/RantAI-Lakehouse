@@ -705,6 +705,21 @@ describe("ChartBuilder breakdown grain and limit label (QA LH-BI-6-01)", () => {
     await waitFor(() => expect(bodies.some((b) => b.breakdownGrain === "month")).toBe(true))
   })
 
+  // QA LH-BI-6-25 (BI-49): a radar compares measures like a bar does, so the
+  // builder offers "Add measure" and the preview carries both.
+  it("a radar offers Add measure and sends both measures", async () => {
+    renderBuilder({ ...barDef, kind: "radar" })
+    await screen.findByLabelText("Measure (Y)")
+    fireEvent.click(screen.getByRole("button", { name: /What to show/ }))
+    fireEvent.click(await screen.findByRole("button", { name: /Add measure/ }))
+    await waitFor(() => expect(screen.queryAllByRole("option")).toHaveLength(0))
+    choose(await screen.findByLabelText("Measure 2"), "stay")
+    await waitFor(() => expect(bodies.some((b) => Array.isArray(b.measures) && b.measures.length === 2)).toBe(true))
+    const body = bodies[bodies.length - 1]!
+    expect(body.kind).toBe("radar")
+    expect(body.measures).toEqual(["visitors", "stay"])
+  })
+
   it("the limit label names the breakdown when the chart has one", async () => {
     renderBuilder({ ...barDef, breakdown: "category" })
     await screen.findByLabelText("Aggregation of visitors")
