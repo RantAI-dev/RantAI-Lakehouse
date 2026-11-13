@@ -38,6 +38,7 @@ import { DATA_LAYER_LABEL, type DataLayer } from "@/lib/status"
 import { cn } from "@/lib/utils"
 import { NamespaceFilterRow, NamespaceSummary, QuickFilterRow } from "./catalog-namespaces"
 import { getAssetActions } from "./data-explorer-actions"
+import { DroppedTablesNote } from "./dropped-tables"
 import { getDataExplorerColumns } from "./data-explorer-columns"
 
 /**
@@ -321,6 +322,10 @@ export function CatalogPage() {
         title="Catalog"
         description="Every governed table and file. Search by name, column, tag, description or owner, narrow by namespace or layer, and open an asset for its schema, quality, lineage and access."
       />
+
+      {/* `DATA-55`: the tables dropped from the console, with the days each has
+          left; each links to its page, where the restore lives. */}
+      <DroppedTablesNote />
 
       {error ? (
         // React Query widens whatever was thrown to `Error`; `ErrorState`

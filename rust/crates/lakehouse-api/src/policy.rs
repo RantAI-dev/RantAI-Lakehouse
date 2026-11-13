@@ -292,6 +292,16 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET", "/api/catalog/{id}/restore",                 Policy::RequiresPermission("catalog:read")),
     ("POST", "/api/catalog/{id}/restore",                Policy::RequiresPermission("governance:write")),
 
+    // DATA-55 (QA `LH-DATA-15-06`, `TC-1731`): dropping a table a file upload
+    // made. The permission is `governance:write` *(proposed, not yet signed,
+    // D6)*: it is the one the signed decision gives the restore, so whoever is
+    // offered Drop table is also offered Restore on the same page.
+    ("GET", "/api/catalog/{id}/drop",                    Policy::RequiresPermission("governance:write")),
+    ("POST", "/api/catalog/{id}/drop",                   Policy::RequiresPermission("governance:write")),
+    // The list of dropped tables is `catalog:read`, like the restore's status
+    // read: it shows what can be restored, and restoring needs more.
+    ("GET", "/api/catalog/dropped/tables",               Policy::RequiresPermission("catalog:read")),
+
     // ── Lakehouse (WS2 §4): the read-only Iceberg warehouse/namespace/
     //    table surface, gated by the same seeded `catalog:read` permission
     //    as the dataset registry above. ────────────────────────────────────
@@ -1393,6 +1403,36 @@ mod tests {
         assert_eq!(
             policy_for("POST", "/api/catalog/{id}/restore"),
             Some(Policy::RequiresPermission("governance:write"))
+        );
+    }
+
+    /// `DATA-55` D6: whether a table may be dropped is the same authority that
+    /// drops it, `governance:write`.
+    #[test]
+    fn the_drop_status_needs_governance_write() {
+        assert_eq!(
+            policy_for("GET", "/api/catalog/{id}/drop"),
+            Some(Policy::RequiresPermission("governance:write"))
+        );
+    }
+
+    /// `DATA-55` D6: dropping a table needs `governance:write` (proposed, not
+    /// yet signed), the permission the restore already takes.
+    #[test]
+    fn dropping_a_table_needs_governance_write() {
+        assert_eq!(
+            policy_for("POST", "/api/catalog/{id}/drop"),
+            Some(Policy::RequiresPermission("governance:write"))
+        );
+    }
+
+    /// `DATA-55` D13: the list of dropped tables is `catalog:read`, like the
+    /// restore's status read.
+    #[test]
+    fn the_dropped_list_needs_catalog_read() {
+        assert_eq!(
+            policy_for("GET", "/api/catalog/dropped/tables"),
+            Some(Policy::RequiresPermission("catalog:read"))
         );
     }
 

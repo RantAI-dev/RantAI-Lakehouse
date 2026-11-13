@@ -526,6 +526,46 @@ export type AssetRestoreStatus =
     }
 
 /**
+ * `GET /api/catalog/{id}/drop` (`DATA-55`, QA `LH-DATA-15-06`, `TC-1731`):
+ * whether this table may be dropped
+ * from its page, and, only when asked for, how many rows it holds.
+ *
+ * `rowCount` is absent when the count was not asked for (`withRowCount`) and
+ * `null` when the rows could not be counted — never 0 for "unknown", because 0
+ * is a real answer for an empty table.
+ */
+export type AssetDropStatus =
+  | { supported: false; reason: string }
+  | { supported?: undefined; droppable: false; reason: string }
+  | { supported?: undefined; droppable: true; table: string; keptDays: number; rowCount?: number | null }
+
+/**
+ * `POST /api/catalog/{id}/drop` (`DATA-55`, QA `LH-DATA-15-06`, `TC-1731`):
+ * what was dropped and until when.
+ */
+export type AssetDropResult = {
+  table: string
+  rowCount: number | null
+  droppedAt: string
+  expiresAt: string
+}
+
+/**
+ * One row of `GET /api/catalog/dropped/tables` (`DATA-55` D13, QA
+ * `LH-DATA-15-06`, `TC-1731`): a table the
+ * caller's tenant dropped from the console, while it can still be restored.
+ * `rowCount` is `null` when the rows could not be counted.
+ */
+export type DroppedTableEntry = {
+  assetId: string
+  table: string
+  droppedBy: string
+  rowCount: number | null
+  droppedAt: string
+  expiresAt: string
+}
+
+/**
  * A catalog search's answer: the best matches and how many matched in all
  * (`DATA-41` D3, `DATA-54`). The palette shows a few of them and says how
  * many more there are.
@@ -644,6 +684,25 @@ export interface AssetService {
    * passed (410).
    */
   restoreTable(id: string, signal?: AbortSignal): Promise<void>
+  /**
+   * `GET /api/catalog/{id}/drop` — whether this table may be dropped from its
+   * page (`DATA-55`). The row count is a scan of the whole table, so it is
+   * only asked for (`withRowCount`) when the confirmation dialog opens.
+   */
+  getDropStatus(
+    id: string,
+    options?: { withRowCount?: boolean },
+    signal?: AbortSignal
+  ): Promise<AssetDropStatus>
+  /**
+   * `POST /api/catalog/{id}/drop` — drop a table a file upload made, keeping it
+   * restorable for 7 days (`DATA-55`, `governance:write`). Refused with the
+   * server's sentence when the table is not an upload's, is already dropped, a
+   * load is running into it, or the install cannot keep it.
+   */
+  dropTable(id: string, signal?: AbortSignal): Promise<AssetDropResult>
+  /** `GET /api/catalog/dropped/tables` — the caller's tenants' restorable drops (`DATA-55`). */
+  listDroppedTables(signal?: AbortSignal): Promise<DroppedTableEntry[]>
   /** `DELETE /api/catalog/{id}/grants/{grantId}` — end a grant made from this asset. */
   revokeGrant(id: string, grantId: string, signal?: AbortSignal): Promise<void>
 }

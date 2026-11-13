@@ -6,7 +6,7 @@
 | Backlog | `BLD-2` |
 | Kind | Feature |
 | Spec | `docs/core/specs/bld-2.md` (every *(proposed)* number is signed under Decisions) |
-| Status | Planned |
+| Status | In Acceptance (merged; the acceptance checklist is not run yet) |
 | Priority | P3 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Held in the base; not the Owner. |
