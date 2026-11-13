@@ -12,14 +12,23 @@
 //! (`store::spec_from_inline_sql`), so what runs here is the statement a chart
 //! is stored with. The engine version is the one `docker-compose.yml` pins
 //! (`clickhouse/clickhouse-server:26.8`).
+//!
+//! `BI-57` (QA `LH-BI-2-02`) is decided by the engine too: whether a column's
+//! values are all whole numbers is read in the same statement that reads the
+//! minimum and maximum (`min(toFloat64(c) = floor(toFloat64(c)))`), and only
+//! the engine can say which bin a row falls in. So the widths and the bars of a
+//! year column under "Automatic" are asserted against the answers, not against
+//! the statement text.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use lakehouse_bi::bin::{BinMode, Range, bin_records_predicate, max_scalar_sql, whole_scalar_sql};
 use lakehouse_bi::grain::TimeContext;
 use lakehouse_bi::sources::SourceColumn;
 use lakehouse_bi::specs::ChartSource;
 use lakehouse_bi::store::{ChartInput, InlineSql, spec_from_inline_sql};
 use lakehouse_clickhouse::ChClient;
+use lakehouse_core::ident::Ident;
 use serde_json::Value;
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
@@ -31,6 +40,12 @@ const AVG_TABLE: &str = "default.bi55_avg";
 
 /// The source of the rounding chart: every row of [`AVG_TABLE`].
 const AVG_SOURCE: &str = "SELECT kab, v FROM default.bi55_avg";
+
+/// `BI-57`: the eleven whole years 2014 to 2024, one row each.
+const YEARS_TABLE: &str = "default.bi57_years";
+
+/// `BI-57`: a fractional column, where the maximum keeps the closed last bin.
+const STAY_TABLE: &str = "default.bi57_stay";
 
 /// ONE `ClickHouse` per test binary (the arrangement of
 /// `tests/breakdown_cap.rs`); the container is never stopped by the test.
@@ -78,6 +93,33 @@ async fn seed(ch: &ChClient) {
     )
     .await
     .expect("fill the rounding table");
+    // `BI-57` (QA `LH-BI-2-02`): a whole-number column (years) and a
+    // fractional one, so the bin rule is proven for both.
+    ch.exec(
+        &format!("CREATE TABLE {YEARS_TABLE} (tahun UInt16) ENGINE = MergeTree ORDER BY tahun"),
+        None,
+    )
+    .await
+    .expect("create the year table");
+    let years: Vec<String> = (2014..=2024).map(|y| format!("({y})")).collect();
+    ch.exec(
+        &format!("INSERT INTO {YEARS_TABLE} VALUES {}", years.join(", ")),
+        None,
+    )
+    .await
+    .expect("fill the year table");
+    ch.exec(
+        &format!("CREATE TABLE {STAY_TABLE} (stay Float64) ENGINE = MergeTree ORDER BY stay"),
+        None,
+    )
+    .await
+    .expect("create the stay table");
+    ch.exec(
+        &format!("INSERT INTO {STAY_TABLE} VALUES (1.5), (2.0), (2.5), (3.0), (4.5)"),
+        None,
+    )
+    .await
+    .expect("fill the stay table");
 }
 
 /// A JSON number, or a number the engine quoted as a 64-bit integer, read as
@@ -170,4 +212,245 @@ async fn an_average_keeps_its_decimals_and_a_maximum_of_whole_numbers_stays_whol
     assert_eq!(number(b.get("v").expect("the sum column")), 10.0);
     assert_eq!(number(b.get("avg_v").expect("the average column")), 10.0);
     assert_eq!(number(b.get("max_v").expect("the maximum column")), 10.0);
+}
+
+/// The last years of [`YEARS_TABLE`], as the filtered base a chart reads.
+fn years_from(first: u16) -> String {
+    format!("(SELECT * FROM {YEARS_TABLE} WHERE tahun >= {first}) AS flt")
+}
+
+/// The statement a binned chart runs, as `Relation::Ranged` renders it: the
+/// bin expression over the base with the range's scalars joined in, one row
+/// per bin (`builder.rs`, `Relation::Ranged`).
+fn bins_statement(column: &Ident, mode: BinMode, base: &str) -> String {
+    let range = Range::new(column, mode);
+    format!(
+        "SELECT {} AS b, count() AS n FROM (SELECT * FROM {base} CROSS JOIN ({}) AS rng) GROUP BY b ORDER BY b",
+        range.bin_expr(),
+        range.scalars_sql(base)
+    )
+}
+
+/// The `(bin, count)` pairs a bins statement answers.
+async fn bins_of(ch: &ChClient, statement: &str) -> Vec<(f64, f64)> {
+    let result = ch
+        .query(statement, None)
+        .await
+        .expect("the bins statement runs on the engine");
+    result
+        .data
+        .iter()
+        .map(|row| {
+            (
+                number(row.get("b").expect("the bin column")),
+                number(row.get("n").expect("the count column")),
+            )
+        })
+        .collect()
+}
+
+/// The one row a range read answers: `(width, min, max, whole)`.
+async fn range_read(
+    ch: &ChClient,
+    column: &Ident,
+    mode: BinMode,
+    base: &str,
+) -> (f64, f64, f64, f64) {
+    let statement = Range::new(column, mode).read_sql(base);
+    let result = ch
+        .query(&statement, None)
+        .await
+        .expect("the range read runs on the engine");
+    let row = &result.data[0];
+    (
+        number(row.get("width").expect("the width column")),
+        number(row.get("min").expect("the minimum column")),
+        number(row.get("max").expect("the maximum column")),
+        number(row.get("whole").expect("the whole column")),
+    )
+}
+
+/// `BI-57` (QA `LH-BI-2-02`): five years under "Automatic" are five bars, one
+/// year each, where the width used to be 0.5 and the bars read
+/// "2,020 – 2,020.5".
+#[tokio::test]
+async fn five_years_under_automatic_bins_are_five_bars_one_year_each() {
+    let (url, _container) = shared_clickhouse().await;
+    let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
+    let tahun = Ident::new("tahun").expect("a column name");
+    let base = years_from(2020);
+
+    assert_eq!(
+        range_read(&ch, &tahun, BinMode::Auto, &base).await,
+        (1.0, 2020.0, 2024.0, 1.0),
+        "the automatic range of a whole-number column is 1 wide and says so"
+    );
+    let statement = bins_statement(&tahun, BinMode::Auto, &base);
+    assert_eq!(
+        bins_of(&ch, &statement).await,
+        vec![
+            (2020.0, 1.0),
+            (2021.0, 1.0),
+            (2022.0, 1.0),
+            (2023.0, 1.0),
+            (2024.0, 1.0)
+        ],
+        "five years are five bars: {statement}"
+    );
+}
+
+/// `BI-57` D4: six and ten years still fit one bar per year, eleven do not, so
+/// their width is 2 (down from ten bars whose last held two years). Counted
+/// bins take the same rule.
+#[tokio::test]
+async fn six_and_ten_years_are_one_bar_per_year_and_eleven_years_are_bins_of_two() {
+    let (url, _container) = shared_clickhouse().await;
+    let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
+    let tahun = Ident::new("tahun").expect("a column name");
+
+    for mode in [BinMode::Auto, BinMode::Count(10)] {
+        for (first, expected, width) in [
+            (
+                2019,
+                vec![
+                    (2019.0, 1.0),
+                    (2020.0, 1.0),
+                    (2021.0, 1.0),
+                    (2022.0, 1.0),
+                    (2023.0, 1.0),
+                    (2024.0, 1.0),
+                ],
+                1.0,
+            ),
+            (
+                2015,
+                (2015..=2024).map(|y| (f64::from(y), 1.0)).collect(),
+                1.0,
+            ),
+            (
+                2014,
+                vec![
+                    (2014.0, 2.0),
+                    (2016.0, 2.0),
+                    (2018.0, 2.0),
+                    (2020.0, 2.0),
+                    (2022.0, 3.0),
+                ],
+                2.0,
+            ),
+        ] {
+            let base = years_from(first);
+            let (w, _, _, _) = range_read(&ch, &tahun, mode, &base).await;
+            assert_eq!(w, width, "{mode:?} from {first} is {width} wide");
+            let statement = bins_statement(&tahun, mode, &base);
+            assert_eq!(
+                bins_of(&ch, &statement).await,
+                expected,
+                "{mode:?} from {first}: {statement}"
+            );
+        }
+    }
+}
+
+/// `BI-57` D3: a fractional column keeps its width, and its maximum stays in
+/// the closed last bin (4.5 in "4 – 4.5", as `BI-10` had it).
+#[tokio::test]
+async fn a_fractional_column_keeps_its_width_and_its_last_bin_holds_the_maximum() {
+    let (url, _container) = shared_clickhouse().await;
+    let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
+    let stay = Ident::new("stay").expect("a column name");
+
+    assert_eq!(
+        range_read(&ch, &stay, BinMode::Auto, STAY_TABLE).await,
+        (0.5, 1.5, 4.5, 0.0),
+        "a fractional column is not whole and keeps its width"
+    );
+    let statement = bins_statement(&stay, BinMode::Auto, STAY_TABLE);
+    assert_eq!(
+        bins_of(&ch, &statement).await,
+        vec![(1.5, 1.0), (2.0, 1.0), (2.5, 1.0), (3.0, 1.0), (4.0, 1.0)],
+        "the maximum sits in the last bin: {statement}"
+    );
+}
+
+/// `BI-57` D3: a width typed as 1 over whole numbers gives the maximum its own
+/// bin, like an automatic one does.
+#[tokio::test]
+async fn a_typed_width_of_one_gives_the_last_year_its_own_bin_too() {
+    let (url, _container) = shared_clickhouse().await;
+    let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
+    let tahun = Ident::new("tahun").expect("a column name");
+    let base = years_from(2020);
+
+    let statement = bins_statement(&tahun, BinMode::Width(1.0), &base);
+    assert_eq!(
+        bins_of(&ch, &statement).await,
+        vec![
+            (2020.0, 1.0),
+            (2021.0, 1.0),
+            (2022.0, 1.0),
+            (2023.0, 1.0),
+            (2024.0, 1.0)
+        ],
+        "a typed width of 1 also gives the maximum its own bin: {statement}"
+    );
+}
+
+/// `BI-57` D3: the rows a clicked bin lists are the rows the bar holds — the
+/// last year lists itself, and a closed last bin over a fractional column is
+/// unchanged.
+#[tokio::test]
+async fn a_clicked_year_lists_that_year_and_the_last_year_lists_itself() {
+    let (url, _container) = shared_clickhouse().await;
+    let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
+    let tahun = Ident::new("tahun").expect("a column name");
+    let base = years_from(2020);
+
+    for (lower, expected) in [(2023.0, vec![2023.0]), (2024.0, vec![2024.0])] {
+        let predicate = bin_records_predicate(
+            &tahun,
+            lower,
+            1.0,
+            Some(&max_scalar_sql(&tahun, &base)),
+            Some(&whole_scalar_sql(&tahun, &base)),
+        );
+        let statement = format!("SELECT tahun FROM {base} WHERE {predicate} ORDER BY tahun");
+        let result = ch
+            .query(&statement, None)
+            .await
+            .expect("the records statement runs on the engine");
+        let listed: Vec<f64> = result
+            .data
+            .iter()
+            .map(|row| number(row.get("tahun").expect("the year column")))
+            .collect();
+        assert_eq!(
+            listed, expected,
+            "the clicked bin lists itself: {statement}"
+        );
+    }
+
+    let stay = Ident::new("stay").expect("a column name");
+    let predicate = bin_records_predicate(
+        &stay,
+        4.0,
+        0.5,
+        Some(&max_scalar_sql(&stay, STAY_TABLE)),
+        None,
+    );
+    let statement = format!("SELECT stay FROM {STAY_TABLE} WHERE {predicate} ORDER BY stay");
+    let result = ch
+        .query(&statement, None)
+        .await
+        .expect("the records statement runs on the engine");
+    let listed: Vec<f64> = result
+        .data
+        .iter()
+        .map(|row| number(row.get("stay").expect("the stay column")))
+        .collect();
+    assert_eq!(
+        listed,
+        vec![4.5],
+        "the closed last bin of a fractional column is unchanged: {statement}"
+    );
 }
