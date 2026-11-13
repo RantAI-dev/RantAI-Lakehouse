@@ -58,6 +58,10 @@ reported, not quietly lowered.
   opens, only nothing is sent.
 - A rule is written for a table that exists and that its author may read; any
   other table is refused (`DATA-54`).
+- A rule is run by hand only by a person who may read its table. Anyone else is
+  refused with the same sentence a table that is not there gets, and nothing is
+  measured or recorded. Scheduled and on-load checks run as the system and are
+  not affected. Changed 2026-11-12 (`GOV-12`), *(proposed, not yet signed)*.
 - On-load checks start when the orchestrator reports the finished load, not
   when the load ends: QA saw about 36 seconds on staging (`LH-DATA-14-05`). The
   upload's result page says so.

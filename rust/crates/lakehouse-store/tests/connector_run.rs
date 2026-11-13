@@ -7,9 +7,9 @@ use lakehouse_test_support as _;
 
 use lakehouse_store::StoreError;
 use lakehouse_store::connector_run::{
-    AttemptReport, EndReason, ErrorClass, LogEvent, RUN_HISTORY_LIMIT, RunStatus, RunTrigger,
-    add_log_line, end_run, end_timed_out_run, get_run_log, list_runs, purge_older_than,
-    record_attempt, run_status, settle_run, start_run,
+    AttemptReport, EndReason, ErrorClass, LogEvent, LogLine, RUN_HISTORY_LIMIT, RunStatus,
+    RunTrigger, add_log_line, end_run, end_timed_out_run, get_run_log, list_runs, purge_older_than,
+    record_attempt, run_status, settle_cancelled_run, settle_run, start_run,
 };
 use sqlx::PgPool;
 use time::{Duration, OffsetDateTime};
@@ -454,6 +454,73 @@ async fn the_sensor_settles_only_a_run_still_running(pool: PgPool) -> sqlx::Resu
         Some("paused")
     );
     assert_eq!(run_status(&pool, PG, "run-unknown").await.unwrap(), None);
+    Ok(())
+}
+
+/// `SRC-43` (#485 review, round 2 (R2)): a run the orchestrator ended as
+/// cancelled, before its limit, is settled as `failed` with the reason
+/// `other`. The record has no word for cancelled and `table_failed` would
+/// invent a cause. A run that already ended and one with no record are left
+/// alone, and a second call writes nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_cancelled_run_still_running_is_settled_as_failed_with_no_reason_invented(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let t0 = OffsetDateTime::now_utc();
+    start_run(&pool, PG, "run-open", RunTrigger::Schedule, None, t0)
+        .await
+        .unwrap();
+    start_run(&pool, PG, "run-done", RunTrigger::Schedule, None, t0)
+        .await
+        .unwrap();
+    end_run(
+        &pool,
+        PG,
+        "run-done",
+        RunStatus::Succeeded,
+        EndReason::Completed,
+        t0,
+    )
+    .await
+    .unwrap();
+    settle_cancelled_run(&pool, PG, "run-open", t0)
+        .await
+        .unwrap();
+    settle_cancelled_run(&pool, PG, "run-done", t0)
+        .await
+        .unwrap();
+    settle_cancelled_run(&pool, PG, "run-unknown", t0)
+        .await
+        .unwrap();
+    // A second call on the run the first one closed writes nothing: the row
+    // is no longer `running`.
+    settle_cancelled_run(&pool, PG, "run-open", t0)
+        .await
+        .unwrap();
+    let runs = list_runs(&pool, PG, RUN_HISTORY_LIMIT).await.unwrap();
+    let open = runs.iter().find(|r| r.run_id == "run-open").unwrap();
+    assert_eq!(open.status, "failed", "a cancelled run is failed");
+    assert_eq!(
+        open.end_reason.as_deref(),
+        Some("other"),
+        "no cause is invented for it"
+    );
+    let done = runs.iter().find(|r| r.run_id == "run-done").unwrap();
+    assert_eq!(done.status, "succeeded", "a run that ended keeps its end");
+    assert_eq!(done.end_reason.as_deref(), Some("completed"));
+    assert_eq!(run_status(&pool, PG, "run-unknown").await.unwrap(), None);
+
+    let log = get_run_log(&pool, PG, "run-open").await.unwrap().unwrap();
+    let ended: Vec<&LogLine> = log
+        .lines
+        .iter()
+        .filter(|line| line.event == "run_ended")
+        .collect();
+    assert_eq!(ended.len(), 1, "the record is closed once");
+    assert_eq!(
+        ended[0].text,
+        "run ended: failed, no further reason is recorded"
+    );
     Ok(())
 }
 
