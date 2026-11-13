@@ -41,7 +41,12 @@
 //!
 //! The rules, in the order they are applied (so the cheapest refusal wins):
 //!
-//! 1. 1 to 5 inputs and at most 20 steps (D2, decisions 4 and 15).
+//! 1. 1 to 5 inputs and at most 20 steps (D2, decisions 4 and 15). A
+//!    definition with no step copies its one input (D1); several inputs and
+//!    no step are refused, because a copy of the first would silently ignore
+//!    the rest — unless `up_to` asks for one input alone, which is the
+//!    editor's preview of a pipeline whose step is not written yet
+//!    (BLD-1 part 1 D1 / S2 review R1-S1).
 //! 2. Every name is an `Ident` of at most 48 characters (D2), not starting
 //!    with `__`, and unique across inputs and steps without regard to case.
 //! 3. Every zone and table is an `Ident` (F2: the API checks the names it
@@ -115,6 +120,10 @@ impl std::fmt::Display for DefinitionError {
 const NO_INPUT: &str = "a pipeline needs at least one input";
 const TOO_MANY_INPUTS: &str = "a pipeline may have at most 5 inputs";
 const TOO_MANY_STEPS: &str = "a pipeline may have at most 20 steps";
+/// BLD-1 part 1 D1 / S2 review R1-S1: with no step there is exactly one
+/// input, which the pipeline copies. Several inputs and no step would compile
+/// to a copy of the first and silently ignore the others.
+const NO_STEP_WITH_MANY_INPUTS: &str = "with more than one input, add a step that reads them";
 const INVALID_NAME: &str = "a name must be letters, digits and underscores (not starting with a digit or __), \
      at most 48 characters";
 const DUPLICATE_NAME: &str = "this name is already used by another input or step";
@@ -263,6 +272,15 @@ fn validate(
     }
     if steps.len() > MAX_STEPS {
         return Err(DefinitionError::step(MAX_STEPS, TOO_MANY_STEPS));
+    }
+    // BLD-1 part 1 D1 / S2 review R1-S1: "with no steps there is exactly one
+    // input and the pipeline copies it." Several inputs and no step would
+    // compile to `SELECT * FROM <the first>` and ignore the others, so the
+    // whole definition is refused at the second input. `up_to` is exempt: it
+    // asks for ONE input (the editor previews an input before its step is
+    // written), not for the definition.
+    if up_to.is_none() && steps.is_empty() && inputs.len() > 1 {
+        return Err(DefinitionError::input(1, NO_STEP_WITH_MANY_INPUTS));
     }
 
     // Names first, across the whole definition: uniqueness is a property of
@@ -616,6 +634,14 @@ mod tests {
         vec![input("orders", "silver", "orders")]
     }
 
+    /// Two inputs: the definition D1 says needs a step (`R1-S1`).
+    fn two_inputs() -> Vec<lakehouse_store::pipelines::PipelineInput> {
+        vec![
+            input("orders", "silver", "orders"),
+            input("customers", "silver", "customers"),
+        ]
+    }
+
     fn refusal(
         inputs: &[lakehouse_store::pipelines::PipelineInput],
         steps: &[lakehouse_store::pipelines::PipelineStep],
@@ -631,6 +657,49 @@ mod tests {
         assert_eq!(
             compile(&one_input(), &[], None, Some("icecat_api")).unwrap(),
             "SELECT * FROM silver.`orders`"
+        );
+    }
+
+    /// BLD-1 part 1 D1 / S2 review R1-S1: "with no steps there is exactly one
+    /// input and the pipeline copies it." Two inputs and no step used to
+    /// compile to a copy of the first, silently ignoring the second.
+    #[test]
+    fn two_inputs_and_no_step_is_refused_at_the_second_input() {
+        let inputs = two_inputs();
+        let err = refusal(&inputs, &[]);
+        assert_eq!(err.path(), "inputs[1]");
+        assert_eq!(
+            err.message(),
+            "with more than one input, add a step that reads them"
+        );
+    }
+
+    /// R1-S1: the same definition still previews ONE input, which is what the
+    /// editor asks before its step is written (`up_to`).
+    #[test]
+    fn two_inputs_and_no_step_still_previews_the_named_input() {
+        assert_eq!(
+            compile(&two_inputs(), &[], Some("customers"), Some("icecat_api")).unwrap(),
+            "WITH\n  `orders` AS (SELECT * FROM silver.`orders`),\n  \
+             `customers` AS (SELECT * FROM silver.`customers`)\nSELECT * FROM `customers`"
+        );
+    }
+
+    /// R1-S1: the refusal is about a definition with NO step; one step over
+    /// two inputs compiles as before.
+    #[test]
+    fn two_inputs_and_one_step_are_not_refused() {
+        let steps = vec![transform_step(
+            "paid",
+            "orders",
+            &["filter(status = 'paid')"],
+        )];
+        assert_eq!(
+            compile(&two_inputs(), &steps, None, Some("icecat_api")).unwrap(),
+            "WITH\n  `orders` AS (SELECT * FROM silver.`orders`),\n  \
+             `customers` AS (SELECT * FROM silver.`customers`),\n  \
+             `paid` AS (SELECT * FROM `orders` WHERE status = 'paid')\n\
+             SELECT * FROM `paid`"
         );
     }
 
