@@ -109,6 +109,30 @@ export function paramsQuery(values: Record<string, ParamValue> | null): string |
   return values && Object.keys(values).length ? JSON.stringify(values) : null
 }
 
+/** A parameter whose requested value did not fit, as `lakehouse_bi::params::RefusedParam` sends it (`BI-52`). */
+export type RefusedParam = { name: string; reason: string }
+
+/**
+ * What the address keeps after an answer (`BI-52`, plan D29; QA `LH-BI-11-06`):
+ * `sent` without the refused names and, when `applied` is given, without the
+ * names the answer does not have; null when nothing is left, so `?p=` goes.
+ */
+export function acceptedParams(
+  sent: Record<string, ParamValue> | null,
+  refused: readonly RefusedParam[] | undefined,
+  applied: Record<string, ParamValue> | undefined,
+): Record<string, ParamValue> | null {
+  if (!sent) return null
+  const drop = new Set((refused ?? []).map((r) => r.name))
+  const kept: Record<string, ParamValue> = {}
+  for (const [name, value] of Object.entries(sent)) {
+    if (drop.has(name)) continue
+    if (applied && applied[name] === undefined) continue
+    kept[name] = value
+  }
+  return Object.keys(kept).length ? kept : null
+}
+
 /** The address with the values written, or the parameter removed when there are none. */
 export function withParamsParam(search: string, values: Record<string, ParamValue> | null): string {
   const q = new URLSearchParams(search)

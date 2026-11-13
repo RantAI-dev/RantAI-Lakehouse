@@ -16,7 +16,7 @@ import { binRangeFilter, isLastBin, toggleBinFilter } from "@/lib/chart-bins";
 import { bucketActions, bucketRangeFilter, dashboardRangeDestination, toggleBucketFilter } from "@/lib/bucket-click";
 import { ParamControls } from "./param-controls";
 import { ParamDialog } from "./param-dialog";
-import { PARAMS_PARAM, normalizeDef, paramsDiffer, paramsQuery, readParamsParam, savedParamsBody, withParamsParam, withValue, type BoardParam, type ParamControl, type ParamValue } from "@/lib/params";
+import { PARAMS_PARAM, acceptedParams, normalizeDef, paramsDiffer, paramsQuery, readParamsParam, savedParamsBody, withParamsParam, withValue, type BoardParam, type ParamControl, type ParamValue, type RefusedParam } from "@/lib/params";
 import { GRAIN_PARAM, differsFromSaved, grainNotAppliedSentence, grainQuery, readGrainParam, savedGrainBody, shownGrain, withGrainParam, type GrainChoice } from "@/lib/grain-switch";
 import { PART_NO_CLICK_REASON, isGrain, isTruncation, switchChoices, type ColumnKind, type Grain, type ReportingContext } from "@/lib/time-grain";
 import { effectiveRefresh, canSaveRefresh as refreshIsSaveable, listedInterval } from "@/lib/dashboard-refresh";
@@ -129,6 +129,8 @@ type Payload = {
   theme?: string; font?: string;
   /** The parameters the board shows with this response's value, the value each has saved (or by default), and every value in force (BI-11). */
   params?: ParamControl[]; defaultParams?: Record<string, ParamValue>; appliedParams?: Record<string, ParamValue>;
+  /** The parameters whose requested value did not fit, with the reason (`BI-52`): empty when there are none. */
+  refusedParams?: RefusedParam[];
   filterColumns: string[]; filterFields?: FilterField[];
   boards: BoardOpt[]; kpis: KpiMeta[];
   charts: ChartCard[]; results: Record<string, Cell>; storeError?: string | null;
@@ -222,6 +224,13 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const pParam = searchParams.get(PARAMS_PARAM);
   const pValues = React.useMemo(() => readParamsParam(pParam), [pParam]);
   const [paramsOpen, setParamsOpen] = React.useState(false);
+  // BI-52: a parameter value the server refused, by name, with its sentence,
+  // and the answer's own view of what was sent, until the person changes that
+  // parameter again, presses Reset, or opens another dashboard.
+  const [paramRefusals, setParamRefusals] = React.useState<Record<string, string>>({});
+  const [paramAnswer, setParamAnswer] = React.useState<
+    { sent: Record<string, ParamValue> | null; refused: RefusedParam[]; applied?: Record<string, ParamValue> } | null
+  >(null);
   const [savingDefault, setSavingDefault] = React.useState(false);
   // Tile delete is one click away, so it asks first.
   const [removing, setRemoving] = React.useState<{ id: string; title: string } | null>(null);
@@ -325,6 +334,15 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       setData({ ...json, charts: (json.charts ?? []).map((c) => (c.def ? { ...c, def: normalizeDef(c.def) } : c)) });
       setLayout(json.layout ?? {});
       setPhone(json.phoneLayout);
+      // BI-52 (plan D28, D29): a refused value is shown on its parameter, and
+      // this answer also decides which names the address may keep.
+      const refused = json.refusedParams ?? [];
+      if (refused.length) setParamRefusals((prev) => {
+        const next = { ...prev };
+        for (const r of refused) next[r.name] = r.reason;
+        return next;
+      });
+      setParamAnswer({ sent: pValues, refused, applied: json.appliedParams });
       return json;
     } catch (e) {
       // Stop is an answer, not an error: the tiles that were already on screen stay, and the page says "Stopped".
@@ -353,7 +371,12 @@ export function DashboardPage({ boardId }: { boardId: string }) {
 
   // Switching dashboard starts in view mode; the switcher navigates without
   // `f`, so the new board opens on its own default.
-  React.useEffect(() => { setEdit(false); setPhoneEdit(false); }, [board]);
+  React.useEffect(() => {
+    setEdit(false);
+    setPhoneEdit(false);
+    // BI-52: a refusal belongs to the dashboard it was made on.
+    setParamRefusals({});
+  }, [board]);
   React.useEffect(() => { if (!edit) setPhoneEdit(false); }, [edit]);
   // `/dashboards` meneruskan ke board terakhir, jadi membukanya di sinilah
   // yang menentukan "terakhir" — bukan klik di daftar, karena kanvas juga
@@ -473,10 +496,33 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const paramsDirty = pValues !== null && paramsDiffer(paramControls, data?.defaultParams);
   const rowDirty = dirty || grainDirty || paramsDirty;
   const changeParam = React.useCallback((name: string, value: ParamValue) => {
+    // BI-52: changing a parameter clears its refusal; the next answer decides
+    // whether there is a new one.
+    setParamRefusals((prev) => {
+      if (!(name in prev)) return prev;
+      const next = { ...prev };
+      delete next[name];
+      return next;
+    });
     const qs = withParamsParam(window.location.search, withValue(pValues, data?.defaultParams ?? {}, name, value));
     router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
   }, [router, pathname, pValues, data?.defaultParams]);
+
+  // BI-52 (plan D29): a refused value never stays in the address, and neither
+  // does a name the answer does not know. Writing it starts the one more read
+  // that confirms the value in force; nothing here asks the server first.
+  React.useEffect(() => {
+    if (!paramAnswer) return;
+    // The address has moved on since this answer: the next answer decides.
+    if (paramsQuery(paramAnswer.sent) !== paramsQuery(pValues)) return;
+    const kept = acceptedParams(paramAnswer.sent, paramAnswer.refused, paramAnswer.applied);
+    if (paramsQuery(kept) === paramsQuery(pValues)) return;
+    const qs = withParamsParam(window.location.search, kept);
+    router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+  }, [paramAnswer, pValues, router, pathname]);
   const resetRow = React.useCallback(() => {
+    // BI-52: Reset is one of the three ways a refusal goes away.
+    setParamRefusals({});
     const q = new URLSearchParams(window.location.search);
     q.delete(FILTER_PARAM);
     q.delete(GRAIN_PARAM);
@@ -1316,7 +1362,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       {error ? <div className="rounded-lg border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive">{readableErrorMessage(error)}</div> : null}
       {data?.storeError ? <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 px-4 py-2 text-xs text-amber-600 dark:text-amber-400">Could not load saved charts: {data.storeError}</div> : null}
 
-      {showFilterBar || grainedCharts.length > 0 || paramControls.length > 0 ? (
+      {showFilterBar || grainedCharts.length > 0 || paramControls.length > 0 || Object.keys(paramRefusals).length > 0 ? (
         <FilterRow count={filters.filter(isActiveFilter).length + (pValues ? Object.keys(pValues).length : 0)}>
           {grainedCharts.length > 0 ? (
             <GrainSwitch
@@ -1325,7 +1371,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
               onChange={(next) => writeGrain(next === "" ? "own" : next)}
             />
           ) : null}
-          <ParamControls controls={paramControls} onChange={changeParam} />
+          <ParamControls controls={paramControls} onChange={changeParam} refusals={paramRefusals} />
           <FilterBar
             board={board}
             fields={filterFields}
