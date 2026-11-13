@@ -57,8 +57,8 @@ use wiremock::matchers::{any, body_string_contains, method, path, path_regex, qu
 use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTemplate};
 
 use common::{
-    TestApp, create_principal_with_permissions, session_cookie_for_seeded_user,
-    session_cookie_for_user, spin_up_with_state,
+    TestApp, create_principal_with_permissions, mount_existing_iceberg_table,
+    session_cookie_for_seeded_user, session_cookie_for_user, spin_up_with_state,
 };
 
 const GROUP: &str = "11111111-1111-4111-8111-000000000001";
@@ -634,6 +634,44 @@ async fn requests_containing(server: &MockServer, needle: &str) -> Vec<Value> {
         .collect()
 }
 
+/// A file holding a test token, for the reader the Iceberg client needs
+/// (`DATA-55` review R2's healing rule reads the catalog).
+fn token_file(name: &str) -> String {
+    let dir = tempfile::tempdir().expect("a temporary directory for the token");
+    let file = dir.path().join(name);
+    std::fs::write(&file, "test-token").expect("the token file is written");
+    std::mem::forget(dir);
+    file.to_str().expect("a UTF-8 path").to_owned()
+}
+
+/// The `ClickHouse` answer `plan_columns` asks for between `ensure_table_free`
+/// and `claim_load`, held until the test's own write is done: the window
+/// `DATA-55` review R3 closes. It answers "no such table", as an append into a
+/// table with no columns this deployment can read.
+struct HeldDescribe {
+    entered: Mutex<std::sync::mpsc::Sender<()>>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl Respond for HeldDescribe {
+    fn respond(&self, _request: &MockRequest) -> ResponseTemplate {
+        self.entered
+            .lock()
+            .unwrap()
+            .send(())
+            .expect("the test is still waiting for the load's column check");
+        self.release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the test releases the load's column check");
+        ResponseTemplate::new(404).set_body_string(
+            "Code: 60. DB::Exception: Table icecat_api.`bronze.stock_raw` does not exist. \
+             (UNKNOWN_TABLE) (version 26.8.1.1 (official build))",
+        )
+    }
+}
+
 // ── the stack ────────────────────────────────────────────────────────────
 
 /// What differs between stacks: the Iceberg query database, and where
@@ -662,6 +700,11 @@ struct Options {
     /// `PR #187` review SHOULD-FIX 6: the most text the API reads from a
     /// child that converts. The real one is 16 MiB, and no test writes that.
     conversion_text_limit: Option<u64>,
+    /// `DATA-55` review R2: the Iceberg REST catalog a load asks "is this
+    /// table there" before it believes a drop record (the healing rule), and
+    /// the reader token file that call needs. `None` leaves it failing at the
+    /// missing token, as every other test has it.
+    catalog_url: Option<String>,
 }
 
 impl Default for Options {
@@ -676,6 +719,7 @@ impl Default for Options {
             conversion_wall: None,
             conversion_parquet_limits: None,
             conversion_text_limit: None,
+            catalog_url: None,
         }
     }
 }
@@ -773,6 +817,16 @@ impl Stack {
         }
         if let Some(url) = options.ch_url {
             env.insert("CH_URL".to_owned(), url.to_owned());
+        }
+        if let Some(url) = options.catalog_url {
+            // `DATA-55` review R2: the load's healing rule reads the Iceberg
+            // REST catalog, which needs a reader token file as well as the
+            // address.
+            env.insert("LAKEKEEPER_CATALOG_URI".to_owned(), url);
+            env.insert(
+                "LAKEKEEPER_READ_TOKEN_FILE".to_owned(),
+                token_file("read.jwt"),
+            );
         }
         if let Some(limit) = options.upload_max_conversions {
             env.insert("UPLOAD_MAX_CONVERSIONS".to_owned(), limit.to_owned());
@@ -2954,6 +3008,141 @@ async fn once_the_restore_window_has_passed_the_name_takes_a_new_load() {
     assert_eq!(
         requests_containing(&stack.dagster, "launchRun").await.len(),
         1
+    );
+}
+
+/// `DATA-55` review R2, the healing rule, on the load side: a record is
+/// believed only while the table is absent. A record left for a table that IS
+/// there is stale, so the next load removes it and goes through instead of
+/// refusing a live table's name for a week.
+#[tokio::test]
+async fn a_stale_record_of_a_table_that_exists_is_removed_by_the_next_load_and_the_load_goes_through()
+ {
+    let catalog = MockServer::start().await;
+    mount_existing_iceberg_table(&catalog, "stock_raw").await;
+    let stack = Stack::with(Options {
+        catalog_url: Some(catalog.uri()),
+        ..Options::default()
+    })
+    .await;
+    let bayu = stack.bayu().await;
+    mount_registered(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-2").await;
+    stack.seed_ingested(GROUP, "up-first", "stock_raw").await;
+    uploads::record_table_drop(
+        &stack.app.pool,
+        &NewTableDrop {
+            bronze_table: "stock_raw",
+            tenant_id: GROUP.parse::<Uuid>().unwrap(),
+            asset_id: "stock-raw",
+            dropped_by: "Seeded Uploader",
+            row_count: Some(1),
+            kept_seconds: 604_800,
+        },
+    )
+    .await
+    .unwrap()
+    .expect("the drop is recorded");
+    let second = stack.upload(&bayu, "again.csv", b"id,name\n1,a\n").await;
+
+    let reply = stack
+        .ingest(&bayu, &id_of(&second), ingest_body("stock_raw"))
+        .await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert!(
+        uploads::dropped_table(&stack.app.pool, "stock_raw")
+            .await
+            .unwrap()
+            .is_none(),
+        "the record of a table that exists was removed"
+    );
+    assert_eq!(
+        requests_containing(&stack.dagster, "launchRun").await.len(),
+        1
+    );
+}
+
+/// `DATA-55` review R3: the load writes its claim first and checks second, so a
+/// drop recorded between `ensure_table_free` and `claim_load` still closes the
+/// name. The record is written while the route waits on its column check, so it
+/// is provably on record after `ensure_table_free` and before `claim_load`; the
+/// load is refused with T6's `409`, nothing is launched, and the claim the load
+/// took is settled as failed rather than left `ingesting`.
+#[tokio::test]
+async fn a_load_whose_table_is_dropped_between_its_checks_is_409_and_settles_its_claim() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_registered(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-2").await;
+    stack.seed_ingested(GROUP, "up-first", "stock_raw").await;
+    let second = stack.upload(&bayu, "again.csv", b"id,name\n1,a\n").await;
+    let id = id_of(&second);
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    Mock::given(method("POST"))
+        .and(body_string_contains("DESCRIBE TABLE"))
+        .respond_with(HeldDescribe {
+            entered: Mutex::new(entered_tx),
+            release: Mutex::new(release_rx),
+        })
+        .with_priority(2)
+        .mount(&stack.ch)
+        .await;
+
+    let pool = stack.app.pool.clone();
+    let tenant = GROUP.parse::<Uuid>().unwrap();
+    let recorder = tokio::spawn(async move {
+        tokio::task::spawn_blocking(move || {
+            entered_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the load asks for its columns");
+        })
+        .await
+        .expect("the gate did not panic");
+        uploads::record_table_drop(
+            &pool,
+            &NewTableDrop {
+                bronze_table: "stock_raw",
+                tenant_id: tenant,
+                asset_id: "stock-raw",
+                dropped_by: "Ada Lovelace",
+                row_count: Some(1),
+                kept_seconds: 604_800,
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the drop is recorded");
+        release_tx.send(()).expect("the load is waiting");
+    });
+
+    let mut body = ingest_body("stock_raw");
+    body["mode"] = json!("append");
+    body["columns"] = json!([
+        { "source": "id", "name": "id", "type": "integer" },
+        { "source": "name", "name": "name", "type": "text" },
+    ]);
+    body["onBadValue"] = json!("stop");
+    let reply = stack.ingest(&bayu, &id, body).await;
+    recorder.await.expect("the record was written");
+
+    assert_eq!(reply.status, StatusCode::CONFLICT, "{}", reply.text);
+    assert_eq!(
+        reply.json["error"],
+        "That table was dropped and can still be restored. Restore it from its page in the Catalog, or choose another name."
+    );
+    let (status, run_id, error) = stack.status_of(&id).await;
+    assert_ne!(status, "ingesting", "the claim was not left loading");
+    assert_eq!(status, "failed");
+    assert_eq!(run_id, None);
+    assert_eq!(error.as_deref(), Some("The load could not be started."));
+    assert!(
+        requests_containing(&stack.dagster, "launchRun")
+            .await
+            .is_empty(),
+        "nothing was launched"
     );
 }
 

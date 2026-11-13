@@ -39,12 +39,16 @@
 //! purged, no registry row is deleted, and no file is touched (D12).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Extension;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use lakehouse_auth::Principal;
-use lakehouse_auth::openfga::{DELETE_RETENTION_SECONDS, LakekeeperAdminClient, OpenfgaError};
+use lakehouse_auth::openfga::{
+    DELETE_RETENTION_SECONDS, DeletedTableLookup, LakekeeperAdminClient, OpenfgaError,
+    is_plain_identifier,
+};
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::audit::NewAuditEvent;
@@ -86,6 +90,19 @@ const NO_TABLE: &str = "There is no table to drop: the catalog holds no table of
 const REFUSED: &str = "The catalog refused to drop the table. Nothing was dropped.";
 /// The catalog did not answer, so the outcome is not known — the page says which.
 const UNKNOWN: &str = "The catalog did not answer, so it is not known whether the table was dropped. Open the table's page again: it says so if it was.";
+/// The catalog did not answer AND the table is still there: nothing was dropped
+/// (`DATA-55` review R2, the second unknown-outcome case).
+const NOT_DROPPED: &str =
+    "The catalog did not answer and the table was not dropped. Try again shortly.";
+/// The drop's own task did not finish, so the handler cannot claim an outcome
+/// (`DATA-55` review R1).
+const INTERRUPTED: &str = "The drop did not finish, so it is not known whether the table was dropped. Open the table's page again: it says so if it was.";
+
+/// The bound on asking the catalog once more what happened (`DATA-55` review
+/// R2): the deleted-tabulars list, and the table's own presence. Ten seconds is
+/// a lookup, not a scan, and it keeps a hanging catalog from turning the
+/// unknown answer into a late one.
+pub(super) const OUTCOME_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// D4, answered before anything is written: may this table be dropped, and by
 /// whom.
@@ -107,9 +124,16 @@ enum Readiness {
 /// Apply D4 in order and stop at the first rule that fails, so a caller learns
 /// the first reason a table cannot be dropped and nothing it may not know.
 ///
+/// Rule 1 also asks the client's own [`is_plain_identifier`] of the registry's
+/// name (`DATA-55` review R7): a name with a `/`, a `.` or a percent-encoded
+/// byte in it would address another catalog path, and the client would refuse it
+/// only after the audit entry and the record were written.
+///
 /// Rule 3 asks `any_connector_targets` unscoped on purpose: any connector's
 /// target means the name is not only an upload's, and the one sentence says no
 /// more than that.
+///
+/// Rule 4 believes a record only while the table is absent ([`dropped_now`]).
 ///
 /// Not [`super::catalog_restore::target`]: its "not configured" answer comes
 /// before the questions D4 asks first, and it knows nothing of claims or loads.
@@ -128,7 +152,7 @@ async fn assess(
         return Ok(Readiness::No(ONLY_UPLOAD));
     }
     let table = bronze_table_name(state, id).await?;
-    if table.is_empty() {
+    if table.is_empty() || !is_plain_identifier(&table) {
         return Ok(Readiness::No(ONLY_UPLOAD));
     }
     let mut owner = None;
@@ -144,17 +168,11 @@ async fn assess(
     if lakehouse_store::connectors::any_connector_targets(pool, &table).await? {
         return Ok(Readiness::No(ONLY_UPLOAD));
     }
-    if uploads::dropped_table(pool, &table).await?.is_some() {
+    if dropped_now(state, pool, &table).await? {
         return Ok(Readiness::No(ALREADY_DROPPED));
     }
-    for row in uploads::loading_into(pool, &table).await? {
-        if super::uploads::settle_loading_upload(state, pool, row)
-            .await
-            .status
-            == "ingesting"
-        {
-            return Ok(Readiness::No(LOADING));
-        }
+    if loading_into_now(state, pool, &table).await? {
+        return Ok(Readiness::No(LOADING));
     }
     let Some(admin) = state.lakekeeper_admin.clone() else {
         return Ok(Readiness::No(NOT_SET_UP));
@@ -164,6 +182,79 @@ async fn assess(
         tenant_id,
         admin,
     })
+}
+
+/// Whether a load is `ingesting` into `table` right now: the row list settled
+/// the way the upload routes settle it, so a load that already ended is not
+/// counted as running (`DATA-55` D4 rule 5).
+///
+/// # Errors
+///
+/// The store's error when the loads cannot be read.
+async fn loading_into_now(state: &AppState, pool: &PgPool, table: &str) -> Result<bool, ApiError> {
+    for row in uploads::loading_into(pool, table).await? {
+        if super::uploads::settle_loading_upload(state, pool, row)
+            .await
+            .status
+            == "ingesting"
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether `table` is dropped right now, believing the record only while the
+/// table is absent (`DATA-55` review R2, QA `LH-DATA-15-06`, `TC-1731`).
+///
+/// A kept record must not lock a live table for seven days: a table that IS
+/// there is not dropped, whatever a leftover record says, so the record is
+/// removed, logged once, and the caller goes on as if there were none. When the
+/// check itself fails, the record stands (fail closed): an answer that is not
+/// known is not an answer that the name is free.
+///
+/// The one definition of the rule, used by the drop's own assessment
+/// ([`assess`]) and by the load's [`super::uploads::ensure_table_free`] and
+/// post-claim check (review R3), so the three cannot drift apart.
+///
+/// # Errors
+///
+/// The store's error when the record cannot be read or removed.
+pub(super) async fn dropped_now(
+    state: &AppState,
+    pool: &PgPool,
+    table: &str,
+) -> Result<bool, lakehouse_store::StoreError> {
+    if uploads::dropped_table(pool, table).await?.is_none() {
+        return Ok(false);
+    }
+    match super::catalog_restore::table_exists(state, table).await {
+        Ok(true) => {
+            match uploads::forget_table_drop(pool, table).await {
+                Ok(true) => tracing::warn!(
+                    %table,
+                    "a drop was on record for a table that exists; the stale record was removed"
+                ),
+                Ok(false) => {}
+                Err(err) => tracing::warn!(
+                    ?err,
+                    %table,
+                    "a stale record of a drop could not be removed"
+                ),
+            }
+            Ok(false)
+        }
+        // Absent, or the check itself failed: the record stands.
+        Ok(false) => Ok(true),
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                %table,
+                "could not tell whether a recorded dropped table exists; the record stands"
+            );
+            Ok(true)
+        }
+    }
 }
 
 /// The `?withRowCount=` flag of the status read.
@@ -287,13 +378,20 @@ pub(super) async fn audit_after(pool: &PgPool, event: NewAuditEvent) {
 /// `POST /api/catalog/{id}/drop` — drops the table, keeping it restorable for
 /// 7 days. See the module doc for the order and every refusal (D5, D8).
 ///
+/// Everything from the first audit entry to the closing one runs in ONE
+/// spawned task this handler awaits (`DATA-55` review R1): the route's own
+/// deadline, or a client that disconnects, then stops only the waiting and can
+/// never leave a record with no `executed` or `failed` behind it.
+///
 /// # Errors
 ///
-/// `403` with the tenant gate's reason; `404` when no dataset has that slug or
-/// the caller's roles may not read it; `409` when D4 refuses the table, when a
-/// drop is already on record, or when the catalog has no such table or refused
+/// `400` for an over-long id; `403` with the tenant gate's reason; `404` when
+/// no dataset has that slug or the caller's roles may not read it; `409` when
+/// D4 refuses the table, when a drop is already on record, when a load started
+/// into it after the checks, or when the catalog has no such table or refused
 /// the drop; `503` when the keep cannot be confirmed, the catalog cannot be
-/// reached, the audit entry cannot be written, or the outcome is not known.
+/// reached, the audit entry cannot be written, or the outcome is not known;
+/// `500` when the store fails or the drop's own task did not finish.
 pub async fn drop_table(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -305,8 +403,8 @@ pub async fn drop_table(
     }
     validate_annotation_id(&id)?;
     ensure_asset_readable(&state, &principal, &id).await?;
-    let pool = annotation_pool(&state)?;
-    let (table, tenant_id, admin) = match assess(&state, pool, &principal, &id).await? {
+    let pool = annotation_pool(&state)?.clone();
+    let (table, tenant_id, admin) = match assess(&state, &pool, &principal, &id).await? {
         Readiness::No(NOT_SET_UP) => {
             return Err(ApiError::Unavailable(NOT_SET_UP.to_owned()).into());
         }
@@ -344,15 +442,10 @@ pub async fn drop_table(
     // D7: the drop counts once more itself, for the record and the audit
     // entry; it never takes a number from the request.
     let rows = count_rows(&state, &format!("bronze.{table}")).await;
-    audit_first(
-        pool,
-        drop_event(&principal, &id, &table, rows, "allowed", None),
-        NOT_AUDITED,
-    )
-    .await?;
     // `DELETE_RETENTION_SECONDS` is 604,800; refuse rather than guess if the
     // constant ever stopped fitting, which fail-closed means refusing the drop
-    // instead of writing a wrong window.
+    // instead of writing a wrong window. Computed BEFORE the first audit entry
+    // so an `allowed` entry always has an ending (`DATA-55` review R7).
     let Ok(kept_seconds) = i64::try_from(DELETE_RETENTION_SECONDS) else {
         tracing::error!(
             seconds = DELETE_RETENTION_SECONDS,
@@ -360,47 +453,264 @@ pub async fn drop_table(
         );
         return Err(ApiError::Internal("drop retention is out of range".to_owned()).into());
     };
-    let record = uploads::record_table_drop(
+    let job = Drop {
+        state,
         pool,
-        &NewTableDrop {
-            bronze_table: &table,
-            tenant_id,
-            asset_id: &id,
-            dropped_by: &principal.display_name,
-            row_count: rows,
-            kept_seconds,
-        },
-    )
-    .await?;
-    let Some(record) = record else {
-        audit_after(
-            pool,
-            drop_event(
-                &principal,
-                &id,
-                &table,
-                rows,
-                "refused",
-                Some("already dropped"),
+        principal,
+        id,
+        table,
+        tenant_id,
+        admin,
+        warehouse,
+        rows,
+        kept_seconds,
+    };
+    // `DATA-55` review R1: one task for the whole audited stretch, awaited here.
+    // The checks above stay in the handler; what must not be cut in half by a
+    // deadline or a disconnect is everything from `allowed` to its ending.
+    let handle = tokio::spawn(async move { job.run().await });
+    match handle.await {
+        Ok(Ok(body)) => Ok(ApiJson(body)),
+        Ok(Err(err)) => Err(err.into()),
+        Err(join) => {
+            tracing::error!(?join, "drop: the task that drops the table did not finish");
+            Err(ApiError::Internal(INTERRUPTED.to_owned()).into())
+        }
+    }
+}
+
+/// The audited half of a drop: the `allowed` entry, the record, the catalog's
+/// answer and the closing entry, in ONE spawned task (`DATA-55` review R1).
+struct Drop {
+    /// The app state the load check settles through.
+    state: AppState,
+    /// The database the record and the audit trail live in.
+    pool: PgPool,
+    /// The person dropping the table, for both audit entries.
+    principal: Principal,
+    /// The asset id the entries and the answer name.
+    id: String,
+    /// The raw table name, as the catalog knows it.
+    table: String,
+    /// The tenant whose upload claimed the name.
+    tenant_id: Uuid,
+    /// The catalog's admin client the drop goes out as (D3).
+    admin: Arc<LakekeeperAdminClient>,
+    /// The catalog's warehouse id.
+    warehouse: String,
+    /// The whole table's row count, or `None` when it could not be counted.
+    rows: Option<i64>,
+    /// The catalog's keep, in seconds.
+    kept_seconds: i64,
+}
+
+impl Drop {
+    /// Run the audited half of the drop and answer with the body of a drop the
+    /// catalog made.
+    ///
+    /// # Errors
+    ///
+    /// `409` and `503` of D5 (the catalog's refusal, a name already dropped, a
+    /// load that started since the checks), the store's `500`, and the
+    /// `500` of an answer that cannot be written as a body.
+    async fn run(&self) -> Result<Value, ApiError> {
+        audit_first(&self.pool, self.event("allowed", None), NOT_AUDITED).await?;
+        let record = match uploads::record_table_drop(
+            &self.pool,
+            &NewTableDrop {
+                bronze_table: &self.table,
+                tenant_id: self.tenant_id,
+                asset_id: &self.id,
+                dropped_by: &self.principal.display_name,
+                row_count: self.rows,
+                kept_seconds: self.kept_seconds,
+            },
+        )
+        .await
+        {
+            Ok(record) => record,
+            Err(err) => {
+                // `DATA-55` review R7: an `allowed` entry always has an ending.
+                audit_after(
+                    &self.pool,
+                    self.event("failed", Some("the drop could not be recorded")),
+                )
+                .await;
+                return Err(err.into());
+            }
+        };
+        let Some(record) = record else {
+            audit_after(&self.pool, self.event("refused", Some("already dropped"))).await;
+            return Err(ApiError::Conflict(ALREADY_DROPPED.to_owned()));
+        };
+        // `DATA-55` review R3: the record is written first, and the load check
+        // is asked a second time here, so a load that started between `assess`
+        // and the record cannot pass the drop's check while the drop passes its
+        // own.
+        match loading_into_now(&self.state, &self.pool, &self.table).await {
+            Ok(false) => {}
+            Ok(true) => {
+                if let Err(err) = uploads::forget_table_drop(&self.pool, &self.table).await {
+                    tracing::error!(
+                        ?err,
+                        table = %self.table,
+                        "drop: the record of a drop refused for a running load could not be removed"
+                    );
+                }
+                audit_after(
+                    &self.pool,
+                    self.event("failed", Some("a load started into the table")),
+                )
+                .await;
+                return Err(ApiError::Conflict(LOADING.to_owned()));
+            }
+            Err(err) => {
+                tracing::error!(
+                    ?err,
+                    table = %self.table,
+                    "drop: could not check the running loads once the record was written; the record stands"
+                );
+                audit_after(
+                    &self.pool,
+                    self.event(
+                        "failed",
+                        Some("the load into the table could not be checked"),
+                    ),
+                )
+                .await;
+                return Err(err);
+            }
+        }
+        match self
+            .admin
+            .drop_table(&self.warehouse, BRONZE_NAMESPACE, &self.table)
+            .await
+        {
+            Ok(true) => {
+                audit_after(&self.pool, self.event("executed", None)).await;
+                drop_answer(&record, self.rows)
+            }
+            other => self.settle_not_dropped(&record, other).await,
+        }
+    }
+
+    /// The audit record of one drop, with this drop's own fields.
+    fn event(&self, outcome: &str, detail: Option<&str>) -> NewAuditEvent {
+        drop_event(
+            &self.principal,
+            &self.id,
+            &self.table,
+            self.rows,
+            outcome,
+            detail,
+        )
+    }
+
+    /// The catalog did not (or may not) have dropped the table: what is known
+    /// decides whether the record stays, and the sentence says which.
+    ///
+    /// `DATA-55` review R2, replacing D8 step 5: a definite refusal removes the
+    /// record; an unknown outcome asks the catalog once, and keeps the record
+    /// unless the catalog says the table is still there. The record is only
+    /// removed when it is known that nothing was dropped — otherwise the name
+    /// stays closed, because a dropped table that is not on record is exactly
+    /// the load `D11` exists to refuse.
+    async fn settle_not_dropped(
+        &self,
+        record: &lakehouse_store::uploads::TableDrop,
+        after: Result<bool, OpenfgaError>,
+    ) -> Result<Value, ApiError> {
+        let (detail, error) = match after {
+            Ok(false) => (
+                "the catalog holds no such table",
+                ApiError::Conflict(NO_TABLE.to_owned()),
             ),
+            Err(OpenfgaError::Rejected) => (
+                "the catalog refused the drop",
+                ApiError::Conflict(REFUSED.to_owned()),
+            ),
+            // The catalog did not answer, or answered 5xx: the drop may have
+            // happened. Ask once, with a bound, what the catalog lists.
+            // (`Ok(true)` is answered in `run` before this; if it ever reached
+            // here, the deleted list is what settles it.)
+            Ok(true) | Err(OpenfgaError::Transport | OpenfgaError::Server) => {
+                return self.settle_unknown_outcome(record).await;
+            }
+        };
+        if let Err(err) = uploads::forget_table_drop(&self.pool, &self.table).await {
+            tracing::error!(
+                ?err,
+                table = %self.table,
+                "drop: the record of a drop the catalog did not make could not be removed"
+            );
+        }
+        audit_after(&self.pool, self.event("failed", Some(detail))).await;
+        Err(error)
+    }
+
+    /// Whether the drop happened, asked of the catalog once: the deleted list
+    /// first, then — only when the list holds no such table — whether the table
+    /// still exists. See [`Drop::settle_not_dropped`].
+    async fn settle_unknown_outcome(
+        &self,
+        record: &lakehouse_store::uploads::TableDrop,
+    ) -> Result<Value, ApiError> {
+        let lookup = tokio::time::timeout(
+            OUTCOME_CHECK_TIMEOUT,
+            self.admin
+                .find_deleted_table(&self.warehouse, BRONZE_NAMESPACE, &self.table),
         )
         .await;
-        return Err(ApiError::Conflict(ALREADY_DROPPED.to_owned()).into());
-    };
-    match admin.drop_table(&warehouse, BRONZE_NAMESPACE, &table).await {
-        Ok(true) => {
-            audit_after(
-                pool,
-                drop_event(&principal, &id, &table, rows, "executed", None),
-            )
-            .await;
-            Ok(ApiJson(drop_answer(&record, rows)?))
+        let Ok(Ok(lookup)) = lookup else {
+            return Err(self.keep_record_and_refuse().await);
+        };
+        match lookup {
+            // The drop happened: the catalog keeps it, so the caller is told
+            // the drop succeeded and the record stays.
+            DeletedTableLookup::Found(_) => {
+                audit_after(&self.pool, self.event("executed", None)).await;
+                drop_answer(record, self.rows)
+            }
+            // The catalog lists no such deleted table: only the table's own
+            // presence can say the drop did not happen.
+            DeletedTableLookup::None => {
+                match super::catalog_restore::table_exists(&self.state, &self.table).await {
+                    Ok(true) => {
+                        if let Err(err) = uploads::forget_table_drop(&self.pool, &self.table).await
+                        {
+                            tracing::error!(
+                                ?err,
+                                table = %self.table,
+                                "drop: the record of a drop that did not happen could not be removed"
+                            );
+                        }
+                        audit_after(
+                            &self.pool,
+                            self.event(
+                                "failed",
+                                Some("the catalog did not answer and the table was not dropped"),
+                            ),
+                        )
+                        .await;
+                        Err(ApiError::Unavailable(NOT_DROPPED.to_owned()))
+                    }
+                    _ => Err(self.keep_record_and_refuse().await),
+                }
+            }
+            // The list is too long to tell, so nothing is known.
+            DeletedTableLookup::CouldNotTell => Err(self.keep_record_and_refuse().await),
         }
-        other => Err(
-            catalog_did_not_drop(pool, &principal, &id, &table, rows, other)
-                .await
-                .into(),
-        ),
+    }
+
+    /// Keep the record (fail closed: the name stays closed) and answer D5's
+    /// "not known" sentence.
+    async fn keep_record_and_refuse(&self) -> ApiError {
+        audit_after(
+            &self.pool,
+            self.event("failed", Some("the outcome is not known")),
+        )
+        .await;
+        ApiError::Unavailable(UNKNOWN.to_owned())
     }
 }
 
@@ -429,48 +739,6 @@ fn drop_answer(
         "droppedAt": dropped_at,
         "expiresAt": expires_at,
     }))
-}
-
-/// D8 step 5: the catalog did not drop the table, so the record is removed
-/// again, the `failed` entry is written in our own words, and the caller gets
-/// the sentence of D5. A failure to remove the record is logged and does not
-/// change the answer: the record then closes the name until its window ends,
-/// which is logged as the error it is.
-async fn catalog_did_not_drop(
-    pool: &PgPool,
-    principal: &Principal,
-    id: &str,
-    table: &str,
-    rows: Option<i64>,
-    after: Result<bool, OpenfgaError>,
-) -> ApiError {
-    if let Err(err) = uploads::forget_table_drop(pool, table).await {
-        tracing::error!(
-            ?err,
-            %table,
-            "drop: the record of a drop the catalog did not make could not be removed"
-        );
-    }
-    let (detail, error) = match after {
-        Ok(false) => (
-            "the catalog holds no such table",
-            ApiError::Conflict(NO_TABLE.to_owned()),
-        ),
-        Err(OpenfgaError::Rejected) => (
-            "the catalog refused the drop",
-            ApiError::Conflict(REFUSED.to_owned()),
-        ),
-        _ => (
-            "the catalog did not answer; the outcome is not known",
-            ApiError::Unavailable(UNKNOWN.to_owned()),
-        ),
-    };
-    audit_after(
-        pool,
-        drop_event(principal, id, table, rows, "failed", Some(detail)),
-    )
-    .await;
-    error
 }
 
 /// `GET /api/catalog/dropped/tables` — the caller's tenants' tables dropped

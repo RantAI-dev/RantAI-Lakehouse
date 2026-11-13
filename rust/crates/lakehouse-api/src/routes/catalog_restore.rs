@@ -43,6 +43,7 @@ use lakehouse_auth::Principal;
 use lakehouse_auth::openfga::{DeletedTableLookup, LakekeeperAdminClient, OpenfgaError};
 use lakehouse_core::ApiError;
 use lakehouse_iceberg::rest::{self, RestError};
+use lakehouse_store::PgPool;
 use lakehouse_store::audit::NewAuditEvent;
 use lakehouse_store::uploads;
 use serde_json::{Value, json};
@@ -73,6 +74,9 @@ const UNREACHABLE: &str = "the catalog could not be asked about this table; try 
 /// The `allowed` audit entry could not be written; nothing was restored (D8).
 const NOT_AUDITED_RESTORE: &str =
     "The restore could not be written to the audit trail, so nothing was restored.";
+/// The restore's own task did not finish (`DATA-55` review R1): the handler
+/// cannot claim an outcome the task never reached.
+const INTERRUPTED: &str = "The restore did not finish, so it is not known whether the table was restored. Open the table's page again: it says so if it was.";
 
 /// What can be done about the asset's table.
 #[derive(Debug, PartialEq, Eq)]
@@ -166,7 +170,17 @@ fn admin_unavailable(err: &OpenfgaError) -> ApiError {
 
 /// Whether the Iceberg table exists now, through the reader catalog every
 /// other asset-page read uses.
-async fn table_exists(state: &AppState, table: &str) -> Result<bool, ApiError> {
+///
+/// `pub(super)` because the drop's healing rule (`DATA-55` review R2,
+/// [`super::catalog_drop::dropped_now`]) asks it too: a record of a drop is
+/// believed only while the table is absent, and this is the one way this
+/// service asks "is the table there".
+///
+/// # Errors
+///
+/// The reader token's own `503`, and [`ApiError::Unavailable`] when the
+/// catalog cannot answer.
+pub(super) async fn table_exists(state: &AppState, table: &str) -> Result<bool, ApiError> {
     let namespace = NamespaceIdent::from_strs([BRONZE_NAMESPACE])
         .map_err(|_| ApiError::Internal("invalid namespace".to_owned()))?;
     let ident = TableIdent::new(namespace, table.to_owned());
@@ -288,14 +302,19 @@ pub async fn status(
 
 /// `POST /api/catalog/{id}/restore` — undrops the table.
 ///
+/// Everything from the first audit entry to the closing one runs in ONE
+/// spawned task this handler awaits (`DATA-55` review R1), for the reason the
+/// drop does: a deadline or a disconnect must not stop the work between the
+/// entry and its ending.
+///
 /// # Errors
 ///
 /// `403` with the tenant gate's reason; `404` when the asset is unknown, when
 /// the caller's roles may not read it, or when nothing is restorable (or the
 /// asset has no restorable kind of table); `409` when a table of that name
-/// exists again; `410` when the 7-day window has passed; `503` when restore
-/// is not configured, the audit entry cannot be written, or `Lakekeeper`
-/// cannot be asked.
+/// exists again; `410` when the 7-day window has passed; `500` when the
+/// restore's own task did not finish; `503` when restore is not configured, the
+/// audit entry cannot be written, or `Lakekeeper` cannot be asked.
 pub async fn restore(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -309,7 +328,7 @@ pub async fn restore(
     // GOV-7 D6: a hidden asset's restore answers the same 404 as an unknown
     // id, exactly as the status read above does.
     crate::routes::catalog::ensure_asset_readable(&state, &principal, &id).await?;
-    let pool = annotation_pool(&state)?;
+    let pool = annotation_pool(&state)?.clone();
     let (admin, table) = match target(&state, &id).await? {
         Target::Ready { admin, table } => (admin, table),
         Target::Unsupported(reason) if reason == NOT_CONFIGURED => {
@@ -327,7 +346,7 @@ pub async fn restore(
         Assessment::Exists => {
             // D8: a table that is there is not dropped, whatever a leftover
             // record says. Best effort: the 409 below is the same either way.
-            if let Err(err) = uploads::forget_table_drop(pool, &table).await {
+            if let Err(err) = uploads::forget_table_drop(&pool, &table).await {
                 tracing::warn!(?err, %table, "restore: a leftover drop record could not be cleared");
             }
             return Err(ApiError::Conflict(
@@ -347,44 +366,140 @@ pub async fn restore(
         Assessment::Expired { .. } => return Err(ApiError::Gone(EXPIRED.to_owned()).into()),
         Assessment::Restorable { id, expires_at, .. } => (id, expires_at),
     };
-    let warehouse = warehouse.ok_or_else(|| ApiError::Unavailable(UNREACHABLE.to_owned()))?;
-    // D8: the `allowed` entry first, or the restore does not happen.
-    audit_first(
+    let Some(warehouse) = warehouse else {
+        return Err(ApiError::Unavailable(UNREACHABLE.to_owned()).into());
+    };
+    let job = Restore {
+        state,
         pool,
-        restore_event(&principal, &id, &table, &expires_at, "allowed", None),
-        NOT_AUDITED_RESTORE,
-    )
-    .await?;
-    if let Err(err) = admin.undrop_table(&warehouse, &tabular).await {
-        let (detail, refusal) = match err {
-            // A race with a load that recreated the table between the check
-            // and the undrop.
-            OpenfgaError::Rejected => (
-                "the catalog refused the restore",
-                ApiError::Conflict(
-                    "the catalog refused the restore; a table of that name may exist again"
-                        .to_owned(),
+        principal,
+        id,
+        table,
+        admin,
+        warehouse,
+        tabular,
+        expires_at,
+    };
+    // `DATA-55` review R1: one task for the audited stretch, awaited here.
+    let handle = tokio::spawn(async move { job.run().await });
+    match handle.await {
+        Ok(Ok(body)) => Ok(ApiJson(body)),
+        Ok(Err(err)) => Err(err.into()),
+        Err(join) => {
+            tracing::error!(
+                ?join,
+                "restore: the task that restores the table did not finish"
+            );
+            Err(ApiError::Internal(INTERRUPTED.to_owned()).into())
+        }
+    }
+}
+
+/// The audited half of a restore: the `allowed` entry, the undrop, the record's
+/// end and the closing entry, in ONE spawned task (`DATA-55` review R1).
+struct Restore {
+    /// The app state the table's presence is checked through.
+    state: AppState,
+    /// The database the record and the audit trail live in.
+    pool: PgPool,
+    /// The person restoring, for both audit entries.
+    principal: Principal,
+    /// The asset id the entries name.
+    id: String,
+    /// The raw table name.
+    table: String,
+    /// The catalog's admin client the undrop goes out as.
+    admin: Arc<LakekeeperAdminClient>,
+    /// The catalog's warehouse id.
+    warehouse: String,
+    /// The soft-deleted table's id, which the undrop takes.
+    tabular: String,
+    /// Until when it was restorable, as the audit entry records it.
+    expires_at: String,
+}
+
+impl Restore {
+    /// Undrop the table and answer `{ "ok": true }`.
+    ///
+    /// # Errors
+    ///
+    /// `409` when the catalog refuses the undrop, `503` when it cannot be
+    /// asked, and the store's error when the record cannot be cleared.
+    async fn run(&self) -> Result<Value, ApiError> {
+        // D8: the `allowed` entry first, or the restore does not happen.
+        audit_first(&self.pool, self.event("allowed", None), NOT_AUDITED_RESTORE).await?;
+        if let Err(err) = self
+            .admin
+            .undrop_table(&self.warehouse, &self.tabular)
+            .await
+        {
+            let (detail, refusal) = match err {
+                // A race with a load that recreated the table between the check
+                // and the undrop.
+                OpenfgaError::Rejected => (
+                    "the catalog refused the restore",
+                    ApiError::Conflict(
+                        "the catalog refused the restore; a table of that name may exist again"
+                            .to_owned(),
+                    ),
                 ),
-            ),
-            other => ("the catalog did not answer", admin_unavailable(&other)),
-        };
-        audit_after(
-            pool,
-            restore_event(&principal, &id, &table, &expires_at, "failed", Some(detail)),
+                // `DATA-55` review R2, the mirror case: an undrop that did not
+                // answer may have happened, so ask once, with a bound, whether
+                // the table is back.
+                other => return self.settle_unknown_undrop(&other).await,
+            };
+            audit_after(&self.pool, self.event("failed", Some(detail))).await;
+            return Err(refusal);
+        }
+        self.finish_restore().await;
+        Ok(json!({ "ok": true }))
+    }
+
+    /// An undrop that did not answer: if the table is there, the restore
+    /// happened — clear the record, write `executed`, answer as a success.
+    /// Otherwise the record stays, `failed` is written and the fixed 503
+    /// answers, as before (`DATA-55` review R2).
+    async fn settle_unknown_undrop(&self, err: &OpenfgaError) -> Result<Value, ApiError> {
+        let existing = tokio::time::timeout(
+            super::catalog_drop::OUTCOME_CHECK_TIMEOUT,
+            table_exists(&self.state, &self.table),
         )
         .await;
-        return Err(refusal.into());
+        if matches!(existing, Ok(Ok(true))) {
+            self.finish_restore().await;
+            return Ok(json!({ "ok": true }));
+        }
+        audit_after(
+            &self.pool,
+            self.event("failed", Some("the catalog did not answer")),
+        )
+        .await;
+        Err(admin_unavailable(err))
     }
-    // The table is back, so it is not dropped any more (D8).
-    if let Err(err) = uploads::forget_table_drop(pool, &table).await {
-        tracing::warn!(?err, %table, "restore: the record of the drop could not be cleared");
+
+    /// The table is back: clear the drop's record (best effort) and write the
+    /// `executed` entry, both inside the awaited task.
+    async fn finish_restore(&self) {
+        // The record of the drop is cleared: a table that is there is not
+        // dropped. A failure is logged, not turned into a failed restore — the
+        // table IS back, and the next status read heals a leftover record.
+        if let Err(err) = uploads::forget_table_drop(&self.pool, &self.table).await {
+            tracing::warn!(?err, %self.table, "restore: the record of the drop could not be cleared");
+        }
+        audit_after(&self.pool, self.event("executed", None)).await;
     }
-    audit_after(
-        pool,
-        restore_event(&principal, &id, &table, &expires_at, "executed", None),
-    )
-    .await;
-    Ok(ApiJson(json!({ "ok": true })))
+
+    /// The audit record of this restore, with this restore's own fields.
+    fn event(&self, outcome: &str, detail: Option<&str>) -> NewAuditEvent {
+        restore_event(
+            &self.principal,
+            &self.id,
+            &self.table,
+            &self.expires_at,
+            outcome,
+            detail,
+        )
+    }
 }
 
 #[cfg(test)]

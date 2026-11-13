@@ -43,6 +43,8 @@
 //! precedent rather than introducing a second dialing pattern into this
 //! crate.
 
+use std::time::Duration;
+
 use serde::Deserialize;
 use serde_json::json;
 
@@ -113,7 +115,12 @@ fn classify_status(status: reqwest::StatusCode) -> Result<(), OpenfgaError> {
 /// and it is the shape of an upload's table name (`[a-z0-9_]`). A `/`, a `.` or
 /// a percent-encoded byte would let a caller address another path, so anything
 /// else is refused before a request is built.
-fn is_plain_identifier(text: &str) -> bool {
+///
+/// Public because the drop route asks it of a registry's table name BEFORE
+/// anything is written, with this one definition rather than a second copy
+/// (`DATA-55` review R7, QA `LH-DATA-15-06`, `TC-1731`).
+#[must_use]
+pub fn is_plain_identifier(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
@@ -255,7 +262,16 @@ pub struct LakekeeperAdminClient {
     base_url: String,
     admin_token: Secret,
     http: reqwest::Client,
+    drop_timeout: Duration,
 }
+
+/// The bound on the drop's own `DELETE` (`DATA-55` review R1, QA
+/// `LH-DATA-15-06`, `TC-1731`): a catalog that accepts the connection and never
+/// answers becomes [`OpenfgaError::Transport`] after this, instead of holding
+/// the request until the route's own deadline drops the handler mid-drop.
+/// Fifteen seconds is longer than a healthy drop takes and shorter than the
+/// route's sixty.
+const DROP_TABLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl LakekeeperAdminClient {
     /// Build a client. `base_url` is `Lakekeeper`'s own base (no trailing
@@ -269,7 +285,19 @@ impl LakekeeperAdminClient {
             base_url: base_url.into(),
             admin_token,
             http: reqwest::Client::new(),
+            drop_timeout: DROP_TABLE_TIMEOUT,
         }
+    }
+
+    /// Set how long the drop's own request waits ([`DROP_TABLE_TIMEOUT`]).
+    ///
+    /// Exists for the test that proves a catalog which never answers ends the
+    /// drop as an unknown outcome without waiting fifteen seconds; a deployment
+    /// never calls it and always gets [`DROP_TABLE_TIMEOUT`].
+    #[must_use]
+    pub fn with_drop_timeout(mut self, bound: Duration) -> Self {
+        self.drop_timeout = bound;
+        self
     }
 
     /// Render the `Authorization` header value. Kept as its own method so
@@ -530,6 +558,12 @@ impl LakekeeperAdminClient {
                 self.base_url
             ))
             .header("Authorization", self.auth_header())
+            // `DATA-55` review R1: a catalog that accepts the connection and
+            // never answers must not hold the drop until the route's own
+            // deadline cuts the handler in half. Fifteen seconds is longer than
+            // a healthy drop takes and short enough to end as a known
+            // [`OpenfgaError::Transport`] the caller can act on.
+            .timeout(self.drop_timeout)
             .send()
             .await
             .map_err(|_| OpenfgaError::Transport)?;

@@ -2670,13 +2670,14 @@ async fn ensure_table_free(
         // table was dropped from the console and can still be restored
         // (DATA-55 D11, QA LH-DATA-15-06, TC-1731). The load job would create a
         // new table of that name, and the dropped one could no longer be
-        // undropped. An unreadable record is `unchecked` like its neighbours:
+        // undropped. The record is believed only while the table is absent
+        // (`DATA-55` review R2, `dropped_now`), so a stale record cannot close a
+        // live table; an unreadable record is `unchecked` like its neighbours:
         // 503, never an assumption that the name is free (fail closed).
         TableClaim::Ours => {
-            if uploads::dropped_table(pool, table)
+            if super::catalog_drop::dropped_now(state, pool, table)
                 .await
                 .map_err(|err| unchecked(&err))?
-                .is_some()
             {
                 return Err(ApiError::Conflict(TABLE_DROPPED.to_owned()));
             }
@@ -3374,6 +3375,33 @@ pub async fn ingest(
     }
 
     let claimed = claim_load(pool, &row, &request, folder, converted.as_ref(), limits).await?;
+
+    // `DATA-55` review R3: the write comes first and the check second, so a drop
+    // recorded between `ensure_table_free` and this claim cannot pass its own
+    // check while this load passes its earlier one. The claim is already
+    // `ingesting`, so a refusal settles it as failed, the way a refused launch
+    // does — never leaving a row that just sits at `ingesting`.
+    match super::catalog_drop::dropped_now(&state, pool, &request.table).await {
+        Ok(false) => {}
+        Ok(true) => {
+            if let Err(err) =
+                uploads::mark_finished(pool, &claimed.id, None, Some(COULD_NOT_START), None).await
+            {
+                tracing::warn!(%err, upload_id = %claimed.id, "a claim refused for a dropped table could not be settled");
+            }
+            return Err(ApiError::Conflict(TABLE_DROPPED.to_owned()).into());
+        }
+        Err(err) => {
+            // The record could not be read: whether the name is dropped is not
+            // known, so the load must not start — and must not stay loading.
+            if let Err(err) =
+                uploads::mark_finished(pool, &claimed.id, None, Some(COULD_NOT_START), None).await
+            {
+                tracing::warn!(%err, upload_id = %claimed.id, "a claim that could not be checked could not be settled");
+            }
+            return Err(err.into());
+        }
+    }
 
     // `DATA-52`: the author is the person who pressed Load, taken from the
     // authenticated principal rather than from anything the request sent.

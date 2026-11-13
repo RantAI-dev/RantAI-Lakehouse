@@ -20,13 +20,17 @@
 mod common;
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use common::{
     CATALOG_TENANT, TestApp, create_principal_with_permissions, in_the_catalog_tenant,
-    session_cookie_for_user, spin_up_with_env,
+    mount_existing_iceberg_table, session_cookie_for_user, spin_up_with_env, spin_up_with_state,
 };
+use lakehouse_auth::Secret;
+use lakehouse_auth::openfga::LakekeeperAdminClient;
 use lakehouse_store::uploads::{self, LoadMode, NewTableDrop, NewUpload};
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -113,6 +117,42 @@ async fn mount_dropped(server: &MockServer, expires: &str) {
         .await;
 }
 
+/// The catalog's deleted list holds no table of this name.
+async fn mount_nothing_deleted(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/management/v1/warehouse/wh-1/deleted-tabulars"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "tabulars": [] })))
+        .mount(server)
+        .await;
+}
+
+/// The catalog's deleted list cannot be read at all: the answer that leaves an
+/// unknown drop unknown (`DATA-55` review R2).
+async fn mount_deleted_unreadable(server: &MockServer, marker: &str) {
+    Mock::given(method("GET"))
+        .and(path("/management/v1/warehouse/wh-1/deleted-tabulars"))
+        .respond_with(ResponseTemplate::new(500).set_body_string(marker.to_owned()))
+        .mount(server)
+        .await;
+}
+
+/// The Iceberg REST catalog's answer to one table's load: "no such table"
+/// first, then the table — the table coming back while the request is running.
+struct BackAfterUndrop(std::sync::atomic::AtomicUsize);
+
+impl wiremock::Respond for BackAfterUndrop {
+    fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+        let seen = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if seen == 0 {
+            ResponseTemplate::new(404).set_body_string(
+                r#"{"error":{"message":"no such table","type":"NoSuchTableException","code":404}}"#,
+            )
+        } else {
+            ResponseTemplate::new(200).set_body_string(common::load_table_fixture("orders"))
+        }
+    }
+}
+
 fn token_file(name: &str) -> String {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join(name);
@@ -155,6 +195,17 @@ async fn admin_cookie(pool: &sqlx::PgPool) -> String {
 /// upload-made table of that name, so the seed's target is cleared, and the
 /// one test that asserts the connector rule writes it back.
 async fn drop_app(server: &MockServer, with_admin: bool) -> TestApp {
+    drop_app_with(server, with_admin, |_state| {}).await
+}
+
+/// The drop's app, with the built [`lakehouse_api::state::AppState`] offered to
+/// `prepare` before the router takes it — for the one test that pins the
+/// admin client's bound on the drop's own request (`DATA-55` review R1).
+async fn drop_app_with(
+    server: &MockServer,
+    with_admin: bool,
+    prepare: impl FnOnce(&mut lakehouse_api::state::AppState),
+) -> TestApp {
     let mut env = HashMap::new();
     env.insert("CH_URL".to_owned(), server.uri());
     env.insert("LAKEKEEPER_CATALOG_URI".to_owned(), server.uri());
@@ -172,7 +223,7 @@ async fn drop_app(server: &MockServer, with_admin: bool) -> TestApp {
             token_file("admin.jwt"),
         );
     }
-    let app = spin_up_with_env(&env).await;
+    let (app, _state) = spin_up_with_state(&env, prepare).await;
     sqlx::query("UPDATE connector SET source_objects = '[]'::jsonb WHERE id = 'conn-pg-lakehouse'")
         .execute(&app.pool)
         .await
@@ -676,6 +727,10 @@ const NO_TABLE: &str = "There is no table to drop: the catalog holds no table of
 const REFUSED: &str = "The catalog refused to drop the table. Nothing was dropped.";
 /// The catalog did not answer, so the outcome is not known (`DATA-55` D5).
 const UNKNOWN: &str = "The catalog did not answer, so it is not known whether the table was dropped. Open the table's page again: it says so if it was.";
+/// The catalog did not answer AND the table is still there, so nothing was
+/// dropped (`DATA-55` review R2, the second unknown-outcome case).
+const NOT_DROPPED: &str =
+    "The catalog did not answer and the table was not dropped. Try again shortly.";
 
 /// The warehouse lookup, the keep write and the one `DELETE` the drop sends
 /// (`DATA-55` D2/D3): the profile `POST` answers 204, and the catalog's drop
@@ -1001,10 +1056,13 @@ async fn a_drop_is_refused_when_the_seven_day_keep_cannot_be_confirmed() {
     assert_eq!(deletes(&server).await, 0);
 }
 
-/// `DATA-55` D5/D8: a catalog that does not answer leaves no record, writes
-/// `allowed` then `failed`, and never puts the catalog's own text on screen.
+/// `DATA-55` review R2 (replacing D8 step 5, which was wrong). An unknown
+/// outcome is not "nothing was dropped": if the catalog went on to list the
+/// table as deleted, the drop DID happen, so the record is kept, `executed` is
+/// written and the caller is told the drop succeeded.
 #[tokio::test]
-async fn a_catalog_that_does_not_answer_the_drop_leaves_no_record_and_no_upstream_text() {
+async fn a_catalog_that_answers_500_and_lists_the_table_as_deleted_keeps_the_record_and_answers_a_drop()
+ {
     const MARKER: &str = "planted-upstream-marker";
     let server = MockServer::start().await;
     mount_row_count(&server, 3).await;
@@ -1015,6 +1073,100 @@ async fn a_catalog_that_does_not_answer_the_drop_leaves_no_record_and_no_upstrea
         1,
     )
     .await;
+    mount_dropped(&server, "2099-01-01T00:00:00Z").await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    claim(&pool, CATALOG_TENANT, "orders").await;
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let (status, body) = call(&router, "POST", DROP, &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], json!(true));
+    assert_eq!(body["table"], json!("bronze.orders"));
+    assert_eq!(body["rowCount"], json!(3));
+    assert!(
+        !body.to_string().contains(MARKER),
+        "upstream text reached the response: {body}"
+    );
+    assert!(
+        uploads::dropped_table(&pool, "orders")
+            .await
+            .unwrap()
+            .is_some(),
+        "the drop happened, so its record stays"
+    );
+    let outcomes: Vec<String> = sqlx::query_scalar(
+        "SELECT outcome FROM audit_event WHERE action = 'catalog.drop' ORDER BY at, id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(outcomes, vec!["allowed", "executed"]);
+}
+
+/// `DATA-55` review R2: the catalog did not answer, the table is NOT among the
+/// deleted ones, and the table itself is still there — so nothing was dropped.
+/// The record goes, `failed` is written, and the sentence says what happened
+/// instead of saying the outcome is unknown.
+#[tokio::test]
+async fn a_catalog_that_answers_500_and_a_table_that_still_exists_removes_the_record_and_says_nothing_was_dropped()
+ {
+    const MARKER: &str = "planted-upstream-marker";
+    let server = MockServer::start().await;
+    mount_row_count(&server, 3).await;
+    mount_registry(&server, "orders").await;
+    mount_drop(
+        &server,
+        ResponseTemplate::new(500).set_body_string(MARKER),
+        1,
+    )
+    .await;
+    mount_nothing_deleted(&server).await;
+    mount_existing_iceberg_table(&server, "orders").await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    claim(&pool, CATALOG_TENANT, "orders").await;
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let (status, body) = call(&router, "POST", DROP, &cookie).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"], json!(NOT_DROPPED));
+    assert!(
+        !body.to_string().contains(MARKER),
+        "upstream text reached the response: {body}"
+    );
+    assert!(
+        uploads::dropped_table(&pool, "orders")
+            .await
+            .unwrap()
+            .is_none(),
+        "the table was not dropped, so the record goes"
+    );
+    let outcomes: Vec<String> = sqlx::query_scalar(
+        "SELECT outcome FROM audit_event WHERE action = 'catalog.drop' ORDER BY at, id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(outcomes, vec!["allowed", "failed"]);
+}
+
+/// `DATA-55` review R2: the catalog did not answer and the lookup that would
+/// say whether the table is gone fails too. Nothing is known, so the record is
+/// KEPT (fail closed: the name stays closed), `failed` says why, and the
+/// caller gets D5's sentence — never the catalog's own text.
+#[tokio::test]
+async fn a_catalog_that_answers_500_and_a_lookup_that_fails_keeps_the_record_and_says_the_outcome_is_not_known()
+ {
+    const MARKER: &str = "planted-upstream-marker";
+    let server = MockServer::start().await;
+    mount_row_count(&server, 3).await;
+    mount_registry(&server, "orders").await;
+    mount_drop(
+        &server,
+        ResponseTemplate::new(500).set_body_string(MARKER),
+        1,
+    )
+    .await;
+    mount_deleted_unreadable(&server, MARKER).await;
     let TestApp { router, pool } = drop_app(&server, true).await;
     claim(&pool, CATALOG_TENANT, "orders").await;
     let cookie = governor(&pool, "catalog:read, governance:write").await;
@@ -1022,21 +1174,271 @@ async fn a_catalog_that_does_not_answer_the_drop_leaves_no_record_and_no_upstrea
     let (status, body) = call(&router, "POST", DROP, &cookie).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["error"], json!(UNKNOWN));
+    assert!(!body.to_string().contains(MARKER), "{body}");
     assert!(
-        !body.to_string().contains(MARKER),
-        "upstream text reached the response: {body}"
-    );
-    let recorded: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM upload_table_drop WHERE bronze_table = 'orders'")
-            .fetch_one(&pool)
+        uploads::dropped_table(&pool, "orders")
             .await
-            .unwrap();
+            .unwrap()
+            .is_some(),
+        "an unknown outcome keeps the name closed"
+    );
+    let outcomes: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT outcome, detail FROM audit_event WHERE action = 'catalog.drop' ORDER BY at, id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(outcomes.len(), 2, "one entry before and one after");
+    assert_eq!(outcomes[1].0, "failed");
     assert_eq!(
-        recorded, 0,
-        "the record of a drop that did not happen is gone"
+        outcomes[1].1.as_deref(),
+        Some("the outcome is not known"),
+        "the trail names the reason in our own words"
+    );
+}
+
+/// `DATA-55` review R1: a catalog that accepts the connection and never answers
+/// is ended by the client's own bound on the drop, not by the route's 60-second
+/// deadline, and it ends as the R2 third case: the record is kept, `failed` is
+/// written, and the caller is told the outcome is not known.
+///
+/// The bound is set the way the review allows: the client takes it as a
+/// constructor argument (`with_drop_timeout`), so this test sets it to one
+/// second instead of waiting the deployment's fifteen.
+#[tokio::test]
+async fn a_catalog_that_does_not_answer_within_the_clients_bound_keeps_the_record_and_says_the_outcome_is_not_known()
+ {
+    const MARKER: &str = "planted-upstream-marker";
+    let server = MockServer::start().await;
+    mount_row_count(&server, 3).await;
+    mount_registry(&server, "orders").await;
+    mount_drop(
+        &server,
+        ResponseTemplate::new(204).set_delay(Duration::from_secs(20)),
+        1,
+    )
+    .await;
+    mount_deleted_unreadable(&server, MARKER).await;
+    let base = server.uri();
+    let TestApp { router, pool } = drop_app_with(&server, true, |state| {
+        state.lakekeeper_admin = Some(Arc::new(
+            LakekeeperAdminClient::new(base, Secret::new("test-token".to_owned()))
+                .with_drop_timeout(Duration::from_secs(1)),
+        ));
+    })
+    .await;
+    claim(&pool, CATALOG_TENANT, "orders").await;
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let (status, body) = call(&router, "POST", DROP, &cookie).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"], json!(UNKNOWN));
+    assert!(
+        uploads::dropped_table(&pool, "orders")
+            .await
+            .unwrap()
+            .is_some(),
+        "the record is kept: whether it was dropped is not known"
     );
     let outcomes: Vec<String> = sqlx::query_scalar(
         "SELECT outcome FROM audit_event WHERE action = 'catalog.drop' ORDER BY at, id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(outcomes, vec!["allowed", "failed"]);
+}
+
+/// `DATA-55` review R2, the kept-record rule: a record is believed only while
+/// the table is absent. A record for a table that IS there is stale — the load
+/// that recreated it was not the record's — so the next status read removes it
+/// and answers as if it were not there.
+#[tokio::test]
+async fn a_stale_record_of_a_table_that_exists_is_removed_by_the_next_status_read() {
+    let server = MockServer::start().await;
+    mount_registry(&server, "orders").await;
+    mount_existing_iceberg_table(&server, "orders").await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    let tenant_id = Uuid::parse_str(CATALOG_TENANT).expect("a tenant id");
+    claim(&pool, CATALOG_TENANT, "orders").await;
+    uploads::record_table_drop(
+        &pool,
+        &NewTableDrop {
+            bronze_table: "orders",
+            tenant_id,
+            asset_id: "orders",
+            dropped_by: "Ada Lovelace",
+            row_count: Some(1),
+            kept_seconds: 604_800,
+        },
+    )
+    .await
+    .unwrap()
+    .expect("the record is written");
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let (status, body) = call(&router, "GET", DROP, &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["droppable"],
+        json!(true),
+        "a table that is there is not dropped: {body}"
+    );
+    assert!(
+        uploads::dropped_table(&pool, "orders")
+            .await
+            .unwrap()
+            .is_none(),
+        "the stale record was removed"
+    );
+}
+
+/// `DATA-55` review R7: a registry table name that is not a plain identifier
+/// would put a path segment the catalog must not see into its URL, so it is
+/// refused in `assess` rule 1, with D5's one sentence and the client's own
+/// check, before anything is written.
+#[tokio::test]
+async fn a_registry_name_that_is_not_a_plain_identifier_is_refused_before_anything_is_written() {
+    let server = MockServer::start().await;
+    mount_registry(&server, "orders/../evil").await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+    claim(&pool, CATALOG_TENANT, "orders/../evil").await;
+
+    let (status, body) = call(&router, "POST", DROP, &cookie).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], json!(ONLY_UPLOAD));
+    assert_eq!(deletes(&server).await, 0, "the catalog was not asked");
+    let audited: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_event WHERE action = 'catalog.drop'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(audited, 0, "nothing was written");
+    let recorded: i64 = sqlx::query_scalar("SELECT count(*) FROM upload_table_drop")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(recorded, 0, "nothing was recorded");
+}
+
+/// `DATA-55` review R2, the restore's mirror case: the undrop did not answer but
+/// the table is there — the restore happened. The record is cleared, `executed`
+/// is written, and the caller is told the restore succeeded.
+#[tokio::test]
+async fn an_undrop_that_does_not_answer_and_a_table_that_exists_clears_the_record_and_answers_a_restore()
+ {
+    let server = MockServer::start().await;
+    mount_registry(&server, "orders").await;
+    mount_warehouse(&server).await;
+    mount_dropped(&server, "2099-01-01T00:00:00Z").await;
+    // The first load of the table (before the undrop) says it is gone; the
+    // second, after the undrop that did not answer, says it is back.
+    Mock::given(method("GET"))
+        .and(path("/v1/config"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"defaults":{},"overrides":{}}"#),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces/bronze/tables/orders"))
+        .respond_with(BackAfterUndrop(std::sync::atomic::AtomicUsize::new(0)))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/management/v1/warehouse/wh-1/deleted-tabulars/undrop",
+        ))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    let tenant_id = Uuid::parse_str(CATALOG_TENANT).expect("a tenant id");
+    uploads::record_table_drop(
+        &pool,
+        &NewTableDrop {
+            bronze_table: "orders",
+            tenant_id,
+            asset_id: "orders",
+            dropped_by: "Ada Lovelace",
+            row_count: Some(1),
+            kept_seconds: 604_800,
+        },
+    )
+    .await
+    .unwrap()
+    .expect("the drop is recorded");
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let (status, body) = call(&router, "POST", RESTORE, &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], json!(true));
+    assert!(
+        uploads::dropped_table(&pool, "orders")
+            .await
+            .unwrap()
+            .is_none(),
+        "the table is back, so the record goes"
+    );
+    let outcomes: Vec<String> = sqlx::query_scalar(
+        "SELECT outcome FROM audit_event WHERE action = 'catalog.restore' ORDER BY at, id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(outcomes, vec!["allowed", "executed"]);
+}
+
+/// `DATA-55` review R2, the restore's mirror case that did not happen: the
+/// undrop did not answer and the table is still gone. The record stays, `failed`
+/// is written, and the answer is the fixed 503.
+#[tokio::test]
+async fn an_undrop_that_does_not_answer_and_a_table_that_is_still_gone_keeps_the_record_and_writes_a_failed_entry()
+ {
+    let server = MockServer::start().await;
+    mount_registry(&server, "orders").await;
+    mount_missing_table(&server).await;
+    mount_warehouse(&server).await;
+    mount_dropped(&server, "2099-01-01T00:00:00Z").await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/management/v1/warehouse/wh-1/deleted-tabulars/undrop",
+        ))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let TestApp { router, pool } = drop_app(&server, true).await;
+    let tenant_id = Uuid::parse_str(CATALOG_TENANT).expect("a tenant id");
+    uploads::record_table_drop(
+        &pool,
+        &NewTableDrop {
+            bronze_table: "orders",
+            tenant_id,
+            asset_id: "orders",
+            dropped_by: "Ada Lovelace",
+            row_count: Some(1),
+            kept_seconds: 604_800,
+        },
+    )
+    .await
+    .unwrap()
+    .expect("the drop is recorded");
+    let cookie = governor(&pool, "catalog:read, governance:write").await;
+
+    let (status, body) = call(&router, "POST", RESTORE, &cookie).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        uploads::dropped_table(&pool, "orders")
+            .await
+            .unwrap()
+            .is_some(),
+        "the table is still dropped, so the record stays"
+    );
+    let outcomes: Vec<String> = sqlx::query_scalar(
+        "SELECT outcome FROM audit_event WHERE action = 'catalog.restore' ORDER BY at, id",
     )
     .fetch_all(&pool)
     .await
