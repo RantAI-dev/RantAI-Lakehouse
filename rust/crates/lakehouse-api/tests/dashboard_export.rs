@@ -723,7 +723,7 @@ async fn the_excel_download_is_masked_keeps_numbers_as_numbers_and_is_audited() 
         .read_to_string(&mut styles)
         .unwrap();
     assert!(
-        styles.contains("IDR "),
+        styles.contains("Rp "),
         "the chart's number format: {styles}"
     );
 
@@ -777,7 +777,7 @@ async fn the_csv_download_is_formatted_or_raw_as_asked() {
             .to_vec(),
     )
     .unwrap();
-    assert_eq!(text, "\u{feff}email,amount\r\n***,IDR 1.23 M\r\n");
+    assert_eq!(text, "\u{feff}email,amount\r\n***,Rp 1.23 M\r\n");
     let raw = get(
         &router,
         "/api/dashboard/chart-export?chart=c_amount&format=csv&values=raw",

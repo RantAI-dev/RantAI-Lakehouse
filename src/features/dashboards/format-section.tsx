@@ -8,7 +8,7 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import {
-  BUILTIN_PALETTES, DATE_STYLES, FORMAT_STYLES, MAX_ANNOTATIONS, MAX_AFFIX_LEN, MAX_AXIS_TITLE_LEN, MAX_CONDITIONAL_RULES, MAX_DECIMALS, MAX_NOTE_LEN,
+  BUILTIN_PALETTES, DATE_STYLES, MAX_ANNOTATIONS, MAX_AFFIX_LEN, MAX_AXIS_TITLE_LEN, MAX_CONDITIONAL_RULES, MAX_DECIMALS, MAX_NOTE_LEN,
   type Annotation, type AxisStyle, type CompareOp, type CondRule, type CondRuleTest, type DateFormat, type StyleFields, type ValueFormat,
 } from "@/lib/chart-style";
 import { MAX_CLUSTERS, MIN_CLUSTERS } from "@/lib/chart-style";
@@ -24,7 +24,12 @@ import { ColourInput } from "./colour-input";
 
 const STYLE_LABELS: Record<string, string> = {
   auto: "As it is now", number: "Number", percent: "Percent", currency: "Currency", scientific: "Scientific", compact: "Compact (1.2 K)",
+  currencyCompact: "Currency, compact (1.2 M)",
 };
+// QA LH-BI-1-06 (BI-55, D12): a compact amount of money is one choice of its
+// own, so the list says that Compact takes a currency code. `FORMAT_STYLES`
+// mirrors the server and is not changed; this list is what the editor offers.
+const STYLE_CHOICES = ["auto", "number", "percent", "currency", "currencyCompact", "scientific", "compact"] as const;
 const DATE_LABELS: Record<string, string> = {
   auto: "As it is now", short: "15/10/26", medium: "15 Oct 2026", long: "15 October 2026", iso: "2026-10-15", monthYear: "October 2026",
 };
@@ -59,11 +64,19 @@ export function ValueFormatEditor({ value, onChange, label }: {
   const style = f.style ?? "auto";
   const set = (patch: Partial<ValueFormat>) => onChange({ ...f, ...patch });
   const currencyStyle = style === "currency" || style === "compact";
+  // A stored compact amount (a compact style with a currency) is shown as the
+  // "Currency, compact" choice.
+  const choice = style === "compact" && f.currency ? "currencyCompact" : style;
+  const choose = (v: string | null) => {
+    if (v === "currencyCompact") set({ style: "compact", currency: f.currency ?? "IDR" });
+    else if (v === "compact") set({ style: "compact", currency: undefined, currencyDisplay: undefined });
+    else set({ style: (v ?? "auto") as ValueFormat["style"] });
+  };
   return (
     <div className="flex flex-wrap items-center gap-1.5">
-      <Select value={style} items={STYLE_LABELS} onValueChange={(v) => set({ style: (v ?? "auto") as ValueFormat["style"] })}>
+      <Select value={choice} items={STYLE_LABELS} onValueChange={choose}>
         <SelectTrigger className="w-40 shrink-0" aria-label={`${label} style`}><SelectValue /></SelectTrigger>
-        <SelectContent>{FORMAT_STYLES.map((s) => <SelectItem key={s} value={s}>{STYLE_LABELS[s]}</SelectItem>)}</SelectContent>
+        <SelectContent>{STYLE_CHOICES.map((s) => <SelectItem key={s} value={s}>{STYLE_LABELS[s]}</SelectItem>)}</SelectContent>
       </Select>
       <Input className="h-8 w-20" type="number" min={0} max={MAX_DECIMALS} value={f.decimals ?? ""} placeholder="Decimals" aria-label={`${label} decimals`}
         onChange={(e) => set({ decimals: num(e.target.value) })} />
