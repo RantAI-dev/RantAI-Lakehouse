@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import {
-  ChartColumn, Check, Copy, Download, Eye, FileDown, History, Mail, Printer, Maximize2, Minimize2, MoreHorizontal, Palette, Pencil, RefreshCw, Save, Share2, Timer, Trash2,
+  ChartColumn, Check, Copy, Download, Eye, FileDown, History, LayoutTemplate, Mail, Printer, Maximize2, Minimize2, MoreHorizontal, Palette, Pencil, RefreshCw, Save, Share2, Timer, Trash2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -22,7 +22,7 @@ import { PDF_NOT_SET_UP } from "./chart-download";
 export function DashboardActionsMenu({
   isDefault, canWrite, canManage = canWrite, isPrivate, onHistory, onTheme, onFreshness, loading, fullscreen, autoSec, savedSec, canSaveRefresh, savingRefresh,
   onRefresh, onToggleFullscreen, onAutoSec, onSaveRefresh, onRename, onShare, onExportPdf, onDuplicate, onDelete,
-  onDownloadPdf, pdfSupported = true, canDownload = true, onSubscriptions, onExportFile,
+  onDownloadPdf, pdfSupported = true, canDownload = true, onSubscriptions, onExportFile, onSaveTemplate,
 }: {
   readonly isDefault: boolean;
   /**
@@ -71,6 +71,8 @@ export function DashboardActionsMenu({
   readonly onSubscriptions?: () => void;
   /** Downloads the dashboard as a file to import elsewhere (`BI-19` part D); left out when absent. */
   readonly onExportFile?: () => void;
+  /** Opens "Save as template" (`BI-18` part D, T6); left out when absent, without `dashboard:write` and on the built-in dashboard. */
+  readonly onSaveTemplate?: () => void;
   readonly onDuplicate: () => void;
   readonly onDelete: () => void;
 }) {
@@ -216,6 +218,11 @@ export function DashboardActionsMenu({
             {canWrite ? (
               <DropdownMenuItem onClick={onDuplicate}>
                 <Copy className="size-4" /> Duplicate
+              </DropdownMenuItem>
+            ) : null}
+            {canWrite && !isDefault && onSaveTemplate ? (
+              <DropdownMenuItem onClick={onSaveTemplate}>
+                <LayoutTemplate className="size-4" /> Save as template…
               </DropdownMenuItem>
             ) : null}
           </DropdownMenuGroup>

@@ -3,7 +3,7 @@
 import * as React from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
-import { ChevronDown, FileText, Folder, FolderCog, LayoutGrid, Lock, PlusIcon, Rows3, Sigma, Trash2, Upload } from "lucide-react"
+import { ChevronDown, FileText, Folder, LayoutTemplate, FolderCog, LayoutGrid, Lock, PlusIcon, Rows3, Sigma, Trash2, Upload } from "lucide-react"
 
 import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
@@ -71,6 +71,7 @@ import { FolderOptions } from "./folder-options"
 import { ImportDashboardDialog } from "./import-dashboard-dialog"
 import { ManageFoldersDialog, MoveBoardDialog } from "./folder-dialogs"
 import { ReportList } from "./report-list"
+import { TemplateList } from "./template-list"
 import { forgetLastBoard } from "./last-board"
 import { TrashDialog } from "./trash-dialog"
 
@@ -81,13 +82,17 @@ type ViewMode = "gallery" | "table"
 
 /**
  * The tabs of the Dashboards page (`BI-18` part D): the dashboards, the
- * reports. The open one is in `?tab=`, so a report's "Reports" link lands on it.
+ * reports and, for a holder of `dashboard:write`, the templates. The open one
+ * is in `?tab=`, so a report's "Reports" link lands on it.
  */
-type ListTab = "dashboards" | "reports"
+type ListTab = "dashboards" | "reports" | "templates"
 const READER_TABS: readonly ListTab[] = ["dashboards", "reports"]
+/** BI-18 part D (T6, T4): templates are for those who may save and use them. */
+const WRITER_TABS: readonly ListTab[] = ["dashboards", "reports", "templates"]
 const TAB_STRIP: Record<ListTab, LineTab> = {
   dashboards: { value: "dashboards", label: "Dashboards", icon: LayoutGrid },
   reports: { value: "reports", label: "Reports", icon: FileText },
+  templates: { value: "templates", label: "Templates", icon: LayoutTemplate },
 }
 const VIEW_STORAGE_KEY = "dashboards:list-view"
 
@@ -333,7 +338,7 @@ export function DashboardListPage() {
   const fileable = React.useMemo(() => folderChoices(folders, me), [folders, me])
   const reloadFolders = foldersState.reload
   const canFile = auth.hasPermission("dashboard:write")
-  const tabValues = READER_TABS
+  const tabValues = canFile ? WRITER_TABS : READER_TABS
   const [tab, setTab] = useUrlTab<ListTab>("tab", tabValues)
   const listTabs = tabValues.map((t) => TAB_STRIP[t])
   // The personal space is created on first use: a writer with none yet opens it
@@ -702,6 +707,11 @@ export function DashboardListPage() {
           {/* BI-18 part D (T5): reports live in the same folders, under the same access. */}
           <ReportList folders={folders} canWrite={canFile} />
         </TabsContent>
+        {canFile ? (
+          <TabsContent value="templates">
+            <TemplateList folders={fileable} />
+          </TabsContent>
+        ) : null}
       </Tabs>
 
       <BoardFormDialog
