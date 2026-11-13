@@ -108,6 +108,15 @@ fn classify_status(status: reqwest::StatusCode) -> Result<(), OpenfgaError> {
     }
 }
 
+/// Whether `text` is a non-empty plain identifier: an ASCII letter, a digit or
+/// `_`, nothing else (`DATA-55` D2). It is what may go into a catalog URL path,
+/// and it is the shape of an upload's table name (`[a-z0-9_]`). A `/`, a `.` or
+/// a percent-encoded byte would let a caller address another path, so anything
+/// else is refused before a request is built.
+fn is_plain_identifier(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 #[derive(Debug, Deserialize)]
 struct WarehouseListResponse {
     warehouses: Vec<WarehouseEntry>,
@@ -475,6 +484,60 @@ impl LakekeeperAdminClient {
             .await
             .map_err(|_| OpenfgaError::Transport)?;
         classify_status(response.status())
+    }
+
+    /// Drops the table `namespace`.`table` in `warehouse_id` through the
+    /// Iceberg REST catalog (`DATA-55` D2/D3).
+    ///
+    /// This is the catalog's drop, sent as the admin principal — the identity
+    /// that also undrops a table, so "who drops is who undrops" (D3). On a
+    /// warehouse whose delete profile is soft the table is kept for
+    /// [`DELETE_RETENTION_SECONDS`] and can be undropped; the caller writes
+    /// that profile first ([`Self::set_soft_delete_profile`]) and drops
+    /// nothing if it could not. There is no `purgeRequested` query: a purge
+    /// is exactly the hard delete this feature promises not to make, and the
+    /// same request without one is what the G3a gate sends and what
+    /// `iceberg-catalog-rest` 0.10.1's `drop_table` sends.
+    ///
+    /// `namespace` and `table` go into a URL path, so each must be a plain
+    /// identifier (ASCII letter, digit or `_`, non-empty); an upload's table
+    /// name is `[a-z0-9_]`. Anything else is [`OpenfgaError::Rejected`] and
+    /// nothing is sent.
+    ///
+    /// Returns `Ok(false)` when the catalog holds no table of that name (a
+    /// `404`), `Ok(true)` when it dropped one. A failed send is
+    /// [`OpenfgaError::Transport`], and every other status is classified by
+    /// [`classify_status`].
+    ///
+    /// # Errors
+    ///
+    /// [`OpenfgaError::Transport`] if the request never reaches the catalog;
+    /// [`OpenfgaError::Rejected`] on a `4xx`, or on a name that is not a plain
+    /// identifier; [`OpenfgaError::Server`] on a `5xx`.
+    pub async fn drop_table(
+        &self,
+        warehouse_id: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Result<bool, OpenfgaError> {
+        if !is_plain_identifier(namespace) || !is_plain_identifier(table) {
+            return Err(OpenfgaError::Rejected);
+        }
+        let response = self
+            .http
+            .delete(format!(
+                "{}/catalog/v1/{warehouse_id}/namespaces/{namespace}/tables/{table}",
+                self.base_url
+            ))
+            .header("Authorization", self.auth_header())
+            .send()
+            .await
+            .map_err(|_| OpenfgaError::Transport)?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        classify_status(response.status())?;
+        Ok(true)
     }
 
     /// Makes a dropped table in `warehouse_id` soft-deleted for
