@@ -4,7 +4,7 @@ import * as React from "react";
 import { cn } from "@/lib/utils";
 import { dashboardLook } from "@/lib/dashboard-look";
 import { normalizeFilters } from "@/lib/dashboard-filter-state";
-import { filterLine, issuedLine, paramLines } from "@/lib/render-summary";
+import { filterLine, issuedLine, paperContentWidth, paramLines } from "@/lib/render-summary";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import type { ReportingContext } from "@/lib/time-grain";
 import type { ParamControl } from "@/lib/params";
@@ -190,7 +190,11 @@ export function RenderView({ token, chart = false }: { token: string; chart?: bo
   return (
     <ReportingProvider reporting={data.reporting}>
       <RenderModeProvider value={mode}>
-        <div className={cn("min-h-screen bg-background p-2 text-foreground", look.className)} style={look.style} data-render-view>
+        <div
+          className={cn("mx-auto min-h-screen bg-background p-2 text-foreground", look.className)}
+          style={{ ...look.style, width: paperContentWidth(data.render?.paper, data.render?.orientation) }}
+          data-render-view
+        >
           <header className="mb-4 border-b pb-3">
             <h1 className="text-xl font-semibold">{name}</h1>
             <dl className="mt-2 grid gap-x-4 gap-y-0.5 text-xs text-muted-foreground sm:grid-cols-[max-content_1fr]">

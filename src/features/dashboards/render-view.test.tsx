@@ -136,6 +136,22 @@ describe("the PDF print view", () => {
     expect(darks.every((d) => d === true)).toBe(true)
   })
 
+  // BI-53 (D17): the print view is as wide as the paper's printable width, so
+  // a chart is created in the layout that is printed.
+  it("the print view is as wide as the paper's printable width", async () => {
+    serve(payload())
+    const { container, unmount } = render(<RenderView token="t" />)
+    await screen.findByRole("heading", { name: "Visits" })
+    const view = container.querySelector("[data-render-view]") as HTMLElement
+    expect(view.style.width).toBe("697px")
+    unmount()
+    serve(payload({ render: { paper: "a4", orientation: "landscape" } }))
+    const second = render(<RenderView token="t" />)
+    await screen.findByRole("heading", { name: "Visits" })
+    const landscape = second.container.querySelector("[data-render-view]") as HTMLElement
+    expect(landscape.style.width).toBe("1027px")
+  })
+
   it("prints an image or web-page card as a placeholder and never mounts it", async () => {
     serve(payload())
     render(<RenderView token="t" />)

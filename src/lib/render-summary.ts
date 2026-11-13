@@ -29,6 +29,23 @@ export function filterLine(f: FilterDef): string {
   return `${f.column}${verb}: ${f.values.join(", ")}`
 }
 
+/**
+ * The paper's printable width in CSS pixels (`BI-53`, D17): the paper's width
+ * less the two 0.5 in side margins the API sends, at 96 px per inch, rounded
+ * down. A4 is 8.27 by 11.7 in and Letter 8.5 by 11 (anything else reads as
+ * A4); `landscape` takes the longer side, anything else the shorter: 697, 1027,
+ * 720 and 960.
+ *
+ * `lakehouse-api/src/pdf.rs` (`Paper::inches`, the margins of
+ * `convert_url`) is the other owner of these numbers: whoever changes one
+ * changes the other.
+ */
+export function paperContentWidth(paper = "a4", orientation = "portrait"): number {
+  const [short, long] = paper === "letter" ? [8.5, 11] : [8.27, 11.7]
+  const side = orientation === "landscape" ? long : short
+  return Math.floor((side - 1) * 96)
+}
+
 /** `Region: North` for each parameter the dashboard shows, with the value used. */
 export function paramLines(controls: readonly ParamControl[] | undefined): string[] {
   return (controls ?? []).map((c) => `${c.param.label || c.param.name}: ${String(c.value)}`)
