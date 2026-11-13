@@ -113,6 +113,10 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         }
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     }
+    // BI-53 (QA LH-BI-1-01 F3): the print view's own read is a stage of one
+    // PDF; durations only, never a token or a name.
+    tracing::info!("render data requested");
+    let read_started = std::time::Instant::now();
     let query = DashboardQuery::for_render(
         &claims.board,
         claims.filters.as_deref(),
@@ -128,7 +132,13 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
     };
     // `SEC-50` slice 2 M4/M5: the PDF reads as the person the token names —
     // their first tenant, because the token carries no tenant (M5).
-    match payload_for(&state, &principal, &query, &HeaderMap::new()).await {
+    let read = payload_for(&state, &principal, &query, &HeaderMap::new()).await;
+    tracing::info!(
+        payload_ms = crate::routes::pdf_export::millis(read_started),
+        ok = read.is_ok(),
+        "render data read"
+    );
+    match read {
         Ok(mut payload) => {
             // BI-19 part D (plan D13): a chart token is good for that chart
             // only. The dashboard was read as the person (rules, masks, trash,

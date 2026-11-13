@@ -211,3 +211,14 @@ test("a pie names a NULL slice (No value) and a breakdown names a NULL series (N
   const stacked = buildOption({ kind: "bar", x: "x", y: "v", series: "g" }, [{ x: "Bali", g: null, v: 1 }, { x: "Bali", g: "A", v: 2 }], false)
   assert.deepEqual((stacked.series as { name: string }[]).map((s) => s.name).sort(), ["(No value)", "A"])
 })
+
+// QA LH-BI-6-39 (BI-55, D6): a donut over many categories cut its legend off;
+// it pages like the rose and the funnel do.
+test("a donut's legend pages when its entries do not fit, like a rose's and a funnel's", () => {
+  const rows = Array.from({ length: 25 }, (_, i) => ({ x: `c${i}`, v: i + 1 }))
+  for (const kind of ["pie", "rose", "funnel"] as const) {
+    const option = buildOption({ kind, x: "x", y: "v" }, rows, false)
+    const legend = option.legend as { type?: string }
+    assert.equal(legend.type, "scroll", `${kind}: the legend pages`)
+  }
+})

@@ -93,7 +93,7 @@ export function TileDataDialog({
         </DialogHeader>
         {hasRows(cell) && cell.rows.length ? (
           <>
-            <RowsTable columns={visibleColumns(cell.columns)} rows={cell.rows} />
+            <RowsTable columns={visibleColumns(cell.columns)} rows={cell.rows} namePlaceholders />
             <div className="flex items-center justify-between">
               <p className="text-[11px] text-muted-foreground">{cell.rows.length} rows</p>
               {canDownload ? (

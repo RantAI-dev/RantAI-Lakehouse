@@ -941,7 +941,8 @@ pub fn kpi_trend_sql(
     } else if agg == Aggregate::Count {
         "count()".to_owned()
     } else {
-        format!("round({agg}({measure}))")
+        // QA LH-BI-6-04 (BI-55, D4).
+        agg.rounded(measure.as_str())
     };
     Some(format!(
         "SELECT * FROM (SELECT {column}, {value} AS v FROM {} WHERE {column} IS NOT NULL \

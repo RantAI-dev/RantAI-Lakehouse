@@ -76,15 +76,18 @@ fn currency_digits(code: &str) -> usize {
 
 /// How a currency is written in front of the number: the text and whether a
 /// space follows it. `Intl` (as `bun` ships it) writes `Rp 1.234,00` in
-/// `id-ID` but `IDR 1,234.00` in `en-US`, `$1,234.00` and `US$1.234,00`; a
-/// code (`IDR`, or any currency not known here) always has a space.
+/// `id-ID`, `$1,234.00` and `US$1.234,00`; a code (`IDR`, or any currency not
+/// known here) always has a space. IDR reads `Rp` in both locales (QA
+/// `LH-BI-1-06`, `BI-55`): the console asks `Intl` for its narrow symbol, which
+/// is `Rp` everywhere, and this twin says the same so a formatted CSV and an
+/// Excel number format do not disagree with the screen.
 fn symbol(code: &str, display: CurrencyDisplay, locale: &str) -> (String, bool) {
     if display == CurrencyDisplay::Code {
         return (code.to_owned(), true);
     }
     let id = locale == "id-ID";
     match (code, id) {
-        ("IDR", true) => ("Rp".to_owned(), true),
+        ("IDR", _) => ("Rp".to_owned(), true),
         ("USD", true) => ("US$".to_owned(), false),
         ("USD", false) => ("$".to_owned(), false),
         ("EUR", _) => ("€".to_owned(), false),
@@ -435,11 +438,12 @@ mod tests {
                 r##"[>=1000000000]"Rp "#,##0.00,,," B";[>=1000000]"Rp "#,##0.00,," M";"Rp "#,##0.00"##
             )
         );
-        // en-US writes the code, as the console does.
+        // en-US writes "Rp" too: the console asks Intl for IDR's narrow
+        // symbol, which is "Rp" in both locales (QA LH-BI-1-06, BI-55).
         assert_eq!(
             excel_number_format(&fmt, "en-US").as_deref(),
             Some(
-                r##"[>=1000000000]"IDR "#,##0.00,,," B";[>=1000000]"IDR "#,##0.00,," M";"IDR "#,##0.00"##
+                r##"[>=1000000000]"Rp "#,##0.00,,," B";[>=1000000]"Rp "#,##0.00,," M";"Rp "#,##0.00"##
             )
         );
     }

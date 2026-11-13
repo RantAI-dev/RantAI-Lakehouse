@@ -293,6 +293,15 @@ describe("PreviewRowsTable and the internal columns", () => {
     expect(screen.queryByText("sum_visitors")).toBeNull()
   })
 
+  // QA LH-BI-6-38 (BI-55, D8): the preview's own Rows table names a missing
+  // and an empty category as the chart does.
+  it("the Rows table under the preview names a missing and an empty category", () => {
+    const rows = [{ a: null, n: 1 }, { a: "", n: 2 }, { a: "Bali", n: 3 }]
+    render(<PreviewRowsTable open data={{ columns: ["a", "n"], rows, truncated: false, limit: 2000 }} />)
+    expect(screen.getByText("(No value)")).toBeTruthy()
+    expect(screen.getByText("(Empty)")).toBeTruthy()
+  })
+
   it("gives a step filter's value input room to show a few digits (phase 2 QA R12)", () => {
     const base = { columns: ["provinsi"], groups: [{ name: "provinsi", kind: "text" as const }], measures: ["visitors"], labels: { visitors: "visitors" } }
     render(<StepsEditor value={[{ filter: [{ column: "visitors", op: "gt", value: "1000" }] }]} onChange={() => {}} base={base as never} disabled={false} />)

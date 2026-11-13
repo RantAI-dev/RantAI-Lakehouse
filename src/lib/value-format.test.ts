@@ -20,6 +20,22 @@ describe("formatValue", () => {
     expect(formatValue(1234, { style: "currency", currency: "IDR", decimals: 0 }, "id-ID")).toBe("Rp 1.234")
   })
 
+  // QA LH-BI-1-06 (BI-55, D12): the English number locale has no symbol for
+  // IDR, so the console asks Intl for its narrow symbol, which is "Rp".
+  test("a rupiah amount reads Rp in the English number locale too", () => {
+    expect(formatValue(1234567.891, { style: "compact", currency: "IDR", decimals: 2 }, "en-US")).toBe("Rp 1.23 M")
+    expect(formatValue(-1234567.891, { style: "compact", currency: "IDR", decimals: 2 }, "en-US")).toBe("-Rp 1.23 M")
+    expect(formatValue(1234, { style: "currency", currency: "IDR", decimals: 0 }, "en-US")).toBe("Rp 1,234")
+  })
+
+  test("a rupiah amount shown as its code still reads IDR, and other currencies keep their symbol", () => {
+    const code = { style: "currency", currency: "IDR", decimals: 0, currencyDisplay: "code" } as const
+    expect(formatValue(1234, code, "en-US")).toBe("IDR 1,234")
+    expect(formatValue(1234.5, { style: "currency", currency: "USD", decimals: 2 }, "en-US")).toBe("$1,234.50")
+    expect(formatValue(1234.5, { style: "currency", currency: "USD", decimals: 2 }, "id-ID")).toBe("US$1.234,50")
+    expect(formatValue(1234.5, { style: "currency", currency: "SGD", decimals: 2 }, "en-US")).toBe("SGD 1,234.50")
+  })
+
   test("a percent multiplies by 100", () => {
     expect(formatValue(0.125, { style: "percent", decimals: 1 })).toBe("12.5%")
     expect(formatValue(0.5, { style: "percent", decimals: 0 })).toBe("50%")

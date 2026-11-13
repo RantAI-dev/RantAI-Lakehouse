@@ -3813,13 +3813,22 @@ fn export_columns(chart: &StoredChartSpec) -> (Vec<String>, Vec<String>) {
         .into_iter()
         .filter(|c| settings.get(c).is_none_or(|s| s.hidden != Some(true)))
         .collect();
+    // QA LH-BI-7-04 (BI-55, D10): on a chart with a join a column with no
+    // label of its own reads `table.column` in the file's header, as the
+    // record list does; a typed label still wins. A chart with no join keeps
+    // the column's own name, so nothing changes there.
+    let joined = !chart.def.shape.joins_list().is_empty();
     let labels = shown
         .iter()
         .map(|c| {
-            settings
-                .get(c)
-                .and_then(|s| s.label.clone())
-                .unwrap_or_else(|| c.clone())
+            if let Some(label) = settings.get(c).and_then(|s| s.label.clone()) {
+                return label;
+            }
+            if joined {
+                lakehouse_bi::joins::display_name(c)
+            } else {
+                c.clone()
+            }
         })
         .collect();
     (shown, labels)

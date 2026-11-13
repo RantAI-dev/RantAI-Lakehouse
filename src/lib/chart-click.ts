@@ -72,6 +72,12 @@ export type ClickContext = {
    * is then one of that question's dimension, and the rows to list are from its own source.
    */
   layer?: LayerClick
+  /**
+   * BI-55 (QA `LH-BI-13-04`): the legend name of the question the mark belongs
+   * to, set only by a chart with more than one question. Display only — it is
+   * never sent to the server.
+   */
+  question?: string
 }
 
 /** The question of a combined chart that a click was on. */

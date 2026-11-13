@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test"
-import { filterLine, issuedLine, paramLines } from "./render-summary"
+import { filterLine, issuedLine, paperContentWidth, paramLines } from "./render-summary"
 
 describe("the PDF's first page lines", () => {
   it("writes each kind of filter as one line", () => {
@@ -21,6 +21,15 @@ describe("the PDF's first page lines", () => {
         { param: { id: "2", name: "top", label: "", type: "number", default: 5 }, value: 10 },
       ]),
     ).toEqual(["Region: north", "top: 10"])
+  })
+
+  // BI-53 (D17): the print view is laid out at the paper's printable width.
+  it("the printable width is the paper's width less the two side margins, in pixels", () => {
+    expect(paperContentWidth("a4", "portrait")).toBe(697)
+    expect(paperContentWidth("a4", "landscape")).toBe(1027)
+    expect(paperContentWidth("letter", "portrait")).toBe(720)
+    expect(paperContentWidth("letter", "landscape")).toBe(960)
+    expect(paperContentWidth(undefined, undefined)).toBe(697)
   })
 
   it("writes the time in the report zone, and falls back to UTC for a zone it does not know", () => {
