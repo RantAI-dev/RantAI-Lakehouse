@@ -47,6 +47,7 @@ once a first release is tagged.
 
 ### Changed
 
+- The pipeline preview answers an engine failure with the fixed sentence for its cause and ` Reference: <id>`, as Query Studio does, and no longer shows the engine's own text (backlog `BLD-1`; `LH-QS-2-08`, owner 2026-11-12 and 2026-11-13). The engine's text goes to the log under that reference.
 - The pipeline page no longer shows Kind and Incremental column (backlog `BLD-1`, decision 18; `BLD-12`). Nothing read them: every run rebuilds the output table. Stored values are kept and sent back unchanged when a pipeline is edited.
 - A pipeline with several inputs and no step is refused when saved, with "with more than one input, add a step that reads them" (backlog `BLD-1`). Before, the API accepted it and copied only the first input.
 - A `query:read` grant made from a table's page opens that table's page without `catalog:read` (backlog `GOV-11`; product owner 2026-11-12, `DEC-20`). It opens that table only — not the catalog list, not search, not another table's page — and masks, row filters and the role's table access apply as everywhere. The seeded **Data Engineer** role gains `catalog:read` (migration `0138`), so the role that edits catalog entries can open the Catalog and a table's page; a renamed or custom role is not changed.

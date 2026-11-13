@@ -129,17 +129,6 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "_for_author(",
         "query-author exception, assistant paths only: the model is shown the trimmed engine diagnosis to correct its SQL",
     ),
-    // BLD-1 part 1 / D16 and the spec's rule 7: a preview reports an error the
-    // way `POST /api/query/run` reports one for the same SQL. The person
-    // previewing is the one who wrote the step's SQL, so the engine's trimmed
-    // diagnosis of it is theirs — the same exception Query Studio has, through
-    // the same function (`upstream_error::ch_failure_for_author`), never a
-    // second classification.
-    (
-        "pipeline_preview.rs",
-        "_for_author(",
-        "BLD-1 part 1 D16 / spec rule 7: the caller wrote the previewed step's SQL, so the engine's trimmed diagnosis is theirs — the same query-author exception as Query Studio, through the same function",
-    ),
     (
         "query.rs",
         ".map_err(|err| err.to_string())?;",
