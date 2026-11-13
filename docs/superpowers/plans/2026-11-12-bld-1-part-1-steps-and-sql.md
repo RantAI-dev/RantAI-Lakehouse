@@ -993,6 +993,90 @@ text `POST /api/query/run` gives for it (compared up to the reference id).
   pull request.
 - The Python suite was not run: no `dagster/` file changed.
 
+### Handoff S2, fix round 1 (developer, 2026-11-13)
+
+Branch `feat/bld-1-steps-preview` (base for this round `1d025c342`, which
+carries the reviewer's entry and the merge of `main`).
+
+**Commits**
+
+| Commit | Subject |
+| --- | --- |
+| `53c1aceed` | test(pipelines): the preview asks nothing about the previewed table (R1-B1) |
+| `513c81e9b` | fix(pipelines): several inputs need a step (R1-S1) |
+| (this commit) | docs(plan): BLD-1 part 1 S2 fix round 1 handoff |
+
+**R1-B1 — which request, and which case.** I could not observe it, so I do
+not quote a body, and I say that plainly rather than invent one. The failure
+did not reproduce here:
+
+- the test alone, one process per run: 40 runs, all passed;
+- the test alone through the built binary, eight processes in parallel, 15
+  runs each: 120 runs, all passed;
+- the whole file, three loops of 10 runs at `--test-threads=16`: 30 runs,
+  all passed;
+- the whole file through `cargo-locked`, 20 runs before the final
+  comment-only polish and 20 after: 40 runs, all passed.
+
+Every one of those runs used an assertion that prints the received requests,
+and none ever received one. The route also cannot produce it: the tenant
+gate reads Postgres, and `rewrite_sql_for_roles` refuses at `table_access`
+**before** `prefetch_for_tables` can ask `ClickHouse` for
+`system.columns`/`system.tables`; `describe_columns` and the row query run
+only after the rewrite returns `Ok`, and either would have answered a
+different sentence than the one the reviewer saw pass (`The database request
+failed. Reference: …`). So this is **case 2**: a request from something else,
+not about the previewed table — this machine runs many test processes at
+once, every mock binds an ephemeral port, and a request one of them queued in
+a background task (the column-lineage build pass is one writer that reads
+`ClickHouse` after its route has answered) can land on whichever server binds
+that port next.
+
+What changed: the assertion now says what the test means — no request the
+engine received names the previewed table (`silver.orders`), which is the
+compiled statement, its `DESCRIBE` and the row query wrapping it. The shape
+alone (`DESCRIBE`, `AS step LIMIT`) is deliberately not used, because another
+preview test's probe has the same shape and would be a false failure; the
+failure message prints every received request (method, url, body) so the next
+failure names the intruder. The assertion is still there; no retry, no sleep,
+no route change (there was no order defect to fix). If the reviewer can
+reproduce it, the printed request will say which process sent it.
+
+**R1-S1 — several inputs need a step (D1).** `pipeline_compile::validate`
+refuses a definition with more than one input and no step at `inputs[1]` with
+the fixed sentence "with more than one input, add a step that reads them",
+when `up_to` is `None`; with `up_to` naming an input it still compiles that
+input (the editor's preview of a pipeline whose step is not written yet). The
+module doc's rule 1 says so. No fixture in `pipeline_definition_save.rs`,
+`pipeline_compile_route.rs`, `pipeline_preview.rs`, or elsewhere in the
+crate's `--lib -- pipeline` tests saved several inputs with no step, so no
+existing fixture needed a step.
+
+**Verification, on the code head (`513c81e9b`), in the foreground.**
+
+```
+cd rust && cargo fmt --check                                  # clean
+cargo-locked clippy -j 2 -p lakehouse-api --all-targets -- -D warnings
+                                                              # clean
+cargo-locked test -j 2 -p lakehouse-api --lib -- pipeline_compile
+                                                              # 38 passed, 0 failed
+cargo-locked test -j 2 -p lakehouse-api --test pipeline_definition_save \
+  --test pipeline_compile_route --test pipeline_preview        # 14, 24, 10 passed
+cargo-locked test -j 2 -p lakehouse-api --lib -- pipeline      # 304 passed
+cargo-locked test -j 2 -p lakehouse-api --test sec11_guard --test route_auth
+                                                              # 4, 95 passed
+```
+
+The 20-run proof of the R1-B1 fix, `for i in $(seq 20); do cargo-locked test
+-j 2 -p lakehouse-api --test pipeline_preview 2>&1 | grep '^test result';
+done`, printed the same line twenty times:
+
+```
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+(finished between 4.53 s and 6.43 s). That is 20 of 20, none failed.
+
 ## 7. Review
 
 
