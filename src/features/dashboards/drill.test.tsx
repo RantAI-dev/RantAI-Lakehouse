@@ -117,6 +117,26 @@ describe("RecordsDialog", () => {
     expect(urls.at(-1)).toContain("offset=0")
   })
 
+  // QA LH-BI-7-04 (BI-55, D10): a joined column reads table.column in the
+  // record list and in the one-record view; the stored name stays
+  // `alias__column` and is never shown.
+  it("a joined column is headed table.column in the list and in the one-record view", async () => {
+    global.fetch = mock(async () => json({
+      columns: ["kota", "zz_hotel__kamar"],
+      rows: [{ kota: "Denpasar", zz_hotel__kamar: 12 }],
+      total: 1, limit: 50, offset: 0, filtersSkipped: [],
+    })) as unknown as typeof fetch
+    render(<RecordsDialog request={REQUEST} onClose={() => {}} />)
+
+    await screen.findByText("1–1 of 1")
+    expect(screen.getByText("zz_hotel.kamar")).toBeTruthy()
+    expect(screen.queryByText("zz_hotel__kamar")).toBeNull()
+
+    fireEvent.click(screen.getByText("Denpasar"))
+    await screen.findByText("Record 1 of 1")
+    expect(screen.getByText("zz_hotel.kamar")).toBeTruthy()
+  })
+
   it("stops at the first and the last record of the whole list", async () => {
     stubPages(2)
     render(<RecordsDialog request={REQUEST} onClose={() => {}} />)

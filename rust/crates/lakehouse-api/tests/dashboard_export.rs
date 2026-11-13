@@ -462,10 +462,12 @@ async fn the_export_of_a_joined_table_lists_joined_columns_and_governs_each_tabl
             .to_vec(),
     )
     .unwrap();
-    // The file starts with a byte-order mark (see the export route).
+    // The file starts with a byte-order mark (see the export route). A joined
+    // column is headed `table.column` (QA LH-BI-7-04, BI-55): the name in SQL
+    // stays the identifier `mart_y__email`.
     assert!(
         body.trim_start_matches('\u{feff}')
-            .starts_with("email,mart_y__email,mart_y__secret"),
+            .starts_with("email,mart_y.email,mart_y.secret"),
         "{body}"
     );
     let sent: Vec<String> = statements(&ch)
