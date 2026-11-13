@@ -27,14 +27,16 @@ pub struct Layer {
 }
 
 /// What the tile needs to label one binned column: the statement that reads
-/// its width, minimum and maximum over the same filtered relation.
+/// its width, minimum, maximum and whether every value is a whole number
+/// (`whole`, `BI-57`) over the same filtered relation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BinRead {
     /// The binned column.
     pub column: String,
     /// `auto`, `count` or `width`.
     pub mode: String,
-    /// `SELECT width, min, max`, one row, to run through the role rewrite.
+    /// `SELECT width, min, max, whole`, one row, to run through the role
+    /// rewrite.
     pub sql: String,
 }
 
@@ -192,8 +194,8 @@ fn filtered(from: &Relation, predicates: Vec<String>) -> Relation {
     }
 }
 
-/// The statement that reads each layer's width, minimum and maximum over the
-/// filtered relation the bins are cut from.
+/// The statement that reads each layer's width, minimum, maximum and whole
+/// flag over the filtered relation the bins are cut from.
 #[must_use]
 pub fn reads(from: &Relation, predicates: &[String], layers: &[Layer]) -> Vec<BinRead> {
     let base = filtered(from, predicates.to_vec()).render();

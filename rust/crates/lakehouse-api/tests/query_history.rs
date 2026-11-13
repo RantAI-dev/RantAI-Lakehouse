@@ -40,7 +40,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+// OPS-32 D4: this file reaches the shared harness as `crate::common::…` from
+// inside each of its modules (a `use` in one module is not visible in
+// another), so it has no file-level import to keep.
 
 /// What the route does with the caller's text before the store sees it.
 mod filters {
@@ -695,13 +697,13 @@ mod recording {
         );
     }
 
-    /// `QS-4` QA (2026-11-05, owner's decision 1): the result tab may still
-    /// show the engine's diagnosis, but History and the history API keep a
+    /// `QS-4` QA (2026-11-05, owner's decision 1) and owner 2026-11-12,
+    /// LH-QS-2-08: the response, History and the history API all carry the
     /// classified sentence with the same reference id, and no engine text and
-    /// no catalog name.
+    /// no catalog name. (The response used to show the engine's diagnosis,
+    /// `QS-1-AC5`.)
     #[tokio::test]
-    async fn a_failed_statement_keeps_a_classified_sentence_while_the_response_keeps_the_diagnosis()
-    {
+    async fn a_failed_statement_answers_and_records_the_same_classified_sentence() {
         let ch = MockServer::start().await;
         mount_prefetch_ok_and_engine_answer(&ch, 404, UNKNOWN_TABLE_ERROR).await;
         let app = spin_up_with_clickhouse(&ch.uri()).await;
@@ -710,15 +712,21 @@ mod recording {
         let (status, body) = post_sql(&app.router, &cookie, "SELECT * FROM icecat_api.x").await;
 
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-        let shown = body["error"].as_str().expect("the author's diagnosis");
-        assert!(
-            shown.contains("Code: 60. DB::Exception") && shown.contains("icecat_api.x"),
-            "the result tab keeps the author's diagnosis (QS-1-AC5): {shown}"
-        );
+        let shown = body["error"].as_str().expect("the failure's sentence");
+        for gone in ["Code:", "DB::Exception", "icecat_api", "UNKNOWN_TABLE"] {
+            assert!(
+                !shown.contains(gone),
+                "the response carries no engine text: {gone} in {shown}"
+            );
+        }
         let (_, reference) = shown
             .rsplit_once("Reference: ")
-            .expect("the diagnosis ends with its reference");
+            .expect("the sentence ends with its reference");
         let expected = format!("{UNKNOWN_TABLE_SENTENCE} Reference: {reference}");
+        assert_eq!(
+            shown, expected,
+            "the response says what the History row keeps"
+        );
 
         let (recorded_status, message, _) =
             the_recorded_run(&app.pool, "rina@meridian.example").await;
@@ -729,7 +737,9 @@ mod recording {
             "the row keeps the cause as a fixed sentence and the same reference"
         );
 
-        let (status, body) = crate::filters::get_history(&app, &cookie, "").await;
+        // OPS-32: as a module of `tests/it.rs`, `crate` is the `it` crate root
+        // now, so the path goes through this file's own module.
+        let (status, body) = crate::query_history::filters::get_history(&app, &cookie, "").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let runs = &body["runs"];
         assert_eq!(runs[0]["message"], expected.as_str(), "{runs}");
@@ -762,11 +772,13 @@ mod recording {
         assert_eq!(recorded_status, "stopped");
         assert_eq!(message.as_deref(), Some("Stopped"));
 
-        let (status, body) = crate::filters::get_history(&app, &cookie, "status=stopped").await;
+        let (status, body) =
+            crate::query_history::filters::get_history(&app, &cookie, "status=stopped").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["runs"][0]["status"], "stopped", "{body}");
         assert_eq!(body["total"], 1, "{body}");
-        let (status, body) = crate::filters::get_history(&app, &cookie, "status=failed").await;
+        let (status, body) =
+            crate::query_history::filters::get_history(&app, &cookie, "status=failed").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["runs"], json!([]), "a stopped run is not a failed one");
         assert_eq!(body["total"], 0, "{body}");

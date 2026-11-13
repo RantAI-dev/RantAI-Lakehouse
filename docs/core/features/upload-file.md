@@ -283,6 +283,10 @@ measurements. The preview decodes at most the first 2,000 rows and shows 20.
   again."
 - In an install with several tenants, the table an upload creates appears in
   the shared catalog, which only the tenant that owns the catalog sees.
+- A file load is not re-run from the Pipelines page; that page answers "A file
+  load is not re-run from Pipelines. Load the file again from the "Uploaded
+  files" tab of Sources, which checks the table first." Changed 2026-11-13
+  (`DATA-61`), *(proposed, not yet signed)*.
 
 ## Acceptance checklist
 

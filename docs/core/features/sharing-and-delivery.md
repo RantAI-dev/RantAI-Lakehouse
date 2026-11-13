@@ -114,6 +114,7 @@ person to approve first).
 - A public link with a password can be locked for 15 minutes by someone guessing, and the page then says so to everyone who tries. The owner can make a new link.
 - Permissions are per person or per role. There are no groups.
 - An alert looks at one number every 15 minutes. A spike that comes and goes between two checks is not seen.
+- An alert on the average, minimum or maximum of a table column compares the value with up to six decimals, as the chart shows it; before `BI-57` it compared the whole number, so an alert close to its threshold can fire or recover at a different check than before, once, without being edited. The alert's message still shows whole numbers. *(proposed, not yet signed; `BI-57`)*
 - A PNG needs the PDF service (`BI-1`).
 - Import cannot read the old YAML file. Export again as a dashboard file.
 - A manager can mark an item "only the people listed" without listing themselves, and the manager of a sub-folder can do the same to a dashboard the manager of the folder above could open. The People tab warns when nobody listed can manage the item; administrators always keep access. To undo it, an administrator or a person listed with manage changes the list.

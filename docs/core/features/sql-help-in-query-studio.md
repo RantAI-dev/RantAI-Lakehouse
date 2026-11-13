@@ -35,7 +35,7 @@ A query that fails in Query Studio shows its error and nothing else. The person 
 
 ## Asking the assistant
 
-This feature is the assistant working inside Query Studio. The user asks with one fixed sentence: "Why does this query fail? Fix it." with the engine, the SQL and the error the run raised, or "Explain what this query does." with the engine and the SQL. For an explanation the assistant writes plain words and calls no tool; the server offers it none in that turn. For a fix it proposes the whole corrected statement through `propose_sql`, a checked, read-only tool that never runs it. A proposal that fails the server's check comes back to the model as an error, so the model can correct it in the same turn; only a checked proposal reaches the person.
+This feature is the assistant working inside Query Studio. The user asks with one fixed sentence: "Why does this query fail? Fix it." with the engine, the SQL and the fixed sentence and reference that the run showed, or "Explain what this query does." with the engine and the SQL. For an explanation the assistant writes plain words and calls no tool; the server offers it none in that turn. For a fix it proposes the whole corrected statement through `propose_sql`, a checked, read-only tool that never runs it. A proposal that fails the server's check comes back to the model as an error, so the model can correct it in the same turn; only a checked proposal reaches the person.
 
 ## Decisions
 
@@ -55,6 +55,7 @@ This feature is the assistant working inside Query Studio. The user asks with on
 - A proposal is checked for the caller's permissions and for the names the engine resolves, and it is never run. A statement that plans can still return rows other than the ones the person meant.
 - The console refuses to send a statement of more than 20,000 characters to be fixed; it says the query is too long for the assistant to fix.
 - The assistant sees the tables the chat's data map lists, and learns of other tables only from the error text. The data map goes only to a user with `catalog:read`, and its sample values and ranges go only to a user who also has `query:read` (`SEC-24`).
+- The engine's own text is not sent to the console (owner, 2026-11-12, LH-QS-2-08). Fix with AI sends the model only the fixed sentence and the reference, so a proposal for a failed run may be less exact than before. The assistant's own tools still get the engine's diagnosis.
 - The diff is against the editor as it was when the proposal came back. Typing in the editor closes the proposal, and so does running the query.
 - In an Explain turn the assistant is offered no tool, so it can neither propose a fix nor run a query.
 - A chat the console opened with a tool list refuses any tool outside that list.
