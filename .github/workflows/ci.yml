@@ -293,6 +293,16 @@ jobs:
           pip install pytest==8.3.4 pyyaml==6.0.3 cryptography==50.0.2
           python -m pytest ops/release -q
 
+      # OPS-25 D10: the gate groups are wired in three places -- the path map,
+      # each gate job's `if:`, and what `ci-required` reads -- and a mismatch
+      # there skips a gate that should have run while `ci-required` reads the
+      # skip as allowed. This is the one check that they agree; it asks the
+      # real scope script which group each gate file selects, so the answer is
+      # the one CI acts on. Its unit tests are the `discover -s ops/lint` step
+      # above; `pyyaml` is installed by the step before this one.
+      - name: Check every gate job has one group and every gate file a path rule (OPS-25)
+        run: python3 ops/lint/check_gate_groups.py
+
       # REL-2 S2-T2: the release's Compose file is RENDERED from the
       # template, and the rendered file is what an operator deploys — so
       # the render is proved here, on every PR, not only when a release
