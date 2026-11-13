@@ -40,12 +40,14 @@ cities on the same chart.
 | 4 | A hierarchy has two to six levels, belongs to one table, and needs `dashboard:write` to define | Planner default | Owner to confirm at QA |
 | 5 | Drilling down is a viewer's own, temporary view: it does not change the saved chart and is not shared in the URL | Planner default | Owner to confirm at QA |
 | 6 | Grid cells are square in degrees: 0.01, 0.1, 1 or 10, or automatic | Planner default | Owner to confirm at QA |
+| 7 | Over a column whose values are all whole numbers (a year), a bin of width 1 holds one value and the maximum has a bin of its own; such a bin reads as its value ("2020"). Automatic and counted bins of such a column are never narrower than 1, and are 2 wide when one bar per value would pass the count | Planner default (QA LH-BI-2-02) | *(proposed, not yet signed; BI-57)* |
 
 ## Limits to tell a customer
 
 - Automatic bins are worked out from the data the viewer may see at that moment, so two viewers with different row filters can see different edges.
 - A grid on a map is in degrees, so cells are not equal in area far from the equator.
 - A value group lists values as they are spelled; a new spelling in the data lands in the rest.
+- A whole-number column over more values than the bin count (more than ten years under Automatic) is cut into ranges, which read with a thousands separator ("2,014 – 2,016"). A width of 1 typed over whole numbers, and a histogram ranged by 1, also give the maximum its own bin. *(proposed, not yet signed; `BI-57`)*
 
 ## Acceptance checklist
 
