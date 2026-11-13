@@ -33,9 +33,9 @@ Found by reading the code on 2026-10-08; evidence is in the plan, section 2.
 
 ## Not included
 
-- A live connection test for Oracle, MongoDB, Kafka and SFTP. These connect
+- A live connection test for batch MongoDB, Kafka and SFTP. These connect
   from the orchestrator, not from the API; a test that runs there is new work
-  (follow-up backlog item, see Decisions 1).
+  (`SRC-5`). Oracle has had one since `SRC-4`: Test runs it on the orchestrator.
 - Testing public AWS S3 with no endpoint set (Decision 3).
 - Making Google Sheets work.
 - Table discovery for these types: `SRC-13`. Gate tests for them: `SRC-9`.
@@ -66,8 +66,9 @@ All seven defaults signed by the product owner on 2026-10-08 ("run everything as
 
 ## Limits to tell a customer
 
-- Oracle, MongoDB, Kafka and SFTP connectors cannot be tested from the
-  console. A wrong credential shows on the first load, not on save.
+- Batch MongoDB, Kafka and SFTP connectors cannot be tested from the
+  console. A wrong credential shows on the first load, not on save. (Oracle
+  can, since `SRC-4`.)
 - A MongoDB source must run MongoDB 4.4 or later: the driver (`pymongo`
   4.18, `SEC-52`) no longer supports 4.0 and 4.2.
 - An object-storage connector is tested only when it has an endpoint.
