@@ -13,7 +13,7 @@ import type {
   UpdatePipelineInput,
 } from "../contracts/pipelines";
 import { apiFetch } from "../http";
-import { ServiceError } from "../errors";
+import { ServiceError, deniedFor } from "../errors";
 
 /**
  * PipelineService is real — Dagster jobs (lakehouse orchestration) via the
@@ -26,6 +26,9 @@ import { ServiceError } from "../errors";
 async function getJson<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await apiFetch(url, init);
   const json = await res.json();
+  // QA LH-BLD-2-03 (WEB-11): the pipeline page said "Service unavailable" for a missing permission.
+  const denied = deniedFor(res.status, json);
+  if (denied) throw denied;
   if (!res.ok) throw new ServiceError("unavailable", json?.error ?? `Failed (${res.status})`);
   return json as T;
 }
@@ -48,6 +51,9 @@ async function sendJson<T>(method: string, url: string, body: unknown, signal?: 
   // already does it for `PUT .../tenant`.
   const json = res.status === 204 ? null : await res.json().catch(() => null);
   if (!res.ok) {
+    // QA TC-1734, LH-DATA-19-03 (WEB-11): Create pipeline and the target lag showed the API's code.
+    const denied = deniedFor(res.status, json);
+    if (denied) throw denied;
     const kind = res.status === 404 ? "not_found" : res.status >= 500 ? "unavailable" : "invalid_request";
     throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`);
   }
@@ -61,9 +67,13 @@ export const dagsterPipelineService: PipelineService = {
     // nothing (`routes::pipelines::list`), and a refused tenant-scoped
     // caller gets `dagsterJobs: {supported:false, reason}` on an
     // otherwise-200 response. Both must reach the page honestly instead
-    // of throwing away the Dagster-half explanation.
+    // of throwing away the Dagster-half explanation. A 401 or 403 carries
+    // nothing worth listing and is thrown, so the page shows the refusal
+    // and not the orchestrator banner (QA TC-1734 F3, LH-DATA-19-03).
     const res = await apiFetch("/api/pipelines", { signal });
     const body = (await res.json()) as PipelineList;
+    const denied = deniedFor(res.status, body);
+    if (denied) throw denied;
     return {
       pipelines: body.pipelines ?? [],
       dagsterJobs: body.dagsterJobs,

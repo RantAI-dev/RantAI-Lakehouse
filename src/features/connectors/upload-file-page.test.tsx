@@ -610,6 +610,17 @@ describe("UploadFilePage, first step", () => {
     expect(alert.textContent).toBe("You do not have permission to do this.")
     expect(next().disabled).toBe(true)
   })
+
+  // QA TC-1734 F1, LH-DATA-17-05, LH-DATA-18-03 (WEB-11): the row showed
+  // "permission_denied: connector:manage".
+  it("shows a refused file in words that name the permission, not the API's code", async () => {
+    stubFetch({ session: () => json({ error: "permission_denied: connector:manage" }, 403) })
+    render(<UploadFilePage lookupDelayMs={0} />)
+    chooseFile(CSV())
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toBe("You don't have access. This needs the connector:manage permission.")
+    expect(next().disabled).toBe(true)
+  })
 })
 
 describe("UploadFilePage, Check step", () => {

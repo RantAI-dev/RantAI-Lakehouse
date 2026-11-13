@@ -186,7 +186,7 @@ describe("a refused dashboard write is an error, not a success (BI-18 part C rev
       expect((err as ServiceError).code).toBe("permission_denied")
       // The page shows the readable sentence: the code is for the log.
       expect(readableErrorMessage((err as ServiceError).message)).toBe(
-        "This account does not have permission. Ask a workspace admin.",
+        "You don't have access. This needs the dashboard:write permission.",
       )
     })
   }
