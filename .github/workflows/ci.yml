@@ -43,8 +43,8 @@ env:
 
 # OPS-24 D1: no job's `if:` names the event any more. A push and a pull
 # request are both scoped by their own diff, so the scope outputs of `changes`
-# decide what runs. Every `if:` below used to begin with
-# `github.event_name == 'push' ||`, which made a push run all 42 jobs.
+# decide what runs. Before this, every `if:` began with an event test that
+# made a push run all 42 jobs.
 jobs:
   # ── Change Scope Detection ──────────────────────────────────────────
   # Classifies the pull request diff or push into change scopes. Downstream
