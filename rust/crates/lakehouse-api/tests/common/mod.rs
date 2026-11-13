@@ -350,6 +350,79 @@ async fn build_state_and_pool(
     (state, pool)
 }
 
+/// A minimal but spec-valid Iceberg REST `LoadTableResult` for `bronze.<table>`:
+/// format version 2, one schema, one snapshot. It is what
+/// `lakehouse_iceberg::rest::load_table_summary` parses without an error, so
+/// `routes::catalog_restore::table_exists` reads the table as there.
+///
+/// Hand-written from the shape the Iceberg REST spec requires, and proven by
+/// `lakehouse-iceberg`'s own fixture of the same shape; a test-only stand-in,
+/// never captured from a live catalog.
+pub fn load_table_fixture(table: &str) -> String {
+    format!(
+        r#"{{
+            "metadata-location": "s3://lakehouse-warehouse/bronze/{table}/metadata/00001.metadata.json",
+            "metadata": {{
+                "format-version": 2,
+                "table-uuid": "9c12d441-03fe-4bb1-8e5c-b2e7c1a04a3d",
+                "location": "s3://lakehouse-warehouse/bronze/{table}",
+                "last-sequence-number": 1,
+                "last-updated-ms": 1700000000000,
+                "last-column-id": 1,
+                "schemas": [
+                    {{
+                        "schema-id": 0,
+                        "type": "struct",
+                        "fields": [{{"id": 1, "name": "id", "required": true, "type": "long"}}]
+                    }}
+                ],
+                "current-schema-id": 0,
+                "partition-specs": [{{"spec-id": 0, "fields": []}}],
+                "default-spec-id": 0,
+                "last-partition-id": 999,
+                "properties": {{}},
+                "current-snapshot-id": 1,
+                "snapshots": [
+                    {{
+                        "snapshot-id": 1,
+                        "sequence-number": 1,
+                        "timestamp-ms": 1700000000000,
+                        "manifest-list": "s3://lakehouse-warehouse/bronze/{table}/metadata/snap-1.avro",
+                        "summary": {{ "operation": "append", "total-records": "1" }}
+                    }}
+                ],
+                "metadata-log": [],
+                "sort-orders": [{{"order-id": 0, "fields": []}}],
+                "default-sort-order-id": 0
+            }}
+        }}"#
+    )
+}
+
+/// Mount the Iceberg REST catalog so that `bronze.<table>` exists: the
+/// `/v1/config` every Iceberg client asks first, and the table's load
+/// (`DATA-55` review R2 — the healing rule and the restore's mirror case need
+/// the "the table is there" answer from the catalog the restore itself reads).
+///
+/// `server` is whatever the deployment's `LAKEKEEPER_CATALOG_URI` points at.
+pub async fn mount_existing_iceberg_table(server: &wiremock::MockServer, table: &str) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    Mock::given(method("GET"))
+        .and(path("/v1/config"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"defaults":{},"overrides":{}}"#),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/namespaces/bronze/tables/{table}")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(load_table_fixture(table)))
+        .mount(server)
+        .await;
+}
+
 /// Swaps the database name in `postgres://user:pass@host:port/dbname` for
 /// `new_db`, without pulling in a URL-parsing crate for one substitution.
 fn swap_database_name(url: &str, new_db: &str) -> String {
