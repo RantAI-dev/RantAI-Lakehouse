@@ -640,4 +640,185 @@ here has been seen by the owner.
 
 ## 5. Handoff
 
+Slice S1 (T1 to T4) on `fix/dashboards-p4`, base `6abf8836`. Branch head after this
+handoff commit: see the commit list. Every commit was pushed to
+`origin/fix/dashboards-p4`; no pull request was opened.
+
+### Commits
+
+| Commit | What |
+| --- | --- |
+| `24c4fc3a` | T1 `fix(bins)`: `wh` in the range read, the width-1 exception in `bin_expr`/`bin_records_predicate`, the 1/2 floor, `whole_scalar_sql`, the builder's `whole_sql`, four pinned statements, three new unit tests, `chart_numbers` engine tests |
+| `96236aa8` | T2 `feat(dashboards)`: `whole` on the tile (`support.rs`), `BinMeta.whole`/`BinInfo.whole`/`binLabel`/`relabelBins`/`isLastBin` in `chart-bins.ts`, `dashboard-page.tsx` passes it, four console tests |
+| `af03d1aa` | T3 `fix(alerts)`: `mart_statement` calls `Aggregate::rounded`, two tests |
+| `dcb7ad84` | T4 `docs(features)`: the two feature pages and the changelog |
+| this commit | `docs(plan): handoff for dashboards-p4 S1` |
+
+### Pinned statements changed (four assertions, four call sites)
+
+The rule changed, so the pinned text changed (rule 2). Nothing else in those
+assertions moved.
+
+1. `bin.rs` `the_range_statement_reads_the_column_once_from_the_filtered_base`
+   - old: `SELECT w AS width, mn AS min, mx AS max FROM (SELECT mn, mx, 500 AS w FROM (SELECT min(toFloat64(visitors)) AS mn, max(toFloat64(visitors)) AS mx FROM serving.t))`
+   - new: `SELECT w AS width, mn AS min, mx AS max, wh AS whole FROM (SELECT mn, mx, wh, 500 AS w FROM (SELECT min(toFloat64(visitors)) AS mn, max(toFloat64(visitors)) AS mx, min(toFloat64(visitors) = floor(toFloat64(visitors))) AS wh FROM serving.t))`
+   - its `matches("serving.t").count() == 1` stayed.
+2. `bin.rs` `the_bin_is_the_lower_edge_and_the_maximum_stays_in_the_last_bin`
+   - old: `round(least(floor(toFloat64(visitors) / __bw_visitors), if(__bmx_visitors > __bmn_visitors, ceil(__bmx_visitors / __bw_visitors) - 1, floor(__bmx_visitors / __bw_visitors))) * __bw_visitors, 10)`
+   - new: `round(least(floor(toFloat64(visitors) / __bw_visitors), if(__bmx_visitors > __bmn_visitors AND NOT (__bwh_visitors = 1 AND __bw_visitors = 1), ceil(__bmx_visitors / __bw_visitors) - 1, floor(__bmx_visitors / __bw_visitors))) * __bw_visitors, 10)`
+3. `builder.rs` `a_binned_dimension_reads_the_range_and_the_filters_under_the_bin` (the `contains`)
+   - old: `FROM (SELECT * FROM (SELECT * FROM serving.mart_x WHERE stay >= 10) AS flt CROSS JOIN (SELECT w AS __bw_stay, mn AS __bmn_stay, mx AS __bmx_stay FROM (SELECT mn, mx, 500 AS w FROM (SELECT min(toFloat64(stay)) AS mn, max(toFloat64(stay)) AS mx FROM (SELECT * FROM serving.mart_x WHERE stay >= 10) AS flt))) AS rng) AS ranged) AS bkt GROUP BY stay ORDER BY stay`
+   - new: `FROM (SELECT * FROM (SELECT * FROM serving.mart_x WHERE stay >= 10) AS flt CROSS JOIN (SELECT w AS __bw_stay, mn AS __bmn_stay, mx AS __bmx_stay, wh AS __bwh_stay FROM (SELECT mn, mx, wh, 500 AS w FROM (SELECT min(toFloat64(stay)) AS mn, max(toFloat64(stay)) AS mx, min(toFloat64(stay) = floor(toFloat64(stay))) AS wh FROM (SELECT * FROM serving.mart_x WHERE stay >= 10) AS flt))) AS rng) AS ranged) AS bkt GROUP BY stay ORDER BY stay`
+4. the same test's `starts_with`
+   - old: `SELECT w AS width, mn AS min, mx AS max FROM`
+   - new: `SELECT w AS width, mn AS min, mx AS max, wh AS whole FROM`
+
+Calls that changed arguments only, assertions untouched: `bin.rs`
+`a_clicked_bin_is_closed_above_only_when_it_ends_at_the_maximum` now passes
+`None` as the fifth argument to both `bin_records_predicate` calls.
+
+Passed unchanged, as the plan required: `builder.rs:5494-5500` (the
+`starts_with` of the bin), `builder.rs:5611-5615` (a clicked bin of width 500:
+no whole read), `binned.rs` (three tests), `bin.rs:681-688`, `bin.rs:817-835`.
+
+### New tests and the failure each showed before the fix
+
+T1, `lakehouse-bi` unit:
+
+- `bin::tests::automatic_bins_read_whether_the_column_is_whole_and_never_go_below_one_for_it`
+- `bin::tests::a_clicked_bin_of_one_over_whole_numbers_is_not_closed_above`
+- `builder::tests::a_clicked_year_in_bins_of_one_asks_whether_the_column_is_whole_and_a_wider_bin_does_not`
+- pre-fix run (`cargo test -p lakehouse-bi --lib bin::`, on the implementation stashed): the crate does not compile against them —
+  `error[E0061]: this function takes 4 arguments but 5 arguments were supplied`
+  at `bin.rs:752` (in the new test) and
+  `error[E0425]: cannot find function whole_scalar_sql in this scope` at
+  `bin.rs:756`. The `whole` column of `read_sql` and the fifth parameter do not
+  exist on the base, so the three tests fail on the symbols they assert.
+
+T1, engine (`tests/chart_numbers.rs`, run as `cargo test -p lakehouse-api --test chart_numbers`):
+
+- `five_years_under_automatic_bins_are_five_bars_one_year_each`
+- `six_and_ten_years_are_one_bar_per_year_and_eleven_years_are_bins_of_two`
+- `a_fractional_column_keeps_its_width_and_its_last_bin_holds_the_maximum`
+- `a_typed_width_of_one_gives_the_last_year_its_own_bin_too`
+- `a_clicked_year_lists_that_year_and_the_last_year_lists_itself`
+- pre-fix run (implementation stashed): the test binary does not compile —
+  `error[E0432]: unresolved import lakehouse_bi::bin::whole_scalar_sql` at
+  `chart_numbers.rs:25`, and `error[E0061]: this function takes 4 arguments but
+  5 arguments were supplied` at `chart_numbers.rs:410` and `:434` (the
+  `bin_records_predicate` calls). The functions and the `whole` column the
+  tests read do not exist on the base. After the fix the engine answers the
+  numbers the plan predicted (width 1.0 and `whole` 1.0 over 2020–2024, width
+  2.0 over all eleven years, 0.5 for `stay`), so no expected value was changed.
+
+T2, `src/lib/chart-bins.test.ts`:
+
+- "a bin of one over whole numbers reads as its value, with no separator" —
+  pre-fix `AssertionError` at `chart-bins.test.ts:71` (`2020` vs `2,020 – 2,021`).
+- "the tile's bins say whole only when the server said so" — pre-fix
+  `AssertionError` (deepEqual) at `chart-bins.test.ts:80`.
+- "a year in a bin of one reads as the year" — pre-fix `AssertionError`
+  (deepEqual) at `chart-bins.test.ts:87`.
+- "in bins of one over whole numbers no bin is closed above" — pre-fix
+  `AssertionError: true !== false` at `chart-bins.test.ts:94`
+  (`isLastBin(2023, 1, 2024, true)`).
+- The existing tests in that file and in `src/lib/chart-click.test.ts` pass
+  unchanged (34 tests across the two files).
+
+T3, `lakehouse-alerts` unit:
+
+- `tests::a_table_rule_rounds_an_average_a_minimum_and_a_maximum_to_six_decimals_as_a_chart_does`
+  — pre-fix panic at `lib.rs:3605`: left
+  `SELECT round(avg(amount)) AS v FROM serving.mart_x`, right
+  `SELECT round(avg(amount), 6) AS v FROM serving.mart_x`.
+- `tests::an_average_rule_sends_the_six_decimal_statement_to_the_gate` —
+  pre-fix panic at `lib.rs:3669`: the gate saw
+  `SELECT round(avg(amount)) AS v FROM serving.mart_x`, not the six-decimal
+  statement.
+- The `BI-39` model test (`round(sum(amount))`, `lib.rs:3621` at the base)
+  passes unchanged, as the plan said it must in S1.
+
+### Commands run, with counts
+
+Per commit (only the languages the commit touched), from `rust/` with
+`CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-4 CARGO_BUILD_JOBS=6`:
+
+- T1: `cargo fmt --check` (clean); `cargo clippy -p lakehouse-bi --all-targets -- -D warnings` (clean);
+  `cargo clippy -p lakehouse-api --all-targets -- -D warnings` (clean);
+  `cargo test -p lakehouse-bi --lib` → `ok. 647 passed; 0 failed; 4 ignored`;
+  `cargo test -p lakehouse-api --test chart_numbers` → `ok. 6 passed; 0 failed`.
+- T2: `cargo fmt --check` (clean); `cargo clippy -p lakehouse-api --all-targets -- -D warnings` (clean);
+  `cargo test -p lakehouse-api --lib bin_rewrite` → `ok. 7 passed; 0 failed`;
+  `cargo test -p lakehouse-api --test chart_numbers` → `ok. 6 passed`;
+  `cargo test -p lakehouse-api --test sec11_guard` → `ok. 4 passed`;
+  `cargo test -p lakehouse-api --test route_auth` → `ok. 96 passed`;
+  `bun install --frozen-lockfile` (779 installs, 753 packages, no changes);
+  `bun run typecheck` (clean);
+  `bun test src/lib/chart-bins.test.ts src/lib/chart-click.test.ts` → `34 pass, 0 fail`.
+- T3: `cargo fmt --check` (clean); `cargo clippy -p lakehouse-alerts --all-targets -- -D warnings` (clean);
+  `cargo test -p lakehouse-alerts --lib` → `ok. 132 passed; 0 failed; 1 ignored`.
+- T4: no code check (documents only).
+
+Every commit: `python3 ops/lint/check_bare_iceberg_count.py` (`R11 guard: no bare
+count() …`), `python3 ops/lint/check_intra_package_imports.py` (`OK: all
+intra-package dispar_orchestrate imports resolve`), `python3
+ops/lint/check_rust_embedded_paths.py` (`22 path(s) compiled into Rust from
+outside rust/, 0 without the rust scope`), `python3 ops/lint/check_gate_groups.py`
+(`gate groups are consistent`), and `git status` (only the commit's own files).
+
+Before the handoff, once, in the foreground, on `dcb7ad84`:
+
+- `cargo fmt --check` — clean.
+- `cargo clippy -p lakehouse-bi --all-targets -- -D warnings` — clean.
+- `cargo clippy -p lakehouse-api --all-targets -- -D warnings` — clean.
+- `cargo clippy -p lakehouse-alerts --all-targets -- -D warnings` — clean.
+- `cargo test -p lakehouse-bi --lib` → `ok. 647 passed; 0 failed; 4 ignored`.
+- `cargo test -p lakehouse-alerts --lib` → `ok. 132 passed; 0 failed; 1 ignored`.
+- `cargo test -p lakehouse-api --lib bin_rewrite` → `ok. 7 passed; 0 failed`.
+- `cargo test -p lakehouse-api --test chart_numbers` → `ok. 6 passed; 0 failed`.
+- `cargo test -p lakehouse-api --test sec11_guard` → `ok. 4 passed; 0 failed`.
+- `cargo test -p lakehouse-api --test route_auth` → `ok. 96 passed; 0 failed`.
+- `bun run typecheck` — clean.
+- `bun run lint` — exit 0, `11 problems (0 errors, 11 warnings)`, all in files
+  this slice does not touch (`data-table.tsx`, `sidebar.tsx`, `sso-page.tsx`,
+  `alerts-page.tsx`, `login-page.tsx`, `use-copilot.ts`, `use-data-table.ts`,
+  `dashboard-specs.ts`, `uploads.test.ts`, `http.ts`).
+- `bun run test` → `4365 pass, 1 skip, 0 fail; 13435 expect() calls; Ran 4366
+  tests across 397 files`.
+- The four repository lints above — all pass.
+- `git status` — clean.
+
+### Not verified, and why
+
+- **Nothing was checked in a browser.** No console behaviour is proven on
+  screen; the owner runs `LH-BI-2-02` on staging after the merge (a year column
+  under "Automatic": five bars 2020 to 2024; a click on 2023 lists 2023 only
+  and filters `2023 ≤ tahun < 2024`; a click on 2024 lists 2024).
+- **No test drives `add_bins`.** It needs the engine, the gate and the policy
+  store together, and no such test exists (T2 says so). What is proven for the
+  wire is T1's engine test (the `whole` column the read answers) and the
+  console tests (`binsOfTile` reading it); the insertion itself in
+  `support.rs` is read, compiled and clippy-clean but not run.
+- **No ClickHouse container was started by hand.** `chart_numbers` starts and
+  drops its own testcontainer (ClickHouse `26.8`); nothing was left running.
+- **S2 (T5) was not built**, per the brief.
+
+### MISMATCH
+
+None in behaviour or decision. Line numbers drifted from the plan's anchors,
+and each anchor was re-found by its quoted text (the plan allows this):
+
+- `dashboard-page.tsx` `isLastBin` call is at `:1068` on this branch, not
+  `:1017`; the argument added is `target.bin.whole` (the fourth).
+- `support.rs` `annotate_bins` is at `:1100`, `add_bins` at `:1116` and its
+  object at `:1128`-ish, not `:1045`/`:1087`.
+- `bin.rs` `stats_sql` is at `:379`, not `:354`.
+- `builder.rs` `records_sql`'s `RecordsValue::Bin` branch is at `:2050`, not
+  `:2049`; its tests are within a few lines of the plan's.
+
+One wording note for the reviewer: D4's `mx - mn < n` is the plan's own form of
+`mx - mn + 1 > n` over all-whole values (they differ only when a
+non-integer value sits at one end, which `wh = 1` excludes), so the statement
+is the plan's literal text and the comment at the site says why.
+
 ## 6. Review
