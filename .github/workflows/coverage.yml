@@ -1,10 +1,28 @@
 name: Coverage & SBOM
 
-# Runs on push to main and manual dispatch only. Nothing reads the artifact output
-# on pull requests, so removing PR triggers saves ~30 runner minutes per PR push.
+# Runs on a push to main that changes a file the Rust tests read, and on manual
+# dispatch. Nothing reads the artifact output on pull requests, so there is no PR
+# trigger. OPS-24 D12: the paths below are the `rust` scope of
+# scripts/ci/detect_change_scope.sh plus the fixtures the Rust tests read. A
+# workflow-level path filter is safe here only because no required check comes
+# from this workflow: a filtered run reports nothing, which for a required check
+# would leave it pending forever.
 on:
   push:
     branches: [main]
+    paths:
+      - "rust/**"
+      - "src/lib/dashboard-specs.ts"
+      - "docker-compose.yml"
+      - ".env.example"
+      # OPS-24 R5: the three files outside `rust/` that Rust compiles in
+      # (`include_bytes!`/`include_str!`), so a change to one of them changes
+      # what `cargo llvm-cov` builds.
+      - "ops/release/release.pub"
+      - "ops/release/fixtures/**"
+      - "public/geo/**"
+      - "ops/fixtures/**"
+      - ".github/workflows/coverage.yml"
   workflow_dispatch:
 
 concurrency:
@@ -13,9 +31,46 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # OPS-24 D11, R4 and R10: the runner of `coverage` is decided here, by the
+  # same script as ci.yml's small Rust jobs, so the switch is compared in one
+  # place and exactly (`true`, lower case, never `TRUE` or `1`) and the worker
+  # is chosen only for `refs/heads/main` — a manual dispatch of another branch
+  # runs hosted, like a fork's pull request elsewhere. This job is hosted and
+  # only decides; nothing reads its result but the job below.
+  choose:
+    name: Choose the coverage runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      coverage_runner: ${{ steps.runner.outputs.coverage_runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Choose the runner
+        id: runner
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          REQUIRE_REF: refs/heads/main
+          SWITCH: ${{ vars.CI_COVERAGE_ON_WORKER }}
+          OUTPUT_NAME: coverage_runner
+        run: ./scripts/ci/select_runner.sh
+
   coverage:
     name: cargo llvm-cov (lcov)
-    runs-on: ubuntu-latest
+    needs: choose
+    # OPS-24 D11: the CI worker when the repository variable
+    # CI_COVERAGE_ON_WORKER is exactly `true`, hosted otherwise, as decided by
+    # `scripts/ci/select_runner.sh` above (R4: an expression's `==` is
+    # case-insensitive, so `TRUE` would have reached the worker from here while
+    # never reaching it from a script). This workflow has no `pull_request`
+    # trigger, so only `main`'s code reaches the worker through it; nothing
+    # waits for this job, so a sleeping worker only delays it (the concurrency
+    # rule above keeps at most one run waiting, and GitHub fails a job no
+    # runner took within 24 hours).
+    runs-on: ${{ fromJSON(needs.choose.outputs.coverage_runner || '["ubuntu-latest"]') }}
     # 90, not 30: the last two green runs before the disk failure started
     # (runs 40149263708 and 40186521664) took 27m30s and 29m03s, so 30
     # minutes is the next wall for this job (OPS-14). The disk is freed by
@@ -53,6 +108,18 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
+      # OPS-24 D10/D11: the same second line of defence as the small Rust jobs
+      # in ci.yml. A self-hosted runner only takes this job if it carries the
+      # label, and this step refuses one that is not marked in its own `.env`.
+      # It runs BEFORE checkout, whose `git clean -ffdx` would delete that file.
+      - name: Refuse a self-hosted runner that is not the CI worker
+        if: runner.environment == 'self-hosted'
+        run: |
+          if [ "${LAKEHOUSE_CI_WORKER:-}" != "1" ]; then
+            echo "::error::this self-hosted runner is not marked as the CI worker (LAKEHOUSE_CI_WORKER=1 in the runner's .env); refusing before checkout"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v7
 
@@ -63,7 +130,10 @@ jobs:
       # job requires is removed. `df -h /` before and after prints what the
       # step actually freed, so the run's log carries the measurement instead
       # of a guess. The `test` job in ci.yml frees the disk the same way.
+      # OPS-24 D11: a hosted runner only. It deletes toolchains the runner
+      # image ships, and the worker is not this job's machine to change.
       - name: Free runner disk
+        if: runner.environment == 'github-hosted'
         run: |
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
@@ -75,7 +145,17 @@ jobs:
         with:
           components: llvm-tools-preview
 
+      # OPS-24 D10/D11: the worker keeps its own target directory, so a hosted
+      # cache would only cost time.
+      - name: Prepare the CI worker
+        if: runner.environment == 'self-hosted'
+        run: bash ./scripts/ci/worker_prepare.sh
+        env:
+          TARGET_MAX_GB: ${{ vars.CI_WORKER_TARGET_MAX_GB }}
+          WORKER_CARGO_JOBS: ${{ vars.CI_WORKER_CARGO_JOBS }}
+
       - name: Cache cargo
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
@@ -83,12 +163,66 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
+      # OPS-24 D11: what already ran on this worker before the tests start, so
+      # the step after `cargo llvm-cov` can tell its containers from someone
+      # else's. The `id` is what the clean-up's `if:` reads (OPS-24 R1): without
+      # this step's success there is no note, and the clean-up then removes
+      # nothing.
+      - name: Note the containers that exist (worker only)
+        id: note
+        if: runner.environment == 'self-hosted'
+        run: docker ps -aq | sort > "$RUNNER_TEMP/containers-before.txt"
+
       # Needs Docker (testcontainers-backed Postgres integration tests) —
       # available by default on ubuntu-latest, same as the `test` job in
       # ci.yml.
       - name: cargo llvm-cov
         run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
         working-directory: rust
+
+      # OPS-24 D11: remove the containers this job started and nothing else:
+      # a container is this job's only when testcontainers started it
+      # (`org.testcontainers.managed-by=testcontainers`) AND it is absent from
+      # the note above, except those carrying
+      # `org.rantai.lakehouse-test-support` (the reusable Postgres the
+      # test-support crate keeps on purpose). No image is removed and nothing
+      # outside Docker is touched. This is correct only because one
+      # container-starting job runs on this worker at a time (this workflow's
+      # concurrency group; the small Rust jobs start none); a second such job
+      # needs another rule (slice S2).
+      #
+      # OPS-24 R1: the step runs under `always()`, so it also runs when nothing
+      # was observed — the refuse step failed on a machine that is not the
+      # worker, or checkout failed. It therefore also requires the note step to
+      # have succeeded, and it exits without removing anything when the note
+      # file is absent: an empty list would make every container on the machine
+      # look "new", and this step must never remove a container it did not
+      # start.
+      - name: Remove the containers this job started (worker only)
+        if: always() && runner.environment == 'self-hosted' && steps.note.outcome == 'success'
+        run: |
+          if [ ! -f "$RUNNER_TEMP/containers-before.txt" ]; then
+            echo "no note of the existing containers: removing nothing"
+            exit 0
+          fi
+          comm -13 <(sort "$RUNNER_TEMP/containers-before.txt") <(docker ps -aq | sort) \
+            > "$RUNNER_TEMP/containers-new.txt"
+          while IFS= read -r id; do
+            [ -z "$id" ] && continue
+            labels="$(docker inspect --format '{{if .Config.Labels}}{{index .Config.Labels "org.testcontainers.managed-by"}}|{{index .Config.Labels "org.rantai.lakehouse-test-support"}}{{end}}' "$id" 2>/dev/null || true)"
+            managed_by="${labels%%|*}"
+            support="${labels#*|}"
+            if [ "$managed_by" != "testcontainers" ]; then
+              echo "keeping $id: it does not carry org.testcontainers.managed-by=testcontainers"
+              continue
+            fi
+            if [ -n "$support" ]; then
+              echo "keeping $id: it carries the test-support label"
+              continue
+            fi
+            docker rm -f "$id"
+          done < "$RUNNER_TEMP/containers-new.txt"
+          docker ps -a
 
       - name: Upload lcov as artifact
         uses: actions/upload-artifact@v7

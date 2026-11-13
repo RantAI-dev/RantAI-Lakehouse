@@ -152,3 +152,75 @@ describe("clickhouseAssetService.searchAssets", () => {
     expect((await clickhouseAssetService.searchAssets("orders", 8)).total).toBe(2)
   })
 })
+
+describe("clickhouseAssetService: dropping a table", () => {
+  it("asks for the drop status without a count, and with one only when asked", async () => {
+    const calls = stubFetch(() => json({ droppable: true, table: "bronze.orders", keptDays: 7 }))
+    await clickhouseAssetService.getDropStatus("orders")
+    await clickhouseAssetService.getDropStatus("orders", { withRowCount: true })
+    expect(calls.map((c) => c.url)).toEqual([
+      "/api/catalog/orders/drop",
+      "/api/catalog/orders/drop?withRowCount=true",
+    ])
+  })
+
+  it("posts the drop and returns what the API says was dropped", async () => {
+    const calls = stubFetch(() =>
+      json({
+        ok: true,
+        table: "bronze.orders",
+        rowCount: 1234,
+        droppedAt: "2026-11-13T08:00:00Z",
+        expiresAt: "2026-11-20T08:00:00Z",
+      })
+    )
+    const result = await clickhouseAssetService.dropTable("orders")
+    expect(calls).toHaveLength(1)
+    expect(calls[0].url).toBe("/api/catalog/orders/drop")
+    expect(calls[0].init.method).toBe("POST")
+    expect(result.table).toBe("bronze.orders")
+    expect(result.rowCount).toBe(1234)
+    expect(result.expiresAt).toBe("2026-11-20T08:00:00Z")
+  })
+
+  it("throws the API's sentence as an invalid_request on a 409", async () => {
+    stubFetch(() => json({ error: "Only a table made by a file upload can be dropped here." }, 409))
+    const err = await clickhouseAssetService.dropTable("orders").catch((e) => e)
+    expect(err).toBeInstanceOf(ServiceError)
+    expect(err.code).toBe("invalid_request")
+    expect(err.message).toBe("Only a table made by a file upload can be dropped here.")
+  })
+
+  it("throws permission_denied with the permission named on a 403", async () => {
+    stubFetch(() => json({ error: "permission_denied: governance:write" }, 403))
+    const err = await clickhouseAssetService.dropTable("orders").catch((e) => e)
+    expect(err).toBeInstanceOf(ServiceError)
+    expect(err.code).toBe("permission_denied")
+    expect(err.message).toBe("You don't have access. This needs the governance:write permission.")
+  })
+
+  it("reads the dropped tables, and an answer without a list as none", async () => {
+    const calls = stubFetch(() =>
+      json({
+        tables: [
+          {
+            assetId: "orders",
+            table: "bronze.orders",
+            droppedBy: "Ada Lovelace",
+            rowCount: null,
+            droppedAt: "2026-11-13T08:00:00Z",
+            expiresAt: "2026-11-20T08:00:00Z",
+          },
+        ],
+      })
+    )
+    const rows = await clickhouseAssetService.listDroppedTables()
+    expect(calls[0].url).toBe("/api/catalog/dropped/tables")
+    expect(rows).toHaveLength(1)
+    expect(rows[0].table).toBe("bronze.orders")
+    expect(rows[0].rowCount).toBeNull()
+
+    stubFetch(() => json({ supported: false, reason: "not the catalog's tenant" }))
+    expect(await clickhouseAssetService.listDroppedTables()).toEqual([])
+  })
+})

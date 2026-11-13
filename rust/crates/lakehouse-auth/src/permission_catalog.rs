@@ -158,7 +158,7 @@ pub const PERMISSIONS: &[PermissionInfo] = &[
     PermissionInfo {
         name: "governance:write",
         area: "Governance",
-        description: "Certify assets, set SLAs, run table maintenance and approve restorations.",
+        description: "Certify assets, set SLAs, run table maintenance, approve restorations, drop a table made by a file upload and restore a dropped table.",
     },
     PermissionInfo {
         name: "access:approve",

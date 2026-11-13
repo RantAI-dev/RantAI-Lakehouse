@@ -1008,6 +1008,36 @@ async fn a_seeded_data_engineer_is_denied_the_undrop() {
     );
 }
 
+/// `DATA-55` (QA `LH-DATA-15-06`, `TC-1731`): dropping a table needs
+/// `governance:write`, for the status read and for the drop alike *(proposed,
+/// not yet signed, D6)*. A seeded Data Engineer holds `catalog:write` but not
+/// `governance:write`, so the permission middleware refuses both with the
+/// permission named.
+#[tokio::test]
+async fn a_seeded_data_engineer_is_denied_the_drop_and_its_status() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+    for method in ["GET", "POST"] {
+        let resp = request_with_cookie(
+            &router,
+            method,
+            "/api/catalog/commerce_orders/drop",
+            &cookie,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method}");
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        assert_eq!(
+            body.get("error").and_then(serde_json::Value::as_str),
+            Some("permission_denied: governance:write"),
+            "{method}: the 403 must come from the permission middleware"
+        );
+    }
+}
+
 /// `DATA-15` F4: the restore status read is `catalog:read`, which a seeded
 /// Analyst holds (and `governance:write` it does not), so the permission
 /// middleware must not refuse it. The first version of this check used the
@@ -4538,4 +4568,39 @@ async fn a_signed_in_person_gets_405_for_a_method_no_route_has_and_404_for_an_un
         let body: serde_json::Value = serde_json::from_slice(&bytes).expect("parse json");
         assert_eq!(body, no_such_address, "{method} {path}");
     }
+}
+
+/// BLD-1 part 1 / D16: the pipeline preview is in `POLICY_TABLE` as
+/// `pipeline:write`, and the gate answers both ways: no session is 401,
+/// `query:read` alone is 403, and a `pipeline:write` holder gets past
+/// authentication (the handler then refuses the empty body it was sent with a
+/// 400, which is not an authorization answer).
+#[tokio::test]
+async fn the_pipeline_preview_route_authorization_is_asserted_both_ways() {
+    let TestApp { router, pool } = spin_up().await;
+    let uri = "/api/pipelines/preview";
+
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "POST" && *p == "/api/pipelines/preview")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("pipeline:write")),
+    );
+
+    let reader = create_principal_with_permissions(&pool, "query:read").await;
+    let refused = session_cookie_for_user(&pool, reader).await;
+    let writer = create_principal_with_permissions(&pool, "pipeline:write").await;
+    let allowed = session_cookie_for_user(&pool, writer).await;
+
+    let none = request_with_cookie(&router, "POST", uri, "").await;
+    assert_eq!(none.status(), StatusCode::UNAUTHORIZED);
+    let denied = request_with_cookie(&router, "POST", uri, &refused).await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let through = request_with_cookie(&router, "POST", uri, &allowed).await;
+    assert!(
+        through.status() != StatusCode::UNAUTHORIZED && through.status() != StatusCode::FORBIDDEN,
+        "a pipeline:write holder must get past the gate, got {}",
+        through.status()
+    );
 }

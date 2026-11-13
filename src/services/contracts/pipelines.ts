@@ -57,8 +57,10 @@ export type Pipeline = {
    * does not run: an administrator must assign an author through
    * `PUT /api/pipelines/{id}/run-as`.
    *
-   * Only ever set on an authored pipeline, and never changed by editing
-   * the pipeline.
+   * Only ever set on an authored pipeline. It changes when an
+   * administrator assigns an author (`assignRunAs`), and when someone else
+   * saves a change to the inputs or steps (BLD-1 part 1 D10, decision 14:
+   * it then reads as that person; BLD-1 part 1 S3 review R1-S8).
    */
   runAs?: string
   /**
@@ -152,11 +154,55 @@ export type PipelineOpNode = {
 export type PipelineOpEdge = { from: string; to: string }
 
 /**
+ * BLD-1 part 1 / D1: one table a pipeline reads, and the short name its
+ * steps read it by. Mirrors `lakehouse_store::pipelines::PipelineInput`.
+ * The name is unique across inputs and steps without regard to case (D2);
+ * a step names it exactly, case included (D6a).
+ */
+export type PipelineInput = {
+  name: string
+  zone: string
+  table: string
+}
+
+/** A step that applies the five existing operations to the one input or earlier step it `reads`. */
+export type PipelineTransformStep = { name: string; kind: "transform"; reads: string; transforms: string[] }
+
+/** A step that is one `SELECT` over the inputs and earlier steps (D5, at most 20,000 characters). */
+export type PipelineSqlStep = { name: string; kind: "sql"; sql: string }
+
+/**
+ * A step of a kind this console does not know (`CODE-STANDARD.md` 4.2's
+ * `| string` widening; BLD-1 part 2 adds kinds). Its other fields are not
+ * known here, so the console shows it, does not edit it, and sends it back
+ * exactly as stored (BLD-1 part 1 S3 review R1-S2). Tell the kinds apart
+ * with `knownStep` (`lib/pipeline-editor.ts`), not with `kind` alone: a
+ * `string` kind also matches `"sql"`.
+ */
+export type PipelineOtherStep = { name: string; kind: string; [field: string]: unknown }
+
+/**
+ * BLD-1 part 1 / D1: one named step, a table later steps read by `name`.
+ * Mirrors `lakehouse_store::pipelines::PipelineStep`, serde's internally
+ * tagged union on `kind`. The last step is the output.
+ */
+export type PipelineStep = PipelineTransformStep | PipelineSqlStep | PipelineOtherStep
+
+/**
  * An authored pipeline's stored definition, exactly the fields
- * `CreatePipelineInput` already sends and `rust/crates/lakehouse-api/src/routes/pipelines.rs`'s
- * `authored_detail` now persists and returns (WS4 item D-series).
+ * `rust/crates/lakehouse-api/src/routes/pipelines.rs`'s `authored_detail`
+ * persists and returns (WS4 item D-series).
+ *
+ * BLD-1 part 1 / D3: `inputs` and `steps` are the definition. The fields
+ * after them are the same definition in the form of before (the first
+ * input; the transforms of a pipeline that is one input and at most one
+ * `transform` step, otherwise empty), still returned so a reader of the old
+ * fields does not break in the same release. The console reads and sends
+ * `inputs` and `steps` only.
  */
 export type AuthoredDefinition = {
+  inputs: PipelineInput[]
+  steps: PipelineStep[]
   sourceZone: string
   sourceTable: string
   incrementalColumn: string | null
@@ -239,13 +285,21 @@ export type PipelineRunLogsPage = {
   cursor: string
 }
 
+/**
+ * `POST /api/pipelines`'s body. BLD-1 part 1 / D3: the API also takes the
+ * form of before (`sourceZone`, `sourceTable`, `transforms`) and refuses
+ * both forms at once (400). The console sends `inputs` and `steps` only
+ * (D17), so the old fields are not on this type (BLD-1 part 1 S3 review
+ * R1-S8, R1-S9).
+ */
 export type CreatePipelineInput = {
   name: string
   kind: PipelineKind
-  sourceZone: string
-  sourceTable: string
+  /** BLD-1 part 1 / D1: 1 to 5 inputs. */
+  inputs: PipelineInput[]
+  /** BLD-1 part 1 / D1: 0 to 20 steps; none means a plain copy of the one input. */
+  steps: PipelineStep[]
   incrementalColumn?: string
-  transforms: string[]
   fbicEnabled?: boolean
   targetZone: string
   targetTable: string
@@ -281,10 +335,19 @@ export type GeneratePipelineInput = {
 /** `PUT /api/pipelines/{id}` body: an authored pipeline's editable fields. The name is fixed at creation (the id, and the job name, derive from it). */
 export type UpdatePipelineInput = {
   kind: PipelineKind | string
-  sourceZone: string
-  sourceTable: string
+  /**
+   * BLD-1 part 1 / D1, as on create. D10: when the caller is not the user
+   * the pipeline reads as and `inputs` or `steps` differ from the stored
+   * ones, the pipeline reads as the caller from then on.
+   */
+  inputs: PipelineInput[]
+  steps: PipelineStep[]
+  /**
+   * Off the page (decision 18) but still stored: the store writes the
+   * column from this field with no COALESCE, so an edit sends the stored
+   * value back (BLD-1 part 1 S3 review R1-B1).
+   */
   incrementalColumn?: string
-  transforms: string[]
   fbicEnabled?: boolean
   targetZone: string
   targetTable: string
@@ -307,6 +370,29 @@ export type UpdatePipelineInput = {
    * names the tables to pick.
    */
   connectorId?: string | null
+}
+
+/**
+ * `POST /api/pipelines/preview`'s body (BLD-1 part 1 / D16). Nothing is
+ * stored, so a pipeline can be previewed before it is saved. The API checks
+ * and compiles the definition up to `upTo` (an input's or a step's name,
+ * exactly) and runs it as the caller, never the author (decision 13).
+ */
+export type PipelinePreviewInput = {
+  inputs: PipelineInput[]
+  steps: PipelineStep[]
+  upTo: string
+}
+
+/**
+ * `POST /api/pipelines/preview`'s answer: at most 100 rows (decision 5),
+ * each an array in the order of `columns`; `truncated` says the step
+ * returned more.
+ */
+export type PipelinePreview = {
+  columns: { name: string; type: string }[]
+  rows: unknown[][]
+  truncated: boolean
 }
 
 /** One schedule evaluation (`GET /api/pipelines/{id}/schedule-ticks`). */
@@ -371,8 +457,9 @@ export interface PipelineService {
   setTargetLag(id: string, targetLag: TargetLag | null, signal?: AbortSignal): Promise<Pipeline>
   /**
    * `PUT /api/pipelines/{id}/run-as` — assign the user this pipeline reads
-   * as (BLD-1 / D2). The only way `runAs` changes after create, and it is
-   * the way out of the "no author, so no run" state.
+   * as (BLD-1 / D2). The way out of the "no author, so no run" state. The
+   * other way `runAs` changes is an edit of the inputs or steps by someone
+   * else (BLD-1 part 1 D10, R1-S8).
    *
    * Platform Admin only (`identity:write`): deciding whose permissions
    * every future run of a row is governed by is a governance decision, not
@@ -382,4 +469,11 @@ export interface PipelineService {
    * tenant.
    */
   assignRunAs(id: string, userId: string, signal?: AbortSignal): Promise<void>
+  /**
+   * `POST /api/pipelines/preview` — the first rows of one input or step of
+   * a definition that need not be saved (BLD-1 part 1 / D16,
+   * `pipeline:write`). A 400 names the item at fault as `inputs[i]` or
+   * `steps[i]` (D7); a 422 is a refusal by the access check.
+   */
+  previewPipelineStep(input: PipelinePreviewInput, signal?: AbortSignal): Promise<PipelinePreview>
 }
