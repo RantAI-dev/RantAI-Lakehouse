@@ -72,6 +72,11 @@
 //!   (`lakehouse_store::uploads::claim_table`, review finding B4), not the
 //!   upload rows'. When the API cannot tell, it answers 503 and does not guess
 //!   that the name is free ([`ensure_table_free`]).
+//!   A name whose table was dropped from the console and can still be
+//!   restored is closed too (`DATA-55` D11, QA `LH-DATA-15-06`, `TC-1731`):
+//!   a new load would create a table of that name, and the dropped one could
+//!   no longer come back, so the answer is [`TABLE_DROPPED`] until the window
+//!   ends.
 //! * **One load per upload, and the row is claimed before the job is
 //!   launched** (review finding B2): see [`ingest`].
 //!
@@ -313,6 +318,10 @@ const CONNECTOR_TABLE: &str = "A connector loads that table, so a file cannot be
 /// `SEC-16`'s, replacing a sentence that said "no upload of this tenant
 /// created it".
 const TABLE_NOT_FREE: &str = "That table name cannot be used. Choose another name.";
+/// A load into a table that was dropped from the console and can still be
+/// restored (`DATA-55` D11). A new table of that name would make the dropped
+/// one impossible to undrop, so the name stays closed until the window ends.
+const TABLE_DROPPED: &str = "That table was dropped and can still be restored. Restore it from its page in the Catalog, or choose another name.";
 const TABLE_UNCHECKED: &str =
     "Could not check whether that table already exists, so nothing was loaded.";
 const NO_QUERY_DATABASE: &str = "Uploads need ICEBERG_QUERY_DB to be set, so the API can check that a table name is free. Nothing was loaded.";
@@ -2604,8 +2613,12 @@ fn parse_ingest_request(
 ///    person that someone else has a connector writing a table of that name
 ///    (`SEC-16`).
 /// 2. The claim table's answer ([`uploads::table_claim`]): the name is this
-///    tenant's, and it is free to load into, whether or not the table exists
-///    yet; or it is another tenant's, and it is not.
+///    tenant's and no drop of it is on record inside its window, and it is
+///    free to load into, whether or not the table exists yet; or it is another
+///    tenant's, and it is not. A name this tenant's table was dropped from,
+///    while that table can still be restored, is [`TABLE_DROPPED`]
+///    (`DATA-55` D11): a new table of that name would make the dropped one
+///    impossible to bring back.
 /// 3. Nobody's claim: the table must not exist (a registry row or an Iceberg
 ///    table). Never "free" on a doubt.
 ///
@@ -2618,10 +2631,11 @@ fn parse_ingest_request(
 ///
 /// 409 for a connector's table ([`CONNECTOR_TABLE`] for the caller's own
 /// tenant's connector, otherwise [`TABLE_NOT_FREE`]), for a name another
-/// tenant holds, and for an existing table nobody claimed (those with the one
-/// sentence, [`TABLE_NOT_FREE`]); 503 when the question cannot be answered (Postgres,
-/// `ClickHouse` or the Iceberg query database did not give a definite
-/// answer, or there is no Iceberg query database to ask).
+/// tenant holds, for an existing table nobody claimed (those with the one
+/// sentence, [`TABLE_NOT_FREE`]), and for this tenant's table that was dropped
+/// and can still be restored ([`TABLE_DROPPED`]); 503 when the question
+/// cannot be answered (Postgres, `ClickHouse` or the Iceberg query database did
+/// not give a definite answer, or there is no Iceberg query database to ask).
 async fn ensure_table_free(
     state: &AppState,
     pool: &PgPool,
@@ -2653,8 +2667,25 @@ async fn ensure_table_free(
         .map_err(|err| unchecked(&err))?
     {
         // This tenant's own claim settles it, whether or not the table exists
-        // yet: replacing or adding to one's own table is the point.
-        TableClaim::Ours => return Ok(()),
+        // yet: replacing or adding to one's own table is the point — unless its
+        // table was dropped from the console and can still be restored
+        // (DATA-55 D11, QA LH-DATA-15-06, TC-1731). The load job would create a
+        // new table of that name, and the dropped one could no longer be
+        // undropped. The record is believed whether or not the table is there,
+        // and a table that IS there only heals it once the record is past its
+        // grace (`DATA-55` review R2, U5, `dropped_now`): a young record whose
+        // `DELETE` may still be on its way keeps the name closed, and a stale
+        // one cannot. An unreadable record is `unchecked` like its neighbours:
+        // 503, never an assumption that the name is free (fail closed).
+        TableClaim::Ours => {
+            if super::catalog_drop::dropped_now(state, pool, table)
+                .await
+                .map_err(|err| unchecked(&err))?
+            {
+                return Err(ApiError::Conflict(TABLE_DROPPED.to_owned()));
+            }
+            return Ok(());
+        }
         // Another tenant's claim, or a claim whose tenant is gone. The same
         // sentence as for an existing table nobody claimed, so the answer does
         // not say which it is.
@@ -2899,11 +2930,12 @@ async fn launch(
             ApiError::Unavailable(LAUNCH_UNREACHABLE.to_owned())
         }
     };
-    if let Err(err) =
-        uploads::mark_finished(pool, &claimed.id, None, Some(COULD_NOT_START), None).await
-    {
-        tracing::warn!(%err, upload_id = %claimed.id, "a claim that could not be launched could not be settled");
-    }
+    settle_claim_failed(
+        pool,
+        claimed,
+        "a claim that could not be launched could not be settled",
+    )
+    .await;
     Err(failure)
 }
 
@@ -3089,6 +3121,18 @@ async fn claim_load(
             .into());
         }
     })
+}
+
+/// Settle a claim that will not be launched as failed, the one way every
+/// refusal after [`claim_load`] does (`DATA-55` review S9): the row must not sit
+/// at `ingesting` with no run. Best effort — a failure is logged with the
+/// caller's own words, and the caller's refusal is the answer either way.
+async fn settle_claim_failed(pool: &PgPool, claimed: &Upload, why: &'static str) {
+    if let Err(err) =
+        uploads::mark_finished(pool, &claimed.id, None, Some(COULD_NOT_START), None).await
+    {
+        tracing::warn!(%err, upload_id = %claimed.id, "{why}");
+    }
 }
 
 /// The folder a load puts its files in (`DATA-35` decision 2, plan AD-4): the one
@@ -3347,6 +3391,35 @@ pub async fn ingest(
     }
 
     let claimed = claim_load(pool, &row, &request, folder, converted.as_ref(), limits).await?;
+
+    // `DATA-55` review R3: the write comes first and the check second, so a drop
+    // recorded between `ensure_table_free` and this claim cannot pass its own
+    // check while this load passes its earlier one. The claim is already
+    // `ingesting`, so a refusal settles it as failed, the way a refused launch
+    // does — never leaving a row that just sits at `ingesting`.
+    match super::catalog_drop::dropped_now(&state, pool, &request.table).await {
+        Ok(false) => {}
+        Ok(true) => {
+            settle_claim_failed(
+                pool,
+                &claimed,
+                "a claim refused for a dropped table could not be settled",
+            )
+            .await;
+            return Err(ApiError::Conflict(TABLE_DROPPED.to_owned()).into());
+        }
+        Err(err) => {
+            // The record could not be read: whether the name is dropped is not
+            // known, so the load must not start — and must not stay loading.
+            settle_claim_failed(
+                pool,
+                &claimed,
+                "a claim that could not be checked could not be settled",
+            )
+            .await;
+            return Err(err.into());
+        }
+    }
 
     // `DATA-52`: the author is the person who pressed Load, taken from the
     // authenticated principal rather than from anything the request sent.

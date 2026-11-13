@@ -4,6 +4,9 @@ import type {
   AssetDetail,
   AssetGrant,
   AssetRestoreStatus,
+  AssetDropStatus,
+  AssetDropResult,
+  DroppedTableEntry,
   AssetProfile,
   AssetFilter,
   CatalogNamespace,
@@ -224,6 +227,33 @@ export const clickhouseAssetService: AssetService = {
     });
     const json = await res.json().catch(() => null);
     if (!res.ok) throw errorFor(res.status, json, "Failed to restore the table");
+  },
+  // `DATA-55` (QA `LH-DATA-15-06`, `TC-1731`): the drop, its status read and
+  // the list of dropped tables. Every sentence of a refusal comes from the API
+  // (`errorFor`), and the count is only asked for when the dialog needs it.
+  async getDropStatus(id, options, signal) {
+    const query = options?.withRowCount ? "?withRowCount=true" : ""
+    const res = await apiFetch(`/api/catalog/${encodeURIComponent(id)}/drop${query}`, { signal })
+    const json = await res.json().catch(() => null)
+    if (!res.ok) throw errorFor(res.status, json, "Failed to check whether the table can be dropped")
+    return json as AssetDropStatus
+  },
+  async dropTable(id, signal) {
+    const res = await apiFetch(`/api/catalog/${encodeURIComponent(id)}/drop`, {
+      method: "POST",
+      signal,
+    })
+    const json = await res.json().catch(() => null)
+    if (!res.ok) throw errorFor(res.status, json, "Failed to drop the table")
+    return json as AssetDropResult
+  },
+  async listDroppedTables(signal) {
+    const res = await apiFetch("/api/catalog/dropped/tables", { signal })
+    const json = await res.json().catch(() => null)
+    if (!res.ok) throw errorFor(res.status, json, "Failed to list the dropped tables")
+    // `supported: false` (outside the tenant that owns the shared catalog)
+    // carries an empty list, and so does an answer that is not shaped as one.
+    return Array.isArray(json?.tables) ? (json.tables as DroppedTableEntry[]) : []
   },
   async revokeGrant(id, grantId, signal) {
     const res = await apiFetch(

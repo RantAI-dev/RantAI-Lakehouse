@@ -256,6 +256,9 @@ measurements. The preview decodes at most the first 2,000 rows and shows 20.
   Until that pipeline exists, the table can be explored and queried.
 - The original file is kept until someone deletes the upload, so storage
   grows with every upload.
+- Deleting an upload never drops its table. A table an upload made is dropped
+  from the table's page in the Catalog (`DATA-55`, `asset-page-depth.md`), and
+  while it can still be restored a file cannot be loaded into its name.
 - Adding the same file to a table twice doubles its rows. The console warns
   about a repeated file; it does not stop it.
 - Replacing a table with a file whose columns differ keeps the old

@@ -359,6 +359,105 @@ async fn undrop_table_sends_the_table_id_as_a_table_target() {
     client.undrop_table("wh-1", "t-1").await.unwrap();
 }
 
+/// `DATA-55` D2: the drop is ONE `DELETE` to the warehouse's catalog path,
+/// with no query string (no `purgeRequested`: this is the soft delete), sent as
+/// the admin principal.
+#[tokio::test]
+async fn drop_table_sends_one_delete_to_that_warehouses_catalog_path_with_no_query() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/catalog/v1/wh-1/namespaces/bronze/tables/orders"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
+    assert!(
+        client.drop_table("wh-1", "bronze", "orders").await.unwrap(),
+        "a 204 means the catalog dropped the table"
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let url = requests[0].url.clone();
+    assert!(
+        url.query().is_none(),
+        "a purge query would make the drop a hard delete: {url}"
+    );
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("Authorization")
+            .map(|v| v.to_str().unwrap()),
+        Some("Bearer admin-token")
+    );
+}
+
+/// `DATA-55` D2: a table the catalog does not hold is `Ok(false)`; every other
+/// refusal is classified, never carried as text.
+#[tokio::test]
+async fn drop_table_is_false_for_a_table_that_is_not_there_and_classifies_the_other_refusals() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/catalog/v1/wh-1/namespaces/bronze/tables/missing"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/catalog/v1/wh-1/namespaces/bronze/tables/refused"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/catalog/v1/wh-1/namespaces/bronze/tables/broken"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
+    assert!(
+        !client
+            .drop_table("wh-1", "bronze", "missing")
+            .await
+            .unwrap(),
+        "a 404 means there was no table to drop"
+    );
+    assert!(matches!(
+        client.drop_table("wh-1", "bronze", "refused").await,
+        Err(OpenfgaError::Rejected)
+    ));
+    assert!(matches!(
+        client.drop_table("wh-1", "bronze", "broken").await,
+        Err(OpenfgaError::Server)
+    ));
+}
+
+/// `DATA-55` D2: a name that is not a plain identifier would address another
+/// catalog path, so the client refuses it before building a request.
+#[tokio::test]
+async fn drop_table_sends_nothing_for_a_name_that_is_not_a_plain_identifier() {
+    let server = MockServer::start().await;
+    let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
+    for table in ["orders/../x", "", "orders?purgeRequested=true"] {
+        assert!(
+            matches!(
+                client.drop_table("wh-1", "bronze", table).await,
+                Err(OpenfgaError::Rejected)
+            ),
+            "{table:?} must be refused"
+        );
+    }
+    assert!(
+        matches!(
+            client.drop_table("wh-1", "", "orders").await,
+            Err(OpenfgaError::Rejected)
+        ),
+        "an empty namespace is refused too"
+    );
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "nothing was sent"
+    );
+}
+
 /// `DATA-15` F4: a refused undrop is `Rejected`, and the warehouse lookup
 /// answers by name.
 #[tokio::test]
