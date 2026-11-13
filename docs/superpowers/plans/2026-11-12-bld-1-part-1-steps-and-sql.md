@@ -1406,3 +1406,36 @@ counts stand unchecked). CI's full run on the head had not finished.
   through `cargo-locked`).
 
 No SHOULD-FIX.
+
+### S2, round 2 (reviewer, 2026-11-13)
+
+Reviewed `1d025c342..315f7b464`: the fix for R1-B1, the planner's addition
+R1-S1, the comment of R2-S1, and the merge of `main`.
+
+- **R1-B1: closed, with what is not known stated.** The developer could not
+  reproduce the failure (230 runs) and showed from the code that the route
+  asks the engine nothing before the refusal: the gate reads Postgres, and
+  the rewrite refuses at table access before its prefetch. The assertion now
+  says what the test means (nothing the engine received names the previewed
+  table) and prints everything received. Which request reached the mock in
+  the reviewer's two failing runs was never captured; the test's comment says
+  so and calls the reused-port explanation a guess (R2-S1, sent by message
+  and fixed in `2c15ea883`).
+- **R1-S1 (sent by message; plan D1): closed.** The compiler refuses several
+  inputs with no step at `inputs[1]` when the whole definition is compiled,
+  and still compiles one input for a preview. Four tests.
+- `main` merged by the developer (`42932cdb4`; no Rust in it).
+
+**Re-run by the reviewer**, in the developer's worktree with
+`cargo-locked -j 2`, on `c405885e6`: `--lib -- pipeline_compile` 38 passed;
+`--test pipeline_preview` passed all 10 tests in 10 of 10 runs. Since then
+only a comment and the merge of `main` changed. Not re-run by the reviewer:
+clippy, `route_auth`, `sec11_guard` on the head (the handoff's counts stand
+unchecked).
+
+**No open BLOCKER and no open SHOULD-FIX.** Merges on a green full run of
+the head commit.
+
+**Not verified by anyone:** a preview of a Bronze input through the catalog
+database on a running stack, and the 30 second limit against a real engine.
+The acceptance checklist's `BLD-1-AC3` covers the first.
