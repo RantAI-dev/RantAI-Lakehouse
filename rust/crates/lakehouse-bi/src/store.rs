@@ -7983,6 +7983,44 @@ mod tests {
         assert!(spec.def.uses_shaping());
     }
 
+    /// QA `LH-BI-6-25` (`BI-49`, plan D8): a radar is a grouped kind, so the
+    /// server already saves it with several measures, each keeping its own
+    /// aggregate. The console starts to rely on this in T8; the test pins it
+    /// so a later change cannot take it away unseen.
+    #[test]
+    fn a_radar_with_two_measures_is_saved_with_both_columns() {
+        let spec = bi6_save(&serde_json::json!({
+            "kind": "radar",
+            "measures": ["visitors", {"column": "stay", "aggregate": "avg"}],
+        }))
+        .expect("a radar takes several measures (plan D8)");
+        assert_eq!(
+            spec.spec.y,
+            ChartY::Multi(vec!["visitors".to_owned(), "avg_stay".to_owned()])
+        );
+        assert!(
+            spec.spec.sql.contains("round(sum(visitors)) AS visitors"),
+            "{}",
+            spec.spec.sql
+        );
+        assert!(
+            spec.spec.sql.contains("round(avg(stay)) AS avg_stay"),
+            "{}",
+            spec.spec.sql
+        );
+    }
+
+    /// QA `LH-BI-6-25` (`BI-49`, plan D7): a radar has no breakdown, before and
+    /// after this slice, so the "a breakdown or several measures" rule is never
+    /// reached for one. Pinned for the console's benefit.
+    #[test]
+    fn a_radar_is_refused_a_breakdown() {
+        assert!(
+            bi6_refusal(&serde_json::json!({ "kind": "radar", "breakdown": "cat" }))
+                .contains("breakdown is only for"),
+        );
+    }
+
     /// `BI-46` (plan D12, D14; QA `LH-BI-6-01`): a bar chart with a breakdown
     /// is marked as shaped — it is rebuilt on every read — and the statement it
     /// is saved with already holds the breakdown cap, so the stored statement
