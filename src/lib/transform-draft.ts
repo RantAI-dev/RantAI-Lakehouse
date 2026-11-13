@@ -40,6 +40,41 @@ export type TransformDraft =
   | { verb: "cast"; column: string; type: CastType }
   | { verb: "select"; columns: string }
 
+/** The five verbs `transform_grammar.rs::parse_transform` accepts — nothing else is offered. */
+export const TRANSFORM_VERBS: TransformDraft["verb"][] = ["dedupe", "filter", "rename", "cast", "select"]
+
+/** A draft of `verb` with nothing filled in yet. */
+export function emptyDraftFor(verb: TransformDraft["verb"]): TransformDraft {
+  switch (verb) {
+    case "dedupe":
+      return { verb: "dedupe", key: "" }
+    case "filter":
+      return { verb: "filter", column: "", operator: FILTER_OPERATORS[0], value: "" }
+    case "rename":
+      return { verb: "rename", from: "", to: "" }
+    case "cast":
+      return { verb: "cast", column: "", type: CAST_TYPES[0] }
+    case "select":
+      return { verb: "select", columns: "" }
+  }
+}
+
+/** A draft is only addable once its own required fields are non-blank — never sent to the server half-filled. */
+export function draftIsComplete(draft: TransformDraft): boolean {
+  switch (draft.verb) {
+    case "dedupe":
+      return draft.key.trim().length > 0
+    case "filter":
+      return draft.column.trim().length > 0 && draft.value.trim().length > 0
+    case "rename":
+      return draft.from.trim().length > 0 && draft.to.trim().length > 0
+    case "cast":
+      return draft.column.trim().length > 0
+    case "select":
+      return draft.columns.trim().length > 0
+  }
+}
+
 /**
  * Renders a draft into the exact grammar string
  * `transform_grammar::parse_transform` accepts for that verb. Every
