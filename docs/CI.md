@@ -62,8 +62,10 @@ Downstream jobs execute according to scope:
 - **`images` and `image-smoke`**: Same condition as the acceptance jobs; see "Images: built once per run" below.
 
 `ci.yml` runs with `permissions: contents: read` for the whole workflow, which is the
-token a fork PR is given. Nothing in it needs more: image artifacts and the layer cache use
-the Actions runtime credentials, which every run gets.
+token a fork PR is given. One job asks for more, and only to read: `changes` adds
+`checks: read` and `pull-requests: read`, which `scripts/ci/detect_push_proof.sh` uses
+on a push to `main` to read the merged pull request's check runs (`OPS-24` D7). On a
+pull request the script returns before any API call.
 
 At the end of the pipeline, **`ci-required`** runs with `if: always()`, checks every job result against the detected scope, and fails if any required job failed, cancelled, or was skipped when the scope indicated it should have run. Both the scope detection script (`scripts/ci/detect_change_scope.sh`) and the gate script (`scripts/ci/required_gate.sh`) have accompanying self-tests that run in CI before the scripts are executed.
 

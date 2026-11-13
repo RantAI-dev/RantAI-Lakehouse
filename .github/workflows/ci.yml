@@ -54,6 +54,17 @@ jobs:
     name: Detect Change Scope
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # OPS-24 D7: read-only, and only this job asks for the two extra scopes.
+    # The push proof reads the merged pull request's check runs, which needs
+    # `checks: read`, and finds that pull request, which needs
+    # `pull-requests: read`. A job-level block replaces the workflow's, so
+    # `contents: read` is repeated. All three are read scopes, which is all a
+    # fork's pull request is given, and the proof script returns before any API
+    # call unless the event is `push`. No secret is used.
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
     outputs:
       rust: ${{ steps.scope.outputs.rust }}
       frontend: ${{ steps.scope.outputs.frontend }}
@@ -61,6 +72,14 @@ jobs:
       stack: ${{ steps.scope.outputs.stack }}
       docs_only: ${{ steps.scope.outputs.docs_only }}
       all: ${{ steps.scope.outputs.all }}
+      # OPS-24 D4/D8: `proven` is true only for a push whose own `ci-required`
+      # run repeated a passed pull request, and only while the kill switch is
+      # unset. Anything else -- another event, an error, an empty answer -- is
+      # `false`, so the jobs run.
+      proven: ${{ (github.event_name == 'push' && vars.CI_PUSH_FULL != 'true' && steps.proof.outputs.proven == 'true') && 'true' || 'false' }}
+      proven_by: ${{ steps.proof.outputs.proven_by }}
+      proven_pr: ${{ steps.proof.outputs.proven_pr }}
+      proof_reason: ${{ steps.proof.outputs.reason }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -81,6 +100,31 @@ jobs:
           # run everything again, from the next push, with no code change.
           FORCE_ALL: ${{ vars.CI_PUSH_FULL }}
         run: ./scripts/ci/detect_change_scope.sh
+
+      - name: Self-test push proof
+        run: bash ./scripts/ci/tests/test_detect_push_proof.sh
+
+      # OPS-24 D4: on a push, ask whether this commit only repeats a pull
+      # request's run. Nothing reads `proven` yet in this task; the gate and
+      # the jobs use it in T4.
+      - name: Detect whether this push repeats a passed pull request
+        id: proof
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          BASE_BRANCH: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          SCOPE_RUST: ${{ steps.scope.outputs.rust }}
+          SCOPE_DAGSTER: ${{ steps.scope.outputs.dagster }}
+          SCOPE_STACK: ${{ steps.scope.outputs.stack }}
+          SCOPE_ALL: ${{ steps.scope.outputs.all }}
+        run: |
+          ./scripts/ci/detect_push_proof.sh || {
+            echo "::warning::the push-proof script failed; nothing is treated as proven"
+            echo "proven=false" >> "$GITHUB_OUTPUT"
+            echo "reason=the proof script failed" >> "$GITHUB_OUTPUT"
+          }
 
   # ── Repo Lints (merged: parity corpus, R11, compose init, Dagster imports) ──
   # Folded into a single job with one step each: these four fast static checks
