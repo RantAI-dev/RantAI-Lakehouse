@@ -877,6 +877,185 @@ is the one with `0140`.
   `dagster/` (the merge brought `main`'s changes, which its own CI covered).
 - `cargo test --workspace`: not run here.
 
+### Handoff S3 (developer, 2026-11-13)
+
+Branch `feat/bld-1-steps-console`, base `origin/main` at `be2c92910` (S1
+merged, #481); `main` merged in once (below). Console only: no file under
+`rust/`, `dagster/`, `ops/`, migrations, `docker-compose.yml` or
+`design-system/` was touched, and no cargo command was run.
+
+**Commits**
+
+| Commit | Subject |
+| --- | --- |
+| `fbe642eb4` | feat(console): the pipeline contracts carry inputs and steps; preview client (S3-T1) |
+| `362bcc1fa` | feat(console): the pipeline editor's state and rules, as pure functions (S3-T2) |
+| `3d43f6f19` | feat(console): one pipeline editor of inputs, steps and an output (S3-T3) |
+| `2c65d03fa` | feat(console): the pipeline page draws inputs, steps and the output (S3-T4) |
+| `c855c9559` | test(console): the editor's own behaviours, as the plan lists them (S3-T5) |
+| `5fbf13bfe` | Merge origin/main (#497, WEB-11) into feat/bld-1-steps-console |
+| (this commit) | docs(plan): BLD-1 part 1 S3 handoff |
+
+Correction: `362bcc1fa`'s message says `pipeline-editor.test.ts` has 37
+tests. It had 34; S3-T4 added 2, so it has 36.
+
+**What was built, by file**
+
+- `src/services/contracts/pipelines.ts`, `clients/pipelines.ts`:
+  `PipelineInput`, `PipelineStep`, `PipelinePreviewInput`, `PipelinePreview`;
+  `AuthoredDefinition` requires `inputs`/`steps` (the API on `main` always
+  sends them); create/update inputs may send them and their fields of before
+  are optional (D3); `previewPipelineStep` posts through `sendJson`.
+- `src/lib/pipeline-editor.ts`: state (ids that are never reused), add,
+  remove, rename (a form step's `reads` follows a renamed name; SQL text is
+  not rewritten), reorder, D2's limits and name rule, readable names (exact
+  case, D6a), the connector's fixed first input, the check before saving,
+  the save body, `definitionChanged`, D17a's rule and sentence, the preview
+  body and key, `errorTarget`/`errorItemId` (D7), the columns a form step
+  offers, the SQL step's completion, `sqlStepReads` (read view edges).
+  `transform-draft.ts` gains `emptyDraftFor`, `draftIsComplete`,
+  `TRANSFORM_VERBS`, moved unchanged from the old page.
+- `src/features/pipelines/pipeline-editor.tsx` (shell, rail, preview, save),
+  `pipeline-editor-panes.tsx` (input, form step, SQL step, output),
+  `pipeline-transform-rows.tsx` (the five-operation rows, moved as they
+  were). `pipeline-create-page.tsx` renders the editor;
+  `pipeline-edit-page.tsx` imports it.
+- `src/components/patterns/sql-rows-table.tsx`: `SqlRowsTable` and
+  `SqlColumnChips` moved from `features/dashboards/sql-source-panel.tsx`,
+  with optional `noRowsText`/`staleText` whose defaults are the dashboard's
+  words; `chart-builder.tsx` and `sql-source-panel.tsx` import them.
+- Read view: `pipeline-flow-layout.ts` `authoredFlow`, a `step` node kind in
+  `pipeline-flowchart.tsx`, and `AuthoredFlow`'s panel in
+  `pipeline-definition.tsx` (a SQL step's SQL in `CodeView`).
+
+**The merge of `main`** (`5fbf13bfe`, #497 `WEB-11`). One conflict:
+`src/services/clients/pipelines.test.ts`, resolved hunk by hunk keeping both
+sides (main's refusal tests for `listPipelines`, `getPipeline` and the
+writes; this branch's three `previewPipelineStep` tests). The merge also
+brought:
+- `src/services/clients/pipelines.ts`, merged by itself: `getJson`,
+  `sendJson` and `listPipelines` call the shared `deniedFor`.
+  `previewPipelineStep` goes through `sendJson`, so it follows that mapping
+  with no code of its own.
+- In the editor, the save error and the preview error show
+  `ServiceError.message` and map nothing themselves. A 401/403 is therefore
+  #497's sentence. `errorTarget` finds no `steps[i]` in that sentence, so it
+  is shown at page level (save) or in the preview (preview).
+- Two tests were added with the merge: a 403 on the preview is
+  `permission_denied` with the shared sentence (client, `BLD-1-AC11`), and
+  the editor's preview shows that sentence.
+
+**Verification, on the head commit `5fbf13bfe` (real counts)**
+
+```
+bun run typecheck                                        # exit 0
+bun run lint                                             # exit 0; 0 errors, 11 warnings (the 11 on main, none in a file this branch touched)
+flock /home/shiro/rantai/.heavy.lock bun test src/features/pipelines/    # 143 pass, 0 fail (12 files)
+flock /home/shiro/rantai/.heavy.lock bun test src/services/              # 253 pass, 0 fail (22 files)
+flock /home/shiro/rantai/.heavy.lock bun test src/components/patterns/   #  32 pass, 0 fail (6 files)
+flock /home/shiro/rantai/.heavy.lock bun test src/lib/                   # 1330 pass, 0 fail, 1 skip (129 files)
+flock /home/shiro/rantai/.heavy.lock bun test src/features/dashboards/   # 636 pass, 0 fail (79 files)
+python3 ops/lint/check_bare_iceberg_count.py                              # R11 guard: none found
+python3 ops/lint/check_intra_package_imports.py                           # OK
+git status                                                                # clean
+```
+
+Total: 2394 pass, 0 fail, 1 skip. The skip is
+`src/lib/connectors/brand-marks.test.ts`, which this branch does not touch.
+The dashboard count (636) is the same before and after the move of the two
+components, and no dashboard test was edited.
+
+**Old tests of `pipeline-create-page.test.tsx` (22) and where each is now**
+
+| Old test | Now |
+| --- | --- |
+| re-upload: offered and ON for Bronze, new and stored | same name, on the Schedule and settings tab, "first input" |
+| re-upload: not offered when the zone is not Bronze | same, for a Silver first input |
+| re-upload: carries every other upstream through a save | same |
+| re-upload: clears the upload upstream when off | same |
+| re-upload: adds it on create, no other upstream | same (input, form step, output instead of wizard steps) |
+| suggestions: real table names, typing still allowed | same; the datalist id is per input (`input-table-options-<id>`) |
+| WEB-8: namespaces as the source zone | "an input's zone" (combobox "Zone") |
+| WEB-8: namespaces as the target zone | "the output zone" (Output pane) |
+| WEB-8: columns from the schema (was: the incremental column picker) | the input pane lists the columns with types, and a form step's Key column picks from them. The incremental column left the page (decision 18) |
+| WEB-8: free text while the table does not exist | same line shown; a form step's Key column is a text box |
+| BLD-7: zone fixed, connector's tables only, trigger is its load | same |
+| BLD-7: sends the chosen table and the connector's load | same; asserts `inputs[0]` instead of `sourceZone`/`sourceTable` (D3) |
+| BLD-7: run the ingest first, link to Ingest | same, plus Create is disabled |
+| BLD-7: plain form without a connector in the URL | same |
+| BLD-9: every connector and No connector, null when cleared | same, across the two tabs |
+| BLD-9: sets the connector picked | same; asserts `inputs` |
+| BLD-10: FBIC offered as not available, disabled and off | **no longer applies**: the FBIC row is not on the page (see mismatch 1). What is sent is still pinned by the two tests below |
+| BLD-10: Next disabled with no transform until plain copy | "Create disabled on a pipeline with no step until the plain copy is switched on" |
+| BLD-10: plain copy off and disabled when a transform is added | "… when a step is added" |
+| BLD-10: no transform shown as a plain copy on Review | there is no Review step; "says that a pipeline with no step is a plain copy of its input" (the rail's line) |
+| BLD-10: sends fbicEnabled false on create | same |
+| BLD-10: sends a stored fbicEnabled true back on edit | same |
+
+New tests (S3-T5): opens a pipeline of before as one input and one form step;
+no sixth input; a SQL step completes the inputs and earlier steps; a 422
+naming `steps[1]` selects step 2, shows the message, and the rail item is
+described by it; the preview posts the selected input and goes stale after
+an edit; a preview refusal is shown at the preview; the preview shows the
+shared 403 sentence; create sends `inputs`, `steps` and `kind: "batch"` and
+none of the old fields; edit sends the stored kind and no incremental
+column; D17a appears on a step change for a pipeline that reads as someone
+else, not on a schedule-only change and not when it reads as you; decision
+13's line; move, remove and the rename that a form step follows. Read view:
+two tests in `pipeline-detail-page.test.tsx`, a two-input SQL case in
+`pipeline-flow-layout.test.ts`. Pattern: `sql-rows-table.test.tsx` (4).
+
+**Existing tests changed, and why**
+- `pipeline-flow-layout.test.ts`: "the transforms stacked in one column"
+  became "an input, one form step, then the target", because a form step is
+  now one node and its operations are listed in its panel. In the
+  plain-copy test, only the input's node id changed (`input:0` instead of
+  `source`); its assertions are the same.
+- Fixtures in `contracts/pipelines.test.ts`, `pipeline-flow-layout.test.ts`
+  and `pipeline-detail-page.test.tsx` gain `inputs`/`steps`, which the API
+  returns and the type requires. What they assert is unchanged.
+
+**Mismatches and choices for the planner**
+
+1. **FBIC row removed from the page.** D17 lists what Schedule and settings
+   holds (schedule, connector, two switches, description), and FBIC is not
+   in it. The body still sends `fbicEnabled`: false on create, the stored
+   value on edit (BLD-10 D1). The read view keeps its FBIC row. If the row
+   should stay on the editor, it is one block to restore.
+2. **Where the pipeline name lives.** The plan does not say. It is above the
+   two tabs, so a create can name the pipeline from either tab.
+3. **Checks the API does not make, added on the client.** A form step with
+   no operation is refused before save ("Add an operation, or remove this
+   step."), because BLD-10 D2 says a copy must be chosen. The API accepts
+   such a step as `SELECT *`. The plain-copy switch is kept on the Output
+   pane for a pipeline with no step. A second input beside a connector is
+   refused on the page (D12).
+4. **The preview body.** An input is previewed alone
+   (`{inputs:[that one], steps:[], upTo}`). A step is sent with every input
+   and only the steps up to it, so an unfinished later item does not block
+   a preview. The shape is section 3's. Whether S2 accepts a body cut this
+   way is **not verified**: S2 is not on `main`, and the tests stub `fetch`.
+5. **D17a is also said when the pipeline has no author**, because D10 then
+   makes it read as the caller. It is also said while the session is still
+   loading. It is not said when it already reads as you, or for a change to
+   anything but inputs and steps.
+6. **Read view edges of a SQL step** come from `sqlStepReads` (names after
+   `FROM`/`JOIN`, as written). It leaves out what it cannot place, such as
+   `FROM a, b`, rather than invent an edge, and the page says how SQL edges
+   are drawn. It is a drawing aid, not a check.
+7. The flowchart's `transform` node kind is no longer produced by
+   `authoredFlow`. It was kept because `layoutFlow`'s test uses it; removing
+   it is a cleanup the planner may want.
+
+**Not verified**
+- **Not verified in a browser.** There is no browser on this machine, so how
+  either page looks, in either theme, was not seen.
+- **Not verified against a running API.** The preview route (S2) is not on
+  `main`; every preview, save and refusal here is against stubbed `fetch`.
+- **The whole console suite (`bun run test`) was not run.** One process
+  reaches 7 GB here. The five touched folders were run one by one (above);
+  CI runs the whole suite on the pull request.
+
 ## 7. Review
 
 
