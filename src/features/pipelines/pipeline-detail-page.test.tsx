@@ -71,6 +71,10 @@ const PIPELINE: PipelineDetail = {
   graph: null,
   config: [],
   definition: {
+    // BLD-1 part 1 / D3: the detail read returns the definition as inputs
+    // and steps, and in the form of before.
+    inputs: [{ name: "northwind_orders", zone: "bronze", table: "northwind_orders" }],
+    steps: [],
     sourceZone: "bronze",
     sourceTable: "northwind_orders",
     incrementalColumn: null,
@@ -245,6 +249,71 @@ describe("the pipeline page's Definition tab (BLD-10)", () => {
     renderPage()
 
     expect(await screen.findByText("Not available (stored as on; nothing runs it)")).toBeTruthy()
+  })
+})
+
+// BLD-1 part 1 D17: the read view draws inputs, steps and the output, and a
+// SQL step shows its SQL.
+describe("the pipeline page's flow of inputs and steps (BLD-1 part 1)", () => {
+  const SQL = "SELECT c.country, count() AS orders FROM paid AS p JOIN customers AS c ON p.customer_id = c.id GROUP BY c.country"
+  const withSteps: PipelineDetail = {
+    ...PIPELINE,
+    definition: {
+      ...PIPELINE.definition!,
+      inputs: [
+        { name: "orders", zone: "bronze", table: "northwind_orders" },
+        { name: "customers", zone: "bronze", table: "northwind_customers" },
+      ],
+      steps: [
+        { name: "paid", kind: "transform", reads: "orders", transforms: ["filter(status = 'paid')"] },
+        { name: "by_country", kind: "sql", sql: SQL },
+      ],
+    },
+  }
+
+  it("draws each input and step, and shows a SQL step's SQL when it is selected", async () => {
+    search = "tab=definition"
+    stubApi({ status: () => "completed", pipeline: withSteps })
+    renderPage()
+
+    const chart = await screen.findByRole("group", { name: "Pipeline flowchart" })
+    expect(within(chart).getByText("bronze.northwind_orders")).toBeTruthy()
+    expect(within(chart).getByText("bronze.northwind_customers")).toBeTruthy()
+    expect(within(chart).getByText("paid")).toBeTruthy()
+    expect(within(chart).getByText("silver.northwind_orders")).toBeTruthy()
+
+    within(chart).getByText("by_country").closest("button")?.click()
+    expect(await screen.findByText("Step 2 of 2 · SQL")).toBeTruthy()
+    // `CodeView` shows the step's text as stored.
+    expect(document.body.textContent).toContain("GROUP BY c.country")
+  })
+
+  // BLD-1 part 1 S3 review R1-S2: a kind the console does not know does not
+  // crash the page; it is shown as stored.
+  it("shows a step of a kind this console does not know with its kind and stored record", async () => {
+    search = "tab=definition"
+    const unknown: PipelineDetail = {
+      ...withSteps,
+      definition: { ...withSteps.definition!, steps: [{ name: "joined", kind: "join", left: "orders" }] },
+    }
+    stubApi({ status: () => "completed", pipeline: unknown })
+    renderPage()
+
+    const chart = await screen.findByRole("group", { name: "Pipeline flowchart" })
+    within(chart).getByText("joined").closest("button")?.click()
+    expect(await screen.findByText("Step 1 of 1 · join")).toBeTruthy()
+    expect(document.body.textContent).toContain('"left": "orders"')
+  })
+
+  it("lists a form step's operations and what it reads", async () => {
+    search = "tab=definition"
+    stubApi({ status: () => "completed", pipeline: withSteps })
+    renderPage()
+
+    const chart = await screen.findByRole("group", { name: "Pipeline flowchart" })
+    within(chart).getByText("paid").closest("button")?.click()
+    expect(await screen.findByText("Step 1 of 2 · Form")).toBeTruthy()
+    expect(screen.getByText("filter(status = 'paid')")).toBeTruthy()
   })
 })
 
