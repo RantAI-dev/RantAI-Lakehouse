@@ -1145,4 +1145,282 @@ plan has been seen by the owner.
 
 ## 5. Handoff
 
+Branch `fix/qa-round-dashboards-p2`, based on `eeb8d189` (the plan commit),
+whose parent is `43d36f55`, the merge of #486.
+Fifteen commits, one per task, pushed after each:
+
+| Commit | Task |
+| --- | --- |
+| `8e6106ea` | T1 `test(bi): pin a radar with several measures and its breakdown refusal` |
+| `1869fd21` | T2 `feat(bi): switch_skip says why the dashboard grain left a chart as it was` |
+| `e632e77f` | T3 `feat(bi): resolve_each lists a refused value and keeps the rest` |
+| `997d87b9` | T4 `feat(api): mark each dashboard tile the date grouping did not change` |
+| `0d9a36d3` | T5 `feat(api): the dashboard read lists a refused parameter value and keeps going` |
+| `6b0b9226` | T6 `feat(api): access_cause says a mask explains a statement that gave no rows` |
+| `07e3ebd7` | T7 `feat(api): a question outside the viewer's access says so without a reference` |
+| `172dcd8e` | T8 `feat(console): a radar draws one shape per measure on one shared scale` |
+| `2c29f0f8` | T9 `feat(console): the tile says when the date grouping does not apply to it` |
+| `d0e9f666` | T10 `feat(console): a question outside the viewer's access is greyed, not a red error` |
+| `5da69aaf` | T11 `feat(console): a refused parameter value is shown on its control and leaves the address` |
+| `584a5ff7` | T12 `feat(console): "Add a level" and "Join a table" stay at their limit, off, with the sentence` |
+| `1e3353b3` | T13 `feat(console): without metric:write the metrics page is a list to read` |
+| `abb4f33e` | T14 `test(ai-eval): a standard request for a radar that compares two measures` |
+| `07abae4d` | T15 `docs(features): the radar, the date grouping mark, an access question, a refused value, metric:write` |
+
+Every commit body cites its QA case IDs and backlog ID. Nothing was committed
+outside the plan's scope; `BACKLOG.md`, `PRODUCT.md` and `HANDOFF.md` are
+untouched.
+
+### What each task changed, and the tests added
+
+T1 (tests only): `a_radar_with_two_measures_is_saved_with_both_columns`,
+`a_radar_is_refused_a_breakdown`. Both pass on today's server, as the plan says.
+
+T2: `grain::SwitchSkip` and `grain::switch_skip`. Test
+`the_switch_says_why_it_left_a_chart_as_it_was`.
+
+T3: `params::{RefusedParam, RequestOutcome, ParamValues::resolve_each}`; `resolve`
+is now a caller. Tests `a_refused_value_keeps_the_saved_value_and_is_listed_with_its_reason`,
+`an_unknown_name_is_ignored_and_never_repeated`, `a_refused_value_is_not_in_its_reason`.
+
+T4: `routes::support::annotate_grain_switch`, called once from the stored chart's
+future in `routes::dashboard`. `mount_board` became a caller of a new
+`mount_board_with(server, board_grain, charts, columns)`; a `chart_row_without_grain`
+helper and `chart_row_with` were added inside `mod time_grain`. Tests
+`while_the_switch_is_on_every_chart_it_does_not_change_says_why`,
+`without_a_dashboard_grain_no_tile_carries_the_mark`,
+`a_chart_that_kept_its_grain_because_the_new_one_does_not_fit_carries_only_grain_skipped`.
+
+T5: `routes::params::OnRefusal`, `Loaded::refused`, a fourth argument on `load`;
+`DashboardQuery::strict_params` (`#[serde(skip)]`) plus `strict_params: false` on
+the seven test literals and `true` in `for_render`; the body's `refusedParams`;
+`payload_for`'s `# Errors` corrected. Tests in `mod time_grain`:
+`a_parameter_value_that_does_not_fit_is_listed_and_the_dashboard_is_still_read`,
+`a_name_that_is_not_a_parameter_is_ignored_by_the_dashboards_read`,
+`a_read_that_makes_a_document_still_refuses_the_whole_read`,
+`params_that_are_not_an_object_are_still_a_bad_request`, with a
+`mount_target_param` and a `dashboard_with_params` helper; and in
+`param_rewrite`, `a_refused_value_reaches_no_statement`.
+
+T6: `HiddenRead`/`hidden_read` (the rewrite's loop moved into one helper),
+`AccessCause`, `PolicyEngineObligations::access_cause`. Test
+`a_mask_on_a_column_the_statement_names_is_the_cause_and_another_column_is_not`.
+
+T7: `NOT_AVAILABLE_WITH_YOUR_ACCESS`, `LayerCause`, `LayerRunner::access_is_the_cause`,
+`explains`, `layer_columns`, the `match` in `ask`, and the two runners in
+`layers_rewrite` (`Engine` answers false, `Stub` reads `MASKEDCOLUMN`/`HIDDENTABLE`).
+`failure_of` is unchanged, to the letter. Tests
+`a_question_the_viewers_access_does_not_cover_says_so_without_a_reference_or_the_engines_text`,
+`only_the_gates_not_found_a_hidden_table_and_a_masked_column_the_engine_refused_count_as_access`,
+and in `tests/table_access.rs` (a new `LayerFake`, modelled on `BoardFake`)
+`a_question_on_a_table_the_viewers_role_does_not_read_is_marked_as_access`,
+`a_question_that_sums_a_column_masked_for_the_viewer_is_marked_as_access`,
+`a_question_the_engine_refuses_for_a_viewer_without_a_mask_keeps_its_reference`.
+
+T8: `measureLimits("radar")` is `{ min: 1, max: 6, own: true }`; the radar branch
+draws one shape per measure on one shared scale, with a legend only when there is
+more than one. Tests `a radar takes one to six measures, each with its own
+aggregate`; `a radar draws one shape per measure on one shared scale and names each
+in the legend`, `a radar with one measure has no legend and keeps the scale of its
+own values`; `a radar offers Add measure and sends both measures` (the column *is*
+picked in the test, so nothing was left out).
+
+T9: `GrainNotApplied`, `grainNotAppliedSentence`; `Rows.grainNotApplied`;
+`GrainMarkers.notApplied`; the mark on the tile only while `appliedGrain` is set
+and a grained chart is on the page; `; date grouping: <sentence>` on the tile's
+page-context line. Tests: `each reason the server gives has its sentence, an
+unknown reason the general one, and no reason none`; new
+`src/features/dashboards/grain-marker.test.tsx` with `a chart the control does not
+change carries the mark with the sentence as its label` and `without a reason no
+such mark is drawn`; `a tile the date grouping does not apply to says so on its
+line`; `the mark is drawn only while the dashboard applied a grain` in
+`dashboard-page-role.test.tsx`.
+
+T10: `LayerCell.cause`, `NOT_AVAILABLE_WITH_YOUR_ACCESS` (no full stop, as the
+line composes it), `unavailableLayers`, `failedLayers` leaving access questions
+out, the greyed `off` series, the legend `data` only when there is one, and the
+muted line in `tile-body`. Tests `a question outside the viewer's access is a
+greyed legend entry with no points and adds no axis`, `a chart with no such
+question has the legend it always had`, `a question outside the viewer's access is
+named in one muted line and not among the questions that could not be drawn`.
+
+T11: `RefusedParam`, `acceptedParams`; `ParamControls.refusals` with the refusal
+under its control (and after the controls for a parameter the page does not show);
+`Payload.refusedParams`, `paramRefusals`, `paramAnswer`, the address effect, and
+the three places a refusal goes away. Tests `a refused value and a name the answer
+does not know leave what the address carries, and nothing left is no parameter at
+all`; `a refusal is shown under its control and the control goes back to the value
+in force`, `a refusal for a parameter the dashboard does not show is listed after
+the controls`, `without a refusal no alert is drawn`; new
+`dashboard-refused-param.test.tsx` with `a value in the address that does not fit
+draws the dashboard, says why on the parameter, and is taken out of the address`.
+
+T12: both buttons always drawn, disabled at the limit, with the sentence. The two
+existing assertions changed because the rule changed (the button used to vanish),
+as the plan says; new tests `says nothing about a limit below six levels` and
+`keeps the button on and says nothing about a limit below four joins` (these two
+also pass before the change, since below the limit nothing moved).
+
+T13: `useAuth().hasPermission("metric:write")` on the page, the row without an
+editor, the D32 sentence, `SegmentsDialog.canWrite`, and `metrics.ts` on
+`deniedFor`. Tests `a person without metric:write reads the list and is offered
+nothing to define or change`, `a person with metric:write is offered New metric,
+New segment and Edit`, and the client test `a refused segment change does not say
+metrics`.
+
+T14: the case `chart_radar_two_measures` appended to
+`ops/ai_eval/dashboard_cases.json`.
+
+T15: the five feature pages, exactly as the plan's lines read; every "Signed" cell
+written keeps `*(proposed, not yet signed)*`.
+
+### Commands and counts (all run in the foreground, `CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-3`, `CARGO_BUILD_JOBS=6`)
+
+Rust, per task (the plan's named tests):
+
+- T1 `cargo test -p lakehouse-bi --lib radar` → 2 passed, 0 failed.
+- T2 `cargo test -p lakehouse-bi --lib the_switch_says_why_it_left_a_chart_as_it_was`
+  → 1 passed; `cargo test -p lakehouse-bi --lib grain::tests` → 17 passed, 0 failed.
+- T3 `cargo test -p lakehouse-bi --lib params::tests` → 21 passed, 0 failed (the
+  existing `resolve` tests included, unchanged).
+- T4 `cargo test -p lakehouse-api --lib time_grain::` → 14 passed, 0 failed.
+- T5 the five named tests one at a time → 1 passed each; `--lib time_grain::` → 18
+  passed; `--lib param_rewrite` → 7 passed; `--lib layout_tabs` → 13 passed, 2
+  ignored; `--lib organise_paths` → 62 passed, 1 ignored.
+- T6 `cargo test -p lakehouse-api --lib a_mask_on_a_column_the_statement_names_is_the_cause_and_another_column_is_not`
+  → 1 passed; `cargo test -p lakehouse-api --test table_access` → 14 passed, 0
+  failed (13 tests + the `tls_proxy` one).
+- T7 `cargo test -p lakehouse-api --lib layers_rewrite` → 8 passed, 7 ignored
+  (the engine-needing ones); `--test table_access` → 17 passed, 0 failed.
+- Every commit that touched `lakehouse-api/src` (T4–T7) also ran
+  `--test sec11_guard` (4 passed) and `--test route_auth` (94 passed), and again in
+  the handoff run; all green.
+- Per commit: `cargo fmt --check` and `cargo clippy -p lakehouse-bi` or
+  `-p lakehouse-api --all-targets -- -D warnings`; no warning.
+
+Tests confirmed to fail before their fix (run, then the fix restored):
+
+- T4: with the `annotate_grain_switch` call removed, the first test failed
+  `left: Null, right: String("part")`.
+- T5: with `OnRefusal::Fail` for every read, the first two failed
+  `a refused value no longer fails the page's read: Params(BadRequest("parameter 'target' must be at most 50."))`
+  and `an unknown name does not fail the page's read: Params(BadRequest("the request names a parameter that does not exist."))`.
+- T6: with `access_cause` returning `None`, the test failed
+  `left: None, right: Some(MaskedColumn)`.
+- T7: with `access_is_the_cause` returning `false`, the two real-router tests
+  failed `left: Null, right: String("access")` (the entries carried the gate's
+  `Table not found …` and `This chart could not be loaded.` with an `errorId`).
+- T8, T10, T11, T13: the test files were run with the product change stashed.
+  T8 → 3 failed; T10 → 2 failed; T11 → 4 failed (the `acceptedParams` test cannot
+  import it, the two control tests and the page test); T13 → 2 failed.
+- T12: the two changed assertions fail on the previous code (the button was gone).
+- T2, T3: not run stashed. Both add a new public item (`switch_skip`,
+  `resolve_each`), so the pre-change failure is a compile error, not an assertion;
+  said here rather than claimed.
+
+Console, per task (after `bun install --frozen-lockfile`):
+
+- T8 `bun test src/lib/chart-shape.test.ts src/features/dashboards/chart-option.test.ts`
+  → 57 pass; `bun test src/features/dashboards/chart-builder.test.tsx` → 48 pass.
+- T9 `bun test src/lib/grain-switch.test.ts src/lib/page-context-summary.test.ts` →
+  29 pass; `grain-marker.test.tsx` + `dashboard-page-role.test.tsx` → 4 pass;
+  `grain-switch.test.tsx` (the older `GrainMarkers` tests) → still green.
+- T10 `combined-option.test.ts` → 10 pass; `combined-tile.test.tsx` → 6 pass.
+- T11 `params.test.ts` + `param-controls.test.tsx` → 21 pass;
+  `dashboard-refused-param.test.tsx` → 1 pass.
+- T12 `hierarchy-dialog.test.tsx` + `joins-section.test.tsx` → 9 pass (with
+  `layers-section.test.tsx` alongside → 19 pass).
+- T13 `metrics-page.test.tsx` → 2 pass; `metrics.test.ts` → 1 pass.
+- Each TypeScript commit: `bun run typecheck` (clean) and `bun run lint`
+  (0 errors; the same 11 warnings as before this slice, all in files it does not
+  touch).
+
+T14:
+
+- `python3 -m json.tool ops/ai_eval/dashboard_cases.json > /dev/null` → OK.
+- `python3 -m pytest ops/ai_eval/test_ai_eval.py -q` → **204 passed**. `pytest` is
+  not installed for this machine's `python3`, so it was run from a throwaway venv
+  at `/home/rismana/rantai/venv-p2` with `pytest==8.3.4` (CI's pin) and `requests`
+  (which `ai_eval.py` imports).
+
+Before handoff, once, on the final commit (`07abae4d`):
+
+- `cargo fmt --check` → clean.
+- `cargo clippy -p lakehouse-bi --all-targets -- -D warnings` → clean.
+- `cargo clippy -p lakehouse-api --all-targets -- -D warnings` → clean.
+- `cargo test -p lakehouse-api --test table_access` → 17 passed, 0 failed.
+- `cargo test -p lakehouse-api --test sec11_guard` → 4 passed, 0 failed.
+- `cargo test -p lakehouse-api --test route_auth` → 94 passed, 0 failed.
+- `bun run typecheck` → clean.
+- `bun run lint` → 0 errors, 11 warnings (none in a file this slice touched).
+- `bun run test` → **4238 pass, 1 skip, 0 fail**, 13060 `expect()` calls, 392
+  files, 100.25 s.
+- `python3 ops/lint/check_bare_iceberg_count.py` → "no bare count() against a
+  Bronze Iceberg table found".
+- `python3 ops/lint/check_intra_package_imports.py` → "all intra-package …
+  imports resolve".
+- `git status` → clean.
+
+### Assistant changes for the AI team to review
+
+- **The page context gained two facts, no tool or schema change** (T9 step 5, D15;
+  D22). A tile's line now ends, after its `binned` part and only when the server
+  sent `grainNotApplied`, with `; date grouping: <sentence>` — the same sentence as
+  the mark's tooltip, from `grainNotAppliedSentence` in
+  `src/lib/grain-switch.ts`, so the words exist once. A
+  question's `error` in the tile's `also "…"` part reads "Not available with your
+  access." for an access failure, because the server's entry now carries that
+  sentence; nothing in the console rewrote it, so no code changed for D22.
+- **One `AI-15` standard request added** (T14): `chart_radar_two_measures` in
+  `ops/ai_eval/dashboard_cases.json` (mode `build`, `confirm: true`, its own SQL
+  source "Eval Radar Two Measures", one turn, `create_chart` with
+  `sqlSource`/`kind: "radar"`). `where_matches` has no list form (`_is_or_holds`
+  takes one value, and the only fan-out in use is `def.measures[].metric`), so both
+  measures are required by two `expect_state` checks — `def.measures` `kunjungan`
+  and `def.measures` `baris`, each `count: 1` — beside the `sqlSource`/`kind`
+  check.
+- **`tests/fixtures/tool_schemas.json` was not regenerated**: no tool's schema
+  changed in this slice (D9, D22, D30, D34 all say "none needed").
+
+### Not verified, and why
+
+- The `chart_radar_two_measures` case's **result**: it needs a model. Only its
+  shape was checked (the two commands above).
+- The eight QA cases in a browser on staging (`LH-BI-6-25`, `LH-BI-9-05`,
+  `LH-BI-13-03`, `LH-BI-11-05`, `LH-BI-11-06`, `LH-BI-10-08`, `LH-BI-7-06`,
+  `LH-BI-2-05`): the owner runs them after the merge.
+- The seven `#[ignore]`d engine tests in `routes::layers_rewrite`: they need the dev
+  `ClickHouse`, and this slice did not touch their path beyond the new trait method.
+- `cargo test --workspace` and the whole-crate integration suites: per section 3 and
+  3a they run once on the pull request (x86_64), not here.
+- `cargo test -p lakehouse-api --test table_access` needs Docker and did run here
+  (17 passed); the containers it starts are sqlx::test's Postgres ones, and none of
+  them is among the containers still up (see "Machine notes").
+
+### Machine notes
+
+- `docker ps -a` before the first integration run: `dreamy_dhawan` and `upbeat_tu`
+  (`postgres:16-alpine`, up 19 min) and `upbeat_engelbart` (`postgres:16-alpine`,
+  up 9 h). The first two are gone afterwards (not by me); `upbeat_engelbart` is
+  still there.
+- After the runs, nine `clickhouse/clickhouse-server:26.8` testcontainers are up
+  (created 10:23–11:25). They are not from any command this slice ran — its
+  integration files use `wiremock` and sqlx's Postgres — so they were left in place
+  for the run that started them (the `dashboards-p3` slice on this machine runs the
+  ClickHouse-backed suites).
+- A throwaway venv was created at `/home/rismana/rantai/venv-p2` only to run
+  `ops/ai_eval/test_ai_eval.py` (see above); nothing in the repository refers to it.
+
+### MISMATCH
+
+- **T7 step 3 (`explains`)**: the plan says a private `fn explains`, but the plan's
+  own second test lives in `routes::layers_rewrite` and reads it. A private item of
+  the sibling `routes::layers` is not visible there, and the plan's path
+  (`super::explains`) resolves to `routes::explains`, which does not exist. The
+  function is therefore `pub(crate)` (still invisible outside the crate) and the
+  test calls `crate::routes::layers::explains`. Nothing else changed; the doc
+  comment says why it is `pub(crate)`.
+
+No other anchor, signature or quoted text differed from the code at `7ac20f8be`.
+
 ## 6. Review
