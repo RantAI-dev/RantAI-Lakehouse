@@ -994,6 +994,41 @@ pub(crate) fn annotate_grain(
     }
 }
 
+/// QA `LH-BI-9-05` (`BI-50`, plan D10, D12): while a dashboard grain is applied
+/// (`requested`), the tile of a stored chart the grain did not change carries
+/// `grainNotApplied`, one of the four reasons [`lakehouse_bi::grain::switch_skip`]
+/// names: the chart's type takes no date grouping, it groups by a part of the
+/// date, its dimension is not a date, or it has no date grouping of its own.
+///
+/// Nothing is added when the control changed the chart, when the chart already
+/// had that grain, or when it kept its own grain because the new one does not
+/// fit its column: that last case keeps `grainSkipped`. The dimension's kind is
+/// read from the columns this read already loaded, so a joined column, a
+/// calculated field or a pivot's field is not among them and the reason is the
+/// general `no_grain`. A tile that is not an object, or that carries no `rows`
+/// (it says its own error), is left alone.
+pub(crate) fn annotate_grain_switch(
+    tile: &mut Value,
+    chart: &store::StoredChartSpec,
+    built: Option<lakehouse_bi::grain::Grain>,
+    requested: Option<lakehouse_bi::grain::Grain>,
+    columns: SourceColumns<'_>,
+) {
+    let Value::Object(tile) = tile else {
+        return;
+    };
+    if !tile.contains_key("rows") {
+        return;
+    }
+    let column = own_columns(chart, columns.0, columns.1)
+        .and_then(|cols| cols.get(&chart.def.dimension).copied());
+    if let Some(reason) =
+        lakehouse_bi::grain::switch_skip(chart.spec.kind, built, column, requested)
+    {
+        tile.insert("grainNotApplied".to_owned(), json!(reason));
+    }
+}
+
 /// `BI-10`: what the tile of a binned chart carries so the console can label
 /// its bins: `bins: { <column>: { mode, width, min, max } }`, read by the
 /// statements the builder made over the same filtered relation as the bins,

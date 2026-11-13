@@ -628,6 +628,13 @@ async fn get_body(
                 let skipped = &filtered.skipped;
                 crate::routes::support::annotate_params(&mut val, c, values_ref);
                 crate::routes::support::annotate_grain(&mut val, &filtered, c);
+                crate::routes::support::annotate_grain_switch(
+                    &mut val,
+                    c,
+                    filtered.grain,
+                    read_ref.grain,
+                    (cols_ref, sources_ref),
+                );
                 crate::routes::support::annotate_table(
                     ch,
                     gate,
@@ -8201,14 +8208,28 @@ mod time_grain {
     }
 
     fn chart_row(id: &str, grain: &str, kind: &str, dimension: &str) -> Value {
+        chart_row_with(id, Some(grain), kind, dimension)
+    }
+
+    /// QA `LH-BI-9-05` (`BI-50`, plan T4): a stored chart whose definition
+    /// carries no `grain` key at all, which is exactly a chart with no date
+    /// grouping for the dashboard's control to change.
+    fn chart_row_without_grain(id: &str, kind: &str, dimension: &str) -> Value {
+        chart_row_with(id, None, kind, dimension)
+    }
+
+    fn chart_row_with(id: &str, grain: Option<&str>, kind: &str, dimension: &str) -> Value {
         let spec = json!({
             "id": id, "title": id, "kind": kind, "mart": "mart_a",
             "sql": "SELECT stored", "x": dimension, "y": "visitors"
         });
-        let def = json!({
+        let mut def = json!({
             "title": id, "mart": "mart_a", "kind": kind, "dimension": dimension,
-            "measures": ["visitors"], "limit": 3, "order": "none", "grain": grain,
+            "measures": ["visitors"], "limit": 3, "order": "none",
         });
+        if let Some(grain) = grain {
+            def["grain"] = json!(grain);
+        }
         json!({
             "id": id, "board": "b1", "created_by": "ui", "created_at": "2026-01-01 00:00:00",
             "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
@@ -8219,8 +8240,32 @@ mod time_grain {
     /// date, and a day-of-week bar; `mart_a` has a `Date` `day` and a
     /// `DateTime` `seen_at`.
     async fn mount_board(server: &MockServer, board_grain: &str) {
-        let col = |n: &str| (n.to_owned(), "String".to_owned());
-        let _ = col;
+        mount_board_with(
+            server,
+            board_grain,
+            vec![
+                chart_row("c_line", "day", "line", "day"),
+                chart_row("c_month", "month", "bar", "day"),
+                chart_row("c_dow", "day_of_week", "bar", "day"),
+            ],
+            vec![
+                json!({"table": "mart_a", "name": "day", "type": "Date"}),
+                json!({"table": "mart_a", "name": "seen_at", "type": "DateTime"}),
+                json!({"table": "mart_a", "name": "visitors", "type": "UInt32"}),
+            ],
+        )
+        .await;
+    }
+
+    /// [`mount_board`] with a board of the caller's own charts and columns
+    /// (`BI-50`, plan T4): the stored charts are `charts`, and `columns` is what
+    /// `FROM system.columns` answers for the marts.
+    async fn mount_board_with(
+        server: &MockServer,
+        board_grain: &str,
+        charts: Vec<Value>,
+        columns: Vec<Value>,
+    ) {
         answer(
             server,
             "FROM console.bi_chart FINAL",
@@ -8231,11 +8276,7 @@ mod time_grain {
                 ("created_at", "String"),
                 ("spec_json", "String"),
             ],
-            vec![
-                chart_row("c_line", "day", "line", "day"),
-                chart_row("c_month", "month", "bar", "day"),
-                chart_row("c_dow", "day_of_week", "bar", "day"),
-            ],
+            charts,
         )
         .await;
         answer(
@@ -8255,11 +8296,7 @@ mod time_grain {
             server,
             "SELECT table, name, type FROM system.columns",
             &[("table", "String"), ("name", "String"), ("type", "String")],
-            vec![
-                json!({"table": "mart_a", "name": "day", "type": "Date"}),
-                json!({"table": "mart_a", "name": "seen_at", "type": "DateTime"}),
-                json!({"table": "mart_a", "name": "visitors", "type": "UInt32"}),
-            ],
+            columns,
         )
         .await;
         // The tiles: every grained statement carries `AS bkt`; three buckets
@@ -8371,6 +8408,80 @@ mod time_grain {
         // The caller's own switch wins over the saved one.
         let body = dashboard(&server, Some(Grain::Month), &TimeContext::default()).await;
         assert_eq!(body["appliedGrain"], json!("month"));
+    }
+
+    /// The board of T4's `grainNotApplied` tests: a chart the switch changes
+    /// (`c_line`), one that groups by a part of the date (`c_dow`), one whose
+    /// dimension is not a date (`c_city`), one with no date grouping of its own
+    /// (`c_plain`) and a KPI, whose type takes no date grouping (`c_kpi`).
+    async fn mount_grain_switch_board(server: &MockServer) {
+        mount_board_with(
+            server,
+            "",
+            vec![
+                chart_row("c_line", "day", "line", "day"),
+                chart_row("c_dow", "day_of_week", "bar", "day"),
+                chart_row_without_grain("c_city", "bar", "city"),
+                chart_row_without_grain("c_plain", "bar", "day"),
+                chart_row_without_grain("c_kpi", "kpi", ""),
+            ],
+            vec![
+                json!({"table": "mart_a", "name": "day", "type": "Date"}),
+                json!({"table": "mart_a", "name": "city", "type": "String"}),
+                json!({"table": "mart_a", "name": "visitors", "type": "UInt32"}),
+            ],
+        )
+        .await;
+    }
+
+    /// QA `LH-BI-9-05` (`BI-50`, plan D10, T4): while the dashboard's switch is
+    /// on, every chart it does not change says why, in the four typed reasons.
+    #[tokio::test]
+    async fn while_the_switch_is_on_every_chart_it_does_not_change_says_why() {
+        let server = MockServer::start().await;
+        mount_grain_switch_board(&server).await;
+        let body = dashboard(&server, Some(Grain::Month), &TimeContext::default()).await;
+        let results = &body["results"];
+        assert!(
+            results["c_line"].get("grainNotApplied").is_none(),
+            "the switch changed it: {results}"
+        );
+        assert_eq!(results["c_dow"]["grainNotApplied"], json!("part"));
+        assert_eq!(results["c_city"]["grainNotApplied"], json!("not_a_date"));
+        assert_eq!(results["c_plain"]["grainNotApplied"], json!("no_grain"));
+        assert_eq!(results["c_kpi"]["grainNotApplied"], json!("kind"));
+    }
+
+    /// QA `LH-BI-9-05` (`BI-50`, plan D13): with no dashboard grain there is no
+    /// control in play, so no tile carries the mark.
+    #[tokio::test]
+    async fn without_a_dashboard_grain_no_tile_carries_the_mark() {
+        let server = MockServer::start().await;
+        mount_grain_switch_board(&server).await;
+        let body = dashboard(&server, None, &TimeContext::default()).await;
+        for (id, tile) in body["results"]
+            .as_object()
+            .expect("the results are an object")
+        {
+            assert!(
+                tile.get("grainNotApplied").is_none(),
+                "{id} carries the mark without a grain: {tile}"
+            );
+        }
+    }
+
+    /// QA `LH-BI-9-05` (`BI-50`, plan D10): a chart that kept its own grain
+    /// because the requested one does not fit its column keeps the older
+    /// `grainSkipped` and is not marked twice.
+    #[tokio::test]
+    async fn a_chart_that_kept_its_grain_because_the_new_one_does_not_fit_carries_only_grain_skipped()
+     {
+        let server = MockServer::start().await;
+        mount_board(&server, "").await;
+        let body = dashboard(&server, Some(Grain::Hour), &TimeContext::default()).await;
+        let line = &body["results"]["c_line"];
+        assert_eq!(line["grainSkipped"], json!("hour"));
+        assert!(line.get("grainNotApplied").is_none(), "{line}");
     }
 
     /// `BI-4` part B T5 (plan D8, `BI-4-AC1`): the second open is served from
