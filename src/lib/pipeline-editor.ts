@@ -353,57 +353,77 @@ export type OutputSettings = {
   hasConnector: boolean
 }
 
+/**
+ * The control a problem is about, so the pane ties the sentence to that
+ * control (`aria-describedby`, `aria-invalid`; BLD-1 part 1 S3 review
+ * R1-S10).
+ */
+export type ProblemField =
+  | "name"
+  | "zone"
+  | "table"
+  | "reads"
+  | "operations"
+  | "sql"
+  | "output-zone"
+  | "output-table"
+  | "plain-copy"
+
+export type Problem = { message: string; field: ProblemField }
+
 /** What is wrong, by item id, plus the output's own problem. Empty means it can be saved. */
-export type EditorProblems = { items: Record<string, string>; output: string | null }
+export type EditorProblems = { items: Record<string, Problem>; output: Problem | null }
 
 /**
  * Every problem the page can know before the API is asked. One sentence per
  * item, the first that applies, so the pane shows one thing to fix at a time.
  */
 export function editorProblems(state: EditorState, output: OutputSettings): EditorProblems {
-  const items: Record<string, string> = {}
+  const items: Record<string, Problem> = {}
+  const at = (field: ProblemField) => (message: string | null): Problem | null => (message ? { message, field } : null)
   state.inputs.forEach((input, index) => {
     const problem =
-      nameProblem(input.name, otherNames(state, input.id)) ??
-      (input.zone.trim() === "" ? "Choose a zone." : null) ??
-      (input.table.trim() === "" ? "Choose a table." : null) ??
-      (output.hasConnector && index > 0 ? "A pipeline fed by a connector reads one input: remove this one." : null)
+      at("name")(nameProblem(input.name, otherNames(state, input.id))) ??
+      at("zone")(input.zone.trim() === "" ? "Choose a zone." : null) ??
+      at("table")(input.table.trim() === "" ? "Choose a table." : null) ??
+      at("name")(output.hasConnector && index > 0 ? "A pipeline fed by a connector reads one input: remove this one." : null)
     if (problem) items[input.id] = problem
   })
   state.steps.forEach((step, index) => {
     // A step of an unknown kind is not edited here, so nothing about it is
     // the page's to check; the API checks it on save (R1-S2).
     if (step.kind === "unknown") return
-    let problem = nameProblem(step.name, otherNames(state, step.id))
+    let problem = at("name")(nameProblem(step.name, otherNames(state, step.id)))
     if (!problem && step.kind === "transform") {
       const reads = step.reads
       const later = "id" in reads && state.steps.slice(index).some((other) => other.id === reads.id)
-      if (later) problem = "This step reads a step that comes after it; reorder the steps."
+      if (later) problem = at("reads")("This step reads a step that comes after it; reorder the steps.")
       else if (!("id" in reads) || !readableItems(state, index).some((item) => item.id === reads.id))
-        problem = "Choose an input or an earlier step for this step to read."
+        problem = at("reads")("Choose an input or an earlier step for this step to read.")
       // BLD-10 D2: an empty form step is a copy that was not chosen.
-      else if (step.transforms.length === 0) problem = "Add an operation, or remove this step."
+      else if (step.transforms.length === 0) problem = at("operations")("Add an operation, or remove this step.")
     }
     if (!problem && step.kind === "sql") {
-      if (step.sql.trim() === "") problem = "Write the step's SELECT."
+      if (step.sql.trim() === "") problem = at("sql")("Write the step's SELECT.")
       else if (step.sql.length > MAX_SQL_CHARS)
-        problem = `A SQL step is at most ${MAX_SQL_CHARS.toLocaleString("en-US")} characters.`
+        problem = at("sql")(`A SQL step is at most ${MAX_SQL_CHARS.toLocaleString("en-US")} characters.`)
     }
     if (problem) items[step.id] = problem
   })
-  let outputProblem: string | null = null
-  if (output.targetZone.trim() === "" || output.targetTable.trim() === "") outputProblem = "Choose the output's zone and table."
+  let outputProblem: Problem | null = null
+  if (output.targetZone.trim() === "") outputProblem = { message: "Choose the output's zone.", field: "output-zone" }
+  else if (output.targetTable.trim() === "") outputProblem = { message: "Choose the output's table.", field: "output-table" }
   else if (
     state.inputs.some(
       (input) => input.zone.trim() === output.targetZone.trim() && input.table.trim() === output.targetTable.trim()
     )
   )
     // `pipeline_compile::OUTPUT_IS_INPUT`, said before the round trip.
-    outputProblem = "The output cannot be one of the inputs."
+    outputProblem = { message: "The output cannot be one of the inputs.", field: "output-table" }
   else if (state.steps.length === 0 && state.inputs.length > 1)
-    outputProblem = "With more than one input, add a step that reads them."
+    outputProblem = { message: "With more than one input, add a step that reads them.", field: "plain-copy" }
   else if (state.steps.length === 0 && !output.plainCopy)
-    outputProblem = "Add a step, or choose to copy the input as it is."
+    outputProblem = { message: "Add a step, or choose to copy the input as it is.", field: "plain-copy" }
   return { items, output: outputProblem }
 }
 

@@ -66,6 +66,7 @@ import {
   TransformStepPane,
   UnknownStepPane,
   type ConnectorSource,
+  type Invalid,
 } from "./pipeline-editor-panes"
 import { isSchedulable, PipelineScheduleField } from "./pipeline-schedule-field"
 import { BRONZE_ZONE, reuploadTriggerOn, showsReuploadSwitch, withReuploadTrigger } from "./pipeline-reupload-trigger"
@@ -362,7 +363,22 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
   function problemFor(id: string): React.ReactNode {
     if (errorItem === id && saveError) return <PaneProblem id={errorMessageId} message={saveError} tone="error" />
     const problem = problems.items[id]
-    return problem ? <PaneProblem message={problem} tone="hint" /> : null
+    return problem ? <PaneProblem id={`problem-${id}`} message={problem.message} tone="hint" /> : null
+  }
+  /** The control the item's own problem is about, and its sentence's id (R1-S10). */
+  function invalidFor(id: string): Invalid {
+    const problem = problems.items[id]
+    return problem && !(errorItem === id && saveError) ? { field: problem.field, describedBy: `problem-${id}` } : null
+  }
+  /**
+   * What a rail item is described by: the refusal or the problem said about
+   * it. R1-S10: it pointed at the pane's sentence, which exists only while
+   * that item's pane is open, so the rail now carries its own.
+   */
+  function railDescription(id: string): string | undefined {
+    if (errorItem === id && saveError) return saveError
+    if (previewErrorItem === id && previewError) return previewError
+    return problems.items[id]?.message
   }
 
   let pane: React.ReactNode = null
@@ -385,6 +401,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
           icebergZones={icebergZones}
           columns={inputColumns[input.id] ?? null}
           problem={problemFor(input.id)}
+          invalid={invalidFor(input.id)}
           onRename={(next) => setEditor((prev) => renameItem(prev, input.id, next))}
           onZone={(zone) => setEditor((prev) => updateInput(prev, input.id, { zone }))}
           onTable={(table) => setEditor((prev) => setInputTable(prev, input.id, table))}
@@ -401,6 +418,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
         index,
         count: editor.steps.length,
         problem: problemFor(step.id),
+        invalid: invalidFor(step.id),
         onRename: (next: string) => setEditor((prev) => renameItem(prev, step.id, next)),
         onMove: (delta: -1 | 1) => setEditor((prev) => moveStep(prev, step.id, delta)),
         onRemove: () => onRemove(step.id),
@@ -455,9 +473,8 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
         writtenFrom={outputSourceLine({ inputs, steps: editor.steps }, plainCopy)}
         plainCopy={plainCopy}
         plainCopyAllowed={editor.steps.length === 0}
-        problem={
-          problems.output ? <PaneProblem message={problems.output} tone="hint" /> : null
-        }
+        problem={problems.output ? <PaneProblem id="problem-output" message={problems.output.message} tone="hint" /> : null}
+        invalid={problems.output ? { field: problems.output.field, describedBy: "problem-output" } : null}
         onZone={setTargetZone}
         onTable={setTargetTable}
         onPlainCopy={setPlainCopy}
@@ -609,8 +626,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                     label={input.name || "Unnamed input"}
                     detail={input.table ? `${input.zone}.${input.table}` : "No table yet"}
                     selected={selection.kind === "input" && selection.id === input.id}
-                    flagged={errorItem === input.id || previewErrorItem === input.id || Boolean(problems.items[input.id])}
-                    describedBy={errorItem === input.id ? errorMessageId : undefined}
+                    description={railDescription(input.id)}
                     onSelect={() => select({ kind: "input", id: input.id })}
                   />
                 ))}
@@ -648,8 +664,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                             `${step.stored.kind} · not editable here`
                     }
                     selected={selection.kind === "step" && selection.id === step.id}
-                    flagged={errorItem === step.id || previewErrorItem === step.id || Boolean(problems.items[step.id])}
-                    describedBy={errorItem === step.id ? errorMessageId : undefined}
+                    description={railDescription(step.id)}
                     onSelect={() => select({ kind: "step", id: step.id })}
                   />
                 ))}
@@ -672,7 +687,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                   label={targetTable ? `${targetZone}.${targetTable}` : "No table yet"}
                   detail="Rebuilt every run"
                   selected={selection.kind === "output"}
-                  flagged={problems.output !== null}
+                  description={problems.output?.message}
                   onSelect={() => select({ kind: "output" })}
                 />
               </RailGroup>
@@ -787,50 +802,58 @@ function RailGroup({ title, children }: { title: string; children: React.ReactNo
 
 /**
  * One item of the rail: a button, so it is reached with Tab and chosen with
- * Enter or Space; `aria-current` says which one the pane shows. An item the
- * check or the API found a problem with is marked, and when the API named
- * it, the button is described by the message in its pane (D7).
+ * Enter or Space; `aria-current` says which one the pane shows. An item with
+ * a problem or a refusal is marked, and is described by that sentence,
+ * which the rail itself carries (BLD-1 part 1 S3 review R1-S10: it used to
+ * point at the pane's copy, which exists only while that pane is open).
  */
 function RailItem({
   icon,
   label,
   detail,
   selected,
-  flagged,
-  describedBy,
+  description,
   onSelect,
 }: {
   icon: React.ReactNode
   label: string
   detail: string
   selected: boolean
-  flagged: boolean
-  describedBy?: string
+  /** The problem or refusal said about the item, if any. */
+  description?: string
   onSelect: () => void
 }) {
+  const descriptionId = React.useId()
   return (
-    <button
-      type="button"
-      aria-current={selected ? "true" : undefined}
-      aria-describedby={describedBy}
-      onClick={onSelect}
-      className={cn(
-        "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [&_svg]:size-4 [&_svg]:shrink-0",
-        selected ? "bg-primary/10 font-medium text-foreground" : "text-muted-foreground hover:bg-muted hover:text-foreground"
-      )}
-    >
-      <span className={selected ? "text-primary" : "opacity-70"}>{icon}</span>
-      <span className="min-w-0 flex-1">
-        <span className="block truncate font-mono">{label}</span>
-        <span className="block truncate text-[11px] text-muted-foreground">{detail}</span>
-      </span>
-      {flagged ? (
-        <>
-          <AlertCircleIcon className="text-amber-600 dark:text-amber-400" aria-hidden />
-          <span className="sr-only">needs attention</span>
-        </>
+    <>
+      <button
+        type="button"
+        aria-current={selected ? "true" : undefined}
+        aria-describedby={description ? descriptionId : undefined}
+        onClick={onSelect}
+        className={cn(
+          "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [&_svg]:size-4 [&_svg]:shrink-0",
+          selected ? "bg-primary/10 font-medium text-foreground" : "text-muted-foreground hover:bg-muted hover:text-foreground"
+        )}
+      >
+        <span className={selected ? "text-primary" : "opacity-70"}>{icon}</span>
+        <span className="min-w-0 flex-1">
+          <span className="block truncate font-mono">{label}</span>
+          <span className="block truncate text-[11px] text-muted-foreground">{detail}</span>
+        </span>
+        {description ? (
+          <>
+            <AlertCircleIcon className="text-amber-600 dark:text-amber-400" aria-hidden />
+            <span className="sr-only">needs attention</span>
+          </>
+        ) : null}
+      </button>
+      {description ? (
+        <span id={descriptionId} className="sr-only">
+          {description}
+        </span>
       ) : null}
-    </button>
+    </>
   )
 }
 

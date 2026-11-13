@@ -19,6 +19,7 @@ import {
   type EditorInput,
   type EditorState,
   type EditorStep,
+  type ProblemField,
   type StepRead,
 } from "@/lib/pipeline-editor"
 import { formatSql } from "@/lib/sql-format"
@@ -34,6 +35,17 @@ import { TransformRows } from "./pipeline-transform-rows"
  * editor's (`pipeline-editor.tsx`).
  */
 
+/**
+ * The control a pane's problem is about, and the id of the sentence that
+ * says it (BLD-1 part 1 S3 review R1-S10: a hint was not tied to its field).
+ */
+export type Invalid = { field: ProblemField; describedBy: string } | null
+
+/** The ARIA a control gets when the pane's problem is about it. */
+function tie(invalid: Invalid | undefined, field: ProblemField): { "aria-invalid"?: true; "aria-describedby"?: string } {
+  return invalid && invalid.field === field ? { "aria-invalid": true, "aria-describedby": invalid.describedBy } : {}
+}
+
 /** A problem or a refusal shown in the pane of the item it is about. */
 export function PaneProblem({ id, message, tone }: { id?: string; message: string; tone: "error" | "hint" }) {
   return (
@@ -47,11 +59,28 @@ export function PaneProblem({ id, message, tone }: { id?: string; message: strin
   )
 }
 
-function NameField({ id, value, onChange }: { id: string; value: string; onChange: (next: string) => void }) {
+function NameField({
+  id,
+  value,
+  onChange,
+  invalid,
+}: {
+  id: string
+  value: string
+  onChange: (next: string) => void
+  invalid?: Invalid
+}) {
   return (
     <div className="space-y-1.5">
       <Label htmlFor={id}>Name in this pipeline</Label>
-      <Input id={id} value={value} onChange={(e) => onChange(e.target.value)} className="font-mono" spellCheck={false} />
+      <Input
+        id={id}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="font-mono"
+        spellCheck={false}
+        {...tie(invalid, "name")}
+      />
     </div>
   )
 }
@@ -98,6 +127,7 @@ export function InputPane({
   icebergZones,
   columns,
   problem,
+  invalid,
   onRename,
   onZone,
   onTable,
@@ -114,6 +144,8 @@ export function InputPane({
   icebergZones: ReadonlySet<string>
   columns: Column[] | null
   problem: React.ReactNode
+  /** Which control the pane's problem is about (R1-S10). */
+  invalid?: Invalid
   onRename: (name: string) => void
   onZone: (zone: string) => void
   onTable: (table: string) => void
@@ -131,6 +163,8 @@ export function InputPane({
   )
   const suggestions = tables.status === "success" ? tables.data.map((table) => table.name).sort() : []
   const listId = `input-table-options-${input.id}`
+  const tableControl =
+    !fromConnector || (connector !== null && !connector.failed && connector.targets !== null && connector.targets.length > 0)
 
   return (
     <div className="flex flex-col gap-4">
@@ -161,10 +195,20 @@ export function InputPane({
             />
           </div>
         ) : (
-          <ZoneField id={`input-zone-${input.id}`} label="Zone" value={input.zone} onChange={onZone} zones={zones} note={zoneNote} />
+          <ZoneField
+            id={`input-zone-${input.id}`}
+            label="Zone"
+            value={input.zone}
+            onChange={onZone}
+            zones={zones}
+            note={zoneNote}
+            describedBy={tie(invalid, "zone")["aria-describedby"]}
+          />
         )}
         <div className="space-y-1.5">
-          <Label htmlFor={`input-table-${input.id}`}>Table</Label>
+          {/* R1-S10: the label names a control only while there is one; while
+              the connector's tables are read there is a sentence instead. */}
+          <Label htmlFor={tableControl ? `input-table-${input.id}` : undefined}>Table</Label>
           {fromConnector ? (
             connector.failed ? (
               <p className="text-sm text-destructive">
@@ -195,6 +239,8 @@ export function InputPane({
                 placeholder="Choose one of the connector's tables"
                 options={connector.targets.map((target) => ({ value: target, label: target }))}
                 onValueChange={onTable}
+                aria-invalid={tie(invalid, "table")["aria-invalid"]}
+                aria-describedby={tie(invalid, "table")["aria-describedby"]}
               />
             )
           ) : (
@@ -206,6 +252,7 @@ export function InputPane({
                 value={input.table}
                 onChange={(e) => onTable(e.target.value)}
                 placeholder="orders_events"
+                {...tie(invalid, "table")}
                 list={suggestions.length > 0 ? listId : undefined}
                 title={suggestions.length > 0 ? `Suggestions from ${zone}; any other name can be typed.` : undefined}
               />
@@ -218,7 +265,7 @@ export function InputPane({
           )}
         </div>
         <div className="sm:col-span-2">
-          <NameField id={`input-name-${input.id}`} value={input.name} onChange={onRename} />
+          <NameField id={`input-name-${input.id}`} value={input.name} onChange={onRename} invalid={invalid} />
           <p className="mt-1 text-xs text-muted-foreground">Steps read this table by this name.</p>
         </div>
       </div>
@@ -290,6 +337,7 @@ export function TransformStepPane({
   failedMessage,
   failedMessageId,
   problem,
+  invalid,
   onRename,
   onChange,
   onMove,
@@ -309,6 +357,8 @@ export function TransformStepPane({
   failedMessage: string | null
   failedMessageId?: string
   problem: React.ReactNode
+  /** Which control the pane's problem is about (R1-S10). */
+  invalid?: Invalid
   onRename: (name: string) => void
   onChange: (patch: { reads?: StepRead; transforms?: string[] }) => void
   onMove: (delta: -1 | 1) => void
@@ -318,7 +368,7 @@ export function TransformStepPane({
     <div className="flex flex-col gap-4">
       <StepHeader step={step} index={index} count={count} onMove={onMove} onRemove={onRemove} />
       <div className="grid gap-3 sm:grid-cols-2">
-        <NameField id={`step-name-${step.id}`} value={step.name} onChange={onRename} />
+        <NameField id={`step-name-${step.id}`} value={step.name} onChange={onRename} invalid={invalid} />
         <div className="space-y-1.5">
           <Label htmlFor={`step-reads-${step.id}`}>Reads</Label>
           {/* D6a: an input or an earlier step. The value is the item's id,
@@ -331,6 +381,8 @@ export function TransformStepPane({
             placeholder="Choose an input or an earlier step"
             options={readable.map((item) => ({ value: item.id, label: item.name }))}
             onValueChange={(id) => onChange({ reads: { id } })}
+            aria-invalid={tie(invalid, "reads")["aria-invalid"]}
+            aria-describedby={tie(invalid, "reads")["aria-describedby"]}
           />
         </div>
       </div>
@@ -342,6 +394,7 @@ export function TransformStepPane({
         failedIndex={failedTransform}
         failedMessage={failedMessage}
         failedMessageId={failedMessageId}
+        describedBy={tie(invalid, "operations")["aria-describedby"]}
       />
       {problem}
     </div>
@@ -360,6 +413,7 @@ export function SqlStepPane({
   state,
   inputColumns,
   problem,
+  invalid,
   hint,
   onRename,
   onSql,
@@ -372,6 +426,8 @@ export function SqlStepPane({
   state: EditorState
   inputColumns: Readonly<Record<string, Column[] | null>>
   problem: React.ReactNode
+  /** Which control the pane's problem is about (R1-S10). */
+  invalid?: Invalid
   /** R1-S1: a name the SQL reads that is not an input or an earlier step; does not block a save. */
   hint: string | null
   onRename: (name: string) => void
@@ -392,12 +448,13 @@ export function SqlStepPane({
     [completionKey]
   )
   const readable = completion.tables.map((table) => table.reference)
+  const hintId = `step-sql-hint-${step.id}`
   const length = step.sql.length
 
   return (
     <div className="flex flex-col gap-4">
       <StepHeader step={step} index={index} count={count} onMove={onMove} onRemove={onRemove} />
-      <NameField id={`step-name-${step.id}`} value={step.name} onChange={onRename} />
+      <NameField id={`step-name-${step.id}`} value={step.name} onChange={onRename} invalid={invalid} />
       <div className="flex flex-col gap-1.5">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <p className="text-sm font-medium" id={`step-sql-label-${step.id}`}>
@@ -423,14 +480,18 @@ export function SqlStepPane({
             </span>
           )}
         </p>
-        <div role="group" aria-labelledby={`step-sql-label-${step.id}`}>
+        <div
+          role="group"
+          aria-labelledby={`step-sql-label-${step.id}`}
+          aria-describedby={[tie(invalid, "sql")["aria-describedby"], hint ? hintId : undefined].filter(Boolean).join(" ") || undefined}
+        >
           <SqlEditor value={step.sql} onChange={onSql} minHeight="220px" wrap extensions={extensions} />
         </div>
         <p className={length > MAX_SQL_CHARS ? "text-xs text-destructive" : "text-xs text-muted-foreground"}>
           {length.toLocaleString("en-US")} of {MAX_SQL_CHARS.toLocaleString("en-US")} characters
         </p>
       </div>
-      {hint ? <PaneProblem message={hint} tone="hint" /> : null}
+      {hint ? <PaneProblem id={hintId} message={hint} tone="hint" /> : null}
       {problem}
     </div>
   )
@@ -447,6 +508,7 @@ export function UnknownStepPane({
   index,
   count,
   problem,
+  invalid,
   onMove,
   onRemove,
 }: {
@@ -454,6 +516,8 @@ export function UnknownStepPane({
   index: number
   count: number
   problem: React.ReactNode
+  /** Which control the pane's problem is about (R1-S10). */
+  invalid?: Invalid
   onMove: (delta: -1 | 1) => void
   onRemove: () => void
 }) {
@@ -485,6 +549,7 @@ export function OutputPane({
   plainCopy,
   plainCopyAllowed,
   problem,
+  invalid,
   onZone,
   onTable,
   onPlainCopy,
@@ -499,6 +564,8 @@ export function OutputPane({
   /** Only with no step is there anything to copy as it is. */
   plainCopyAllowed: boolean
   problem: React.ReactNode
+  /** Which control the pane's problem is about (R1-S10). */
+  invalid?: Invalid
   onZone: (zone: string) => void
   onTable: (table: string) => void
   onPlainCopy: (on: boolean) => void
@@ -512,10 +579,24 @@ export function OutputPane({
       <div className="grid gap-3 sm:grid-cols-2">
         {/* WEB-8 D8: the zone is one the lakehouse lists. The table stays
             free text: this pipeline creates it. */}
-        <ZoneField id="pipeline-target-zone" label="Output zone" value={targetZone} onChange={onZone} zones={zones} note={zoneNote} />
+        <ZoneField
+          id="pipeline-target-zone"
+          label="Output zone"
+          value={targetZone}
+          onChange={onZone}
+          zones={zones}
+          note={zoneNote}
+          describedBy={tie(invalid, "output-zone")["aria-describedby"]}
+        />
         <div className="space-y-1.5">
           <Label htmlFor="pipeline-target-table">Output table</Label>
-          <Input id="pipeline-target-table" value={targetTable} onChange={(e) => onTable(e.target.value)} placeholder="orders_hourly" />
+          <Input
+            id="pipeline-target-table"
+            value={targetTable}
+            onChange={(e) => onTable(e.target.value)}
+            placeholder="orders_hourly"
+            {...tie(invalid, "output-table")}
+          />
         </div>
       </div>
       <p className="text-sm text-muted-foreground">Every run rebuilds this table.</p>
@@ -529,6 +610,7 @@ export function OutputPane({
           onCheckedChange={onPlainCopy}
           disabled={!plainCopyAllowed}
           aria-label="Copy the input as it is"
+          aria-describedby={tie(invalid, "plain-copy")["aria-describedby"]}
         />
       </div>
       {problem}

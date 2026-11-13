@@ -199,7 +199,7 @@ describe("adding, removing, renaming and reordering", () => {
     const readsByCountry = base.state
     expect(readsByCountry.steps[2]).toMatchObject({ reads: { id: "step-4" } })
     const moved = moveStep(readsByCountry, String(base.id), -1)
-    expect(editorProblems(moved, OUTPUT).items[String(base.id)]).toBe(
+    expect(editorProblems(moved, OUTPUT).items[String(base.id)]?.message).toBe(
       "This step reads a step that comes after it; reorder the steps."
     )
   })
@@ -211,7 +211,7 @@ describe("adding, removing, renaming and reordering", () => {
     })
     expect(state.steps[0]).toMatchObject({ reads: { name: "gone" } })
     expect(definitionBody(state.inputs, state.steps).steps[0]).toMatchObject({ reads: "gone" })
-    expect(editorProblems(state, OUTPUT).items["step-2"]).toBe("Choose an input or an earlier step for this step to read.")
+    expect(editorProblems(state, OUTPUT).items["step-2"]?.message).toBe("Choose an input or an earlier step for this step to read.")
   })
 
   it("moves a step up and down, and does nothing past either end", () => {
@@ -255,35 +255,35 @@ describe("editorProblems", () => {
     state = updateStep(state, "step-3", { reads: { id: "step-4" } })
     state = updateStep(state, "step-4", { sql: "   " })
     const problems = editorProblems(state, OUTPUT)
-    expect(problems.items["input-2"]).toBe("Another input or step already has this name.")
+    expect(problems.items["input-2"]?.message).toBe("Another input or step already has this name.")
     // A step after it is not readable: reads names an input or an EARLIER step.
-    expect(problems.items["step-3"]).toBe("This step reads a step that comes after it; reorder the steps.")
-    expect(problems.items["step-4"]).toBe("Write the step's SELECT.")
+    expect(problems.items["step-3"]?.message).toBe("This step reads a step that comes after it; reorder the steps.")
+    expect(problems.items["step-4"]?.message).toBe("Write the step's SELECT.")
   })
 
   it("refuses a SQL step over 20,000 characters (decision 16)", () => {
     const state = updateStep(stored(), "step-4", { sql: `SELECT 1 ${"-".repeat(MAX_SQL_CHARS)}` })
-    expect(editorProblems(state, OUTPUT).items["step-4"]).toBe("A SQL step is at most 20,000 characters.")
+    expect(editorProblems(state, OUTPUT).items["step-4"]?.message).toBe("A SQL step is at most 20,000 characters.")
   })
 
   it("refuses a form step with no operation, so a copy is never made by accident (BLD-10 D2)", () => {
     const state = updateStep(stored(), "step-3", { transforms: [] })
-    expect(editorProblems(state, OUTPUT).items["step-3"]).toBe("Add an operation, or remove this step.")
+    expect(editorProblems(state, OUTPUT).items["step-3"]?.message).toBe("Add an operation, or remove this step.")
   })
 
   it("asks for a step, or the plain copy chosen on purpose, when there is no step", () => {
     const one = editorStateFrom({ inputs: [STORED.inputs[0]], steps: [] })
-    expect(editorProblems(one, OUTPUT).output).toBe("Add a step, or choose to copy the input as it is.")
+    expect(editorProblems(one, OUTPUT).output?.message).toBe("Add a step, or choose to copy the input as it is.")
     expect(editorProblems(one, { ...OUTPUT, plainCopy: true }).output).toBeNull()
     const two = editorStateFrom({ inputs: STORED.inputs, steps: [] })
-    expect(editorProblems(two, { ...OUTPUT, plainCopy: true }).output).toBe("With more than one input, add a step that reads them.")
+    expect(editorProblems(two, { ...OUTPUT, plainCopy: true }).output?.message).toBe("With more than one input, add a step that reads them.")
   })
 
   it("refuses an output that is one of the inputs, and a second input beside a connector", () => {
-    expect(editorProblems(stored(), { ...OUTPUT, targetZone: "bronze", targetTable: "orders" }).output).toBe(
+    expect(editorProblems(stored(), { ...OUTPUT, targetZone: "bronze", targetTable: "orders" }).output?.message).toBe(
       "The output cannot be one of the inputs."
     )
-    expect(editorProblems(stored(), { ...OUTPUT, hasConnector: true }).items["input-2"]).toMatch(/connector reads one input/)
+    expect(editorProblems(stored(), { ...OUTPUT, hasConnector: true }).items["input-2"]?.message).toMatch(/connector reads one input/)
   })
 })
 

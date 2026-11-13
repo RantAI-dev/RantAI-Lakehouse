@@ -37,6 +37,7 @@ export function TransformRows({
   failedIndex,
   failedMessage,
   failedMessageId,
+  describedBy,
 }: {
   transforms: string[]
   onChange: (next: string[]) => void
@@ -48,6 +49,8 @@ export function TransformRows({
   failedIndex: number | null
   failedMessage: string | null
   failedMessageId?: string
+  /** The sentence of a problem about the operations as a whole (R1-S10). */
+  describedBy?: string
 }) {
   const [pendingVerb, setPendingVerb] = React.useState<TransformDraft["verb"]>("dedupe")
   const [pendingDraft, setPendingDraft] = React.useState<TransformDraft>(emptyDraftFor("dedupe"))
@@ -69,7 +72,7 @@ export function TransformRows({
         <p className="mb-2 text-xs text-muted-foreground">{columnsNote ?? COLUMNS_APPEAR_LATER}</p>
       ) : null}
       {transforms.length > 0 ? (
-        <ul className="mb-3 space-y-1" aria-label="Operations of this step">
+        <ul className="mb-3 space-y-1" aria-label="Operations of this step" aria-describedby={describedBy}>
           {transforms.map((transform, index) => (
             <li
               key={`${index}:${transform}`}
@@ -77,7 +80,8 @@ export function TransformRows({
                 "flex items-center justify-between gap-2 rounded-lg border px-3 py-1.5 text-xs",
                 failedIndex === index ? "border-destructive bg-destructive/10" : "border-border"
               )}
-              aria-invalid={failedIndex === index ? true : undefined}
+              // R1-S10: `aria-invalid` is for a control, not a list item; the
+              // row is described by the refusal instead.
               aria-describedby={failedIndex === index ? failedMessageId : undefined}
             >
               <span className="font-mono">{transform}</span>
@@ -98,7 +102,9 @@ export function TransformRows({
           ))}
         </ul>
       ) : (
-        <p className="mb-3 text-xs text-muted-foreground">No operations added yet.</p>
+        <p className="mb-3 text-xs text-muted-foreground" aria-describedby={describedBy}>
+          No operations added yet.
+        </p>
       )}
       <div className="flex flex-wrap items-end gap-2 rounded-lg border border-dashed border-border p-3">
         <div className="space-y-1.5">

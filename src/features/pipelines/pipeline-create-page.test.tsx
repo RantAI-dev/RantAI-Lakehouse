@@ -596,7 +596,11 @@ describe("FBIC and the plain copy in the pipeline editor (BLD-10)", () => {
 
     const create = saveButton(/create pipeline/i)
     expect(create.disabled).toBe(true)
-    expect(screen.getByText("Add a step, or choose to copy the input as it is.")).toBeTruthy()
+    // The pane says it, tied to the switch (R1-S10); the rail carries its own copy.
+    const sentence = within(screen.getByRole("region", { name: "Output" })).getByText(
+      "Add a step, or choose to copy the input as it is."
+    )
+    expect(plainCopySwitch().getAttribute("aria-describedby")).toBe(sentence.id)
 
     fireEvent.click(plainCopySwitch())
     await waitFor(() => expect(create.disabled).toBe(false))
@@ -736,10 +740,11 @@ describe("the pipeline editor of inputs and steps (BLD-1 part 1)", () => {
     expect(await screen.findByText("Step 2 · SQL")).toBeTruthy()
     const alert = screen.getByRole("alert")
     expect(alert.textContent).toBe(message)
-    // The rail item is the selected one, and is described by the message.
+    // The rail item is the selected one, and is described by the message,
+    // through a sentence the rail carries itself (R1-S10).
     const item = screen.getByRole("button", { name: /2\. by_stock/ })
     expect(item.getAttribute("aria-current")).toBe("true")
-    expect(item.getAttribute("aria-describedby")).toBe(alert.id)
+    expect(document.getElementById(item.getAttribute("aria-describedby") ?? "")?.textContent).toBe(message)
   })
 
   it("previews the selected input, and marks the preview stale after an edit", async () => {
@@ -930,6 +935,21 @@ describe("the pipeline editor of inputs and steps (BLD-1 part 1)", () => {
     expect(rows()[0].className).not.toContain("border-destructive")
     // The refusal is still said on the step.
     expect(screen.getAllByText(message).length).toBeGreaterThan(0)
+  })
+
+  // BLD-1 part 1 S3 review R1-S10.
+  it("ties a hint to its field, and keeps a rail item described while another pane is open", async () => {
+    renderEditor(twoSteps())
+    selectRail(/^orders_raw/)
+    const name = screen.getByLabelText("Name in this pipeline")
+    fireEvent.change(name, { target: { value: "" } })
+    const hint = await screen.findByText("Give it a name.", { selector: "p" })
+    expect(name.getAttribute("aria-invalid")).toBe("true")
+    expect(name.getAttribute("aria-describedby")).toBe(hint.id)
+
+    selectOutput()
+    const item = screen.getByRole("button", { name: /Unnamed input/ })
+    expect(document.getElementById(item.getAttribute("aria-describedby") ?? "")?.textContent).toBe("Give it a name.")
   })
 
   it("moves and removes a step, and renames a step's reader with its input", async () => {
