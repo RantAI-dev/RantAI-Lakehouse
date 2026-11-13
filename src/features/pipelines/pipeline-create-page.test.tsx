@@ -31,6 +31,8 @@ mock.module("next/navigation", () => ({
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
+import { currentCompletions, startCompletion } from "@codemirror/autocomplete"
+import { EditorView } from "@codemirror/view"
 import { chooseOption } from "@/components/patterns/select-field.testing"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import type { PipelineDetail } from "@/services/contracts/pipelines"
@@ -237,6 +239,12 @@ async function openTab(name: "Build" | "Schedule and settings") {
   const tab = screen.getByRole("tab", { name })
   fireEvent.click(tab)
   await waitFor(() => expect(tab.getAttribute("aria-selected")).toBe("true"))
+}
+
+/** Selects an item of the rail by the text it shows. */
+function selectRail(label: string | RegExp) {
+  const rail = screen.getByRole("navigation", { name: "Pipeline parts" })
+  fireEvent.click(within(rail).getByRole("button", { name: label }))
 }
 
 /** Selects the output, the one item of the rail's Output group. */
@@ -603,5 +611,191 @@ describe("FBIC and the plain copy in the pipeline editor (BLD-10)", () => {
 
     const body = await saveAndRead("PUT")
     expect(body.fbicEnabled).toBe(true)
+  })
+})
+
+// BLD-1 part 1 S3-T5: what the editor adds over the wizard.
+describe("the pipeline editor of inputs and steps (BLD-1 part 1)", () => {
+  /** A stored pipeline of two inputs, a form step and a SQL step (plan D1). */
+  function twoSteps(over: Partial<PipelineDetail> = {}): PipelineDetail {
+    const base = existing(over)
+    return {
+      ...base,
+      definition: {
+        ...base.definition!,
+        inputs: [
+          { name: "orders_raw", zone: "bronze", table: "orders_raw" },
+          { name: "stock", zone: "bronze", table: "stock_raw" },
+        ],
+        steps: [
+          { name: "paid", kind: "transform", reads: "orders_raw", transforms: ["filter(status = 'paid')"] },
+          { name: "by_stock", kind: "sql", sql: "SELECT * FROM paid JOIN stock ON paid.id = stock.id" },
+        ],
+      },
+    }
+  }
+
+  /** Waits until the session is known, so a check of who reads as whom is not made against an unknown user. */
+  async function signedIn() {
+    await waitFor(() => expect(sent.some((c) => c.path === "/api/auth/me")).toBe(true))
+    await act(async () => {})
+  }
+
+  it("opens a pipeline made before this change as one input and one form step (BLD-1-AC9)", async () => {
+    renderEditor(existing())
+    const inputs = screen.getByRole("group", { name: /^Inputs/ })
+    expect(within(inputs).getAllByRole("button", { name: /orders_raw/ })).toHaveLength(1)
+    const steps = screen.getByRole("group", { name: /^Steps/ })
+    expect(within(steps).getByRole("button", { name: /1\. transformed/ })).toBeTruthy()
+
+    selectRail(/1\. transformed/)
+    expect(await screen.findByText("Step 1 · Form")).toBeTruthy()
+    expect(screen.getByRole("combobox", { name: "Reads" }).textContent).toContain("orders_raw")
+    expect(within(screen.getByRole("list", { name: "Operations of this step" })).getByText("dedupe(id)")).toBeTruthy()
+  })
+
+  it("does not offer a sixth input (decision 4)", async () => {
+    renderEditor()
+    for (let n = 0; n < 4; n += 1) fireEvent.click(screen.getByRole("button", { name: "Add input" }))
+    expect(screen.getByRole("group", { name: "Inputs · 5 of 5" })).toBeTruthy()
+    expect(screen.queryByRole("button", { name: "Add input" })).toBeNull()
+  })
+
+  it("completes a SQL step with the inputs and the earlier steps", async () => {
+    renderEditor(existing())
+    fireEvent.click(screen.getByRole("button", { name: "SQL step" }))
+    expect(await screen.findByText("Step 2 · SQL")).toBeTruthy()
+    const content = await waitFor(() => {
+      const found = document.querySelector(".cm-content")
+      if (!found) throw new Error("no editor yet")
+      return found as HTMLElement
+    })
+    const view = EditorView.findFromDOM(content)
+    if (!view) throw new Error("no editor view")
+    const text = "SELECT * FROM "
+    act(() => {
+      view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: text }, selection: { anchor: text.length } })
+    })
+    startCompletion(view)
+    // The editor waits a moment before it asks its sources.
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    const labels = currentCompletions(view.state).map((completion) => completion.label)
+    expect(labels).toContain("orders_raw")
+    expect(labels).toContain("transformed")
+    // A step does not read itself.
+    expect(labels).not.toContain("step_2")
+  })
+
+  it("selects the step a 422 names, and shows the message in its pane (D7)", async () => {
+    const message = "steps[1]: you may not read a table this step reads"
+    saveAnswer = { status: 422, body: { error: message } }
+    renderEditor(twoSteps())
+    // The first input is selected when the page opens.
+    expect(await screen.findByText("Input 1")).toBeTruthy()
+
+    fireEvent.click(saveButton(/save changes/i))
+
+    expect(await screen.findByText("Step 2 · SQL")).toBeTruthy()
+    const alert = screen.getByRole("alert")
+    expect(alert.textContent).toBe(message)
+    // The rail item is the selected one, and is described by the message.
+    const item = screen.getByRole("button", { name: /2\. by_stock/ })
+    expect(item.getAttribute("aria-current")).toBe("true")
+    expect(item.getAttribute("aria-describedby")).toBe(alert.id)
+  })
+
+  it("previews the selected input, and marks the preview stale after an edit", async () => {
+    renderEditor(existing())
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }))
+    expect(await screen.findByText("First 2 rows.")).toBeTruthy()
+    const call = sent.find((c) => c.path === "/api/pipelines/preview")
+    expect(call?.body).toEqual({
+      inputs: [{ name: "orders_raw", zone: "bronze", table: "orders_raw" }],
+      steps: [],
+      upTo: "orders_raw",
+    })
+    expect(screen.queryByText("Stale: the definition changed since this preview ran.")).toBeNull()
+
+    fireEvent.change(screen.getByLabelText("Name in this pipeline"), { target: { value: "orders" } })
+    expect(await screen.findByText("Stale: the definition changed since this preview ran.")).toBeTruthy()
+  })
+
+  it("shows the preview's refusal where the preview is", async () => {
+    previewAnswer = { status: 400, body: { error: "inputs[0]: a zone and a table must be plain names" } }
+    renderEditor(existing())
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }))
+    expect((await screen.findByRole("alert")).textContent).toBe("inputs[0]: a zone and a table must be plain names")
+  })
+
+  it("creates with inputs, steps and kind batch, and none of the fields of before (D3, decision 18)", async () => {
+    renderEditor()
+    await fillNewPipeline()
+
+    const body = await saveAndRead("POST")
+    expect(body.kind).toBe("batch")
+    expect(body.inputs).toEqual([{ name: "orders_raw", zone: "bronze", table: "orders_raw" }])
+    expect(body.steps).toEqual([{ name: "step_1", kind: "transform", reads: "orders_raw", transforms: ["dedupe(id)"] }])
+    for (const old of ["sourceZone", "sourceTable", "transforms", "incrementalColumn"]) {
+      expect(Object.keys(body)).not.toContain(old)
+    }
+  })
+
+  it("sends the stored kind back on an edit, and no incremental column (decision 18)", async () => {
+    renderEditor(existing({ kind: "incremental" }))
+
+    const body = await saveAndRead("PUT")
+    expect(body.kind).toBe("incremental")
+    expect(body.inputs).toEqual([{ name: "orders_raw", zone: "bronze", table: "orders_raw" }])
+    expect(body.steps).toEqual([{ name: "transformed", kind: "transform", reads: "orders_raw", transforms: ["dedupe(id)"] }])
+    for (const old of ["sourceZone", "sourceTable", "transforms", "incrementalColumn"]) {
+      expect(Object.keys(body)).not.toContain(old)
+    }
+  })
+
+  it("says before saving that the pipeline will read as you, when its steps change and it reads as someone else (D17a)", async () => {
+    renderEditor(existing({ runAs: "u-author", runAsName: "Author" }))
+    await signedIn()
+    // A change to the schedule only does not move the reader (D10).
+    await openTab("Schedule and settings")
+    fireEvent.click(screen.getByRole("radio", { name: "Hourly" }))
+    expect(screen.queryByText("This pipeline will read as you from now on.")).toBeNull()
+
+    await openTab("Build")
+    fireEvent.click(screen.getByRole("button", { name: "SQL step" }))
+    expect(await screen.findByText("This pipeline will read as you from now on.")).toBeTruthy()
+  })
+
+  it("does not say so when the pipeline already reads as you", async () => {
+    renderEditor(existing({ runAs: ME }))
+    await signedIn()
+    fireEvent.click(screen.getByRole("button", { name: "SQL step" }))
+    expect(await screen.findByText("Step 2 · SQL")).toBeTruthy()
+    expect(screen.queryByText("This pipeline will read as you from now on.")).toBeNull()
+  })
+
+  it("says the preview is what you may see when the pipeline reads as someone else (decision 13)", async () => {
+    renderEditor(existing({ runAs: "u-author", runAsName: "Author" }))
+    await signedIn()
+    expect(
+      await screen.findByText(/The pipeline reads as Author, so what it writes can differ\./)
+    ).toBeTruthy()
+  })
+
+  it("moves and removes a step, and renames a step's reader with its input", async () => {
+    renderEditor(twoSteps())
+    selectRail(/2\. by_stock/)
+    fireEvent.click(await screen.findByRole("button", { name: "Move by_stock up" }))
+    const steps = screen.getByRole("group", { name: /^Steps/ })
+    expect(within(steps).getAllByRole("button").map((b) => b.textContent?.match(/^\d\. [a-z_]+/)?.[0]).filter(Boolean)).toEqual([
+      "1. by_stock",
+      "2. paid",
+    ])
+    selectRail(/1\. by_stock/)
+    fireEvent.click(screen.getByRole("button", { name: "Remove step" }))
+    expect(within(steps).queryByRole("button", { name: /by_stock/ })).toBeNull()
+
+    selectRail(/^orders_raw/)
+    fireEvent.change(screen.getByLabelText("Name in this pipeline"), { target: { value: "orders" } })
+    expect(within(steps).getByRole("button", { name: /1\. paid/ }).textContent).toContain("reads orders")
   })
 })
