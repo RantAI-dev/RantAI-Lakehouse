@@ -246,8 +246,9 @@ const UNKNOWN_RUN_BOUND: time::Duration = time::Duration::hours(1);
 /// How long a read waits for the orchestrator or for `ClickHouse` while it
 /// settles a loading upload. A bound so that a page that polls is not held
 /// for the whole request deadline by a hung connection; not a measurement.
-/// The upload is returned unchanged when it elapses.
-const SETTLE_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// The upload is returned unchanged when it elapses. The connector's run list
+/// uses it too, for the same reason.
+pub(super) const SETTLE_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The Dagster job that loads an uploaded file
 /// (`dagster/dispar_orchestrate/file_ingest.py`).

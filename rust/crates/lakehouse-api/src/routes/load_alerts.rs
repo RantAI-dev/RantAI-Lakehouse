@@ -132,6 +132,46 @@ impl Outcome {
             Self::Success => "SUCCESS",
         }
     }
+
+    /// The final status the run record is closed with. The sensors only post
+    /// a `FAILURE` or a `SUCCESS`, so those are the two this mapping has.
+    const fn final_status(self) -> FinalStatus {
+        match self {
+            Self::Failure => FinalStatus::Failure,
+            Self::Success => FinalStatus::Success,
+        }
+    }
+}
+
+/// A `Dagster` run status that ends a run, as the run record records it
+/// (`SRC-43` D11).
+///
+/// Only these three words are an end. `QUEUED`, `NOT_STARTED`, `STARTING`,
+/// `STARTED`, `MANAGED` and `CANCELING` are not: a run that is still being
+/// cancelled has not ended. [`lakehouse_dagster::map_run_status`] is not used
+/// here because it folds `CANCELING` into `cancelled`, and any word this
+/// build does not know is not an end either (nothing is guessed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FinalStatus {
+    /// The orchestrator says `SUCCESS`.
+    Success,
+    /// The orchestrator says `FAILURE`.
+    Failure,
+    /// The orchestrator says `CANCELED`.
+    Canceled,
+}
+
+impl FinalStatus {
+    /// The final status a `Dagster` status word is, or `None` when the word
+    /// does not end a run (see the type's doc).
+    pub(super) fn of(dagster_status: &str) -> Option<Self> {
+        match dagster_status {
+            "SUCCESS" => Some(Self::Success),
+            "FAILURE" => Some(Self::Failure),
+            "CANCELED" => Some(Self::Canceled),
+            _ => None,
+        }
+    }
 }
 
 /// Where a run's dedupe, summary and alerts hang: a connector that exists.
@@ -184,6 +224,58 @@ fn ran_at_least(start: Option<f64>, end: Option<f64>, limit_seconds: u32) -> boo
     match (start, end) {
         (Some(start), Some(end)) => end - start >= f64::from(limit_seconds),
         _ => false,
+    }
+}
+
+/// Close a run's record from the orchestrator's own final status, once.
+///
+/// One mapping, used by the sensor's report and by the read of a connector's
+/// run list (`SRC-43` D12): a run that ended as `FAILURE` or `CANCELED` and
+/// ran for its limit or longer closes as `failed` with `timed_out` and a last
+/// line that names the limit; otherwise `SUCCESS` closes as succeeded and
+/// `FAILURE` as a failed table, and a `CANCELED` run (cancelled before its
+/// limit, which is what "Run now" does) closes as failed with the reason
+/// `other`. Every close changes only a record that still says `running`, so a
+/// record that already ended keeps its own end and a second call writes
+/// nothing.
+///
+/// # Errors
+///
+/// [`lakehouse_store::StoreError::Database`] on a failed statement.
+pub(super) async fn close_run_record(
+    state: &AppState,
+    pool: &PgPool,
+    connector_id: &str,
+    run_id: &str,
+    ended: FinalStatus,
+    info: &lakehouse_dagster::RunStatusInfo,
+) -> Result<(), lakehouse_store::StoreError> {
+    let at = run_end(info.end_time);
+    let limit = state.config.ingest_run_max_runtime_seconds;
+    // QA TC-1702 (SRC-39): a run the orchestrator ended after it outlived the
+    // limit closes with its own word (`timed_out`, D11), not "a table failed".
+    // The count, the streak and the alerts are unchanged: it is a failed run
+    // like any other (D12, D14).
+    if ended != FinalStatus::Success && ran_at_least(info.start_time, info.end_time, limit) {
+        connector_run::end_timed_out_run(pool, connector_id, run_id, i64::from(limit), at).await?;
+    }
+    match ended {
+        FinalStatus::Success => {
+            // `SRC-11` D7: close the run record from the orchestrator's own
+            // final status when its end report never came (a killed run, an
+            // orchestrator that could not reach this API). Idempotent, and a
+            // no-op for a run with no record or one that already ended.
+            connector_run::settle_run(pool, connector_id, run_id, true, at).await
+        }
+        FinalStatus::Failure => {
+            connector_run::settle_run(pool, connector_id, run_id, false, at).await
+        }
+        // SRC-43 (#485 review, round 2 (R2)): a run cancelled before its limit
+        // is recorded as failed with the reason `other`; the record has no word
+        // for cancelled and `table_failed` would invent a cause.
+        FinalStatus::Canceled => {
+            connector_run::settle_cancelled_run(pool, connector_id, run_id, at).await
+        }
     }
 }
 
@@ -475,37 +567,13 @@ pub(super) async fn connector_run_event(
         return Ok(skipped("a paused run loads nothing"));
     }
     let info = confirm_status(state, &req.run_id, outcome).await?;
-    // QA TC-1702 (SRC-39): a run the orchestrator's monitoring failed after it
-    // outlived the limit closes with its own word (`timed_out`, D11), not "a
-    // table failed". `settle_run` below then finds it ended. The count, the
-    // streak and the alerts are unchanged: it is a failed run like any other
-    // (D12, D14).
-    if outcome == Outcome::Failure
-        && ran_at_least(
-            info.start_time,
-            info.end_time,
-            state.config.ingest_run_max_runtime_seconds,
-        )
-    {
-        connector_run::end_timed_out_run(
-            pool,
-            &connector.id,
-            &req.run_id,
-            i64::from(state.config.ingest_run_max_runtime_seconds),
-            run_end(info.end_time),
-        )
-        .await?;
-    }
-    // `SRC-11` D7: close the run record from the orchestrator's own final
-    // status when its end report never came (a killed run, an orchestrator
-    // that could not reach this API). Idempotent, and a no-op for a run with
-    // no record or one that already ended.
-    connector_run::settle_run(
+    close_run_record(
+        state,
         pool,
         &connector.id,
         &req.run_id,
-        outcome == Outcome::Success,
-        run_end(info.end_time),
+        outcome.final_status(),
+        &info,
     )
     .await?;
     // Count the run once, with its streak kept for a retry (`SRC-17` F2).
@@ -2038,5 +2106,27 @@ mod tests {
         assert!(!ran_at_least(None, None, 21_600));
         assert!(ran_at_least(Some(1000.0), Some(22_600.0), 21_600));
         assert!(!ran_at_least(Some(1000.0), Some(22_599.0), 21_600));
+    }
+
+    /// `SRC-43` D11: only the three words that end a run are an end. A run
+    /// being cancelled (`CANCELING`) has not ended, and an unknown word is
+    /// not guessed at.
+    #[test]
+    fn only_success_failure_and_canceled_end_a_run_and_a_run_being_cancelled_has_not_ended() {
+        assert_eq!(FinalStatus::of("SUCCESS"), Some(FinalStatus::Success));
+        assert_eq!(FinalStatus::of("FAILURE"), Some(FinalStatus::Failure));
+        assert_eq!(FinalStatus::of("CANCELED"), Some(FinalStatus::Canceled));
+        for word in [
+            "QUEUED",
+            "NOT_STARTED",
+            "STARTING",
+            "STARTED",
+            "MANAGED",
+            "CANCELING",
+            "unknown",
+            "",
+        ] {
+            assert_eq!(FinalStatus::of(word), None, "{word} does not end a run");
+        }
     }
 }
