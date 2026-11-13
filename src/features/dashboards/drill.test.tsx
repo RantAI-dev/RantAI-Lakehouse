@@ -137,6 +137,22 @@ describe("RecordsDialog", () => {
     expect(screen.getByText("zz_hotel.kamar")).toBeTruthy()
   })
 
+  // QA LH-BI-13-04 (BI-55, D9): a chart with more than one question says which
+  // one the records belong to.
+  it("says which question the records belong to", async () => {
+    stubPages(1)
+    render(<RecordsDialog request={{ ...REQUEST, question: "Rooms" }} onClose={() => {}} />)
+    await screen.findByText("1–1 of 1")
+    expect(screen.getByText("Question: Rooms")).toBeTruthy()
+  })
+
+  it("says nothing about a question for a chart with one", async () => {
+    stubPages(1)
+    render(<RecordsDialog request={REQUEST} onClose={() => {}} />)
+    await screen.findByText("1–1 of 1")
+    expect(screen.queryByText(/^Question:/)).toBeNull()
+  })
+
   it("stops at the first and the last record of the whole list", async () => {
     stubPages(2)
     render(<RecordsDialog request={REQUEST} onClose={() => {}} />)

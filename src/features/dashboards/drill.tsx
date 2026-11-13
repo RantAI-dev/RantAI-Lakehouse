@@ -24,6 +24,8 @@ export type DrillTarget = {
   chart?: string;
   /** BI-13: the index of the chart's other question the click was on; `mart`, `sqlSource` and `column` are then that question's own. */
   layer?: number;
+  /** BI-55: the legend name of the question the records belong to, for the panel's second line. */
+  question?: string;
 };
 
 /** The menu at the cursor after clicking a data point: filter by it, or see its rows. */
@@ -142,6 +144,7 @@ function RecordsContent({ request }: { readonly request: RecordsRequest }) {
     <DialogContent className="max-h-[85vh] overflow-hidden sm:max-w-3xl">
       <DialogHeader>
         <DialogTitle className="flex items-center gap-2"><Table2 className="size-4" /> Records · {request.title}</DialogTitle>
+        {request.question ? <p className="text-xs text-muted-foreground">Question: {request.question}</p> : null}
       </DialogHeader>
       {inDetail ? (
         <RecordDetail

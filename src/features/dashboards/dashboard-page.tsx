@@ -1023,6 +1023,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       column: layer ? layer.dimension : target.column,
       mart: layer ? layer.mart : spec.mart, sqlSource: layer ? layer.sqlSource : spec.sqlSource,
       chart: layer ? spec.id : ownFilterChart(spec), layer: layer?.index,
+      question: ctx.question,
       x: pos.x, y: pos.y, builtin: spec.source === "builtin",
     });
   };
@@ -1478,7 +1479,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
           onAddNote={edit && canWrite && !drill.builtin && drill.tileId && drillChart && NOTE_KINDS.includes(drillChart.kind) && drill.layer === undefined
             ? () => { setNoteError(null); setNoteFor({ tileId: drill.tileId as string, point: drill.label ?? drill.name }); setDrill(null); }
             : undefined}
-          onRecords={() => openRecords({ title: drill.label ?? drill.name, mart: drill.mart, sqlSource: drill.sqlSource, column: drill.column, value: drill.name, grain: drill.grain, binWidth: drill.bin?.width, chart: drill.chart, layer: drill.layer }, drill.builtin, drillChart && drill.layer === undefined ? tileDrills.fixed(drillChart) : NO_FILTERS, drill.tileId)}
+          onRecords={() => openRecords({ title: drill.label ?? drill.name, mart: drill.mart, sqlSource: drill.sqlSource, column: drill.column, value: drill.name, grain: drill.grain, binWidth: drill.bin?.width, chart: drill.chart, layer: drill.layer, question: drill.question }, drill.builtin, drillChart && drill.layer === undefined ? tileDrills.fixed(drillChart) : NO_FILTERS, drill.tileId)}
           drillDown={drillOffer && drill.layer === undefined ? ("reason" in drillOffer ? drillOffer : { label: `Drill down to ${drillOffer.to}`, onSelect: () => { if (drillChart) tileDrills.down(drillChart, drillOffer.hierarchy, drill.name, drill.label); setDrill(null); } }) : undefined}
         />
       ) : null}

@@ -66,6 +66,19 @@ describe("a tile with more questions on its chart", () => {
     expect(clicks[1][2].layer).toBeUndefined()
   })
 
+  // QA LH-BI-13-04 (BI-55, D9): a click carries the name of the question its
+  // mark belongs to, so the records panel can say which one that is.
+  it("tells a click the name of the question the mark belongs to", () => {
+    const clicks: Parameters<ChartClickHandler>[] = []
+    render(<TileBody spec={SPEC} cell={CELL} dark={false} loading={false} onDataClick={(...args) => { clicks.push(args) }} />)
+    const click = drawn[0].onDataClick
+    expect(click).toBeTruthy()
+    click?.({ name: "2026-02-01", seriesIndex: 1, dataIndex: 1 }, { x: 1, y: 2 })
+    click?.({ name: "2026-01-01", seriesIndex: 0, dataIndex: 0 }, { x: 1, y: 2 })
+    expect(clicks[0][2].question).toBe("Rooms")
+    expect(clicks[1][2].question).toBe("visitors")
+  })
+
   it("draws a chart with no answered question at all as no data, not as an empty axis", () => {
     const empty: Rows = { columns: ["month", "visitors"], rows: [], layers: [CELL.layers![1]] }
     render(<TileBody spec={SPEC} cell={empty} dark={false} loading={false} />)
