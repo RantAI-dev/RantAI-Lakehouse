@@ -3879,6 +3879,9 @@ fn schedule_mutation_body(job: &DgJob, paused: bool) -> Value {
 /// `pipeline_run_pipeline_name` surfaces as 503 with the FIXED body
 /// `{"error": "orchestrator error"}` and the detail only to `tracing`
 /// (PR #80 review BLOCKER 1, AGENTS.md principle 4).
+///
+/// It answers the run's job name, which a route that must treat one job
+/// differently reads (`DATA-61`: a file load is not re-run from here).
 // Same reason as `authored_launch_target` above: the `Err` is the ready
 // rejection the caller returns, not a value it inspects (REL-9, D2).
 #[allow(
@@ -3890,7 +3893,7 @@ async fn enforce_run_id_pipeline_scope(
     principal: &Principal,
     headers: &HeaderMap,
     run_id: &str,
-) -> Result<(), Response> {
+) -> Result<String, Response> {
     let pipeline_name = match state.dagster.pipeline_run_pipeline_name(run_id).await {
         Ok(Some(name)) => name,
         Ok(None) => {
@@ -3928,7 +3931,7 @@ async fn enforce_run_id_pipeline_scope(
     let Some(suffix) = crate::routes::authored_pipelines::pipeline_id_from_job_name(&pipeline_name)
     else {
         // Dagster-native job name — un-tenanted, proceed.
-        return Ok(());
+        return Ok(pipeline_name);
     };
     // F2.1 (PR #59 review): the factory's `_dagster_safe_name` collapses
     // every `pl-foo-bar` and `pl_foo_bar` to the same `pl_foo_bar`, so
@@ -3950,7 +3953,7 @@ async fn enforce_run_id_pipeline_scope(
     {
         return Err(ApiRejection(rejection.0).into_response());
     }
-    Ok(())
+    Ok(pipeline_name)
 }
 
 /// `POST /api/pipelines/runs/{runId}/cancel` — terminate a running
@@ -4025,6 +4028,24 @@ pub async fn cancel_run(
     }
 }
 
+/// `DATA-61` (#501 review, round 1 (R4)): why a file load is not re-run from
+/// Pipelines. A re-run would execute the run's old config again, skipping
+/// everything `POST /api/uploads/{id}/ingest` checks — whether the table name
+/// is free, the `DATA-55` refusal of a dropped table, and the claim that marks
+/// the upload as loading. The upload's own load makes those checks, so it is
+/// the way to load a file again.
+const FILE_LOAD_NOT_RERUN: &str = "A file load is not re-run from Pipelines. Load the file again from the \"Uploaded files\" tab of Sources, which checks the table first.";
+
+/// The `409` body of a re-run of a file load: [`FILE_LOAD_NOT_RERUN`], the one
+/// sentence, so the route and its tests read the same text (`DATA-61`).
+fn file_load_not_rerun() -> Response {
+    (
+        StatusCode::CONFLICT,
+        ApiJson(json!({ "error": FILE_LOAD_NOT_RERUN })),
+    )
+        .into_response()
+}
+
 /// `POST /api/pipelines/runs/{runId}/retry` — re-execute a finished run.
 /// An empty body re-runs every step. `{"strategy":"fromFailure"}` re-runs
 /// only the steps that failed or never ran, which `Dagster` refuses (409)
@@ -4033,7 +4054,9 @@ pub async fn cancel_run(
 /// # Errors
 ///
 /// Same as [`cancel_run`], plus 400 for a body that names no known
-/// strategy.
+/// strategy, and `409` with [`FILE_LOAD_NOT_RERUN`] for a run of
+/// `file_ingest_job` whatever the strategy — a file load is not re-run from
+/// here (`DATA-61`).
 pub async fn retry_run(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
@@ -4058,10 +4081,18 @@ pub async fn retry_run(
     // cannot be retried by a caller in this one — a run's existence
     // would otherwise be observable through the run-failed/run-
     // finished sensor payloads.
-    if let Err(rejection) =
-        enforce_run_id_pipeline_scope(&state, &principal, &headers, &run_id).await
-    {
-        return rejection;
+    let job = match enforce_run_id_pipeline_scope(&state, &principal, &headers, &run_id).await {
+        Ok(job) => job,
+        Err(rejection) => return rejection,
+    };
+    // DATA-61 (#501 review, round 1 (R4)): a file load is not re-run from
+    // Pipelines. Its old config may name a table that is no longer free, and
+    // the `DATA-55` refusal and the load claim would all be skipped; the
+    // upload's own "Load" makes them. The refusal comes after the scope check
+    // (an unknown or out-of-scope run is still 404) and before the body is
+    // read or anything is launched.
+    if job == crate::routes::uploads::FILE_INGEST_JOB {
+        return file_load_not_rerun();
     }
     let request = match parse_retry_request(&body) {
         Ok(r) => r,
@@ -7112,6 +7143,124 @@ mod tests {
                 parsed["error"], "orchestrator refused the re-execution",
                 "retry not-found body MUST be the fixed classified string",
             );
+        }
+
+        /// `DATA-61` (#501 review, round 1 (R4)): a re-run of a file load is
+        /// refused with one sentence — whatever the strategy — and nothing is
+        /// launched. The upload's own "Load" is the way to load a file again,
+        /// because it runs the checks a re-run would skip.
+        #[tokio::test]
+        async fn a_rerun_of_a_file_load_is_refused_with_a_sentence_and_launches_nothing() {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::body_string_contains(
+                    "pipelineRunOrError",
+                ))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "pipelineRunOrError": {
+                        "__typename": "Run",
+                        "runId": "r1",
+                        "status": "FAILURE",
+                        "pipelineName": "file_ingest_job"
+                    } }
+                })))
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::body_string_contains(
+                    "launchRunReexecution",
+                ))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "launchRunReexecution": {
+                        "__typename": "LaunchRunSuccess", "run": { "runId": "r-new" }
+                    } }
+                })))
+                .expect(0)
+                .mount(&server)
+                .await;
+
+            for body in [
+                &br"{}"[..],
+                &br#"{"strategy":"fromFailure"}"#[..],
+                &br#"{"strategy":"selected","stepKeys":["load"]}"#[..],
+            ] {
+                let state = state_with_dagster(&server.uri());
+                let response = retry_run(
+                    State(state),
+                    Some(Extension(fixture_unrestricted_principal())),
+                    HeaderMap::new(),
+                    Path("r1".to_owned()),
+                    Bytes::from_static(body),
+                )
+                .await;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::CONFLICT,
+                    "a file load is not re-run from Pipelines, whatever the body"
+                );
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("collect body");
+                let parsed: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+                assert_eq!(parsed["error"], FILE_LOAD_NOT_RERUN);
+            }
+            let requests = server.received_requests().await.expect("request log");
+            for request in &requests {
+                let body = String::from_utf8_lossy(&request.body);
+                assert!(
+                    !body.contains("launchRunReexecution") && !body.contains("runOrError(runId"),
+                    "nothing was asked beyond the job name, got {body}"
+                );
+            }
+        }
+
+        /// `DATA-61` (#501 review, round 1 (R4)): the guard shuts out no other
+        /// job — a connector's load is re-run as it was.
+        #[tokio::test]
+        async fn a_rerun_of_another_job_still_launches() {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::body_string_contains(
+                    "pipelineRunOrError",
+                ))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "pipelineRunOrError": {
+                        "__typename": "Run",
+                        "runId": "r1",
+                        "status": "FAILURE",
+                        "pipelineName": "ingest_job"
+                    } }
+                })))
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::body_string_contains(
+                    "launchRunReexecution",
+                ))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "launchRunReexecution": {
+                        "__typename": "LaunchRunSuccess", "run": { "runId": "r-new" }
+                    } }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let state = state_with_dagster(&server.uri());
+            let response = retry_run(
+                State(state),
+                Some(Extension(fixture_unrestricted_principal())),
+                HeaderMap::new(),
+                Path("r1".to_owned()),
+                Bytes::from_static(br"{}"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let parsed: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+            assert_eq!(parsed["id"], "r-new");
         }
     }
 
