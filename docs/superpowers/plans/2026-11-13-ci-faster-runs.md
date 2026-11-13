@@ -1040,4 +1040,137 @@ for memory or passes 90 minutes, unset the variable: the next run is on a hosted
 
 ## 5. Handoff
 
+Branch `ci/faster-runs`, off `origin/ci/faster-runs` at `66b43603`. Slice S1 only; section
+2b (S2) is not built. No pull request opened, no repository setting, variable or runner
+changed, nothing pushed to `main`.
+
+### Commits
+
+| Commit | Title |
+|---|---|
+| `39794db2` | `ci(ci-fast): a push follows the scope, each push has its own run, nightly full run` (T1) |
+| `9a5890e7` | `ci(ci-fast): Coverage starts only when a file the Rust tests read changed` (T2) |
+| `eca05695` | "ci(ci-fast): the push proof, its self-test, and its outputs on `changes`" (T3) |
+| `0a77aead` | `ci(ci-fast): a proven push skips the test runs and the acceptance gates` (T4) |
+| `7628981c` | `ci(ci-fast): the Rust test job pulls its images first and prints two sizes` (T5) |
+| `ed58a4a7` | `ci(ci-fast): the small Rust jobs can run on a CI worker, behind a switch that is off` (T6) |
+| `fd866422` | `ci(ci-fast): Coverage can run on the CI worker, behind its own switch that is off` (T7) |
+| `fbfe5a50` | "ci(ci-fast): the workflow comment no longer quotes the deleted `if:` clause" (fixes T1's `grep` check, below) |
+
+Every commit was pushed to `ci/faster-runs` immediately; no force-push.
+
+### What was run, on the final commit (`fbfe5a50`), in the foreground
+
+```
+bash scripts/ci/tests/test_detect_change_scope.sh   → === Results: 38 passed, 0 failed ===
+bash scripts/ci/tests/test_required_gate.sh         → === Results: 72 passed, 0 failed ===
+bash scripts/ci/tests/test_detect_push_proof.sh     → === Results: 24 passed, 0 failed ===
+bash scripts/ci/tests/test_select_runner.sh         → === Results: 17 passed, 0 failed ===
+bash scripts/ci/tests/test_worker_prepare.sh        → === Results: 9 passed, 0 failed ===
+bash -n <the 10 scripts above and their self-tests> → 0 syntax errors
+python3 -c "import yaml,sys; [yaml.safe_load(open(f)) for f in sys.argv[1:]]" \
+  .github/workflows/ci.yml .github/workflows/coverage.yml → ok
+python3 ops/lint/check_bare_iceberg_count.py        → R11 guard: no bare count() found
+python3 ops/lint/check_intra_package_imports.py     → OK: all imports resolve
+git status --short                                  → empty
+```
+
+`actionlint` is **not installed** on this machine and `shellcheck` is not either, so the
+YAML check is the weaker `yaml.safe_load` one the plan allows: it does not know
+expressions, contexts or `needs`. No `cargo`, `bun`, `pytest` or `docker compose` command
+was run: no Rust, TypeScript, Python or compose file is touched.
+
+The proof script's dry run (§3), `gh` authenticated, `git fetch origin` first:
+
+```
+for sha in 43d36f55b 9d3443cc5 2306e7302 eaebacf28; do
+  EVENT_NAME=push PUSH_SHA="$(git rev-parse "$sha")" REPO=RantAI-dev/RantAI-Lakehouse \
+    SCOPE_ALL=true bash scripts/ci/detect_push_proof.sh
+done
+proven=true proven_by=7e098119e1a301e2f9cb5a201c58fc639a873349 proven_pr= reason=tree 0efb7ba04d425d716685eed311bd9d86891af850 equals pull-request head 7e098119e1a301e2f9cb5a201c58fc639a873349, whose ci-required check run 131663839418 succeeded
+proven=true proven_by=22c641fe681bc3bf416d784af5858e41601eb50a proven_pr=500 reason=tree e6367512d60a6ed8d1304db4fdb9fdda669d5f33 equals pull-request head 22c641fe681bc3bf416d784af5858e41601eb50a, whose ci-required check run 131698522336 succeeded
+proven=false proven_by= proven_pr= reason=the pull-request run did not run the Rust jobs
+proven=false proven_by= proven_pr= reason=the pull-request run did not run the Rust jobs
+```
+
+That is the plan's expected output, in the same order.
+
+### Break-it-once, one per script
+
+Each rule was broken once in place, the self-test run, the file restored, and the
+self-test run again.
+
+| Script | Break | Result with the break | Result restored |
+|---|---|---|---|
+| `detect_change_scope.sh` | the `FORCE_ALL` condition back to `[ "$EVENT" = "push" ]` | 36 passed, **2 failed** (`a documents-only push is documents-only`, `a Rust push sets rust only`) | 38 / 0 |
+| `required_gate.sh` (D1) | `if [ "$scope_all" = "true" ]` back to `if [ "$event_name" = "push" ] \|\| …` | 60 passed, **1 failed** (`Documents-only push with only the lints passes gate`) | 61 / 0 at that commit |
+| `required_gate.sh` (D6) | the `push_proven` branch replaced by `if false` | 70 passed, **2 failed** (`Proven push with the gates skipped passes gate`, `Proven push whose gates ran green passes gate`) | 72 / 0 |
+| `detect_push_proof.sh` | the tree comparison replaced by `[ "$push_tree" = "x" ]` | 23 passed, **1 failed** (`a merge commit whose tree differs from the head's tree is not proven`) | 24 / 0 |
+| `select_runner.sh` | the fork rule replaced by a condition that never matches | 15 passed, **2 failed** (`… a fork's pull request gives a hosted runner`, `… an empty head repository …`) | 17 / 0 |
+| `worker_prepare.sh` | stage 1's `find … -delete` replaced by `true` | 8 passed, **1 failed** (`over the limit the old files go and the new stay`) | 9 / 0 |
+
+### What the pull request's own run shows, per task
+
+The pull request's scope is `all` (it touches `.github/**` and `scripts/ci/**`), so every
+job runs with the new `if:` clauses.
+
+| Task | Job | Line to look for |
+|---|---|---|
+| T1 | `Detect Change Scope` | `PASS a documents-only push is documents-only`, then `=== Results: 38 passed, 0 failed ===` |
+| T1 | `ci-required` | `PASS Documents-only push with only the lints passes gate`, `=== Results: 72 passed, 0 failed ===` |
+| T2 | (nothing on a PR) | `coverage.yml` has no `pull_request` trigger; the change is visible only in the file |
+| T3 | `Detect Change Scope` | `PASS a squash commit whose pull request passed is proven …`, `=== Results: 24 passed, 0 failed ===`; then `proven=false proven_by= proven_pr= reason=not a push event` |
+| T4 | `ci-required` | `PASS Proven push with the gates skipped passes gate`; `nextest total across partitions: … (floor 6826)` |
+| T4 | the run | three `Rust · test 1/3 (stable)`, `2/3`, `3/3` jobs and all 25 gate jobs present and green |
+| T5 | `Rust · test 1/3` | the three image names from `docker images`; `test binaries: count=… total_gib=…`; `largest binary: raw=… zstd3=…`; both `df -h /` blocks |
+| T6 | `Detect Change Scope` | `compile_runner=["ubuntu-latest"]`; `=== Results: 17 passed, 0 failed ===` and `=== Results: 9 passed, 0 failed ===` |
+| T6 | `Rust · clippy` | `Hosted Compute Agent`; `Restored from cache key "v0-rust-clippy-…" full match: true` |
+| T7 | `Detect Change Scope` | the selection self-test's lint covers `coverage.yml`: `PASS every job that can run self-hosted refuses a foreign runner and guards its cache steps` |
+
+### Only visible after the merge
+
+§3b, in full: this pull request's merge is the first proven push (`proven=true`,
+`proven_by=` this pull request's head, one `Rust · test 1/3`, the gates skipped, a
+`ci-required` summary starting "Proven push:"); the next documents-only merge runs 3 jobs
+and starts no Coverage run; the next 19:23 UTC run runs all 42 jobs. T6's and T7's worker
+paths are not run by any pull request: they need `CI_WORKER_COMPILE` or
+`CI_COVERAGE_ON_WORKER` set, which is the owner's checklist (§3c).
+
+### Not verified
+
+- **No GitHub Actions run of this branch exists yet** (no pull request was opened, as
+  instructed). Every statement above about a CI log line is what to look for, not a
+  measured result.
+- **`actionlint`**: not installed, so expressions, contexts and `needs` are unchecked
+  beyond `yaml.safe_load`.
+- **`shellcheck`**: not installed.
+- **The self-hosted paths**: `worker_prepare.sh` and the Coverage container cleanup were
+  never run on a self-hosted runner, and `docker` was not called by any check here; the
+  cleanup step was only `bash -n`-checked.
+- **T5's two measurements**: they are CI-only lines; the numbers S2 starts from do not
+  exist until the pull request's run.
+
+### MISMATCH
+
+- **T1's second check cannot print 2.** `grep -c "github.event_name == 'push' &&"` prints
+  **3**: the two `cache-to` expressions the task names (unchanged) and T3's `proven` output,
+  which the plan itself writes as `github.event_name == 'push' && vars.CI_PUSH_FULL !=
+  'true' && …`. The first half of the check prints 0 as specified (after `fbfe5a50`: the
+  comment T1 added above `jobs:` quoted the deleted text and made it print 1).
+- **T4's count cannot print 26.** `grep -c "needs.changes.outputs.proven != 'true' &&
+  (needs.changes.outputs.rust"` prints **28**: T4 step 5 gives the same prefix to the two
+  `ci-required` count steps as well. The 26 job-level `if:` lines are counted by
+  `grep -c "^    if: needs.changes.outputs.proven != 'true' &&
+  (needs.changes.outputs.rust"` → **26**, and `images` is the only job left with the plain
+  acceptance `if:` (checked with `yaml.safe_load` over `jobs`).
+- **T6's self-test cannot use `truncate` for the over-limit cases.** `truncate -s` makes a
+  sparse file, and `du -sk` (which the script uses) does not count sparse blocks, so the
+  limit would never be reached. `test_worker_prepare.sh` uses `fallocate -l 5300M`
+  (real blocks, no I/O, instant) with a `dd` fallback; the rule, the 5 GiB floor and the
+  expected results are the plan's. It runs in `changes` and takes 0.6 s here.
+- **T6's `TARGET_MAX_GB` floor** is why the two over-limit cases allocate 5.3 GiB: the
+  script accepts no limit below 5, so the test cannot make the case cheaper without
+  changing the rule.
+
+
 ## 6. Review
