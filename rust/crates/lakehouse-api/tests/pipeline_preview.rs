@@ -159,6 +159,31 @@ async fn preview(
     )
 }
 
+/// One request to `POST /api/query/run`, for the test that compares the two
+/// routes' answers to the same engine failure.
+async fn query_run(router: &axum::Router, cookie: &str, sql: &str) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/query/run")
+        .header("cookie", cookie)
+        .header("content-type", "application/json");
+    let resp = router
+        .clone()
+        .oneshot(
+            request
+                .body(Body::from(json!({ "sql": sql }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
 /// A mask on `table`'s `email` column for `role` (`GOV-4`, the same policy
 /// `pipeline_compile_route.rs` seeds).
 async fn seed_mask(pool: &PgPool, role: &str, table: &str) {
@@ -450,4 +475,109 @@ async fn more_than_a_hundred_rows_answer_a_hundred_and_say_they_were_cut() {
     assert_eq!(answered[0], json!([0]));
     assert_eq!(answered[99], json!([99]));
     assert_eq!(answer["truncated"], json!(true), "{answer}");
+}
+
+/// S2-T2, D16 and decision 17: the statement the engine runs carries this
+/// route's own limits — 101 rows (one past the 100 answered) and 30 seconds —
+/// in the dashboard preview's `SETTINGS` text.
+#[tokio::test]
+async fn the_row_query_carries_the_previews_row_and_time_limits() {
+    let (router, pool, engine) = app().await;
+    mount_preview(
+        &engine,
+        describe_body(&[("id", "UInt64")]),
+        rows_body(&[("id", "UInt64")], &[json!({"id": 1})]),
+    )
+    .await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let (status, answer) = preview(
+        &router,
+        &cookie,
+        Some(GROUP_TENANT),
+        json!({
+            "inputs": [{"name": "orders", "zone": "silver", "table": "orders"}],
+            "steps": [],
+            "upTo": "orders",
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let bodies = sent(&engine).await;
+    let row_query = bodies
+        .iter()
+        .find(|body| body.contains(") AS step LIMIT 101"))
+        .expect("the row query was sent");
+    assert!(
+        row_query.contains(
+            "max_result_rows = 101, result_overflow_mode = 'break', max_execution_time = 30"
+        ),
+        "the preview's limits are not in the statement: {row_query}"
+    );
+}
+
+/// S2-T2, D16 and spec rule 7: a `ClickHouse` failure reaches the preview's
+/// caller in the same form `POST /api/query/run` gives for the same failure —
+/// the author's trimmed diagnosis and a reference id, at 422.
+#[tokio::test]
+async fn a_clickhouse_failure_answers_the_way_query_run_answers_the_same_failure() {
+    const ENGINE_TEXT: &str = "Code: 60. DB::Exception: upstream-secret-detail";
+    let (router, pool, engine) = app().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("DESCRIBE"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(describe_body(&[("id", "UInt64")])))
+        .mount(&engine)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(" AS step LIMIT "))
+        .respond_with(ResponseTemplate::new(500).set_body_string(ENGINE_TEXT))
+        .mount(&engine)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("SELECT 1"))
+        .respond_with(ResponseTemplate::new(500).set_body_string(ENGINE_TEXT))
+        .mount(&engine)
+        .await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let (status, answer) = preview(
+        &router,
+        &cookie,
+        Some(GROUP_TENANT),
+        json!({
+            "inputs": [{"name": "orders", "zone": "silver", "table": "orders"}],
+            "steps": [],
+            "upTo": "orders",
+        }),
+    )
+    .await;
+    let (studio_status, studio) = query_run(&router, &cookie, "SELECT 1").await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    assert_eq!(studio_status, StatusCode::UNPROCESSABLE_ENTITY, "{studio}");
+    let message = answer["error"].as_str().unwrap_or_default();
+    let studio_message = studio["error"].as_str().unwrap_or_default();
+    // The reference id is per failure, so the two are compared up to it: the
+    // form — the author's diagnosis, then `Reference: <id>` — must match.
+    let before_reference = |message: &str| {
+        message
+            .split(" Reference: ")
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert_eq!(
+        before_reference(message),
+        before_reference(studio_message),
+        "the preview and query/run must report the engine the same way: {message:?} vs {studio_message:?}"
+    );
+    assert!(
+        message.starts_with(ENGINE_TEXT),
+        "the author's own step must get the engine's diagnosis: {message}"
+    );
+    assert!(
+        message.contains(" Reference: "),
+        "the diagnosis must carry a reference id: {message}"
+    );
 }

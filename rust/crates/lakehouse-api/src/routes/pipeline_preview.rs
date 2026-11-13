@@ -16,8 +16,10 @@
 //!    may see. This is the same gate and the same
 //!    [`crate::policy_engine::rewrite_sql_for_roles`] Query Studio uses.
 //! 3. The rewritten statement, wrapped as `SELECT * FROM (<rewritten>) AS step
-//!    LIMIT 101` so a preview returns [`PREVIEW_ROWS`] rows and says whether
-//!    more existed. Nothing that names a table reaches `ClickHouse` before
+//!    LIMIT 101` under the dashboard preview's `SETTINGS`
+//!    ([`lakehouse_bi::builder::SQL_SOURCE_SETTINGS`], swapped by
+//!    [`lakehouse_bi::builder::with_run_settings`] for a 30 second time limit —
+//!    decision 17). Nothing that names a table reaches `ClickHouse` before
 //!    steps 1 and 2 succeed, not even the column probe.
 //!
 //! # What is refused, and as what
@@ -29,17 +31,20 @@
 //! - The gate's or the rewrite's refusal: 422 with the fixed sentence this
 //!   code base wrote, the same status the save path gives it. An outage keeps
 //!   its own status — an unreachable database is not a bad request.
-//! - A `ClickHouse` failure: reported under a fixed sentence and a reference
-//!   id, through [`crate::upstream_error`].
+//! - A `ClickHouse` failure: reported the way `POST /api/query/run` reports
+//!   one for the same SQL (spec rule 7), through
+//!   [`upstream_error::ch_failure_for_author`] — the same function, not a
+//!   second classification.
 //!
 //! No input table or column name comes from anywhere but the caller's own
-//! request; `ClickHouse`'s text never reaches the response.
+//! request; `ClickHouse`'s text reaches only the person who wrote the step.
 
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use lakehouse_auth::Principal;
+use lakehouse_bi::builder::{SQL_SOURCE_SETTINGS, with_run_settings};
 use lakehouse_core::ApiError;
 use lakehouse_store::pipelines::{PipelineInput, PipelineStep};
 use serde::Deserialize;
@@ -62,6 +67,9 @@ const PREVIEW_ROWS: usize = 100;
 /// cut from an exact fit — the same reason Query Studio asks for one more than
 /// it keeps.
 const PREVIEW_ROW_LIMIT: u32 = 101;
+
+/// How long one preview may run on `ClickHouse` (decision 17).
+const PREVIEW_SECONDS: u32 = 30;
 
 /// `POST /api/pipelines/preview` body (D16).
 #[derive(Debug, Deserialize)]
@@ -111,7 +119,7 @@ pub async fn preview(
     let rewritten = rewrite_as_caller(&state, &principal, &headers, &compiled).await?;
     let columns = crate::routes::support::describe_columns(&state.clickhouse, &rewritten)
         .await
-        .map_err(|err| crate::upstream_error::ch_error(&upstream_error::DATABASE, &err))?;
+        .map_err(|err| preview_failure(&err))?;
     if columns.is_empty() {
         return Err(ApiError::Unprocessable("The preview returns no columns.".to_owned()).into());
     }
@@ -120,8 +128,22 @@ pub async fn preview(
         .clickhouse
         .query(&sql, None)
         .await
-        .map_err(|err| crate::upstream_error::ch_error(&upstream_error::DATABASE, &err))?;
+        .map_err(|err| preview_failure(&err))?;
     Ok(ApiJson(answer(&columns, &result.data)))
+}
+
+/// A `ClickHouse` failure, reported the way `POST /api/query/run` reports one
+/// for the same SQL (D16, spec rule 7): the query-author exception's own
+/// function, so there is no second classification to drift — the caller wrote
+/// the step's SQL and is previewing it, exactly the person Query Studio shows
+/// a trimmed diagnosis to.
+///
+/// The 30 second limit is this route's own (decision 17), not one of the
+/// caller's configured limits, so a timeout reads as the engine's fixed
+/// failure sentence rather than Query Studio's "stopped after N seconds, the
+/// limit for your role".
+fn preview_failure(err: &lakehouse_clickhouse::ChError) -> ApiError {
+    upstream_error::ch_failure_for_author(&upstream_error::DATABASE, err).response
 }
 
 /// The tenant gate and the policy rewrite for `sql`, as the CALLER (D16,
@@ -160,9 +182,19 @@ async fn rewrite_as_caller(
 }
 
 /// D16's wrapper: `SELECT * FROM (<rewritten>) AS step LIMIT 101`, one row
-/// past [`PREVIEW_ROWS`] so [`answer`] can say whether anything was cut.
+/// past [`PREVIEW_ROWS`] so [`answer`] can say whether anything was cut,
+/// under the dashboard preview's `SETTINGS` text
+/// ([`SQL_SOURCE_SETTINGS`]) with the numbers this route owns — 101 rows and
+/// decision 17's 30 seconds — swapped in by the shared
+/// [`with_run_settings`]. The settings are in the text rather than the request
+/// because a statement-level `SETTINGS` is what the engine obeys (`SEC-21`),
+/// and `result_overflow_mode = 'break'` is what keeps a huge table from being
+/// produced only to be cut here.
 fn preview_sql(rewritten: &str) -> String {
-    format!("SELECT * FROM (\n{rewritten}\n) AS step LIMIT {PREVIEW_ROW_LIMIT}")
+    let sql = format!(
+        "SELECT * FROM (\n{rewritten}\n) AS step LIMIT {PREVIEW_ROW_LIMIT}{SQL_SOURCE_SETTINGS}"
+    );
+    with_run_settings(&sql, PREVIEW_ROW_LIMIT, PREVIEW_SECONDS)
 }
 
 /// The response body: the probed columns, the rows as arrays in column order
@@ -184,4 +216,27 @@ fn answer(
     let truncated = rows.len() > PREVIEW_ROWS;
     rows.truncate(PREVIEW_ROWS);
     json!({ "columns": columns, "rows": rows, "truncated": truncated })
+}
+
+#[cfg(test)]
+mod tests {
+    //! The wrapper's own text, pinned without a router or an engine: S2-T2's
+    //! "the wrapper carries the limits" is a property of this one function, and
+    //! a route test can only see it through a mock's matcher.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::preview_sql;
+
+    /// S2-T2 / D16 / decision 17: D16's `AS step` wrapper, one row past the
+    /// 100 answered, the dashboard preview's settings text with this route's
+    /// own numbers (101 rows, 30 seconds).
+    #[test]
+    fn the_wrapper_carries_the_row_and_time_limits() {
+        assert_eq!(
+            preview_sql("SELECT id FROM silver.`orders`"),
+            "SELECT * FROM (\nSELECT id FROM silver.`orders`\n) AS step LIMIT 101 SETTINGS \
+             max_result_rows = 101, result_overflow_mode = 'break', max_execution_time = 30"
+        );
+    }
 }
