@@ -30,6 +30,8 @@ use uuid::Uuid;
 
 fn input() -> CreatePipelineInput {
     CreatePipelineInput {
+        inputs: Vec::new(),
+        steps: Vec::new(),
         name: "orders_hourly_rollup".to_owned(),
         kind: "incremental".to_owned(),
         source_zone: "bronze".to_owned(),
@@ -176,9 +178,15 @@ async fn update_replaces_depends_on_wholesale(pool: PgPool) -> sqlx::Result<()> 
         &pool,
         &created.id,
         &pipelines::UpdatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
+            run_as: pipelines::RunAsChange::Keep,
             depends_on: Some(vec!["pl-new-1".to_owned(), "pl-new-2".to_owned()]),
             connector_id: pipelines::ConnectorChange::Keep,
             ..pipelines::UpdatePipelineInput {
+                inputs: Vec::new(),
+                steps: Vec::new(),
+                run_as: pipelines::RunAsChange::Keep,
                 kind: input().kind,
                 source_zone: input().source_zone,
                 source_table: input().source_table,
@@ -211,6 +219,8 @@ async fn update_replaces_depends_on_wholesale(pool: PgPool) -> sqlx::Result<()> 
 #[sqlx::test(migrations = "../../migrations")]
 async fn depends_on_defaults_to_empty_when_unset(pool: PgPool) -> sqlx::Result<()> {
     let empty_deps = CreatePipelineInput {
+        inputs: Vec::new(),
+        steps: Vec::new(),
         depends_on: vec![],
         ..input()
     };
@@ -294,6 +304,8 @@ fn tenant_input(slug: &str) -> CreateTenantInput {
 /// without a name collision.
 fn named_input(name: &str) -> CreatePipelineInput {
     CreatePipelineInput {
+        inputs: Vec::new(),
+        steps: Vec::new(),
         name: name.to_owned(),
         ..input()
     }
@@ -382,6 +394,8 @@ async fn create_pipeline_with_a_tenant_is_listed_for_it(pool: PgPool) -> sqlx::R
     let created = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
             tenant_id: Some(tenant_id),
             ..named_input("pl-created-with-tenant")
         },
@@ -473,6 +487,8 @@ async fn a_pipeline_created_with_a_tenant_is_on_that_tenants_list(
     let created = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
             tenant_id: Some(tenant_id),
             ..named_input("assigned at creation")
         },
@@ -505,6 +521,9 @@ async fn update_replaces_the_definition_and_keeps_the_status(pool: PgPool) -> sq
         &pool,
         &created.id,
         &pipelines::UpdatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
+            run_as: pipelines::RunAsChange::Keep,
             kind: "batch".to_owned(),
             source_zone: "silver".to_owned(),
             source_table: "events".to_owned(),
@@ -542,6 +561,9 @@ async fn update_replaces_the_definition_and_keeps_the_status(pool: PgPool) -> sq
         &pool,
         "pl-missing",
         &pipelines::UpdatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
+            run_as: pipelines::RunAsChange::Keep,
             kind: "batch".to_owned(),
             source_zone: "a".to_owned(),
             source_table: "b".to_owned(),
@@ -621,6 +643,8 @@ async fn create_pipeline_persists_max_retries_zero_and_five(pool: PgPool) -> sql
     let zero = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
             max_retries: Some(0),
             ..named_input("zero retries")
         },
@@ -632,6 +656,8 @@ async fn create_pipeline_persists_max_retries_zero_and_five(pool: PgPool) -> sql
     let five = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
             max_retries: Some(5),
             ..named_input("five retries")
         },
@@ -660,6 +686,8 @@ async fn create_pipeline_rejects_max_retries_outside_zero_to_five(
     let result = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
             max_retries: Some(6),
             ..named_input("out of range")
         },
@@ -683,6 +711,8 @@ async fn update_pipeline_keeps_max_retries_when_absent_and_overwrites_when_prese
     let created = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
             max_retries: Some(4),
             ..named_input("editable retries")
         },
@@ -694,6 +724,9 @@ async fn update_pipeline_keeps_max_retries_when_absent_and_overwrites_when_prese
 
     // An update that doesn't touch max_retries keeps the stored value.
     let mut update = pipelines::UpdatePipelineInput {
+        inputs: Vec::new(),
+        steps: Vec::new(),
+        run_as: pipelines::RunAsChange::Keep,
         max_retries: None,
         ..update_input_for(&created)
     };
@@ -724,6 +757,8 @@ async fn runnable_pipelines_carry_their_max_retries(pool: PgPool) -> sqlx::Resul
     let ready = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
             max_retries: Some(3),
             ..named_input("ready with 3")
         },
@@ -751,6 +786,9 @@ fn update_input_for(p: &pipelines::Pipeline) -> pipelines::UpdatePipelineInput {
     // single-field change).
     let _ = p; // helper shape only
     pipelines::UpdatePipelineInput {
+        inputs: Vec::new(),
+        steps: Vec::new(),
+        run_as: pipelines::RunAsChange::Keep,
         kind: "batch".to_owned(),
         source_zone: "a".to_owned(),
         source_table: "b".to_owned(),
@@ -867,6 +905,8 @@ async fn list_pipelines_for_all_tenants_includes_unassigned_and_tenanted_rows(
     let tenanted = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
             tenant_id: Some(tenant_id),
             ..named_input("all-tenants-tenanted")
         },
@@ -994,6 +1034,9 @@ async fn create_pipeline_writes_one_created_version_in_the_same_transaction(
         &pool,
         &created.id,
         &UpdatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
+            run_as: pipelines::RunAsChange::Keep,
             kind: "batch".to_owned(),
             source_zone: "silver".to_owned(),
             source_table: "events".to_owned(),
@@ -1023,6 +1066,9 @@ async fn create_pipeline_writes_one_created_version_in_the_same_transaction(
         &pool,
         &created.id,
         &UpdatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
+            run_as: pipelines::RunAsChange::Keep,
             kind: created_snapshot.kind.clone(),
             source_zone: created_snapshot.source_zone.clone(),
             source_table: created_snapshot.source_table.clone(),
@@ -1098,6 +1144,9 @@ async fn restore_pipeline_writes_exactly_one_restored_version(pool: PgPool) -> s
         &pool,
         &created.id,
         &UpdatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
+            run_as: pipelines::RunAsChange::Keep,
             kind: "batch".to_owned(),
             source_zone: "silver".to_owned(),
             source_table: "events".to_owned(),
@@ -1135,6 +1184,9 @@ async fn restore_pipeline_writes_exactly_one_restored_version(pool: PgPool) -> s
         &pool,
         &created.id,
         &UpdatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
+            run_as: pipelines::RunAsChange::Keep,
             kind: snap.kind,
             source_zone: snap.source_zone,
             source_table: snap.source_table,
@@ -1201,6 +1253,9 @@ async fn update_pipeline_writes_one_updated_version_with_post_write_state(
         &pool,
         &created.id,
         &UpdatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
+            run_as: pipelines::RunAsChange::Keep,
             kind: "batch".to_owned(),
             source_zone: "silver".to_owned(),
             source_table: "events".to_owned(),
@@ -1299,6 +1354,9 @@ async fn failed_update_writes_no_version_row(pool: PgPool) -> sqlx::Result<()> {
         &pool,
         &created.id,
         &UpdatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
+            run_as: pipelines::RunAsChange::Keep,
             kind: "batch".to_owned(),
             source_zone: "silver".to_owned(),
             source_table: "events".to_owned(),
@@ -1348,6 +1406,9 @@ async fn list_definition_versions_is_newest_first_without_snapshots(
         &pool,
         &created.id,
         &UpdatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
+            run_as: pipelines::RunAsChange::Keep,
             kind: created.kind.clone(),
             source_zone: "silver".to_owned(),
             source_table: created_def.source_table.clone(),
@@ -1371,6 +1432,9 @@ async fn list_definition_versions_is_newest_first_without_snapshots(
         &pool,
         &created.id,
         &UpdatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
+            run_as: pipelines::RunAsChange::Keep,
             kind: created.kind.clone(),
             source_zone: "gold".to_owned(),
             source_table: created_def.source_table.clone(),
@@ -1495,6 +1559,9 @@ async fn snapshot_round_trips_through_create_update_and_restore(pool: PgPool) ->
         &pool,
         &created.id,
         &UpdatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
+            run_as: pipelines::RunAsChange::Keep,
             kind: "batch".to_owned(),
             source_zone: "silver".to_owned(),
             source_table: "events".to_owned(),
@@ -1525,6 +1592,9 @@ async fn snapshot_round_trips_through_create_update_and_restore(pool: PgPool) ->
         &pool,
         &created.id,
         &UpdatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
+            run_as: pipelines::RunAsChange::Keep,
             kind: snap.kind.clone(),
             source_zone: snap.source_zone.clone(),
             source_table: snap.source_table.clone(),
@@ -1704,6 +1774,8 @@ async fn baseline_backfill_synthesises_version_one_for_a_legacy_row(
     let created = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
             tenant_id: Some(tenant_id),
             ..input()
         },
@@ -2549,6 +2621,8 @@ async fn create_lag_reader_fixture(
     let (source_zone, source_table) = source.split_once('.').expect("source is zone.table");
     let (target_zone, target_table) = target.split_once('.').expect("target is zone.table");
     let fixture = CreatePipelineInput {
+        inputs: Vec::new(),
+        steps: Vec::new(),
         name: name.to_owned(),
         source_zone: source_zone.to_owned(),
         source_table: source_table.to_owned(),
@@ -3004,6 +3078,9 @@ async fn update_pipeline_refuses_target_lag_cycle(pool: PgPool) -> sqlx::Result<
     // the stored `Pipeline`, which carries the flattened `source`/`target`
     // strings rather than the zone/table parts `UpdatePipelineInput` takes.
     let update_input = pipelines::UpdatePipelineInput {
+        inputs: Vec::new(),
+        steps: Vec::new(),
+        run_as: pipelines::RunAsChange::Keep,
         kind: p1.kind,
         source_zone: "silver".to_owned(),
         source_table: "p2".to_owned(),
@@ -3069,6 +3146,8 @@ async fn update_leaves_the_author_alone(pool: PgPool) -> sqlx::Result<()> {
     let created = pipelines::create_pipeline(
         &pool,
         &CreatePipelineInput {
+            inputs: Vec::new(),
+            steps: Vec::new(),
             run_as: Some(author),
             ..input()
         },
@@ -3308,5 +3387,585 @@ async fn lock_lag_states_ordered_waits_for_the_first_sorted_id_before_locking_a_
     for conn in [&mut holder, &mut walker, &mut prober] {
         let _ = sqlx::query("ROLLBACK").execute(&mut **conn).await;
     }
+    Ok(())
+}
+
+// ── BLD-1 part 1 D1/D3/D13: inputs, steps and input_tables ────────────
+
+/// The `input_tables` column, read raw: D11's readers use exactly this
+/// value, so a test that only looked at `get_definition`'s decoded shape
+/// would not prove it was written.
+async fn input_tables_of(pool: &PgPool, id: &str) -> Vec<String> {
+    sqlx::query_scalar("SELECT input_tables FROM pipeline_definition WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// D3: a create through today's three fields becomes one input and one
+/// `transform` step, and the store writes `source`, `transforms` and
+/// `input_tables` from that one definition.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_legacy_create_becomes_one_input_and_one_transform_step(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let created = pipelines::create_pipeline(&pool, &input(), None)
+        .await
+        .expect("create should succeed");
+    let definition = pipelines::get_definition(&pool, &created.id)
+        .await
+        .expect("get_definition should succeed")
+        .expect("definition should exist");
+
+    assert_eq!(
+        definition.inputs,
+        vec![pipelines::PipelineInput {
+            name: "orders".to_owned(),
+            zone: "bronze".to_owned(),
+            table: "orders".to_owned(),
+        }],
+        "the table name becomes the input name"
+    );
+    assert_eq!(
+        definition.steps,
+        vec![pipelines::PipelineStep::Transform {
+            name: "transformed".to_owned(),
+            reads: "orders".to_owned(),
+            transforms: vec![
+                "dedupe(order_id)".to_owned(),
+                "select(order_id,total)".to_owned()
+            ],
+        }]
+    );
+    assert_eq!(definition.source_zone, "bronze");
+    assert_eq!(definition.source_table, "orders");
+    assert_eq!(
+        input_tables_of(&pool, &created.id).await,
+        vec!["bronze.orders".to_owned()],
+        "a pipeline that reads one table is a reader of exactly that table"
+    );
+    Ok(())
+}
+
+/// D3: a create with no transforms has one input and no steps — the plain
+/// copy today's wizard produced.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_legacy_create_without_transforms_has_one_input_and_no_steps(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let mut plain = input();
+    plain.transforms = Vec::new();
+    let created = pipelines::create_pipeline(&pool, &plain, None)
+        .await
+        .expect("create should succeed");
+    let definition = pipelines::get_definition(&pool, &created.id)
+        .await
+        .expect("get_definition should succeed")
+        .expect("definition should exist");
+
+    assert_eq!(definition.inputs.len(), 1);
+    assert_eq!(
+        definition.steps,
+        [] as [pipelines::PipelineStep; 0],
+        "no transforms means no steps"
+    );
+    Ok(())
+}
+
+/// D13 and AGENTS.md rule 2: the migration's backfill and the store's own
+/// rule are the SAME rule, and this is what proves it — the SQL functions
+/// the migration's `UPDATE` uses are called directly on the same fixtures
+/// the Rust function sees.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_migration_backfill_matches_the_store_rule(pool: PgPool) -> sqlx::Result<()> {
+    // R1-B4's fixtures: a plain location; one with no dot (an empty zone, the
+    // table as the whole location); one with two (the table keeps the rest);
+    // a name that is not a usable identifier; and a table named `Transformed`,
+    // whose step must avoid it without regard to case.
+    let fixtures = [
+        ("bronze.orders", vec!["dedupe(id)".to_owned()]),
+        ("silver.orders_clean", Vec::new()),
+        ("orders", vec!["select(id)".to_owned()]),
+        ("serving.sales.orders", vec!["select(id)".to_owned()]),
+        ("__reserved.table", vec!["select(id)".to_owned()]),
+        ("2024.orders", Vec::new()),
+        ("bronze.transformed", vec!["select(id)".to_owned()]),
+        ("bronze.Transformed", vec!["select(id)".to_owned()]),
+    ];
+    for (location, transforms) in fixtures {
+        // The same split the store uses (`split_zone_table`): at the first
+        // dot, an empty zone for a location with none.
+        let (zone, table) = location
+            .split_once('.')
+            .map_or(("", location), |(zone, table)| (zone, table));
+        let expected = pipelines::legacy_definition(zone, table, &transforms);
+
+        let (input_json, steps_json): (serde_json::Value, serde_json::Value) = sqlx::query_as(
+            "SELECT jsonb_build_array(pipeline_legacy_input($1)), \
+             pipeline_legacy_steps($1, $2)",
+        )
+        .bind(location)
+        .bind(serde_json::json!(transforms))
+        .fetch_one(&pool)
+        .await?;
+
+        let sql_inputs: Vec<pipelines::PipelineInput> = serde_json::from_value(input_json).unwrap();
+        let sql_steps: Vec<pipelines::PipelineStep> = serde_json::from_value(steps_json).unwrap();
+        assert_eq!(
+            (sql_inputs, sql_steps),
+            expected,
+            "the migration and the store disagree for {location}"
+        );
+    }
+    Ok(())
+}
+
+/// D3: a table name that is not a usable name becomes `input_1`, so a
+/// pipeline still has a name its steps can read.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_table_name_that_is_not_a_usable_name_becomes_input_1(pool: PgPool) -> sqlx::Result<()> {
+    let mut reserved = input();
+    reserved.source_table = "__reserved".to_owned();
+    let created = pipelines::create_pipeline(&pool, &reserved, None)
+        .await
+        .expect("create should succeed");
+    let definition = pipelines::get_definition(&pool, &created.id)
+        .await
+        .expect("get_definition should succeed")
+        .expect("definition should exist");
+    assert_eq!(definition.inputs[0].name, "input_1");
+    assert_eq!(definition.inputs[0].table, "__reserved");
+    Ok(())
+}
+
+/// R1-B4: the migration's backfill itself, run over rows inserted in the
+/// legacy shape (the state every row was in when `0140` ran), equals D3's
+/// rule — and a row that already has a definition is left alone, which is the
+/// "running it again is a no-op" claim the comment makes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_migration_backfill_fills_legacy_rows_and_skips_defined_ones(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO pipeline_definition \
+            (id, name, kind, status, owner, source, target, schedule, transforms) \
+         VALUES ('pl-b4-dotted', 'b4-dotted', 'batch', 'draft', 'o', \
+                 'serving.sales.orders', 'silver.t', 'manual', '[]'::jsonb), \
+                ('pl-b4-transformed', 'b4-transformed', 'batch', 'draft', 'o', \
+                 'bronze.Transformed', 'silver.t', 'manual', '[\"select(id)\"]'::jsonb), \
+                ('pl-b4-nodot', 'b4-nodot', 'batch', 'draft', 'o', \
+                 'orders', 'silver.t', 'manual', '[]'::jsonb)",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query("SELECT pipeline_backfill_legacy_definition()")
+        .execute(&pool)
+        .await?;
+
+    for (id, location, transforms) in [
+        ("pl-b4-dotted", "serving.sales.orders", Vec::<String>::new()),
+        (
+            "pl-b4-transformed",
+            "bronze.Transformed",
+            vec!["select(id)".to_owned()],
+        ),
+        ("pl-b4-nodot", "orders", Vec::new()),
+    ] {
+        let (zone, table) = location
+            .split_once('.')
+            .map_or(("", location), |(zone, table)| (zone, table));
+        let definition = pipelines::get_definition(&pool, id)
+            .await
+            .expect("get_definition")
+            .expect("the row exists");
+        assert_eq!(
+            (definition.inputs, definition.steps),
+            pipelines::legacy_definition(zone, table, &transforms),
+            "the migration and the store disagree for {location}"
+        );
+        assert_eq!(
+            input_tables_of(&pool, id).await,
+            vec![location.to_owned()],
+            "input_tables is the whole location, not its two split parts"
+        );
+    }
+    Ok(())
+}
+
+/// D13: a snapshot written before `inputs`/`steps` existed still reads (the
+/// serde default) and restores to D3's shape — the same shape the migration
+/// gave that version's live row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_old_snapshot_without_inputs_restores_to_the_legacy_shape(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let old = serde_json::json!({
+        "kind": "incremental",
+        "sourceZone": "bronze",
+        "sourceTable": "orders",
+        "incrementalColumn": null,
+        "transforms": ["dedupe(order_id)"],
+        "fbicEnabled": false,
+        "targetZone": "silver",
+        "targetTable": "orders_clean",
+        "schedule": "manual",
+        "owner": "Current user",
+        "description": null,
+        "maxRetries": 2,
+        "dependsOn": [],
+        "name": "orders_hourly_rollup",
+        "status": "draft"
+    });
+    let snapshot: pipelines::PipelineDefinitionSnapshot = serde_json::from_value(old).unwrap();
+    assert!(
+        snapshot.inputs.is_empty(),
+        "an old snapshot carries no inputs"
+    );
+
+    let (inputs, steps) = pipelines::snapshot_definition(&snapshot);
+    assert_eq!(
+        (inputs, steps),
+        pipelines::legacy_definition("bronze", "orders", &["dedupe(order_id)".to_owned()])
+    );
+    // Nothing about this test needs the pool; `#[sqlx::test]` is used so the
+    // migrations (and therefore the backfill) are the ones this branch has.
+    let _ = &pool;
+    Ok(())
+}
+
+/// D13: a row whose `inputs` was never filled (a backfill that missed it)
+/// still reads as one input, because the store falls back to the same rule
+/// instead of reporting a pipeline with no inputs at all.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_row_with_no_stored_inputs_reads_as_the_legacy_shape(pool: PgPool) -> sqlx::Result<()> {
+    let created = pipelines::create_pipeline(&pool, &input(), None)
+        .await
+        .expect("create should succeed");
+    sqlx::query("UPDATE pipeline_definition SET inputs = '[]', steps = '[]' WHERE id = $1")
+        .bind(&created.id)
+        .execute(&pool)
+        .await?;
+    let definition = pipelines::get_definition(&pool, &created.id)
+        .await
+        .expect("get_definition should succeed")
+        .expect("definition should exist");
+    assert_eq!(definition.inputs.len(), 1);
+    assert_eq!(definition.inputs[0].name, "orders");
+    assert_eq!(definition.steps.len(), 1);
+    Ok(())
+}
+
+/// D3/D11: an update that carries the new shape rewrites `source`,
+/// `transforms` and `input_tables` together, so the target-lag readers and
+/// the orchestrator cannot see the old definition.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_update_carrying_inputs_and_steps_rewrites_every_legacy_column(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let created = pipelines::create_pipeline(&pool, &input(), None)
+        .await
+        .expect("create should succeed");
+    let mut update = pipelines::UpdatePipelineInput {
+        inputs: Vec::new(),
+        steps: Vec::new(),
+        run_as: pipelines::RunAsChange::Keep,
+        ..update_input_for(&created)
+    };
+    update.inputs = vec![
+        pipelines::PipelineInput {
+            name: "orders".to_owned(),
+            zone: "bronze".to_owned(),
+            table: "orders".to_owned(),
+        },
+        pipelines::PipelineInput {
+            name: "customers".to_owned(),
+            zone: "silver".to_owned(),
+            table: "customers".to_owned(),
+        },
+    ];
+    update.steps = vec![pipelines::PipelineStep::Sql {
+        name: "joined".to_owned(),
+        sql: "SELECT * FROM orders".to_owned(),
+    }];
+    let updated = pipelines::update_pipeline(&pool, &created.id, &update, None)
+        .await
+        .expect("update should succeed")
+        .expect("the pipeline exists");
+
+    assert_eq!(
+        updated.source, "bronze.orders",
+        "source stays the first input"
+    );
+    let definition = pipelines::get_definition(&pool, &created.id)
+        .await
+        .expect("get_definition should succeed")
+        .expect("definition should exist");
+    assert_eq!(definition.inputs.len(), 2);
+    assert_eq!(
+        definition.transforms,
+        Vec::<String>::new(),
+        "a multi-input pipeline is not one input and one transform step"
+    );
+    assert_eq!(
+        input_tables_of(&pool, &created.id).await,
+        vec!["bronze.orders".to_owned(), "silver.customers".to_owned()]
+    );
+    Ok(())
+}
+
+// ── BLD-1 part 1 D11: target lag follows every input ─────────────────
+
+/// A pipeline whose definition reads `inputs`, created in `tenant`, with an
+/// optional target lag.
+async fn lag_pipeline_with_inputs(
+    pool: &PgPool,
+    name: &str,
+    tenant_id: Uuid,
+    inputs: &[(&str, &str)],
+    target: (&str, &str),
+    target_lag: Option<pipelines::TargetLag>,
+) -> pipelines::Pipeline {
+    let mut create = input();
+    create.name = name.to_owned();
+    create.inputs = inputs
+        .iter()
+        .enumerate()
+        .map(|(index, (zone, table))| pipelines::PipelineInput {
+            name: format!("in_{index}"),
+            zone: (*zone).to_owned(),
+            table: (*table).to_owned(),
+        })
+        .collect();
+    create.steps = Vec::new();
+    create.transforms = Vec::new();
+    create.target_zone = target.0.to_owned();
+    create.target_table = target.1.to_owned();
+    create.tenant_id = Some(tenant_id);
+    create.target_lag = target_lag;
+    create.depends_on = Vec::new();
+    pipelines::create_pipeline(pool, &create, None)
+        .await
+        .expect("create the lag fixture")
+}
+
+/// D11: a pipeline with two inputs is a reader of BOTH producers' targets —
+/// `lag_reader_predicate` asks the `input_tables` column, not the single
+/// `source`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_two_input_pipeline_reads_both_producers(pool: PgPool) -> sqlx::Result<()> {
+    let tenant: Uuid = create_tenant(&pool, &tenant_input("lag-two-inputs"))
+        .await
+        .unwrap()
+        .id
+        .parse()
+        .unwrap();
+    // Two producers, each writing one of the tables the reader reads.
+    lag_pipeline_with_inputs(
+        &pool,
+        "lag-producer-a",
+        tenant,
+        &[("bronze", "orders")],
+        ("silver", "a"),
+        None,
+    )
+    .await;
+    lag_pipeline_with_inputs(
+        &pool,
+        "lag-producer-b",
+        tenant,
+        &[("bronze", "customers")],
+        ("silver", "b"),
+        None,
+    )
+    .await;
+    let reader = lag_pipeline_with_inputs(
+        &pool,
+        "lag-reader",
+        tenant,
+        &[("silver", "a"), ("silver", "b")],
+        ("gold", "joined"),
+        Some(pipelines::TargetLag::Lag { minutes: 5 }),
+    )
+    .await;
+    assert_eq!(
+        reader.input_tables,
+        vec!["silver.a".to_owned(), "silver.b".to_owned()],
+        "the store writes every input's location"
+    );
+
+    for target in ["silver.a", "silver.b"] {
+        let count =
+            pipelines::count_lag_pipelines_reading(&pool, "someone-else", target, Some(tenant))
+                .await
+                .unwrap();
+        assert_eq!(count, 1, "the reader must be counted for {target}");
+    }
+    Ok(())
+}
+
+/// D11: the write-time cycle check follows a SECOND input too. A cycle that
+/// only exists through the reader's second input is refused when the target
+/// lag is set, exactly as one through the first always was.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_cycle_check_sees_a_cycle_through_a_second_input(pool: PgPool) -> sqlx::Result<()> {
+    let tenant: Uuid = create_tenant(&pool, &tenant_input("lag-cycle-two"))
+        .await
+        .unwrap()
+        .id
+        .parse()
+        .unwrap();
+    // `a` reads `x` and `silver.b`; `b` reads `silver.a` with no lag yet.
+    lag_pipeline_with_inputs(
+        &pool,
+        "lag-cycle-b",
+        tenant,
+        &[("bronze", "customers")],
+        ("silver", "b"),
+        None,
+    )
+    .await;
+    lag_pipeline_with_inputs(
+        &pool,
+        "lag-cycle-a",
+        tenant,
+        &[("silver", "x"), ("silver", "b")],
+        ("silver", "a"),
+        Some(pipelines::TargetLag::Lag { minutes: 5 }),
+    )
+    .await;
+    // Make `b` a lag pipeline reading `a`: that closes a cycle through a's
+    // SECOND input, so the write must be refused.
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT id FROM pipeline_definition WHERE name = 'lag-cycle-b'")
+            .fetch_all(&pool)
+            .await?;
+    let b_id = rows[0].0.clone();
+    let b_pipeline = pipelines::get_pipeline(&pool, &b_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut update = update_input_for(&b_pipeline);
+    update.inputs = vec![pipelines::PipelineInput {
+        name: "a_in".to_owned(),
+        zone: "silver".to_owned(),
+        table: "a".to_owned(),
+    }];
+    update.transforms = Vec::new();
+    // Keep the target the fixture created: `update_input_for`'s own default
+    // would move it and break the edge the cycle needs.
+    update.target_zone = "silver".to_owned();
+    update.target_table = "b".to_owned();
+    pipelines::update_pipeline(&pool, &b_id, &update, None)
+        .await
+        .unwrap();
+    let refusal =
+        pipelines::set_target_lag(&pool, &b_id, Some(pipelines::TargetLag::Lag { minutes: 5 }))
+            .await;
+    assert!(
+        matches!(refusal, Err(StoreError::Validation(_))),
+        "a cycle through a second input must be refused, got {refusal:?}"
+    );
+    Ok(())
+}
+
+// ── BLD-1 part 1 review R1-B5: a definition that cannot be read ────────
+
+/// R1-B5: `steps` this crate wrote and cannot decode is a refusal, never an
+/// empty definition — an empty `steps` compiles to a plain copy, which would
+/// overwrite the pipeline's output with unfiltered rows (principle 3).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_undecodable_steps_column_is_refused(pool: PgPool) -> sqlx::Result<()> {
+    let created = pipelines::create_pipeline(&pool, &input(), None)
+        .await
+        .expect("create should succeed");
+    sqlx::query("UPDATE pipeline_definition SET steps = '[{\"unknown\": true}]' WHERE id = $1")
+        .bind(&created.id)
+        .execute(&pool)
+        .await?;
+
+    let refused = pipelines::get_definition(&pool, &created.id).await;
+    assert!(
+        matches!(refused, Err(StoreError::CorruptDefinition)),
+        "an unreadable definition must be refused, got {refused:?}"
+    );
+    Ok(())
+}
+
+/// R1-B5, the write side: a version snapshot is built from the same row, so a
+/// corrupt one must not record an empty definition that a restore would then
+/// replay. `delete_pipeline` snapshots the PRE-delete row, which is corrupt:
+/// it fails closed and deletes nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_undecodable_definition_writes_no_snapshot(pool: PgPool) -> sqlx::Result<()> {
+    let created = pipelines::create_pipeline(&pool, &input(), None)
+        .await
+        .expect("create should succeed");
+    sqlx::query("UPDATE pipeline_definition SET inputs = '\"not an array\"' WHERE id = $1")
+        .bind(&created.id)
+        .execute(&pool)
+        .await?;
+
+    let refused = pipelines::delete_pipeline(&pool, &created.id, None).await;
+    assert!(
+        matches!(refused, Err(StoreError::CorruptDefinition)),
+        "the delete must fail closed, got {refused:?}"
+    );
+    assert!(
+        pipelines::get_pipeline(&pool, &created.id)
+            .await
+            .expect("get_pipeline")
+            .is_some(),
+        "a refused delete leaves the row"
+    );
+    let versions: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM pipeline_definition_version \
+         WHERE pipeline_id = $1 AND event = 'deleted'",
+    )
+    .bind(&created.id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        versions.0, 0,
+        "no snapshot may be written for a corrupt row"
+    );
+    Ok(())
+}
+
+/// R1-B9 / D10a: a write that clears the author really clears the column, in
+/// the same transaction as the definition — the state a pipeline is in after a
+/// service identity changed what it reads, and it does not run until an
+/// administrator assigns one (D2).
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_can_clear_the_author(pool: PgPool) -> sqlx::Result<()> {
+    let author = seed_user(&pool, "clear-author@test.invalid").await;
+    let mut create = input();
+    create.run_as = Some(author);
+    let created = pipelines::create_pipeline(&pool, &create, None)
+        .await
+        .expect("create should succeed");
+    assert_eq!(created.run_as, Some(author));
+
+    let mut update = pipelines::UpdatePipelineInput {
+        inputs: Vec::new(),
+        steps: Vec::new(),
+        run_as: pipelines::RunAsChange::Clear,
+        ..update_input_for(&created)
+    };
+    update.transforms = vec!["select(id)".to_owned()];
+    let updated = pipelines::update_pipeline(&pool, &created.id, &update, None)
+        .await
+        .expect("update should succeed")
+        .expect("the pipeline exists");
+    assert_eq!(updated.run_as, None, "the author is cleared");
+    assert_eq!(
+        pipelines::get_pipeline(&pool, &created.id)
+            .await
+            .expect("get_pipeline")
+            .expect("the row exists")
+            .run_as,
+        None,
+    );
     Ok(())
 }

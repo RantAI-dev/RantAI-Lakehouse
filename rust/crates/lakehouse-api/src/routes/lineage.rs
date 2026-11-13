@@ -455,19 +455,25 @@ async fn add_tenant_owned(
     .await
     .unwrap_or_default();
     for pipeline in &pipelines {
-        let (Some((from, from_label, from_kind)), Some((to, to_label, to_kind))) =
-            (zone_node(&pipeline.source), zone_node(&pipeline.target))
-        else {
+        // BLD-1 part 1 / D11 and review R1-B7: a pipeline reads EVERY input,
+        // so it draws one edge per input. `input_tables_of` is the store's one
+        // rule for a row that predates the column.
+        let Some((to, to_label, to_kind)) = zone_node(&pipeline.target) else {
             continue;
         };
-        g.node(&from, &from_label, from_kind);
         g.node(&to, &to_label, to_kind);
-        g.edge(
-            &from,
-            &to,
-            "pipeline",
-            &format!("authored pipeline {} ({})", pipeline.name, pipeline.id),
-        );
+        for table in lakehouse_store::pipelines::input_tables_of(pipeline) {
+            let Some((from, from_label, from_kind)) = zone_node(&table) else {
+                continue;
+            };
+            g.node(&from, &from_label, from_kind);
+            g.edge(
+                &from,
+                &to,
+                "pipeline",
+                &format!("authored pipeline {} ({})", pipeline.name, pipeline.id),
+            );
+        }
     }
 }
 
@@ -1088,6 +1094,55 @@ mod tests {
         assert!(!g.coverage.contains(
             &"connectors, pipelines and uploads are not shown: you belong to no tenant".to_owned()
         ));
+        Ok(())
+    }
+
+    /// BLD-1 part 1 / D11 and review R1-B7: the graph draws one pipeline edge
+    /// per INPUT, not one for the first — a pipeline with two inputs is
+    /// downstream of both producers.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_two_input_pipeline_has_one_edge_per_input(
+        pool: lakehouse_store::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let state = state_for(&pool)?;
+        let tenant = uuid::Uuid::from_u128(1);
+        sqlx::query(
+            "INSERT INTO tenant (id, name, slug, plan, residency) \
+             VALUES ($1, $2, $3, 'Standard', 'US')",
+        )
+        .bind(tenant)
+        .bind("Tenant 1")
+        .bind("tenant-1")
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO pipeline_definition \
+                (id, name, kind, status, source, target, schedule, tenant_id, input_tables) \
+             VALUES ('pl-multi', 'Pipeline multi', 'batch', 'draft', \
+                     'bronze.first', 'silver.multi', '@hourly', $1, \
+                     ARRAY['bronze.first', 'bronze.second'])",
+        )
+        .bind(tenant)
+        .execute(&pool)
+        .await?;
+
+        let principal = restricted_principal();
+        let mut g = Graph::default();
+        add_tenant_owned(&state, &principal, Some(tenant), &mut g).await;
+
+        let edge_tuples: Vec<(&str, &str, &str)> = g
+            .edges
+            .iter()
+            .map(|(from, to, kind, _)| (from.as_str(), to.as_str(), *kind))
+            .collect();
+        assert!(
+            edge_tuples.contains(&("bronze:first", "table:silver.multi", "pipeline")),
+            "the first input's edge: {edge_tuples:?}"
+        );
+        assert!(
+            edge_tuples.contains(&("bronze:second", "table:silver.multi", "pipeline")),
+            "the second input's edge: {edge_tuples:?}"
+        );
         Ok(())
     }
 

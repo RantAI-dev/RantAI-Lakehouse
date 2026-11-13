@@ -1704,10 +1704,26 @@ fn rotate_connector_credential_schema() -> Value {
 
 fn create_pipeline_schema() -> Value {
     json!({ "type": "function", "function": { "name": "create_pipeline",
-        "description": "Author a new pipeline that reads a source table, applies transforms and writes a target table. It is saved as a draft; mark_pipeline_ready makes it runnable. Source zones: bronze, silver, gold. Target zones: silver, gold -- a pipeline never writes bronze, which is written by ingestion. Transforms use a fixed vocabulary, one per entry: dedupe(col), filter(col = 'value') with = != < > <= >=, rename(old,new), cast(col,Int64) with String Int32 Int64 Float64 Boolean Date DateTime UUID, select(col1,col2).",
+        "description": "Author a new pipeline that reads tables and writes a target table. It is saved as a draft; mark_pipeline_ready makes it runnable. Source zones: bronze, silver, gold. Target zones: silver, gold -- a pipeline never writes bronze, which is written by ingestion. A pipeline is 1-5 named inputs and 0-20 named steps. Give the shape one of two ways: (a) inputs and steps, which is the fuller one -- a step is { name, kind: 'sql', sql } with ONE read-only SELECT over the inputs and earlier steps by their names (joins, aggregations, CASE, subqueries and window functions are allowed; a table that is not an input is refused, so list every table you read under inputs), or { name, kind: 'transform', reads, transforms } with the five operations below; or (b) today's sourceZone, sourceTable and transforms, which is one input and one transform step. Send one form, never both. Use a SQL step whenever the person asks for a join, a group-by, an aggregate, a calculated column or anything the five operations cannot say. Transforms use a fixed vocabulary, one per entry: dedupe(col), filter(col = 'value') with = != < > <= >=, rename(old,new), cast(col,Int64) with String Int32 Int64 Float64 Boolean Date DateTime UUID, select(col1,col2).",
         "parameters": { "type": "object", "properties": {
             "name": { "type": "string" },
             "description": { "type": "string" },
+            "inputs": { "type": "array", "minItems": 1, "maxItems": 5,
+                "description": "the tables the pipeline reads, each with the short name its steps use",
+                "items": { "type": "object", "properties": {
+                    "name": { "type": "string", "description": "name steps read it by, letters digits and _ only" },
+                    "zone": { "type": "string", "enum": ["bronze", "silver", "gold"] },
+                    "table": { "type": "string" } },
+                    "required": ["name", "zone", "table"] } },
+            "steps": { "type": "array", "maxItems": 20,
+                "description": "the pipeline's steps in order; the last one's result is the output",
+                "items": { "type": "object", "properties": {
+                    "name": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["sql", "transform"] },
+                    "sql": { "type": "string", "description": "kind=sql: one read-only SELECT over the inputs and earlier steps" },
+                    "reads": { "type": "string", "description": "kind=transform: the input or earlier step it reads" },
+                    "transforms": { "type": "array", "items": { "type": "string" }, "description": "kind=transform: the operations, one per entry" } },
+                    "required": ["name", "kind"] } },
             "sourceZone": { "type": "string", "enum": ["bronze", "silver", "gold"] },
             "sourceTable": { "type": "string" },
             "targetZone": { "type": "string", "enum": ["silver", "gold"] },
@@ -1715,7 +1731,7 @@ fn create_pipeline_schema() -> Value {
             "transforms": { "type": "array", "items": { "type": "string" } },
             "incrementalColumn": { "type": "string", "description": "optional column for incremental loads" },
             "schedule": { "type": "string", "description": "\"manual\" or a cron expression" } },
-            "required": ["name", "sourceZone", "sourceTable", "targetZone", "targetTable"] } } })
+            "required": ["name", "targetZone", "targetTable"] } } })
 }
 
 fn get_pipeline_schema() -> Value {

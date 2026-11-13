@@ -3,12 +3,12 @@
 //! stand-ins for `ClickHouse` and `Dagster`.
 //!
 //! The record has two halves with a run in between. The orchestrator posts
-//! the SELECT it will run to `.../enforce`, and the API keeps it in Postgres
+//! `.../compile` for the statement it will run, and the API keeps it in Postgres
 //! (not in memory: it can restart before the run ends). When Dagster's
 //! sensor reports the run `SUCCESS`, the API maps the kept SQL and writes the
 //! pipeline's rows. A run that did not succeed writes nothing.
 //!
-//! `SEC-50` puts the tenant gate in front of `.../enforce`: a pipeline acts
+//! `SEC-50` puts the tenant gate in front of `.../compile`: a pipeline acts
 //! as its OWN tenant (`pipeline_definition.tenant_id`), and a pipeline with
 //! no tenant reaches nothing. So the fixtures below give every pipeline a
 //! tenant and the deployment a catalog tenant, because that is what a
@@ -38,7 +38,7 @@ use common::{TestApp, session_cookie_for_seeded_user, spin_up_with_env};
 /// reads it as ``<catalog db>.`bronze.<table>` ``): one copy, one rename and
 /// one cast.
 const SQL: &str = "SELECT id, amount AS amt, CAST(price AS Float64) AS price_f \
-                   FROM icecat.`bronze.orders`";
+                   FROM icecat_api.`bronze.orders`";
 
 /// `SEC-50`: the tenant that owns the shared catalog in these tests —
 /// Meridian Group, the tenant the seeded identity migration gives `yoga`
@@ -104,6 +104,9 @@ async fn app(run_status: &str) -> (axum::Router, PgPool, String, (MockServer, Mo
     // these tests read (`bronze.orders`) is a table no upload claimed, so
     // only that tenant may read it.
     overrides.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
+    // BLD-1 part 1 / D4: the pipeline reads Bronze, so the compiler names the
+    // catalog database (R1-CI2: not in the shared harness).
+    overrides.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
     let TestApp { router, pool } = spin_up_with_env(&overrides).await;
     let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
     (router, pool, cookie, (ch, dagster))
@@ -120,12 +123,30 @@ async fn seeded_user_id(pool: &PgPool, email: &str) -> Uuid {
 /// A runnable pipeline `bronze.orders -> silver.orders_clean`.
 ///
 /// `SEC-50`: the pipeline carries a tenant of its own, because that is the
-/// tenant the enforce route's gate measures the statement against.
+/// tenant the compile route's gate measures the statement against.
 async fn seed_pipeline(pool: &PgPool, run_as: Option<Uuid>, tenant_id: Option<Uuid>) -> String {
+    // BLD-1 part 1 / D1: today's shape, written as one input and one
+    // `transform` step. Under D4a it compiles to exactly `SQL`, which is the
+    // statement the lineage mapper reads.
     let created = pipelines::create_pipeline(
         pool,
         &CreatePipelineInput {
-            name: "lineage-probe".to_owned(),
+            inputs: vec![pipelines::PipelineInput {
+                name: "orders".to_owned(),
+                zone: "bronze".to_owned(),
+                table: "orders".to_owned(),
+            }],
+            steps: vec![pipelines::PipelineStep::Transform {
+                name: "transformed".to_owned(),
+                reads: "orders".to_owned(),
+                transforms: vec![
+                    "select(id,amount,price)".to_owned(),
+                    "rename(amount,amt)".to_owned(),
+                    "rename(price,price_f)".to_owned(),
+                    "cast(price,Float64)".to_owned(),
+                ],
+            }],
+            name: format!("lineage-probe-{}", Uuid::new_v4()),
             kind: "batch".to_owned(),
             source_zone: "bronze".to_owned(),
             source_table: "orders".to_owned(),
@@ -194,12 +215,14 @@ async fn post(router: &axum::Router, cookie: &str, uri: &str, body: Value) -> (S
     )
 }
 
-async fn enforce(router: &axum::Router, cookie: &str, id: &str) -> (StatusCode, Value) {
+/// BLD-1 part 1 / D8: the route takes no body — the API compiles the stored
+/// definition itself, and under D4a that is exactly [`SQL`].
+async fn compile(router: &axum::Router, cookie: &str, id: &str) -> (StatusCode, Value) {
     post(
         router,
         cookie,
-        &format!("/api/pipelines/runnable/{id}/enforce"),
-        json!({ "sql": SQL }),
+        &format!("/api/pipelines/runnable/{id}/compile"),
+        Value::Null,
     )
     .await
 }
@@ -228,22 +251,22 @@ async fn pending(pool: &PgPool, id: &str) -> Option<String> {
 }
 
 #[tokio::test]
-async fn the_enforce_call_keeps_the_submitted_sql_in_postgres() {
+async fn the_compile_call_keeps_the_compiled_sql_in_postgres() {
     let (router, pool, cookie, _servers) = app("SUCCESS").await;
     let author = seeded_user_id(&pool, "yoga@meridian.example").await;
     let id = seed_pipeline(&pool, Some(author), Some(catalog_tenant())).await;
 
-    let (status, body) = enforce(&router, &cookie, &id).await;
+    let (status, body) = compile(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(pending(&pool, &id).await.as_deref(), Some(SQL));
 }
 
 #[tokio::test]
-async fn a_refused_enforce_keeps_nothing() {
+async fn a_refused_compile_keeps_nothing() {
     let (router, pool, cookie, _servers) = app("SUCCESS").await;
     let id = seed_pipeline(&pool, None, Some(catalog_tenant())).await;
 
-    let (status, _) = enforce(&router, &cookie, &id).await;
+    let (status, _) = compile(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(pending(&pool, &id).await, None);
 }
@@ -253,10 +276,10 @@ async fn a_successful_run_writes_the_pipelines_mappings_and_clears_the_pending_s
     let (router, pool, cookie, _servers) = app("SUCCESS").await;
     let author = seeded_user_id(&pool, "yoga@meridian.example").await;
     let id = seed_pipeline(&pool, Some(author), Some(catalog_tenant())).await;
-    // Enforce through the route, then report the run: the pending row is the
+    // Compile through the route, then report the run: the pending row is the
     // only thing carried from one request to the other. A restart of the
     // API between the two loses nothing, because nothing is in memory.
-    let (status, body) = enforce(&router, &cookie, &id).await;
+    let (status, body) = compile(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
     let (status, body) = run_finished(&router, &cookie, &id).await;
@@ -307,7 +330,7 @@ async fn a_successful_run_writes_the_pipelines_mappings_and_clears_the_pending_s
 #[tokio::test]
 async fn pending_sql_left_by_an_earlier_process_is_mapped_by_the_next_success() {
     // The "restart": the row was written by a process that no longer
-    // exists; this app instance never saw the enforce call.
+    // exists; this app instance never saw the compile call.
     let (router, pool, cookie, _servers) = app("SUCCESS").await;
     let id = seed_pipeline(&pool, None, Some(catalog_tenant())).await;
     column_lineage::put_pending(&pool, &id, SQL).await.unwrap();
@@ -325,7 +348,7 @@ async fn a_run_that_did_not_succeed_writes_nothing() {
     let (router, pool, cookie, _servers) = app("FAILURE").await;
     let author = seeded_user_id(&pool, "yoga@meridian.example").await;
     let id = seed_pipeline(&pool, Some(author), Some(catalog_tenant())).await;
-    let (status, _) = enforce(&router, &cookie, &id).await;
+    let (status, _) = compile(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::OK);
 
     let (status, _) = run_finished(&router, &cookie, &id).await;
@@ -341,7 +364,7 @@ async fn a_repeated_success_event_leaves_the_rows_as_they_were() {
     let (router, pool, cookie, _servers) = app("SUCCESS").await;
     let author = seeded_user_id(&pool, "yoga@meridian.example").await;
     let id = seed_pipeline(&pool, Some(author), Some(catalog_tenant())).await;
-    enforce(&router, &cookie, &id).await;
+    compile(&router, &cookie, &id).await;
     run_finished(&router, &cookie, &id).await;
     let (status, _) = run_finished(&router, &cookie, &id).await;
     assert_eq!(status, StatusCode::OK);
@@ -349,4 +372,70 @@ async fn a_repeated_success_event_leaves_the_rows_as_they_were() {
         .await
         .unwrap();
     assert_eq!(rows.len(), 3, "nothing pending, so nothing was rewritten");
+}
+
+/// BLD-1 part 1 review R1-B1 / D4b: a definition that is not today's shape
+/// compiles to a `WITH`, which the lineage mapper cannot read. Rather than
+/// record a target column with no provenance, the API notes no statement at
+/// all for it — table lineage (D11) is unaffected, and a `WITH`-aware mapper
+/// is a backlog item.
+#[tokio::test]
+async fn a_pipeline_with_a_sql_step_writes_no_column_lineage_row() {
+    let (router, pool, cookie, _servers) = app("SUCCESS").await;
+    let author = seeded_user_id(&pool, "yoga@meridian.example").await;
+    let created = pipelines::create_pipeline(
+        &pool,
+        &CreatePipelineInput {
+            inputs: vec![pipelines::PipelineInput {
+                name: "orders".to_owned(),
+                zone: "bronze".to_owned(),
+                table: "orders".to_owned(),
+            }],
+            steps: vec![pipelines::PipelineStep::Sql {
+                name: "projected".to_owned(),
+                sql: "SELECT id, amount AS amt FROM orders".to_owned(),
+            }],
+            name: format!("lineage-sql-{}", Uuid::new_v4()),
+            kind: "batch".to_owned(),
+            source_zone: "bronze".to_owned(),
+            source_table: "orders".to_owned(),
+            target_zone: "silver".to_owned(),
+            target_table: "orders_clean".to_owned(),
+            schedule: "0 3 * * *".to_owned(),
+            description: None,
+            incremental_column: None,
+            transforms: Vec::new(),
+            fbic_enabled: false,
+            max_retries: None,
+            owner: None,
+            tenant_id: Some(catalog_tenant()),
+            depends_on: Vec::new(),
+            connector_id: None,
+            id: None,
+            target_lag: None,
+            run_as: Some(author),
+        },
+        Some(author),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE pipeline_definition SET status = 'ready' WHERE id = $1")
+        .bind(&created.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = compile(&router, &cookie, &created.id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(pending(&pool, &created.id).await, None, "nothing was noted");
+
+    let (status, body) = run_finished(&router, &cookie, &created.id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = column_lineage::touching_table(&pool, "silver.orders_clean", everything())
+        .await
+        .unwrap();
+    assert!(
+        rows.iter().all(|row| row.producer_ref != created.id),
+        "no column row may be recorded for a WITH: {rows:#?}"
+    );
 }
