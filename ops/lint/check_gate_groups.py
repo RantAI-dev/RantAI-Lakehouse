@@ -75,6 +75,8 @@ SCOPE_SCRIPT = REPO_ROOT / "scripts" / "ci" / "detect_change_scope.sh"
 # D10 (a): the jobs that are not gates. They either have no `if:` (the scope
 # and the lints), carry their own scope-only `if:` (the Rust and Dagster unit
 # jobs, `images`, `image-smoke`), or are the gate itself.
+# OPS-30: `test-build` is the Rust unit job that compiles the test archive; it
+# has the same scope-only `if:` as `test` and runs no acceptance gate.
 NON_GATE_JOBS = frozenset(
     {
         "changes",
@@ -83,6 +85,7 @@ NON_GATE_JOBS = frozenset(
         "fmt",
         "clippy",
         "build",
+        "test-build",
         "test",
         "msrv",
         "dagster-unit-tests",

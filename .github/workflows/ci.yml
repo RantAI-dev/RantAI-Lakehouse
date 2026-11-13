@@ -593,33 +593,24 @@ jobs:
         run: cargo build --locked
         working-directory: rust
 
-  # ── Rust: tests (Docker/testcontainers required — Postgres) ───────────
-  test:
-    name: Rust · test ${{ matrix.partition }}/3 (stable)
+  # ── Rust: test build (the compile happens once, here) ────────────────
+  # OPS-24 S2 / OPS-30: before this, every one of the three `Rust · test N/3`
+  # jobs compiled the whole test workspace before its first test — 8 to 9
+  # minutes each (`Finished test profile … in 9m 02s`, run 43400226518) — and
+  # then ran about 2,600 tests over 191 binaries in 13.5 minutes. The compile
+  # is now paid here, once: this job builds the test binaries and writes them
+  # to a nextest archive, which the partitions download and run.
+  #
+  # Hosted only, and both sides on hosted (S2-D3): 24 uses of
+  # `env!("CARGO_MANIFEST_DIR")` in 17 files bake the build machine's absolute
+  # path into the binaries, and `--workspace-remap` does not change a
+  # compile-time value. Building on the CI worker would need those sites to
+  # read the path at run time first.
+  test-build:
+    name: Rust · test build (compile once)
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
-    strategy:
-      # REL-20 (D4): three partitions. `count:` balances by test count rather
-      # than test name, so the three runners finish at roughly the same time
-      # despite `lakehouse-api`'s unit tests outnumbering every other crate.
-      # `fail-fast: false` keeps all three partitions running to completion
-      # even when one fails, so the `ci-required` sum check always sees three
-      # counts. `needs: test` in `ci-required` fans in on all three, and
-      # `needs.test.result` is the worst of the three (D5).
-      fail-fast: false
-      matrix:
-        # OPS-24 D5: a proven push keeps ONE leg of the matrix, so that the
-        # dependency cache pull requests restore is still refreshed (and
-        # nothing else is); any value but `true` gives the three legs.
-        partition: ${{ fromJSON(needs.changes.outputs.proven == 'true' && '[1]' || '[1, 2, 3]') }}
-    # 60, not 40: the three last green runs of this job on `main` took 39m18s,
-    # 30m07s and 36m12s (runs 40627697997, 40628462938, 40667618267), the
-    # longest took 39m27s (40387475151), and the job was cancelled at the
-    # 40-minute budget in three runs on 2026-10-28 (40634916754, 40673812061,
-    # 40674201583), with every test that ran up to the cancel passing. The
-    # budget is a guard against a hung test, not a speed target; a hang still
-    # ends here.
     timeout-minutes: 60
     # OPS-12: this job links one test binary per file in
     # `rust/crates/lakehouse-api/tests/` (68 of them), each against the whole
@@ -649,10 +640,9 @@ jobs:
 
       # OPS-12: the disk that ran out is the runner's, and the runner ships
       # toolchains this job never uses. Deleting them is free space for the
-      # test binaries; the Postgres image this job needs is pulled by
-      # testcontainers itself later, so nothing this job requires is removed.
-      # `df -h /` before and after prints what the step actually freed, so the
-      # run's log carries the measurement instead of a guess.
+      # test binaries. `df -h /` before and after prints what the step actually
+      # freed, so the run's log carries the measurement instead of a guess.
+      # One disk step, not the two the old `test` job carried.
       - name: Free runner disk
         run: |
           df -h /
@@ -663,58 +653,18 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # PR #186 CI ran out of runner disk twice (`No space left on device`)
-      # once main's sqlx 0.9 build and this branch's extra integration-test
-      # binaries shared the runner. The runner image ships toolchains this job
-      # never uses; removing them frees the space without lowering what is
-      # tested. Docker is left alone: testcontainers needs it.
-      - name: Free runner disk
-        run: |
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-          df -h /
-
-      # OPS-24 D13: the three images the tests start, pulled once here with a
-      # retry around the PULL only (a registry 502 was what failed a run; no
-      # test is ever retried). The tags are the ones the tests name:
-      # postgres:16-alpine (`lakehouse-test-support/src/lib.rs:279`),
-      # clickhouse/clickhouse-server:26.8 (`testcontainers-modules`' default
-      # repository with the tests' `.with_tag("26.8")`) and
-      # axllent/mailpit:v1.33.0 (`lakehouse-api/tests/email_settings_route.rs:52-53`).
-      # A tag that drifts only loses the retry: the test still pulls its own.
-      # The step ends with `docker images`, so it cannot fail the job.
-      # OPS-24 R12: each attempt is bounded by `timeout 180` (a pull that hangs
-      # would otherwise hold the job for its 30-minute limit), and the last
-      # attempt is not followed by a sleep nothing waits for.
-      - name: Pull the test images (the pull is retried, a test never is)
-        if: needs.changes.outputs.proven != 'true'
-        run: |
-          for image in postgres:16-alpine clickhouse/clickhouse-server:26.8 axllent/mailpit:v1.33.0; do
-            for attempt in 1 2 3; do
-              if timeout 180 docker pull --quiet "$image"; then break; fi
-              echo "pull of $image failed (attempt $attempt of 3)"
-              if [ "$attempt" -lt 3 ]; then sleep $((attempt * 10)); fi
-            done
-          done
-          docker images --format '{{.Repository}}:{{.Tag}}' | sort
-
-      # Save on `main` only; see the `clippy` job's `Cache cargo` step.
+      # The cache the old `test` job kept, under the same key. `shared-key`
+      # replaces `key` plus the job name in rust-cache's config.ts, so
+      # `shared-key: stable-test` is still `v0-rust-stable-test-Linux-x64-…`:
+      # the entries `main` already stores are read here, and `main` is still
+      # the only writer (save-if).
       - name: Cache cargo
         id: cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          key: stable
-
-      # Needed by lakehouse-bi's specs_match_typescript drift guard, which
-      # shells out to `bun` to cross-check lakehouse_bi::specs against
-      # src/lib/dashboard-specs.ts. It skips cleanly without bun, but this
-      # job is where it should actually run.
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: "1.3.12"
+          shared-key: stable-test
 
       # REL-20 (D3): cargo-nextest, pinned by full commit SHA with the version
       # in the comment (the `release.yml` convention); `@v2` resolves to
@@ -725,38 +675,42 @@ jobs:
         with:
           tool: cargo-nextest
 
-      # OPS-24 D5: a proven push still compiles the workspace once, but does
-      # not run the tests, because the pull request's run already ran them on
-      # this tree. `rust-cache` saves only when its restore was not an exact
-      # hit, so only then is there something to build; on an exact hit this
-      # step is skipped and the cache is already what the pull requests read.
-      - name: Build the tests without running them (proven push, cache not current)
-        if: needs.changes.outputs.proven == 'true' && steps.cache.outputs.cache-hit != 'true'
-        run: cargo nextest run --workspace --locked --profile ci --no-run
+      # OPS-24 S2: build every test binary once and write the archive the
+      # partitions run (`cargo nextest run --archive-file`). The size is
+      # printed so a regression in it — and so in every partition's download —
+      # is visible in the log.
+      #
+      # OPS-24 D5: a proven push still keeps the cache current, but does not
+      # upload an archive nothing will download. `rust-cache` saves only when
+      # its restore was not an exact hit, so only then is there something to
+      # build; on an exact hit this step is skipped and the cache is already
+      # what the pull requests read.
+      - name: Build the test archive
+        if: needs.changes.outputs.proven != 'true' || steps.cache.outputs.cache-hit != 'true'
+        run: |
+          cargo nextest archive --workspace --locked \
+            --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst"
+          echo "nextest archive: $(stat -c %s "$RUNNER_TEMP/nextest-archive.tar.zst") bytes"
+          ls -l "$RUNNER_TEMP/nextest-archive.tar.zst"
         working-directory: rust
 
-      # ubuntu-latest ships Docker; lakehouse-test-support's integration
-      # tests spin up real Postgres via testcontainers.
-      #
-      # REL-20 (D4): one of three partitions. `--color never` keeps the
-      # summary line parseable (no ANSI); `tee` captures it for the count
-      # step below while `PIPESTATUS` preserves nextest's own exit status.
-      # OPS-24 D5: a proven push does not run the tests at all.
-      - name: cargo nextest run (partition ${{ matrix.partition }}/3)
+      # REL-20 (D3): nextest does not run doctests, so `cargo test --doc`
+      # still does. This workspace's doc comments use only non-Rust fences
+      # (text/bash/json/sh/ignore), so it compiles and runs zero doctests
+      # today, but the guarantee is kept. Run once here, where the toolchain
+      # is, instead of once per partition.
+      # OPS-24 D5: a proven push ran the doctests in the pull request's run.
+      - name: cargo test --workspace --locked --doc (doctests)
         if: needs.changes.outputs.proven != 'true'
-        run: |
-          cargo nextest run --workspace --locked --profile ci --color never \
-            --partition "count:${{ matrix.partition }}/3" 2>&1 | tee nextest.log
-          exit "${PIPESTATUS[0]}"
+        run: cargo test --workspace --locked --doc
         working-directory: rust
 
       # OPS-24 (T5, measured for slice S2): a measurement, not a check. It
-      # prints the disk this job really used (the plan's §0.1 says 86 GB were
-      # free before "Free runner disk") and the size an archive of the test
-      # binaries would have, which is the number S2 starts from. No line of it
-      # may fail the job.
+      # prints the disk this job really used and the size of the test binaries
+      # the archive carries. It moved here with the compile it measures; in
+      # the old job it ran on partition 1. No line of it may fail the job.
       - name: Report disk and test binary sizes (OPS-24, measured for slice S2)
-        if: always() && matrix.partition == 1 && needs.changes.outputs.proven != 'true'
+        if: always() && needs.changes.outputs.proven != 'true'
         run: |
           set +e   # a measurement: no line of it may fail the job
           df -h / || true
@@ -772,37 +726,153 @@ jobs:
           true
         working-directory: rust
 
-      # REL-20 (D3): nextest does not run doctests, so `cargo test --doc`
-      # still does. This workspace's doc comments use only non-Rust fences
-      # (text/bash/json/sh/ignore), so it compiles and runs zero doctests
-      # today, but the guarantee is kept. Run once, on partition 1, so the
-      # doctest compile/run is not triplicated across the three partitions.
-      # OPS-24 D5: a proven push ran the doctests in the pull request's run.
-      - name: cargo test --workspace --locked --doc (doctests)
-        if: matrix.partition == 1 && needs.changes.outputs.proven != 'true'
-        run: cargo test --workspace --locked --doc
+      # One artifact for every partition, one day: per-run scratch, never a
+      # build product anyone fetches later. `compression-level: 0` because the
+      # archive is already zstd (`README` of upload-artifact: the service would
+      # otherwise deflate it a second time for nothing).
+      - name: Upload the test archive
+        if: needs.changes.outputs.proven != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}/nextest-archive.tar.zst
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+  # ── Rust: test partitions (Docker/testcontainers required — Postgres) ──
+  # OPS-24 S2 / OPS-30: these jobs download the archive `test-build` built and
+  # only run it. No Rust toolchain, no cache step and no disk step: the disk
+  # the old job ran out of was filled by the compile this job no longer does
+  # (the runner had 110 GB free after the disk step, `df -h /` in the build
+  # job's log), and `cargo-nextest` runs the binaries directly.
+  test:
+    name: Rust · test ${{ matrix.partition }}/${{ needs.changes.outputs.test_partitions }} (stable)
+    needs: [changes, test-build]
+    # OPS-24 S2/D6: the partitions are skipped on a proven push, where
+    # `test-build` alone keeps the cache current — the pull request's run
+    # already ran these tests on this tree. Before S2 one leg ran to compile.
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true')
+    runs-on: ubuntu-latest
+    strategy:
+      # REL-20 (D4): `count:` balances by test count rather than test name, so
+      # the partitions finish at roughly the same time despite
+      # `lakehouse-api`'s unit tests outnumbering every other crate.
+      # `fail-fast: false` keeps every partition running to completion even
+      # when one fails, so the `ci-required` sum check always sees every
+      # count. `needs: test` in `ci-required` fans in on all of them, and
+      # `needs.test.result` is the worst (D5).
+      #
+      # OPS-30: the legs are 1..M from `scripts/ci/test_partitions.sh`
+      # (repository variable CI_TEST_PARTITIONS, 1 to 6, unset means 3). The
+      # same output is the `--partition` argument's M and the sum check's loop
+      # bound.
+      fail-fast: false
+      matrix:
+        partition: ${{ fromJSON(needs.changes.outputs.test_partition_list) }}
+    # 60, not 40: the three last green runs of the old job on `main` took
+    # 39m18s, 30m07s and 36m12s (runs 40627697997, 40628462938, 40667618267),
+    # the longest took 39m27s (40387475151), and the job was cancelled at the
+    # 40-minute budget in three runs on 2026-10-28 (40634916754, 40673812061,
+    # 40674201583), with every test that ran up to the cancel passing. The
+    # budget is a guard against a hung test, not a speed target; a hang still
+    # ends here.
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # OPS-24 S2: the archive `test-build` uploaded. Downloading it is the
+      # only build-shaped work this job does; it never compiles.
+      - name: Download the test archive
+        uses: actions/download-artifact@v8
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}/nextest-archive
+
+      # OPS-24 D13: the three images the tests start, pulled once here with a
+      # retry around the PULL only (a registry 502 was what failed a run; no
+      # test is ever retried). The tags are the ones the tests name:
+      # postgres:16-alpine (`lakehouse-test-support/src/lib.rs:279`),
+      # clickhouse/clickhouse-server:26.8 (`testcontainers-modules`' default
+      # repository with the tests' `.with_tag("26.8")`) and
+      # axllent/mailpit:v1.33.0 (`lakehouse-api/tests/email_settings_route.rs:52-53`).
+      # A tag that drifts only loses the retry: the test still pulls its own.
+      # The step ends with `docker images`, so it cannot fail the job.
+      # OPS-24 R12: each attempt is bounded by `timeout 180` (a pull that hangs
+      # would otherwise hold the job for its 30-minute limit), and the last
+      # attempt is not followed by a sleep nothing waits for.
+      # OPS-30: the `proven` condition the old step carried is on the job's own
+      # `if:` now, which is where the whole run is excused.
+      - name: Pull the test images (the pull is retried, a test never is)
+        run: |
+          for image in postgres:16-alpine clickhouse/clickhouse-server:26.8 axllent/mailpit:v1.33.0; do
+            for attempt in 1 2 3; do
+              if timeout 180 docker pull --quiet "$image"; then break; fi
+              echo "pull of $image failed (attempt $attempt of 3)"
+              if [ "$attempt" -lt 3 ]; then sleep $((attempt * 10)); fi
+            done
+          done
+          docker images --format '{{.Repository}}:{{.Tag}}' | sort
+
+      # Needed by lakehouse-bi's specs_match_typescript drift guard, which
+      # shells out to `bun` to cross-check lakehouse_bi::specs against
+      # src/lib/dashboard-specs.ts. It skips cleanly without bun, but this
+      # job is where it should actually run.
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.12"
+
+      # The archive is run by the `cargo-nextest` binary directly, not through
+      # `cargo`: a `cargo` line in `rust/` would make rustup resolve
+      # `rust-toolchain.toml` and download a toolchain this job does not need
+      # (`--archive-file` builds nothing).
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: cargo-nextest
+
+      # OPS-24 S2: one partition of the archive. `--workspace-remap` points the
+      # tests at this checkout, which they read fixtures and migrations from;
+      # `--color never` keeps the summary line the count step parses free of
+      # ANSI, and `tee` captures it while `PIPESTATUS` preserves nextest's own
+      # exit status.
+      - name: cargo-nextest nextest run (partition ${{ matrix.partition }}/${{ needs.changes.outputs.test_partitions }})
+        env:
+          PARTITION: ${{ matrix.partition }}
+          TEST_PARTITIONS: ${{ needs.changes.outputs.test_partitions }}
+        run: |
+          cargo-nextest nextest run \
+            --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" \
+            --workspace-remap "$GITHUB_WORKSPACE/rust" \
+            --profile ci --color never \
+            --partition "count:${PARTITION}/${TEST_PARTITIONS}" 2>&1 | tee nextest.log
+          exit "${PIPESTATUS[0]}"
         working-directory: rust
 
       # REL-20 (D4): record this partition's test count (from nextest's
-      # summary line) for the cross-partition sum check in `ci-required`,
-      # and print it in this partition's job summary.
-      # OPS-24 D5: nothing ran, so there is no count to record.
+      # summary line) for the cross-partition sum check in `ci-required`, and
+      # print it in this partition's job summary.
       - name: Record nextest partition count (REL-20)
-        if: always() && needs.changes.outputs.proven != 'true'
+        if: always()
+        env:
+          PARTITION: ${{ matrix.partition }}
+          TEST_PARTITIONS: ${{ needs.changes.outputs.test_partitions }}
         run: |
           count=$(grep -oE '[0-9]+ tests run' nextest.log | head -1 | awk '{print $1}')
           if [ -z "$count" ]; then count=0; fi
-          echo "partition ${{ matrix.partition }}: $count tests run"
-          echo "$count" > "$RUNNER_TEMP/partition-${{ matrix.partition }}.txt"
-          echo "## Nextest partition ${{ matrix.partition }}/3: $count tests" >> "$GITHUB_STEP_SUMMARY"
+          echo "partition ${PARTITION}: $count tests run"
+          echo "$count" > "$RUNNER_TEMP/partition-${PARTITION}.txt"
+          echo "## Nextest partition ${PARTITION}/${TEST_PARTITIONS}: $count tests" >> "$GITHUB_STEP_SUMMARY"
         working-directory: rust
 
       # REL-20 (D4): one artifact per partition (`test-counts-N`):
       # `upload-artifact` v4 and later refuse a second upload under a name
-      # that already exists in the run, so the three cannot share one name.
-      # `ci-required` downloads them by pattern, merges them and sums.
+      # that already exists in the run, so the partitions cannot share one
+      # name. `ci-required` downloads them by pattern, merges them and sums.
       - name: Upload nextest partition count (REL-20)
-        if: always() && needs.changes.outputs.proven != 'true'
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: test-counts-${{ matrix.partition }}
@@ -4169,6 +4239,7 @@ jobs:
       - fmt
       - clippy
       - build
+      - test-build
       - test
       - msrv
       - dagster-unit-tests
@@ -4253,6 +4324,7 @@ jobs:
           RUST_FMT_RESULT: ${{ needs.fmt.result }}
           RUST_CLIPPY_RESULT: ${{ needs.clippy.result }}
           RUST_BUILD_RESULT: ${{ needs.build.result }}
+          RUST_TEST_BUILD_RESULT: ${{ needs.test-build.result }}
           RUST_TEST_RESULT: ${{ needs.test.result }}
           RUST_MSRV_RESULT: ${{ needs.msrv.result }}
           DAGSTER_TESTS_RESULT: ${{ needs.dagster-unit-tests.result }}

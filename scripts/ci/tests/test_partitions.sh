@@ -148,6 +148,24 @@ for output in ("test_partitions", "test_partition_list"):
 if not re.search(r'run: \./scripts/ci/test_partitions\.sh$', ci, re.M):
     problems.append("changes does not run scripts/ci/test_partitions.sh")
 
+# The matrix expands the list. A literal partition array would ignore the
+# variable and, worse, disagree with the sum check's loop bound.
+if not re.search(r'partition: \$\{\{ fromJSON\(needs\.changes\.outputs\.test_partition_list\) \}\}', ci):
+    problems.append("the test matrix does not expand needs.changes.outputs.test_partition_list")
+
+# One leg per partition, numbered against the same count, passed in through
+# env: (no expression inside the run body).
+for output, source in (
+    ("PARTITION", r'\$\{\{ matrix\.partition \}\}'),
+    ("TEST_PARTITIONS", r'\$\{\{ needs\.changes\.outputs\.test_partitions \}\}'),
+):
+    pattern = r'^\s+' + output + r': ' + source + r'$'
+    if not re.search(pattern, ci, re.M):
+        problems.append("the nextest step does not take " + output + " from " + source)
+
+if not re.search(r'--partition "count:\$\{PARTITION\}/\$\{TEST_PARTITIONS\}"', ci):
+    problems.append("the nextest run does not partition count:PARTITION/TEST_PARTITIONS")
+
 if problems:
     sys.stderr.write("\n".join(problems) + "\n")
     sys.exit(1)

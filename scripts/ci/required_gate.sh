@@ -29,7 +29,13 @@
 #   RUST_FMT_RESULT       result of `fmt` job
 #   RUST_CLIPPY_RESULT    result of `clippy` job
 #   RUST_BUILD_RESULT     result of `build` job
-#   RUST_TEST_RESULT      result of `test` job (stable)
+#   RUST_TEST_BUILD_RESULT result of `test-build` job (compiles the test
+#                         archive once, OPS-30). Required with the Rust group,
+#                         also on a proven push: it replaces the compile-only
+#                         leg the `test` job used to run there.
+#   RUST_TEST_RESULT      result of `test` job (the nextest partitions). A
+#                         proven push skips them, so they are excused there
+#                         (OPS-30) and nowhere else.
 #   RUST_MSRV_RESULT      result of `msrv` job (1.99.0)
 #   DAGSTER_TESTS_RESULT  result of `dagster-unit-tests` job
 #   DAGSTER_LOADER_TESTS_RESULT result of `dagster-loader-tests` job
@@ -186,6 +192,15 @@ run_gate() {
     req_gates="false"
   fi
 
+  # OPS-30: `test-build` replaces the compile-only leg the `test` job ran on a
+  # proven push, so the archive job is required there (`req_rust`, which the
+  # proof never excuses) and the partitions are the one Rust job the proof does
+  # excuse. A failure or a cancellation is still an error either way.
+  local req_test="$req_rust"
+  if [ "$push_proven" = "true" ]; then
+    req_test="false"
+  fi
+
   # OPS-25 D7: a gate job is required when its group was selected. The value
   # `changes` writes is `none` or `,<groups>,`; anything else -- unset, empty,
   # a bare `cdc`, a value from another job -- requires every gate, so a broken
@@ -270,7 +285,11 @@ run_gate() {
   check_job "fmt" "${RUST_FMT_RESULT:-skipped}" "$req_rust"
   check_job "clippy" "${RUST_CLIPPY_RESULT:-skipped}" "$req_rust"
   check_job "build" "${RUST_BUILD_RESULT:-skipped}" "$req_rust"
-  check_job "test" "${RUST_TEST_RESULT:-skipped}" "$req_rust"
+  # OPS-30: the archive build compiles once and is required with the Rust
+  # group on every event, a proven push included; the partitions it feeds are
+  # excused on a proven push and only there.
+  check_job "test-build" "${RUST_TEST_BUILD_RESULT:-skipped}" "$req_rust"
+  check_job "test" "${RUST_TEST_RESULT:-skipped}" "$req_test"
   check_job "msrv" "${RUST_MSRV_RESULT:-skipped}" "$req_rust"
 
   # Dagster

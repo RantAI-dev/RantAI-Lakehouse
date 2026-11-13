@@ -41,7 +41,7 @@ expect() {
     unset EVENT_NAME SCOPE_RUST SCOPE_FRONTEND SCOPE_DAGSTER SCOPE_STACK SCOPE_DOCS_ONLY SCOPE_ALL \
           PUSH_PROVEN SELECTED_GATE_GROUPS GATE_PATHS_FILE \
           CHANGES_RESULT REPO_LINTS_RESULT FRONTEND_RESULT RUST_FMT_RESULT RUST_CLIPPY_RESULT \
-          RUST_BUILD_RESULT RUST_TEST_RESULT RUST_MSRV_RESULT DAGSTER_TESTS_RESULT DAGSTER_LOADER_TESTS_RESULT \
+          RUST_BUILD_RESULT RUST_TEST_BUILD_RESULT RUST_TEST_RESULT RUST_MSRV_RESULT DAGSTER_TESTS_RESULT DAGSTER_LOADER_TESTS_RESULT \
           G1_RUSTFS_RESULT G2_SEAWEEDFS_RESULT G3A_DAGSTER_RESULT G3_MAINTENANCE_RESULT \
           G4_CDC_RESULT G4_MYSQL_RESULT G4_MSSQL_RESULT G4_MONGO_RESULT G4_ORACLE_RESULT G10_SSO_RESULT G6_INGEST_RESULT G6_INGEST_OTHER_RESULT G6_ORACLE_RESULT G9_UPLOAD_RESULT G6_ALERTS_RESULT G6_OPS_RESULT G6_CREDENTIALS_RESULT G6_SECRET_MANAGERS_RESULT G6_OAUTH_RESULT G6_DISCOVERY_SCALE_RESULT G6_SAAS_A_RESULT G6_SAAS_B_RESULT GOLD_EXPORT_RESULT G8_GOVERNANCE_RESULT G8_TIME_TRAVEL_RESULT \
           IMAGES_RESULT IMAGE_SMOKE_RESULT
@@ -63,7 +63,7 @@ base_docs_green=(
   EVENT_NAME=pull_request SCOPE_DOCS_ONLY=true
   CHANGES_RESULT=success REPO_LINTS_RESULT=success
   FRONTEND_RESULT=skipped RUST_FMT_RESULT=skipped RUST_CLIPPY_RESULT=skipped
-  RUST_BUILD_RESULT=skipped RUST_TEST_RESULT=skipped RUST_MSRV_RESULT=skipped
+  RUST_BUILD_RESULT=skipped RUST_TEST_BUILD_RESULT=skipped RUST_TEST_RESULT=skipped RUST_MSRV_RESULT=skipped
   DAGSTER_TESTS_RESULT=skipped DAGSTER_LOADER_TESTS_RESULT=skipped G1_RUSTFS_RESULT=skipped G2_SEAWEEDFS_RESULT=skipped
   G3A_DAGSTER_RESULT=skipped G3_MAINTENANCE_RESULT=skipped G4_CDC_RESULT=skipped G4_MYSQL_RESULT=skipped G4_MSSQL_RESULT=skipped G4_MONGO_RESULT=skipped G4_ORACLE_RESULT=skipped G10_SSO_RESULT=skipped
   G6_INGEST_RESULT=skipped G6_INGEST_OTHER_RESULT=skipped G6_ORACLE_RESULT=skipped G9_UPLOAD_RESULT=skipped G6_ALERTS_RESULT=skipped G6_OPS_RESULT=skipped G6_CREDENTIALS_RESULT=skipped G6_SECRET_MANAGERS_RESULT=skipped G6_OAUTH_RESULT=skipped G6_DISCOVERY_SCALE_RESULT=skipped G6_SAAS_A_RESULT=skipped G6_SAAS_B_RESULT=skipped GOLD_EXPORT_RESULT=skipped G8_GOVERNANCE_RESULT=skipped G8_TIME_TRAVEL_RESULT=skipped
@@ -73,7 +73,7 @@ base_docs_green=(
 base_frontend_green=(
   EVENT_NAME=pull_request SCOPE_FRONTEND=true
   CHANGES_RESULT=success REPO_LINTS_RESULT=success FRONTEND_RESULT=success
-  RUST_FMT_RESULT=skipped RUST_CLIPPY_RESULT=skipped RUST_BUILD_RESULT=skipped
+  RUST_FMT_RESULT=skipped RUST_CLIPPY_RESULT=skipped RUST_BUILD_RESULT=skipped RUST_TEST_BUILD_RESULT=skipped
   RUST_TEST_RESULT=skipped RUST_MSRV_RESULT=skipped DAGSTER_TESTS_RESULT=skipped DAGSTER_LOADER_TESTS_RESULT=skipped
   G1_RUSTFS_RESULT=skipped G2_SEAWEEDFS_RESULT=skipped G3A_DAGSTER_RESULT=skipped
   G3_MAINTENANCE_RESULT=skipped G4_CDC_RESULT=skipped G4_MYSQL_RESULT=skipped G4_MSSQL_RESULT=skipped G4_MONGO_RESULT=skipped G4_ORACLE_RESULT=skipped G10_SSO_RESULT=skipped G6_INGEST_RESULT=skipped G6_INGEST_OTHER_RESULT=skipped G6_ORACLE_RESULT=skipped G9_UPLOAD_RESULT=skipped G6_ALERTS_RESULT=skipped G6_OPS_RESULT=skipped G6_CREDENTIALS_RESULT=skipped G6_SECRET_MANAGERS_RESULT=skipped G6_OAUTH_RESULT=skipped G6_DISCOVERY_SCALE_RESULT=skipped G6_SAAS_A_RESULT=skipped G6_SAAS_B_RESULT=skipped
@@ -84,7 +84,7 @@ base_frontend_green=(
 base_rust_green=(
   EVENT_NAME=pull_request SCOPE_RUST=true
   CHANGES_RESULT=success REPO_LINTS_RESULT=success FRONTEND_RESULT=skipped
-  RUST_FMT_RESULT=success RUST_CLIPPY_RESULT=success RUST_BUILD_RESULT=success
+  RUST_FMT_RESULT=success RUST_CLIPPY_RESULT=success RUST_BUILD_RESULT=success RUST_TEST_BUILD_RESULT=success
   RUST_TEST_RESULT=success RUST_MSRV_RESULT=success DAGSTER_TESTS_RESULT=skipped DAGSTER_LOADER_TESTS_RESULT=skipped
   G1_RUSTFS_RESULT=success G2_SEAWEEDFS_RESULT=success G3A_DAGSTER_RESULT=success
   G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G4_MYSQL_RESULT=success G4_MSSQL_RESULT=success G4_MONGO_RESULT=success G4_ORACLE_RESULT=success G10_SSO_RESULT=success G6_INGEST_RESULT=success G6_INGEST_OTHER_RESULT=success G6_ORACLE_RESULT=success G9_UPLOAD_RESULT=success G6_ALERTS_RESULT=success G6_OPS_RESULT=success G6_CREDENTIALS_RESULT=success G6_SECRET_MANAGERS_RESULT=success G6_OAUTH_RESULT=success G6_DISCOVERY_SCALE_RESULT=success G6_SAAS_A_RESULT=success G6_SAAS_B_RESULT=success
@@ -95,7 +95,7 @@ base_rust_green=(
 base_dagster_green=(
   EVENT_NAME=pull_request SCOPE_DAGSTER=true
   CHANGES_RESULT=success REPO_LINTS_RESULT=success FRONTEND_RESULT=skipped
-  RUST_FMT_RESULT=skipped RUST_CLIPPY_RESULT=skipped RUST_BUILD_RESULT=skipped
+  RUST_FMT_RESULT=skipped RUST_CLIPPY_RESULT=skipped RUST_BUILD_RESULT=skipped RUST_TEST_BUILD_RESULT=skipped
   RUST_TEST_RESULT=skipped RUST_MSRV_RESULT=skipped DAGSTER_TESTS_RESULT=success DAGSTER_LOADER_TESTS_RESULT=success
   G1_RUSTFS_RESULT=success G2_SEAWEEDFS_RESULT=success G3A_DAGSTER_RESULT=success
   G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G4_MYSQL_RESULT=success G4_MSSQL_RESULT=success G4_MONGO_RESULT=success G4_ORACLE_RESULT=success G10_SSO_RESULT=success G6_INGEST_RESULT=success G6_INGEST_OTHER_RESULT=success G6_ORACLE_RESULT=success G9_UPLOAD_RESULT=success G6_ALERTS_RESULT=success G6_OPS_RESULT=success G6_CREDENTIALS_RESULT=success G6_SECRET_MANAGERS_RESULT=success G6_OAUTH_RESULT=success G6_DISCOVERY_SCALE_RESULT=success G6_SAAS_A_RESULT=success G6_SAAS_B_RESULT=success
@@ -106,7 +106,7 @@ base_dagster_green=(
 base_stack_green=(
   EVENT_NAME=pull_request SCOPE_STACK=true
   CHANGES_RESULT=success REPO_LINTS_RESULT=success FRONTEND_RESULT=skipped
-  RUST_FMT_RESULT=skipped RUST_CLIPPY_RESULT=skipped RUST_BUILD_RESULT=skipped
+  RUST_FMT_RESULT=skipped RUST_CLIPPY_RESULT=skipped RUST_BUILD_RESULT=skipped RUST_TEST_BUILD_RESULT=skipped
   RUST_TEST_RESULT=skipped RUST_MSRV_RESULT=skipped DAGSTER_TESTS_RESULT=skipped DAGSTER_LOADER_TESTS_RESULT=skipped
   G1_RUSTFS_RESULT=success G2_SEAWEEDFS_RESULT=success G3A_DAGSTER_RESULT=success
   G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G4_MYSQL_RESULT=success G4_MSSQL_RESULT=success G4_MONGO_RESULT=success G4_ORACLE_RESULT=success G10_SSO_RESULT=success G6_INGEST_RESULT=success G6_INGEST_OTHER_RESULT=success G6_ORACLE_RESULT=success G9_UPLOAD_RESULT=success G6_ALERTS_RESULT=success G6_OPS_RESULT=success G6_CREDENTIALS_RESULT=success G6_SECRET_MANAGERS_RESULT=success G6_OAUTH_RESULT=success G6_DISCOVERY_SCALE_RESULT=success G6_SAAS_A_RESULT=success G6_SAAS_B_RESULT=success
@@ -117,7 +117,7 @@ base_stack_green=(
 base_all_green=(
   EVENT_NAME=pull_request SCOPE_ALL=true
   CHANGES_RESULT=success REPO_LINTS_RESULT=success FRONTEND_RESULT=success
-  RUST_FMT_RESULT=success RUST_CLIPPY_RESULT=success RUST_BUILD_RESULT=success
+  RUST_FMT_RESULT=success RUST_CLIPPY_RESULT=success RUST_BUILD_RESULT=success RUST_TEST_BUILD_RESULT=success
   RUST_TEST_RESULT=success RUST_MSRV_RESULT=success DAGSTER_TESTS_RESULT=success DAGSTER_LOADER_TESTS_RESULT=success
   G1_RUSTFS_RESULT=success G2_SEAWEEDFS_RESULT=success G3A_DAGSTER_RESULT=success
   G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G4_MYSQL_RESULT=success G4_MSSQL_RESULT=success G4_MONGO_RESULT=success G4_ORACLE_RESULT=success G10_SSO_RESULT=success G6_INGEST_RESULT=success G6_INGEST_OTHER_RESULT=success G6_ORACLE_RESULT=success G9_UPLOAD_RESULT=success G6_ALERTS_RESULT=success G6_OPS_RESULT=success G6_CREDENTIALS_RESULT=success G6_SECRET_MANAGERS_RESULT=success G6_OAUTH_RESULT=success G6_DISCOVERY_SCALE_RESULT=success G6_SAAS_A_RESULT=success G6_SAAS_B_RESULT=success
@@ -128,7 +128,7 @@ base_all_green=(
 base_push_green=(
   EVENT_NAME=push
   CHANGES_RESULT=success REPO_LINTS_RESULT=success FRONTEND_RESULT=success
-  RUST_FMT_RESULT=success RUST_CLIPPY_RESULT=success RUST_BUILD_RESULT=success
+  RUST_FMT_RESULT=success RUST_CLIPPY_RESULT=success RUST_BUILD_RESULT=success RUST_TEST_BUILD_RESULT=success
   RUST_TEST_RESULT=success RUST_MSRV_RESULT=success DAGSTER_TESTS_RESULT=success DAGSTER_LOADER_TESTS_RESULT=success
   G1_RUSTFS_RESULT=success G2_SEAWEEDFS_RESULT=success G3A_DAGSTER_RESULT=success
   G3_MAINTENANCE_RESULT=success G4_CDC_RESULT=success G4_MYSQL_RESULT=success G4_MSSQL_RESULT=success G4_MONGO_RESULT=success G4_ORACLE_RESULT=success G10_SSO_RESULT=success G6_INGEST_RESULT=success G6_INGEST_OTHER_RESULT=success G6_ORACLE_RESULT=success G9_UPLOAD_RESULT=success G6_ALERTS_RESULT=success G6_OPS_RESULT=success G6_CREDENTIALS_RESULT=success G6_SECRET_MANAGERS_RESULT=success G6_OAUTH_RESULT=success G6_DISCOVERY_SCALE_RESULT=success G6_SAAS_A_RESULT=success G6_SAAS_B_RESULT=success
@@ -142,8 +142,10 @@ base_push_green=(
 base_push_proven_green=(
   EVENT_NAME=push SCOPE_RUST=true PUSH_PROVEN=true
   CHANGES_RESULT=success REPO_LINTS_RESULT=success FRONTEND_RESULT=skipped
-  RUST_FMT_RESULT=success RUST_CLIPPY_RESULT=success RUST_BUILD_RESULT=success
-  RUST_TEST_RESULT=success RUST_MSRV_RESULT=success DAGSTER_TESTS_RESULT=skipped DAGSTER_LOADER_TESTS_RESULT=skipped
+  RUST_FMT_RESULT=success RUST_CLIPPY_RESULT=success RUST_BUILD_RESULT=success RUST_TEST_BUILD_RESULT=success
+  # OPS-30: the partitions are skipped on a proven push; `test-build` above
+  # is the job that keeps the cache current instead.
+  RUST_TEST_RESULT=skipped RUST_MSRV_RESULT=success DAGSTER_TESTS_RESULT=skipped DAGSTER_LOADER_TESTS_RESULT=skipped
   G1_RUSTFS_RESULT=skipped G2_SEAWEEDFS_RESULT=skipped G3A_DAGSTER_RESULT=skipped
   G3_MAINTENANCE_RESULT=skipped G4_CDC_RESULT=skipped G4_MYSQL_RESULT=skipped G4_MSSQL_RESULT=skipped G4_MONGO_RESULT=skipped G4_ORACLE_RESULT=skipped G10_SSO_RESULT=skipped G6_INGEST_RESULT=skipped G6_INGEST_OTHER_RESULT=skipped G6_ORACLE_RESULT=skipped G9_UPLOAD_RESULT=skipped G6_ALERTS_RESULT=skipped G6_OPS_RESULT=skipped G6_CREDENTIALS_RESULT=skipped G6_SECRET_MANAGERS_RESULT=skipped G6_OAUTH_RESULT=skipped G6_DISCOVERY_SCALE_RESULT=skipped G6_SAAS_A_RESULT=skipped G6_SAAS_B_RESULT=skipped
   GOLD_EXPORT_RESULT=skipped G8_GOVERNANCE_RESULT=skipped G8_TIME_TRAVEL_RESULT=skipped
@@ -171,6 +173,10 @@ expect 1 "Skipped MSRV check blocks rust PR" "${base_rust_green[@]}" RUST_MSRV_R
 expect 1 "Failing clippy blocks rust PR" "${base_rust_green[@]}" RUST_CLIPPY_RESULT=failure
 expect 1 "Failing fmt blocks rust PR" "${base_rust_green[@]}" RUST_FMT_RESULT=failure
 expect 1 "Failing build blocks rust PR" "${base_rust_green[@]}" RUST_BUILD_RESULT=failure
+# OPS-30: the archive build is the only compile, so a skipped or failed one
+# must be red on a Rust-scoped pull request.
+expect 1 "Failing test build blocks rust PR" "${base_rust_green[@]}" RUST_TEST_BUILD_RESULT=failure
+expect 1 "Skipped test build blocks rust PR" "${base_rust_green[@]}" RUST_TEST_BUILD_RESULT=skipped
 expect 1 "Failing acceptance blocks rust PR" "${base_rust_green[@]}" G6_INGEST_RESULT=failure
 expect 1 "Failing second half of the ingest gate blocks rust PR" "${base_rust_green[@]}" G6_INGEST_OTHER_RESULT=failure
 expect 1 "Failing Oracle gate blocks rust PR" "${base_rust_green[@]}" G6_ORACLE_RESULT=failure
@@ -231,7 +237,16 @@ expect 0 "Proven push whose gates ran green passes gate" "${base_push_proven_gre
 expect 1 "A failed gate on a proven push blocks gate" "${base_push_proven_green[@]}" G4_CDC_RESULT=failure
 expect 1 "A cancelled gate on a proven push blocks gate" "${base_push_proven_green[@]}" G6_OPS_RESULT=cancelled
 expect 1 "A skipped images job on a proven push blocks gate" "${base_push_proven_green[@]}" IMAGES_RESULT=skipped
-expect 1 "A skipped Rust test job on a proven push blocks gate" "${base_push_proven_green[@]}" RUST_TEST_RESULT=skipped
+# OPS-24 D5/D6 used to say the proof never excuses the `test` job, and one leg
+# ran there to compile. OPS-30 moved the compile to `test-build`, so the
+# partitions are the one Rust job a proven push skips and the archive build is
+# the one it requires. A failed or cancelled leg is still red.
+expect 0 "Skipped Rust test partitions on a proven push pass the gate" "${base_push_proven_green[@]}"
+expect 1 "A failed Rust test job on a proven push blocks gate" "${base_push_proven_green[@]}" RUST_TEST_RESULT=failure
+expect 1 "A cancelled Rust test job on a proven push blocks gate" "${base_push_proven_green[@]}" RUST_TEST_RESULT=cancelled
+expect 1 "A skipped test build on a proven push blocks gate" "${base_push_proven_green[@]}" RUST_TEST_BUILD_RESULT=skipped
+expect 1 "A failed test build on a proven push blocks gate" "${base_push_proven_green[@]}" RUST_TEST_BUILD_RESULT=failure
+expect 1 "Skipped Rust test partitions on a pull request block gate" "${base_push_proven_green[@]}" EVENT_NAME=pull_request
 expect 1 "A skipped clippy job on a proven push blocks gate" "${base_push_proven_green[@]}" RUST_CLIPPY_RESULT=skipped
 expect 1 "Skipped gates on a push that is not proven block gate" "${base_push_proven_green[@]}" PUSH_PROVEN=false
 expect 1 "Skipped gates on a push with no proof value block gate" "${base_push_proven_green[@]}" PUSH_PROVEN=
