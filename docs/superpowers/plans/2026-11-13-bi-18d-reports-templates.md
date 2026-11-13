@@ -300,3 +300,21 @@ this round; it goes to the owner's QA on a preview stack.
   - question 4, the extra input limits and list caps. The planner adds them to the feature page's
     limits.
 - **Verification:** the reviewer re-runs the full block on the final commit before the PR.
+
+### Fixes, round 1 (developer, 2026-11-13)
+
+- `a09a126c`, **BLOCKER 1**:
+  - Saving a template now runs the dashboard file export's checks in its order: the board must be visible (else the same 404), then `require_download`, then `edit` on the source dashboard.
+  - The console hides "Save as template…" when downloads are off.
+  - Test `saving_a_template_follows_the_dashboard_file_checks_then_needs_edit`: a hidden board gives the 404 with downloads off or on; downloads off gives the download refusal; view without edit gives 403; nothing is saved.
+- `7bb9fc76`, **SHOULD-FIX 2**:
+  - `list_reports` is a read: `dashboard:read`, `Reach::Anywhere`, through `dashboard_reports::readable_reports`, the list route's own function.
+  - The report page sends its id and title as page context (`buildReportPageContext`).
+  - `tool_schemas.json` regenerated: 122 tools.
+- **Scoped checks.** Each cargo command ran through the lock with one job, in `/home/hv/.cache/lakehouse-bi18d-target`, and the test executables were deleted afterwards.
+  - `cargo fmt --check`: OK. `cargo clippy -p lakehouse-api --all-targets -- -D warnings`: OK.
+  - The fixture test: 1 passed.
+  - `cargo test -p lakehouse-api --lib`: 3645 passed and 3 failed on a ClickHouse testcontainer `StartupTimeout`. A rerun of `--lib registry_clash` passed 23, those 3 included.
+  - `--test ai_written_tools`: 7. `--test dashboard_reports`: 13. `--test dashboard_templates`: 7. `--test route_auth`: 98.
+  - `bun run typecheck`: OK. `bun run lint`: 0 errors, the same 11 warnings in files this slice does not touch. `bun run test`: 4397 pass, 0 fail.
+- **Not run:** the batched workspace test (PID 1136608). I stopped it by PID after `lakehouse-alerts`, `lakehouse-bi`, `lakehouse-clickhouse` and `lakehouse-core` had passed, so the lock was free for these checks. The reviewer runs the full block.
