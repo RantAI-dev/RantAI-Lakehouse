@@ -21,11 +21,6 @@ import type { AssetDetail, AssetGrant } from "@/services/contracts/assets"
 /** The permissions a grant from this page may carry: the three a user can request. */
 const GRANTABLE = ["catalog:write", "lineage:read", "query:read"] as const
 
-/** The server's sentence, without the `permission_denied: ` its 403 body carries. */
-function sentence(message: string): string {
-  return message.replace(/^permission_denied:\s*/, "")
-}
-
 /**
  * The Access tab's Grants card (`DATA-15` F3), for a holder of
  * `access:approve`: the grants made from this asset, a form to give a user a
@@ -146,7 +141,7 @@ export function AssetGrants({ asset: a }: { asset: AssetDetail }) {
       </form>
       {grant.status === "error" ? (
         <p role="alert" className="mt-2 text-sm text-destructive">
-          {sentence(grant.error.message)}
+          {grant.error.message}
         </p>
       ) : null}
       <ConfirmActionDialog

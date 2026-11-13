@@ -6,12 +6,14 @@ import type {
   FormulaFunction,
 } from "../contracts/calc-fields"
 import { apiFetch } from "../http"
-import { ServiceError } from "../errors"
+import { ServiceError, deniedFor } from "../errors"
 
 /**
  * CalcFieldService over `/api/dashboard/calc-fields`. A non-OK answer
  * becomes a `ServiceError` carrying the server's sentence (already fixed and
- * free of database text), 409 and 422 as `invalid_request`.
+ * free of database text), 409 and 422 as `invalid_request`. A 401 or 403 goes
+ * through `deniedFor` (`errors.ts`), so a refusal is the sentence that names
+ * the missing permission.
  */
 
 function sourceQuery(source: CalcFieldSource): string {
@@ -24,14 +26,15 @@ async function call<T>(url: string, init: RequestInit, fallback: string): Promis
   const res = await apiFetch(url, init)
   const json = await res.json().catch(() => null)
   if (!res.ok) {
+    // QA LH-BI-8-04 (WEB-11): a missing dashboard:write read "permission_denied: dashboard:write".
+    const denied = deniedFor(res.status, json)
+    if (denied) throw denied
     const kind =
-      res.status === 401 || res.status === 403
-        ? "permission_denied"
-        : res.status === 404
-          ? "not_found"
-          : res.status >= 500
-            ? "unavailable"
-            : "invalid_request"
+      res.status === 404
+        ? "not_found"
+        : res.status >= 500
+          ? "unavailable"
+          : "invalid_request"
     throw new ServiceError(kind, json?.error ?? fallback)
   }
   return json as T
