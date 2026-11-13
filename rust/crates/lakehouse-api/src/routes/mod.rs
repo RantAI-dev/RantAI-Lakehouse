@@ -49,6 +49,7 @@ pub mod dashboard_comments;
 mod dashboard_file;
 mod dashboard_folders;
 pub(crate) mod dashboard_organise;
+pub(crate) mod dashboard_reports;
 mod dashboard_sources;
 pub(crate) mod drill;
 mod embed;
@@ -304,6 +305,11 @@ fn limit_bearing(path: &str) -> bool {
 fn is_board_path(path: &str) -> bool {
     path == "/api/dashboard"
         || path == "/api/render/data"
+        // BI-18 part D (T1): reading a report reads up to 30 charts, each
+        // under the board deadline of its own dashboard read.
+        || path
+            .strip_prefix("/api/dashboard/reports/")
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'))
         || path == "/api/embed/data"
         || path
             .strip_prefix("/api/public/dashboard/")
@@ -1624,6 +1630,17 @@ pub fn router(state: AppState) -> Router {
             get(lineage::charts::chart_lineage),
         )
         .route("/api/dashboard/export/pdf", get(pdf_export::export_pdf))
+        // BI-18 part D (T1): reports, written pages with live charts.
+        .route(
+            "/api/dashboard/reports",
+            get(dashboard_reports::list).post(dashboard_reports::create),
+        )
+        .route(
+            "/api/dashboard/reports/{id}",
+            get(dashboard_reports::get)
+                .put(dashboard_reports::update)
+                .delete(dashboard_reports::delete),
+        )
         .route("/api/dashboard/embed-info", get(dashboard::embed_info))
         .route("/api/embed/data", axum::routing::post(embed::data))
         .route("/api/render/data", axum::routing::post(render::data))

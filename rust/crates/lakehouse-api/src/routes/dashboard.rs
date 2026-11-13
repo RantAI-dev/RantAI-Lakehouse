@@ -108,6 +108,19 @@ impl DashboardQuery {
         }
     }
 
+    /// The query one chart block of a report reads its chart with (`BI-18`
+    /// part D, R1): the chart's dashboard with its saved filters, parameters
+    /// and grain, and only that chart ([`Self::only_chart`]). Not strict: a
+    /// saved parameter value that no longer fits is that tile's sentence, as on
+    /// the dashboard page.
+    pub(crate) fn for_report(board: &str, chart: &str) -> Self {
+        Self {
+            board: Some(board.to_owned()),
+            ..Self::default()
+        }
+        .only_chart(chart)
+    }
+
     /// The same read with every tile computed and its entry replaced
     /// (`fresh=1`). For a caller that decides something from the numbers *now*
     /// (the report runner's "skip when empty"): a remembered answer within the

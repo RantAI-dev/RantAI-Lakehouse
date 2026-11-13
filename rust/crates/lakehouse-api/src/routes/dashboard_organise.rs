@@ -727,6 +727,13 @@ pub async fn trash_list(
     let items = trash::list_trash(&state.clickhouse, &viewer)
         .await
         .map_err(|err| classify_ch_error(&err))?;
+    // BI-18 part D (T1): deleted reports are in the same trash, for the same
+    // 30 days, with the same visibility as their folder.
+    let mut items: Vec<Value> = items
+        .iter()
+        .map(|item| serde_json::to_value(item).unwrap_or(Value::Null))
+        .collect();
+    items.extend(crate::routes::dashboard_reports::trash_items(&state, &viewer).await?);
     Ok(ApiJson(
         json!({ "items": items, "retentionDays": trash::RETENTION_DAYS }),
     ))
@@ -764,6 +771,13 @@ pub async fn trash_restore(
     let ch = &state.clickhouse;
     // BI-19 B1 review R5: the resolved viewer, so a restricted dashboard is a 404.
     let scope = crate::routes::dashboard_access::scope_for_write(&state, &principal).await?;
+    // BI-18 part D (T1): a report comes back into its folder with `manage`
+    // there, as a dashboard does.
+    if body.kind.trim() == "report" {
+        let restored =
+            crate::routes::dashboard_reports::restore_from_trash(&state, &scope, id).await?;
+        return Ok(ApiJson(json!({ "ok": true, "restored": restored })));
+    }
     let viewer = scope.viewer.clone();
     // BI-19 B2 (plan D8): bringing a dashboard back undoes a delete, so it is
     // `manage`; a chart comes back with `edit` on its dashboard. The trashed
@@ -808,7 +822,9 @@ pub async fn trash_restore(
         Some(Kind::Board) => trash::restore_board(ch, id, &viewer).await,
         Some(Kind::Chart) => trash::restore_chart(ch, id, &viewer).await,
         None => {
-            return Err(ApiError::BadRequest("kind must be board or chart.".to_owned()).into());
+            return Err(
+                ApiError::BadRequest("kind must be board, chart or report.".to_owned()).into(),
+            );
         }
     }
     .map_err(|err| match err {

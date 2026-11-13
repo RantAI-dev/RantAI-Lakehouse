@@ -3088,6 +3088,91 @@ async fn history_trash_personal_space_favourites_and_search_have_the_right_permi
     }
 }
 
+/// `BI-18` part D (T1, feature R2 and `BI-18D-AC8`): reading reports is
+/// "signed in" at the router and `dashboard:read` (or a rule) in the handler;
+/// writing them needs `dashboard:write` at the router. Asserted both ways for
+/// every route: the right principal gets past the gate, the one holding only
+/// the other permission is refused, and so is one holding neither.
+#[tokio::test]
+async fn report_routes_need_dashboard_read_to_read_and_dashboard_write_to_write() {
+    let TestApp { router, pool } = spin_up().await;
+    let reader = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let reader = common::session_cookie_for_user(&pool, reader).await;
+    let writer = common::create_principal_with_permissions(&pool, "dashboard:write").await;
+    let writer = common::session_cookie_for_user(&pool, writer).await;
+    let neither = common::create_principal_with_permissions(&pool, "query:read").await;
+    let neither = common::session_cookie_for_user(&pool, neither).await;
+    let id = Uuid::new_v4();
+    for (method, pattern, uri, needs) in [
+        (
+            "GET",
+            "/api/dashboard/reports",
+            "/api/dashboard/reports".to_owned(),
+            "dashboard:read",
+        ),
+        (
+            "POST",
+            "/api/dashboard/reports",
+            "/api/dashboard/reports".to_owned(),
+            "dashboard:write",
+        ),
+        (
+            "GET",
+            "/api/dashboard/reports/{id}",
+            format!("/api/dashboard/reports/{id}"),
+            "dashboard:read",
+        ),
+        (
+            "PUT",
+            "/api/dashboard/reports/{id}",
+            format!("/api/dashboard/reports/{id}"),
+            "dashboard:write",
+        ),
+        (
+            "DELETE",
+            "/api/dashboard/reports/{id}",
+            format!("/api/dashboard/reports/{id}"),
+            "dashboard:write",
+        ),
+    ] {
+        assert_eq!(
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == method && *p == pattern)
+                .map(|(_, _, policy)| *policy),
+            Some(if needs == "dashboard:read" {
+                Policy::RequiresAuth
+            } else {
+                Policy::RequiresPermission(needs)
+            }),
+            "{method} {pattern}"
+        );
+        let (allowed, other) = if needs == "dashboard:read" {
+            (&reader, &writer)
+        } else {
+            (&writer, &reader)
+        };
+        let resp = request_with_cookie(&router, method, &uri, allowed).await;
+        assert!(
+            resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+            "{method} {uri}: the right principal must get past the gate, got {}",
+            resp.status()
+        );
+        let resp = request_with_cookie(&router, method, &uri, other).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {uri} (other)"
+        );
+        let resp = request_with_cookie(&router, method, &uri, &neither).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {uri} (neither)"
+        );
+    }
+}
+
 /// BI-19 part B1 (plan D8): the reads a person needs to see a dashboard are
 /// `RequiresAuth` at the router and refuse in the handler. Asserted both ways
 /// for every moved row: a principal with no `dashboard:read` and no rule is
