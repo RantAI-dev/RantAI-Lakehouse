@@ -1122,4 +1122,209 @@ None of these blocks the plan.
 
 ## 5. Handoff
 
+Base `d3a2c42f`; branch `fix/qa-round-data-p4`; one commit per task, pushed after
+each. Migration number used: **`0141`** (`rust/migrations/0141_upload_table_drop.sql`);
+`ls rust/migrations | tail -3` showed `0138`–`0140` before it, so `0141` was free.
+
+### Commits
+
+| Task | Commit | Title |
+| --- | --- | --- |
+| T1 | `ed9e0012` | feat(store): the record of a dropped table (T1) |
+| T2 | `7d22410e` | feat(auth): the admin client can drop a table (T2) |
+| T3 | `d27f89d1` | feat(api): the drop status says whether a table may be dropped (T3) |
+| T4 | `4d037b7a` | feat(api): drop a table made by an upload (T4) |
+| T5 | `2ece7b0d` | feat(api): the restore asks table access, audits first and clears the record (T5) |
+| T6 | `4fb64cc2` | feat(api): a load into a dropped table's name is refused while it can be restored (T6) |
+| T7 | `947baca7` | feat(api): the list of dropped tables (T7) |
+| T8 | `911aed0f` | test(g9): the gate drops and restores an uploaded table (T8) |
+| T9 | `4306cc3c` | feat(console): the contract and client for the drop routes (T9) |
+| T10 | `9dad6930` | feat(console): Drop table on the table's page (T10) |
+| T11 | `13cf7592` | feat(console): the Catalog lists the dropped tables (T11) |
+| T12 | `a4c751e0` | docs: the drop, in the spec, the feature page and the changelog (T12) |
+
+### Tests added or changed, by name
+
+- `rust/crates/lakehouse-store/tests/uploads.rs` (+6):
+  `a_drop_is_recorded_once_and_a_second_one_inside_the_window_is_not`,
+  `a_drop_whose_window_has_passed_no_longer_counts_and_the_next_one_replaces_it`,
+  `forgetting_a_drop_removes_it_and_says_whether_there_was_one`,
+  `the_dropped_list_is_the_given_tenants_unexpired_drops_newest_first`,
+  `a_drop_whose_tenant_is_gone_is_listed_for_nobody_and_still_closes_the_name`,
+  `loading_into_lists_only_the_uploads_loading_into_that_table`.
+- `rust/crates/lakehouse-auth/tests/openfga.rs` (+3):
+  `drop_table_sends_one_delete_to_that_warehouses_catalog_path_with_no_query`,
+  `drop_table_is_false_for_a_table_that_is_not_there_and_classifies_the_other_refusals`,
+  `drop_table_sends_nothing_for_a_name_that_is_not_a_plain_identifier`.
+- `rust/crates/lakehouse-api/src/policy.rs` (+3 unit tests):
+  `the_drop_status_needs_governance_write`, `dropping_a_table_needs_governance_write`,
+  `the_dropped_list_needs_catalog_read`.
+- `rust/crates/lakehouse-api/tests/catalog_restore.rs` (+7 for the status read):
+  `the_drop_status_names_an_uploads_table_and_counts_its_rows_only_when_asked`,
+  `the_drop_status_says_null_when_the_rows_cannot_be_counted_and_never_zero`,
+  `the_drop_status_refuses_every_table_that_is_not_an_upload_of_the_callers_tenant_with_one_sentence`,
+  `the_drop_status_of_a_table_the_callers_role_does_not_read_is_the_unknown_assets_404`,
+  `the_drop_status_says_a_load_is_in_progress`,
+  `without_the_admin_client_the_drop_status_says_dropping_is_not_set_up`,
+  `the_drop_status_of_a_dropped_table_says_it_is_already_dropped` (the seventh
+  covers D4 rule 4 / D5's "already dropped" row, which the task's list omitted but
+  D5 requires every refusal to be tested);
+  (+11 for the drop) `a_permitted_person_drops_an_uploads_table_and_the_catalog_is_asked_once`,
+  `the_drop_writes_who_dropped_which_table_and_its_row_count_to_the_audit_trail`,
+  `a_second_drop_of_a_dropped_table_is_a_409_and_the_catalog_is_not_asked_again`,
+  `a_table_that_is_not_an_upload_of_the_callers_tenant_is_not_dropped_and_the_catalog_is_not_asked`,
+  `a_table_with_a_load_in_progress_is_not_dropped`,
+  `a_caller_whose_role_does_not_read_the_table_cannot_drop_it_and_learns_nothing`,
+  `a_drop_is_refused_when_its_audit_entry_cannot_be_written`,
+  `a_drop_is_refused_when_the_seven_day_keep_cannot_be_confirmed`,
+  `a_catalog_that_does_not_answer_the_drop_leaves_no_record_and_no_upstream_text`,
+  `a_catalog_that_refuses_the_drop_or_has_no_such_table_is_a_409_with_no_upstream_text`,
+  `without_the_admin_client_nothing_is_dropped`;
+  (+4 for the restore) `restoring_a_table_dropped_from_the_console_clears_its_record`,
+  `a_restore_is_refused_when_its_audit_entry_cannot_be_written`,
+  `a_failed_undrop_keeps_the_record_and_writes_a_failed_audit_entry`,
+  `a_caller_whose_role_does_not_read_the_table_cannot_restore_it`;
+  (+2 for the list) `the_dropped_list_shows_the_callers_tenants_unexpired_tables_they_may_read_with_when_each_expires`,
+  `a_table_is_listed_after_its_drop_and_gone_from_the_list_after_its_restore`;
+  (changed) `a_table_dropped_inside_its_window_is_reported_restorable_and_undropped`
+  now asserts one `allowed` and one `executed` row (two queries), per D8 — a
+  stronger assertion, not a weaker one.
+- `rust/crates/lakehouse-api/tests/upload_routes.rs` (+2):
+  `a_load_into_a_table_that_was_dropped_and_can_still_be_restored_is_409_and_claims_marks_and_launches_nothing`,
+  `once_the_restore_window_has_passed_the_name_takes_a_new_load`.
+- `rust/crates/lakehouse-api/tests/route_auth.rs` (+1):
+  `a_seeded_data_engineer_is_denied_the_drop_and_its_status`.
+- `ops/g9/upload_test.py`: `step_drop_and_restore` (T8).
+- `src/services/clients/assets.test.ts` (+5, in `describe("clickhouseAssetService: dropping a table")`):
+  "asks for the drop status without a count, and with one only when asked";
+  "posts the drop and returns what the API says was dropped"; "throws the API's
+  sentence as an invalid_request on a 409"; "throws permission_denied with the
+  permission named on a 403"; "reads the dropped tables, and an answer without a
+  list as none".
+- `src/features/catalog/asset-drop.test.tsx` (new, 6): "names the table and its
+  counted rows before the drop can be confirmed"; "says the rows could not be
+  counted, and never shows 0"; "offers nothing for a table that was not made by an
+  upload"; "says how many saved queries and dashboards that the reader can open
+  read the table"; "sends the drop once, says until when the table can be restored,
+  and reloads the table"; "shows the server's sentence when the drop is refused,
+  and stays open".
+- `src/features/catalog/asset-detail-tabs.test.tsx` (+2): "offers Drop table on the
+  Snapshots card for a table an upload made"; "offers no Drop table, and asks the
+  API nothing about it, without governance:write".
+- `src/features/catalog/dropped-tables.test.tsx` (new, 5): "lists each dropped table
+  with who dropped it, its rows and the days it has left, and links to its page";
+  "says the rows were not counted rather than 0"; "says less than a day is left on
+  the last day"; "shows nothing when no table is dropped"; "says so when the list
+  could not be read".
+
+Each task's first test was run once against the code before its fix (the fix
+stashed), and failed:
+
+- T1: `error[E0432]: unresolved imports ... NewTableDrop, dropped_table,
+  forget_table_drop, list_dropped_tables, loading_into, record_table_drop`.
+- T2: `error[E0599]: no method named drop_table ... on LakekeeperAdminClient`.
+- T3: `404 ... {"error":"No such address."}` for `GET /api/catalog/orders/drop`.
+- T4: `POST /api/catalog/orders/drop` answered 405 (the route had only `GET`).
+- T5: `restoring_a_table_dropped_from_the_console_clears_its_record`: "the record is
+  gone after the restore" failed — the record was still there.
+- T6: the ingest answered `200` where the test expects `409`.
+- T7: the list test failed (the route did not exist).
+- T9: 5 of 17 failed with `clickhouseAssetService.listDroppedTables is not a
+  function`.
+- T10: the new test file could not import `./asset-drop` (module not found).
+- T11: the new test file could not import `./dropped-tables` (module not found).
+- T8 has no local test binary (Python gate); its proof is CI.
+
+### Commands run, with their counts
+
+Per commit (from `rust/`, `CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-1`,
+`CARGO_BUILD_JOBS=6`, plain `cargo`):
+
+| Task | Runs |
+| --- | --- |
+| T1 | `cargo fmt --check` OK · `cargo clippy -p lakehouse-store --all-targets -- -D warnings` OK · `cargo test -p lakehouse-store --test uploads` **69 passed, 0 failed** |
+| T2 | `cargo fmt --check` OK · `cargo clippy -p lakehouse-auth --all-targets -- -D warnings` OK · `cargo test -p lakehouse-auth --test openfga` **18 passed** |
+| T3 | clippy `-p lakehouse-api` OK · `--lib the_drop_status_needs_governance_write` **1 passed** · `--lib routes::route_policy_tests` **5 passed** · `--test catalog_restore` **16 passed** · `--test sec11_guard` **4 passed** · `--test route_auth` **94 passed** |
+| T4 | clippy `-p lakehouse-auth -p lakehouse-api` OK · `--lib dropping_a_table_needs_governance_write` **1** · `--lib routes::route_policy_tests` **5** · `--test catalog_restore` **27** · `--test permission_catalog` **2 passed, 1 ignored** (the fixture writer is `#[ignore]` by design) · `--test sec11_guard` **4** · `--test route_auth` **95** |
+| T5 | clippy OK · `--test catalog_restore` **31** · `--test sec11_guard` **4** · `--test route_auth` **95** |
+| T6 | clippy OK · `--test upload_routes` **178** · `--test sec11_guard` **4** · `--test route_auth` **95** |
+| T7 | clippy OK · `--lib the_dropped_list_needs_catalog_read` **1** · `--lib routes::route_policy_tests` **5** · `--test catalog_restore` **33** · `--test sec11_guard` **4** · `--test route_auth` **95** |
+| T8 | `python3 -m py_compile ops/g9/upload_test.py` OK |
+| T9 | `bun install --frozen-lockfile` (779 installs, no changes) · `bun run typecheck` OK · `bun run lint` 0 errors, 11 warnings (all pre-existing) · `bun test src/services/clients/assets.test.ts` **17 passed** |
+| T10 | `bun run typecheck` OK · `bun run lint` 0 errors · `bun test src/features/catalog/asset-drop.test.tsx` **6 passed** · `bun test src/features/catalog/asset-detail-tabs.test.tsx` **169 passed** · `bun test src/features/connectors/uploads-panel.test.tsx` **29 passed** |
+| T11 | `bun run typecheck` OK · `bun run lint` 0 errors · `bun test src/features/catalog/dropped-tables.test.tsx` **5 passed** · `bun test src/features/catalog/catalog-page.test.tsx` **10 passed** (unchanged) |
+| T12 | docs only: `python3 ops/lint/check_bare_iceberg_count.py` and `check_intra_package_imports.py` OK |
+
+`python3 ops/lint/check_bare_iceberg_count.py` and `.../check_intra_package_imports.py`
+were run before every commit and both passed every time.
+
+Before handoff, on `a4c751e0`, in the foreground:
+
+```text
+cd rust && cargo fmt --check                                   OK
+cargo clippy -p lakehouse-store -p lakehouse-auth -p lakehouse-api --all-targets -- -D warnings   OK
+cargo test -p lakehouse-store --test uploads                    69 passed, 0 failed
+cargo test -p lakehouse-auth --test openfga                     18 passed, 0 failed
+cargo test -p lakehouse-api --lib routes::route_policy_tests     5 passed, 0 failed
+cargo test -p lakehouse-api --lib policy::                      32 passed, 0 failed
+cargo test -p lakehouse-api --test catalog_restore              33 passed, 0 failed
+cargo test -p lakehouse-api --test upload_routes               178 passed, 0 failed
+cargo test -p lakehouse-api --test permission_catalog            2 passed, 1 ignored
+cargo test -p lakehouse-api --test sec11_guard                   4 passed, 0 failed
+cargo test -p lakehouse-api --test route_auth                   95 passed, 0 failed
+python3 -m py_compile ops/g9/upload_test.py                     OK
+bun run typecheck                                              OK
+bun run lint                                                   0 errors, 11 warnings (pre-existing)
+bun run test                                                   4206 passed, 1 skipped, 0 failed (388 files)
+python3 ops/lint/check_bare_iceberg_count.py                    OK
+python3 ops/lint/check_intra_package_imports.py                 OK
+git status                                                     clean
+```
+
+### Not verified
+
+- **`cargo test --workspace`**: *not verified locally* — per section 3a and
+  AGENTS.md, the full workspace run is CI's on the pull request.
+- **The `g9-upload` gate**: *not verified locally, CI*. `py_compile` passed; the
+  step's proof (that the catalog's admin identity may drop a `dlt`-made table and
+  that it comes back) is the `g9-upload` job on the pull request.
+- **The feature page's spec row** reads **"Built, not proven against the catalog"**,
+  not "Met in code": the `g9-upload` job has not run on the pull request yet.
+- **Compose**: no compose file changed, so no `docker compose` check.
+- **`docker ps -a`** was checked before the first `cargo test --test` run: one
+  `postgres:16-alpine` was already up (`24d7d1d1667e`, up 8 h, not mine). At the
+  end, testcontainer leftovers were present (`0eccdc83`, `3051b903`, `f7c5e3e2`
+  ClickHouse; `7d1ee824`, `4c6f2a2b` Postgres); I could not tell which of them my
+  runs started on this shared machine, so I removed none rather than risk another
+  agent's.
+
+### MISMATCH
+
+- **MISMATCH (T3/T4 tests): the seeded connector already targets `orders`.** The
+  task's third status test says to `UPDATE connector SET source_objects = …` on the
+  seeded `conn-pg-lakehouse` "with `"target":"orders"`", implying the seed did
+  not target it. `0034_seed_connector_ingest_spec.sql` seeds
+  `[{"name":"ingest_demo.orders",…,"target":"orders"}]`, so every `orders` asset
+  is a connector's table on a fresh database, and every case was refused by D4
+  rule 3. I did not change a decision: `drop_app` in `tests/catalog_restore.rs`
+  clears that seed's `source_objects` (with a comment saying why), and the one
+  test that asserts the connector rule writes the target back.
+- **MISMATCH (counts): the per-file base counts in section 3 are one higher than
+  this branch has.** Measured here: `--test uploads` 63 base + 6 = 69 (plan: 71);
+  `--test openfga` 15 + 3 = 18 (plan: 19); `--test catalog_restore` 8 base + 24 new
+  (7 status + 11 drop + 4 restore + 2 list) + 1 `tls_proxy` = 33 (the plan's
+  numbers add up to 31 + 1; the seventh status test is the difference);
+  `--test upload_routes`
+  175 + 2 + 1 `tls_proxy` = 178 (plan: 177); `--test route_auth` 93 base + 2 = 95
+  (plan: 93 then 94 — the table-driven sweep adds one case per new `POLICY_TABLE`
+  row, and there are two new rows now). CI is the final word.
+- **Note (not a mismatch): `daysLeft` cannot return 0 before expiry.** It is
+  `Math.ceil`, so a table with an hour left reads "1 day left"; 0 (and so D15's
+  "less than a day left") is only reachable at or after `expiresAt`. Implemented as
+  D15 says, with `daysLeft` as the one definition of that arithmetic; the test pins
+  `expiresAt` to `now`.
+- **Note: the R11 lint reads doc comments.** A doc sentence containing the text
+  `count (` next to `bronze.` is flagged; one comment in `catalog_drop.rs` was
+  re-worded (no predicate added, no test or threshold changed).
+
 ## 6. Review
