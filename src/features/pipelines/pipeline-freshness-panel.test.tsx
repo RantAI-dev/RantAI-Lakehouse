@@ -239,6 +239,37 @@ describe("PipelineFreshnessPanel authorization and controls", () => {
     }
   })
 
+  // QA LH-BLD-2-03 F1 (WEB-11): the panel would print `permission_denied:
+  // pipeline:write`; a refusal is the sentence that names the permission.
+  it("says a refused target lag in words, not the API's code", async () => {
+    const p = makePipeline()
+    const originalFetch = global.fetch
+    global.fetch = mock(
+      async () =>
+        new Response(JSON.stringify({ error: "permission_denied: pipeline:write" }), {
+          status: 403,
+          headers: { "Content-Type": "application/json" },
+        })
+    ) as unknown as typeof fetch
+
+    try {
+      render(<PipelineFreshnessPanel pipeline={p} />)
+
+      fireEvent.click(screen.getByLabelText("Configure target lag"))
+      const form = screen.getByText("Save target lag").closest("form")!
+      fireEvent.submit(form)
+
+      await waitFor(() => {
+        expect(
+          screen.getByText("You don't have access. This needs the pipeline:write permission.")
+        ).toBeTruthy()
+      })
+      expect(document.body.textContent ?? "").not.toMatch(/permission_denied/)
+    } finally {
+      global.fetch = originalFetch
+    }
+  })
+
   it("surfaces honest API error text on rejection", async () => {
     const p = makePipeline()
     const orig = pipelineService.setTargetLag

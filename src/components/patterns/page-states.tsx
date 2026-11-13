@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { cn } from "@/lib/utils"
 import { buildErrorDescription } from "@/lib/notify-message"
+import { ASK_ADMIN, deniedDetail, isDeniedText } from "@/services/errors"
 import type { ServiceError } from "@/services/errors"
 
 function StateShell({
@@ -83,8 +84,10 @@ export function ErrorState({
   onRetry?: () => void
   className?: string
 }) {
-  if (error.code === "permission_denied") {
-    return <PermissionState className={className} />
+  // QA LH-BLD-2-03, TC-1724 (WEB-11 D7): a refusal a client still files as an
+  // outage or a bad request is a refusal here.
+  if (error.code === "permission_denied" || isDeniedText(error.message)) {
+    return <PermissionState error={error} className={className} />
   }
   return (
     <StateShell
@@ -109,12 +112,17 @@ export function ErrorState({
 }
 
 /** Shown when the current identity is not allowed to view a resource. */
-export function PermissionState({ className }: { className?: string }) {
+export function PermissionState({ error, className }: { error?: ServiceError; className?: string }) {
+  const detail = error ? deniedDetail(error) : ""
   return (
     <StateShell
       icon={<Lock className="size-5" aria-hidden />}
       title="You don't have access"
-      description="Your role does not permit viewing this resource. Request access from a workspace administrator."
+      description={
+        detail === ""
+          ? "Your role does not permit viewing this resource. Request access from a workspace administrator."
+          : `${detail} ${ASK_ADMIN}`
+      }
       className={className}
     />
   )
