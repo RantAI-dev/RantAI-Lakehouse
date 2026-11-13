@@ -182,6 +182,47 @@ async fn sent_to_clickhouse(ch: &MockServer) -> Vec<String> {
         .collect()
 }
 
+/// A session for a person outside the tenant that owns the shared catalog:
+/// `governance:write,governance:read`, a member of seeded tenant 2, which no
+/// deployment here names as the catalog's (`GOV-15`; the block the `GOV-12`
+/// tests write inline).
+async fn outsider(pool: &PgPool) -> String {
+    let outsider =
+        create_principal_with_permissions(pool, "governance:write,governance:read").await;
+    // Seeded tenant 2, not the one the catalog names.
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(outsider)
+        .bind(
+            "11111111-1111-4111-8111-000000000002"
+                .parse::<uuid::Uuid>()
+                .unwrap(),
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    session_cookie_for_user(pool, outsider).await
+}
+
+/// A session for a person in the catalog's tenant whose only role reads
+/// `silver.orders` (`GOV-15`; the block the `GOV-12` tests write inline).
+async fn narrowed(pool: &PgPool) -> String {
+    let user = create_principal_with_permissions(pool, "governance:write,governance:read").await;
+    narrow_to_orders(pool, user).await;
+    common::in_the_catalog_tenant(pool, user).await;
+    session_cookie_for_user(pool, user).await
+}
+
+/// How many audit events `action` has. A refusal writes none and a permitted
+/// change writes its own, so a test compares the number before and after
+/// (`GOV-15` D8: a refused request changes no row and records nothing).
+async fn audit_events(pool: &PgPool, action: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM audit_event WHERE action = $1")
+        .bind(action)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
 /// `DATA-14-AC1`: a 'no nulls' style check that fails opens an incident,
 /// and a second failure of the same rule does not open another.
 #[tokio::test]
@@ -1126,6 +1167,276 @@ async fn running_a_rule_whose_table_cannot_be_checked_is_a_503_and_measures_noth
             .iter()
             .any(|b| b.contains("INSERT INTO console.quality_run")),
         "a run whose table cannot be checked records nothing"
+    );
+}
+
+/// `GOV-15` (`GOV-12` plan, section 4): a person outside the tenant that owns
+/// the shared catalog cannot edit or delete a rule, whether it exists or not,
+/// and the refusal changes nothing. The answers are equal, so an edit says
+/// nothing about which rule ids exist.
+#[tokio::test]
+async fn a_caller_outside_the_catalog_tenant_cannot_edit_or_delete_a_rule_and_nothing_changes() {
+    let (router, pool, ch) = app().await;
+    let id = rule(&pool, "g15_kept", "email not null >= 90%").await;
+    let cookie = outsider(&pool).await;
+    let kept = json!({
+        "asset": "silver.orders",
+        "threshold": "email not null >= 70%", "severity": "high",
+    });
+    let unknown = "00000000-0000-4000-8000-000000000000";
+    let before = (
+        audit_events(&pool, "quality.rule_update").await,
+        audit_events(&pool, "quality.rule_delete").await,
+    );
+
+    let (code, on_kept) = call(
+        &router,
+        &cookie,
+        "PUT",
+        &format!("/api/governance/quality/{id}"),
+        Some(kept.clone()),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{on_kept}");
+    let (code, deleted) = call(
+        &router,
+        &cookie,
+        "DELETE",
+        &format!("/api/governance/quality/{id}"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{deleted}");
+    let (code, on_unknown) = call(
+        &router,
+        &cookie,
+        "PUT",
+        &format!("/api/governance/quality/{unknown}"),
+        Some(kept),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{on_unknown}");
+    let (code, deleted_unknown) = call(
+        &router,
+        &cookie,
+        "DELETE",
+        &format!("/api/governance/quality/{unknown}"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{deleted_unknown}");
+    for other in [&deleted, &on_unknown, &deleted_unknown] {
+        assert_eq!(
+            &on_kept, other,
+            "the tenant refusal is the same for every rule, so it names none"
+        );
+    }
+
+    let after: String =
+        sqlx::query_scalar("SELECT threshold FROM quality_rule WHERE id::text = $1")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(after, "email not null >= 90%", "a refusal changes nothing");
+    assert_eq!(
+        (
+            audit_events(&pool, "quality.rule_update").await,
+            audit_events(&pool, "quality.rule_delete").await,
+        ),
+        before,
+        "a refusal records no audit event"
+    );
+    let sent = sent_to_clickhouse(&ch).await;
+    assert!(
+        !sent
+            .iter()
+            .any(|b| b.contains("ALTER TABLE console.quality_run DELETE")),
+        "a refusal forgets no runs"
+    );
+}
+
+/// `GOV-15` (`GOV-12` plan, section 4): a rule on a table the caller's role
+/// does not read is not on their list, so it answers 404 exactly as an
+/// unknown rule does — it cannot be edited, moved into view, or deleted.
+#[tokio::test]
+async fn a_rule_on_a_table_the_role_may_not_read_cannot_be_edited_or_deleted_and_reads_as_not_found()
+ {
+    let (router, pool, ch) = app().await;
+    let id = rule_on(
+        &pool,
+        "g15_hidden",
+        "silver.customers",
+        "email not null >= 90%",
+    )
+    .await;
+    let cookie = narrowed(&pool).await;
+    let unknown = "00000000-0000-4000-8000-000000000000";
+    let before = (
+        audit_events(&pool, "quality.rule_update").await,
+        audit_events(&pool, "quality.rule_delete").await,
+    );
+    let kept = json!({
+        "asset": "silver.customers",
+        "threshold": "email not null >= 70%", "severity": "high",
+    });
+
+    let (code, hidden) = call(
+        &router,
+        &cookie,
+        "PUT",
+        &format!("/api/governance/quality/{id}"),
+        Some(kept.clone()),
+    )
+    .await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{hidden}");
+    let (_, unknown_rule) = call(
+        &router,
+        &cookie,
+        "PUT",
+        &format!("/api/governance/quality/{unknown}"),
+        Some(kept),
+    )
+    .await;
+    assert_eq!(hidden, unknown_rule, "reads as an unknown rule");
+
+    let (code, moved) = call(
+        &router,
+        &cookie,
+        "PUT",
+        &format!("/api/governance/quality/{id}"),
+        Some(json!({
+            "asset": "silver.orders",
+            "threshold": "email not null >= 70%", "severity": "high",
+        })),
+    )
+    .await;
+    assert_eq!(
+        code,
+        StatusCode::NOT_FOUND,
+        "a hidden rule cannot be moved into view: {moved}"
+    );
+
+    let (code, deleted) = call(
+        &router,
+        &cookie,
+        "DELETE",
+        &format!("/api/governance/quality/{id}"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{deleted}");
+    let (_, deleted_unknown) = call(
+        &router,
+        &cookie,
+        "DELETE",
+        &format!("/api/governance/quality/{unknown}"),
+        None,
+    )
+    .await;
+    assert_eq!(deleted, deleted_unknown, "reads as an unknown rule");
+
+    let (asset, threshold): (String, String) =
+        sqlx::query_as("SELECT asset, threshold FROM quality_rule WHERE id::text = $1")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(asset, "silver.customers", "a refusal moves no rule");
+    assert_eq!(
+        threshold, "email not null >= 90%",
+        "a refusal changes nothing"
+    );
+    assert_eq!(
+        (
+            audit_events(&pool, "quality.rule_update").await,
+            audit_events(&pool, "quality.rule_delete").await,
+        ),
+        before,
+        "a refusal records no audit event"
+    );
+    let sent = sent_to_clickhouse(&ch).await;
+    assert!(
+        !sent
+            .iter()
+            .any(|b| b.contains("ALTER TABLE console.quality_run DELETE")),
+        "a refusal forgets no runs"
+    );
+}
+
+/// `GOV-15` (`GOV-12` plan, section 4): the gate shuts out nobody permitted —
+/// a narrowed person still edits and deletes a rule on their own table, and a
+/// person who may read every table still edits and deletes one whose table is
+/// gone (keeping a table is not an existence check, `DATA-54`).
+#[tokio::test]
+async fn a_permitted_caller_still_edits_and_deletes_rules_including_one_whose_table_is_gone() {
+    let (router, pool, ch) = app().await;
+    let id = rule(&pool, "g15_own", "email not null >= 90%").await;
+    let cookie = narrowed(&pool).await;
+
+    let (code, edited) = call(
+        &router,
+        &cookie,
+        "PUT",
+        &format!("/api/governance/quality/{id}"),
+        Some(json!({
+            "asset": "silver.orders",
+            "threshold": "email not null >= 70%", "severity": "high",
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{edited}");
+    assert_eq!(edited["threshold"], "email not null >= 70%");
+    let (code, deleted) = call(
+        &router,
+        &cookie,
+        "DELETE",
+        &format!("/api/governance/quality/{id}"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{deleted}");
+
+    // A person in the catalog's tenant who may read every table: "not there"
+    // is not checked when the rewrite keeps the table.
+    let user = create_principal_with_permissions(&pool, "governance:write,governance:read").await;
+    common::in_the_catalog_tenant(&pool, user).await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+    let gone = rule_on(
+        &pool,
+        "g15_gone",
+        "silver.no_such_table",
+        "email not null >= 90%",
+    )
+    .await;
+    let (code, edited) = call(
+        &router,
+        &cookie,
+        "PUT",
+        &format!("/api/governance/quality/{gone}"),
+        Some(json!({
+            "asset": "silver.no_such_table",
+            "threshold": "email not null >= 70%", "severity": "high",
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{edited}");
+    let (code, deleted) = call(
+        &router,
+        &cookie,
+        "DELETE",
+        &format!("/api/governance/quality/{gone}"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{deleted}");
+
+    let sent = sent_to_clickhouse(&ch).await;
+    assert!(
+        !sent
+            .iter()
+            .any(|b| b.contains("system.columns") && b.contains("no_such_table")),
+        "keeping a table is not an existence check"
     );
 }
 

@@ -1253,8 +1253,11 @@ pub struct UpdateRuleBody {
 /// `400` when the body is malformed, leaves the table, the threshold or the
 /// severity empty, or names a table that is not there or that the caller may
 /// not read (QA `LH-DATA-14-01` F2, `DATA-54`); `403` when the caller is
-/// outside the tenant that owns the shared catalog; `404` when no rule has
-/// that id; `503` when the table cannot be checked; `500` on a store failure.
+/// outside the tenant that owns the shared catalog — for every edit, not only
+/// one that changes the table; `404` when no rule has that id, and for a rule
+/// on a table the caller's role does not read (it answers as an unknown rule,
+/// `GOV-15`); `503` when the table cannot be checked; `500` on a store
+/// failure.
 pub async fn update_rule(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1262,6 +1265,9 @@ pub async fn update_rule(
     Path(id): Path<String>,
     body: axum::body::Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    // GOV-15 (GOV-12 plan, section 4): the tenant gate comes first, before the
+    // body is read, so a caller outside it learns nothing about a rule id (D4).
+    let access = quality_table_access(&state, Some(&principal), &headers).await?;
     let body: UpdateRuleBody = serde_json::from_slice(&body)
         .map_err(|err| ApiError::BadRequest(format!("Invalid request body: {err}")))?;
     let input = lakehouse_store::governance::UpdateQualityRuleInput {
@@ -1285,6 +1291,11 @@ pub async fn update_rule(
         .into_iter()
         .find(|r| r.id == id)
         .ok_or_else(|| ApiError::NotFound("Quality rule not found".to_owned()))?;
+    // GOV-15 (GOV-12 plan, section 4): a rule on a table the role does not
+    // read is not on the caller's list, so it answers as an unknown rule (D5).
+    if !access.allows_key(before.asset.trim()) {
+        return Err(ApiError::NotFound("Quality rule not found".to_owned()).into());
+    }
     // A rewrite that keeps the table is not checked, so a rule whose table
     // has since been dropped can still be edited or loosened (QA
     // `LH-DATA-14-01` F2, `DATA-54`). A rewrite that changes it gets the same
@@ -1344,13 +1355,31 @@ pub async fn update_rule(
 ///
 /// # Errors
 ///
-/// `404` when no rule has that id; `503`/`500` on a store failure.
+/// `403` when the caller is outside the tenant that owns the shared catalog;
+/// `404` when no rule has that id, and for a rule on a table the caller's role
+/// does not read (it answers as an unknown rule, `GOV-15`); `503`/`500` on a
+/// store failure.
 pub async fn delete_rule(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<ApiJson<Value>> {
+    // GOV-15 (GOV-12 plan, section 4): the tenant gate comes first, before
+    // anything is looked up, so a caller outside it learns nothing about a
+    // rule id (D4).
+    let access = quality_table_access(&state, Some(&principal), &headers).await?;
     let pool = pool(&state)?;
+    let before = lakehouse_store::governance::list_quality_rules(pool)
+        .await?
+        .into_iter()
+        .find(|r| r.id == id)
+        .ok_or_else(|| ApiError::NotFound("Quality rule not found".to_owned()))?;
+    // GOV-15 (GOV-12 plan, section 4): a rule on a table the role does not
+    // read is not on the caller's list, so it answers as an unknown rule (D5).
+    if !access.allows_key(before.asset.trim()) {
+        return Err(ApiError::NotFound("Quality rule not found".to_owned()).into());
+    }
     let rule = lakehouse_store::governance::delete_quality_rule(pool, &id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Quality rule not found".to_owned()))?;
