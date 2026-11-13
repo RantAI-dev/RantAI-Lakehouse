@@ -1542,3 +1542,222 @@ lakehouse-store --test uploads`; `cargo test -p lakehouse-api --test catalog_res
 `bun run lint`; `bun test src/features/catalog`; `bun run test` once), each new test by
 name, each case of R5 or R3 that could not be tested with the reason, and how the client's
 bound is set in the R1 test.
+
+### Round 1, developer's handoff
+
+Developer agent, 2026-11-13. Branch `fix/qa-round-data-p4`, pushed after each commit.
+`main` was merged first (`b9bb4176`, "Merge remote-tracking branch 'origin/main' into
+fix/qa-round-data-p4"); it merged cleanly, `rust/migrations` still holds exactly one
+`0141`, and `cargo fmt --check` plus `cargo clippy -p lakehouse-api --all-targets --
+-D warnings` were clean before the push. Every commit below is on top of it, in the
+task order, and no rebase, force-push or `--ours`/`--theirs` was used.
+
+#### Commits
+
+| Commit | Title |
+| --- | --- |
+| `b9bb4176` | Merge remote-tracking branch 'origin/main' into fix/qa-round-data-p4 |
+| `115c0e14` | fix(review): the drop keeps its record when the outcome is not known (R1, R2, R7) |
+| `dc470d7f` | fix(review): a load and a drop of one table cannot both pass (R3) |
+| `97d0bf3b` | test(review): the refusals and failure paths of the drop that had no test (R5) |
+| `abd51144` | docs(review): comments say what the code does, and cite the cases (R6, R9, R10) |
+| `<this commit>` | docs(plan): handoff for review round 1 of data-p4 |
+
+#### Tests added or rewritten, with the failure seen before the fix
+
+The line numbers are the ones in the run that failed, before the fix that made the
+test pass.
+
+**Commit A (`115c0e14`)**
+
+- `a_catalog_that_does_not_answer_within_the_clients_bound_keeps_the_record_and_says_the_outcome_is_not_known`
+  (R1). Before: `left: 200 right: 503`, the body
+  `{"ok":true,"table":"bronze.orders","rowCount":3,…}`, after **20.83 s** — the
+  client waited out the catalog's 20-second delay because the drop's `DELETE` had
+  no bound of its own.
+- `a_catalog_that_answers_500_and_lists_the_table_as_deleted_keeps_the_record_and_answers_a_drop`
+  (R2 case 1). Before: `left: 503 right: 200`, `{"error":"The catalog did not
+  answer, so it is not known…"}`.
+- `a_catalog_that_answers_500_and_a_table_that_still_exists_removes_the_record_and_says_nothing_was_dropped`
+  (R2 case 2). Before: `left: "The catalog did not answer, so it is not known
+  whether the table was dropped…" right: "The catalog did not answer and the table
+  was not dropped. Try again shortly."`.
+- `a_catalog_that_answers_500_and_a_lookup_that_fails_keeps_the_record_and_says_the_outcome_is_not_known`
+  (R2 case 3). Before: `an unknown outcome keeps the name closed` — the record had
+  been removed.
+- `a_stale_record_of_a_table_that_exists_is_removed_by_the_next_status_read` (R2
+  healing). Before: `a table that is there is not dropped:
+  {"droppable":false,"reason":"This table is already dropped…"}`, `left: false
+  right: true`.
+- `a_stale_record_of_a_table_that_exists_is_removed_by_the_next_load_and_the_load_goes_through`
+  (R2 healing, load side; `tests/upload_routes.rs`). Before: `left: 409 right:
+  200`, `{"error":"That table was dropped and can still be restored…"}`.
+- `an_undrop_that_does_not_answer_and_a_table_that_exists_clears_the_record_and_answers_a_restore`
+  (R2 mirror case). Before: `left: 503 right: 200`, `{"error":"the catalog could
+  not be asked about this table; try again shortly"}`.
+- `an_undrop_that_does_not_answer_and_a_table_that_is_still_gone_keeps_the_record_and_writes_a_failed_entry`
+  (R2 mirror case that did not happen). It passed before the fix, on purpose: it
+  pins today's keep-the-record branch, which the review keeps ("otherwise leave the
+  record, write `failed`, answer as today"). It guards that branch, it does not
+  change it.
+- `a_registry_name_that_is_not_a_plain_identifier_is_refused_before_anything_is_written`
+  (R7). Before: `left: 503 right: 409`, `{"error":"The catalog could not be
+  reached, so nothing was dropped. Try again shortly."}` — the refusal came from
+  the client, after the audit entry and the record.
+- Rewritten, not added: `a_catalog_that_does_not_answer_the_drop_leaves_no_record_and_no_upstream_text`
+  is gone. It pinned the planner's wrong decision (an unknown outcome removing the
+  record); its three replacements are the first three tests above. The commit body
+  says so in those words.
+
+**Commit B (`dc470d7f`)**
+
+- `a_drop_whose_upload_starts_loading_between_its_checks_is_a_409_and_leaves_no_record`
+  (R3, drop side). Before: `left: 200 right: 409` and a `DELETE` sent
+  (`{"ok":true,…}`), with the load marked `ingesting` while the drop waited on the
+  keep write.
+- `a_load_whose_table_is_dropped_between_its_checks_is_409_and_settles_its_claim`
+  (R3, load side; `tests/upload_routes.rs`). Before: `left: 200 right: 409`, body
+  `{"upload":{…,"status":"ingesting",…,"runId":"run-2"},"runId":"run-2"}` — the
+  load launched over the drop's record.
+
+**Commit C (`97d0bf3b`)** — tests only, of paths that had none:
+
+- `the_tenant_gate_refuses_the_drop_and_its_two_reads_without_reaching_the_catalog`
+  (`403` with the gate's reason on the write, `200 {supported:false}` on the status
+  read, `{supported:false, tables:[]}` on the list, no `DELETE`).
+- `an_unknown_asset_id_is_a_404_on_the_drop_status_and_on_its_post`.
+- `a_drop_whose_warehouse_cannot_be_looked_up_is_503_and_asks_the_catalog_nothing`
+  (a `500` from the warehouse list and an empty list, both `503` with D5's
+  sentence, no `DELETE`).
+- `a_drop_whose_record_cannot_be_written_answers_the_database_error_and_asks_the_catalog_nothing`
+  (a `CHECK` constraint on `upload_table_drop` in this test's own database; the
+  store's `database error`, no `DELETE`, `allowed` then `failed`). The `failed`
+  ending is R7's behaviour, so this one would have failed before commit A (one
+  entry only); it is listed here because the review asked for the case.
+- `two_drops_of_one_table_at_the_same_moment_are_one_drop_and_one_conflict`
+  (`tokio::join!`: exactly one `200`, one `409`, one `DELETE`).
+- `a_drop_whose_rows_cannot_be_counted_still_drops_with_a_null_row_count` (`null`
+  in the answer, in the record and in both audit entries).
+- `the_dropped_list_of_an_unrestricted_caller_in_no_tenant_is_empty`.
+- `the_dropped_list_stops_at_one_hundred_rows`.
+- `the_drop_status_says_null_when_the_rows_cannot_be_counted_and_never_zero`: its
+  stand-in changed (the count query answers `500`); the assertions did not.
+
+**Commit D (`abd51144`)** — console: `dropped-tables.test.tsx` gains "says one
+row in the singular, as the dialog does", the test that pinned `expiresAt` equal to
+now is renamed "says less than a day is left for a row at its end", and
+`asset-detail-tabs.test.tsx`'s Drop-table case now finds the button with
+`within(card)`. No assertion was weakened.
+
+#### How the client's bound is set in the R1 test
+
+The smaller change of the two the review allowed: **not** a `#[cfg(test)]`-settable
+constant (an integration test links the library built without `cfg(test)`, so it
+could never set one), but the bound taken by the client: `DROP_TABLE_TIMEOUT`
+(fifteen seconds) is the default, and `LakekeeperAdminClient::with_drop_timeout`
+takes it as an argument. The test rebuilds the admin client with one second in
+`drop_app_with(..., |state| …)`, the harness hook that hands the built `AppState` to
+the test before the router takes it. A deployment never calls the builder.
+
+#### Commands run, with their real counts
+
+Merge step (`b9bb4176`): `git merge origin/main` (clean); `ls rust/migrations|tail -3`
+→ `0139_alert_rule_delivery.sql`, `0140_pipeline_inputs_and_steps.sql`,
+`0141_upload_table_drop.sql`; `cargo fmt --check` clean; `cargo clippy -p
+lakehouse-api --all-targets -- -D warnings` clean.
+
+Commit A:
+- `cargo fmt --check` clean; `cargo clippy -p lakehouse-api -p lakehouse-auth
+  --all-targets -- -D warnings` clean.
+- `cargo test -p lakehouse-auth --test openfga` — 18 passed, 0 failed.
+- `cargo test -p lakehouse-store --test uploads` — 69 passed, 0 failed.
+- `cargo test -p lakehouse-api --test catalog_restore` — 40 passed, 0 failed.
+- `cargo test -p lakehouse-api --test upload_routes` — 180 passed, 0 failed.
+- `cargo test -p lakehouse-api --test sec11_guard` — 4 passed, 0 failed.
+- `cargo test -p lakehouse-api --test route_auth` — 95 passed, 0 failed.
+
+Commit B:
+- `cargo fmt --check` clean; `cargo clippy -p lakehouse-api --all-targets -- -D
+  warnings` clean.
+- `catalog_restore` 41 passed; `upload_routes` 180 passed; `sec11_guard` 4 passed;
+  `route_auth` 95 passed; 0 failed in each.
+
+Commit C:
+- `cargo fmt --check` clean; `cargo clippy -p lakehouse-api --all-targets -- -D
+  warnings` clean.
+- `catalog_restore` 49 passed; `upload_routes` 180 passed; `sec11_guard` 4 passed;
+  `route_auth` 95 passed; `uploads` (store) 69 passed; `openfga` (auth) 18 passed;
+  0 failed in each.
+
+Commit D:
+- `python3 ops/lint/check_bare_iceberg_count.py` → "R11 guard: no bare count()
+  against a Bronze Iceberg table found."
+- `python3 ops/lint/check_intra_package_imports.py` → "OK: all intra-package
+  dispar_orchestrate imports resolve".
+- `bun install --frozen-lockfile` → 779 installs across 753 packages, no changes.
+- `bun run typecheck` clean.
+- `bun run lint` → 0 errors, 11 warnings (all pre-existing, none in a file this
+  round touched).
+- `bun test src/features/catalog` → 402 pass, 0 fail, 1275 `expect()` calls, 16
+  files.
+- `cargo fmt --check` clean; `cargo clippy -p lakehouse-api -p lakehouse-auth -p
+  lakehouse-store --all-targets -- -D warnings` clean (the migration's header is
+  embedded at compile time).
+- `catalog_restore` 49 passed; `upload_routes` 180 passed; `sec11_guard` 4 passed;
+  `route_auth` 95 passed; `uploads` 69 passed; `openfga` 18 passed.
+
+Before the handoff, on this final tree:
+- `bun run test` → **4235 pass, 1 skip, 0 fail**, 13 046 `expect()` calls, 390
+  files.
+- `python3 ops/lint/check_bare_iceberg_count.py` → "R11 guard: no bare count()
+  against a Bronze Iceberg table found."
+- `python3 ops/lint/check_intra_package_imports.py` → "OK: all intra-package
+  dispar_orchestrate imports resolve".
+- `git status` clean before this handoff commit.
+
+The bare-count lint read a comment of mine (`catalog_restore.rs`, "a registry row
+without a count (review R5)") as a bare `count(` call and failed CI's "Repo lints"
+on `97d0bf3b`; the comment now says "a registry row that answers without a row
+count; review R5". The lint, its allowlist and every assertion are unchanged, and
+the lint passes on every commit from `abd51144` on (the earlier commits keep their
+wording; CI runs the job on a commit, and the branch's head is what it lints).
+
+#### Cases of R3 or R5 that could not be tested
+
+None. Both R3 cases are covered through the routes, with a stand-in the route
+cannot skip: the load side holds the `DESCRIBE` that `plan_columns` sends between
+`ensure_table_free` and `claim_load` until the test has written the record, and the
+drop side holds the keep write until the test has marked the load `ingesting`. All
+eight rows of R5 are covered; the record-insert failure uses a test-only `CHECK`
+constraint, no product code.
+
+R1's `tokio::spawn` itself (part 2 and part 3) has **no test that provokes a route
+deadline or a disconnect**: the harness calls the router with `oneshot`, and
+provoking the 60-second deadline would mean a test that waits a minute and then
+asserts on a task it cannot observe. What is covered is the client's own bound (the
+test above), and the existing suite proves the spawned task still writes the same
+records and entries.
+
+#### Not verified
+
+- CI on the pull request. Not mine to run, and the run on `97d0bf3b` failed the
+  repo lints for the comment above (fixed in `abd51144`, lints re-run and quoted).
+- Full workspace `cargo test` and `cargo clippy --workspace`: by the task's rule,
+  only the touched crates and test files were built and run.
+- `docker compose --profile '*' config` and the Dagster suite: nothing in this round
+  touches `docker-compose.yml`, `dagster/` or `ops/` code (only two `ops/lint`
+  scripts were run).
+- The G9 gate (T8) against the real catalog: unchanged by this round, not re-run.
+
+#### MISMATCH
+
+None against the code: every finding matched what the code does.
+
+Two deviations from the commit grouping, both mine to report:
+
+- **R3's product code landed in commit A**, not B: it was written in the same pass
+  as R2's (both touch the same two functions), so `115c0e14` carries the two
+  second checks and `dc470d7f` carries only their tests. No history was rewritten
+  to split it — a rebase or force-push is not allowed on this branch.
+- The restore's second mirror test passes before the fix as well; it pins the
+  branch the review kept, as written above.
