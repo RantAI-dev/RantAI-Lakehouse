@@ -418,9 +418,12 @@ async fn require_chart_call_allowed(
     let scope = scope_for_write(state, principal).await?;
     // `AI-6`: a chart call that names a map that does not exist is refused
     // here, so the draft and the save refuse it with one sentence. It runs
-    // after the writer check (nobody without `dashboard:write` learns which
-    // maps exist) and before the board checks (the map catalogue needs no
-    // dashboard).
+    // after the writer check (a caller with neither `dashboard:read` nor a
+    // rule is refused there) and before the board checks (the map catalogue
+    // needs no dashboard). The uploaded maps it names are the ones
+    // `list_maps` already shows any assistant caller, so nothing new is
+    // disclosed.
+    // (PR #524 security review)
     maps::require_known_map(state, name, args).await?;
     if name == "create_chart" {
         require_edit_on(state, &scope, &arg_str(args, "board")).await?;
@@ -1104,6 +1107,82 @@ mod tests {
                     .unwrap_or_default()
                     .contains("does not exist. Use one of:"),
                 "{map:?}: {saved}"
+            );
+        }
+    }
+
+    /// `AI-6`: a new region map chart has no stored map to keep, so a
+    /// `create_chart` of that kind that names no map is refused: the draft
+    /// check and the save refuse it with one sentence that names the maps the
+    /// model may use.
+    #[tokio::test]
+    async fn a_new_region_map_chart_that_names_no_map_is_refused_as_the_save_is() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(TwoBoards::default())
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let writer = caller_with("dashboard:read, dashboard:write");
+        for map in [None, Some(json!(null)), Some(json!("   "))] {
+            let mut args = json!({ "board": "b1", "title": "T", "kind": "geomap" })
+                .as_object()
+                .cloned()
+                .unwrap();
+            if let Some(map) = map.as_ref() {
+                args.insert("map".to_owned(), map.clone());
+            }
+            let saved = assert_the_draft_is_refused_as_the_save_is(
+                &state,
+                Some(&writer),
+                "create_chart",
+                &args,
+            )
+            .await;
+            assert_eq!(
+                saved["error"],
+                json!(
+                    "a geomap chart needs `map`. Use one of: dki-jakarta, id-provinces, id-regencies, world, adm1-<iso3> for a country's provinces, or an uploaded map from list_maps."
+                ),
+                "{map:?}: {saved}"
+            );
+        }
+    }
+
+    /// Only a new region map chart needs a map of its own: a chart of another
+    /// kind draws from its columns, and an update keeps the map it was saved
+    /// with, so neither is refused by the map check.
+    #[tokio::test]
+    async fn a_chart_that_needs_no_map_of_its_own_is_not_refused_by_the_map_check() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(TwoBoards::default())
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let writer = caller_with("dashboard:read, dashboard:write");
+        let calls = [
+            (
+                "create_chart",
+                json!({ "board": "b1", "title": "T", "kind": "bar" }),
+            ),
+            (
+                "create_chart",
+                json!({ "board": "b1", "title": "T", "kind": "pointmap" }),
+            ),
+            (
+                "update_chart",
+                json!({ "id": "c1", "title": "T", "kind": "geomap" }),
+            ),
+        ];
+        for (tool, args) in calls {
+            let args = args.as_object().cloned().unwrap();
+            let saved = run_tool(&state, Some(&writer), tool, &args).await;
+            let error = saved["error"].as_str().unwrap_or_default();
+            assert!(!error.contains("needs `map`"), "{tool}: {saved}");
+            assert!(
+                !error.contains("does not exist. Use one of:"),
+                "{tool}: {saved}"
             );
         }
     }
