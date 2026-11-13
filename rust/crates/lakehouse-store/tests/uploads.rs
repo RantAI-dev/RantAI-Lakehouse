@@ -35,9 +35,10 @@ use lakehouse_store::StoreError;
 use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::uploads::{
     ClaimFolder, ClaimedTable, LimitOutcome, LoadClaim, LoadLimits, LoadMode, MarkOutcome,
-    NewReceiving, NewUpload, TableClaim, Upload, UploadPart, attach_run, claim_table, delete,
-    find_by_sha256, get, get_by_run_id, insert, list, list_claims, loads_under_limits,
-    mark_finished, mark_group_within_limits, mark_ingesting, mark_ingesting_within_limits,
+    NewReceiving, NewTableDrop, NewUpload, TableClaim, Upload, UploadPart, attach_run, claim_table,
+    delete, dropped_table, find_by_sha256, forget_table_drop, get, get_by_run_id, insert, list,
+    list_claims, list_dropped_tables, loading_into, loads_under_limits, mark_finished,
+    mark_group_within_limits, mark_ingesting, mark_ingesting_within_limits, record_table_drop,
     table_being_loaded, table_claim, table_claimed, upload_in_tenants,
 };
 use lakehouse_store::uploads::{
@@ -3062,5 +3063,308 @@ async fn a_large_load_older_than_the_window_does_not_count(pool: PgPool) -> sqlx
         start_limited(&pool, "up-big-3", limits).await,
         MarkOutcome::Marked(_)
     ));
+    Ok(())
+}
+
+/// A drop written as the drop route writes one (`DATA-55`).
+fn new_drop<'a>(
+    table: &'a str,
+    tenant_id: Uuid,
+    asset_id: &'a str,
+    dropped_by: &'a str,
+    row_count: Option<i64>,
+) -> NewTableDrop<'a> {
+    NewTableDrop {
+        bronze_table: table,
+        tenant_id,
+        asset_id,
+        dropped_by,
+        row_count,
+        kept_seconds: 604_800,
+    }
+}
+
+/// `DATA-55` D9: a second drop inside the window must not succeed, or it would
+/// name a second person on a drop they did not make. One statement is what
+/// makes the primary key the arbiter.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_drop_is_recorded_once_and_a_second_one_inside_the_window_is_not(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-drop-once").await;
+    claim(&pool, tenant_a, "orders", "up-1").await;
+
+    let first = record_table_drop(
+        &pool,
+        &new_drop("orders", tenant_a, "orders", "Ada Lovelace", Some(12)),
+    )
+    .await
+    .unwrap()
+    .expect("the first drop is recorded");
+    assert_eq!(first.bronze_table, "orders");
+    assert_eq!(first.tenant_id, Some(tenant_a));
+    assert_eq!(first.asset_id, "orders");
+    assert_eq!(first.dropped_by, "Ada Lovelace");
+    assert_eq!(first.row_count, Some(12));
+    assert_eq!(
+        (first.expires_at - first.dropped_at).whole_seconds(),
+        604_800,
+        "the window is the catalog's keep, written by the database clock"
+    );
+
+    let second = record_table_drop(
+        &pool,
+        &new_drop("orders", tenant_a, "orders", "Grace Hopper", Some(99)),
+    )
+    .await
+    .unwrap();
+    assert!(second.is_none(), "a drop inside its window is refused");
+
+    let still = dropped_table(&pool, "orders").await.unwrap().unwrap();
+    assert_eq!(
+        still.dropped_by, "Ada Lovelace",
+        "the refused drop changed nothing"
+    );
+    assert_eq!(still.row_count, Some(12));
+    Ok(())
+}
+
+/// `DATA-55` D10: after the window the name is free again, and the next drop
+/// replaces the stale row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_drop_whose_window_has_passed_no_longer_counts_and_the_next_one_replaces_it(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-drop-expired").await;
+    claim(&pool, tenant_a, "orders", "up-1").await;
+    record_table_drop(
+        &pool,
+        &new_drop("orders", tenant_a, "orders", "Ada Lovelace", Some(12)),
+    )
+    .await
+    .unwrap()
+    .expect("the first drop is recorded");
+
+    sqlx::query(
+        "UPDATE upload_table_drop SET expires_at = now() - interval '1 second' \
+         WHERE bronze_table = 'orders'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    assert!(
+        dropped_table(&pool, "orders").await.unwrap().is_none(),
+        "a row past its window no longer says the name is dropped"
+    );
+
+    let again = record_table_drop(
+        &pool,
+        &new_drop("orders", tenant_a, "orders", "Grace Hopper", Some(3)),
+    )
+    .await
+    .unwrap()
+    .expect("the name is free after the window");
+    assert_eq!(again.dropped_by, "Grace Hopper");
+    assert_eq!(again.row_count, Some(3));
+    Ok(())
+}
+
+/// `DATA-55` D8: a restore removes the record and says whether there was one;
+/// an absent record is not an error.
+#[sqlx::test(migrations = "../../migrations")]
+async fn forgetting_a_drop_removes_it_and_says_whether_there_was_one(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-drop-forget").await;
+    claim(&pool, tenant_a, "orders", "up-1").await;
+    record_table_drop(
+        &pool,
+        &new_drop("orders", tenant_a, "orders", "Ada Lovelace", None),
+    )
+    .await
+    .unwrap()
+    .expect("the drop is recorded");
+
+    assert!(forget_table_drop(&pool, "orders").await.unwrap());
+    assert!(dropped_table(&pool, "orders").await.unwrap().is_none());
+    assert!(
+        !forget_table_drop(&pool, "orders").await.unwrap(),
+        "there is no record left to remove"
+    );
+    Ok(())
+}
+
+/// `DATA-55` D13: the list is the given tenants' unexpired drops, newest
+/// first, and an empty tenant list is nobody's rather than everyone's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_dropped_list_is_the_given_tenants_unexpired_drops_newest_first(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-drop-list-a").await;
+    let tenant_b = tenant(&pool, "uploads-drop-list-b").await;
+    claim(&pool, tenant_a, "orders", "up-1").await;
+    claim(&pool, tenant_a, "stock", "up-2").await;
+    claim(&pool, tenant_b, "other", "up-3").await;
+
+    record_table_drop(
+        &pool,
+        &new_drop("orders", tenant_a, "orders", "Ada Lovelace", Some(1)),
+    )
+    .await
+    .unwrap()
+    .expect("orders is recorded");
+    record_table_drop(
+        &pool,
+        &new_drop("stock", tenant_a, "stock", "Ada Lovelace", None),
+    )
+    .await
+    .unwrap()
+    .expect("stock is recorded");
+    record_table_drop(
+        &pool,
+        &new_drop("other", tenant_b, "other", "Grace Hopper", Some(2)),
+    )
+    .await
+    .unwrap()
+    .expect("other is recorded");
+
+    // Explicit timestamps, so "newest first" is a fact of the test and not of
+    // how fast two statements ran.
+    sqlx::query(
+        "UPDATE upload_table_drop SET dropped_at = now() - interval '2 hours' \
+         WHERE bronze_table = 'orders'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE upload_table_drop SET dropped_at = now() - interval '1 hour' \
+         WHERE bronze_table = 'stock'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let listed = list_dropped_tables(&pool, &[tenant_a, tenant_b], 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|r| r.bronze_table.as_str())
+            .collect::<Vec<_>>(),
+        vec!["other", "stock", "orders"],
+        "newest first (other was never backdated), and both tenants' rows are listed"
+    );
+
+    let only_a = list_dropped_tables(&pool, &[tenant_a], 100).await.unwrap();
+    assert_eq!(
+        only_a
+            .iter()
+            .map(|r| r.bronze_table.as_str())
+            .collect::<Vec<_>>(),
+        vec!["stock", "orders"]
+    );
+
+    assert!(
+        list_dropped_tables(&pool, &[], 100)
+            .await
+            .unwrap()
+            .is_empty(),
+        "an empty tenant list lists nothing, never everything"
+    );
+
+    sqlx::query(
+        "UPDATE upload_table_drop SET expires_at = now() - interval '1 second' \
+         WHERE bronze_table = 'orders'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let unexpired = list_dropped_tables(&pool, &[tenant_a], 100).await.unwrap();
+    assert_eq!(
+        unexpired
+            .iter()
+            .map(|r| r.bronze_table.as_str())
+            .collect::<Vec<_>>(),
+        vec!["stock"],
+        "a row past its window is not in the list"
+    );
+
+    let limited = list_dropped_tables(&pool, &[tenant_a, tenant_b], 1)
+        .await
+        .unwrap();
+    assert_eq!(limited.len(), 1, "the limit is the list's bound");
+    Ok(())
+}
+
+/// `DATA-55` D10: the tenant's deletion hides the row from every list and does
+/// not free the name — the table stays restorable and no load may take it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_drop_whose_tenant_is_gone_is_listed_for_nobody_and_still_closes_the_name(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-drop-gone").await;
+    claim(&pool, tenant_a, "orders", "up-1").await;
+    record_table_drop(
+        &pool,
+        &new_drop("orders", tenant_a, "orders", "Ada Lovelace", Some(4)),
+    )
+    .await
+    .unwrap()
+    .expect("the drop is recorded");
+
+    sqlx::query("UPDATE upload_table_drop SET tenant_id = NULL WHERE bronze_table = 'orders'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert!(
+        list_dropped_tables(&pool, &[tenant_a], 100)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a row with no tenant shows to nobody"
+    );
+    let still = dropped_table(&pool, "orders").await.unwrap();
+    assert!(
+        still.is_some(),
+        "the name stays closed: the table can still be restored"
+    );
+    Ok(())
+}
+
+/// `DATA-55` D4 rule 5: a drop is refused while a load is in progress, and
+/// only the uploads actually loading into THAT table count.
+#[sqlx::test(migrations = "../../migrations")]
+async fn loading_into_lists_only_the_uploads_loading_into_that_table(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-drop-loading").await;
+    add(&pool, "up-1", tenant_a, &"a".repeat(64)).await;
+    add(&pool, "up-2", tenant_a, &"b".repeat(64)).await;
+    add(&pool, "up-3", tenant_a, &"c".repeat(64)).await;
+
+    start(&pool, "up-1", "stock_raw", LoadMode::Replace, Some("run-1")).await;
+    start(&pool, "up-2", "stock_raw", LoadMode::Replace, Some("run-2")).await;
+    mark_finished(&pool, "up-2", Some("run-2"), None, Some(2))
+        .await
+        .unwrap()
+        .expect("the load is settled");
+    start(&pool, "up-3", "other_raw", LoadMode::Replace, Some("run-3")).await;
+
+    assert_eq!(
+        ids(&loading_into(&pool, "stock_raw").await.unwrap()),
+        vec!["up-1"]
+    );
+    assert_eq!(
+        ids(&loading_into(&pool, "other_raw").await.unwrap()),
+        vec!["up-3"]
+    );
+    assert!(
+        loading_into(&pool, "nobody_raw").await.unwrap().is_empty(),
+        "a table nothing loads into lists nothing"
+    );
     Ok(())
 }
