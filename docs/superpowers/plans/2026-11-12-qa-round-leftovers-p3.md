@@ -690,4 +690,158 @@ None of these blocks the plan.
 
 ## 5. Handoff
 
+Developer: a non-Opus agent, on the ARM64 machine in
+`/home/rismana/rantai/lakehouse-agents-2`, branch `fix/qa-round-leftovers-p3`
+tracking `origin/fix/qa-round-leftovers-p3`, based on `bfce2c38d` (`main` at
+the plan's commit; the branch already held `ffa9b228`, the plan itself).
+`CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-2`,
+`CARGO_BUILD_JOBS=6`. Four commits, one per task, pushed after each.
+
+### Commits
+
+| Task | Commit | Title |
+| --- | --- | --- |
+| T1 | `c9cfd519` | `fix(quality): run a rule by hand only for a person who may read its table` |
+| T2 | `2e32ca8d` | `feat(store): settle a cancelled run as failed with no reason invented` |
+| T3 | `fc539800` | `fix(connectors): close a run record whose run has ended when the run list is read` |
+| T4 | `0d2745b1` | `docs: say what the two fixes changed, for GOV-12 and SRC-43` |
+
+### T1 — `GOV-12` (#493 review, round 1 (R3))
+
+Changed: `rust/crates/lakehouse-api/src/routes/quality.rs` (module comment,
+`run_rule`'s signature, one `ensure_rule_table` call, its `# Errors`) and
+`rust/crates/lakehouse-api/tests/quality_incidents.rs`.
+
+Tests added (after
+`a_caller_outside_the_catalog_tenant_is_refused_before_the_table_is_asked_about`),
+one helper `rule_on(pool, name, asset, threshold)` with `rule` now calling it
+with `silver.orders`:
+
+1. `a_caller_outside_the_catalog_tenant_cannot_run_a_rule_and_nothing_is_measured`
+2. `a_caller_whose_role_does_not_read_the_rules_table_cannot_run_it`
+3. `running_a_rule_answers_the_same_for_a_table_that_is_not_there_and_one_the_caller_may_not_read`
+4. `a_permitted_caller_still_runs_a_rule_and_gets_its_value`
+5. `running_a_rule_whose_table_cannot_be_checked_is_a_503_and_measures_nothing`
+
+Run before the fix (`cargo test -p lakehouse-api --test quality_incidents`):
+`FAILED. 15 passed; 4 failed` — tests 1, 2, 3 answered `200
+{"status":"failed","value":"75.0% not null"}` where 403/403/400 were expected,
+and test 5 answered `400` (`"silver.broken_table" is not a table this can read
+…`) where 503 was expected. Test 4 passed on the base, as the plan says. After
+the fix: `19 passed; 0 failed` (18 of the file plus the `tls_proxy` test).
+
+### T2 — `SRC-43` (#485 review, round 2 (R2))
+
+Changed: `rust/crates/lakehouse-store/src/connector_run.rs` (module comment's
+"Who writes", new `settle_cancelled_run` after `settle_run`) and
+`rust/crates/lakehouse-store/tests/connector_run.rs` (`settle_cancelled_run`
+and `LogLine` added to the imports).
+
+Test added (after `the_sensor_settles_only_a_run_still_running`):
+`a_cancelled_run_still_running_is_settled_as_failed_with_no_reason_invented`.
+
+Must-fail check: the function does not exist on the base, so the test cannot
+compile there. The planned bite check was made instead: `EndReason::Other`
+switched to `EndReason::TableFailed` in `settle_cancelled_run` and the test run
+alone answered `FAILED. 0 passed; 1 failed` (`left: Some("table_failed")`,
+`right: Some("other")`); the value was put back and the file then answered
+`12 passed; 0 failed` (11 of the file plus the new one — the store's
+`connector_run` binary has no extra `tls_proxy` test, as 3a says).
+
+### T3 — `SRC-43` (#485 review, round 2 (R2))
+
+Changed: `rust/crates/lakehouse-api/src/routes/load_alerts.rs` (`FinalStatus`,
+`Outcome::final_status`, `close_run_record`, `connector_run_event` now calling
+it), `rust/crates/lakehouse-api/src/routes/connector_runs.rs`
+(`RECONCILE_PER_READ`, `close_ended_runs`, `list`, the two "two places"
+comments, the unit-test harness's dead `DAGSTER_URL` and comment),
+`rust/crates/lakehouse-api/src/routes/uploads.rs` (`SETTLE_CALL_TIMEOUT` is
+`pub(super)` and says the run list uses it too), and
+`rust/crates/lakehouse-api/tests/ingest_run.rs`.
+
+Tests added: one unit test in `load_alerts.rs`,
+`only_success_failure_and_canceled_end_a_run_and_a_run_being_cancelled_has_not_ended`;
+three helpers in `tests/ingest_run.rs` (`get_runs`, `mount_run_status`,
+`run_status_requests`); and nine integration tests after
+`an_orchestrator_that_cannot_be_reached_for_the_cancel_answers_503_and_starts_nothing`:
+
+1. `a_record_left_running_after_its_run_was_cancelled_is_closed_by_one_read_of_the_run_list`
+2. `a_run_cancelled_before_its_limit_is_closed_as_failed_with_no_reason_invented`
+3. `a_record_left_running_after_its_run_succeeded_or_failed_is_closed_as_the_run_report_would_close_it`
+4. `a_run_that_is_still_going_keeps_its_record_running`
+5. `a_record_whose_run_the_orchestrator_does_not_know_is_left_running`
+6. `the_run_list_still_answers_when_the_orchestrator_cannot_be_asked`
+7. `two_reads_at_once_close_a_record_once`
+8. `a_connector_with_no_running_record_asks_the_orchestrator_nothing`
+9. `one_read_asks_about_at_most_ten_running_records`
+
+Must-fail check (the T3 `src/` files stashed, the tests kept):
+`FAILED. 30 passed; 8 failed` — tests 1, 2, 3 and 7 failed on the record
+staying `running`, and tests 4, 5, 6 and 9 on the request counts; test 8 passed
+on the base, as the plan says. Test 4 was also seen to bite on the status rule:
+`FinalStatus::of` made to answer `Canceled` for `CANCELING` once answered
+`FAILED` (`left: String("failed")`, `right: "running"`); put back. After the
+fix: `38 passed; 0 failed` (37 of the file plus the `tls_proxy` test).
+
+Tests that had to stay green, run and green:
+`--lib only_success_failure_and_canceled_end_a_run` (1), `--lib a_failed_run_`
+(4), `--lib a_paused_run_is_not_counted` (1), `--lib
+the_end_report_cannot_write_the_timed_out_reason` (1), `--lib
+the_history_route_answers_fifty_runs` (1) — none of their assertions changed.
+
+### T4 — documents
+
+`docs/core/features/data-quality-in-depth.md`,
+`docs/core/features/connector-operations.md` and `CHANGELOG.md`, exactly as the
+task says. `git diff --stat` of that commit: the three files, 13 insertions.
+`BACKLOG.md`, `PRODUCT.md` and every Decisions table are untouched.
+
+### Before handoff (final commit `0d2745b1`, foreground)
+
+```text
+cargo fmt --check                                              OK
+cargo clippy -p lakehouse-store --all-targets -- -D warnings   ok (finished)
+cargo clippy -p lakehouse-api --all-targets -- -D warnings     ok (finished)
+cargo test -p lakehouse-store --test connector_run             12 passed; 0 failed
+cargo test -p lakehouse-api --lib only_success_failure_…       1 passed; 0 failed
+cargo test -p lakehouse-api --lib a_failed_run_                4 passed; 0 failed
+cargo test -p lakehouse-api --lib a_paused_run_is_not_counted  1 passed; 0 failed
+cargo test -p lakehouse-api --lib the_end_report_cannot_…      1 passed; 0 failed
+cargo test -p lakehouse-api --lib the_history_route_…          1 passed; 0 failed
+cargo test -p lakehouse-api --test quality_incidents          19 passed; 0 failed
+cargo test -p lakehouse-api --test ingest_run                 38 passed; 0 failed
+cargo test -p lakehouse-api --test sec11_guard                 4 passed; 0 failed
+cargo test -p lakehouse-api --test route_auth                 93 passed; 0 failed
+python3 ops/lint/check_bare_iceberg_count.py                  OK
+python3 ops/lint/check_intra_package_imports.py               OK
+git status                                                    clean
+```
+
+`tests/route_auth.rs`, `tests/sec11_guard.rs`, `POLICY_TABLE`,
+`routes/mod.rs`, `policy.rs`, `dagster/`, `src/`, migrations: not edited.
+
+### Docker
+
+Before the first `cargo test --test …`: one container,
+`24d7d1d1667e postgres:16-alpine upbeat_engelbart Up 7 hours` (not mine).
+After the last run: the same one container and nothing else — the testcontainers
+runs left nothing behind, and nothing was removed. I started no container of my
+own.
+
+### Not verified
+
+- `cargo test --workspace` and `cargo nextest run --workspace`: *not verified
+  locally, CI* (rule 7; the plan leaves it to the pull request).
+- The store failure while a record is closed (the loop stops and the first list
+  is returned): read only, not covered by a test, as T3 says.
+- That a real orchestrator gives a cancelled run an end time, and that a real
+  500 with a non-JSON body and a `RunNotFoundError` answer read as the tests'
+  mocks do: the mocks only; *not verified against a running orchestrator*.
+- Cheaper checks I did not run: `bun`, `pytest`, `docker compose config` — this
+  slice touches no TypeScript, Python or compose file (section 3).
+
+### MISMATCH
+
+None. Every anchor was found by its quoted text and behaved as the plan says.
+
 ## 6. Review
