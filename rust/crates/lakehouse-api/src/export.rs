@@ -62,6 +62,19 @@ pub(crate) const EXPORT_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// (`BI-27`, plan D3).
 pub(crate) const EXPORT_ENGINE_TIME: std::time::Duration = std::time::Duration::from_secs(280);
 
+/// The most memory the engine may use for one download's statement: 2 GiB
+/// (`BI-34`, plan D3), sent as `max_memory_usage`. A scan streams, but a sort
+/// or a grouping behind a raw table or a grouped tile does not, and the
+/// engine's own default is far above what two downloads at once
+/// ([`crate::state::EXPORT_AT_ONCE`]) should take from a shared host. A
+/// statement that needs more fails with the engine's error, which the route
+/// turns into a fixed sentence.
+pub(crate) const EXPORT_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// What a download refused for lack of a slot is told (`BI-34`): fixed, so
+/// nothing of the process's state is in it.
+pub(crate) const EXPORT_BUSY: &str = "Two downloads are already running. Try again in a moment.";
+
 /// The most bytes a dashboard download holds: 1 GiB of text (`BI-27`, plan D3).
 /// The Query Studio download has 5 GB because it is one person's one result;
 /// this one is also what a scheduled report builds, in the temporary
@@ -560,6 +573,84 @@ fn xlsx_err(e: &rust_xlsxwriter::XlsxError) -> ExportError {
     ExportError::Xlsx(e.to_string())
 }
 
+/// Rows handed to the workbook writer in one `spawn_blocking` call. The
+/// writer's work per cell is CPU, not I/O, so a million rows written on the
+/// async worker held it for seconds at a time (`BI-34`); a batch is the unit
+/// that moves to the blocking pool, big enough that the hand-over costs
+/// nothing and small enough that the rows held in memory stay a few hundred
+/// kilobytes.
+const XLSX_BATCH_ROWS: usize = 1_000;
+
+/// The workbook and what the row writes need of the columns. It is moved into
+/// `spawn_blocking` and back, one batch at a time, so the writes never run on
+/// the async worker (`BI-34`).
+struct XlsxSink {
+    workbook: rust_xlsxwriter::Workbook,
+    number_formats: Vec<Option<rust_xlsxwriter::Format>>,
+    numeric: Vec<bool>,
+}
+
+impl XlsxSink {
+    /// Write `rows` to the data sheet, the first at sheet row `first_row`.
+    /// Constant-memory mode needs the rows in order, which a batch keeps.
+    fn write_rows(&mut self, first_row: u32, rows: &[Vec<Value>]) -> Result<(), ExportError> {
+        let sheet = self
+            .workbook
+            .worksheet_from_index(0)
+            .map_err(|e| xlsx_err(&e))?;
+        for (offset, row) in rows.iter().enumerate() {
+            let r = u32::try_from(offset)
+                .ok()
+                .and_then(|o| first_row.checked_add(o))
+                .ok_or_else(|| ExportError::Xlsx("more rows than a sheet has".to_owned()))?;
+            for (i, value) in row.iter().enumerate() {
+                let col = u16::try_from(i)
+                    .map_err(|_| ExportError::Xlsx("more columns than a sheet has".to_owned()))?;
+                let numeric = self.numeric.get(i).copied().unwrap_or(false);
+                let written = match (value, cell_number(value, numeric)) {
+                    (Value::Null, _) => Ok(&mut *sheet),
+                    (_, Some(n)) => match self.number_formats.get(i).and_then(Option::as_ref) {
+                        Some(f) => sheet.write_number_with_format(r, col, n, f),
+                        None => sheet.write_number(r, col, n),
+                    },
+                    (Value::Bool(b), None) => sheet.write_boolean(r, col, *b),
+                    (other, None) => {
+                        let text = csv_export::cell_text(Some(other));
+                        if text.chars().count() > XLSX_CELL_CHARS {
+                            return Err(ExportError::Xlsx(
+                                "a cell is longer than Excel allows".to_owned(),
+                            ));
+                        }
+                        sheet.write_string(r, col, text)
+                    }
+                };
+                written.map_err(|e| xlsx_err(&e))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Run `work` on the sink on the blocking pool and take the sink back. The
+/// sink is lost when the task panics or is cancelled, which is an error of
+/// the export, never a half-written file.
+async fn on_blocking_pool<T: Send + 'static>(
+    sink: &mut Option<XlsxSink>,
+    work: impl FnOnce(&mut XlsxSink) -> Result<T, ExportError> + Send + 'static,
+) -> Result<T, ExportError> {
+    let mut owned = sink
+        .take()
+        .ok_or_else(|| ExportError::Xlsx("the workbook was lost".to_owned()))?;
+    let (owned, result) = tokio::task::spawn_blocking(move || {
+        let result = work(&mut owned);
+        (owned, result)
+    })
+    .await
+    .map_err(|e| ExportError::Xlsx(e.to_string()))?;
+    *sink = Some(owned);
+    result
+}
+
 async fn write_xlsx_file<S: RowSource>(
     source: &mut S,
     options: &ExportOptions<'_>,
@@ -597,8 +688,15 @@ async fn write_xlsx_file<S: RowSource>(
             .write_string_with_format(0, col, csv_export::neutralise(label), &bold)
             .map_err(|e| xlsx_err(&e))?;
     }
+    let mut sink = Some(XlsxSink {
+        workbook,
+        number_formats,
+        numeric: cols.numeric.clone(),
+    });
     let mut rows = 0_usize;
     let mut cut = false;
+    // The rows read and counted but not yet written: at most a batch.
+    let mut batch: Vec<Vec<Value>> = Vec::with_capacity(XLSX_BATCH_ROWS);
     // The byte cap counts the text of the cells the workbook holds, the
     // workbook being compressed: the file on disk is never bigger than this.
     let mut bytes: u64 = cols
@@ -629,42 +727,22 @@ async fn write_xlsx_file<S: RowSource>(
                     break;
                 }
                 bytes += row_bytes;
-                let r = u32::try_from(rows + 1)
-                    .map_err(|_| ExportError::Xlsx("more rows than a sheet has".to_owned()))?;
-                for (i, value) in row.iter().enumerate() {
-                    let col = u16::try_from(i).map_err(|_| {
-                        ExportError::Xlsx("more columns than a sheet has".to_owned())
-                    })?;
-                    let numeric = cols.numeric.get(i).copied().unwrap_or(false);
-                    let written = match (value, cell_number(value, numeric)) {
-                        (Value::Null, _) => Ok(&mut *sheet),
-                        (_, Some(n)) => match number_formats.get(i).and_then(Option::as_ref) {
-                            Some(f) => sheet.write_number_with_format(r, col, n, f),
-                            None => sheet.write_number(r, col, n),
-                        },
-                        (Value::Bool(b), None) => sheet.write_boolean(r, col, *b),
-                        (other, None) => {
-                            let text = csv_export::cell_text(Some(other));
-                            if text.chars().count() > XLSX_CELL_CHARS {
-                                return Err(ExportError::Xlsx(
-                                    "a cell is longer than Excel allows".to_owned(),
-                                ));
-                            }
-                            sheet.write_string(r, col, text)
-                        }
-                    };
-                    written.map_err(|e| xlsx_err(&e))?;
-                }
+                batch.push(row);
                 rows += 1;
+                if batch.len() >= XLSX_BATCH_ROWS {
+                    flush_batch(&mut sink, &mut batch, rows).await?;
+                }
             }
         }
     }
+    flush_batch(&mut sink, &mut batch, rows).await?;
     let path = TempPath::new("xlsx");
     let target = path.0.clone();
-    tokio::task::spawn_blocking(move || workbook.save(&target))
-        .await
-        .map_err(|e| ExportError::Xlsx(e.to_string()))?
-        .map_err(|e| xlsx_err(&e))?;
+    on_blocking_pool(&mut sink, move |sink| {
+        // `Workbook::save` takes `&mut self`.
+        sink.workbook.save(&target).map_err(|e| xlsx_err(&e))
+    })
+    .await?;
     let mut file = tokio::fs::File::open(&path.0).await?;
     drop(tokio::fs::remove_file(&path.0).await);
     let len = file.seek(SeekFrom::End(0)).await?;
@@ -675,6 +753,23 @@ async fn write_xlsx_file<S: RowSource>(
         rows,
         cut,
     })
+}
+
+/// Write the pending batch (the last `batch.len()` of `rows_so_far` rows) on
+/// the blocking pool. Sheet row 0 is the header, so the batch starts at sheet
+/// row `rows_so_far - batch.len() + 1`.
+async fn flush_batch(
+    sink: &mut Option<XlsxSink>,
+    batch: &mut Vec<Vec<Value>>,
+    rows_so_far: usize,
+) -> Result<(), ExportError> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let first = u32::try_from(rows_so_far - batch.len() + 1)
+        .map_err(|_| ExportError::Xlsx("more rows than a sheet has".to_owned()))?;
+    let pending = std::mem::replace(batch, Vec::with_capacity(XLSX_BATCH_ROWS));
+    on_blocking_pool(sink, move |sink| sink.write_rows(first, &pending)).await
 }
 
 #[cfg(test)]
@@ -843,6 +938,43 @@ mod tests {
         assert_eq!(w.rows, 2);
         let text = String::from_utf8(read_all(w).await).unwrap();
         assert_eq!(text, "\u{feff}name,amount\r\nxxxx,1\r\nxxxx,2\r\n");
+    }
+
+    /// BI-34: the workbook rows are written in batches on the blocking pool;
+    /// a result longer than a batch (and one cut inside a batch) keeps every
+    /// row it counts, in order.
+    #[tokio::test]
+    async fn a_workbook_longer_than_a_batch_holds_every_counted_row() {
+        let (labels, formats) = (HashMap::new(), HashMap::new());
+        let make = |i: usize| vec![json!("xxxx"), json!(i)];
+        let w = write_export(
+            &mut source(2_500, make),
+            &options(FileFormat::Xlsx, Values::Raw, 10_000, &labels, &formats),
+        )
+        .await
+        .unwrap();
+        assert_eq!((w.rows, w.cut), (2_500, false));
+        let bytes = read_all(w).await;
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut sheet = String::new();
+        archive
+            .by_name("xl/worksheets/sheet1.xml")
+            .unwrap()
+            .read_to_string(&mut sheet)
+            .unwrap();
+        // The header is row 1, the last data row is row 2,501.
+        assert!(sheet.contains("<row r=\"2501\""), "last row missing");
+        assert!(!sheet.contains("<row r=\"2502\""), "a row too many");
+        let cut = write_export_with_byte_cap(
+            &mut source(2_500, make),
+            &options(FileFormat::Xlsx, Values::Raw, 10_000, &labels, &formats),
+            Some(7_510),
+        )
+        .await
+        .unwrap();
+        // 9 one-digit, 90 two-digit and 900 three-digit rows take 6,885 of
+        // the 7,510 bytes; the 8-byte rows after them fill the rest.
+        assert_eq!((cut.rows, cut.cut), (1_077, true));
     }
 
     /// BI-27: a cut file says which limit cut it, and the row count a cut file

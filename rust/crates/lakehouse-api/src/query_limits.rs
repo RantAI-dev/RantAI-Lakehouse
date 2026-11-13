@@ -386,6 +386,7 @@ impl QueryRun {
             // A tile's numbers are numbers: the decimal quoting of `DATA-53` is the
             // query route's, whose cells are text already.
             quote_decimals: false,
+            max_memory_usage: None,
         }
     }
 }

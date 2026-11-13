@@ -4290,6 +4290,12 @@ pub(crate) struct ChartFile {
 /// `require_download`, the runner checks the owner's rights) and records the
 /// audit entry before the file is handed over.
 ///
+/// This does not take a download slot (`BI-34`, plan D5 decision 5): the
+/// routes take one in [`take_export_slot`] before they call it, and a
+/// scheduled report never does, so a send is never refused for concurrency.
+/// The report has the byte cap, the engine's time and memory limits like any
+/// download.
+///
 /// # Errors
 ///
 /// As [`chart_export`].
@@ -4344,6 +4350,8 @@ pub(crate) async fn build_chart_file(
     // `SETTINGS` (a SQL source's, a grouped tile's) still wins.
     let options = lakehouse_clickhouse::QueryOptions {
         max_execution_time: Some(crate::export::EXPORT_ENGINE_TIME),
+        // BI-34 (plan D3): the engine's own memory limit for the statement.
+        max_memory_usage: Some(crate::export::EXPORT_MEMORY_BYTES),
         ..lakehouse_clickhouse::QueryOptions::default()
     };
     let mut stream = state
@@ -4378,6 +4386,21 @@ pub(crate) async fn build_chart_file(
     })
 }
 
+/// One of the process's download slots, or the 429 a person is told
+/// (`BI-34`, plan D3). Try-acquire: a download that cannot start now is
+/// refused with a fixed sentence, it does not queue behind a long one.
+fn take_export_slot(
+    slots: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
+    slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::TooManyRequests {
+            message: crate::export::EXPORT_BUSY.to_owned(),
+            retry_after_secs: 10,
+        })
+}
+
 async fn export_chart(
     state: &AppState,
     principal: &Principal,
@@ -4387,6 +4410,9 @@ async fn export_chart(
     gate: &crate::routes::query::StatementGate<'_>,
 ) -> ApiResult<Response> {
     crate::routes::settings::require_download(state, principal).await?;
+    // Held until the file is written; the stream to the client that follows
+    // reads a file on disk and holds no memory on the engine.
+    let _slot = take_export_slot(&state.export_slots)?;
     let ChartFile {
         chart,
         written,
@@ -5717,6 +5743,21 @@ mod tests {
             serde_json::from_str(r#"{"id":"default","refreshSeconds":300}"#).unwrap();
         assert!(board_edit_allowed(&body));
         assert_eq!(body.refresh_seconds, Some(300));
+    }
+
+    /// `BI-34`: a third concurrent download is refused with a 429 and a fixed
+    /// sentence, and a slot freed by a finished one is taken again.
+    #[test]
+    fn a_third_concurrent_download_is_refused_with_a_429() {
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(crate::state::EXPORT_AT_ONCE));
+        let held: Vec<_> = (0..crate::state::EXPORT_AT_ONCE)
+            .map(|_| take_export_slot(&slots).unwrap())
+            .collect();
+        let refused = take_export_slot(&slots).unwrap_err();
+        assert_eq!(refused.status(), 429);
+        assert_eq!(refused.to_string(), crate::export::EXPORT_BUSY);
+        drop(held);
+        assert!(take_export_slot(&slots).is_ok());
     }
 
     /// `BI-27`: the file name and the headers of a download the byte cap cut
