@@ -45,6 +45,12 @@ env:
 # request are both scoped by their own diff, so the scope outputs of `changes`
 # decide what runs. Before this, every `if:` began with an event test that
 # made a push run all 42 jobs.
+# OPS-25 D9: a gate job also follows its group. Every gate's `if:` keeps its
+# scope condition and appends `needs.changes.outputs.` plus the group's
+# `gates_<group>` output, so a pull request runs only the gates its files can
+# affect (`scripts/ci/gate_paths.txt`). The nightly run and a manual run still
+# select every group (D5), and `ci-required` is what turns the run red when a
+# gate that was selected did not succeed.
 jobs:
   # ── Change Scope Detection ──────────────────────────────────────────
   # Classifies the pull request diff or push into change scopes. Downstream
@@ -77,6 +83,23 @@ jobs:
       # `CI_PUSH_FULL` itself, so an expression's case-insensitive `==` cannot
       # call `TRUE` on when the script calls it off.
       push_full: ${{ steps.scope.outputs.push_full }}
+      # OPS-25 D1/D7: the gate groups this run selected. `gate_groups` is
+      # `none` or the selected groups between commas (`,cdc,`); `ci-required`
+      # reads it to decide whether a skipped gate job was allowed to be
+      # skipped. `gates_<group>` is the per-group answer each gate's `if:`
+      # tests, so a pull request runs only the gates its files can affect.
+      # The scope script writes all nine on every path, including when the map
+      # is missing: an absent output would read as "not selected".
+      gates_storage: ${{ steps.scope.outputs.gates_storage }}
+      gates_pipelines: ${{ steps.scope.outputs.gates_pipelines }}
+      gates_cdc: ${{ steps.scope.outputs.gates_cdc }}
+      gates_ingest: ${{ steps.scope.outputs.gates_ingest }}
+      gates_saas: ${{ steps.scope.outputs.gates_saas }}
+      gates_secrets: ${{ steps.scope.outputs.gates_secrets }}
+      gates_alerts: ${{ steps.scope.outputs.gates_alerts }}
+      gates_upload: ${{ steps.scope.outputs.gates_upload }}
+      gates_governance: ${{ steps.scope.outputs.gates_governance }}
+      gate_groups: ${{ steps.scope.outputs.gate_groups }}
       # OPS-24 D4/D8: `proven` is true only for a push whose own `ci-required`
       # run repeated a passed pull request, and only while the kill switch is
       # unset. The proof script returns `false` on every other event, and R4
@@ -111,6 +134,12 @@ jobs:
           # push, with no code change; the script, not an expression, is where
           # that is compared (R4).
           FORCE_ALL: ${{ vars.CI_PUSH_FULL }}
+          # OPS-25 D6: the `ci:all-gates` label, as one boolean. Only this
+          # answer crosses into the script -- no label text, no label name a
+          # label's own author chose -- and the script compares it to exactly
+          # `true`. Labels are in the event payload, so no new permission is
+          # needed for this.
+          ALL_GATES_LABEL: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:all-gates') }}
         run: ./scripts/ci/detect_change_scope.sh
 
       - name: Self-test push proof
@@ -263,6 +292,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install pytest==8.3.4 pyyaml==6.0.3 cryptography==50.0.2
           python -m pytest ops/release -q
+
+      # OPS-25 D10: the gate groups are wired in three places -- the path map,
+      # each gate job's `if:`, and what `ci-required` reads -- and a mismatch
+      # there skips a gate that should have run while `ci-required` reads the
+      # skip as allowed. This is the one check that they agree; it asks the
+      # real scope script which group each gate file selects, so the answer is
+      # the one CI acts on. Its unit tests are the `discover -s ops/lint` step
+      # above; `pyyaml` is installed by the step before this one.
+      - name: Check every gate job has one group and every gate file a path rule (OPS-25)
+        run: python3 ops/lint/check_gate_groups.py
 
       # REL-2 S2-T2: the release's Compose file is RENDERED from the
       # template, and the rendered file is what an operator deploys — so
@@ -812,7 +851,7 @@ jobs:
   g1-rustfs:
     name: Rust · G1 acceptance (RustFS)
     needs: changes
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_storage == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -858,7 +897,7 @@ jobs:
   g2-seaweedfs:
     name: Rust · G2 storage boundary (SeaweedFS)
     needs: changes
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_storage == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -1033,7 +1072,7 @@ jobs:
   g3a-dagster:
     name: Rust · G3a Dagster + dlt Bronze ingest
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_pipelines == 'true'
     runs-on: ubuntu-latest
     # BLD-2 review R1 SHOULD-FIX 16: raised to 45 for the BLD-2 D11 target lag
     # verification step inside G7, which takes 5 append iterations with settling
@@ -1223,7 +1262,7 @@ jobs:
   g3-maintenance:
     name: Rust · G3 Bronze maintenance job
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_pipelines == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -1311,7 +1350,7 @@ jobs:
   g4-cdc:
     name: Rust · G4 change capture into Bronze
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_cdc == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -1476,7 +1515,7 @@ jobs:
   g4-mysql:
     name: Rust · G4 MySQL change capture into Bronze
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_cdc == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -1626,7 +1665,7 @@ jobs:
   g4-mongo:
     name: Rust · G4 MongoDB change capture into Bronze
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_cdc == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -1777,7 +1816,7 @@ jobs:
   g4-oracle:
     name: Rust · G4 Oracle change capture into Bronze
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_cdc == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -1921,7 +1960,7 @@ jobs:
   g4-mssql:
     name: Rust · G4 SQL Server change capture into Bronze
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_cdc == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -2084,7 +2123,7 @@ jobs:
     # `scripts/ci/required_gate.sh` requires acceptance gates when Dagster
     # changed, so a trigger without `dagster` skipped this job and failed
     # `ci-required` on every Dagster-only PR (found on #251, `SEC-52`).
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_secrets == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -2166,7 +2205,7 @@ jobs:
   g6-ingest:
     name: Rust · G6 ingest matrix (SQL sources)
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_ingest == 'true'
     runs-on: ubuntu-latest
     # 25, not 20, as the job timeout (PR #101, product owner 2026-10-10): it
     # is the cut-off, not the target. Before the split this one job took
@@ -2327,7 +2366,7 @@ jobs:
   g6-ingest-other:
     name: Rust · G6 ingest matrix (files, APIs, streams)
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_ingest == 'true'
     runs-on: ubuntu-latest
     # The cut-off, as in `g6-ingest`; the target is under 20 minutes.
     timeout-minutes: 25
@@ -2492,7 +2531,7 @@ jobs:
   g6-oracle:
     name: Rust · G6 Oracle connector
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_ingest == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -2602,7 +2641,7 @@ jobs:
   g9-upload:
     name: Rust · G9 file upload
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_upload == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -2702,7 +2741,7 @@ jobs:
   g6-alerts:
     name: Rust · SRC-17 alert delivery
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_alerts == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -2849,7 +2888,7 @@ jobs:
   g6-ops:
     name: Rust · SRC-11 connector operations
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_ingest == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -2980,7 +3019,7 @@ jobs:
   g6-credentials:
     name: Rust · SRC-12 credentials at rest
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_secrets == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -3130,7 +3169,7 @@ jobs:
   g6-secret-managers:
     name: Rust · SRC-12 secret managers (Vault, AWS)
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_secrets == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -3264,7 +3303,7 @@ jobs:
   g6-oauth:
     name: Rust · SRC-12 OAuth sign-in
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_secrets == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -3374,7 +3413,7 @@ jobs:
   g6-discovery-scale:
     name: Rust · SRC-13 discovery of 10,000 tables
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_ingest == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -3489,7 +3528,7 @@ jobs:
   g6-saas-a:
     name: Rust · SRC-3 business-app connectors (A)
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_saas == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -3587,7 +3626,7 @@ jobs:
   g6-saas-b:
     name: Rust · SRC-3 business-app connectors (B)
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_saas == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -3694,7 +3733,7 @@ jobs:
   gold-export:
     name: Rust · Gold export to Iceberg (ADR 0010)
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_pipelines == 'true'
     runs-on: ubuntu-latest
     # DATA-2: raised from 20 by measured acceptance test execution time
     # (327s, ~6 minutes) plus 5 minutes of slack (11 minutes total raise).
@@ -3808,7 +3847,7 @@ jobs:
   g8-governance:
     name: Rust · G8 governance masking (${{ matrix.engine }})
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_governance == 'true'
     runs-on: ubuntu-latest
     # Raised from 15: the `trino` leg's stack carries the whole Lakekeeper
     # chain (the coordinator's own `depends_on`), which takes a few
@@ -3999,7 +4038,7 @@ jobs:
   g8-time-travel:
     name: Rust · G8 time travel keeps the policy (${{ matrix.engine }})
     needs: [changes, images]
-    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true') && needs.changes.outputs.gates_governance == 'true'
     runs-on: ubuntu-latest
     # Raised from 25: the `trino` leg's stack carries the Trino
     # coordinator, whose own startup (and the Lakekeeper chain behind it)
@@ -4181,6 +4220,11 @@ jobs:
           SCOPE_DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
           SCOPE_ALL: ${{ needs.changes.outputs.all }}
           PUSH_PROVEN: ${{ needs.changes.outputs.proven }}
+          # OPS-25 D7: which gate groups this run selected. A gate whose group
+          # was selected is required; a skip is accepted only for a gate whose
+          # group was not selected. An empty or malformed value requires every
+          # gate (fail closed).
+          SELECTED_GATE_GROUPS: ${{ needs.changes.outputs.gate_groups }}
           CHANGES_RESULT: ${{ needs.changes.result }}
           REPO_LINTS_RESULT: ${{ needs.repo-lints.result }}
           FRONTEND_RESULT: ${{ needs.verify.result }}

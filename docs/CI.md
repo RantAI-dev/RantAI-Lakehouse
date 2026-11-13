@@ -40,6 +40,11 @@ To reduce CI feedback latency on targeted changes (such as docs-only or frontend
 | `docs_only` | True when every changed file is under `docs/**`, `GTM/**`, or is a root `*.md`, `LICENSE` or `NOTICE` |
 | `all` | `.github/**`, `ops/fixtures/**`, `scripts/ci/**`, an unreadable base SHA, or any file unclassified by the rules above (fails safe) |
 
+The same script also writes the gate groups the run selected: `gates_storage`,
+`gates_pipelines`, `gates_cdc`, `gates_ingest`, `gates_saas`, `gates_secrets`,
+`gates_alerts`, `gates_upload`, `gates_governance` and `gate_groups` (`OPS-25`;
+see "Gates by path" below).
+
 A `push` to `main` follows the same scopes as a pull request (`OPS-24` D1): the diff
 is the push's own (`github.event.before` to the pushed commit). Every push has its own
 run and none waits for another (D2). One full run starts every night at 19:23 UTC and
@@ -106,7 +111,7 @@ the run's base SHA, which the check-run payload does not carry.
 | `fmt`, `clippy`, `build`, `msrv`, `test` | neither `rust` nor `all` (a proven push does not excuse them) |
 | `dagster-unit-tests`, `dagster-loader-tests` | neither `dagster` nor `all` |
 | `images` | none of `rust`, `dagster`, `stack`, `all` (a proven push does not excuse it) |
-| the 25 gate jobs and `image-smoke` | none of `rust`, `dagster`, `stack`, `all`; **or** the event is `push` and the push is proven |
+| the 25 gate jobs and `image-smoke` | none of `rust`, `dagster`, `stack`, `all` (a gate job's own group narrows this further, see "Gates by path" below); **or** the event is `push` and the push is proven |
 
 | Result | Required | Not required |
 |---|---|---|
@@ -120,6 +125,93 @@ manual run it is ignored, and `ci-required` gates exactly as it does without it.
 nightly run of D3 and `CI_PUSH_FULL=true` are the backstops that still run every
 gate.
 
+### Gates by path (`OPS-25`)
+
+A pull request runs only the acceptance gates its changed files can affect. The 25 gate
+jobs are arranged in nine groups, and a group runs only when a file that can change what
+it exercises changes:
+
+| Group | Jobs | What they exercise |
+|---|---|---|
+| `storage` | `g1-rustfs`, `g2-seaweedfs` | `g1_lakekeeper`, tenant provisioning on SeaweedFS |
+| `pipelines` | `g3a-dagster`, `g3-maintenance`, `gold-export` | Dagster + dlt Bronze ingest, the authored pipelines, maintenance, Gold export |
+| `cdc` | `g4-cdc`, `g4-mysql`, `g4-mongo`, `g4-oracle`, `g4-mssql` | change capture through Kafka Connect |
+| `ingest` | `g6-ingest`, `g6-ingest-other`, `g6-oracle`, `g6-ops`, `g6-discovery-scale` | batch connectors, connector operations, discovery at scale |
+| `saas` | `g6-saas-a`, `g6-saas-b` | business-app connectors against the vendor stubs |
+| `secrets` | `g6-credentials`, `g6-secret-managers`, `g6-oauth`, `g10-sso` | credentials at rest, Vault/AWS, OAuth sign-in, Keycloak SSO |
+| `alerts` | `g6-alerts` | alert delivery |
+| `upload` | `g9-upload` | file upload |
+| `governance` | `g8-governance`, `g8-time-travel` | masking and time travel on Trino and ClickHouse |
+
+`images` and `image-smoke` are not in a group: their condition is unchanged, so a
+console-only pull request still builds both images and proves `/health` starts.
+
+`scripts/ci/gate_paths.txt` is the one place this is written. A `group` line lists a
+group's jobs; a `path <pattern> <groups>` line names the files that select it, with
+`<groups>` a comma list, `all` (every group) or `none` (no gate). Patterns are bash
+globs, where `*` also matches `/`, and **the first matching line wins**, so the specific
+lines come before the catch-alls. `scripts/ci/detect_change_scope.sh` reads the map
+once, writes `gates_<group>` for each group and `gate_groups` (`none`, or the selected
+groups between commas, `,cdc,`), and each gate's `if:` keeps today's scope condition and
+appends its own `gates_<group>`. An unmapped file, a missing or unreadable map, and the
+label below select every group: unknown means everything, and a map that names a group
+that does not exist turns `changes` red.
+
+**Shared paths select every group.** One binary (`cargo build -p lakehouse-api`) serves
+every gate, and 21 of the 25 gates create connectors, run pipelines and read back
+through the router and the shared routes, so `docker-compose.yml`, `.env.example`,
+`.github/*`, `scripts/*`, `rust/migrations/*`, `rust/Cargo.toml`, `rust/Cargo.lock`,
+every crate's `Cargo.toml` and every `src/` module not named in the map, `rust/Dockerfile`,
+`rust/entrypoint.api.sh`, `rust/rust-toolchain.toml`, `dagster/Dockerfile`,
+`dagster/pyproject.toml`, `dagster/dagster.yaml`, `definitions.py` and every Dagster
+module not named in the map, `ops/fixtures/*`, `ops/gates/*`, `ops/oidc-mock/*`,
+`ops/smtp-ca/*`, `ops/backups/*`, `ops/init-env.sh`, and any other `ops/*` or `rust/*`
+path select all nine groups. Inside the API that includes `lib.rs`, `main.rs`,
+`state.rs`, `config.rs`, `policy.rs` (`POLICY_TABLE`), `policy_engine.rs`,
+`sql_rewrite.rs`, `routes/mod.rs` (the router), `routes/support.rs`, `routes/auth.rs`,
+`routes/identity.rs`, `routes/connectors.rs`, `routes/pipelines.rs`, `routes/query.rs`,
+`routes/governance.rs` and `upstream_error.rs`.
+
+**`none` is explicit and narrow.** A path selects no group only when no gate can load
+it: integration tests and benches (except G1's own `g1_lakekeeper` test, which is the
+`storage` gate), the parity corpus, `lakehouse-test-support` (a dev-dependency),
+`lakehousectl` (not in any image), the assistant (`routes/ai/*`, `lakehouse-llm`, the
+store's `chat_term.rs`, `assistant_settings.rs` and `knowledge.rs`), Dagster's unit
+tests, `ops/lint`, `ops/release`, `ops/ai_eval`, `ops/bench`, `ops/geo`, `ops/demo`,
+`ops/forecast`, and the console (`src/*`, `public/*`, its config files,
+`Dockerfile.frontend`; `images` builds the API and Dagster only). Two console paths are
+the exception: `src/lib/dashboard-specs.ts` and `public/geo/*` are compiled into
+`lakehouse-bi`, so they select `governance,alerts`.
+
+**The label `ci:all-gates`.** Adding that label to a pull request selects every group
+and sets `stack=true`, so `images` runs too. Only a boolean crosses into the script
+(`ALL_GATES_LABEL`), never any label text, and the script compares it to exactly `true`;
+labels are in the event payload, so no new permission is needed. It takes effect on the
+next push to the pull request (or a close and reopen): no `labeled` trigger is added,
+because any label event would start a run and cancel the one in progress. Whether
+"Re-run jobs" sees a label added after the original event is *not verified*: push.
+
+**What a skipped gate means (`ci-required`, `OPS-25` D7).** `required_gate.sh` reads
+`gate_groups` and the map's `group` lines:
+
+| Scope | The job's group | Required |
+|---|---|---|
+| no acceptance scope (§`ci-required` above) | any | no |
+| acceptance scope, `all=true`, or the nightly/manual run | any | yes |
+| acceptance scope, a pull request or an unproven push | in `gate_groups` | yes |
+| acceptance scope, a pull request or an unproven push | not in it, and `gate_groups` is `none` or well formed | no |
+| acceptance scope | `gate_groups` unset, empty or malformed, or the job has no `group` line | **yes** (fail closed) |
+
+`images` stays required by the acceptance scope and `image-smoke` by the unproven scope
+(the two lines are unchanged). A gate that failed or was cancelled is red whatever the
+selection says.
+
+**Pushes** follow the same map: a proven push skips every gate as before, and an
+unproven push runs the gates of the groups its own diff selects.
+
+The owner accepted on 2026-11-13 that `main` may occasionally be red until the nightly
+run catches a gate that a pull request did not run.
+
 
 Downstream jobs execute according to scope:
 - **`repo-lints`**: Runs unconditionally on all pushes and PRs. Folds the static lints (parity corpus secrets, R11 bare iceberg count, compose init readiness, Dagster intra-package imports, every file compiled into Rust from outside `rust/` setting the `rust` scope (`OPS-24` R5), connector gate coverage (`SRC-9`: every supported connector type has a gate in `ops/gates/coverage.json`, or an explicit waiver that the output lists)) and the unit tests of the connector gate tooling into one fast job.
@@ -132,7 +224,7 @@ Downstream jobs execute according to scope:
 - **`g6-saas-a`** and **`g6-saas-b`** (`SRC-3` AD9 amended before slice 6, `ops/g6/g6_saas_test.py`): the gate of the business-app (`saas`) connectors is two jobs that run in parallel on the same scripts, each given the vendors it owns by `SAAS_GATE_VENDORS` (comma separated vendor ids, or `--vendors=`; empty means every vendor, as in a local run). `g6-saas-a` owns HubSpot, Zendesk, Salesforce, Google Analytics 4 and ServiceNow; `g6-saas-b` owns Confluence, SharePoint, Dynamics 365, Workday and NetSuite. One job with eight vendors took 16m17s of the signed 20 minutes (`7a8af090`), so ten would not fit; no step was removed to make them fit, and each job has its own compose project (`saasagci`, `saasbgci`). Both are in `ci-required` and `scripts/ci/required_gate.sh` (`G6_SAAS_A_RESULT`, `G6_SAAS_B_RESULT`), and `coverage.json` (slice 7) names the job each type is proven in. The rest of this entry describes what either job runs for its vendors. It is a gate in jobs of their own so that no existing connector gate grows (`g6-ingest-other` measured 14m53s to 18m36s of its 20 minutes, `docs/plans/SRC-9-RESULT.md`). One mock vendor server (`ops/g6/saas_stub.py`, stdlib only, service `saas-stub-g6`, profile `g6-saas`) answers for every vendor on the vendor's own port (the vendor's real paths, `VENDOR_PORTS` in the stub; `GET /health` and the `/__admin/<vendor>` state controls on 8080). **Through the product (slice 2 review BLOCKER 4):** the job runs the Dagster stack as `g6-ingest-other` does (`--profile dagster`: API, `dagster-code-location`, `dagster-webserver`, `dagster-daemon`, ClickHouse and the catalog as dependencies) with `ops/g6/docker-compose.g6-saas.override.yml` layered on `docker-compose.g6.override.yml`; that file turns on, for the API and the code location only, the gate-only `CONNECTOR_OAUTH_ALLOW_HTTP` and `SAAS_GATE_ORIGINS` (vendor id to the mock's origin; a no-op without the switch, in Rust and in Python, both tested) so that the product dials the mock. For every vendor in `PRODUCT_VENDORS` the gate: creates the connector through the API (a type that is `supported = false` is not refused) and saves its ingest spec; runs the API's connection test (passes, names the account, repeats none of the mock's words); lists the objects through the orchestrator (the object says it loads incrementally) and previews it (HubSpot's properties API, Zendesk honestly `not_supported`); loads with `ingest_job` into Bronze Iceberg and reads the rows back through ClickHouse; changes the vendor, reloads, and reads back the merged table (no key twice; Zendesk's deleted ticket says `status = deleted`; HubSpot's archived deal stays because HubSpot reports no deletes); revokes the sign-in and checks the API's test and a run fail without the vendor's words. The browser sign-in has no browser here, so it stays a vendor-level step, and the vendor-level steps (the vendor module and `SaasSession` run in the runner against the mock) stay as well: HubSpot connect with the private-app token and the browser sign-in, discover, load, reload through search, a new property in describe, a 429 with `Retry-After` waited out and one that never lifts, a revoked token and refresh token; Zendesk connect with an email and API token and with the browser sign-in (the token request is JSON and the refresh token rotates), the mock's time-based export repeating tickets at page boundaries (upstream #659) and the connector reading each once, a cursor reload with a changed, a new and a deleted ticket, a new field, rate limits, a forbidden and a revoked sign-in. `--vendors-only` runs the vendor-level steps with no API against a local `python ops/g6/saas_stub.py` (set `PORT` if 8080 is taken). The API steps first assert the ten types are `supported: false`. ServiceNow (client credentials; Table API paged by the `Link` header; the dictionary describes the table) and Confluence (email + API token for the product steps; the browser sign-in behind Atlassian's gateway, with its cloud id, at vendor level; a reload that must stop near the cursor, `max_reads`) joined in slice 4. SharePoint (Graph delta feed, its link kept in dlt state; a delete marked; a 410 Gone resync at vendor level and in the dlt-state pytest) and Dynamics 365 (an untracked table filtered by `modifiedon`, a tracked table read by its change-tracking delta link) joined in slice 5; each has a product entry for client credentials and one for the browser sign-in's connection test and load, with Entra's token endpoint in the mock at the customer's tenant. Workday (a report read once and replaced; Basic for the integration user, the refresh grant with the client in the Basic header) and NetSuite (SuiteQL pages by `offset` and `hasMore`; the certificate way, whose PS256 assertion the mock verifies with the public key the gate registers, and the browser sign-in) joined in slice 6, each with a vendor-level run and two product entries in `g6-saas-b`; both are models of documentation that could not be run against a real account. Each later vendor adds an entry to `PRODUCT_VENDORS`, its mock and its vendor-level steps in its own slice, and the types stay `supported = false` until slice 7. Budget: the signed 20 minutes per job (each job's cut-off is 25, as `g6-ingest-other`'s); the first CI runs are its measurement and the job summary has each vendor's product steps time.
 - **`g6-discovery-scale`** (`SRC-13` decisions D9 and D12, `ops/g6/src13_discovery_scale_test.py`): creates a PostgreSQL schema of 10,000 tables in the stack's own database, lists it through `POST /api/connectors/conn-pg-lakehouse/discovery/list`, searches one table by part of its name, previews it, and prints each call's seconds on `[src13]` lines that are copied to the job summary. **Fails if the listing takes more than 120 seconds** (the feature page's "10,000 tables in 2 minutes", D9) or does not return exactly the 10,000 names. The stack is the API and its PostgreSQL only (with ClickHouse and `oidc-mock`, which the API depends on): no Dagster, because the API lists PostgreSQL itself. Its own job, so no existing connector gate grows past its 20 minutes (the type-by-type `discover` steps of `g6-ingest`, `g6-ingest-other`, `g4-cdc` and `g6-oracle` are quick calls, and the ones the orchestrator answers run after the loads). Estimated 8 to 12 minutes; the first CI runs are its measurement. The measured seconds are for a CI runner against a local PostgreSQL, not a customer's database. Not run against a real stack before it reached CI.
 - **Rust fmt / clippy / build / test / msrv**: Runs if `rust` or `all` is true. The `test` job runs `cargo nextest run --workspace` across three partitions (`--partition count:N/3`, `REL-20`) plus `cargo test --doc` for doctests; local developers may keep `cargo test`.
-- **Acceptance jobs (`g1-rustfs`, `g2-seaweedfs`, `g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g4-mysql`, `g4-mssql`, `g4-mongo`, `g4-oracle`, `g6-ingest`, `g6-ingest-other`, `g6-oracle`, `g9-upload`, `g6-alerts`, `g6-ops`, `g6-credentials`, `g6-secret-managers`, `g6-oauth`, `g6-discovery-scale`, `g6-saas-a`, `g6-saas-b`, `gold-export`, `g8-governance`, `g8-time-travel`)**: Run if `rust`, `dagster`, `stack`, or `all` is true.
+- **Acceptance jobs (`g1-rustfs`, `g2-seaweedfs`, `g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g4-mysql`, `g4-mssql`, `g4-mongo`, `g4-oracle`, `g6-ingest`, `g6-ingest-other`, `g6-oracle`, `g9-upload`, `g6-alerts`, `g6-ops`, `g6-credentials`, `g6-secret-managers`, `g6-oauth`, `g6-discovery-scale`, `g6-saas-a`, `g6-saas-b`, `gold-export`, `g8-governance`, `g8-time-travel`)**: Run if `rust`, `dagster`, `stack`, or `all` is true **and** the job's gate group was selected ("Gates by path").
 - **`images` and `image-smoke`**: Same condition as the acceptance jobs; see "Images: built once per run" below.
 
 `ci.yml` runs with `permissions: contents: read` for the whole workflow, which is the

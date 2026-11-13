@@ -27,6 +27,9 @@ if [ ! -f "$SCRIPT" ]; then
   exit 1
 fi
 
+REPO_TMP="$(mktemp -d)"
+trap 'rm -rf "$REPO_TMP"' EXIT
+
 expect() {
   local want="$1"
   local label="$2"
@@ -36,7 +39,7 @@ expect() {
   (
     # Clean subshell environment
     unset EVENT_NAME SCOPE_RUST SCOPE_FRONTEND SCOPE_DAGSTER SCOPE_STACK SCOPE_DOCS_ONLY SCOPE_ALL \
-          PUSH_PROVEN \
+          PUSH_PROVEN SELECTED_GATE_GROUPS GATE_PATHS_FILE \
           CHANGES_RESULT REPO_LINTS_RESULT FRONTEND_RESULT RUST_FMT_RESULT RUST_CLIPPY_RESULT \
           RUST_BUILD_RESULT RUST_TEST_RESULT RUST_MSRV_RESULT DAGSTER_TESTS_RESULT DAGSTER_LOADER_TESTS_RESULT \
           G1_RUSTFS_RESULT G2_SEAWEEDFS_RESULT G3A_DAGSTER_RESULT G3_MAINTENANCE_RESULT \
@@ -251,6 +254,59 @@ expect 1 "Skipped consumers alone block rust PR even when images reports success
   G9_UPLOAD_RESULT=skipped G6_ALERTS_RESULT=skipped G6_OPS_RESULT=skipped G6_CREDENTIALS_RESULT=skipped G6_SECRET_MANAGERS_RESULT=skipped G6_OAUTH_RESULT=skipped G6_DISCOVERY_SCALE_RESULT=skipped G6_SAAS_A_RESULT=skipped G6_SAAS_B_RESULT=skipped GOLD_EXPORT_RESULT=skipped \
   G8_GOVERNANCE_RESULT=skipped G8_TIME_TRAVEL_RESULT=skipped
 expect 0 "Images and smoke skipped is fine for a docs-only PR" "${base_docs_green[@]}"
+
+# OPS-25 D7: a gate job is required only when its group was selected, and a
+# selection that cannot be read means every gate is required. The cases above
+# set no SELECTED_GATE_GROUPS at all, which is the fail-closed answer ("the
+# scope needs the gates, so every gate is required"); they keep their meaning.
+base_cdc_selected=(
+  EVENT_NAME=pull_request SCOPE_STACK=true SELECTED_GATE_GROUPS=,cdc,
+  CHANGES_RESULT=success REPO_LINTS_RESULT=success
+  G4_CDC_RESULT=success G4_MYSQL_RESULT=success G4_MSSQL_RESULT=success
+  G4_MONGO_RESULT=success G4_ORACLE_RESULT=success
+  IMAGES_RESULT=success IMAGE_SMOKE_RESULT=success
+)
+
+base_none_selected=(
+  EVENT_NAME=pull_request SCOPE_STACK=true SELECTED_GATE_GROUPS=none
+  CHANGES_RESULT=success REPO_LINTS_RESULT=success
+  IMAGES_RESULT=success IMAGE_SMOKE_RESULT=success
+)
+
+base_cdc_scope_no_selection=(
+  EVENT_NAME=pull_request SCOPE_STACK=true
+  CHANGES_RESULT=success REPO_LINTS_RESULT=success
+  G4_CDC_RESULT=success IMAGES_RESULT=success IMAGE_SMOKE_RESULT=success
+)
+
+expect 0 "a pull request selecting only cdc passes with the five cdc gates green" "${base_cdc_selected[@]}"
+expect 1 "a pull request selecting only cdc fails when g4-mysql is skipped" "${base_cdc_selected[@]}" G4_MYSQL_RESULT=skipped
+expect 1 "a pull request selecting only cdc fails when g6-ingest, not selected, failed" "${base_cdc_selected[@]}" G6_INGEST_RESULT=failure
+expect 0 "a pull request selecting no gate group passes with every gate skipped" "${base_none_selected[@]}"
+expect 1 "a pull request selecting no gate group fails when a gate failed" "${base_none_selected[@]}" G1_RUSTFS_RESULT=failure
+
+# Fail closed: unset, empty and malformed selections require every gate.
+expect 1 "an unset SELECTED_GATE_GROUPS requires every gate" "${base_cdc_scope_no_selection[@]}"
+expect 1 "an empty SELECTED_GATE_GROUPS requires every gate" "${base_cdc_selected[@]}" SELECTED_GATE_GROUPS=
+expect 1 "a malformed SELECTED_GATE_GROUPS (bare cdc) requires every gate" "${base_cdc_selected[@]}" SELECTED_GATE_GROUPS=cdc
+
+# A selection never overrides "every gate is required": all=true, the nightly
+# run and the manual run keep requiring all 25.
+expect 1 "all=true requires every gate even when only cdc is selected" "${base_cdc_selected[@]}" SCOPE_ALL=true
+expect 1 "a scheduled run requires every gate even when only cdc is selected" "${base_cdc_selected[@]}" EVENT_NAME=schedule
+expect 1 "a manual run requires every gate even when only cdc is selected" "${base_cdc_selected[@]}" EVENT_NAME=workflow_dispatch
+
+# A proven push excuses the gates whatever the selection says (OPS-24 D5/D6).
+expect 0 "a proven push with the cdc group selected passes with every gate skipped" "${base_push_proven_green[@]}" SELECTED_GATE_GROUPS=,cdc,
+expect 1 "a proven push with the cdc group selected still fails on a failed gate" "${base_push_proven_green[@]}" SELECTED_GATE_GROUPS=,cdc, G4_CDC_RESULT=failure
+
+# The map is the only source of "which group is this job in?". A job with no
+# `group` line, and an unreadable map, are required.
+no_cdc_map="$REPO_TMP/no_cdc_gate_paths.txt"
+mkdir -p "$REPO_TMP"
+grep -v '^group cdc ' "${SCRIPT_DIR}/../gate_paths.txt" > "$no_cdc_map"
+expect 1 "a gate job with no group line is required even when cdc is not selected" "${base_none_selected[@]}" GATE_PATHS_FILE="$no_cdc_map"
+expect 1 "an unreadable gate path map makes every gate required" "${base_cdc_selected[@]}" GATE_PATHS_FILE=/nonexistent
 
 # 3. Workflow & Gate structure consistency checks (SHOULD-FIX 6)
 CI_YML="${SCRIPT_DIR}/../../../.github/workflows/ci.yml"
