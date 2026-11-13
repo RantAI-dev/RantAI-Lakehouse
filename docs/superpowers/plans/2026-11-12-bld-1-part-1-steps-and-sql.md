@@ -877,6 +877,212 @@ is the one with `0140`.
   `dagster/` (the merge brought `main`'s changes, which its own CI covered).
 - `cargo test --workspace`: not run here.
 
+### Handoff S2 (developer, 2026-11-13)
+
+Branch `feat/bld-1-steps-preview`, base `origin/main` at `be2c92910` (S1's
+merge, PR #481). Rust only; no migration, no dependency change, no `src/`,
+`dagster/`, compose or CI change.
+
+**Commits**
+
+| Commit | Subject |
+| --- | --- |
+| `264380ad6` | feat(pipelines): preview one input or step as the caller (S2-T1) |
+| `0dfed1599` | feat(pipelines): a preview's limits and the query/run error form (S2-T2) |
+| (this commit) | docs(plan): BLD-1 part 1 S2 handoff |
+
+**What was built.** `POST /api/pipelines/preview` in the new
+`routes/pipeline_preview.rs`, `pipeline:write` in `POLICY_TABLE` (deny by
+default would otherwise answer 500), its own `pipeline_preview_router()`
+merged into `pipelines_router()` so that function stays under
+`clippy::too_many_lines`, and asserted both ways in `tests/route_auth.rs`.
+The handler parses `{ inputs, steps, upTo }`, requires `upTo`, compiles
+through `pipeline_compile::compile(inputs, steps, Some(upTo), catalog_db)`,
+runs the tenant gate as `GateActor::Caller` and then
+`policy_engine::rewrite_sql_for_roles` (decision 13: as the person looking,
+never as any pipeline's author), probes the columns, and runs
+`SELECT * FROM (<rewritten>) AS step LIMIT 101 SETTINGS max_result_rows =
+101, result_overflow_mode = 'break', max_execution_time = 30`. The response
+is `{ columns: [{name, type}], rows, truncated }`, rows as arrays in column
+order, at most 100 of them.
+
+**Reuse, and what moved (AGENTS.md rule 4).** `placeholders_for` and the
+`DESCRIBE` column probe moved from `routes/dashboard_sources.rs` to
+`routes/support.rs`; the dashboard preview calls them and its behaviour and
+its 7 unit tests and `dashboard_tenant_scope.rs` (13) are unchanged. The
+gate's 404/422-to-422 rule is `authored_pipelines::gate_refusal_as_unprocessable`,
+made `pub(crate)` rather than copied; the rewrite's refusal sentence is
+`policy_engine::enforcement_error_message`, as the save path uses it. The
+settings text is `lakehouse_bi::builder::SQL_SOURCE_SETTINGS` swapped by
+`with_run_settings`, not a second `SETTINGS` string. The
+`ClickHouse` error path is `upstream_error::ch_failure_for_author` — the
+function `POST /api/query/run` itself uses. One `tests/sec11_guard.rs`
+allowlist entry was added with its reason (the query-author exception,
+spec rule 7); no existing entry or test was changed or weakened.
+
+**Verification, run on the final commit (`0dfed1599`), in the foreground.**
+
+```
+cd rust && cargo fmt --check                                  # clean
+cargo-locked clippy -j 2 -p lakehouse-api --all-targets -- -D warnings
+                                                              # clean
+cargo-locked test -j 2 -p lakehouse-api --lib -- pipeline_compile sql_guard
+                                                              # 61 passed, 0 failed
+cargo-locked test -j 2 -p lakehouse-api --lib -- preview      # 30 passed, 0 failed
+cargo-locked test -j 2 -p lakehouse-api --test pipeline_preview \
+  --test route_auth --test sec11_guard --test pipeline_compile_route \
+  --test pipeline_definition_save --test dashboard_tenant_scope
+                        # 10, 95, 4, 24, 14, 13 passed; 0 failed in each
+python3 ops/lint/check_intra_package_imports.py               # OK
+python3 ops/lint/check_bare_iceberg_count.py                  # R11 guard: none found
+```
+
+On the T1 commit (`264380ad6`), the same scoped set: `--test
+pipeline_preview` 8 passed, `--test route_auth` 95, `--test sec11_guard` 4,
+`--lib -- preview_tests` 7, `--test dashboard_tenant_scope` 13.
+
+The route tests are in `tests/pipeline_preview.rs` and cover S2-T1's and
+S2-T2's checks: `upTo` an input answers that table's rows (and the compiled
+text reads Bronze through `icecat_api.`); `upTo` a step answers that step;
+a column masked for the caller is masked in the statement the engine runs
+and in the returned rows; an input the caller may not read is a 422 with the
+fixed sentence and NOTHING reaches `ClickHouse`; a `DROP TABLE` step is a
+400 whose message starts `steps[0]: `; a caller without `pipeline:write` is
+403; 101 rows answer 100 with `truncated: true`; the row query carries the
+limits; and a `ClickHouse` statement failure answers `422` with the same
+text `POST /api/query/run` gives for it (compared up to the reference id).
+
+**Mismatch between plan and code (for the planner)**
+
+1. **D16's wrapper is `LIMIT 100`; the built wrapper is `LIMIT 101`.** The
+   S2-T1 check requires "more than 100 rows gives 100 and `truncated: true`",
+   and `ClickHouse` reports only the rows it returned, so `LIMIT 100` cannot
+   tell a cut from an exact fit. One more row is asked and 100 answered —
+   the rule Query Studio already follows ("one row more than the route keeps
+   is asked for, so `truncated` stays honest"). The `SETTINGS` cap is 101 for
+   the same reason.
+2. **A table the caller may not read is a 422 here, and a 404 everywhere
+   else.** S2-T1's check and section 3's contract say 422, so the gate's own
+   404 refusal (`SEC-20`) and the rewrite's `TableNotReadable` (`GOV-7` D5,
+   which `routes::support::enforcement_refusal` answers 404) are answered
+   422 with the same fixed sentence. That is the save path's rule (D9), but
+   it differs from Query Studio and the dashboard preview, which keep the
+   404. No sentence changes, so nothing about a hidden table leaks; the
+   console must not read this route's 422 as "bad definition" when the
+   message is an access sentence. If the planner wants the 404 instead, it
+   is one `map_err` and one test assertion.
+3. Not a mismatch, noted for the review: a preview that hits its 30 second
+   limit answers the engine's fixed failure sentence (`ch_error`'s), not
+   Query Studio's "stopped after N seconds, the limit for your role", because
+   that sentence names a configured limit and the preview's 30 seconds is
+   decision 17's own.
+
+**Not verified, with the reason**
+
+- **A preview of a Bronze input through the catalog database on a running
+  stack: not verified.** The wiremock proof pins that the compiled text is
+  `` SELECT * FROM icecat_api.`bronze.<table>` ``, but no `ClickHouse` was
+  asked. Running it needs the full stack (`docker compose --profile '*'`), a
+  loaded Bronze table and `ICEBERG_QUERY_DB`; none was brought up here.
+- No browser or console check: S3 owns the page, and nothing in `src/` was
+  touched.
+- A real `ClickHouse`'s `DESCRIBE` over a masked subquery, and its
+  `max_execution_time` behaviour at 30 s: wiremock only.
+- `cargo test --workspace`, the full workspace clippy run and the acceptance
+  gates: not run here (the brief scopes local runs); CI runs them on the
+  pull request.
+- The Python suite was not run: no `dagster/` file changed.
+
+### Handoff S2, fix round 1 (developer, 2026-11-13)
+
+Branch `feat/bld-1-steps-preview` (base for this round `1d025c342`, which
+carries the reviewer's entry and the merge of `main`).
+
+**Commits**
+
+| Commit | Subject |
+| --- | --- |
+| `53c1aceed` | test(pipelines): the preview asks nothing about the previewed table (R1-B1) |
+| `513c81e9b` | fix(pipelines): several inputs need a step (R1-S1) |
+| (this commit) | docs(plan): BLD-1 part 1 S2 fix round 1 handoff |
+
+**R1-B1 — which request, and which case.** I could not observe it, so I do
+not quote a body, and I say that plainly rather than invent one. The failure
+did not reproduce here:
+
+- the test alone, one process per run: 40 runs, all passed;
+- the test alone through the built binary, eight processes in parallel, 15
+  runs each: 120 runs, all passed;
+- the whole file, three loops of 10 runs at `--test-threads=16`: 30 runs,
+  all passed;
+- the whole file through `cargo-locked`, 20 runs before the final
+  comment-only polish and 20 after: 40 runs, all passed.
+
+Every one of those runs used an assertion that prints the received requests,
+and none ever received one. The route also cannot produce it: the tenant
+gate reads Postgres, and `rewrite_sql_for_roles` refuses at `table_access`
+**before** `prefetch_for_tables` can ask `ClickHouse` for
+`system.columns`/`system.tables`; `describe_columns` and the row query run
+only after the rewrite returns `Ok`, and either would have answered a
+different sentence than the one the reviewer saw pass (`The database request
+failed. Reference: …`). So this is **case 2**: a request from something else,
+not about the previewed table — this machine runs many test processes at
+once, every mock binds an ephemeral port, and a request one of them queued in
+a background task (the column-lineage build pass is one writer that reads
+`ClickHouse` after its route has answered) can land on whichever server binds
+that port next.
+
+What changed: the assertion now says what the test means — no request the
+engine received names the previewed table (`silver.orders`), which is the
+compiled statement, its `DESCRIBE` and the row query wrapping it. The shape
+alone (`DESCRIBE`, `AS step LIMIT`) is deliberately not used, because another
+preview test's probe has the same shape and would be a false failure; the
+failure message prints every received request (method, url, body) so the next
+failure names the intruder. The assertion is still there; no retry, no sleep,
+no route change (there was no order defect to fix). If the reviewer can
+reproduce it, the printed request will say which process sent it.
+
+**R1-S1 — several inputs need a step (D1).** `pipeline_compile::validate`
+refuses a definition with more than one input and no step at `inputs[1]` with
+the fixed sentence "with more than one input, add a step that reads them",
+when `up_to` is `None`; with `up_to` naming an input it still compiles that
+input (the editor's preview of a pipeline whose step is not written yet). The
+module doc's rule 1 says so. No fixture in `pipeline_definition_save.rs`,
+`pipeline_compile_route.rs`, `pipeline_preview.rs`, or elsewhere in the
+crate's `--lib -- pipeline` tests saved several inputs with no step, so no
+existing fixture needed a step.
+
+**Verification, on the code head (`513c81e9b`), in the foreground.**
+
+```
+cd rust && cargo fmt --check                                  # clean
+cargo-locked clippy -j 2 -p lakehouse-api --all-targets -- -D warnings
+                                                              # clean
+cargo-locked test -j 2 -p lakehouse-api --lib -- pipeline_compile
+                                                              # 38 passed, 0 failed
+cargo-locked test -j 2 -p lakehouse-api --test pipeline_definition_save \
+  --test pipeline_compile_route --test pipeline_preview        # 14, 24, 10 passed
+cargo-locked test -j 2 -p lakehouse-api --lib -- pipeline      # 304 passed
+cargo-locked test -j 2 -p lakehouse-api --test sec11_guard --test route_auth
+                                                              # 4, 95 passed
+```
+
+The 20-run proof of the R1-B1 fix, `for i in $(seq 20); do cargo-locked test
+-j 2 -p lakehouse-api --test pipeline_preview 2>&1 | grep '^test result';
+done`, printed the same line twenty times:
+
+```
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+(finished between 4.53 s and 6.43 s). That is 20 of 20, none failed.
+
+### Handoff S2, fix round 2 (developer, 2026-11-13)
+
+- **Commits:** `2c15ea883` `test(pipelines): the preview test's comment says what is known (S2 review R2-S1)` — the comment above the assertion only, rewritten to say what is known (what the test asserts and why; the gate is Postgres and the rewrite refuses at `table_access` before its prefetch; the "received nothing at all" form failed twice in the reviewer's runs on 2026-11-13, the stray request was never captured and did not reproduce in 230 runs; a request from another test process on a reused port is a guess, not a finding; the assertion prints everything received). The assertion and every other line are unchanged. `42932cdb4` `Merge remote-tracking branch 'origin/main' into feat/bld-1-steps-preview` — no conflict.
+- **Counts on `42932cdb4`:** `cargo fmt --check` clean; `cargo-locked clippy -j 2 -p lakehouse-api --all-targets -- -D warnings` clean; `--test pipeline_preview` 10 passed, `--test sec11_guard` 4 passed, `--test route_auth` 95 passed, 0 failed in each.
+- **What the merge touched:** 31 files, +2063 −91: 27 under `src/` (the console's WEB-11 round), `CHANGELOG.md`, the new plan `docs/superpowers/plans/2026-11-12-qa-round-web-11.md`, and `docs/core/features/pages-per-role.md`. No Rust and no `dagster/` file, so the branch's Rust is exactly what round 1 verified. No new migration: `0140` (this feature's) is still the highest, and this slice adds none.
+
 ### Handoff S3 (developer, 2026-11-13)
 
 Branch `feat/bld-1-steps-console`, base `origin/main` at `be2c92910` (S1
@@ -1447,6 +1653,98 @@ two gates in `g3a-dagster` (the G7 case with two inputs and a SQL step; the
 author gate against the compile route) have never run to the end on it. The
 pull request stays a draft until that run is green; a failure there reopens
 the review.
+
+### S2, round 1 (reviewer, 2026-11-13)
+
+Reviewed `origin/main...30bc20a88` (10 files, +1073 −27) against D16 and
+S2-T1, S2-T2. `main` was merged into the branch with this entry (documents
+only; no conflict).
+
+What is right: the route is one small module over the compiler's `up_to`
+seam; it runs as the caller through `StatementGate` and
+`rewrite_sql_for_roles`; the wrapper reuses the dashboard preview's settings
+and `with_run_settings`; the column probe and the placeholder set were moved
+to `routes/support.rs` and shared, not copied; an engine failure goes through
+`ch_failure_for_author`, the function Query Studio uses, and the guard's new
+allowlist entry names that function and the reason (the same exception
+`query.rs` has; the guard's pattern is untouched); the policy row is asserted
+both ways.
+
+Accepted as reported in the handoff: the row query asks for 101 rows and
+answers 100, so `truncated` is exact; a table the caller may not read is 422
+here, as D16 and section 3 say; a timeout answers the engine's fixed
+sentence.
+
+**Re-run by the reviewer on `30bc20a88`**, in the developer's worktree, with
+`cargo-locked -j 2`: `cargo fmt --check` clean; `--test sec11_guard` 4
+passed; `--test pipeline_preview` **9 passed, 1 failed**. Not re-run by the
+reviewer: clippy, `route_auth`, the dashboard preview's tests (the handoff's
+counts stand unchecked). CI's full run on the head had not finished.
+
+#### BLOCKER
+
+- **R1-B1. `an_input_the_caller_may_not_read_is_refused_before_the_engine`
+  fails some of the time.** `tests/pipeline_preview.rs:396` asserts that the
+  mock engine received no request at all. In the reviewer's runs it failed
+  once when the whole file ran and once in three runs of that test alone;
+  the status and the sentence were right each time, and only the "received
+  nothing" assertion failed. A test that fails one run in three cannot go to
+  `main`, and what it asserts matters: the refusal for a table the caller may
+  not read must come before anything about that table is asked of the engine
+  (`SEC-50` says the same for the run route).
+  Find out first which request reaches the engine: print the bodies the mock
+  received on a failing run. Then one of two things is true, and each has its
+  own fix:
+  1. The request comes from the preview itself (the gate or the rewrite asks
+     the engine about the statement before the refusal is decided, depending
+     on a cache or on timing). That is a defect in the order of the route's
+     steps: fix the order so the refusal is decided first, and keep the
+     assertion as it is.
+  2. The request comes from something else the test app starts (a background
+     task, a warm-up, a health probe) and is not about the previewed table.
+     Then the assertion is wrong, not the route: assert what the test means,
+     that no request the engine received names the previewed table and none
+     is a `DESCRIBE` or the row query, and say in the test which other
+     request may arrive and why.
+  Do not remove the assertion and do not add a retry or a sleep. Run the
+  whole file 20 times in a row afterwards and quote the count in the
+  handoff (`for i in $(seq 20); do ... --test pipeline_preview; done`, each
+  through `cargo-locked`).
+
+No SHOULD-FIX.
+
+### S2, round 2 (reviewer, 2026-11-13)
+
+Reviewed `1d025c342..315f7b464`: the fix for R1-B1, the planner's addition
+R1-S1, the comment of R2-S1, and the merge of `main`.
+
+- **R1-B1: closed, with what is not known stated.** The developer could not
+  reproduce the failure (230 runs) and showed from the code that the route
+  asks the engine nothing before the refusal: the gate reads Postgres, and
+  the rewrite refuses at table access before its prefetch. The assertion now
+  says what the test means (nothing the engine received names the previewed
+  table) and prints everything received. Which request reached the mock in
+  the reviewer's two failing runs was never captured; the test's comment says
+  so and calls the reused-port explanation a guess (R2-S1, sent by message
+  and fixed in `2c15ea883`).
+- **R1-S1 (sent by message; plan D1): closed.** The compiler refuses several
+  inputs with no step at `inputs[1]` when the whole definition is compiled,
+  and still compiles one input for a preview. Four tests.
+- `main` merged by the developer (`42932cdb4`; no Rust in it).
+
+**Re-run by the reviewer**, in the developer's worktree with
+`cargo-locked -j 2`, on `c405885e6`: `--lib -- pipeline_compile` 38 passed;
+`--test pipeline_preview` passed all 10 tests in 10 of 10 runs. Since then
+only a comment and the merge of `main` changed. Not re-run by the reviewer:
+clippy, `route_auth`, `sec11_guard` on the head (the handoff's counts stand
+unchecked).
+
+**No open BLOCKER and no open SHOULD-FIX.** Merges on a green full run of
+the head commit.
+
+**Not verified by anyone:** a preview of a Bronze input through the catalog
+database on a running stack, and the 30 second limit against a real engine.
+The acceptance checklist's `BLD-1-AC3` covers the first.
 
 ### S3, round 1 (reviewer, 2026-11-13)
 

@@ -79,6 +79,7 @@ mod notifications;
 mod ops;
 mod overview;
 pub(crate) mod params;
+mod pipeline_preview;
 mod pipelines;
 mod quality;
 mod quality_anomaly;
@@ -421,6 +422,21 @@ fn pipeline_compile_router() -> Router<AppState> {
     )
 }
 
+/// `POST /api/pipelines/preview` (BLD-1 part 1 / D16): the first rows of one
+/// input or step of a definition that is not saved yet.
+///
+/// Its own function for the same reason [`pipeline_compile_router`] is: so the
+/// route can be added without pushing [`pipelines_router`] over
+/// `clippy::too_many_lines`. It merges straight back in and carries no
+/// middleware or state of its own. Static, like `generate`, so axum never
+/// reads it as `/api/pipelines/{id}`.
+fn pipeline_preview_router() -> Router<AppState> {
+    Router::new().route(
+        "/api/pipelines/preview",
+        axum::routing::post(pipeline_preview::preview),
+    )
+}
+
 /// The authored-pipeline (orchestrator-only) routes: the definitions the
 /// job factory loads, and the rewrite it asks for before it runs one.
 ///
@@ -445,6 +461,10 @@ fn pipelines_router() -> Router<AppState> {
             "/api/pipelines/generate",
             axum::routing::post(pipelines::generate),
         )
+        // BLD-1 part 1 / D16: the preview of one input or step of a definition
+        // that is not saved yet. Static, like `generate`, so it is never read
+        // as `/api/pipelines/{id}`.
+        .merge(pipeline_preview_router())
         // Static, so it is matched ahead of `/api/pipelines/{id}`.
         .merge(authored_pipelines_router())
         .route(
