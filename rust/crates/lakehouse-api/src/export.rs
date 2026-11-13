@@ -54,6 +54,21 @@ pub(crate) const EXPORT_ROW_CAP: u32 = 1_000_000;
 /// seconds (D6).
 pub(crate) const EXPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// The longest the engine may run a download's statement: 280 seconds, below
+/// [`EXPORT_TIMEOUT`] so the engine's own answer reaches the caller before the
+/// client gives up. A raw table over a SQL source already carried it in the
+/// statement; a table over a mart did not, and a grouped tile runs under its
+/// own limits, so this is sent as a setting of the request for every download
+/// (`BI-27`, plan D3).
+pub(crate) const EXPORT_ENGINE_TIME: std::time::Duration = std::time::Duration::from_secs(280);
+
+/// The most bytes a dashboard download holds: 1 GiB of text (`BI-27`, plan D3).
+/// The Query Studio download has 5 GB because it is one person's one result;
+/// this one is also what a scheduled report builds, in the temporary
+/// directory, so it is a fifth of that. A file over it is cut at the last whole row that fits and
+/// says so in its name, its headers and its audit row, as the row cap does.
+pub(crate) const EXPORT_BYTE_CAP: u64 = 1024 * 1024 * 1024;
+
 /// The file kinds a chart can be downloaded as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FileFormat {
@@ -213,6 +228,21 @@ pub(crate) struct Written {
     pub(crate) cut: bool,
 }
 
+impl Written {
+    /// Which limit cut the file: `"rows"` when it holds the row cap, `"bytes"`
+    /// when the byte cap stopped it earlier, `None` when it was not cut
+    /// (`BI-27`: a cut file always says which limit it met).
+    pub(crate) fn cut_by(&self, row_cap: usize) -> Option<&'static str> {
+        // The dashboard's row cap (1,000,000) is under a sheet's (1,048,575),
+        // so a workbook cut by rows holds exactly `row_cap` rows too.
+        match (self.cut, self.rows >= row_cap) {
+            (false, _) => None,
+            (true, true) => Some("rows"),
+            (true, false) => Some("bytes"),
+        }
+    }
+}
+
 /// What reading the next row came to.
 enum Next {
     Row(Vec<Value>),
@@ -294,17 +324,16 @@ impl Drop for TempPath {
     }
 }
 
-/// Read `source` to its end (or the cap) and write it as `options` say.
-///
-/// This entry has no byte cap: the dashboard's download is bounded by its row
-/// cap alone, and its files are what they were before the byte cap existed.
-/// The Query Studio download, which has a cap of its own, calls
-/// [`write_export_with_byte_cap`].
+/// Read `source` to its end (or the cap) and write it as `options` say, with no
+/// byte cap. Every route sets a byte cap (`BI-27`: the dashboard's is
+/// [`EXPORT_BYTE_CAP`], Query Studio's its own), so this is the tests' short
+/// form of [`write_export_with_byte_cap`].
 ///
 /// # Errors
 ///
 /// [`ExportError`]: the source failed, the disk failed, or the workbook writer
 /// refused a cell.
+#[cfg(test)]
 pub(crate) async fn write_export<S: RowSource>(
     source: &mut S,
     options: &ExportOptions<'_>,
@@ -315,9 +344,9 @@ pub(crate) async fn write_export<S: RowSource>(
 /// Read `source` to its end (or the caps) and write it as `options` say.
 ///
 /// `byte_cap` is the most bytes the file may hold, `None` for no byte cap.
-/// The Query Studio download (`QS-2`) is the caller that has one: it stops a
-/// result that passes its cap at the last whole row, and tells the person
-/// which limit cut the file. The comma and tab files count the bytes they
+/// The Query Studio download (`QS-2`) and the dashboard's (`BI-27`) have one:
+/// each stops a result that passes its cap at the last whole row, and tells
+/// the person which limit cut the file. The comma and tab files count the bytes they
 /// write, the byte-order mark and the header among them; the workbook counts
 /// the text of its cells, the workbook being compressed, so the file on disk
 /// is never bigger than the counted text. A cap cuts at the last whole row
@@ -814,6 +843,41 @@ mod tests {
         assert_eq!(w.rows, 2);
         let text = String::from_utf8(read_all(w).await).unwrap();
         assert_eq!(text, "\u{feff}name,amount\r\nxxxx,1\r\nxxxx,2\r\n");
+    }
+
+    /// BI-27: a cut file says which limit cut it, and the row count a cut file
+    /// names is the one it holds.
+    #[tokio::test]
+    async fn a_cut_file_says_whether_rows_or_bytes_cut_it() {
+        let (labels, formats) = (HashMap::new(), HashMap::new());
+        let make = |i: usize| vec![json!("xxxx"), json!(i)];
+        for format in [FileFormat::Csv, FileFormat::Xlsx] {
+            let by_bytes = write_export_with_byte_cap(
+                &mut source(10, make),
+                &options(format, Values::Raw, 10, &labels, &formats),
+                Some(24),
+            )
+            .await
+            .unwrap();
+            assert!(by_bytes.cut, "{format:?}");
+            assert_eq!(by_bytes.cut_by(10), Some("bytes"), "{format:?}");
+            let by_rows = write_export_with_byte_cap(
+                &mut source(11, make),
+                &options(format, Values::Raw, 10, &labels, &formats),
+                Some(EXPORT_BYTE_CAP),
+            )
+            .await
+            .unwrap();
+            assert_eq!(by_rows.cut_by(10), Some("rows"), "{format:?}");
+            let whole = write_export_with_byte_cap(
+                &mut source(3, make),
+                &options(format, Values::Raw, 10, &labels, &formats),
+                Some(EXPORT_BYTE_CAP),
+            )
+            .await
+            .unwrap();
+            assert_eq!(whole.cut_by(10), None, "{format:?}");
+        }
     }
 
     #[tokio::test]

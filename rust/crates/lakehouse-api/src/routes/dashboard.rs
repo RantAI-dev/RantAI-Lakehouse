@@ -3789,6 +3789,8 @@ struct ExportOutcome {
     action: &'static str,
     rows: usize,
     cut: bool,
+    /// Which limit cut the file (`rows` or `bytes`), `None` when it was whole.
+    cut_by: Option<&'static str>,
     cap: u32,
     format: crate::export::FileFormat,
     values: crate::export::Values,
@@ -3843,7 +3845,11 @@ async fn record_export_audit(
             "tile": chart.spec.id,
             "rows": outcome.rows,
             "cut": outcome.cut,
+            // BI-27: a file the byte cap cut says so in the audit row, with
+            // the cap it met, as the row cap does.
+            "cutBy": outcome.cut_by,
             "cap": outcome.cap,
+            "byteCap": crate::export::EXPORT_BYTE_CAP,
             "format": outcome.format.extension(),
             "values": if outcome.values == crate::export::Values::Raw { "raw" } else { "formatted" },
         }),
@@ -4047,7 +4053,7 @@ fn export_response(
     written: crate::export::Written,
     file_name: &str,
     format: crate::export::FileFormat,
-    cap: u32,
+    (cap, cut_by): (u32, Option<&'static str>),
 ) -> Response {
     let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(written.file));
     (
@@ -4071,10 +4077,25 @@ fn export_response(
                 header::HeaderName::from_static("x-export-cap"),
                 cap.to_string(),
             ),
+            (
+                header::HeaderName::from_static("x-export-cut-by"),
+                cut_by.unwrap_or("none").to_owned(),
+            ),
         ],
         body,
     )
         .into_response()
+}
+
+/// The row count a cut file names: the row cap when that cut it, the rows it
+/// holds when the byte cap did (`BI-27`), so "first N rows" is always true of
+/// the file and the console's sentence stays right. `X-Export-Cap` carries
+/// the same number.
+pub(crate) fn cut_rows(written: &crate::export::Written, row_cap: u32) -> u32 {
+    match written.cut_by(row_cap as usize) {
+        Some("bytes") => u32::try_from(written.rows).unwrap_or(row_cap),
+        _ => row_cap,
+    }
 }
 
 /// `GET /api/dashboard/chart-export?chart=&format=&values=` — the whole result
@@ -4318,9 +4339,16 @@ pub(crate) async fn build_chart_file(
     // GOV-7 D5: one mapping for every refusal (BI-16 C3's `RegionOf`
     // sentence is inside it), so a hidden table answers 404.
     .map_err(|err| crate::routes::support::enforcement_refusal(&statement, &err))?;
+    // BI-27 (plan D3): the engine stops the statement at its own time limit,
+    // also over a mart, which carries no limit in its text. A statement-level
+    // `SETTINGS` (a SQL source's, a grouped tile's) still wins.
+    let options = lakehouse_clickhouse::QueryOptions {
+        max_execution_time: Some(crate::export::EXPORT_ENGINE_TIME),
+        ..lakehouse_clickhouse::QueryOptions::default()
+    };
     let mut stream = state
         .clickhouse
-        .query_stream(&rewritten, crate::export::EXPORT_TIMEOUT)
+        .query_stream_with_options(&rewritten, crate::export::EXPORT_TIMEOUT, &options)
         .await
         .map_err(|err| classify_dashboard_ch_error(&err))?;
     let (labels, formats) =
@@ -4328,7 +4356,7 @@ pub(crate) async fn build_chart_file(
     let locale = crate::routes::settings::format_settings(state)
         .await?
         .number_locale;
-    let written = crate::export::write_export(
+    let written = crate::export::write_export_with_byte_cap(
         &mut stream,
         &crate::export::ExportOptions {
             format,
@@ -4338,6 +4366,7 @@ pub(crate) async fn build_chart_file(
             labels: &labels,
             formats: &formats,
         },
+        Some(crate::export::EXPORT_BYTE_CAP),
     )
     .await
     .map_err(|err| super::export_failure(&DASHBOARD_QUERY, &err))?;
@@ -4365,6 +4394,7 @@ async fn export_chart(
         values,
     } = build_chart_file(state, principal, q, rows_only, gate).await?;
     let cap = crate::export::EXPORT_ROW_CAP;
+    let cut_by = written.cut_by(cap as usize);
 
     record_export_audit(
         state,
@@ -4374,6 +4404,7 @@ async fn export_chart(
             action,
             rows: written.rows,
             cut: written.cut,
+            cut_by,
             cap,
             format,
             values,
@@ -4381,12 +4412,18 @@ async fn export_chart(
     )
     .await?;
 
+    let shown = cut_rows(&written, cap);
     let file_name = export_file_name(
         &chart.spec.title,
         format.extension(),
-        written.cut.then_some(cap),
+        written.cut.then_some(shown),
     );
-    Ok(export_response(written, &file_name, format, cap))
+    Ok(export_response(
+        written,
+        &file_name,
+        format,
+        (shown, cut_by),
+    ))
 }
 
 // ── /api/dashboard/values ───────────────────────────────────────────────
@@ -5680,6 +5717,74 @@ mod tests {
             serde_json::from_str(r#"{"id":"default","refreshSeconds":300}"#).unwrap();
         assert!(board_edit_allowed(&body));
         assert_eq!(body.refresh_seconds, Some(300));
+    }
+
+    /// `BI-27`: the file name and the headers of a download the byte cap cut
+    /// name the rows the file holds, not the row cap it never reached.
+    #[tokio::test]
+    async fn a_download_cut_by_bytes_names_the_rows_it_holds() {
+        use crate::export::{
+            ExportOptions, FileFormat, RowSource, Values, write_export_with_byte_cap,
+        };
+
+        struct Rows(usize);
+        impl RowSource for Rows {
+            fn names(&self) -> &[String] {
+                static NAMES: std::sync::LazyLock<Vec<String>> =
+                    std::sync::LazyLock::new(|| vec!["n".to_owned()]);
+                &NAMES
+            }
+            fn types(&self) -> &[String] {
+                static TYPES: std::sync::LazyLock<Vec<String>> =
+                    std::sync::LazyLock::new(|| vec!["String".to_owned()]);
+                &TYPES
+            }
+            fn next_row(
+                &mut self,
+            ) -> impl std::future::Future<
+                Output = Result<Option<Vec<Value>>, lakehouse_clickhouse::ChError>,
+            > + Send {
+                let row = (self.0 > 0).then(|| {
+                    self.0 -= 1;
+                    vec![json!("xxxx")]
+                });
+                std::future::ready(Ok(row))
+            }
+        }
+        let (labels, formats) = (HashMap::new(), HashMap::new());
+        let options = ExportOptions {
+            format: FileFormat::Csv,
+            values: Values::Raw,
+            cap: 100,
+            locale: "en-US",
+            labels: &labels,
+            formats: &formats,
+        };
+        // The byte-order mark and "n\r\n" are 6 bytes, a row 6: room for two.
+        let written = write_export_with_byte_cap(&mut Rows(10), &options, Some(18))
+            .await
+            .unwrap();
+        assert_eq!((written.rows, written.cut), (2, true));
+        assert_eq!(cut_rows(&written, 100), 2);
+        assert_eq!(written.cut_by(100), Some("bytes"));
+        assert_eq!(
+            export_file_name(
+                "Visits",
+                "csv",
+                written.cut.then_some(cut_rows(&written, 100))
+            ),
+            "Visits-first-2-rows.csv"
+        );
+        let response = export_response(
+            written,
+            "Visits-first-2-rows.csv",
+            FileFormat::Csv,
+            (2, Some("bytes")),
+        );
+        let headers = response.headers();
+        assert_eq!(headers["x-export-cut"], "true");
+        assert_eq!(headers["x-export-cap"], "2");
+        assert_eq!(headers["x-export-cut-by"], "bytes");
     }
 
     /// BI-6: the export lists a chart's own filters, sort, "Other", groupings

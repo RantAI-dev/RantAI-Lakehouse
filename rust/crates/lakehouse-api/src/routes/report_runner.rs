@@ -1029,7 +1029,8 @@ impl Collected<'_> {
             }
         };
         let title = file.chart.spec.title.clone();
-        let cap = crate::export::EXPORT_ROW_CAP;
+        // BI-27: a file the byte cap cut names the rows it holds, not the row cap.
+        let cap = crate::routes::dashboard::cut_rows(&file.written, crate::export::EXPORT_ROW_CAP);
         let cut = file.written.cut;
         let name = unique_name(
             &self.files.attachments,
