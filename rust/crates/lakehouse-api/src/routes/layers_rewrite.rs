@@ -129,6 +129,18 @@ impl LayerRunner for Engine {
         let columns: Vec<String> = r.meta.iter().map(|m| m.name.clone()).collect();
         Ok(json!({ "columns": columns, "rows": r.data }))
     }
+
+    /// The real engine test answers no access cause: it seeds the rewrite's
+    /// own refusals and engines, and a second look at the policies would widen
+    /// what these tests pin.
+    fn access_is_the_cause(
+        &self,
+        _sql: &str,
+        _columns: &[String],
+        _failure: &SpecRunFailure,
+    ) -> impl std::future::Future<Output = bool> {
+        std::future::ready(false)
+    }
 }
 
 pub(crate) fn one_line(sql: &str) -> String {
@@ -629,6 +641,21 @@ impl Stub {
     /// suspends (clippy's `unused_async_trait_impl`, REL-9).
     fn run_now(&self, sql: &str) -> Result<Value, SpecRunFailure> {
         self.asked.lock().unwrap().push(sql.to_owned());
+        if sql.contains("MASKEDCOLUMN") {
+            // QA LH-BI-13-03 (BI-51): a masked number the rewrite turned into
+            // `***`, which the engine then refuses — the shape QA saw.
+            return Err(SpecRunFailure::Clickhouse(
+                lakehouse_clickhouse::ChError::Server(
+                    "Code: 43. Illegal type String of argument for aggregate function sum on db-internal.example.net"
+                        .to_owned(),
+                ),
+            ));
+        }
+        if sql.contains("HIDDENTABLE") {
+            return Err(SpecRunFailure::Refused(
+                "Table not found or not available to your organisation: serving.x".to_owned(),
+            ));
+        }
         if sql.contains("SECRETCOLUMN") {
             return Err(SpecRunFailure::Clickhouse(
                 lakehouse_clickhouse::ChError::Server(
@@ -661,6 +688,18 @@ impl LayerRunner for Stub {
     // and promising more in the impl is `refining_impl_trait`.
     fn run(&self, sql: &str) -> impl std::future::Future<Output = Result<Value, SpecRunFailure>> {
         std::future::ready(self.run_now(sql))
+    }
+
+    /// The stub's own spelling of the two access shapes (`BI-51`): a statement
+    /// naming a masked column or a hidden table, as the real rewrite would
+    /// have built it.
+    fn access_is_the_cause(
+        &self,
+        sql: &str,
+        _columns: &[String],
+        _failure: &SpecRunFailure,
+    ) -> impl std::future::Future<Output = bool> {
+        std::future::ready(sql.contains("MASKEDCOLUMN") || sql.contains("HIDDENTABLE"))
     }
 }
 
@@ -765,6 +804,100 @@ async fn a_failing_or_refused_statement_is_that_layers_sentence_and_its_neighbou
     );
     // The base rows are untouched.
     assert_eq!(tile["rows"].as_array().unwrap().len(), 2);
+}
+
+/// QA `LH-BI-13-03` (`BI-51`, plan D16, D18, T7): a question the viewer's
+/// access does not cover says so, with the cause and without a reference or
+/// the engine's text; an engine failure the access does not explain keeps its
+/// sentence and its reference.
+#[tokio::test]
+async fn a_question_the_viewers_access_does_not_cover_says_so_without_a_reference_or_the_engines_text()
+ {
+    let stub = Stub::new();
+    let base = by_province(
+        5,
+        &[
+            capacity_layer("hotels"),
+            capacity_layer("MASKEDCOLUMN"),
+            capacity_layer("HIDDENTABLE"),
+            capacity_layer("SECRETCOLUMN"),
+        ],
+    );
+    let tile = stub_tile(&stub, &base, tile_of(&["A", "B"])).await;
+    let layers = tile["layers"].as_array().unwrap();
+    assert_eq!(layers.len(), 4);
+    assert!(layers[0].get("error").is_none(), "{}", layers[0]);
+    for index in [1, 2] {
+        assert_eq!(
+            layers[index]["error"], "Not available with your access.",
+            "{index}: {}",
+            layers[index]
+        );
+        assert_eq!(layers[index]["cause"], json!("access"), "{index}");
+        assert!(
+            layers[index].get("errorId").is_none(),
+            "{index}: {}",
+            layers[index]
+        );
+        assert_eq!(layers[index]["rows"], json!([]), "{index}");
+    }
+    // Layer 3 is an engine failure the runner does not put down to access.
+    assert_eq!(layers[3]["error"], "This chart could not be loaded.");
+    assert!(layers[3]["errorId"].is_string());
+    assert!(layers[3].get("cause").is_none(), "{}", layers[3]);
+    let all = tile.to_string();
+    for needle in ["MASKEDCOLUMN", "Code: 43", "db-internal", "serving.x"] {
+        assert!(!all.contains(needle), "{needle} leaked: {all}");
+    }
+    assert_eq!(tile["rows"].as_array().unwrap().len(), 2);
+}
+
+/// QA `LH-BI-13-03` (`BI-51`, plan D16, T7): exactly four shapes count as the
+/// viewer's access — the gate's not-found, a hidden table, and a masked column
+/// the engine refused with a server code — and nothing else does.
+#[test]
+fn only_the_gates_not_found_a_hidden_table_and_a_masked_column_the_engine_refused_count_as_access()
+{
+    use crate::policy_engine::AccessCause;
+    use crate::routes::layers::explains;
+    use lakehouse_clickhouse::ChError;
+    use lakehouse_core::ApiError;
+
+    let gated = |err: ApiError| SpecRunFailure::Gated(err);
+    let refused = || SpecRunFailure::Refused("refused by the role rewrite".to_owned());
+    let server = |text: &str| SpecRunFailure::Clickhouse(ChError::Server(text.to_owned()));
+    assert!(explains(
+        &gated(ApiError::NotFound("not found".to_owned())),
+        None
+    ));
+    assert!(explains(
+        &gated(ApiError::NotFound("not found".to_owned())),
+        Some(AccessCause::MaskedColumn)
+    ));
+    assert!(!explains(
+        &gated(ApiError::Unprocessable("bad".to_owned())),
+        Some(AccessCause::HiddenTable)
+    ));
+    assert!(explains(&refused(), Some(AccessCause::HiddenTable)));
+    assert!(!explains(&refused(), Some(AccessCause::MaskedColumn)));
+    assert!(!explains(&refused(), None));
+    assert!(explains(
+        &server("Code: 43. x"),
+        Some(AccessCause::MaskedColumn)
+    ));
+    assert!(!explains(&server("Code: 43. x"), None));
+    assert!(!explains(
+        &server("Code: 43. x"),
+        Some(AccessCause::HiddenTable)
+    ));
+    assert!(!explains(
+        &server("no code"),
+        Some(AccessCause::MaskedColumn)
+    ));
+    assert!(!explains(
+        &SpecRunFailure::Tile(json!({ "error": "This chart could not be loaded." })),
+        Some(AccessCause::MaskedColumn)
+    ));
 }
 
 /// BI-13 review fix (SHOULD-FIX) R1: a layer asked for its own values that has
