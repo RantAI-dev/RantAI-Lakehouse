@@ -40,7 +40,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+// OPS-32 D4: this file reaches the shared harness as `crate::common::…` from
+// inside each of its modules (a `use` in one module is not visible in
+// another), so it has no file-level import to keep.
 
 /// What the route does with the caller's text before the store sees it.
 mod filters {
@@ -735,7 +737,9 @@ mod recording {
             "the row keeps the cause as a fixed sentence and the same reference"
         );
 
-        let (status, body) = crate::filters::get_history(&app, &cookie, "").await;
+        // OPS-32: as a module of `tests/it.rs`, `crate` is the `it` crate root
+        // now, so the path goes through this file's own module.
+        let (status, body) = crate::query_history::filters::get_history(&app, &cookie, "").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let runs = &body["runs"];
         assert_eq!(runs[0]["message"], expected.as_str(), "{runs}");
@@ -768,11 +772,13 @@ mod recording {
         assert_eq!(recorded_status, "stopped");
         assert_eq!(message.as_deref(), Some("Stopped"));
 
-        let (status, body) = crate::filters::get_history(&app, &cookie, "status=stopped").await;
+        let (status, body) =
+            crate::query_history::filters::get_history(&app, &cookie, "status=stopped").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["runs"][0]["status"], "stopped", "{body}");
         assert_eq!(body["total"], 1, "{body}");
-        let (status, body) = crate::filters::get_history(&app, &cookie, "status=failed").await;
+        let (status, body) =
+            crate::query_history::filters::get_history(&app, &cookie, "status=failed").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["runs"], json!([]), "a stopped run is not a failed one");
         assert_eq!(body["total"], 0, "{body}");
