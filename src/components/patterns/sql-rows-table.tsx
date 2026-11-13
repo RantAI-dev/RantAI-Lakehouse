@@ -22,8 +22,12 @@ export type SqlRowsResult = {
 
 const NO_ROWS = "The SQL ran and returned no rows."
 
-/** The columns a Run returned, with their types. */
-export function SqlColumnChips({ result, noRowsText = NO_ROWS }: { result: SqlRowsResult; noRowsText?: string }) {
+/**
+ * The columns a Run returned, with their types. `noRowsText={null}` leaves
+ * the no-rows line to the rows table, where a pane shows both (BLD-1 part 1
+ * S3 review R1-S7: the line was said twice).
+ */
+export function SqlColumnChips({ result, noRowsText = NO_ROWS }: { result: SqlRowsResult; noRowsText?: string | null }) {
   return (
     <div className="grid gap-1.5">
       <div className="flex flex-wrap gap-1.5" aria-label="Columns">
@@ -33,7 +37,7 @@ export function SqlColumnChips({ result, noRowsText = NO_ROWS }: { result: SqlRo
           </span>
         ))}
       </div>
-      {result.rows.length === 0 ? <p className="text-xs text-muted-foreground">{noRowsText}</p> : null}
+      {result.rows.length === 0 && noRowsText !== null ? <p className="text-xs text-muted-foreground">{noRowsText}</p> : null}
     </div>
   )
 }

@@ -30,6 +30,7 @@ import {
   previewAsRecords,
   previewBody,
   previewKey,
+  previewRequest,
   readableNames,
   readsAsYouAfterSave,
   removeItem,
@@ -39,6 +40,7 @@ import {
   sqlStepHint,
   stepCompletion,
   suggestInputName,
+  updateInput,
   updateStep,
   type EditorState,
   type OutputSettings,
@@ -391,12 +393,49 @@ describe("errors that name an item (D7)", () => {
     expect(errorTarget("database error")).toBeNull()
   })
 
-  it("finds the item a refusal names, and nothing for an index that is not there", () => {
+  it("finds the item a refusal names through what was sent, and nothing for an index that is not there", () => {
+    const sent = { inputIds: ["input-1", "input-2"], stepIds: ["step-3", "step-4"] }
+    expect(errorItemId(sent, errorTarget("steps[1]: refused"))).toBe("step-4")
+    expect(errorItemId(sent, errorTarget("inputs[1]: refused"))).toBe("input-2")
+    expect(errorItemId(sent, errorTarget("steps[9]: refused"))).toBeNull()
+    expect(errorItemId(sent, null)).toBeNull()
+  })
+
+  // BLD-1 part 1 S3 review R1-S5: a preview sends a part of the definition,
+  // so its `inputs[0]` is the editor's item at that place in the body.
+  it("puts a preview's refusal on the item of the body it names", () => {
     const state = stored()
-    expect(errorItemId(state, errorTarget("steps[1]: refused"))).toBe("step-4")
-    expect(errorItemId(state, errorTarget("inputs[1]: refused"))).toBe("input-2")
-    expect(errorItemId(state, errorTarget("steps[9]: refused"))).toBeNull()
-    expect(errorItemId(state, null)).toBeNull()
+    const request = previewRequest(state.inputs, state.steps, { kind: "input", id: "input-2" })
+    if (!("body" in request)) throw new Error("expected a body")
+    expect(errorItemId(request, errorTarget("inputs[0]: refused"))).toBe("input-2")
+  })
+})
+
+describe("previewRequest (R1-S5, R1-S7)", () => {
+  it("leaves an input with no table out of a step's preview, and maps the rest", () => {
+    const state = updateInput(stored(), "input-1", { table: "" })
+    const request = previewRequest(state.inputs, state.steps, { kind: "step", id: "step-4" })
+    if (!("body" in request)) throw new Error("expected a body")
+    expect(request.body.inputs.map((input) => input.name)).toEqual(["customers"])
+    expect(request.inputIds).toEqual(["input-2"])
+    expect(request.stepIds).toEqual(["step-3", "step-4"])
+    // The form step still names what it reads.
+    expect(request.body.steps[0]).toMatchObject({ reads: "orders" })
+  })
+
+  it("says why there is no preview, for the item it is about", () => {
+    const fresh = editorStateFrom(null)
+    expect(previewRequest(fresh.inputs, fresh.steps, { kind: "input", id: "input-1" })).toEqual({
+      reason: "Give this input a name first; the preview runs it by its name.",
+    })
+    const named = renameItem(fresh, "input-1", "orders")
+    expect(previewRequest(named.inputs, named.steps, { kind: "input", id: "input-1" })).toEqual({
+      reason: "Choose this input's table first.",
+    })
+    const two = editorStateFrom({ inputs: STORED.inputs, steps: [] })
+    expect(previewRequest(two.inputs, two.steps, { kind: "output" })).toEqual({
+      reason: "Add a step first: with several inputs, the output is what a step returns.",
+    })
   })
 })
 

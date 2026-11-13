@@ -882,6 +882,29 @@ describe("the pipeline editor of inputs and steps (BLD-1 part 1)", () => {
     expect(reads("/api/lakehouse/tables/bronze/orders_raw")).toBe(1)
   })
 
+  // BLD-1 part 1 S3 review R1-S5: the path in a preview's refusal is read
+  // through the body that was sent, and an old refusal goes stale.
+  it("leads from a preview's refusal to the item it names, and marks an old refusal stale", async () => {
+    previewAnswer = { status: 422, body: { error: "inputs[1]: you may not read this table" } }
+    renderEditor(twoSteps())
+    selectRail(/2\. by_stock/)
+    fireEvent.click(await screen.findByRole("button", { name: "Preview" }))
+    expect((await screen.findByRole("alert")).textContent).toBe("inputs[1]: you may not read this table")
+    const call = sent.find((c) => c.path === "/api/pipelines/preview")
+    expect((call?.body.inputs as { name: string }[]).map((input) => input.name)).toEqual(["orders_raw", "stock"])
+    // The rail marks the input it names.
+    expect(screen.getByRole("button", { name: /^stock/ }).textContent).toContain("needs attention")
+
+    fireEvent.click(screen.getByRole("button", { name: "Show stock" }))
+    expect(await screen.findByText("Input 2")).toBeTruthy()
+
+    selectRail(/^orders_raw/)
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }))
+    expect(await screen.findByRole("alert")).toBeTruthy()
+    fireEvent.change(screen.getByLabelText("Name in this pipeline"), { target: { value: "orders" } })
+    expect(await screen.findByText("Stale: the definition changed since this preview was refused.")).toBeTruthy()
+  })
+
   it("moves and removes a step, and renames a step's reader with its input", async () => {
     renderEditor(twoSteps())
     selectRail(/2\. by_stock/)

@@ -486,32 +486,66 @@ export function readsAsYouAfterSave(storedRunAs: string | undefined, userId: str
 export const READS_AS_YOU_NOTICE = "This pipeline will read as you from now on."
 
 /**
- * The body of a preview of the selected item (D16), or `null` when the item
- * has no name yet. An input is previewed alone, so an unfinished second
- * input does not stop it; a step is sent with every input and the steps up
- * to it, so an unfinished later step does not stop it either.
+ * A preview that can run: the body to send, and which editor item each of
+ * its inputs and steps is, so a refusal that names `inputs[i]` or
+ * `steps[i]` of that body is put on the right item (R1-S5).
  */
+export type PreviewRequest = { body: PipelinePreviewInput; inputIds: string[]; stepIds: string[] }
+
+/**
+ * The preview of the selected item (D16), or why there is none yet, said
+ * for the item it is about (R1-S7).
+ *
+ * An input is previewed alone, so an unfinished second input does not stop
+ * it. A step is sent with the steps up to it and with every input that has
+ * a name and a table: BLD-1 part 1 S3 review R1-S5, an input still being
+ * filled in no longer blocks every step's preview. If the step reads it, the
+ * API says so, on that step.
+ */
+export function previewRequest(
+  inputs: readonly EditorInput[],
+  steps: readonly EditorStep[],
+  selection: EditorSelection
+): PreviewRequest | { reason: string } {
+  const complete = (input: EditorInput) => input.name.trim() !== "" && input.table.trim() !== ""
+  if (selection.kind === "input") {
+    const input = inputs.find((candidate) => candidate.id === selection.id)
+    if (!input) return { reason: "Nothing to preview." }
+    if (input.name.trim() === "") return { reason: "Give this input a name first; the preview runs it by its name." }
+    if (input.table.trim() === "") return { reason: "Choose this input's table first." }
+    return { body: { ...definitionBody([input], []), upTo: input.name.trim() }, inputIds: [input.id], stepIds: [] }
+  }
+  // The output is what the last step returns, or the one input with no step.
+  const index = selection.kind === "step" ? steps.findIndex((step) => step.id === selection.id) : steps.length - 1
+  if (selection.kind === "step" && index < 0) return { reason: "Nothing to preview." }
+  if (index < 0) {
+    return inputs.length === 1
+      ? previewRequest(inputs, steps, { kind: "input", id: inputs[0].id })
+      : { reason: "Add a step first: with several inputs, the output is what a step returns." }
+  }
+  const step = steps[index]
+  if (step.name.trim() === "") return { reason: "Give this step a name first; the preview runs it by its name." }
+  const sentInputs = inputs.filter(complete)
+  const sentSteps = steps.slice(0, index + 1)
+  // Names are resolved against every item, so a form step that reads an
+  // input left out of the body still says which one it reads.
+  const full = definitionBody(inputs, steps)
+  const body: PipelinePreviewInput = {
+    inputs: full.inputs.filter((_, i) => complete(inputs[i])),
+    steps: full.steps.slice(0, index + 1),
+    upTo: step.name.trim(),
+  }
+  return { body, inputIds: sentInputs.map((input) => input.id), stepIds: sentSteps.map((sent) => sent.id) }
+}
+
+/** The body of a preview of the selected item, or `null` when there is none yet (`previewRequest`). */
 export function previewBody(
   inputs: readonly EditorInput[],
   steps: readonly EditorStep[],
   selection: EditorSelection
 ): PipelinePreviewInput | null {
-  if (selection.kind === "input") {
-    const input = inputs.find((candidate) => candidate.id === selection.id)
-    if (!input || input.name.trim() === "") return null
-    const body = definitionBody([input], [])
-    return { ...body, upTo: input.name.trim() }
-  }
-  // The output is what the last step returns, or the one input with no step.
-  const index =
-    selection.kind === "step" ? steps.findIndex((step) => step.id === selection.id) : steps.length - 1
-  if (selection.kind === "step" && index < 0) return null
-  if (index < 0) {
-    return inputs.length === 1 ? previewBody(inputs, steps, { kind: "input", id: inputs[0].id }) : null
-  }
-  const step = steps[index]
-  if (step.name.trim() === "") return null
-  return { ...definitionBody(inputs, steps.slice(0, index + 1)), upTo: step.name.trim() }
+  const request = previewRequest(inputs, steps, selection)
+  return "body" in request ? request.body : null
 }
 
 /**
@@ -559,11 +593,15 @@ export function errorTarget(message: string): ErrorTarget | null {
   return { kind: "step", index, transform: match[3] === undefined ? null : Number(match[3]) }
 }
 
-/** The id of the item a refusal names, in the state it was sent from; `null` when there is no such item. */
-export function errorItemId(state: Pick<EditorState, "inputs" | "steps">, target: ErrorTarget | null): string | null {
+/**
+ * The id of the item a refusal names, through the body that was sent: its
+ * `i`-th input or step is the `i`-th id of what was sent (R1-S5; a preview
+ * sends a part of the definition, so the index is not the editor's).
+ * `null` when there is no such item.
+ */
+export function errorItemId(sent: { inputIds: readonly string[]; stepIds: readonly string[] }, target: ErrorTarget | null): string | null {
   if (!target) return null
-  const item = target.kind === "input" ? state.inputs[target.index] : state.steps[target.index]
-  return item?.id ?? null
+  return (target.kind === "input" ? sent.inputIds[target.index] : sent.stepIds[target.index]) ?? null
 }
 
 // ── columns and completion (D17) ─────────────────────────────────────────

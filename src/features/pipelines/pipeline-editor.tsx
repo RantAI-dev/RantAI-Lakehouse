@@ -38,7 +38,7 @@ import {
   noStepLine,
   outputSourceLine,
   previewAsRecords,
-  previewBody,
+  previewRequest,
   previewKey,
   readableItems,
   readableNames,
@@ -194,8 +194,12 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
 
   // ── the preview (D16) ──────────────────────────────────────────────
   const preview = useServiceAction((signal, body: PipelinePreviewInput) => pipelineService.previewPipelineStep(body, signal))
-  /** The item and the key of the preview that ran last. */
-  const [ran, setRan] = React.useState<{ item: string; key: string } | null>(null)
+  /**
+   * The item and the key of the preview that ran last, and which editor item
+   * each input and step of its body was, so its refusal can be put on the
+   * item it names (R1-S5).
+   */
+  const [ran, setRan] = React.useState<{ item: string; key: string; inputIds: string[]; stepIds: string[] } | null>(null)
   /** The last successful preview of each item, with the key it was made for. */
   const [results, setResults] = React.useState<Record<string, { key: string; data: PipelinePreview }>>({})
   React.useEffect(() => {
@@ -203,14 +207,20 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
     const data = preview.data
     setResults((prev) => (prev[ran.item]?.data === data ? prev : { ...prev, [ran.item]: { key: ran.key, data } }))
   }, [preview.status, preview.data, ran])
-  const currentBody = previewBody(inputs, editor.steps, selection)
+  const request = previewRequest(inputs, editor.steps, selection)
+  const currentBody = "body" in request ? request.body : null
   const currentKey = currentBody ? previewKey(currentBody) : null
   const itemKey = selectionKey(selection)
   async function runPreview() {
-    if (!currentBody || currentKey === null) return
-    setRan({ item: itemKey, key: currentKey })
-    await preview.run(currentBody)
+    if (!("body" in request) || currentKey === null) return
+    setRan({ item: itemKey, key: currentKey, inputIds: request.inputIds, stepIds: request.stepIds })
+    await preview.run(request.body)
   }
+  // BLD-1 part 1 S3 review R1-S5: the item a preview's refusal names, read
+  // through the body that was sent (a preview sends a part of the
+  // definition, so `inputs[0]` there may be the editor's third input).
+  const previewError = preview.status === "error" ? preview.error.message : null
+  const previewErrorItem = previewError && ran ? errorItemId(ran, errorTarget(previewError)) : null
   // A step's columns are known once it was previewed: they feed the pickers
   // of a form step that reads it.
   const stepColumns = React.useMemo(() => {
@@ -286,9 +296,9 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
   }
   // The ids of what was sent, so a refusal's `steps[1]` names the item it
   // meant even if the steps were moved since (D7).
-  const [sent, setSent] = React.useState<Pick<EditorState, "inputs" | "steps"> | null>(null)
+  const [sent, setSent] = React.useState<{ inputIds: string[]; stepIds: string[] } | null>(null)
   async function handleSubmit() {
-    setSent({ inputs, steps: editor.steps })
+    setSent({ inputIds: inputs.map((input) => input.id), stepIds: editor.steps.map((step) => step.id) })
     const result = await save.run(saveBody())
     // Straight to the pipeline's own page, where it can be marked ready and
     // run; the list is one click away.
@@ -301,7 +311,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
   // Only a new refusal moves the selection; editing afterwards does not.
   React.useEffect(() => {
     if (!errorItem) return
-    const isInput = sent?.inputs.some((input) => input.id === errorItem) ?? false
+    const isInput = sent?.inputIds.includes(errorItem) ?? false
     setSelection({ kind: isInput ? "input" : "step", id: errorItem })
     setTab("build")
   }, [errorItem, saveError, sent])
@@ -331,6 +341,11 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
     setEditor(next)
     const first = next.inputs[0]
     select(first ? { kind: "input", id: first.id } : { kind: "output" })
+  }
+
+  /** An input's or a step's current name, by id. */
+  function itemName(id: string): string {
+    return [...editor.inputs, ...editor.steps].find((item) => item.id === id)?.name ?? ""
   }
 
   // ── the pane of the selected item ──────────────────────────────────
@@ -458,13 +473,36 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
           {thisRun && preview.status === "pending" ? "Running…" : result ? "Run again" : "Preview"}
         </Button>
       </div>
-      {!currentBody ? (
-        <p className="text-xs text-muted-foreground">Give it a name first; the preview runs it by its name.</p>
-      ) : null}
-      {thisRun && preview.status === "error" ? (
-        <p role="alert" className="text-sm text-destructive">
-          {preview.error.message}
-        </p>
+      {"reason" in request ? <p className="text-xs text-muted-foreground">{request.reason}</p> : null}
+      {thisRun && previewError ? (
+        <div className="flex flex-col gap-1.5">
+          <p role="alert" className="text-sm text-destructive">
+            {previewError}
+          </p>
+          {ran && ran.key !== currentKey ? (
+            // R1-S5: an old refusal is marked as an old answer is.
+            <p role="status" className="text-xs font-medium text-amber-700 dark:text-amber-400">
+              Stale: the definition changed since this preview was refused.
+            </p>
+          ) : null}
+          {previewErrorItem && previewErrorItem !== itemKey ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="w-fit"
+              onClick={() =>
+                select(
+                  ran?.inputIds.includes(previewErrorItem)
+                    ? { kind: "input", id: previewErrorItem }
+                    : { kind: "step", id: previewErrorItem }
+                )
+              }
+            >
+              Show {itemName(previewErrorItem) || "the item it names"}
+            </Button>
+          ) : null}
+        </div>
       ) : null}
       {result ? (
         <div className="flex min-h-0 flex-col gap-2">
@@ -473,7 +511,8 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
               Stale: the definition changed since this preview ran.
             </p>
           ) : null}
-          <SqlColumnChips result={previewAsRecords(result.data)} noRowsText="It returned no rows." />
+          {/* R1-S7: the no-rows line is said once, by the rows table. */}
+          <SqlColumnChips result={previewAsRecords(result.data)} noRowsText={null} />
           <SqlRowsTable
             result={previewAsRecords(result.data)}
             stale={result.key !== currentKey}
@@ -485,7 +524,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
             <p className="text-xs text-muted-foreground">There are more rows; the preview shows the first 100.</p>
           ) : null}
         </div>
-      ) : !(thisRun && preview.status === "error") ? (
+      ) : !(thisRun && previewError) && currentBody ? (
         <EmptyState className="py-6" title="Not previewed yet" description="Run the preview to see its first rows." />
       ) : null}
     </section>
@@ -551,7 +590,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                     label={input.name || "Unnamed input"}
                     detail={input.table ? `${input.zone}.${input.table}` : "No table yet"}
                     selected={selection.kind === "input" && selection.id === input.id}
-                    flagged={errorItem === input.id || Boolean(problems.items[input.id])}
+                    flagged={errorItem === input.id || previewErrorItem === input.id || Boolean(problems.items[input.id])}
                     describedBy={errorItem === input.id ? errorMessageId : undefined}
                     onSelect={() => select({ kind: "input", id: input.id })}
                   />
@@ -590,7 +629,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                             `${step.stored.kind} · not editable here`
                     }
                     selected={selection.kind === "step" && selection.id === step.id}
-                    flagged={errorItem === step.id || Boolean(problems.items[step.id])}
+                    flagged={errorItem === step.id || previewErrorItem === step.id || Boolean(problems.items[step.id])}
                     describedBy={errorItem === step.id ? errorMessageId : undefined}
                     onSelect={() => select({ kind: "step", id: step.id })}
                   />
