@@ -12,20 +12,22 @@ import type {
 } from "../contracts/assets";
 import type { Pagination } from "../contracts/pagination";
 import { apiFetch } from "../http";
-import { ServiceError } from "../errors";
+import { ServiceError, deniedFor } from "../errors";
 
 /**
- * Maps an HTTP status to the `ServiceError` code pages branch on. Mirrors
- * `postgresAgentService`'s own `errorFor` (`clients/agents.ts`) — `403`
- * becomes `"permission_denied"` so a self-approval refusal
- * (`routes::catalog::decide_access_request`, WS7 item E3) surfaces the
- * backend's own message rather than the generic `"unavailable"` this
- * file's other methods fell back to before this task.
+ * Maps an HTTP status to the `ServiceError` code pages branch on. A 401 or
+ * 403 goes through `deniedFor` (WEB-11): the refusal reads "You don't have
+ * access" with the permission the API named (`QA LH-DATA-12-09`, `TC-1724`).
+ * Every other status keeps this table: 404 is "not_found", 400 and 409 are
+ * "invalid_request" (the request is wrong, not the service), the rest
+ * "unavailable".
  */
-function errorFor(status: number, message: string): ServiceError {
+function errorFor(status: number, body: { error?: string } | null, fallback: string): ServiceError {
+  const denied = deniedFor(status, body);
+  if (denied) return denied;
+  const message = body?.error ?? fallback;
   if (status === 404) return new ServiceError("not_found", message);
   if (status === 400 || status === 409) return new ServiceError("invalid_request", message);
-  if (status === 401 || status === 403) return new ServiceError("permission_denied", message);
   return new ServiceError("unavailable", message);
 }
 
@@ -50,7 +52,7 @@ async function loadCatalog(
   q: string | undefined,
   limit: number | undefined,
   signal?: AbortSignal,
-): Promise<{ assets: Asset[]; namespaces: CatalogNamespace[] }> {
+): Promise<{ assets: Asset[]; namespaces: CatalogNamespace[]; total?: number }> {
   const params = new URLSearchParams();
   if (q) params.set("q", q);
   if (limit !== undefined) params.set("limit", String(limit));
@@ -60,7 +62,7 @@ async function loadCatalog(
   // DATA-11 review SHOULD-FIX 4: a refusal (`403`) keeps its own code so the
   // ⌘K box can tell "no access" from an outage (`errorFor`, as the other
   // methods of this file do).
-  if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to load catalog");
+  if (!res.ok) throw errorFor(res.status, json, "Failed to load catalog");
   // DATA-11 review SHOULD-FIX 4: a search answered `supported: false` (the
   // tenant refusal, `200`) carries a fixed `reason`. It is thrown with the
   // status it came with, `200`, which no failed request has, so the palette
@@ -85,6 +87,12 @@ export const clickhouseAssetService: AssetService = {
       return true;
     });
   },
+  async searchAssets(term, limit, signal) {
+    const { assets, total } = await loadCatalog(term.trim(), limit, signal);
+    // `DATA-41` D3: the server counts every match; a server that answers no
+    // count is read as "all of them", which is what its answer holds.
+    return { assets, total: typeof total === "number" ? total : assets.length };
+  },
   async listAssetsPage(query, signal) {
     // Only non-empty params are sent: the backend applies its own
     // defaults, and a URL full of `filters=` blanks makes the React Query
@@ -102,6 +110,10 @@ export const clickhouseAssetService: AssetService = {
     const res = await apiFetch(`/api/catalog/query?${params}`, { signal });
     const json = await res.json();
     if (!res.ok) {
+      // QA LH-DATA-12-09, TC-1724 (WEB-11): a refusal is not an outage; the
+      // Catalog said "Service unavailable" with Retry.
+      const denied = deniedFor(res.status, json);
+      if (denied) throw denied;
       // 400 means this client sent a field the server does not allow —
       // a bug here, not a transient outage, so it is not "unavailable".
       throw new ServiceError(
@@ -118,13 +130,13 @@ export const clickhouseAssetService: AssetService = {
     // "Not found". The status picks the kind, and a body that is not JSON
     // must not hide it.
     const json = await res.json().catch(() => null);
-    if (!res.ok) throw errorFor(res.status, json?.error ?? "Asset not found");
+    if (!res.ok) throw errorFor(res.status, json, "Asset not found");
     return json as AssetDetail;
   },
   async getAssetProfile(id, signal) {
     const res = await apiFetch(`/api/catalog/${encodeURIComponent(id)}/profile`, { signal });
     const json = await res.json().catch(() => null);
-    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to profile asset");
+    if (!res.ok) throw errorFor(res.status, json, "Failed to profile asset");
     return json as AssetProfile;
   },
   async getAssetSample(id, limit, signal) {
@@ -133,7 +145,7 @@ export const clickhouseAssetService: AssetService = {
       { signal }
     );
     const json = await res.json().catch(() => null);
-    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to load sample rows");
+    if (!res.ok) throw errorFor(res.status, json, "Failed to load sample rows");
     return (json?.rows ?? []) as Record<string, string | null>[];
   },
   async updateAnnotation(id, input, signal) {
@@ -144,7 +156,7 @@ export const clickhouseAssetService: AssetService = {
       signal,
     });
     const json = await res.json().catch(() => null);
-    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to save the asset's details");
+    if (!res.ok) throw errorFor(res.status, json, "Failed to save the asset's details");
   },
   async setCertification(id, input, signal) {
     const res = await apiFetch(`/api/catalog/${encodeURIComponent(id)}/certification`, {
@@ -154,7 +166,7 @@ export const clickhouseAssetService: AssetService = {
       signal,
     });
     const json = await res.json().catch(() => null);
-    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to save the certification");
+    if (!res.ok) throw errorFor(res.status, json, "Failed to save the certification");
   },
   async listNamespaces(signal) {
     return (await loadCatalog(undefined, undefined, signal)).namespaces;
@@ -167,7 +179,7 @@ export const clickhouseAssetService: AssetService = {
       signal,
     });
     const json = await res.json().catch(() => null);
-    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to request access");
+    if (!res.ok) throw errorFor(res.status, json, "Failed to request access");
   },
   async decideAccessRequest(approvalId, decision, comment, signal) {
     const res = await apiFetch(
@@ -180,13 +192,13 @@ export const clickhouseAssetService: AssetService = {
       }
     );
     const json = await res.json().catch(() => null);
-    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to decide access request");
+    if (!res.ok) throw errorFor(res.status, json, "Failed to decide access request");
     return json as DecideAccessRequestResult;
   },
   async listGrants(id, signal) {
     const res = await apiFetch(`/api/catalog/${encodeURIComponent(id)}/grants`, { signal });
     const json = await res.json().catch(() => null);
-    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to load the grants");
+    if (!res.ok) throw errorFor(res.status, json, "Failed to load the grants");
     return (json?.grants ?? []) as AssetGrant[];
   },
   async grantAccess(id, input, signal) {
@@ -197,12 +209,12 @@ export const clickhouseAssetService: AssetService = {
       signal,
     });
     const json = await res.json().catch(() => null);
-    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to grant access");
+    if (!res.ok) throw errorFor(res.status, json, "Failed to grant access");
   },
   async getRestoreStatus(id, signal) {
     const res = await apiFetch(`/api/catalog/${encodeURIComponent(id)}/restore`, { signal });
     const json = await res.json().catch(() => null);
-    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to check whether the table can be restored");
+    if (!res.ok) throw errorFor(res.status, json, "Failed to check whether the table can be restored");
     return json as AssetRestoreStatus;
   },
   async restoreTable(id, signal) {
@@ -211,7 +223,7 @@ export const clickhouseAssetService: AssetService = {
       signal,
     });
     const json = await res.json().catch(() => null);
-    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to restore the table");
+    if (!res.ok) throw errorFor(res.status, json, "Failed to restore the table");
   },
   async revokeGrant(id, grantId, signal) {
     const res = await apiFetch(
@@ -219,6 +231,6 @@ export const clickhouseAssetService: AssetService = {
       { method: "DELETE", signal }
     );
     const json = await res.json().catch(() => null);
-    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to revoke the grant");
+    if (!res.ok) throw errorFor(res.status, json, "Failed to revoke the grant");
   },
 };

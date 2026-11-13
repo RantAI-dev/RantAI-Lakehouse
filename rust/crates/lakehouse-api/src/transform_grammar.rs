@@ -97,23 +97,9 @@ impl Transform {
     /// (identifier-safety / literal-escaping), never raw interpolation of
     /// caller text.
     ///
-    /// Not called from Rust at runtime yet — it is the reference twin of
-    /// `dagster/dispar_orchestrate/authored_transforms.py::render_clickhouse`
-    /// (Phase E2), which is what actually renders a `Transform` into the
-    /// `ClickHouse` SQL `authored_factory.py`'s generated jobs execute.
-    /// `WS4` item D3/D4/G2/G3 (this commit) is the first task to add a
-    /// second `mod transform_grammar;` declaration for this file (in
-    /// `main.rs`, alongside `lib.rs`'s existing `pub mod`) so
-    /// `routes::pipelines::create`'s new `parse_transform` call compiles
-    /// for the `lakehouse-api` BINARY target, not only its library target
-    /// — that surfaces `clippy::dead_code` here for the first time: a
-    /// binary crate has no public-API boundary keeping an unused `pub fn`
-    /// alive the way the library target's `pub mod` already did.
-    #[allow(
-        dead_code,
-        reason = "reference twin of authored_transforms.py::render_clickhouse (Phase E2); \
-                  exercised by this file's own tests, not yet called from Rust at runtime"
-    )]
+    /// This is what a pipeline's `transform` step is rendered through
+    /// (BLD-1 part 1 / D4, [`crate::pipeline_compile`]); the Python twin this
+    /// used to name is gone with the orchestrator's own SQL builder (D14).
     #[must_use]
     pub fn render_clickhouse(&self) -> String {
         match self {
@@ -371,5 +357,44 @@ mod tests {
             "error message must not echo the payload: {message}"
         );
         assert_eq!(err, TransformError::InvalidIdentifier);
+    }
+}
+
+/// F4 (`AGENTS.md` rule 1): `authored_transforms.py` and this module both
+/// claimed `transform_test_vectors.json` was loaded by this file's tests, and
+/// nothing in Rust read it. This reads the copy under
+/// `crates/lakehouse-api/tests/fixtures/`, so a one-sided change to either
+/// grammar fails a test instead of drifting silently.
+#[cfg(test)]
+mod shared_vectors {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::parse_transform;
+
+    /// The accept/reject decision for every shared vector, exactly as the
+    /// file labels it. The rendered SQL is deliberately not compared: the two
+    /// implementations escape a literal differently and both are safe
+    /// encodings.
+    #[test]
+    fn the_shared_accept_reject_vectors_match_this_grammar() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/transform_test_vectors.json"
+        );
+        let text = std::fs::read_to_string(path).expect("the shared vector file is in the crate");
+        let vectors: Vec<serde_json::Value> =
+            serde_json::from_str(&text).expect("the vector file is valid JSON");
+        assert!(!vectors.is_empty(), "the vector file has vectors");
+        for vector in vectors {
+            let input = vector["input"].as_str().expect("every vector has an input");
+            let accepted = vector["accepted"]
+                .as_bool()
+                .expect("every vector is labelled");
+            assert_eq!(
+                parse_transform(input).is_ok(),
+                accepted,
+                "{input:?}: expected accepted={accepted}"
+            );
+        }
     }
 }

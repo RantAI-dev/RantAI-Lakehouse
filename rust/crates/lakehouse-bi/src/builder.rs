@@ -194,6 +194,23 @@ pub fn trailing_limit(statement: &str) -> Option<u32> {
     statement[start..start + len].parse().ok()
 }
 
+/// Whether a built statement carries [`QueryBuilder::with_breakdown_cap`]'s
+/// clause for `breakdown` (`BI-46`; QA `LH-BI-6-01` review round 1, R4).
+///
+/// The assistant's digest is written from a chart's definition, which does not
+/// say whether its measure is a table calculation — that is resolved from the
+/// deployment's calculated fields while the statement is built, and such a
+/// chart gets no cap. The saved statement is the fact, so the digest reads it
+/// here rather than repeating the builder's resolution rules. `false` for a
+/// name that is not an identifier: no such statement can have been built.
+#[must_use]
+pub fn statement_caps_breakdown(statement: &str, breakdown: &str) -> bool {
+    let Ok(breakdown) = Ident::new(breakdown.to_owned()) else {
+        return false;
+    };
+    statement.contains(&ranked::cap_clause_start(&breakdown))
+}
+
 /// Where a chart's rows come from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Relation {
@@ -590,6 +607,11 @@ pub struct QueryBuilder<S> {
     groupings: Vec<Ident>,
     /// `BI-6` part 2: steps applied to the grouped result.
     steps: Option<steps::StepsSql>,
+    /// `BI-46` (plan D12): the limit keeps the N breakdown values with the
+    /// largest total, so a grained chart keeps every bucket and the breakdown
+    /// cap is the only cut. Set by
+    /// [`QueryBuilder::with_breakdown_cap`](crate::builder::ranked).
+    cap_breakdown: bool,
     _state: PhantomData<S>,
 }
 
@@ -619,6 +641,7 @@ impl QueryBuilder<NeedsProjection> {
             other: false,
             groupings: Vec::new(),
             steps: None,
+            cap_breakdown: false,
             _state: PhantomData,
         }
     }
@@ -724,6 +747,7 @@ impl QueryBuilder<NeedsProjection> {
             other: self.other,
             groupings: self.groupings,
             steps: self.steps,
+            cap_breakdown: self.cap_breakdown,
             _state: PhantomData,
         }
     }
@@ -776,6 +800,12 @@ impl QueryBuilder<Ready> {
     /// `BI-6`: "Other", a sort by a measure beside a breakdown, and several
     /// groupings have their own statements; everything else is the statement
     /// it always was, with a sort (when set) in place of `order`.
+    ///
+    /// `BI-46` (plan D12; QA `LH-BI-6-01`): a chart whose limit is the
+    /// breakdown's keeps every bucket of a time grain — the breakdown cap is
+    /// the only cut — so a grained chart with `cap_breakdown` writes its
+    /// breakdown statement without the `IN (SELECT … LIMIT …)` guard on the
+    /// dimension. Every other shape is the statement it always was.
     #[must_use]
     pub fn build(&self) -> String {
         // BI-8 part 2: a chart with a table calculation or a period comparison
@@ -816,56 +846,31 @@ impl QueryBuilder<Ready> {
         // from a result that fits (`grain::trim_to_latest`).
         // BI-9 review fix (BLOCKER) R1: a part of the date is never cut to
         // its latest buckets (the limit it carries is its whole range).
-        let latest = self
-            .grain
-            .is_some_and(|(g, _)| grain::cuts_to_latest(g, self.order_words()));
+        // `BI-46` (plan D12): with a breakdown, the limit is the breakdown's,
+        // so a grained chart keeps every bucket.
+        let cap_keeps_every_bucket = self.cap_breakdown && self.grain.is_some();
+        let latest = !cap_keeps_every_bucket
+            && self
+                .grain
+                .is_some_and(|(g, _)| grain::cuts_to_latest(g, self.order_words()));
         let bucket_limit = self.limit + u32::from(latest);
         let key = self.grain.map_or_else(
             || dimension.clone(),
             |(g, week_start)| g.order_key(&dimension, week_start),
         );
         // BI-6: a sort by the dimension keeps the groups it keeps and only
-        // turns the final order round when it is descending.
-        let key_dir = match &self.sort {
-            Some(s) if self.is_dimension(&s.by) => {
-                format!(" {}", if s.desc { "DESC" } else { "ASC" })
-            }
-            _ => String::new(),
-        };
+        // turns the final order round when it is descending. One `key_dir`,
+        // the method below, is what the breakdown statement reads too (review
+        // round 1, developer's note 4: not two copies).
+        let key_dir = self.key_dir(&dimension);
 
-        if let Some(breakdown) = &self.breakdown {
-            let Some(measure) = self.measures.first() else {
-                return String::new();
-            };
-            let agg_expr = self.agg_of(measure);
-            let outer = if self.where_clauses.is_empty() {
-                "WHERE".to_owned()
-            } else {
-                format!("WHERE {} AND", self.where_clauses.join(" AND "))
-            };
-            // Which buckets are kept: the biggest by value, or (grained and
-            // ordered by bucket) the latest.
-            let keep_by = if latest {
-                format!("{key} DESC")
-            } else if !key_dir.is_empty() {
-                // BI-6: a sort by the dimension keeps its first N in that order.
-                format!("{key}{key_dir}")
-            } else if let Some(field) = self.from.aggregate_field(measure.column.as_str()) {
-                format!("{} DESC", field.sql)
-            } else if self.measure_aggregate(measure) == Aggregate::Count {
-                "count() DESC".to_owned()
-            } else {
-                format!(
-                    "{}({}) DESC",
-                    self.measure_aggregate(measure),
-                    measure.column
-                )
-            };
-            return format!(
-                "SELECT {dimension}, {breakdown}, {agg_expr} FROM {from} \
-                 {outer} {dimension} IN (SELECT {dimension} FROM {from} {where_sql}\
-                 GROUP BY {dimension} ORDER BY {keep_by} LIMIT {bucket_limit}) \
-                 GROUP BY {dimension}, {breakdown} ORDER BY {key}{key_dir}, {breakdown}{settings}",
+        if self.breakdown.is_some() {
+            return self.breakdown_statement(
+                &dimension,
+                &where_sql,
+                &key,
+                latest,
+                cap_keeps_every_bucket,
             );
         }
 
@@ -896,6 +901,77 @@ impl QueryBuilder<Ready> {
                 limit = self.limit,
             ),
         }
+    }
+
+    /// The `ORDER BY` direction of a sort on the dimension (`BI-6`): empty for
+    /// every other sort, because they keep their groups and only turn the final
+    /// order round when the dimension is what they sort by.
+    fn key_dir(&self, dimension: &str) -> String {
+        match &self.sort {
+            Some(s) if s.by.as_str() == dimension => {
+                format!(" {}", if s.desc { "DESC" } else { "ASC" })
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// The statement of a chart with a breakdown (`BI-6`), and the one
+    /// `BI-46` changes: with `cap` (a `BI-46` chart and a time grain) every
+    /// bucket is kept, so the dimension needs no `IN (SELECT … LIMIT …)` guard
+    /// and the breakdown cap in `where_clauses` is the only cut.
+    fn breakdown_statement(
+        &self,
+        dimension: &str,
+        where_sql: &str,
+        key: &str,
+        latest: bool,
+        cap: bool,
+    ) -> String {
+        let (Some(breakdown), Some(measure)) = (&self.breakdown, self.measures.first()) else {
+            return String::new();
+        };
+        let agg_expr = self.agg_of(measure);
+        let key_dir = self.key_dir(dimension);
+        let settings = self.from.settings();
+        let from = self.from.render();
+        if cap {
+            // `BI-46` (plan D12): no bucket is cut; the breakdown cap in
+            // `where_clauses` is the limit.
+            return format!(
+                "SELECT {dimension}, {breakdown}, {agg_expr} FROM {from} \
+                 {where_sql}GROUP BY {dimension}, {breakdown} ORDER BY {key}{key_dir}, {breakdown}{settings}",
+            );
+        }
+        let bucket_limit = self.limit + u32::from(latest);
+        let outer = if self.where_clauses.is_empty() {
+            "WHERE".to_owned()
+        } else {
+            format!("WHERE {} AND", self.where_clauses.join(" AND "))
+        };
+        // Which buckets are kept: the biggest by value, or (grained and
+        // ordered by bucket) the latest.
+        let keep_by = if latest {
+            format!("{key} DESC")
+        } else if !key_dir.is_empty() {
+            // BI-6: a sort by the dimension keeps its first N in that order.
+            format!("{key}{key_dir}")
+        } else if let Some(field) = self.from.aggregate_field(measure.column.as_str()) {
+            format!("{} DESC", field.sql)
+        } else if self.measure_aggregate(measure) == Aggregate::Count {
+            "count() DESC".to_owned()
+        } else {
+            format!(
+                "{}({}) DESC",
+                self.measure_aggregate(measure),
+                measure.column
+            )
+        };
+        format!(
+            "SELECT {dimension}, {breakdown}, {agg_expr} FROM {from} \
+             {outer} {dimension} IN (SELECT {dimension} FROM {from} {where_sql}\
+             GROUP BY {dimension} ORDER BY {keep_by} LIMIT {bucket_limit}) \
+             GROUP BY {dimension}, {breakdown} ORDER BY {key}{key_dir}, {breakdown}{settings}",
+        )
     }
 
     /// The measures' select list, and when the engine would read one measure's
@@ -1531,8 +1607,9 @@ fn grained<H: std::hash::BuildHasher>(
         Grained {
             grain,
             column,
-            // A pivot is cut by its cell cap, not to its latest buckets.
-            latest_limit: (!pivot && grain::cuts_to_latest(grain, order)).then_some(limit),
+            // A pivot is cut by its cell cap, not to its latest buckets; a
+            // chart with a breakdown keeps every bucket (`BI-46`, plan D12).
+            latest_limit: (!pivot && def.keeps_latest_buckets(grain)).then_some(limit),
         }
     });
     (g, r.skipped)
@@ -2465,6 +2542,46 @@ fn rebuild_chart<H: std::hash::BuildHasher>(
         let relation = binned::binned(from, where_clauses, &bins, &needed);
         return rebuild_chart_over(spec, &relation, Vec::new(), &[], (read, cols), None);
     }
+    // `BI-46` (plan D13; QA `LH-BI-6-01`): a date or timestamp breakdown can be
+    // grouped by a day, week, month, quarter or year. Its bucket is put in the
+    // relation under the breakdown's own name, with the predicates under it on
+    // the raw rows, so everything after this — the cap of T8 included — reads
+    // buckets. The dimension's own grain, when it has one, nests its bucket on
+    // top, as a grouped table's grains do.
+    if let (Some(raw), Some(breakdown)) = (
+        def.shape.breakdown_grain.as_deref(),
+        def.breakdown.as_deref().filter(|b| !b.is_empty()),
+    ) {
+        let grain = crate::grain::Grain::parse(raw)?;
+        let measures = shape::resolve_measures(&def.measures, from)?;
+        let groups: Vec<String> = [Some(def.dimension.as_str()), Some(breakdown)]
+            .into_iter()
+            .flatten()
+            .filter(|g| !g.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let needed = binned::needed_columns(from, &groups, &measures)?;
+        let column = Ident::new(breakdown.to_owned()).ok()?;
+        let expr = grain.bucket_expr(&column, cols.get(breakdown).copied()?, read.time)?;
+        let base = if where_clauses.is_empty() {
+            from.clone()
+        } else {
+            Relation::Filtered {
+                base: Box::new(from.clone()),
+                predicates: where_clauses,
+            }
+        };
+        let relation = Relation::Bucketed {
+            base: Box::new(base),
+            dimension: breakdown.to_owned(),
+            expr,
+            carried: needed
+                .into_iter()
+                .filter(|name| name != breakdown)
+                .collect(),
+        };
+        return rebuild_chart_over(spec, &relation, Vec::new(), &[], (read, cols), grained);
+    }
     rebuild_chart_over(
         spec,
         from,
@@ -2602,6 +2719,13 @@ fn rebuild_chart_over<H: std::hash::BuildHasher>(
         // (through `SqlLiteral`) by `filter_predicates`; pass them through
         // as-is rather than re-deriving column/values.
         builder = builder.raw_where(clause);
+    }
+    // `BI-46` (plan D12, D14; QA `LH-BI-6-01`): a bar, hbar, line or area
+    // chart with a breakdown keeps the N breakdown values with the largest
+    // total; the cap ranks over the rows the clauses above leave, so a
+    // dashboard filter narrows what is ranked.
+    if def.caps_breakdown() {
+        builder = builder.with_breakdown_cap();
     }
     Some(builder.build())
 }
@@ -2808,6 +2932,9 @@ pub struct GrainedChart {
     pub limit: u32,
     /// `BI-6`: a sort that replaces `order`.
     pub sort: Option<Sort>,
+    /// `BI-46` (plan D12): the limit keeps the N breakdown values with the
+    /// largest total, so every bucket of the grain is kept.
+    pub cap_breakdown: bool,
 }
 
 impl GrainedChart {
@@ -2825,8 +2952,15 @@ impl GrainedChart {
         let dimension = Ident::new(def.dimension.clone()).ok()?;
         let sort = sort_of(def, &measures, std::slice::from_ref(&dimension), None).ok()?;
         let order = def.effective_order();
-        let limit =
-            grain::effective_limit(grain, &order, grain::clamp_limit(kind, def.limit_value()));
+        // `BI-46` (plan D12): with a breakdown the limit is the breakdown's,
+        // so a date part must not swap it for its whole range either.
+        let cap_breakdown = def.caps_breakdown();
+        let limit = grain::clamp_limit(kind, def.limit_value());
+        let limit = if cap_breakdown {
+            limit
+        } else {
+            grain::effective_limit(grain, &order, limit)
+        };
         Some(Self {
             grain,
             dimension,
@@ -2839,6 +2973,7 @@ impl GrainedChart {
             order,
             limit,
             sort,
+            cap_breakdown,
         })
     }
 }
@@ -2907,18 +3042,21 @@ pub fn grained_sql(
         expr,
         carried,
     };
-    Some(
-        QueryBuilder::over(bucketed)
-            .dimension(chart.dimension.clone())
-            .aggregate(chart.agg)
-            .order(chart.order.clone())
-            .limit(chart.limit)
-            .breakdown(chart.breakdown.clone())
-            .grain(chart.grain, time.week_start())
-            .sort(chart.sort.clone())
-            .measure_list(chart.measures.clone())
-            .build(),
-    )
+    let mut builder = QueryBuilder::over(bucketed)
+        .dimension(chart.dimension.clone())
+        .aggregate(chart.agg)
+        .order(chart.order.clone())
+        .limit(chart.limit)
+        .breakdown(chart.breakdown.clone())
+        .grain(chart.grain, time.week_start())
+        .sort(chart.sort.clone())
+        .measure_list(chart.measures.clone());
+    // `BI-46` (plan D12): with a breakdown the limit is the breakdown's, so
+    // every bucket is kept and the cap (over the buckets) is the only cut.
+    if chart.cap_breakdown {
+        builder = builder.with_breakdown_cap();
+    }
+    Some(builder.build())
 }
 
 impl QueryBuilder<Ready> {
@@ -4209,9 +4347,13 @@ mod tests {
         spec
     }
 
+    /// `mart_x`'s columns for a grained chart: the date dimension `d`, the
+    /// measure `v`, the text breakdown `g`, and — `BI-46` — a second date
+    /// column `d2` to be a grained breakdown.
     fn dated(kind: ColumnKind) -> HashMap<String, RelationColumns> {
         let mut cols: RelationColumns = RelationColumns::default();
         cols.insert("d".to_owned(), kind);
+        cols.insert("d2".to_owned(), kind);
         cols.insert("v".to_owned(), ColumnKind::Number);
         cols.insert("g".to_owned(), ColumnKind::Text);
         HashMap::from([("mart_x".to_owned(), cols)])
@@ -4302,8 +4444,13 @@ mod tests {
         assert!(!sql.contains("HAVING"), "{sql}");
     }
 
+    /// `BI-46` (plan D12; QA `LH-BI-6-01`) replaces the rule this test used to
+    /// pin (`a_breakdown_keeps_the_latest_buckets_and_orders_by_bucket_then_series`,
+    /// the latest N buckets): on a line chart with a breakdown the limit keeps
+    /// the N breakdown values with the largest total and every quarter bucket
+    /// stays, so nothing is cut to the latest buckets.
     #[test]
-    fn a_breakdown_keeps_the_latest_buckets_and_orders_by_bucket_then_series() {
+    fn a_breakdown_beside_a_time_grain_keeps_every_bucket_and_the_top_breakdown_values() {
         let mut spec = grained_spec(ChartKind::Line, "quarter", "none");
         spec.def.breakdown = Some("g".to_owned());
         spec.def.limit = Some(8.into());
@@ -4312,10 +4459,247 @@ mod tests {
             got.sql,
             "SELECT d, g, round(sum(v)) AS v FROM \
              (SELECT date_trunc('quarter', toTimeZone(d, 'Asia/Jakarta')) AS d, g, v FROM serving.mart_x) AS bkt \
-             WHERE d IN (SELECT d FROM (SELECT date_trunc('quarter', toTimeZone(d, 'Asia/Jakarta')) AS d, g, v FROM serving.mart_x) AS bkt \
-             GROUP BY d ORDER BY d DESC LIMIT 9) GROUP BY d, g ORDER BY d, g"
+             WHERE (isNull(g), ifNull(toString(g), '')) IN (SELECT isNull(g), ifNull(toString(g), '') FROM (SELECT date_trunc('quarter', toTimeZone(d, 'Asia/Jakarta')) AS d, g, v FROM serving.mart_x) AS bkt \
+             GROUP BY g ORDER BY sum(v) DESC, g LIMIT 8) GROUP BY d, g ORDER BY d, g"
         );
-        assert_eq!(got.latest_limit, Some(8));
+        assert_eq!(got.latest_limit, None);
+    }
+
+    /// `BI-46` (plan D13; QA `LH-BI-6-01`): a date breakdown grouped by month
+    /// is bucketed under the chart under the breakdown's own name, and the
+    /// breakdown cap ranks the buckets.
+    #[test]
+    fn a_date_breakdown_grouped_by_month_is_bucketed_under_the_chart_and_capped_by_bucket() {
+        let mut spec = stored_spec(ChartKind::Bar, "mart_x", "g", &["v"]);
+        spec.def.breakdown = Some("d2".to_owned());
+        spec.def.shape.breakdown_grain = Some("month".to_owned());
+        let got = sql_with_filters_report(&spec, &[], &[], &dated(ColumnKind::Date));
+        let bucket = "(SELECT date_trunc('month', d2) AS d2, g, v FROM serving.mart_x) AS bkt";
+        assert!(
+            got.sql.contains(bucket),
+            "the month bucket is under the chart: {}",
+            got.sql
+        );
+        assert!(
+            got.sql.contains(&format!(
+                "(isNull(d2), ifNull(toString(d2), '')) IN (SELECT isNull(d2), ifNull(toString(d2), '') FROM {bucket} GROUP BY d2 ORDER BY sum(v) DESC, d2 LIMIT 20)"
+            )),
+            "the cap ranks the buckets: {}",
+            got.sql
+        );
+        assert!(
+            got.sql.contains("GROUP BY g, d2 ORDER BY g, d2"),
+            "{}",
+            got.sql
+        );
+        assert_eq!(got.latest_limit, None);
+    }
+
+    /// `BI-46` (plan D13): the dimension's own grain nests its bucket on top of
+    /// the breakdown's, one each.
+    #[test]
+    fn a_grain_on_the_dimension_and_on_the_breakdown_nest_one_bucket_each() {
+        let mut spec = grained_spec(ChartKind::Line, "month", "none");
+        spec.def.breakdown = Some("d2".to_owned());
+        spec.def.shape.breakdown_grain = Some("month".to_owned());
+        let got = sql_with_filters_report(&spec, &[], &[], &dated(ColumnKind::Date));
+        assert!(
+            got.sql
+                .contains("SELECT date_trunc('month', d2) AS d2, d, v FROM serving.mart_x"),
+            "the breakdown's bucket is the inner one: {}",
+            got.sql
+        );
+        assert!(
+            got.sql
+                .contains("SELECT date_trunc('month', d) AS d, d2, v FROM"),
+            "the dimension's bucket nests on top: {}",
+            got.sql
+        );
+    }
+
+    /// `BI-46` (plan D12): without a time grain the dimension keeps its own
+    /// top N as before, and the breakdown is cut to N as well.
+    #[test]
+    fn a_breakdown_without_a_grain_keeps_the_top_dimension_values_and_the_top_breakdown_values() {
+        let mut spec = stored_spec(ChartKind::Bar, "mart_x", "kab", &["visitors"]);
+        spec.def.breakdown = Some("cat".to_owned());
+        spec.def.order = Some("desc".to_owned());
+        spec.def.limit = Some(3.into());
+        let got = sql_with_filters_report(&spec, &[], &[], &bi6_cols());
+        assert!(
+            got.sql.contains(
+                "(isNull(cat), ifNull(toString(cat), '')) IN (SELECT isNull(cat), ifNull(toString(cat), '') FROM serving.mart_x GROUP BY cat ORDER BY sum(visitors) DESC, cat LIMIT 3)"
+            ),
+            "{}",
+            got.sql
+        );
+        assert!(
+            got.sql.contains("kab IN (SELECT kab FROM serving.mart_x"),
+            "the dimension's own top N is still there: {}",
+            got.sql
+        );
+    }
+
+    /// `BI-46` (plan D12; QA `LH-BI-6-01` review round 1, R1): `ClickHouse`
+    /// answers `NULL IN (<set>)` with false unless `transform_null_in` is set,
+    /// so the cap compares `(isNull, toString)` on both sides and a NULL
+    /// breakdown value keeps its own series. `lakehouse-api`'s
+    /// `tests/breakdown_cap.rs` runs the same clause on a real engine with a
+    /// `Nullable(String)` breakdown.
+    #[test]
+    fn a_breakdown_cap_keeps_a_null_breakdown_value_and_does_not_compare_the_bare_column() {
+        let mut spec = stored_spec(ChartKind::Bar, "mart_x", "kab", &["visitors"]);
+        spec.def.breakdown = Some("cat".to_owned());
+        spec.def.order = Some("desc".to_owned());
+        let got = sql_with_filters_report(&spec, &[], &[], &bi6_cols());
+        assert!(
+            got.sql.contains(
+                "(isNull(cat), ifNull(toString(cat), '')) IN \
+                 (SELECT isNull(cat), ifNull(toString(cat), '') FROM serving.mart_x \
+                 GROUP BY cat ORDER BY sum(visitors) DESC, cat LIMIT 20)"
+            ),
+            "the cap keeps a NULL breakdown value: {}",
+            got.sql
+        );
+        assert!(
+            !got.sql.contains("cat IN (SELECT cat"),
+            "no bare `IN` over a nullable column: {}",
+            got.sql
+        );
+    }
+
+    /// `BI-46` review round 1, R4: the assistant's digest asks a built
+    /// statement whether it caps the breakdown (`statement_caps_breakdown`). A
+    /// bar chart's capped statement says yes; a chart whose measure is a table
+    /// calculation has no cap in its statement — its windows run over the whole
+    /// grouped result — so the digest is not told to promise one.
+    #[test]
+    fn a_table_calculations_statement_carries_no_breakdown_cap() {
+        let capped = bi6_sql(r#"{"breakdown":"cat","limit":3}"#, &[]);
+        assert!(statement_caps_breakdown(&capped, "cat"), "{capped}");
+        assert!(
+            !statement_caps_breakdown(&capped, "kab"),
+            "another column's cap is not this one's: {capped}"
+        );
+        assert!(
+            !statement_caps_breakdown(&capped, "not a name"),
+            "a name that is not an identifier has no clause"
+        );
+
+        let catalog = FieldCatalog::from_fields(vec![crate::fields::FieldDef {
+            id: "f_1".to_owned(),
+            source_kind: crate::fields::SourceKind::Mart,
+            source_id: "mart_x".to_owned(),
+            name: "running".to_owned(),
+            formula: "RunningTotal(Sum(visitors))".to_owned(),
+            level: "table".to_owned(),
+            ty: "number".to_owned(),
+            created_by: "ui".to_owned(),
+            updated_at: None,
+        }]);
+        let read = ReadContext {
+            time: &DEFAULT_TIME,
+            grain: None,
+            fields: &catalog,
+        };
+        let mut plain = stored_spec(ChartKind::Bar, "mart_x", "kab", &["running"]);
+        plain.def.breakdown = Some("cat".to_owned());
+        plain.def.limit = Some(10.into());
+        let sql = super::sql_with_filters_report(&plain, &[], &[], &bi6_cols(), &read).sql;
+        assert!(
+            sql.contains("cat"),
+            "the breakdown is still a series: {sql}"
+        );
+        assert!(
+            !statement_caps_breakdown(&sql, "cat"),
+            "a table calculation gets no cap: {sql}"
+        );
+
+        let mut grained = stored_spec(ChartKind::Line, "mart_x", "d", &["running"]);
+        grained.def.grain = Some("month".to_owned());
+        grained.def.breakdown = Some("cat".to_owned());
+        grained.def.limit = Some(10.into());
+        let sql = super::sql_with_filters_report(&grained, &[], &[], &bi6_cols(), &read).sql;
+        assert!(
+            !statement_caps_breakdown(&sql, "cat"),
+            "a grained table calculation gets no cap: {sql}"
+        );
+    }
+
+    /// `BI-46` (plan D12): the breakdown is ranked over the rows the chart's
+    /// filters leave, so a dashboard filter's predicate is inside the cap's
+    /// subquery — a value hidden by the filter cannot be kept.
+    #[test]
+    fn a_dashboard_filter_narrows_the_rows_the_breakdown_values_are_ranked_over() {
+        let mut spec = stored_spec(ChartKind::Bar, "mart_x", "kab", &["visitors"]);
+        spec.def.breakdown = Some("cat".to_owned());
+        spec.def.order = Some("desc".to_owned());
+        let got = sql_with_filters_report(
+            &spec,
+            &[],
+            &[filter(r#"{"column":"cat","op":"not_in","values":["x"]}"#)],
+            &bi6_cols(),
+        );
+        assert!(
+            got.sql.contains(
+                "(isNull(cat), ifNull(toString(cat), '')) IN (SELECT isNull(cat), ifNull(toString(cat), '') FROM serving.mart_x WHERE cat NOT IN ('x')"
+            ),
+            "the cap ranks over the filtered rows: {}",
+            got.sql
+        );
+    }
+
+    /// `BI-46` (plan D12) review round 1, R5: a heatmap's, sankey's and
+    /// sunburst's second column is an axis, a target or a ring, not a series,
+    /// so the whole statement is the one `main` builds. A dashboard filter is
+    /// passed so the builder really rebuilds it: without one, such a chart
+    /// returns its stored statement (`"SELECT 1"` in these tests) and an
+    /// assertion about what the builder did would pass whatever it did.
+    #[test]
+    fn a_heatmap_a_sankey_and_a_sunburst_keep_their_statements_and_their_second_column_is_not_capped()
+     {
+        let expected = "SELECT kab, cat, round(sum(visitors)) AS visitors FROM serving.mart_x \
+             WHERE cat IN ('a') AND kab IN (SELECT kab FROM serving.mart_x WHERE cat IN ('a') \
+             GROUP BY kab ORDER BY sum(visitors) DESC LIMIT 20) GROUP BY kab, cat ORDER BY kab, cat";
+        for kind in [ChartKind::Heatmap, ChartKind::Sankey, ChartKind::Sunburst] {
+            let mut spec = stored_spec(kind, "mart_x", "kab", &["visitors"]);
+            spec.def.breakdown = Some("cat".to_owned());
+            let got = sql_with_filters_report(
+                &spec,
+                &[],
+                &[filter(r#"{"column":"cat","values":["a"]}"#)],
+                &bi6_cols(),
+            );
+            assert_eq!(got.sql, expected, "{kind:?}");
+            assert!(
+                !got.sql.contains("isNull(cat)"),
+                "{kind:?}: the breakdown is not capped"
+            );
+        }
+    }
+
+    /// `BI-46` (plan D12): with a breakdown the limit is the chart's own, so a
+    /// date part must not swap it for its whole range (64).
+    #[test]
+    fn a_date_part_with_a_breakdown_caps_the_breakdown_at_the_charts_own_limit() {
+        let mut spec = grained_spec(ChartKind::Bar, "day_of_week", "none");
+        spec.def.breakdown = Some("g".to_owned());
+        spec.def.limit = Some(5.into());
+        let got = sql_with_filters_report(&spec, &[], &[], &dated(ColumnKind::Date));
+        assert!(
+            got.sql.contains(
+                "WHERE (isNull(g), ifNull(toString(g), '')) IN (SELECT isNull(g), ifNull(toString(g), '') FROM (SELECT toDayOfWeek(d) AS d, g, v"
+            ),
+            "the cap ranks the breakdown: {}",
+            got.sql
+        );
+        assert!(got.sql.contains("LIMIT 5)"), "{}", got.sql);
+        assert!(!got.sql.contains("LIMIT 64"), "{}", got.sql);
+        assert!(
+            !got.sql.contains("d IN (SELECT d FROM"),
+            "a breakdown chart keeps every day of the week, even on a part: {}",
+            got.sql
+        );
     }
 
     #[test]
@@ -4763,11 +5147,17 @@ mod tests {
             &[filter(r#"{"column":"cat","values":["a"]}"#)],
             &bi6_cols(),
         );
+        // `BI-46` (plan D14): a chart with a breakdown is rebuilt from its
+        // definition, so this one gains the breakdown cap — the rule reaches
+        // charts saved before it, which is what D14 asks for.
         assert_eq!(
             got.sql,
             "SELECT kab, cat, round(sum(visitors)) AS visitors FROM serving.mart_x \
-             WHERE cat IN ('a') AND kab IN (SELECT kab FROM serving.mart_x WHERE cat IN ('a') \
-             GROUP BY kab ORDER BY sum(visitors) DESC LIMIT 20) GROUP BY kab, cat ORDER BY kab, cat"
+             WHERE cat IN ('a') AND (isNull(cat), ifNull(toString(cat), '')) IN (SELECT isNull(cat), ifNull(toString(cat), '') FROM serving.mart_x WHERE cat IN ('a') \
+             GROUP BY cat ORDER BY sum(visitors) DESC, cat LIMIT 20) AND kab IN (SELECT kab FROM \
+             serving.mart_x WHERE cat IN ('a') AND (isNull(cat), ifNull(toString(cat), '')) IN (SELECT isNull(cat), ifNull(toString(cat), '') FROM serving.mart_x WHERE \
+             cat IN ('a') GROUP BY cat ORDER BY sum(visitors) DESC, cat LIMIT 20) GROUP BY kab \
+             ORDER BY sum(visitors) DESC LIMIT 20) GROUP BY kab, cat ORDER BY kab, cat"
         );
         let mut counted = stored_spec(ChartKind::Bar, "mart_x", "kab", &["visitors"]);
         counted.def.aggregate = Some("count".to_owned());
@@ -4844,11 +5234,14 @@ mod tests {
             r#"{"breakdown":"cat","filters":[{"column":"kab","op":"not_in","values":["x"]}]}"#,
             &dash,
         );
+        // `BI-46` (plan D12): the breakdown cap adds its own subquery, so the
+        // same predicates now sit in the cap, in the kept-groups subquery (over
+        // the capped rows) and outside it — still "both apply", everywhere.
         assert_eq!(
             with_breakdown
                 .matches("kab NOT IN ('x') AND kab IN ('a','b')")
                 .count(),
-            2
+            4
         );
     }
 
@@ -4957,11 +5350,16 @@ mod tests {
             r#"{"breakdown":"cat","sort":{"by":"visitors","dir":"desc"},"limit":5}"#,
             &[],
         );
+        // `BI-46` (plan D12): the breakdown keeps its 5 largest values; the
+        // dimension's own guard still keeps its own top 5, over them.
         assert_eq!(
             sql,
             "SELECT kab, cat, __m0 AS visitors FROM (SELECT kab, cat, round(sum(visitors)) AS __m0, \
              sum(sum(visitors)) OVER (PARTITION BY kab) AS __t FROM serving.mart_x \
-             WHERE kab IN (SELECT kab FROM serving.mart_x GROUP BY kab \
+             WHERE (isNull(cat), ifNull(toString(cat), '')) IN (SELECT isNull(cat), ifNull(toString(cat), '') FROM serving.mart_x GROUP BY cat \
+             ORDER BY sum(visitors) DESC, cat LIMIT 5) AND kab IN (SELECT kab FROM serving.mart_x \
+             WHERE (isNull(cat), ifNull(toString(cat), '')) IN (SELECT isNull(cat), ifNull(toString(cat), '') FROM serving.mart_x GROUP BY cat \
+             ORDER BY sum(visitors) DESC, cat LIMIT 5) GROUP BY kab \
              ORDER BY sum(visitors) DESC, kab LIMIT 5) GROUP BY kab, cat) \
              ORDER BY __t DESC, kab, cat"
         );

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
 import { ChartFilters, GroupingsEditor, MeasureRows, PreviewRowsTable, StepsEditor } from "./chart-shape-section"
 import { OwnFiltersMarker } from "./filters/own-filters-marker"
@@ -103,10 +103,33 @@ describe("ChartFilters", () => {
   const columns = [{ name: "category", kind: "text" as const }, { name: "visitors", kind: "number" as const }]
   it("lists each filter like a dashboard chip and removes one", () => {
     const onChange = mock<(filters: unknown[]) => void>(() => {})
-    render(<ChartFilters value={[{ column: "category", values: ["Office"] }]} onChange={onChange} columns={columns} disabled={false} />)
+    render(<ChartFilters value={[{ column: "category", values: ["Office"] }]} onChange={onChange} columns={columns} disabled={false} source={{ mart: "mart_x" }} />)
     expect(screen.getByText("category is Office")).toBeTruthy()
     fireEvent.click(screen.getByLabelText("Remove category filter"))
     expect(onChange.mock.calls[0][0]).toEqual([])
+  })
+
+  /** `BI-47` (QA `LH-BI-6-01`): a chart filter's values come from the chart's own mart, not from every mart. */
+  it("reads the value list of a chart filter from the mart it was given and names no board", async () => {
+    const originalFetch = global.fetch
+    const calls: string[] = []
+    global.fetch = mock(async (input: RequestInfo | URL) => {
+      calls.push(String(input))
+      return new Response(JSON.stringify({ values: ["Office"] }), { status: 200, headers: { "Content-Type": "application/json" } })
+    }) as unknown as typeof fetch
+    try {
+      render(<ChartFilters value={[{ column: "category", values: ["Office"] }]} onChange={() => {}} columns={columns} disabled={false} source={{ mart: "mart_x" }} />)
+      // The chip opens the filter's editor, whose value list is the request.
+      fireEvent.click(screen.getByText("category is Office"))
+      await waitFor(() => expect(calls.length).toBeGreaterThan(0))
+      const url = new URL(calls[0], "http://console.invalid")
+      expect(url.pathname).toBe("/api/dashboard/values")
+      expect(url.searchParams.get("column")).toBe("category")
+      expect(url.searchParams.get("mart")).toBe("mart_x")
+      expect(url.searchParams.has("board")).toBe(false)
+    } finally {
+      global.fetch = originalFetch
+    }
   })
 })
 
@@ -115,15 +138,15 @@ describe("ChartFilters with segments (BI-2)", () => {
   const segments = [{ name: "domestic", label: "Domestic visitors" }, { name: "foreign", label: "Foreign visitors" }]
   it("adds a segment as a reference by name and lists it as a chip that can be removed", () => {
     const onChange = mock<(filters: unknown[]) => void>(() => {})
-    const { rerender } = render(<ChartFilters value={[]} onChange={onChange} columns={columns} disabled={false} segments={segments} />)
+    const { rerender } = render(<ChartFilters value={[]} onChange={onChange} columns={columns} disabled={false} segments={segments} source={{ mart: "mart_x" }} />)
     expect(screen.getByLabelText("Add a segment")).toBeTruthy()
-    rerender(<ChartFilters value={[{ column: "", values: [], segment: "domestic" }]} onChange={onChange} columns={columns} disabled={false} segments={segments} />)
+    rerender(<ChartFilters value={[{ column: "", values: [], segment: "domestic" }]} onChange={onChange} columns={columns} disabled={false} segments={segments} source={{ mart: "mart_x" }} />)
     expect(screen.getByText("Segment: Domestic visitors")).toBeTruthy()
     fireEvent.click(screen.getByLabelText("Remove segment domestic"))
     expect(onChange.mock.calls[0][0]).toEqual([])
   })
   it("offers no segment picker when the table has none", () => {
-    render(<ChartFilters value={[]} onChange={() => {}} columns={columns} disabled={false} />)
+    render(<ChartFilters value={[]} onChange={() => {}} columns={columns} disabled={false} source={{ mart: "mart_x" }} />)
     expect(screen.queryByLabelText("Add a segment")).toBeNull()
   })
 })

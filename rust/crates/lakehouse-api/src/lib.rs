@@ -40,6 +40,7 @@ pub mod lakekeeper_token;
 pub mod next_run;
 pub mod pdf;
 pub mod pg_probe;
+pub mod pipeline_compile;
 pub mod pipeline_lag;
 pub mod pipeline_source;
 pub mod policy;

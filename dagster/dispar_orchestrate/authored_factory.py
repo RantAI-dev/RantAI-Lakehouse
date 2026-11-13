@@ -6,8 +6,8 @@ row. At code-load time this module reads `GET /api/pipelines/runnable`
 (every `ready` or `paused` authored pipeline, with its definition, across
 all tenants) and builds, per pipeline:
 
-* an `authored__<id>` job that reads its source, applies its `transforms`,
-  and writes its target (item E3, below);
+* an `authored__<id>` job that asks the API for the statement its stored
+  definition compiles to, runs it, and writes its target (item E3, below);
 * an `authored__<id>_schedule` when the pipeline's schedule is a five-field
   cron. `default_status` is RUNNING for a `ready` pipeline and STOPPED for a
   `paused` one: the schedule the author set is meant to fire, and one that
@@ -65,39 +65,29 @@ token from `PIPELINE_RUN_TOKEN`.
 # Reading a Bronze source
 
 A Bronze table is Iceberg in Lakekeeper, not a ClickHouse database: this
-stack's ClickHouse has `serving`, `silver` and `lake` only, so a Bronze
-source cannot be read as `` bronze.`orders` ``. It is read through a
-`DataLakeCatalog` database, where the table is named ``bronze.<table>``,
-exactly as `connector_catalog.register_loaded_table` and
-`maintenance.discover_bronze_tables` already read one. `_resolve_source`
-picks the source and `_reading` attaches `allow_database_iceberg = 1` to
-every statement that reads it; `_resolve_source`'s own docstring and
-`_reading`'s carry the details.
+stack's ClickHouse has `serving`, `silver` and `lake` only. The API names
+that read when it compiles the pipeline (`pipeline_compile.rs`), and this
+module attaches `allow_database_iceberg = 1` to every statement whose
+compiled text reads it — the `readsIceberg` flag `_compiled_sql` gets back
+from the API decides. `_reading` carries the detail.
 
-BLD-1 / D5 changed WHICH database that is, and the reason is governance,
-not convenience. The `SELECT` a pipeline runs is rewritten by the API
-(`_enforced_sql`, below) through the same masking and row-filter rewrite
-every governed surface uses, and that rewriter only recognises a governed
-table under the database the API itself reads it from -- its own
-`ICEBERG_QUERY_DB` (`icecat_api` in compose). Reading Bronze through this
-module's former private `icecat_authored` database made the rewriter see an
-unknown table, so it enforced nothing on exactly the tables that most need
-it. So the source is now named `ICEBERG_QUERY_DB`.`bronze.<table>` and this
-module no longer creates a catalog database of its own: the
-`clickhouse-iceberg-init` compose service already creates that one, on every
-`up`, and a second `CREATE DATABASE ... DataLakeCatalog` here would be a
-duplicate of it that could drift.
+BLD-1 part 1 / D14: this module no longer builds SQL. It asks the API for
+the statement (`POST /api/pipelines/runnable/{id}/compile`) and runs it.
+
+The database that names it is the API's own `ICEBERG_QUERY_DB`
+(`icecat_api` in compose), because the API's policy rewriter only recognises
+a governed table under that name — a pipeline read through any other database
+was never rewritten at all (BLD-1 / D5).
 
 # Reading as the pipeline's author
 
-BLD-1 / D4: the `SELECT` this module builds is not the `SELECT` it runs.
-`_enforced_sql` posts it to the API, which rewrites it as the pipeline's
-recorded author (`pipeline_definition.run_as`) and returns the SQL to run;
-only that returned text reaches ClickHouse. A pipeline with no recorded
+BLD-1 part 1 / D4 and D14: the API compiles the pipeline's stored definition
+and rewrites it as its recorded author (`pipeline_definition.run_as`), and
+only the text it returns reaches ClickHouse. A pipeline with no recorded
 author, or one whose author has been deactivated, is refused with a fixed
-message (409) that no retry can fix; a refused construct is refused the
-same way (422). A transport failure still propagates, because that IS
-retryable and used to be.
+message (409) that no retry can fix; a refused definition or construct is
+refused the same way (422). A transport failure still propagates, because
+that IS retryable and used to be.
 """
 
 from __future__ import annotations
@@ -127,7 +117,7 @@ from dagster import (
     sensor,
 )
 
-from dispar_orchestrate import authored_transforms, op_metadata
+from dispar_orchestrate import op_metadata
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, _ch_exec, _ch_query_json
 from dispar_orchestrate.file_ingest import JOB_NAME as FILE_INGEST_JOB
 
@@ -141,22 +131,15 @@ def _env(name: str, default: str) -> str:
 class AuthoredPipelineConfig:
     api_url: str
     run_token: str
-    # BLD-1 / D5: the API's own `DataLakeCatalog` database. A Bronze
-    # source is read through THIS one, not through a database private to
-    # this module, because the API's policy rewriter only recognises a
-    # governed table under the database it reads it from -- named any
-    # other way, `SELECT * FROM <other-db>.`bronze.t`` reaches ClickHouse
-    # unmasked. Defaults to the compose default; `lakehouse-api` and
-    # `clickhouse-iceberg-init` read the same variable, so one `.env`
-    # value moves all three together.
-    iceberg_query_db: str = "icecat_api"
+    # BLD-1 part 1 / D14: there is no catalog-database setting here any more.
+    # The API owns `ICEBERG_QUERY_DB` — it compiles a Bronze input through it
+    # and answers `readsIceberg`, which is all this module needs.
 
     @classmethod
     def from_env(cls) -> "AuthoredPipelineConfig":
         return cls(
             api_url=_env("LAKEHOUSE_API_URL", "http://lakehouse-api:8080"),
             run_token=_env("PIPELINE_RUN_TOKEN", ""),
-            iceberg_query_db=_env("ICEBERG_QUERY_DB", "icecat_api"),
         )
 
 
@@ -300,45 +283,27 @@ def _dagster_safe_name(raw: str) -> str:
 
 
 def _is_safe_ch_identifier(name: str) -> bool:
-    """Defense in depth for a zone/table name pulled out of a stored
+    """Defense in depth for a name pulled out of a stored
     `pipeline_definition` row before it is interpolated into a ClickHouse
-    statement -- the same non-trust-by-default posture
-    `authored_transforms.py` takes for a transform string, applied here to
-    the four identifier fields this module itself builds SQL from
-    (`source_zone`/`source_table`/`target_zone`/`target_table` are
-    validated server-side at `POST /api/pipelines` time, but this op
-    re-checks rather than assuming that validation can never be bypassed by
-    a future/older API version)."""
+    statement — the three fields this module still formats itself (`the
+    source zone`, which the connector rule reads, and `target_zone`/
+    `target_table`). They are validated server-side at `POST /api/pipelines`
+    time, but this op re-checks rather than assuming that validation can
+    never be bypassed by a future/older API version. The source table is not
+    here: it is a `SELECT` the API compiled (BLD-1 part 1 / D14)."""
     return bool(name) and not name[0].isdigit() and all(c.isascii() and (c.isalnum() or c == "_") for c in name)
 
 
-# ── Where a pipeline reads FROM: BLD-3 / D1, D2 ────────────────────────
+# ── Reading a Bronze source: BLD-3 / D1, D2 + BLD-1 part 1 / D14 ─────
 
 # Bronze is not a ClickHouse database on this stack: `scripts/seed-clickhouse.sql`
 # creates `serving`, `silver` and `lake` only. A Bronze table is Iceberg in
 # Lakekeeper and is readable from ClickHouse ONLY through a
 # `DataLakeCatalog` database, where the table's name is the catalog's own
 # flat `bronze.<table>` (ADR 0004) -- `` <catalog db>.`bronze.<table>` ``.
-# Reading it as a plain `` bronze.`orders` `` is the 404 this module's
-# Bronze source used to raise (plan `2026-10-14-bld-3-bronze-pipeline-source`,
-# T1's reproduced trace).
-#
-# WHICH catalog database is BLD-1 / D5's change, and it is a governance
-# decision rather than tidiness: this module used to own a private
-# `icecat_authored` and create it here, the way every other job owns its
-# own (`icecat_maintenance`, `icecat_ingest`, `ops/g3a`'s `icecat_g3a`), so
-# a pipeline never depended on another job having created one first. That
-# independence now costs more than it buys: the API's policy rewriter
-# resolves a governed table by its qualified name under the database the
-# API itself reads it from (`ICEBERG_QUERY_DB`), so `SELECT`ting through a
-# private database produced SQL the rewriter did not recognise, and the
-# masking a pipeline is supposed to inherit never applied to Bronze -- the
-# tables that hold the rawest personal data. So the name comes from
-# `AuthoredPipelineConfig.iceberg_query_db` (the API's own `ICEBERG_QUERY_DB`,
-# the same one `lakehouse-api` and `clickhouse-iceberg-init` use), and this
-# module creates nothing: `clickhouse-iceberg-init` already creates that
-# database on every `up`, so a `CREATE DATABASE` here would be a second
-# copy of a statement that already exists and could drift from it.
+# The API names that read (it owns `ICEBERG_QUERY_DB` and the rewriter that
+# must recognise the table), and tells this module with `readsIceberg`
+# whether the compiled statement reads it.
 
 # Every statement that READS the catalog database needs this setting;
 # ClickHouse refuses an Iceberg read without it. `maintenance.py` sends it
@@ -350,82 +315,45 @@ def _is_safe_ch_identifier(name: str) -> bool:
 ICEBERG_READ_SETTINGS = "allow_database_iceberg = 1"
 
 
-@dataclass(frozen=True)
-class _PipelineSource:
-    """One authored pipeline's ClickHouse source: the name to read, and
-    whether reading it is an Iceberg read (which decides whether the
-    statements that touch it carry `ICEBERG_READ_SETTINGS`).
-
-    `clickhouse_name` is a ClickHouse identifier expression, never a bare
-    zone: for a Bronze source it is the catalog database plus the
-    catalog's own ``bronze.<table>`` name inside one pair of backticks.
-    """
-    clickhouse_name: str
-    reads_iceberg: bool = False
-
-
-def _resolve_source(
-    source_zone: str, source_table: str, catalog_db: str
-) -> _PipelineSource:
-    """The source an authored pipeline reads from, and whether reading it
-    is an Iceberg read (which decides whether the statements that touch it
-    carry `ICEBERG_READ_SETTINGS`).
-
-    `silver`/`gold` (and every other ClickHouse zone) are read as
-    `<zone>.<table>`, exactly as before. A `bronze` source is read through
-    the API's own catalog database -- `catalog_db`, the caller's
-    `ICEBERG_QUERY_DB` -- where the table is ``bronze.<table>``. See the
-    catalog-database comment above for why that is the API's database and
-    not one of this module's own, and why nothing is created here any more.
-
-    # Errors
-
-    None. Every value it returns is a name this module's own identifier
-    check (`_is_safe_ch_identifier`, applied to the zone and table in
-    `_op_for_pipeline`) has already vouched for.
-    """
-    if source_zone == "bronze":
-        return _PipelineSource(
-            f"{catalog_db}.`bronze.{source_table}`", reads_iceberg=True
-        )
-    return _PipelineSource(f"{source_zone}.`{source_table}`")
-
-
-def _reading(source: _PipelineSource, statement: str) -> str:
+def _reading(reads_iceberg: bool, statement: str) -> str:
     """`statement`, plus `SETTINGS allow_database_iceberg = 1` when it
     reads the catalog database (D2). ClickHouse reads `SETTINGS` as the
     last clause of the `SELECT` it belongs to, so this is appended to the
     WHOLE statement -- after its `LIMIT 0`, after its `FORMAT`, never in
     the middle of a `FROM`."""
-    if not source.reads_iceberg:
+    if not reads_iceberg:
         return statement
     return f"{statement} SETTINGS {ICEBERG_READ_SETTINGS}"
 
 
-# The API's answer to "I will not run this SELECT for you, and running it
-# again will not change my mind": 409 when the pipeline has no author to
-# read as (BLD-1 / D2) or that author is gone, 422 when the SQL touches a
-# governed table through a construct the policy engine will not rewrite.
-# Both carry a FIXED message (`policy_engine::enforcement_error_message` /
-# D2's own string), which is why `_enforced_sql` can put it in an op
-# failure without leaking anything: there is no upstream text in it to
-# leak.
-_ENFORCE_REFUSAL_STATUSES = (409, 422)
+# The API's answer to "I will not compile or run this for you, and asking
+# again will not change my mind":
+#   409 the pipeline has no author to read as (BLD-1 / D2), that author is
+#       gone, or it belongs to no tenant;
+#   404 a table the author's roles do not include (`GOV-7`; the run route
+#       answers the same 404 Query Studio does, and review R1-S2 made it a
+#       refusal here — it used to be retried);
+#   422 the stored definition does not compile, or the rewrite refused it.
+# Each carries a FIXED message written in this repository
+# (`policy_engine::enforcement_error_message`, D2's own string, the
+# definition's `steps[i]: ...`), which is why `_compiled_sql` can put it in
+# an op failure without leaking anything: there is no upstream text in it.
+_ENFORCE_REFUSAL_STATUSES = (404, 409, 422)
 
 # Fallback when the API refuses but its body carries no `error` string. A
 # fixed message of our own, never the raw body: an unexpected body is
 # exactly the case where its text is least trustworthy.
 _ENFORCE_REFUSAL_FALLBACK = (
-    "the lakehouse API refused to enforce this pipeline's query; "
+    "the lakehouse API refused to compile this pipeline's query; "
     "see the API logs for the reason"
 )
 
-# Fixed text for a 2xx whose body is not the `{ "sql": "..." }` shape the
-# route documents. Retrying the identical request cannot repair a response
+# Fixed text for a 2xx whose body is not the `{ "sql": ..., "readsIceberg":
+# ... }` shape the route documents. Retrying the identical request cannot repair a response
 # shape, so this is a refusal rather than a transient failure -- but it is
 # OURS, not the API's, and it says nothing about what came back.
 _ENFORCE_BAD_BODY = (
-    "the lakehouse API returned an unreadable enforcement response for "
+    "the lakehouse API returned an unreadable compile response for "
     "this pipeline's query"
 )
 
@@ -459,33 +387,34 @@ def _refusal_message(resp: requests.Response) -> str:
     return _ENFORCE_REFUSAL_FALLBACK
 
 
-def _enforced_sql(cfg: AuthoredPipelineConfig, pipeline_id: str, select_sql: str) -> str:
-    """The SQL to RUN for `select_sql`: the API's rewrite of it as the
-    pipeline's recorded author, or [`AuthoredEnforceRefused`].
+def _compiled_sql(cfg: AuthoredPipelineConfig, pipeline_id: str) -> tuple[str, bool]:
+    """What to RUN for this pipeline, and whether it reads Bronze: the API's
+    compile of the stored definition, rewritten as the pipeline's recorded
+    author, or [`AuthoredEnforceRefused`].
 
-    This is BLD-1 / D4's whole point, and the reason the returned text --
-    never `select_sql` itself -- is what `_write_clickhouse_table` writes
-    into the `CREATE TABLE ... AS`, the staging `INSERT` and every other
-    statement that reads the source. The API applies the same masking and
+    This is BLD-1 part 1 / D4, D8 and D14's whole point. The API owns the
+    definition compiler and the policy rewrite (the same masking and
     row-filter rewrite Query Studio, dashboards, alerts and the Gold export
-    apply, so a pipeline cannot be used to copy a masked column into a
-    Silver table in clear (`GOV-4`).
+    apply), and the returned text -- never anything this module composes --
+    is what `_write_clickhouse_table` writes into the `CREATE TABLE ... AS`,
+    the staging `INSERT` and every other statement that reads the source, so a
+    pipeline cannot be used to copy a masked column into a Silver table in
+    clear (`GOV-4`). `readsIceberg` says whether that text reads the catalog
+    database, which decides `allow_database_iceberg` (`_reading`).
 
     # Errors
 
-    [`AuthoredEnforceRefused`] when the API refuses (409/422) or answers
-    with a body that is not `{ "sql": ... }` -- neither of which a retry
-    changes, so the op fails without retrying.
+    [`AuthoredEnforceRefused`] when the API refuses (409/422) or answers with
+    a body that is not `{ "sql": ..., "readsIceberg": ... }` -- neither of
+    which a retry changes, so the op fails without retrying.
 
-    `requests.RequestException` propagates UNWRAPPED, and the op retries:
-    an unreachable API, a timeout or a 5xx are the infrastructure failures
-    the retry policy exists for, and they are exactly as retryable as they
-    were before this call existed.
+    `requests.RequestException` propagates UNWRAPPED, and the op retries: an
+    unreachable API, a timeout or a 5xx are the infrastructure failures the
+    retry policy exists for.
     """
     resp = requests.post(
-        f"{cfg.api_url}/api/pipelines/runnable/{quote(pipeline_id, safe='')}/enforce",
-        headers={**_headers(cfg), "content-type": "application/json"},
-        json={"sql": select_sql},
+        f"{cfg.api_url}/api/pipelines/runnable/{quote(pipeline_id, safe='')}/compile",
+        headers=_headers(cfg),
         timeout=60,
     )
     if resp.status_code in _ENFORCE_REFUSAL_STATUSES:
@@ -498,57 +427,13 @@ def _enforced_sql(cfg: AuthoredPipelineConfig, pipeline_id: str, select_sql: str
         body = resp.json()
     except ValueError as exc:
         raise AuthoredEnforceRefused(_ENFORCE_BAD_BODY) from exc
-    if not isinstance(body, dict) or not isinstance(body.get("sql"), str):
+    if (
+        not isinstance(body, dict)
+        or not isinstance(body.get("sql"), str)
+        or not isinstance(body.get("readsIceberg"), bool)
+    ):
         raise AuthoredEnforceRefused(_ENFORCE_BAD_BODY)
-    return body["sql"]
-
-
-def _build_select_sql(source: str, transforms: list[authored_transforms.Transform]) -> str:
-    """Compose the whole `transforms` list into ONE `SELECT ... FROM
-    source [WHERE ...] [ORDER BY ... LIMIT 1 BY ...]` statement -- see
-    this task's plan doc: a `Dedupe` becomes an `ORDER BY` clause paired
-    with `LIMIT BY` executed server-side in ClickHouse; `Filter`/`Cast`/
-    `Rename`/`Select` compose into the column list and `WHERE` clause.
-    Every `Filter` clause is rendered through
-    `authored_transforms.render_clickhouse` directly (item E2's actual
-    function, never a re-derivation of its literal-escaping)."""
-    columns: list[str] | None = None
-    renames: dict[str, str] = {}
-    casts: dict[str, str] = {}
-    filters: list[str] = []
-    dedupe_key: str | None = None
-
-    for t in transforms:
-        if isinstance(t, authored_transforms.Select):
-            columns = list(t.columns)
-        elif isinstance(t, authored_transforms.Rename):
-            renames[t.from_col] = t.to_col
-        elif isinstance(t, authored_transforms.Cast):
-            casts[t.column] = t.target_type
-        elif isinstance(t, authored_transforms.Filter):
-            filters.append(authored_transforms.render_clickhouse(t))
-        elif isinstance(t, authored_transforms.Dedupe):
-            dedupe_key = t.key
-        else:  # unreachable -- authored_transforms.Transform is a closed union
-            raise AuthoredJobError(f"unrenderable transform: {t!r}")
-
-    if columns is None:
-        select_cols = "*"
-    else:
-        rendered = []
-        for c in columns:
-            expr = f"CAST({c} AS {casts[c]})" if c in casts else c
-            if c in renames:
-                expr = f"{expr} AS {renames[c]}"
-            rendered.append(expr)
-        select_cols = ", ".join(rendered)
-
-    sql = f"SELECT {select_cols} FROM {source}"
-    if filters:
-        sql += " WHERE " + " AND ".join(filters)
-    if dedupe_key:
-        sql += f" ORDER BY {dedupe_key} LIMIT 1 BY {dedupe_key}"
-    return sql
+    return body["sql"], body["readsIceberg"]
 
 
 def _ensure_target_table(
@@ -556,7 +441,7 @@ def _ensure_target_table(
     target_zone: str,
     target_table: str,
     select_sql: str,
-    source: _PipelineSource,
+    reads_iceberg: bool,
 ) -> None:
     """Schema-on-write for an authored pipeline's target: create the
     database and (if it does not already exist) the table, inferring
@@ -565,14 +450,14 @@ def _ensure_target_table(
     is `_write_clickhouse_table`'s job, run every time this job runs, not
     only on first creation).
 
-    `SELECT ... AS ... LIMIT 0` is the FIRST statement that reads a Bronze
-    source, so it carries `source`'s read setting (`_reading`); the
+    `SELECT ... AS ... LIMIT 0` is the FIRST statement that may read a Bronze
+    source, so it carries the read setting when it does (`_reading`); the
     `CREATE DATABASE` above it writes only and never carries one."""
     _ch_exec(target, f"CREATE DATABASE IF NOT EXISTS {target_zone}")
     _ch_exec(
         target,
         _reading(
-            source,
+            reads_iceberg,
             f"CREATE TABLE IF NOT EXISTS {target_zone}.`{target_table}` "
             f"ENGINE = MergeTree ORDER BY tuple() AS {select_sql} LIMIT 0",
         ),
@@ -584,7 +469,7 @@ def _write_clickhouse_table(
     target_zone: str,
     target_table: str,
     select_sql: str,
-    source: _PipelineSource,
+    reads_iceberg: bool,
 ) -> int:
     """REPLACE `target_zone.target_table` with `select_sql`'s rows,
     atomically, and return the REAL row-count DELTA between before and
@@ -620,7 +505,7 @@ def _write_clickhouse_table(
     run is retryable because no committed write happened to the live
     target.
     """
-    _ensure_target_table(target, target_zone, target_table, select_sql, source)
+    _ensure_target_table(target, target_zone, target_table, select_sql, reads_iceberg)
     staging_table = f"__staging_{target_table}"
     # Idempotency under retry: drop any staging table left behind from
     # a prior attempt that failed between `INSERT INTO staging` and
@@ -630,13 +515,16 @@ def _write_clickhouse_table(
     _ch_exec(
         target,
         _reading(
-            source,
+            reads_iceberg,
             f"CREATE TABLE {target_zone}.`{staging_table}` "
             f"ENGINE = MergeTree ORDER BY tuple() AS {select_sql} LIMIT 0",
         ),
     )
     before = _ch_query_json(target, f"SELECT count() AS n FROM {target_zone}.`{target_table}`")
-    _ch_exec(target, _reading(source, f"INSERT INTO {target_zone}.`{staging_table}` {select_sql}"))
+    _ch_exec(
+        target,
+        _reading(reads_iceberg, f"INSERT INTO {target_zone}.`{staging_table}` {select_sql}"),
+    )
     # ClickHouse `EXCHANGE TABLES` is the atomic-swap primitive: both
     # tables must exist in the same database, and the swap is a single
     # mutation step (no transactional gap where readers see a
@@ -678,18 +566,23 @@ def _op_for_pipeline(pipeline: dict[str, Any]) -> Any:
         retry_policy=per_pipeline_retry,
         tags=op_metadata.source_metadata(
             "dispar_orchestrate/authored_factory.py::_op_for_pipeline",
-            reads=[f"ClickHouse {definition.get('sourceZone')}.{definition.get('sourceTable')}"],
+            reads=[
+                ", ".join(
+                    f"ClickHouse {i.get('zone')}.{i.get('table')}"
+                    for i in definition.get("inputs", [])
+                )
+                or f"ClickHouse {definition.get('sourceZone')}.{definition.get('sourceTable')}"
+            ],
             writes=[f"ClickHouse {definition.get('targetZone')}.{definition.get('targetTable')}"],
         ),
     )
     def _run(context) -> dict[str, Any]:
-        # PART D boundary: config-shaped failures raised by the
-        # transform-grammar port (`TransformError`, a `ValueError`
-        # subclass) and by this module's own authored-pipeline guard
-        # (`AuthoredJobError`, a `RuntimeError` subclass) are wrapped in
-        # `Failure(allow_retries=False)` here so `DEFAULT_RETRY_POLICY`
-        # does not burn 60s on a config that will not change between
-        # attempts. `SchemaDriftError` from `bronze_catalog.py` does
+        # PART D boundary: config-shaped failures raised by this module's
+        # own authored-pipeline guard (`AuthoredJobError`, a `RuntimeError`
+        # subclass) are wrapped in `Failure(allow_retries=False)` here so
+        # `DEFAULT_RETRY_POLICY` does not burn 60s on a config that will not
+        # change between attempts. The transform grammar is the API's now
+        # (BLD-1 part 1 / D14), so there is no `TransformError` to catch. `SchemaDriftError` from `bronze_catalog.py` does
         # NOT reach this body (the `_ensure_target_table` path uses
         # `_ch_exec` directly, not `_assert_or_create_all`), so it is
         # not in the wrap tuple -- a SchemaDriftError raised elsewhere
@@ -699,11 +592,6 @@ def _op_for_pipeline(pipeline: dict[str, Any]) -> Any:
         # not in this tuple and propagate retryably, as the retry
         # policy intends.
         try:
-            transforms = [
-                authored_transforms.parse_transform(t)
-                for t in definition.get("transforms", [])
-            ]
-
             source_zone = definition["sourceZone"]
             # BLD-7 / decision 3: a connector means the data came from that
             # connector's Bronze table, and the run reads `sourceZone.
@@ -714,12 +602,14 @@ def _op_for_pipeline(pipeline: dict[str, Any]) -> Any:
             if definition.get("connectorId") and source_zone != "bronze":
                 raise AuthoredJobError(CONNECTOR_SOURCE_NOT_BRONZE_REASON)
 
-            source_table = definition["sourceTable"]
             target_zone = definition["targetZone"]
             target_table = definition["targetTable"]
+            # BLD-1 part 1 / D14: this module formats the target itself, so it
+            # checks the two names it interpolates. The source is a
+            # `SELECT` the API compiled, so there is no source identifier here
+            # to format.
             for ident, field in (
                 (source_zone, "sourceZone"),
-                (source_table, "sourceTable"),
                 (target_zone, "targetZone"),
                 (target_table, "targetTable"),
             ):
@@ -739,7 +629,7 @@ def _op_for_pipeline(pipeline: dict[str, Any]) -> Any:
             # this message instead of writing somewhere meaningless.
             if target_zone == "bronze":
                 raise AuthoredJobError(BRONZE_TARGET_REFUSED_REASON)
-        except (authored_transforms.TransformError, AuthoredJobError) as exc:
+        except AuthoredJobError as exc:
             raise Failure(
                 description=f"authored pipeline {pipeline['id']!r} config rejected: {exc}",
                 allow_retries=False,
@@ -747,25 +637,24 @@ def _op_for_pipeline(pipeline: dict[str, Any]) -> Any:
 
         ch = ClickHouseTarget.from_env()
         cfg = AuthoredPipelineConfig.from_env()
-        source = _resolve_source(source_zone, source_table, cfg.iceberg_query_db)
-        select_sql = _build_select_sql(source.clickhouse_name, transforms)
-        # BLD-1 / D4: what we BUILT is not what we RUN. The API rewrites
-        # the SELECT as the pipeline's recorded author, and only the SQL it
-        # returns reaches ClickHouse -- through `_write_clickhouse_table`,
-        # which uses this one value for the `CREATE TABLE ... AS`, the
-        # staging INSERT and every other statement that reads the source.
-        # A refusal (no author, or a construct the policy engine will not
-        # rewrite) is not retried: the same pipeline asked again minutes
-        # later gets the same answer. A transport failure is not caught
-        # here at all, so it stays retryable exactly as it always was.
+        # BLD-1 part 1 / D4 and D14: this module builds no SQL. The API
+        # compiles the stored definition and rewrites it as the pipeline's
+        # recorded author; only that text is written, and `readsIceberg`
+        # decides whether every statement that reads it carries the catalog
+        # database's setting. A refusal (no author, or a definition the rules
+        # refuse) is not retried: the same pipeline asked again minutes later
+        # gets the same answer. A transport failure propagates, so it stays
+        # retryable exactly as it always was.
         try:
-            enforced_sql = _enforced_sql(cfg, pipeline["id"], select_sql)
+            compiled_sql, reads_iceberg = _compiled_sql(cfg, pipeline["id"])
         except AuthoredEnforceRefused as exc:
             raise Failure(
                 description=f"authored pipeline {pipeline['id']!r} refused: {exc}",
                 allow_retries=False,
             ) from exc
-        written = _write_clickhouse_table(ch, target_zone, target_table, enforced_sql, source)
+        written = _write_clickhouse_table(
+            ch, target_zone, target_table, compiled_sql, reads_iceberg
+        )
 
         if definition.get("fbicEnabled"):
             context.log.info(FBIC_UNSUPPORTED_REASON)
@@ -1500,15 +1389,31 @@ def _pipeline_target(p: dict[str, Any]) -> str:
     return ""
 
 
-def _pipeline_source(p: dict[str, Any]) -> str:
-    if p.get("source"):
-        return str(p["source"])
+def _pipeline_sources(p: dict[str, Any]) -> list[str]:
+    """Every table a pipeline reads (BLD-1 part 1 / D11, review R1-B7).
+
+    `definition.inputs` is the shape; a payload that predates it (or a stored
+    row the backfill never reached) falls back to `source`, then to
+    `sourceZone`/`sourceTable` — the same fallback the store's own
+    `input_tables_of` makes. A pipeline with two inputs must be watched at
+    both: the lag sensor below attaches a downstream pipeline that produces
+    the SECOND one too, or that pipeline never runs.
+    """
     defn = p.get("definition") or {}
+    tables = [
+        f"{i.get('zone')}.{i.get('table')}"
+        for i in (defn.get("inputs") or [])
+        if isinstance(i, dict) and i.get("zone") and i.get("table")
+    ]
+    if tables:
+        return tables
+    if p.get("source"):
+        return [str(p["source"])]
     zone = defn.get("sourceZone") or p.get("sourceZone") or p.get("source_zone") or ""
     table = defn.get("sourceTable") or p.get("sourceTable") or p.get("source_table") or ""
     if zone and table:
-        return f"{zone}.{table}"
-    return ""
+        return [f"{zone}.{table}"]
+    return []
 
 
 def _pipeline_tenant(p: dict[str, Any]) -> str | None:
@@ -1559,7 +1464,7 @@ def build_authored_lag_sensors(
             # two unassigned pipelines never share a lag sensor.
             if curr_tenant is None:
                 continue
-            curr_source = _pipeline_source(curr)
+            curr_sources = _pipeline_sources(curr)
             curr_deps = set(_pipeline_depends_on(curr))
             for other_p, other_j in pipeline_jobs:
                 other_id = other_p.get("id", "")
@@ -1571,7 +1476,9 @@ def build_authored_lag_sensors(
                 if _pipeline_tenant(other_p) != curr_tenant:
                     continue
                 other_target = _pipeline_target(other_p)
-                if (other_target and other_target == curr_source) or (other_id in curr_deps):
+                if (other_target and other_target in curr_sources) or (
+                    other_id in curr_deps
+                ):
                     visited_ids.add(other_id)
                     queue.append(other_p)
 

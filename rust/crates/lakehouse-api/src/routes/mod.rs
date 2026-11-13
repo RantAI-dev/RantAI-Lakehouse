@@ -79,6 +79,7 @@ mod notifications;
 mod ops;
 mod overview;
 pub(crate) mod params;
+mod pipeline_preview;
 mod pipelines;
 mod quality;
 mod quality_anomaly;
@@ -223,8 +224,11 @@ const PDF_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 + 70 + 10);
 /// | route                          | TS `maxDuration` |
 /// |---------------------------------|------------------|
 /// | `/api/ai/chat`                  | 120              |
+/// | `/api/ai/tool`                  | 60 (review round 1 R3: the longest configured limit + 15, like a save — the assistant's confirmed saves run under the limit here, see [`deadline_for`]) |
 /// | `/api/alerts/run`               | 60               |
 /// | `/api/query/run`                | 60 (BI-5: the longest configured limit + 15, see [`deadline_for`]) |
+/// | `/api/dashboard/specs`, `/api/dashboard/specs/preview` | 60 (BI-45: the longest configured limit + 15, see [`deadline_for`]) |
+/// | `/api/dashboard/sources/preview` | 60 (BI-45: twice the longest configured limit + 15, see [`deadline_for`]) |
 /// | board routes (`/api/dashboard`, `/api/embed/*`, `/api/public/dashboard/*`, `/api/render/data`) | 60 (BI-5: an outer cap of 35 minutes, see [`deadline_for`]) |
 /// | `/api/query/run/{id}/download`   | no TS handler (QS-2: an outer cap of 35 minutes, see [`crate::query_limits::BOARD_DEADLINE_CAP`]) |
 /// | everything else (no export)     | [`DEFAULT_REQUEST_TIMEOUT`] (60) |
@@ -266,8 +270,28 @@ fn route_timeout(path: &str) -> Duration {
 
 /// The routes whose queries run under the administrator's time limit
 /// (`BI-5`): their deadline follows the limit instead of the fixed 60 s.
+///
+/// `BI-45` (QA `LH-BI-5-01`): saving a chart and previewing one run its
+/// statement under the limit too, so these three join it — without that, the
+/// fixed 60-second deadline fires before the default limit can be reported.
+/// `GET`/`DELETE` on `/api/dashboard/specs` share the path and so the bound;
+/// they send no long statement, so the longer bound changes nothing for them.
+///
+/// `/api/ai/tool` joins them (`BI-45` review round 1, R3): the assistant drafts
+/// `create_chart`, `update_chart`, `format_chart` and `move_chart`, and the
+/// Confirm button executes the draft through this route, which awaits
+/// `tools::run_tool` in the request task. With the fixed 60-second deadline the
+/// default limit (60 s) could never be reported there: the engine answered
+/// `TIMEOUT_EXCEEDED` after the route had already ended in "request timeout",
+/// and the tool's `{ "error": <sentence>, "limit": … }` never reached the
+/// model or the person.
 fn limit_bearing(path: &str) -> bool {
-    path == "/api/query/run" || is_board_path(path)
+    path == "/api/query/run"
+        || path == "/api/dashboard/specs"
+        || path == "/api/dashboard/specs/preview"
+        || path == "/api/dashboard/sources/preview"
+        || path == "/api/ai/tool"
+        || is_board_path(path)
 }
 
 /// The routes that answer a whole board: tiles run six at a time, so one can
@@ -296,9 +320,20 @@ fn is_board_path(path: &str) -> bool {
 /// middleware gives `/api/query/run` the limit plus 15 s, and a board route
 /// the 35-minute cap as an outer bound, leaving the handler's own deadline
 /// (`query_limits::board_deadline`) the one that decides.
+///
+/// `BI-45` (QA `LH-BI-5-01`): the SQL source preview runs its source TWICE
+/// with a chart — the row read, then the chart's own statement — so its
+/// deadline is twice the longest limit plus the margin; with one limit it
+/// would cut the second statement before the limit could be reported.
+///
+/// `BI-45` review round 1 R3: `/api/ai/tool` takes the same limit plus margin
+/// as a save, because the assistant's confirmed saves run there.
 fn deadline_for(path: &str, longest: Option<Duration>) -> Duration {
     match longest {
         Some(_) if is_board_path(path) => crate::query_limits::BOARD_DEADLINE_CAP,
+        Some(longest) if path == "/api/dashboard/sources/preview" => longest
+            .saturating_mul(2)
+            .saturating_add(crate::query_limits::DEADLINE_MARGIN),
         Some(longest) if limit_bearing(path) => {
             longest.saturating_add(crate::query_limits::DEADLINE_MARGIN)
         }
@@ -371,18 +406,34 @@ fn chat_timeout_from(raw: Option<&str>) -> Duration {
 /// No `#[must_use]` here: `axum::Router` is already `#[must_use]`, and
 /// repeating the attribute without a message trips
 /// `clippy::double_must_use`.
-/// `POST /api/pipelines/runnable/{id}/enforce` (BLD-1 / D3), the rewrite
-/// the orchestrator asks for before it runs a pipeline's `SELECT`.
+/// `POST /api/pipelines/runnable/{id}/compile` (BLD-1 part 1 / D8), the one
+/// statement the orchestrator runs for a pipeline, compiled from its stored
+/// definition and rewritten as its author.
 ///
 /// Its own function for the same reason [`pipelines_router`] is: so the
 /// route can be added without pushing that function over
 /// `clippy::too_many_lines`. It merges straight back in, through
 /// [`authored_pipelines_router`], and carries no middleware or state of
 /// its own.
-fn pipeline_enforce_router() -> Router<AppState> {
+fn pipeline_compile_router() -> Router<AppState> {
     Router::new().route(
-        "/api/pipelines/runnable/{id}/enforce",
-        axum::routing::post(authored_pipelines::enforce_pipeline_sql),
+        "/api/pipelines/runnable/{id}/compile",
+        axum::routing::post(authored_pipelines::compile_pipeline),
+    )
+}
+
+/// `POST /api/pipelines/preview` (BLD-1 part 1 / D16): the first rows of one
+/// input or step of a definition that is not saved yet.
+///
+/// Its own function for the same reason [`pipeline_compile_router`] is: so the
+/// route can be added without pushing [`pipelines_router`] over
+/// `clippy::too_many_lines`. It merges straight back in and carries no
+/// middleware or state of its own. Static, like `generate`, so axum never
+/// reads it as `/api/pipelines/{id}`.
+fn pipeline_preview_router() -> Router<AppState> {
+    Router::new().route(
+        "/api/pipelines/preview",
+        axum::routing::post(pipeline_preview::preview),
     )
 }
 
@@ -394,7 +445,7 @@ fn pipeline_enforce_router() -> Router<AppState> {
 /// [`crate::policy`], and keeping them together makes that pairing the
 /// thing a reader sees first.
 fn authored_pipelines_router() -> Router<AppState> {
-    pipeline_enforce_router().route("/api/pipelines/runnable", get(authored_pipelines::runnable))
+    pipeline_compile_router().route("/api/pipelines/runnable", get(authored_pipelines::runnable))
 }
 
 /// The `/api/pipelines/*` sub-router (Task 2.5), split out of [`router`]
@@ -410,6 +461,10 @@ fn pipelines_router() -> Router<AppState> {
             "/api/pipelines/generate",
             axum::routing::post(pipelines::generate),
         )
+        // BLD-1 part 1 / D16: the preview of one input or step of a definition
+        // that is not saved yet. Static, like `generate`, so it is never read
+        // as `/api/pipelines/{id}`.
+        .merge(pipeline_preview_router())
         // Static, so it is matched ahead of `/api/pipelines/{id}`.
         .merge(authored_pipelines_router())
         .route(
@@ -2070,6 +2125,35 @@ mod tests {
         assert_eq!(
             deadline_for("/api/query/run", longest),
             Duration::from_secs(315)
+        );
+        // BI-45: the console's save and both previews wait for the limit.
+        for path in ["/api/dashboard/specs", "/api/dashboard/specs/preview"] {
+            assert_eq!(
+                deadline_for(path, longest),
+                Duration::from_secs(315),
+                "{path}"
+            );
+            assert_eq!(deadline_for(path, None), route_timeout(path), "{path}");
+        }
+        // BI-45 review round 1 R3: the assistant's confirmed save runs here,
+        // so it waits on its statement's limit too.
+        assert_eq!(
+            deadline_for("/api/ai/tool", longest),
+            Duration::from_secs(315)
+        );
+        assert_eq!(
+            deadline_for("/api/ai/tool", None),
+            route_timeout("/api/ai/tool")
+        );
+        // Twice the limit: the source preview runs its source again for the
+        // chart.
+        assert_eq!(
+            deadline_for("/api/dashboard/sources/preview", longest),
+            Duration::from_secs(615)
+        );
+        assert_eq!(
+            deadline_for("/api/dashboard/sources/preview", None),
+            route_timeout("/api/dashboard/sources/preview")
         );
         for board in [
             "/api/dashboard",

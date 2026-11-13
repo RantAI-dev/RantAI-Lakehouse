@@ -186,7 +186,7 @@ describe("a refused dashboard write is an error, not a success (BI-18 part C rev
       expect((err as ServiceError).code).toBe("permission_denied")
       // The page shows the readable sentence: the code is for the log.
       expect(readableErrorMessage((err as ServiceError).message)).toBe(
-        "This account does not have permission. Ask a workspace admin.",
+        "You don't have access. This needs the dashboard:write permission.",
       )
     })
   }
@@ -284,6 +284,14 @@ describe("the chart builder's write and read (WEB-7 D6)", () => {
     await clickhouseDashboardService.saveChart({ id: "c1", title: "Visitors" }, true)
     expect(calls[1].init.method).toBe("PUT")
     expect(sent(calls[1])).toEqual({ id: "c1", title: "Visitors" })
+  })
+
+  /** `BI-48`: the tile's Duplicate places the copy by the id the create answers. */
+  it("returns the new chart's id, and an empty id when the answer carries none", async () => {
+    stubFetch(() => json({ ok: true, chart: { id: "c_new" } }))
+    expect(await clickhouseDashboardService.saveChart({ title: "T", kind: "bar" }, false)).toEqual({ id: "c_new" })
+    stubFetch(() => json({ ok: true }))
+    expect(await clickhouseDashboardService.saveChart({ title: "T", kind: "bar" }, false)).toEqual({ id: "" })
   })
 
   it("throws the server's own sentence when the save is refused", async () => {

@@ -77,9 +77,15 @@ impl QueryBuilder<Ready> {
         let key = self
             .grain
             .map_or_else(|| dim.to_string(), |(g, ws)| g.order_key(dim.as_str(), ws));
-        let latest = self
-            .grain
-            .is_some_and(|(g, _)| grain::cuts_to_latest(g, &self.order));
+        // `BI-46` (plan D12; QA `LH-BI-6-01`): with a breakdown the limit is
+        // the breakdown's, so a grained chart keeps every bucket and no rank
+        // cut is applied. A table calculation gets no breakdown cap either, so
+        // its windows still run over the whole grouped result.
+        let cap_keeps_every_bucket = self.cap_breakdown && self.grain.is_some();
+        let latest = !cap_keeps_every_bucket
+            && self
+                .grain
+                .is_some_and(|(g, _)| grain::cuts_to_latest(g, &self.order));
         let keep = self.limit + u32::from(latest);
         let is_calc = |m: &Measure| calcs.iter().any(|c| c.name == m.column.as_str());
 
@@ -174,8 +180,13 @@ impl QueryBuilder<Ready> {
                 "join_use_nulls = 1",
             ],
         );
+        let kept = if cap_keeps_every_bucket {
+            String::new()
+        } else {
+            format!("WHERE __rk <= {keep} ")
+        };
         Some(format!(
-            "SELECT {head}, {all_names} FROM ({ranked}) WHERE __rk <= {keep} ORDER BY {order}{settings}"
+            "SELECT {head}, {all_names} FROM ({ranked}) {kept}ORDER BY {order}{settings}"
         ))
     }
 

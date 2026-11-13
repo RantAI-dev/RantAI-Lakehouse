@@ -129,6 +129,17 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "_for_author(",
         "query-author exception, assistant paths only: the model is shown the trimmed engine diagnosis to correct its SQL",
     ),
+    // BLD-1 part 1 / D16 and the spec's rule 7: a preview reports an error the
+    // way `POST /api/query/run` reports one for the same SQL. The person
+    // previewing is the one who wrote the step's SQL, so the engine's trimmed
+    // diagnosis of it is theirs — the same exception Query Studio has, through
+    // the same function (`upstream_error::ch_failure_for_author`), never a
+    // second classification.
+    (
+        "pipeline_preview.rs",
+        "_for_author(",
+        "BLD-1 part 1 D16 / spec rule 7: the caller wrote the previewed step's SQL, so the engine's trimmed diagnosis is theirs — the same query-author exception as Query Studio, through the same function",
+    ),
     (
         "query.rs",
         ".map_err(|err| err.to_string())?;",
@@ -183,6 +194,13 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "the tenant gate's own fixed sentence (SEC-20's 404 or D6's 422), written in this repository",
     ),
     (
+        // `BI-45` (QA `LH-BI-5-01`): the assistant's reply for a save the gate
+        // refused. The same gate error `run_spec_sql` shows in its tile above.
+        "support.rs",
+        "SpecRunFailure::Gated(err) => json!({ \"error\": err.to_string() }),",
+        "the tenant gate's own fixed sentence (SEC-20's 404 or D6's 422), written in this repository",
+    ),
+    (
         "quality.rs",
         "Invalid request body: {err}",
         "serde error over the caller's own request body",
@@ -203,11 +221,6 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     // Our own validators: the text is written in this repository.
     (
         "authored_pipelines.rs",
-        "invalid transform at transforms[{index}]: {err}",
-        "transform_grammar's own validation message",
-    ),
-    (
-        "pipelines.rs",
         "invalid transform at transforms[{index}]: {err}",
         "transform_grammar's own validation message",
     ),

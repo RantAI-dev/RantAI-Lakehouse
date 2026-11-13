@@ -610,6 +610,17 @@ describe("UploadFilePage, first step", () => {
     expect(alert.textContent).toBe("You do not have permission to do this.")
     expect(next().disabled).toBe(true)
   })
+
+  // QA TC-1734 F1, LH-DATA-17-05, LH-DATA-18-03 (WEB-11): the row showed
+  // "permission_denied: connector:manage".
+  it("shows a refused file in words that name the permission, not the API's code", async () => {
+    stubFetch({ session: () => json({ error: "permission_denied: connector:manage" }, 403) })
+    render(<UploadFilePage lookupDelayMs={0} />)
+    chooseFile(CSV())
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toBe("You don't have access. This needs the connector:manage permission.")
+    expect(next().disabled).toBe(true)
+  })
 })
 
 describe("UploadFilePage, Check step", () => {
@@ -1572,6 +1583,25 @@ describe("UploadFilePage, after Load", () => {
     expect(open?.getAttribute("href")).toBe("/data/assets/stock")
   })
 
+  // QA `LH-DATA-14-05` (`DATA-54`): the on-load checks start when the
+  // orchestrator reports the finished run, not when the load ends.
+  it("says when on-load checks run once the load has finished", async () => {
+    await review({
+      get: (n) => (n === 1 ? upload() : { ...started, status: "ingested", rows: 1234, assetId: "stock" }),
+      ingest: json({ upload: started, runId: "run-1" }),
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Load" }))
+    await screen.findByText("Load finished")
+    const paragraph = screen.getByText(/^Quality checks set to run on every load/)
+    expect(paragraph.textContent).toContain(
+      "Their results are on the table's Quality tab."
+    )
+    // Review round 1 R4: the sentence names no time. Nothing in this
+    // repository bounds when the orchestrator reports a load, so a promise
+    // here would be one the code does not keep.
+    expect(paragraph.textContent).not.toMatch(/minute|second/)
+  })
+
   it("offers no action while loading, and Upload another file after a failure goes back to an empty first step", async () => {
     await review({
       get: (n) => (n === 1 ? upload() : n === 2 ? started : { ...started, status: "failed", error: "The load into the table failed." }),
@@ -1583,6 +1613,9 @@ describe("UploadFilePage, after Load", () => {
     expect(screen.queryByRole("button", { name: "Try again" })).toBeNull()
 
     await screen.findByText("Load failed")
+    // QA `LH-DATA-14-05` (`DATA-54`): a load that did not finish says nothing
+    // about the checks that would follow it.
+    expect(screen.queryByText(/^Quality checks set to run/)).toBeNull()
     expect(screen.getByText("The load into bronze.stock failed.")).toBeDefined()
     expect(screen.getByText("The load into the table failed.")).toBeDefined()
     expect(screen.getByRole("button", { name: "Try again" })).toBeDefined()

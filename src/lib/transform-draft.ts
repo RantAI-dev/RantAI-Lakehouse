@@ -40,6 +40,41 @@ export type TransformDraft =
   | { verb: "cast"; column: string; type: CastType }
   | { verb: "select"; columns: string }
 
+/** The five verbs `transform_grammar.rs::parse_transform` accepts — nothing else is offered. */
+export const TRANSFORM_VERBS: TransformDraft["verb"][] = ["dedupe", "filter", "rename", "cast", "select"]
+
+/** A draft of `verb` with nothing filled in yet. */
+export function emptyDraftFor(verb: TransformDraft["verb"]): TransformDraft {
+  switch (verb) {
+    case "dedupe":
+      return { verb: "dedupe", key: "" }
+    case "filter":
+      return { verb: "filter", column: "", operator: FILTER_OPERATORS[0], value: "" }
+    case "rename":
+      return { verb: "rename", from: "", to: "" }
+    case "cast":
+      return { verb: "cast", column: "", type: CAST_TYPES[0] }
+    case "select":
+      return { verb: "select", columns: "" }
+  }
+}
+
+/** A draft is only addable once its own required fields are non-blank — never sent to the server half-filled. */
+export function draftIsComplete(draft: TransformDraft): boolean {
+  switch (draft.verb) {
+    case "dedupe":
+      return draft.key.trim().length > 0
+    case "filter":
+      return draft.column.trim().length > 0 && draft.value.trim().length > 0
+    case "rename":
+      return draft.from.trim().length > 0 && draft.to.trim().length > 0
+    case "cast":
+      return draft.column.trim().length > 0
+    case "select":
+      return draft.columns.trim().length > 0
+  }
+}
+
 /**
  * Renders a draft into the exact grammar string
  * `transform_grammar::parse_transform` accepts for that verb. Every
@@ -60,22 +95,6 @@ export function renderTransformDraft(draft: TransformDraft): string {
     case "select":
       return `select(${draft.columns})`
   }
-}
-
-/**
- * Extracts the failing row index from a `POST /api/pipelines` 400 body's
- * `error` message, which `routes/pipelines.rs::create` always shapes as
- * `"invalid transform at transforms[<index>]: <reason>"` (see
- * `rust/crates/lakehouse-api/src/routes/pipelines.rs`, the
- * `parse_transform` validation loop). Returns `null` when the message
- * does not name a `transforms[N]` index — a different validation failure,
- * or a non-validation error (network, 500, etc.) — so the caller can fall
- * back to a generic, page-level error instead of guessing a row.
- */
-export function transformErrorRowIndex(message: string): number | null {
-  const match = /transforms\[(\d+)\]/.exec(message)
-  if (!match) return null
-  return Number(match[1])
 }
 
 /**
@@ -107,41 +126,5 @@ export function describeTransform(
       return { verb, detail: args.split(",").map((s) => s.trim()).join(", ") }
     case "filter":
       return { verb, detail: args }
-  }
-}
-
-/**
- * The inverse of `renderTransformDraft`: a stored transform string back to
- * the draft the editor shows, so an existing pipeline can be edited in the
- * same form it was created in. `null` for a string outside the five shapes
- * `renderTransformDraft` produces; the server's grammar is the same set,
- * so a stored transform always parses.
- */
-export function parseTransformDraft(raw: string): TransformDraft | null {
-  const match = /^\s*(dedupe|filter|rename|cast|select)\((.*)\)\s*$/.exec(raw)
-  if (!match) return null
-  const args = match[2].trim()
-  switch (match[1]) {
-    case "dedupe":
-      return args ? { verb: "dedupe", key: args } : null
-    case "select":
-      return args ? { verb: "select", columns: args } : null
-    case "rename": {
-      const [from, to, extra] = args.split(",").map((s) => s.trim())
-      return from && to && extra === undefined ? { verb: "rename", from, to } : null
-    }
-    case "cast": {
-      const [column, type, extra] = args.split(",").map((s) => s.trim())
-      const castType = CAST_TYPES.find((t) => t === type)
-      return column && castType && extra === undefined ? { verb: "cast", column, type: castType } : null
-    }
-    case "filter": {
-      // Longest operators first, so `>=` is not read as `>`.
-      const f = /^(\w+)\s*(!=|<=|>=|=|<|>)\s*'(.*)'$/.exec(args)
-      const operator = FILTER_OPERATORS.find((op) => op === f?.[2])
-      return f && operator ? { verb: "filter", column: f[1], operator, value: f[3] } : null
-    }
-    default:
-      return null
   }
 }

@@ -36,6 +36,37 @@
 //!   count). A calculated aggregate has no such total, so it cannot rank a
 //!   chart with a breakdown (refused when the chart is saved).
 //!
+//! # The breakdown's own limit (`BI-46`)
+//!
+//! QA `LH-BI-6-01`: on a bar, hbar, line or area chart with a breakdown the
+//! limit keeps the N breakdown values with the largest total of the chart's
+//! measure over the chart's filtered rows; every other breakdown value is left
+//! out (plan D12). [`QueryBuilder::with_breakdown_cap`] adds that as one more
+//! `WHERE` clause — `(isNull({b}), ifNull(toString({b}), '')) IN (SELECT
+//! isNull({b}), ifNull(toString({b}), '') FROM <relation> [WHERE the same rows]
+//! GROUP BY {b} ORDER BY <the measure> DESC, {b} LIMIT N)` — so the cap ranks
+//! over the same filtered rows as the statement it sits in, and the
+//! dimension's own top N is untouched when the dimension has no grain. With a
+//! time grain the limit is the breakdown's: the dimension keeps every bucket
+//! and the cap is the only cut. A chart whose measure is a table calculation
+//! gets no cap (its windows run over the whole grouped result); heatmap,
+//! sankey and sunburst keep their statements, because there the second column
+//! is an axis, a target or a ring, not a series.
+//!
+//! The key is a `(isNull, toString)` pair rather than the bare column
+//! (`QA LH-BI-6-01` review round 1, R1): `ClickHouse` answers `NULL IN (<set>)`
+//! with false unless `transform_null_in` is set, and nothing in this
+//! repository sets it, so a bare `{b} IN (…)` silently dropped every row
+//! whose breakdown value is NULL — a nullable mart column, a left-joined
+//! column (`Relation::Joined` reads with `join_use_nulls = 1`) or a bucket of a
+//! NULL date. The pair keeps the NULL series and cannot merge it with an empty
+//! string. Measured on `clickhouse/clickhouse-server:26.8` (the version
+//! `docker-compose.yml` pins) by `lakehouse-api`'s
+//! `tests/breakdown_cap.rs`: with rows `(NULL, 100), (x, 50), (y, 30), ('',
+//! 7)`, the bare form returned three of four series at `LIMIT 20` and none at
+//! `LIMIT 1` when NULL was the largest; the pair returned all four, and only
+//! the NULL series at `LIMIT 1`.
+//!
 //! # Safety of the SQL
 //!
 //! Every name is a validated [`Ident`] or a fixed alias, every aggregate a
@@ -45,6 +76,7 @@
 
 use super::{Measure, QueryBuilder, Ready};
 use crate::specs::Aggregate;
+use lakehouse_core::ident::Ident;
 
 /// What the groups are ranked by.
 enum Target<'a> {
@@ -52,6 +84,23 @@ enum Target<'a> {
     Dimension,
     /// A measure, by position.
     Measure(usize, &'a Measure),
+}
+
+/// The comparison key of the breakdown cap, on both sides of `IN` (`QA
+/// LH-BI-6-01` review round 1, R1): whether the value is NULL and its text, so
+/// a NULL breakdown value is its own key (a bare `NULL IN (<set>)` is false in
+/// `ClickHouse` unless `transform_null_in` is set) and an empty string is not
+/// merged with it.
+fn cap_key(breakdown: &Ident) -> String {
+    format!("(isNull({breakdown}), ifNull(toString({breakdown}), ''))")
+}
+
+/// What a built statement's breakdown cap starts with, on the left of `IN`
+/// (`QA LH-BI-6-01` review round 1, R4). [`super::statement_caps_breakdown`]
+/// reads it out of a statement, so the recognizer and the clause share one
+/// spelling.
+pub(super) fn cap_clause_start(breakdown: &Ident) -> String {
+    format!("{} IN (SELECT", cap_key(breakdown))
 }
 
 impl QueryBuilder<Ready> {
@@ -153,13 +202,20 @@ impl QueryBuilder<Ready> {
              ORDER BY {rank} {dir}, {dimension} LIMIT {}",
             self.limit
         );
-        let guard = if self.where_clauses.is_empty() {
+        let clauses = self.where_clauses.join(" AND ");
+        // `BI-46` (plan D12): with a breakdown the limit is the breakdown's,
+        // so a grained chart keeps every dimension value and the guard is the
+        // chart's plain `WHERE` (the cap included, when there is one).
+        let guard = if self.cap_breakdown && self.grain.is_some() {
+            if clauses.is_empty() {
+                String::new()
+            } else {
+                format!("WHERE {clauses}")
+            }
+        } else if clauses.is_empty() {
             format!("WHERE {dimension} IN ({kept})")
         } else {
-            format!(
-                "WHERE {} AND {dimension} IN ({kept})",
-                self.where_clauses.join(" AND ")
-            )
+            format!("WHERE {clauses} AND {dimension} IN ({kept})")
         };
         format!(
             "SELECT {dimension}, {breakdown}, {renamed} FROM \
@@ -170,6 +226,57 @@ impl QueryBuilder<Ready> {
             inner = self.inner_measures(),
             settings = self.from.settings(),
         )
+    }
+
+    /// The `WHERE` clause that keeps the N breakdown values with the largest
+    /// total of the first measure (`BI-46`, plan D12; QA `LH-BI-6-01`), over
+    /// the rows the chart's own `WHERE` clauses leave — `None` when the chart
+    /// has no breakdown, applies steps or groups by several columns, has no
+    /// measure, or that measure is a table calculation (whose windows run over
+    /// the whole grouped result).
+    ///
+    /// "Largest" is always the largest: the subquery orders descending even on
+    /// a chart sorted ascending, because the limit counts the biggest values.
+    ///
+    /// The comparison key is [`cap_key`] on both sides rather than the bare
+    /// column (`QA LH-BI-6-01` review round 1, R1): `ClickHouse` answers
+    /// `NULL IN (<set>)` with false unless `transform_null_in` is set, so a
+    /// bare `b IN (…)` dropped every row whose breakdown value is NULL, on
+    /// every bar, hbar, line and area chart. The module comment names the
+    /// measurement.
+    pub(super) fn breakdown_cap(&self) -> Option<String> {
+        let breakdown = self.breakdown.as_ref()?;
+        if self.steps.is_some() || !self.groupings.is_empty() {
+            return None;
+        }
+        let measure = self.measures.first()?;
+        if self.from.table_calc(measure.column.as_str()).is_some() {
+            return None;
+        }
+        let rank = self.rank_expr(measure);
+        Some(format!(
+            "{} IN (SELECT isNull({breakdown}), ifNull(toString({breakdown}), '') \
+             FROM {from}{where_sql} \
+             GROUP BY {breakdown} ORDER BY {rank} DESC, {breakdown} LIMIT {limit})",
+            cap_key(breakdown),
+            from = self.from.render(),
+            where_sql = self.where_sql(),
+            limit = self.limit,
+        ))
+    }
+
+    /// Keep the N breakdown values with the largest total (`BI-46`, plan D12):
+    /// `cap_breakdown` is true when the chart has a breakdown (so a grained
+    /// chart keeps every bucket), and the cap itself becomes one more `WHERE`
+    /// clause. An empty `breakdown_cap` (a table calculation) still sets the
+    /// flag: the limit is the breakdown's, there is just no cap to apply.
+    #[must_use]
+    pub(crate) fn with_breakdown_cap(mut self) -> Self {
+        self.cap_breakdown = self.breakdown.is_some();
+        if let Some(cap) = self.breakdown_cap() {
+            self.where_clauses.push(cap);
+        }
+        self
     }
 
     /// The top or bottom N groups of the dimension and one `Other` group over

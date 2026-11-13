@@ -2458,14 +2458,45 @@ shows the gate's 404. With the setting set, the members of that tenant
 read the shared catalog as before, and the other tenants read only their
 own uploads. A **single-tenant** deployment is unaffected either way.
 
+### How an authored pipeline gets its SQL (`BLD-1` part 1)
+
+The orchestrator no longer builds a pipeline's statement. On a run it posts
+neither SQL nor a body to `POST /api/pipelines/runnable/{id}/compile`, and
+the API compiles the stored definition (its named inputs and steps) and
+rewrites the result as the pipeline's author — the same masking and row
+filters every other surface gets. The answer is
+`{"sql": "...", "readsIceberg": <bool>}`; `readsIceberg` is true exactly
+when an input is Bronze, and the orchestrator attaches
+`allow_database_iceberg = 1` to every statement that reads it.
+
+The answer says which of these it is, and the orchestrator treats all three
+as final (no retry):
+
+| Status | Meaning | Message |
+| --- | --- | --- |
+| 409 | no author, an author who is no longer active, or a pipeline with no tenant | a fixed sentence saying which |
+| 404 | a table whose roles do not include it (`GOV-7`) — the same answer Query Studio gives | the SEC-20 sentence |
+| 422 | the stored definition no longer compiles, or the rewrite refused it | starts with `inputs[i]: ` or `steps[i]: ` — the item at fault — then fixed text |
+
+A 422 is also what a **save** or a **restore** answers for the same reasons,
+with the same `inputs[i]`/`steps[i]` prefix, so a definition that could never
+run is refused where a person can fix it. An outage at save keeps its own
+status (a 503 or 500), never a 422.
+
+`ICEBERG_QUERY_DB` must be set on `lakehouse-api`: compiling a Bronze input
+names the catalog database through it, and a deployment without it refuses a
+Bronze pipeline when it is saved. The orchestrator (`dagster-code-location`)
+no longer needs the variable — it runs the statement the API returns and
+attaches `allow_database_iceberg` from the answer's `readsIceberg`.
+
 ### Authored pipelines with no tenant (`SEC-50`)
 
 Migration `0042_tenant_provisioning.sql` added `tenant_id` to
 `pipeline_definition` and **backfilled nothing**: every pipeline created
 before that migration has a NULL tenant, and so has every pipeline an
 operator created without a tenant. `SEC-50` refuses such a pipeline — its
-enforce call (`POST /api/pipelines/runnable/{id}/enforce`, the one the
-orchestrator makes) answers **409** with:
+compile call (`POST /api/pipelines/runnable/{id}/compile`, the one the
+orchestrator makes to get the SQL it runs) answers **409** with:
 
 ```
 This pipeline belongs to no tenant. An administrator assigns one with PUT /api/pipelines/{id}/tenant.

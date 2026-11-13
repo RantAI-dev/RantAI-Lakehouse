@@ -81,9 +81,12 @@ function stubReads(rules: AlertRule[] = []) {
   spyOn(connectorService, "listConnectors").mockResolvedValue([])
   spyOn(metricService, "list").mockResolvedValue([])
   // WEB-8 D8: the table pickers read the catalog.
+  // Shaped like the API's list rows (`DATA-54`): a Silver row's `id` is its
+  // table key; a Bronze row's `id` is a registry slug and its table is named
+  // by `tableKey`.
   spyOn(assetService, "listAssets").mockResolvedValue([
-    { id: "a-orders", name: "orders", namespace: "silver" },
-    { id: "a-raw", name: "raw_orders", namespace: "bronze" },
+    { id: "silver.orders", name: "Orders", namespace: "silver" },
+    { id: "raw-orders", name: "Raw Orders", namespace: "primer", tableKey: "bronze.raw_orders" },
   ] as never)
 }
 
@@ -337,7 +340,7 @@ describe("a refusal on the alert rule page (LH-SRC-7-10)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Create" }))
 
     expect(
-      await screen.findByText("This account does not have permission. Ask a workspace admin.")
+      await screen.findByText("You don't have access. This needs the alert:write permission.")
     ).toBeTruthy()
     expect(document.body.textContent).not.toMatch(/permission_denied/)
   })

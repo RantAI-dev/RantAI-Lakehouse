@@ -58,6 +58,7 @@ export function ZoneField({
   onChange,
   zones,
   note,
+  describedBy,
 }: {
   id: string
   label: string
@@ -67,12 +68,20 @@ export function ZoneField({
   zones: string[] | null
   /** Shown under the field when there is no list: why, and that typing is allowed. */
   note?: string
+  /** The id of a sentence about this field, when the page has one (BLD-1 part 1 S3 review R1-S10). */
+  describedBy?: string
 }) {
   if (zones === null) {
     return (
       <div className="space-y-1.5">
         <Label htmlFor={id}>{label}</Label>
-        <Input id={id} value={value} onChange={(e) => onChange(e.target.value)} />
+        <Input
+          id={id}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          aria-invalid={describedBy ? true : undefined}
+          aria-describedby={describedBy}
+        />
         {note ? <p className="text-xs text-muted-foreground">{note}</p> : null}
       </div>
     )
@@ -89,7 +98,13 @@ export function ZoneField({
     <div className="space-y-1.5">
       <Label htmlFor={id}>{label}</Label>
       <Select items={labels} value={value} onValueChange={(next) => onChange(next ?? "")}>
-        <SelectTrigger id={id} aria-label={label} className="w-full">
+        <SelectTrigger
+          id={id}
+          aria-label={label}
+          aria-invalid={describedBy ? true : undefined}
+          aria-describedby={describedBy}
+          className="w-full"
+        >
           <SelectValue placeholder="Pick a namespace" />
         </SelectTrigger>
         <SelectContent>
@@ -107,8 +122,9 @@ export function ZoneField({
 /**
  * One column: a `Select` over the source table's schema when the table is
  * known, and the same text input as before when it is not (`columns ===
- * null`). `label` is also the control's accessible name, because the form's
- * `Field` wrapper has no `htmlFor` of its own.
+ * null`). `label` is also the control's accessible name: a call site may
+ * pass no `id`, and then the `Label` names no control (BLD-1 part 1 S3
+ * review R1-S8).
  */
 export function ColumnField({
   id,

@@ -538,6 +538,11 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/pipelines",                        Policy::RequiresPermission("pipeline:read")),
     ("POST", "/api/pipelines",                        Policy::RequiresPermission("pipeline:write")),
     ("POST", "/api/pipelines/generate",               Policy::RequiresPermission("pipeline:write")),
+    // BLD-1 part 1 / D16: the first rows of one input or step of a definition
+    // that is not saved yet. `pipeline:write`, because it is the editor's own
+    // preview and not a read of a stored pipeline; nothing is stored, and the
+    // statement runs as the CALLER (decision 13), never as a pipeline's author.
+    ("POST", "/api/pipelines/preview",                Policy::RequiresPermission("pipeline:write")),
     ("GET",  "/api/pipelines/{id}",                    Policy::RequiresPermission("pipeline:read")),
     ("PUT",  "/api/pipelines/{id}",                    Policy::RequiresPermission("pipeline:write")),
     ("PUT",  "/api/pipelines/{id}/target-lag",         Policy::RequiresPermission("pipeline:write")),
@@ -562,7 +567,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // this route reveals how a governed table rewrites for any pipeline in
     // any tenant, so it cannot be reachable by someone who merely holds
     // `pipeline:read`.
-    ("POST", "/api/pipelines/runnable/{id}/enforce",   Policy::RequiresPermission("pipeline:read")),
+    ("POST", "/api/pipelines/runnable/{id}/compile",   Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/source",             Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/runs",              Policy::RequiresPermission("pipeline:read")),
     // Plan 1c (R2, day-1): runs × steps matrix for the recovery UI.

@@ -23,6 +23,7 @@
 //! create a non-active record with today's schema.
 
 use axum::extract::{Path, State};
+use lakehouse_auth::Principal;
 use serde_json::{Map, Value, json};
 
 use super::{api_result_to_value, arg_str, response_to_value};
@@ -148,7 +149,17 @@ pub(super) async fn draft_classification_rule(
     .await
 }
 
-pub(super) async fn draft_quality_rule(state: &AppState, args: &Map<String, Value>) -> Value {
+/// `draft_quality_rule` creates the rule through the console's own handler, as
+/// the person behind the chat: the table they may not read is refused exactly
+/// as the form refuses it, and a table that is not there is refused too
+/// (QA `LH-DATA-14-01` F2, `DATA-54`; review round 1 R1). With no signed-in
+/// person (a headless run) there is nobody to narrow by, and `TableAccess`
+/// documents that such a call is not narrowed.
+pub(super) async fn draft_quality_rule(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let name = arg_str(args, "name");
     if name.is_empty() {
         return json!({ "error": "name is required" });
@@ -161,6 +172,10 @@ pub(super) async fn draft_quality_rule(state: &AppState, args: &Map<String, Valu
     api_result_to_value(
         crate::routes::governance::create_quality_rule(
             State(state.clone()),
+            principal,
+            // The tool has no request headers of its own, so the tenant rule
+            // reads the person's own tenant (`tenant_scope::resolve`).
+            &axum::http::HeaderMap::new(),
             axum::body::Bytes::from(bytes),
         )
         .await,
@@ -201,7 +216,7 @@ mod tests {
             json!({ "error": "asset is required" })
         );
         assert_eq!(
-            draft_quality_rule(&s, &Map::new()).await,
+            draft_quality_rule(&s, None, &Map::new()).await,
             json!({ "error": "name is required" })
         );
     }
