@@ -515,7 +515,7 @@ impl LakekeeperAdminClient {
     }
 
     /// Drops the table `namespace`.`table` in `warehouse_id` through the
-    /// Iceberg REST catalog (`DATA-55` D2/D3).
+    /// Iceberg REST catalog (`DATA-55` D2/D3; QA `LH-DATA-15-06`, `TC-1731`).
     ///
     /// This is the catalog's drop, sent as the admin principal — the identity
     /// that also undrops a table, so "who drops is who undrops" (D3). On a

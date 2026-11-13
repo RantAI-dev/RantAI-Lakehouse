@@ -419,7 +419,7 @@ pub async fn restore(
     let Some(warehouse) = warehouse else {
         return Err(ApiError::Unavailable(UNREACHABLE.to_owned()).into());
     };
-    let job = Restore {
+    let job = RestoreJob {
         state,
         pool,
         principal,
@@ -447,7 +447,7 @@ pub async fn restore(
 
 /// The audited half of a restore: the `allowed` entry, the undrop, the record's
 /// end and the closing entry, in ONE spawned task (`DATA-55` review R1).
-struct Restore {
+struct RestoreJob {
     /// The app state the table's presence is checked through.
     state: AppState,
     /// The database the record and the audit trail live in.
@@ -468,7 +468,7 @@ struct Restore {
     expires_at: String,
 }
 
-impl Restore {
+impl RestoreJob {
     /// Undrop the table and answer `{ "ok": true }`.
     ///
     /// Every catalog call in here has a bound of its own ([`UNDROP_TIMEOUT`]
@@ -479,8 +479,9 @@ impl Restore {
     ///
     /// # Errors
     ///
-    /// `409` when the catalog refuses the undrop, `503` when it cannot be
-    /// asked, and the store's error when the record cannot be cleared.
+    /// `409` when the catalog refuses the undrop, `503` when it cannot be asked
+    /// or when the `allowed` entry cannot be written. The record's clearing is
+    /// best effort: a failure is logged, never an error of this function.
     async fn run(&self) -> Result<Value, ApiError> {
         // `DATA-55` D8 (QA `LH-DATA-15-06`, `TC-1731`): the `allowed`
         // entry first, or the restore does not happen.

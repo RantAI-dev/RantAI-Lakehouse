@@ -100,6 +100,7 @@ reported, not quietly lowered.
 - The row count in the confirmation is counted at that moment and can take up to 30 seconds on a large table; when it cannot be counted the dialog says so.
 - Dropping needs the restore to be configured on the install (the catalog's admin token). Without it nothing can be dropped.
 - Re-running an old file load from the Pipelines page is not stopped by a drop: it can load into a dropped table's name during the 7 days, after which that dropped table can no longer be restored. To be closed in its own item. *(proposed, not yet signed)*
+- If the catalog does not answer a drop, the table stays marked as dropped until the product can tell: for up to two minutes a table that was not dropped can read as dropped, and a load into its name is refused. A drop the catalog applies later than that is not recorded. *(proposed, not yet signed)*
 
 ## Spec rows
 

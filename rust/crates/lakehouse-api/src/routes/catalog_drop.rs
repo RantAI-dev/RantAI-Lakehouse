@@ -41,8 +41,10 @@
 //! nobody knows keeps it, so the name stays closed and a table that was dropped
 //! is not mistaken for one that is absent; and a record that cannot be written
 //! leaves the `allowed` entry and its `failed` ending, never an entry with no
-//! ending (review R7). A record is believed only while the table is absent
-//! ([`dropped_now`]), so a stale one cannot close a live table's name.
+//! ending (review R7). A record is believed while the table is absent, and a
+//! record for a table that is there is healed only once it is too old for its
+//! drop to still be in flight ([`dropped_now`], [`HEAL_GRACE`]), so a stale one
+//! cannot close a live table's name and a fresh one cannot be lost.
 //!
 //! # What never happens
 //!
@@ -117,10 +119,12 @@ const INTERRUPTED: &str = "The drop did not finish, so it is not known whether t
 /// Two minutes covers all of it.
 pub(super) const HEAL_GRACE: i64 = 120;
 
-/// The bound on asking the catalog once more what happened (`DATA-55` review
-/// R2): the deleted-tabulars list, and the table's own presence. Ten seconds is
-/// a lookup, not a scan, and it keeps a hanging catalog from turning the
-/// unknown answer into a late one.
+/// The bound on each of the two checks the unknown outcome makes (`DATA-55`
+/// review R2): the deleted-tabulars list, and the table's own presence. Ten
+/// seconds is a lookup, not a scan. Every catalog call inside the drop's or the
+/// restore's spawned task is bounded by one of these or by the client's own
+/// bound on its request (`DATA-55` review S2), so a hanging catalog cannot
+/// leave an `allowed` entry with no ending.
 pub(super) const OUTCOME_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// D4, answered before anything is written: may this table be dropped, and by
@@ -306,10 +310,11 @@ pub struct DropQuery {
 /// # Errors
 ///
 /// `400` for an over-long id; `404` when no dataset has that slug or the
-/// caller's roles may not read it; `503` when the store or the pool cannot be
-/// reached. A caller outside the tenant that owns the shared catalog is NOT an
-/// error here: the answer is `200` with `supported: false` and the gate's
-/// reason ([`super::catalog::catalog_tenant_refusal`]).
+/// caller's roles may not read it; `500` with the store's own `database error`
+/// when the record cannot be read; `503` when no database pool is configured
+/// ([`annotation_pool`]). A caller outside the tenant that owns the shared
+/// catalog is NOT an error here: the answer is `200` with `supported: false`
+/// and the gate's reason ([`super::catalog::catalog_tenant_refusal`]).
 pub async fn status(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -422,9 +427,10 @@ pub(super) async fn audit_after(pool: &PgPool, event: NewAuditEvent) {
 /// no dataset has that slug or the caller's roles may not read it; `409` when
 /// D4 refuses the table, when a drop is already on record, when a load started
 /// into it after the checks, or when the catalog has no such table or refused
-/// the drop; `503` when the keep cannot be confirmed, the catalog cannot be
-/// reached, the audit entry cannot be written, or the outcome is not known;
-/// `500` when the store fails or the drop's own task did not finish.
+/// the drop; `503` when dropping is not set up ([`NOT_SET_UP`]), the keep cannot
+/// be confirmed, the catalog cannot be reached, the audit entry cannot be
+/// written, or the outcome is not known; `500` when the store fails or the
+/// drop's own task did not finish.
 pub async fn drop_table(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -486,7 +492,7 @@ pub async fn drop_table(
         );
         return Err(ApiError::Internal("drop retention is out of range".to_owned()).into());
     };
-    let job = Drop {
+    let job = DropJob {
         state,
         pool,
         principal,
@@ -514,7 +520,7 @@ pub async fn drop_table(
 
 /// The audited half of a drop: the `allowed` entry, the record, the catalog's
 /// answer and the closing entry, in ONE spawned task (`DATA-55` review R1).
-struct Drop {
+struct DropJob {
     /// The app state the load check settles through.
     state: AppState,
     /// The database the record and the audit trail live in.
@@ -537,7 +543,7 @@ struct Drop {
     kept_seconds: i64,
 }
 
-impl Drop {
+impl DropJob {
     /// Run the audited half of the drop and answer with the body of a drop the
     /// catalog made.
     ///
@@ -812,9 +818,10 @@ fn drop_answer(
 ///
 /// # Errors
 ///
-/// `503` when the pool or the store cannot be reached. A caller outside the
-/// tenant that owns the shared catalog is NOT an error here: the answer is
-/// `200` with `supported: false`, the gate's reason and no tables.
+/// `500` with the store's own `database error` when the list cannot be read;
+/// `503` when no database pool is configured ([`annotation_pool`]). A caller
+/// outside the tenant that owns the shared catalog is NOT an error here: the
+/// answer is `200` with `supported: false`, the gate's reason and no tables.
 pub async fn list(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,

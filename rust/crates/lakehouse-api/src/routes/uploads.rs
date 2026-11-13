@@ -2927,11 +2927,12 @@ async fn launch(
             ApiError::Unavailable(LAUNCH_UNREACHABLE.to_owned())
         }
     };
-    if let Err(err) =
-        uploads::mark_finished(pool, &claimed.id, None, Some(COULD_NOT_START), None).await
-    {
-        tracing::warn!(%err, upload_id = %claimed.id, "a claim that could not be launched could not be settled");
-    }
+    settle_claim_failed(
+        pool,
+        claimed,
+        "a claim that could not be launched could not be settled",
+    )
+    .await;
     Err(failure)
 }
 
@@ -3117,6 +3118,18 @@ async fn claim_load(
             .into());
         }
     })
+}
+
+/// Settle a claim that will not be launched as failed, the one way every
+/// refusal after [`claim_load`] does (`DATA-55` review S9): the row must not sit
+/// at `ingesting` with no run. Best effort — a failure is logged with the
+/// caller's own words, and the caller's refusal is the answer either way.
+async fn settle_claim_failed(pool: &PgPool, claimed: &Upload, why: &'static str) {
+    if let Err(err) =
+        uploads::mark_finished(pool, &claimed.id, None, Some(COULD_NOT_START), None).await
+    {
+        tracing::warn!(%err, upload_id = %claimed.id, "{why}");
+    }
 }
 
 /// The folder a load puts its files in (`DATA-35` decision 2, plan AD-4): the one
@@ -3384,21 +3397,23 @@ pub async fn ingest(
     match super::catalog_drop::dropped_now(&state, pool, &request.table).await {
         Ok(false) => {}
         Ok(true) => {
-            if let Err(err) =
-                uploads::mark_finished(pool, &claimed.id, None, Some(COULD_NOT_START), None).await
-            {
-                tracing::warn!(%err, upload_id = %claimed.id, "a claim refused for a dropped table could not be settled");
-            }
+            settle_claim_failed(
+                pool,
+                &claimed,
+                "a claim refused for a dropped table could not be settled",
+            )
+            .await;
             return Err(ApiError::Conflict(TABLE_DROPPED.to_owned()).into());
         }
         Err(err) => {
             // The record could not be read: whether the name is dropped is not
             // known, so the load must not start — and must not stay loading.
-            if let Err(err) =
-                uploads::mark_finished(pool, &claimed.id, None, Some(COULD_NOT_START), None).await
-            {
-                tracing::warn!(%err, upload_id = %claimed.id, "a claim that could not be checked could not be settled");
-            }
+            settle_claim_failed(
+                pool,
+                &claimed,
+                "a claim that could not be checked could not be settled",
+            )
+            .await;
             return Err(err.into());
         }
     }
