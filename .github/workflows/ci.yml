@@ -72,11 +72,18 @@ jobs:
       stack: ${{ steps.scope.outputs.stack }}
       docs_only: ${{ steps.scope.outputs.docs_only }}
       all: ${{ steps.scope.outputs.all }}
+      # OPS-24 D8, R4: `push_full` is the scope script's own answer to "is the
+      # kill switch on for this push?". The workflow never compares
+      # `CI_PUSH_FULL` itself, so an expression's case-insensitive `==` cannot
+      # call `TRUE` on when the script calls it off.
+      push_full: ${{ steps.scope.outputs.push_full }}
       # OPS-24 D4/D8: `proven` is true only for a push whose own `ci-required`
       # run repeated a passed pull request, and only while the kill switch is
-      # unset. Anything else -- another event, an error, an empty answer -- is
-      # `false`, so the jobs run.
-      proven: ${{ (github.event_name == 'push' && vars.CI_PUSH_FULL != 'true' && steps.proof.outputs.proven == 'true') && 'true' || 'false' }}
+      # unset. The proof script returns `false` on every other event, and R4
+      # makes the off switch the scope script's output, so neither half is a
+      # second expression here. Anything else -- an error, an empty answer --
+      # is `false`, so the jobs run.
+      proven: ${{ (steps.scope.outputs.push_full != 'true' && steps.proof.outputs.proven == 'true') && 'true' || 'false' }}
       proven_by: ${{ steps.proof.outputs.proven_by }}
       proven_pr: ${{ steps.proof.outputs.proven_pr }}
       proof_reason: ${{ steps.proof.outputs.reason }}
@@ -99,8 +106,10 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-          # OPS-24 D8: the kill switch. `CI_PUSH_FULL=true` makes every push
-          # run everything again, from the next push, with no code change.
+          # OPS-24 D8: the kill switch, passed through raw. Exactly `true`
+          # (lower case) makes every push run everything again, from the next
+          # push, with no code change; the script, not an expression, is where
+          # that is compared (R4).
           FORCE_ALL: ${{ vars.CI_PUSH_FULL }}
         run: ./scripts/ci/detect_change_scope.sh
 
@@ -185,6 +194,14 @@ jobs:
       # task's own commit body.
       - name: Check compose init-container readiness (WS0)
         run: python3 ops/lint/check_compose_init_readiness.py
+
+      # OPS-24 R5: a file Rust compiles in with `include_str!`/`include_bytes!`
+      # is part of the Rust build even when it sits outside `rust/`, so a change
+      # to it must set the `rust` scope or the only jobs that compile it are
+      # skipped. The check reads the sources and asks the real scope script, so
+      # it fails when a new such path is added and the scope is not widened.
+      - name: Check every file compiled into Rust from outside rust/ sets the rust scope (OPS-24)
+        run: python3 ops/lint/check_rust_embedded_paths.py
 
       # A dangling `from dispar_orchestrate.X import Y` is an ImportError at
       # code-location load, which takes down EVERY job in the location — the
@@ -605,14 +622,17 @@ jobs:
       # axllent/mailpit:v1.33.0 (`lakehouse-api/tests/email_settings_route.rs:52-53`).
       # A tag that drifts only loses the retry: the test still pulls its own.
       # The step ends with `docker images`, so it cannot fail the job.
+      # OPS-24 R12: each attempt is bounded by `timeout 180` (a pull that hangs
+      # would otherwise hold the job for its 30-minute limit), and the last
+      # attempt is not followed by a sleep nothing waits for.
       - name: Pull the test images (the pull is retried, a test never is)
         if: needs.changes.outputs.proven != 'true'
         run: |
           for image in postgres:16-alpine clickhouse/clickhouse-server:26.8 axllent/mailpit:v1.33.0; do
             for attempt in 1 2 3; do
-              if docker pull --quiet "$image"; then break; fi
+              if timeout 180 docker pull --quiet "$image"; then break; fi
               echo "pull of $image failed (attempt $attempt of 3)"
-              sleep $((attempt * 10))
+              if [ "$attempt" -lt 3 ]; then sleep $((attempt * 10)); fi
             done
           done
           docker images --format '{{.Repository}}:{{.Tag}}' | sort

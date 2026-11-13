@@ -37,29 +37,42 @@ ROOT="$(mktemp -d)"
 trap 'rm -rf "$ROOT"' EXIT
 REPO_DIR="$ROOT/repo"
 FAKE_BIN="$ROOT/bin"
-mkdir -p "$REPO_DIR" "$FAKE_BIN"
+GH_DIR="$ROOT/gh"
+mkdir -p "$REPO_DIR" "$FAKE_BIN" "$GH_DIR"
 
 GH_MARKER="$ROOT/gh.calls"
-GH_RC="$ROOT/gh.rc"
-PULLS_JSON="$ROOT/pulls.json"
-CHECK_RUNS="$ROOT/check_runs.json"
+PULLS_JSON="$GH_DIR/pulls.json"
+CHECK_RUNS="$GH_DIR/checks.json"
+# A per-endpoint exit code (R7): `<endpoint>.rc`, and `0` means "answer from
+# `<endpoint>.json`". The endpoints are `pulls` and `checks`.
+GH_RC="$GH_DIR/checks.rc"
+PULLS_RC="$GH_DIR/pulls.rc"
 OUTPUT_FILE="$ROOT/github_output"
-export GH_MARKER GH_RC PULLS_JSON CHECK_RUNS
+export GH_MARKER GH_DIR
 
-# The fake `gh`: record the call, honour an exit code the case asked for, then
-# answer the two endpoints the script uses from the fixture files.
+# The fake `gh`: record the call, honour that endpoint's exit code, then answer
+# it from that endpoint's fixture file. An endpoint it has no answer for fails
+# instead of guessing.
 cat > "$FAKE_BIN/gh" <<'EOF'
 #!/usr/bin/env bash
 echo "$*" >> "$GH_MARKER"
-if [ -f "$GH_RC" ]; then
-  exit "$(cat "$GH_RC")"
-fi
+endpoint="other"
 for arg in "$@"; do
   case "$arg" in
-    */pulls*) cat "$PULLS_JSON"; exit 0 ;;
-    */check-runs*) cat "$CHECK_RUNS"; exit 0 ;;
+    */pulls*) endpoint="pulls" ;;
+    */check-runs*) endpoint="checks" ;;
   esac
 done
+if [ -f "$GH_DIR/$endpoint.rc" ]; then
+  rc="$(cat "$GH_DIR/$endpoint.rc")"
+  if [ "$rc" != "0" ]; then
+    exit "$rc"
+  fi
+fi
+if [ -f "$GH_DIR/$endpoint.json" ]; then
+  cat "$GH_DIR/$endpoint.json"
+  exit 0
+fi
 exit 1
 EOF
 chmod +x "$FAKE_BIN/gh"
@@ -168,8 +181,56 @@ with open(out, "w") as f:
 PY
 }
 
+# write_two_pulls <merge_sha_a> <head_sha_a> <merge_sha_b> <head_sha_b>: two
+# merged pull requests on `main`, the way a cherry-pick can leave things.
+write_two_pulls() {
+  python3 - "$PULLS_JSON" "$@" <<'PY'
+import json, sys
+
+out = sys.argv[1]
+entries = []
+for number, (merge_sha, head_sha) in enumerate(zip(sys.argv[2::2], sys.argv[3::2]), start=1):
+    entries.append({
+        "number": number,
+        "merge_commit_sha": merge_sha,
+        "head": {"sha": head_sha},
+        "base": {"ref": "main"},
+        "merged_at": "2026-11-13T09:00:00Z",
+    })
+with open(out, "w") as f:
+    json.dump(entries, f)
+PY
+}
+
 write_no_pulls() {
   printf '[]\n' > "$PULLS_JSON"
+}
+
+# append_check_runs_page <spec>…: one more page, after the one write_check_runs
+# wrote. `gh api --paginate` prints one JSON document per page, one after the
+# other, and the script slurps them together.
+append_check_runs_page() {
+  SECOND_PAGE="$ROOT/second_page.json"
+  python3 - "$SECOND_PAGE" "$@" <<'PY'
+import json, sys
+
+out = sys.argv[1]
+runs = []
+for i, spec in enumerate(sys.argv[2:], start=1):
+    name, conclusion, status, completed_at, suite, app = spec.split("|")
+    runs.append({
+        "id": 2000 + i,
+        "name": name,
+        "status": status,
+        "conclusion": conclusion or None,
+        "completed_at": completed_at or None,
+        "app": {"slug": app},
+        "check_suite": {"id": int(suite)},
+    })
+with open(out, "w") as f:
+    json.dump({"total_count": len(runs), "check_runs": runs}, f)
+PY
+  cat "$SECOND_PAGE" >> "$CHECK_RUNS"
 }
 
 rust_run() { echo "Rust · fmt|$1|${2:-completed}|${3:-2026-11-13T10:00:00Z}|${4:-77}|github-actions"; }
@@ -177,12 +238,13 @@ acc_run() { echo "Images · build lakehouse-api + dagster once|$1|${2:-completed
 gate_run() { echo "ci-required|$1|${2:-completed}|${3:-2026-11-13T10:10:00Z}|${4:-77}|${5:-github-actions}"; }
 
 # ── Runner ──────────────────────────────────────────────────────────────────
+# CASE_CWD moves the case into another checkout (the shallow clone, below).
 run_proof() {
   : > "$GH_MARKER"
   : > "$OUTPUT_FILE"
   PROOF_RC=0
   PROOF_OUT="$(
-    cd "$REPO_DIR"
+    cd "${CASE_CWD:-$REPO_DIR}"
     EVENT_NAME="${CASE_EVENT:-push}" \
     PUSH_SHA="${CASE_SHA:-$H_MERGE}" \
     REPO="${CASE_REPO:-example-org/example-repo}" \
@@ -278,6 +340,41 @@ write_check_runs "$(rust_run success)" "$(acc_run success)" \
 assert_proof "a ci-required made by another app than GitHub Actions is not proven" \
   "false" "" "" "called" "no ci-required check run on the pull-request head"
 
+# OPS-24 R6b: a tie on `completed_at` between a success and a failure is not
+# proven. The failure is listed first so that a `sort_by(...) | last` -- the
+# previous filter -- would have answered "proven".
+write_check_runs "$(rust_run success)" "$(acc_run success)" \
+  "$(gate_run failure completed 2026-11-13T10:10:00Z)" \
+  "$(gate_run success completed 2026-11-13T10:10:00Z)"
+assert_proof "a tie on completed_at between a failure and a success is not proven" \
+  "false" "" "" "called" "finished at the same time"
+
+# OPS-24 R6a: a conclusion is not one of GitHub's known values, and it holds a
+# line break. It is reported as `unknown`, and every line of $GITHUB_OUTPUT
+# stays KEY=VALUE.
+write_check_runs "$(rust_run success)" "$(acc_run success)" \
+  "$(gate_run "$(printf 'fail\nure')")"
+assert_proof "a conclusion holding a line break is reported as unknown" \
+  "false" "" "" "called" "ended unknown"
+if ! grep -qv '^[A-Za-z_][A-Za-z0-9_]*=' "$OUTPUT_FILE" \
+   && [ "$(grep -c '^reason=' "$OUTPUT_FILE")" = "1" ]; then
+  log_pass "a conclusion holding a line break leaves the output file one KEY=VALUE per line"
+else
+  log_fail "a conclusion holding a line break broke the KEY=VALUE shape of the output file"
+fi
+
+# OPS-24 R7: a ci-required that GitHub has queued has not completed, and a
+# second page of check runs is read like the first.
+write_check_runs "$(rust_run success)" "$(acc_run success)" "$(gate_run "" queued "")"
+assert_proof "a queued ci-required on the head is not proven" \
+  "false" "" "" "called" "has not completed"
+
+write_check_runs "$(rust_run success)" "$(acc_run success)" \
+  "$(gate_run success completed 2026-11-13T10:00:00Z)"
+append_check_runs_page "$(gate_run failure completed 2026-11-13T10:10:00Z)"
+assert_proof "a newer failure on the second page of check runs is not proven" \
+  "false" "" "" "called" "the latest ci-required on the pull-request head ended failure"
+
 # 10-13. The group each push needs has to have run in that suite.
 write_check_runs "$(acc_run success)" "$(gate_run success)"
 assert_proof "a Rust scope with the Rust group skipped on the head is not proven" \
@@ -338,9 +435,65 @@ write_no_pulls
 CASE_SHA="$H_SQUASH" assert_proof "a squash with no pull request at all is not proven" \
   "false" "" "" "called" "no merged pull request has this commit as its merge commit"
 
+# OPS-24 R7: the pull-request API's error paths, one at a time.
+write_check_runs "$(rust_run success)" "$(acc_run success)" "$(gate_run success)"
+write_pull "$H_SQUASH" "$P_SHA" main 7 "2026-11-13T09:00:00Z"
+echo 1 > "$PULLS_RC"
+CASE_SHA="$H_SQUASH" assert_proof "a failing pull-request API is not proven and the script still exits 0" \
+  "false" "" "" "called" "the GitHub API could not be asked for the pull requests"
+rm -f "$PULLS_RC"
+
+echo 124 > "$PULLS_RC"
+CASE_SHA="$H_SQUASH" assert_proof "a pull-request API call that timed out is not proven" \
+  "false" "" "" "called" "did not answer within 60 seconds"
+rm -f "$PULLS_RC"
+
+printf 'this is not json\n' > "$PULLS_JSON"
+CASE_SHA="$H_SQUASH" assert_proof "a pull-request body that is not JSON is not proven" \
+  "false" "" "" "called" "not JSON this script can read"
+
+write_two_pulls "$H_SQUASH" "$P_SHA" "$H_SQUASH" "$P_SHA"
+CASE_SHA="$H_SQUASH" assert_proof "two merged pull requests naming one commit are not proven" \
+  "false" "" "" "called" "more than one merged pull request names this commit"
+
+# A pull request merged into `main` but with `merged_at: null` is not merged.
+write_pull "$H_SQUASH" "$P_SHA" main 7 "null"
+CASE_SHA="$H_SQUASH" assert_proof "a pull request whose merged_at is null is not proven" \
+  "false" "" "" "called" "no merged pull request has this commit as its merge commit"
+
+# A head that the API names but the checkout cannot fetch.
+write_pull "$H_SQUASH" "$P_SHA" main 7 "2026-11-13T09:00:00Z"
+git -C "$REPO_DIR" update-ref -d refs/pull/7/head
+CASE_SHA="$H_SQUASH" assert_proof "a pull-request head that cannot be fetched is not proven" \
+  "false" "" "" "called" "the pull request's head could not be fetched"
+git -C "$REPO_DIR" update-ref refs/pull/7/head "$P_SHA"
+
 # 22. Input validation, before any API call.
 CASE_SHA="not-a-sha" assert_proof "a malformed PUSH_SHA is not proven" \
   "false" "" "" "not called" "not a 40-hex-digit SHA"
+
+# 23. A commit with three parents (an octopus merge) is neither shape this
+# script reads, and it asks the API nothing.
+H_THREE="$(git -C "$REPO_DIR" commit-tree \
+  "$(git -C "$REPO_DIR" rev-parse m0^{tree})" \
+  -p "$M0_SHA" -p "$P_SHA" -p "$M1_SHA" -m "H_three")"
+CASE_SHA="$H_THREE" assert_proof "a commit with three parents is not proven and gh is never called" \
+  "false" "" "" "not called" "not a merge commit with one or two parents"
+
+# 24. A shallow clone has the pushed commit but not its parents, so it cannot
+# decide and says "not proven" (R7).
+SHALLOW="$ROOT/shallow"
+git init -q -b main "$SHALLOW"
+git -C "$SHALLOW" remote add origin "file://$REPO_DIR"
+if git -C "$SHALLOW" fetch -q --depth 1 origin "$H_MERGE" 2>/dev/null \
+   && git -C "$SHALLOW" rev-parse -q --verify FETCH_HEAD >/dev/null 2>&1; then
+  SHALLOW_SHA="$(git -C "$SHALLOW" rev-parse FETCH_HEAD)"
+  CASE_CWD="$SHALLOW" CASE_SHA="$SHALLOW_SHA" assert_proof \
+    "a shallow clone cannot read the pushed commit's parents and is not proven" \
+    "false" "" "" "not called" "not a merge commit with one or two parents"
+else
+  log_fail "a shallow clone case could not be built (fetch --depth 1 failed)"
+fi
 
 # ── Consistency: the two sentinels equal the job names in ci.yml ─────────────
 test_consistency() {
@@ -380,15 +533,22 @@ else
   log_fail "a sentinel does not equal the fmt or images job name in ci.yml"
 fi
 
-(
-  tmp_proof="$ROOT/proof-renamed.sh"
+# A copy whose Rust sentinel no longer matches the job name has to be refused by
+# that same check. OPS-24 R2: the block reports through its exit status, so the
+# counters are incremented outside it -- as a subshell it printed FAIL and the
+# suite still counted 0 failed.
+test_renamed_sentinel() {
+  local tmp_proof="$ROOT/proof-renamed.sh"
   sed 's/^RUST_SENTINEL=".*"/RUST_SENTINEL="Rust · renamed"/' "$SCRIPT" > "$tmp_proof"
-  if ! test_consistency "$tmp_proof" "$CI_YML" >/dev/null 2>&1; then
-    log_pass "the consistency check fails when a sentinel no longer matches its job name"
-  else
-    log_fail "the consistency check passed with a renamed sentinel"
-  fi
-)
+  [ -s "$tmp_proof" ] || return 1
+  ! test_consistency "$tmp_proof" "$CI_YML" >/dev/null 2>&1
+}
+
+if test_renamed_sentinel; then
+  log_pass "the consistency check fails when a sentinel no longer matches its job name"
+else
+  log_fail "the consistency check passed with a renamed sentinel"
+fi
 
 echo "=== Results: $PASS passed, $FAIL failed ==="
 if [ "$FAIL" -gt 0 ]; then

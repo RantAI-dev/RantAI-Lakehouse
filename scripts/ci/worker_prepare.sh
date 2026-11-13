@@ -39,6 +39,14 @@ if [ -z "$RUNNER" ]; then
   echo "::error::RUNNER_NAME is empty; the cache needs one directory per runner registration"
   exit 1
 fi
+# OPS-24 R9: `.` and `..` survive the alphabet below and would name the cache
+# root or its parent, which stage 2 may remove. Refuse them by name.
+case "$RUNNER" in
+  . | ..)
+    echo "::error::RUNNER_NAME is '${RUNNER}': it names a directory, not a runner registration"
+    exit 1
+    ;;
+esac
 
 # One directory per registration: two registrations never build in the same
 # directory, and cargo's own lock on the shared ~/.cargo registry covers the
@@ -49,10 +57,19 @@ dir="${root}/target/${name}"
 mkdir -p "$dir"
 
 limit_gb=40
-if [[ "${TARGET_MAX_GB:-}" =~ ^[0-9]+$ ]]; then
-  candidate=$((10#${TARGET_MAX_GB}))
-  if [ "$candidate" -ge 5 ] && [ "$candidate" -le 500 ]; then
-    limit_gb="$candidate"
+if [ -n "${TARGET_MAX_GB:-}" ]; then
+  candidate_ok="false"
+  if [[ "$TARGET_MAX_GB" =~ ^[0-9]+$ ]]; then
+    candidate=$((10#${TARGET_MAX_GB}))
+    if [ "$candidate" -ge 5 ] && [ "$candidate" -le 500 ]; then
+      limit_gb="$candidate"
+      candidate_ok="true"
+    fi
+  fi
+  # OPS-24 R9: a value that is set but outside 5 to 500 is a mistake in the
+  # repository variable, and silently using 40 hides it.
+  if [ "$candidate_ok" != "true" ]; then
+    echo "::warning::TARGET_MAX_GB='${TARGET_MAX_GB}' is not a number from 5 to 500; using ${limit_gb} GiB"
   fi
 fi
 limit_kb=$((limit_gb * 1024 * 1024))
@@ -66,18 +83,18 @@ if [ "$used_kb" -gt "$limit_kb" ]; then
   used_kb="$(du -sk "$dir" | awk '{print $1}')"
   echo "worker cache: ${used_kb} KiB after stage 1"
   if [ "$used_kb" -gt "$limit_kb" ]; then
-    case "$dir" in
-      "${root}/target/"*)
-        echo "::warning::worker cache: still over the limit; stage 2 removes ${dir} and recreates it"
-        rm -rf -- "$dir"
-        mkdir -p "$dir"
-        echo "worker cache: ${dir} was recreated empty"
-        ;;
-      *)
-        echo "::error::refusing to remove ${dir}: it is not under ${root}/target/"
-        exit 1
-        ;;
-    esac
+    # OPS-24 R9: the previous guard compared `$dir` against a prefix it had
+    # just been built from, so it could never fail. These two checks can: the
+    # directory must sit directly in the cache root's `target/`, and it must
+    # not be a symlink pointing somewhere else.
+    if [ "$(dirname -- "$dir")" != "${root}/target" ] || [ -L "$dir" ]; then
+      echo "::error::refusing to remove ${dir}: it is not a plain directory directly under ${root}/target/"
+      exit 1
+    fi
+    echo "::warning::worker cache: still over the limit; stage 2 removes ${dir} and recreates it"
+    rm -rf -- "$dir"
+    mkdir -p "$dir"
+    echo "worker cache: ${dir} was recreated empty"
   fi
 fi
 

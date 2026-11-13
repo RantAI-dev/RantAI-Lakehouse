@@ -44,9 +44,11 @@ assert_runner() {
   : > "$OUTPUT_FILE"
   local rc=0
   (
-    EVENT_NAME="${CASE_EVENT:-push}" \
+    EVENT_NAME="${CASE_EVENT-push}" \
     REPO="${CASE_REPO-example-org/example-repo}" \
     HEAD_REPO="${CASE_HEAD_REPO-}" \
+    REF="${CASE_REF-}" \
+    REQUIRE_REF="${CASE_REQUIRE_REF-}" \
     SWITCH="${CASE_SWITCH-}" \
     OUTPUT_NAME=compile_runner \
     GITHUB_OUTPUT="$OUTPUT_FILE" \
@@ -80,6 +82,22 @@ CASE_EVENT=schedule CASE_SWITCH=true assert_runner "the switch on a scheduled ru
 CASE_EVENT=workflow_dispatch CASE_SWITCH=true \
   assert_runner "the switch on a manual run gives the worker" "$WORKER"
 
+# OPS-24 R8: only those four events. Anything else -- `pull_request_target`, an
+# empty event -- keeps the hosted runner, whatever the switch says.
+CASE_EVENT=pull_request_target CASE_HEAD_REPO=someone-else/fork CASE_SWITCH=true \
+  assert_runner "the switch on with a pull_request_target from a fork gives a hosted runner" "$HOSTED"
+CASE_EVENT= CASE_SWITCH=true \
+  assert_runner "the switch on with an empty event gives a hosted runner" "$HOSTED"
+
+# OPS-24 R10: coverage.yml passes REQUIRE_REF=refs/heads/main, so a manual run
+# of another branch stays hosted even with the switch on.
+CASE_EVENT=workflow_dispatch CASE_REF=refs/heads/main CASE_REQUIRE_REF=refs/heads/main CASE_SWITCH=true \
+  assert_runner "a require-ref equal to the ref gives the worker" "$WORKER"
+CASE_EVENT=workflow_dispatch CASE_REF=refs/heads/topic CASE_REQUIRE_REF=refs/heads/main CASE_SWITCH=true \
+  assert_runner "a manual run of another branch gives a hosted runner" "$HOSTED"
+CASE_EVENT=push CASE_REF=refs/heads/main CASE_REQUIRE_REF=refs/heads/main CASE_SWITCH=true \
+  assert_runner "a push to main with the main requirement gives the worker" "$WORKER"
+
 # Anything but the exact string `true` keeps the hosted runner.
 CASE_EVENT=push CASE_SWITCH=TRUE assert_runner "TRUE gives a hosted runner" "$HOSTED"
 CASE_EVENT=push CASE_SWITCH=1 assert_runner "1 gives a hosted runner" "$HOSTED"
@@ -101,9 +119,13 @@ fi
 #   (a) its first step refuses a self-hosted runner that is not the CI worker;
 #   (b) every step that runs `sudo` or `prune`, and every `Swatinem/rust-cache`
 #       step, is guarded to a hosted runner;
-#   (c) a workflow that names `lakehouse-ci` has no `pull_request` trigger.
+#   (c) a workflow that names `lakehouse-ci` has no `pull_request` trigger;
+#   (d) a step under `always()` also names a step whose `outcome` is
+#       `success` (OPS-24 R1): a clean-up under `always()` runs on a failed or
+#       skipped job too, and must not act on state it never observed.
 workflow_lint() {
   python3 - "$@" <<'PY'
+import re
 import sys
 
 import yaml
@@ -136,6 +158,14 @@ for path in sys.argv[1:]:
             guarded = "sudo" in run or "prune" in run or "Swatinem/rust-cache" in uses
             if guarded and "runner.environment == 'github-hosted'" not in str(step.get("if", "")):
                 problems.append("%s:%s: step %d (%r) needs if: runner.environment == 'github-hosted'"
+                                % (path, name, index, step.get("name")))
+            # (d) OPS-24 R1: `always()` reaches a job that failed or was
+            # skipped, so the step must say which step it needs to have
+            # succeeded; without that it would act on state nobody observed.
+            condition = str(step.get("if", ""))
+            if "always()" in condition and not re.search(
+                    r"steps\.[A-Za-z0-9_-]+\.outcome\s*==\s*'success'", condition):
+                problems.append("%s:%s: step %d (%r) runs under always() without a steps.<id>.outcome == 'success' condition"
                                 % (path, name, index, step.get("name")))
 
     triggers = doc.get("on")
@@ -217,6 +247,27 @@ if ! workflow_lint "$copy" >/dev/null 2>&1; then
   log_pass "the lint fails when a workflow with a pull_request trigger names lakehouse-ci"
 else
   log_fail "the lint passed with lakehouse-ci named in a pull_request workflow"
+fi
+
+# Negative (d), OPS-24 R1: the Coverage clean-up back under a bare `always()`.
+copy="$ROOT/coverage-cleanup-always.yml"
+python3 - "$COVERAGE_YML" "$copy" <<'PY'
+import sys
+
+import yaml
+
+with open(sys.argv[1]) as f:
+    coverage = yaml.safe_load(f)
+for step in coverage["jobs"]["coverage"]["steps"]:
+    if step.get("name") == "Remove the containers this job started (worker only)":
+        step["if"] = "always() && runner.environment == 'self-hosted'"
+with open(sys.argv[2], "w") as f:
+    yaml.dump(coverage, f)
+PY
+if ! workflow_lint "$copy" >/dev/null 2>&1; then
+  log_pass "the lint fails when a clean-up under always() names no step that succeeded"
+else
+  log_fail "the lint passed with a clean-up under always() and no steps.<id>.outcome condition"
 fi
 
 echo "=== Results: $PASS passed, $FAIL failed ==="

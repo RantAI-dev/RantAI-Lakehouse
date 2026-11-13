@@ -108,6 +108,28 @@ else
   log_fail "an empty runner name did not fail (exit=$rc)"
 fi
 
+# OPS-24 R9: `.` and `..` survive the name's alphabet and would name the cache
+# root or its parent, so each is refused before any directory is used.
+set_case dot
+CASE_NAME="."
+rc=0
+run_prepare || rc=$?
+if [ "$rc" = "1" ] && grep -q '::error::' "$LOG"; then
+  log_pass "a runner name of . fails"
+else
+  log_fail "a runner name of . did not fail (exit=$rc)"
+fi
+
+set_case dotdot
+CASE_NAME=".."
+rc=0
+run_prepare || rc=$?
+if [ "$rc" = "1" ] && grep -q '::error::' "$LOG"; then
+  log_pass "a runner name of .. fails"
+else
+  log_fail "a runner name of .. did not fail (exit=$rc)"
+fi
+
 # 4. Under the limit nothing is deleted.
 set_case under
 CASE_MAX=5
@@ -157,13 +179,25 @@ else
   log_fail "could not allocate the 5.3 GiB test file (neither fallocate nor dd worked)"
 fi
 
-# 7. A limit that is not a number in range falls back to 40 GiB.
+# 7. A limit that is not a number in range falls back to 40 GiB, and says so
+# (OPS-24 R9: a value that is set but outside 5 to 500 is a warning, not
+# silence).
 set_case defaultlimit
 CASE_MAX=abc
-if run_prepare && grep -q 'limit 41943040 KiB (40 GiB)' "$LOG"; then
-  log_pass "TARGET_MAX_GB=abc uses 40 GiB"
+if run_prepare && grep -q 'limit 41943040 KiB (40 GiB)' "$LOG" \
+   && grep -q "::warning::TARGET_MAX_GB='abc'" "$LOG"; then
+  log_pass "TARGET_MAX_GB=abc uses 40 GiB and warns"
 else
-  log_fail "TARGET_MAX_GB=abc did not use 40 GiB"
+  log_fail "TARGET_MAX_GB=abc did not use 40 GiB or did not warn"
+fi
+
+set_case out_of_range
+CASE_MAX=999
+if run_prepare && grep -q 'limit 41943040 KiB (40 GiB)' "$LOG" \
+   && grep -q "::warning::TARGET_MAX_GB='999'" "$LOG"; then
+  log_pass "TARGET_MAX_GB=999 uses 40 GiB and warns"
+else
+  log_fail "TARGET_MAX_GB=999 did not use 40 GiB or did not warn"
 fi
 
 # 8. CARGO_BUILD_JOBS is exported only for a number in range.

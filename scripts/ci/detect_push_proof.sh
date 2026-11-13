@@ -23,7 +23,9 @@
 #
 # Anything else is "not proven", and the caller then runs everything in scope.
 # That is the fail-closed answer: an error, an empty answer, an unexpected
-# value or a failed API call never turns into a skip.
+# value, a failed API call or an API call that took longer than 60 seconds
+# never turns into a skip (OPS-24 R6d: every `gh` call is wrapped in
+# `timeout 60`).
 #
 # Inputs (environment):
 #   EVENT_NAME     github.event_name
@@ -50,9 +52,21 @@ SHA="${PUSH_SHA:-}"
 REPO_NAME="${REPO:-}"
 BASE_BRANCH="${BASE_BRANCH:-main}"
 
+# $GITHUB_OUTPUT is line-oriented and read by the workflow, so every value
+# written to it is reduced to one line. A check run's conclusion comes from the
+# API and is not validated by GitHub; R6a is about the case where such a value
+# holds a line break.
+one_line() {
+  printf '%s' "${1:-}" | tr -d '\r\n'
+}
+
 # Print the answer, write it to $GITHUB_OUTPUT when there is one, and stop.
 finish() {
-  local proven="$1" head="$2" pr="$3" reason="$4"
+  local proven head pr reason
+  proven="$(one_line "${1:-}")"
+  head="$(one_line "${2:-}")"
+  pr="$(one_line "${3:-}")"
+  reason="$(one_line "${4:-}")"
   echo "proven=$proven proven_by=$head proven_pr=$pr reason=$reason"
   if [ -n "${GITHUB_OUTPUT:-}" ]; then
     {
@@ -113,7 +127,13 @@ case "$parent_count" in
     # A squash (or a single-parent commit): ask the API which merged pull
     # request names this commit as its merge commit.
     first="${parent_fields[1]}"
-    if ! pulls="$(gh api "repos/${REPO_NAME}/commits/${SHA}/pulls" 2>/dev/null)"; then
+    pulls=""
+    pulls_rc=0
+    pulls="$(timeout 60 gh api "repos/${REPO_NAME}/commits/${SHA}/pulls" 2>/dev/null)" || pulls_rc=$?
+    if [ "$pulls_rc" -eq 124 ]; then
+      finish false "" "" "the GitHub API did not answer within 60 seconds when asked for the pull requests of this commit"
+    fi
+    if [ "$pulls_rc" -ne 0 ]; then
       finish false "" "" "the GitHub API could not be asked for the pull requests of this commit"
     fi
     if ! selection="$(printf '%s' "$pulls" | jq -r --arg sha "$SHA" --arg base "$BASE_BRANCH" '
@@ -184,7 +204,13 @@ fi
 
 # 7. The pull request's own `ci-required` run has to be a completed success, and
 # the job that stands for each group this push needs has to have run in it.
-if ! runs="$(gh api --paginate "repos/${REPO_NAME}/commits/${head}/check-runs?per_page=100" 2>/dev/null)"; then
+runs=""
+runs_rc=0
+runs="$(timeout 60 gh api --paginate "repos/${REPO_NAME}/commits/${head}/check-runs?per_page=100" 2>/dev/null)" || runs_rc=$?
+if [ "$runs_rc" -eq 124 ]; then
+  finish false "" "" "the GitHub API did not answer within 60 seconds when asked for the check runs of the pull-request head"
+fi
+if [ "$runs_rc" -ne 0 ]; then
   finish false "" "" "the GitHub API could not be asked for the check runs of the pull-request head"
 fi
 if ! verdict="$(printf '%s' "$runs" | jq -s -r \
@@ -192,13 +218,30 @@ if ! verdict="$(printf '%s' "$runs" | jq -s -r \
     --arg need_acc "$need_acc" \
     --arg rust_name "$RUST_SENTINEL" \
     --arg acc_name "$ACCEPTANCE_SENTINEL" '
+    # R6a: a conclusion this script does not know is reported as `unknown`,
+    # never echoed. GitHub lists these values for a check run; anything else
+    # (an empty string, null, a value with a line break in it) is not one of
+    # them.
+    def known_conclusion:
+      ["success", "failure", "neutral", "cancelled", "skipped", "timed_out",
+       "action_required", "stale", "startup_failure"];
+    def said: . as $c | if (known_conclusion | index($c)) then $c else "unknown" end;
     [ .[].check_runs[] | select(.app.slug == "github-actions") ] as $runs
     | [ $runs[] | select(.name == "ci-required") ] as $gate
     | if ($gate | length) == 0 then "NOT no ci-required check run on the pull-request head"
       elif ($gate | any(.status != "completed")) then "NOT a ci-required check run on the pull-request head has not completed"
-      else ($gate | sort_by(.completed_at) | last) as $g
+      else ($gate | map(.completed_at) | max) as $latest
+        # R6b: a tie on `completed_at` between a success and anything else is
+        # not proven. `sort_by(...) | last` would have picked whichever came
+        # last in the order the API reported them in.
+        | [$gate[] | select(.completed_at == $latest)] as $top
+        | ($top | last) as $g
         | def ran($n): any($runs[]; .name == $n and .check_suite.id == $g.check_suite.id and .status == "completed" and .conclusion == "success");
-          if $g.conclusion != "success" then "NOT the latest ci-required on the pull-request head ended \($g.conclusion)"
+          if ($top | any(.conclusion != "success")) then
+            if ($top | length) > 1
+            then "NOT more than one ci-required check run on the pull-request head finished at the same time and not all of them succeeded"
+            else "NOT the latest ci-required on the pull-request head ended \($g.conclusion | said)"
+            end
           elif ($need_rust == "true" and (ran($rust_name) | not)) then "NOT the pull-request run did not run the Rust jobs"
           elif ($need_acc == "true" and (ran($acc_name) | not)) then "NOT the pull-request run did not run the acceptance jobs"
           else "PROVEN \($g.id)"

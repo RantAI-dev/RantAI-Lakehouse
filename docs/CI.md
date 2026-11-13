@@ -33,7 +33,7 @@ To reduce CI feedback latency on targeted changes (such as docs-only or frontend
 
 | Scope | Triggered By |
 |---|---|
-| `rust` | `rust/**`, `src/lib/dashboard-specs.ts`, `docker-compose.yml`, `.env.example` |
+| `rust` | `rust/**`, `src/lib/dashboard-specs.ts`, `docker-compose.yml`, `.env.example`, `ops/release/release.pub`, `ops/release/fixtures/**`, `public/geo/**` (the last three are compiled in by `include_bytes!`/`include_str!`, `OPS-24` R5) |
 | `frontend` | `src/**`, `public/**`, `package.json`, `bun.lock`, `bunfig.toml`, `tsconfig.json`, `next.config.ts`, `eslint.config.mjs`, `postcss.config.mjs`, `components.json`, `Dockerfile.frontend` |
 | `dagster` | `dagster/**` |
 | `stack` | `docker-compose.yml`, `ops/**` (except `ops/fixtures/**`), `scripts/**` (except `scripts/ci/**`), `.env.example` |
@@ -43,9 +43,13 @@ To reduce CI feedback latency on targeted changes (such as docs-only or frontend
 A `push` to `main` follows the same scopes as a pull request (`OPS-24` D1): the diff
 is the push's own (`github.event.before` to the pushed commit). Every push has its own
 run and none waits for another (D2). One full run starts every night at 19:23 UTC and
-can be started by hand (`workflow_dispatch`): it has no base commit, so every job runs
-(D3). Setting the repository variable `CI_PUSH_FULL` to `true` makes every push run
-everything again.
+can be started by hand (`workflow_dispatch`): it has no base commit, and `ci-required`
+requires every job on both events whatever the scope says (D3, `OPS-24` R3). Setting the
+repository variable `CI_PUSH_FULL` to **exactly `true`, lower case** makes every push run
+everything again; any other value (`TRUE`, `1`, `yes`) is a `::warning::` in the log and
+does nothing, because the comparison happens in `detect_change_scope.sh` and nowhere else
+(`OPS-24` R4). The same push's run then also turns the push proof off, from that script's
+`push_full` output.
 
 ### A push that repeats a passed pull request
 
@@ -80,6 +84,19 @@ was not an exact hit. It skips the nextest runs, the doctest step, the test-coun
 check, the 25 gate jobs and `image-smoke`. `images` keeps running because it is the
 only writer of the image layer cache the pull requests read.
 
+**The accepted limit of this proof (`OPS-24` D4, R6c).** Condition 5 reads the
+`ci-required` check run of the head commit `P`, and a head's checks are reported for
+whatever base that run was made against. So a head whose green `ci-required` came from a
+run against another base — a pull request retargeted after it passed, or a stack branch
+whose checks were made against its parent branch rather than `main` — satisfies condition
+5 without its run having tested the tree against `main`'s tip. Conditions 3 and 4 still
+prove that the *code* is the code that was tested; what they cannot prove is that the
+run's merge base was `main`. The nightly run (D3) runs every job on `main` every night, so
+a gap of that kind is closed within a day. Retargeting a pull request does not by itself
+start a new run (the `pull_request` trigger names no `edited` type), so the fresh run
+against the new base comes with the next push to the branch. A future fix could compare
+the run's base SHA, which the check-run payload does not carry.
+
 `ci-required` treats the skipped jobs as follows (`OPS-24` D6):
 
 | Jobs | "skipped" is accepted when |
@@ -105,7 +122,7 @@ gate.
 
 
 Downstream jobs execute according to scope:
-- **`repo-lints`**: Runs unconditionally on all pushes and PRs. Folds the static lints (parity corpus secrets, R11 bare iceberg count, compose init readiness, Dagster intra-package imports, connector gate coverage (`SRC-9`: every supported connector type has a gate in `ops/gates/coverage.json`, or an explicit waiver that the output lists)) and the unit tests of the connector gate tooling into one fast job.
+- **`repo-lints`**: Runs unconditionally on all pushes and PRs. Folds the static lints (parity corpus secrets, R11 bare iceberg count, compose init readiness, Dagster intra-package imports, every file compiled into Rust from outside `rust/` setting the `rust` scope (`OPS-24` R5), connector gate coverage (`SRC-9`: every supported connector type has a gate in `ops/gates/coverage.json`, or an explicit waiver that the output lists)) and the unit tests of the connector gate tooling into one fast job.
 - **`verify`**: Runs if `frontend` or `all` is true.
 - **`dagster-unit-tests`**: Runs if `dagster` or `all` is true. Runs the tests not marked `loader` (`-m "not loader"`).
 - **`dagster-loader-tests`**: Same condition. Runs the tests marked `loader` (`-m loader`): a real `dlt` pipeline against a local Iceberg table. Split from the job above because together they took 13m52s of a 15-minute limit (PR #115).
@@ -124,7 +141,7 @@ token a fork PR is given. One job asks for more, and only to read: `changes` add
 on a push to `main` to read the merged pull request's check runs (`OPS-24` D7). On a
 pull request the script returns before any API call.
 
-At the end of the pipeline, **`ci-required`** runs with `if: always()`, checks every job result against the detected scope, and fails if any required job failed, cancelled, or was skipped when the scope indicated it should have run, except the acceptance jobs and the test runs of a push proven to repeat a passed pull request (below). Both the scope detection script (`scripts/ci/detect_change_scope.sh`) and the gate script (`scripts/ci/required_gate.sh`) have accompanying self-tests that run in CI before the scripts are executed.
+At the end of the pipeline, **`ci-required`** runs with `if: always()`, checks every job result against the detected scope, and fails if any required job failed, cancelled, or was skipped when the scope indicated it should have run, except the acceptance jobs and the test runs of a push proven to repeat a passed pull request (above). Both the scope detection script (`scripts/ci/detect_change_scope.sh`) and the gate script (`scripts/ci/required_gate.sh`) have accompanying self-tests that run in CI before the scripts are executed.
 
 ## Images: built once per run
 
@@ -215,6 +232,11 @@ they were: every job runs on `ubuntu-latest`.
 | `CI_WORKER_COMPILE` | the four small Rust jobs: `fmt`, `clippy`, `build`, `msrv` | unset, hosted |
 | `CI_COVERAGE_ON_WORKER` | the `coverage` job of `coverage.yml` | unset, hosted |
 
+Both are read by `scripts/ci/select_runner.sh` and compared there, **exactly `true`,
+lower case** (`OPS-24` R4). `TRUE`, `1` or `yes` leaves every job hosted, because the
+workflows pass the raw value to the script and never compare it themselves — a GitHub
+expression's `==` on strings ignores case, so two comparisons could disagree.
+
 The labels are fixed in the repository, not read from a variable:
 `scripts/ci/select_runner.sh` holds `["self-hosted","lakehouse-ci"]` as a constant. A job
 is only offered to a runner that carries every label, so no variable value can reach
@@ -248,6 +270,27 @@ always on. That is what keeps utilisation under 0.7 at the measured peak and fin
 burst of five runs within today's eight minutes. A machine that can sleep blocks every
 pull request that waits for it, for up to 24 hours.
 
+**Before either variable is set, the owner checks these, in order** (`OPS-24` §3c, R11):
+
+1. Settings, Actions, General: "Require approval for all external contributors". A
+   contributor with one merged pull request can otherwise run an edited workflow that
+   names the worker's labels; whoever approves a fork's run reads its `.github/` and
+   `scripts/ci/` diff first.
+2. The CI worker's runner `.env` holds `LAKEHOUSE_CI_WORKER=1`. The staging runner's does
+   not, and the staging runner never gets the label `lakehouse-ci`.
+3. The runner's user has no `sudo`. It is in the `docker` group only if Coverage runs
+   there (Docker access is root on that machine): then `CI_WORKER_COMPILE` stays unset, so
+   that no pull request's code runs beside Docker.
+4. Nothing that user can read is a secret (keys, tokens, other checkouts).
+5. Optional: a runner registered at organisation level in a group limited to this
+   repository; not needed for D11.
+
+Then, for the first machine: leave `CI_WORKER_COMPILE` unset. Set
+`CI_COVERAGE_ON_WORKER=true` and `CI_WORKER_CARGO_JOBS=4`, start "Coverage & SBOM" by
+hand, and read the "Prepare the CI worker" step (cores, memory, disk, mount options) and
+the job's time. If the job is killed for memory or passes 90 minutes, unset the variable:
+the next run is on a hosted runner.
+
 **The cost of turning `CI_WORKER_COMPILE` on:** `main` no longer writes the hosted caches
 of `clippy`, `build` and `msrv` (those steps are guarded to a hosted runner), so a fork's
 pull request compiles them cold. That is why the switch is off by default.
@@ -256,13 +299,16 @@ pull request compiles them cold. That is why the switch is off by default.
 run on the CI worker when the variable is exactly `true`. It qualifies because nothing
 reads its result — it is not a required check and no workflow names its artifacts — and
 because the workflow has no `pull_request` trigger, so only `main`'s code reaches the
-worker through it. It needs Docker (testcontainers) and 44 to 55 job-minutes on a hosted
+worker through it. It is chosen only for `refs/heads/main` (`OPS-24` R10): a manual
+dispatch of another branch runs hosted, decided by `select_runner.sh` in the workflow's
+own `choose` job. It needs Docker (testcontainers) and 44 to 55 job-minutes on a hosted
 runner. When the worker is offline the run waits; `coverage.yml`'s concurrency rule allows
 one running and one waiting run and a newer push replaces the waiting one, so nothing
 piles up, and GitHub fails a job no runner took within 24 hours. Nothing waits for it, so
-that is acceptable. The job removes the containers it started and keeps the labelled
-reusable Postgres; the `sbom` job of the same workflow stays hosted, because 34 seconds
-have nothing to gain.
+that is acceptable. The job removes the containers it started — only those carrying
+`org.testcontainers.managed-by=testcontainers` and absent from its note, and nothing at
+all when that note is missing — and keeps the labelled reusable Postgres; the `sbom` job
+of the same workflow stays hosted, because 34 seconds have nothing to gain.
 
 What may run on the worker, and what may not (`OPS-24` D11):
 

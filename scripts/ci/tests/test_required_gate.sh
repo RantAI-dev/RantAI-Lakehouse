@@ -214,6 +214,11 @@ expect 1 "Push that forces all with a skipped gate blocks gate" "${base_push_gre
 # OPS-24 D3: the scheduled run has no base commit, so the scope is all=true.
 expect 0 "Scheduled run with everything green passes gate" "${base_all_green[@]}" EVENT_NAME=schedule
 expect 1 "Scheduled run with a skipped gate blocks gate" "${base_all_green[@]}" EVENT_NAME=schedule G4_CDC_RESULT=skipped
+# OPS-24 R3: the two all-jobs events require every job whatever the scope
+# says, so an empty scope with skipped jobs is red, not green.
+expect 1 "Scheduled run with empty scopes and skipped gates blocks gate" "${base_docs_green[@]}" EVENT_NAME=schedule
+expect 1 "Manual run with empty scopes and skipped gates blocks gate" "${base_docs_green[@]}" EVENT_NAME=workflow_dispatch
+expect 0 "Manual run with everything green passes gate" "${base_all_green[@]}" EVENT_NAME=workflow_dispatch
 
 # OPS-24 D5/D6: a proven push excuses the acceptance jobs and `image-smoke`,
 # and nothing else. A failure or a cancellation is still an error, and the

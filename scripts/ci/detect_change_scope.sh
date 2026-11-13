@@ -7,19 +7,60 @@
 # Required environment variables:
 #   GITHUB_OUTPUT   — GitHub Actions output file (optional for local testing)
 #   EVENT_NAME      — github.event_name: push, pull_request, schedule or
-#                     workflow_dispatch. The last two have no base commit, so
-#                     the base rule below forces all=true for them.
+#                     workflow_dispatch. Anything other than `push` and
+#                     `pull_request` has no base commit this script can read,
+#                     so the event rule below forces all=true (OPS-24 D3, R3).
 #   BASE_SHA        — base commit SHA to diff against
-#   FORCE_ALL       — "true" forces all=true on a push (repository variable
-#                     CI_PUSH_FULL, the switch back to "a push runs
-#                     everything"); OPS-24 D8. Ignored on other events.
+#   FORCE_ALL       — the raw repository variable CI_PUSH_FULL. Exactly
+#                     `true` (lower case) forces all=true on a push and turns
+#                     the push proof off; any other value is a warning and
+#                     nothing else (OPS-24 D8, R4). Ignored on other events.
 set -euo pipefail
 
 EVENT="${EVENT_NAME:-}"
 BASE="${BASE_SHA:-}"
 
 echo "Event: ${EVENT:-unknown}"
+echo "CI_PUSH_FULL: ${FORCE_ALL:-unset}"
 echo "Base SHA: ${BASE:-none}"
+
+# R4: one comparison, here, and it is case-sensitive. The workflow passes the
+# variable through `env:` raw and never compares it again, so `TRUE` or `1`
+# cannot mean "on" in one place and "off" in another. Say so in the log.
+if [ -n "${FORCE_ALL:-}" ] && [ "$FORCE_ALL" != "true" ]; then
+  echo "::warning::CI_PUSH_FULL is '${FORCE_ALL}', not exactly 'true' (lower case); it does not force a full push run"
+fi
+
+# The push proof is off whenever this switch is on: `push_full` is the single
+# answer the workflow reads (R4), so the script's comparison and the proof's
+# off switch cannot disagree.
+push_full=false
+if [ "$EVENT" = "push" ] && [ "${FORCE_ALL:-}" = "true" ]; then
+  push_full=true
+fi
+
+# R3: only `push` and `pull_request` carry a diff this script can read. A
+# scheduled run, a manual run and an event this script does not know have no
+# base commit, so they force a full run explicitly instead of relying on the
+# empty base below (which a future change to that rule could narrow).
+case "$EVENT" in
+  push | pull_request) ;;
+  *)
+    echo "Event '${EVENT:-none}' is neither push nor pull_request: forcing all=true."
+    if [ -n "${GITHUB_OUTPUT:-}" ]; then
+      {
+        echo "rust=true"
+        echo "frontend=true"
+        echo "dagster=true"
+        echo "stack=true"
+        echo "docs_only=false"
+        echo "all=true"
+        echo "push_full=${push_full}"
+      } >> "$GITHUB_OUTPUT"
+    fi
+    exit 0
+    ;;
+esac
 
 # A push follows the same change scope as a pull request (OPS-24 D1): the diff
 # is the push's own (`github.event.before` to the pushed commit). FORCE_ALL=true
@@ -35,6 +76,7 @@ if [ "$EVENT" = "push" ] && [ "${FORCE_ALL:-}" = "true" ]; then
       echo "stack=true"
       echo "docs_only=false"
       echo "all=true"
+      echo "push_full=${push_full}"
     } >> "$GITHUB_OUTPUT"
   fi
   exit 0
@@ -51,6 +93,7 @@ if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
       echo "stack=true"
       echo "docs_only=false"
       echo "all=true"
+      echo "push_full=${push_full}"
     } >> "$GITHUB_OUTPUT"
   fi
   exit 0
@@ -66,6 +109,7 @@ if ! CHANGED="$(git diff --no-renames --name-only "$BASE" HEAD)"; then
       echo "stack=true"
       echo "docs_only=false"
       echo "all=true"
+      echo "push_full=${push_full}"
     } >> "$GITHUB_OUTPUT"
   fi
   exit 0
@@ -81,6 +125,7 @@ if [ -z "$CHANGED" ]; then
       echo "stack=true"
       echo "docs_only=false"
       echo "all=true"
+      echo "push_full=${push_full}"
     } >> "$GITHUB_OUTPUT"
   fi
   exit 0
@@ -108,15 +153,24 @@ while IFS= read -r file; do
   # Any file outside the docs-only set means docs_only is false
   docs_only=false
 
-  # Rust: rust/**, src/lib/dashboard-specs.ts, docker-compose.yml, .env.example
+  # Rust: rust/**, src/lib/dashboard-specs.ts, docker-compose.yml, .env.example,
+  # ops/release/release.pub, ops/release/fixtures/**, public/geo/**
   # Note: docker-compose.yml is embedded via include_str! in
   # rust/crates/lakehouse-store/src/cdc.rs:1131 for demo_connector_compose_properties.
   # .env.example is embedded via include_str! in
   # rust/crates/lakehousectl/src/secrets.rs:66, so a change to it changes the
   # installer's build; the `stack` rule below keeps covering it as well
   # (OPS-24 D1).
+  # OPS-24 R5: three more paths outside rust/ are compiled into Rust by
+  # include_bytes!/include_str! -- ops/release/release.pub and
+  # ops/release/fixtures/** (rust/crates/lakehousectl/src/verify.rs:51,291-295)
+  # and public/geo/** (rust/crates/lakehouse-bi/src/formula/compile.rs:2535).
+  # ops/lint/check_rust_embedded_paths.py keeps this list honest: it fails when
+  # a file compiled into Rust outside rust/ does not set rust here.
   if [[ "$file" == rust/* ]] || [[ "$file" == "src/lib/dashboard-specs.ts" ]] || \
-     [[ "$file" == "docker-compose.yml" ]] || [[ "$file" == ".env.example" ]]; then
+     [[ "$file" == "docker-compose.yml" ]] || [[ "$file" == ".env.example" ]] || \
+     [[ "$file" == "ops/release/release.pub" ]] || [[ "$file" == ops/release/fixtures/* ]] || \
+     [[ "$file" == public/geo/* ]]; then
     rust=true
     classified=true
   fi
@@ -191,6 +245,7 @@ echo "  dagster=$dagster"
 echo "  stack=$stack"
 echo "  docs_only=$docs_only"
 echo "  all=$all"
+echo "  push_full=$push_full"
 
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
   {
@@ -200,5 +255,6 @@ if [ -n "${GITHUB_OUTPUT:-}" ]; then
     echo "stack=$stack"
     echo "docs_only=$docs_only"
     echo "all=$all"
+    echo "push_full=${push_full}"
   } >> "$GITHUB_OUTPUT"
 fi

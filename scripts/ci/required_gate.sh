@@ -8,8 +8,10 @@
 #
 # Inputs:
 #   EVENT_NAME            github.event_name (push, pull_request, schedule or
-#                         workflow_dispatch). The event no longer makes any job
-#                         required by itself; the scope does (OPS-24 D1).
+#                         workflow_dispatch). A push and a pull request are
+#                         gated by the scope alone (OPS-24 D1); the nightly
+#                         run and a manual run require every job whatever the
+#                         scope says (OPS-24 D3, R3).
 #   SCOPE_RUST            "true" if rust changed
 #   SCOPE_FRONTEND        "true" if frontend changed
 #   SCOPE_DAGSTER         "true" if dagster changed
@@ -85,6 +87,16 @@ run_gate() {
   echo "SCOPE_ALL:            $scope_all"
   echo "PUSH_PROVEN:          $push_proven"
 
+  # OPS-24 D3, R3: the nightly run and a manual run have no base commit, so
+  # their scope is `all=true`. This makes "every job is required" explicit for
+  # those two events instead of depending on that scope output; a partial or
+  # empty scope on either event is still required to have run everything.
+  local event_requires_all="false"
+  if [ "$event_name" = "schedule" ] || [ "$event_name" = "workflow_dispatch" ]; then
+    event_requires_all="true"
+    echo "EVENT_REQUIRES_ALL:   true (the ${event_name} run requires every job)"
+  fi
+
   local failures=0
 
   check_job() {
@@ -124,8 +136,9 @@ run_gate() {
   # OPS-24 D1: the event no longer requires anything by itself; the scope does.
   # A push and a pull request are gated identically, and `all=true` (a workflow
   # or fixture change, an unreadable base, the nightly run) is what forces
-  # every job.
-  if [ "$scope_all" = "true" ]; then
+  # every job. R3: the nightly run and a manual run require every job even if
+  # their scope output says otherwise.
+  if [ "$scope_all" = "true" ] || [ "$event_requires_all" = "true" ]; then
     req_all="true"
   fi
 

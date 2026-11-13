@@ -15,6 +15,12 @@ on:
       - "src/lib/dashboard-specs.ts"
       - "docker-compose.yml"
       - ".env.example"
+      # OPS-24 R5: the three files outside `rust/` that Rust compiles in
+      # (`include_bytes!`/`include_str!`), so a change to one of them changes
+      # what `cargo llvm-cov` builds.
+      - "ops/release/release.pub"
+      - "ops/release/fixtures/**"
+      - "public/geo/**"
       - "ops/fixtures/**"
       - ".github/workflows/coverage.yml"
   workflow_dispatch:
@@ -25,15 +31,46 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # OPS-24 D11, R4 and R10: the runner of `coverage` is decided here, by the
+  # same script as ci.yml's small Rust jobs, so the switch is compared in one
+  # place and exactly (`true`, lower case, never `TRUE` or `1`) and the worker
+  # is chosen only for `refs/heads/main` — a manual dispatch of another branch
+  # runs hosted, like a fork's pull request elsewhere. This job is hosted and
+  # only decides; nothing reads its result but the job below.
+  choose:
+    name: Choose the coverage runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      coverage_runner: ${{ steps.runner.outputs.coverage_runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Choose the runner
+        id: runner
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          REQUIRE_REF: refs/heads/main
+          SWITCH: ${{ vars.CI_COVERAGE_ON_WORKER }}
+          OUTPUT_NAME: coverage_runner
+        run: ./scripts/ci/select_runner.sh
+
   coverage:
     name: cargo llvm-cov (lcov)
+    needs: choose
     # OPS-24 D11: the CI worker when the repository variable
-    # CI_COVERAGE_ON_WORKER is exactly `true`, hosted otherwise. This workflow
-    # has no `pull_request` trigger, so only `main`'s code reaches the worker
-    # through it; nothing waits for this job, so a sleeping worker only delays
-    # it (the concurrency rule above keeps at most one run waiting, and GitHub
-    # fails a job no runner took within 24 hours).
-    runs-on: ${{ fromJSON(vars.CI_COVERAGE_ON_WORKER == 'true' && '["self-hosted","lakehouse-ci"]' || '["ubuntu-latest"]') }}
+    # CI_COVERAGE_ON_WORKER is exactly `true`, hosted otherwise, as decided by
+    # `scripts/ci/select_runner.sh` above (R4: an expression's `==` is
+    # case-insensitive, so `TRUE` would have reached the worker from here while
+    # never reaching it from a script). This workflow has no `pull_request`
+    # trigger, so only `main`'s code reaches the worker through it; nothing
+    # waits for this job, so a sleeping worker only delays it (the concurrency
+    # rule above keeps at most one run waiting, and GitHub fails a job no
+    # runner took within 24 hours).
+    runs-on: ${{ fromJSON(needs.choose.outputs.coverage_runner || '["ubuntu-latest"]') }}
     # 90, not 30: the last two green runs before the disk failure started
     # (runs 40149263708 and 40186521664) took 27m30s and 29m03s, so 30
     # minutes is the next wall for this job (OPS-14). The disk is freed by
@@ -128,8 +165,11 @@ jobs:
 
       # OPS-24 D11: what already ran on this worker before the tests start, so
       # the step after `cargo llvm-cov` can tell its containers from someone
-      # else's.
+      # else's. The `id` is what the clean-up's `if:` reads (OPS-24 R1): without
+      # this step's success there is no note, and the clean-up then removes
+      # nothing.
       - name: Note the containers that exist (worker only)
+        id: note
         if: runner.environment == 'self-hosted'
         run: docker ps -aq | sort > "$RUNNER_TEMP/containers-before.txt"
 
@@ -141,22 +181,42 @@ jobs:
         working-directory: rust
 
       # OPS-24 D11: remove the containers this job started and nothing else:
-      # every container `docker ps -aq` lists now and the note above did not,
-      # except those carrying `org.rantai.lakehouse-test-support` (the reusable
-      # Postgres the test-support crate keeps on purpose). No image is removed
-      # and nothing outside Docker is touched. This is correct only because one
+      # a container is this job's only when testcontainers started it
+      # (`org.testcontainers.managed-by=testcontainers`) AND it is absent from
+      # the note above, except those carrying
+      # `org.rantai.lakehouse-test-support` (the reusable Postgres the
+      # test-support crate keeps on purpose). No image is removed and nothing
+      # outside Docker is touched. This is correct only because one
       # container-starting job runs on this worker at a time (this workflow's
       # concurrency group; the small Rust jobs start none); a second such job
       # needs another rule (slice S2).
+      #
+      # OPS-24 R1: the step runs under `always()`, so it also runs when nothing
+      # was observed — the refuse step failed on a machine that is not the
+      # worker, or checkout failed. It therefore also requires the note step to
+      # have succeeded, and it exits without removing anything when the note
+      # file is absent: an empty list would make every container on the machine
+      # look "new", and this step must never remove a container it did not
+      # start.
       - name: Remove the containers this job started (worker only)
-        if: always() && runner.environment == 'self-hosted'
+        if: always() && runner.environment == 'self-hosted' && steps.note.outcome == 'success'
         run: |
+          if [ ! -f "$RUNNER_TEMP/containers-before.txt" ]; then
+            echo "no note of the existing containers: removing nothing"
+            exit 0
+          fi
           comm -13 <(sort "$RUNNER_TEMP/containers-before.txt") <(docker ps -aq | sort) \
             > "$RUNNER_TEMP/containers-new.txt"
           while IFS= read -r id; do
             [ -z "$id" ] && continue
-            label="$(docker inspect --format '{{if .Config.Labels}}{{index .Config.Labels "org.rantai.lakehouse-test-support"}}{{end}}' "$id" 2>/dev/null || true)"
-            if [ -n "$label" ]; then
+            labels="$(docker inspect --format '{{if .Config.Labels}}{{index .Config.Labels "org.testcontainers.managed-by"}}|{{index .Config.Labels "org.rantai.lakehouse-test-support"}}{{end}}' "$id" 2>/dev/null || true)"
+            managed_by="${labels%%|*}"
+            support="${labels#*|}"
+            if [ "$managed_by" != "testcontainers" ]; then
+              echo "keeping $id: it does not carry org.testcontainers.managed-by=testcontainers"
+              continue
+            fi
+            if [ -n "$support" ]; then
               echo "keeping $id: it carries the test-support label"
               continue
             fi
