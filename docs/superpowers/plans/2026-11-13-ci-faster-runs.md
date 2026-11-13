@@ -1354,3 +1354,160 @@ what A shows. With both edits, only the push block fails.
 #### MISMATCH
 
 None. Every ruling of R1 to R12 is implemented as written.
+
+## Handoff (OPS-30)
+
+Slice S2 of this plan (section 2b), on branch `ci/compile-once` off
+`origin/main` at `65cf0358`. No pull request was opened: the planner reviews and
+opens it.
+
+### Commits
+
+| # | SHA | What |
+|---|---|---|
+| 1 | `06310491` | `scripts/ci/test_partitions.sh`, its self-test, `changes` reads `CI_TEST_PARTITIONS` and exposes `test_partitions` / `test_partition_list` (S2-T1) |
+| 2 | `9b96d11f` | `test-build` (archive, size, doctests once, upload) and the rewired `test` partitions; `ci-required` needs `test-build`; `required_gate.sh` requires it and excuses only the partitions on a proven push (S2-T2, plus the "new job names" half of S2-T3) |
+| 3 | `4e89a35f` | the `ci-required` sum check loops over `test_partitions`, refuses a count outside 1 to 6, and fails a partition that ran zero tests; the self-test runs the extracted step (S2-T3) |
+| 4 | `96bf720a` | `docs/CI.md` and `rust/.config/nextest.toml`'s comment describe what is true now (S2-T4) |
+| 5 | `2c4beafd` | the partition job's disk comment quotes the number that applies to it (86 GB free, not 110) |
+| 6 | this commit | `docs(plan): handoff for OPS-30` |
+
+Every commit cites `OPS-24 S2` and `OPS-30`, and was pushed to
+`origin/ci/compile-once`.
+
+### What was run, on the final commit of each task, in the foreground
+
+| Check | Result |
+|---|---|
+| `bash scripts/ci/tests/test_detect_change_scope.sh` | `=== Results: 85 passed, 0 failed ===`, exit 0 |
+| `bash scripts/ci/tests/test_detect_push_proof.sh` | `=== Results: 38 passed, 0 failed ===`, exit 0 |
+| `bash scripts/ci/tests/test_partitions.sh` | `=== Results: 30 passed, 0 failed ===`, exit 0 |
+| `bash scripts/ci/tests/test_required_gate.sh` | `=== Results: 97 passed, 0 failed ===`, exit 0 |
+| `bash scripts/ci/tests/test_select_runner.sh` | `=== Results: 23 passed, 0 failed ===`, exit 0 |
+| `bash scripts/ci/tests/test_worker_prepare.sh` | `=== Results: 12 passed, 0 failed ===`, exit 0 |
+| `python3 ops/lint/check_gate_groups.py` | `gate groups are consistent: …`, exit 0 (needed `test-build` in `NON_GATE_JOBS`) |
+| `python3 ops/lint/check_rust_embedded_paths.py` | `22 path(s) …, 0 without the rust scope`, exit 0 |
+| `python3 ops/lint/check_bare_iceberg_count.py` | exit 0 |
+| `python3 ops/lint/check_intra_package_imports.py` | exit 0 |
+| `bash -n` on every touched script | exit 0 |
+| `python3 -c "import yaml, sys; …safe_load…" .github/workflows/*.yml` | exit 0 |
+| `git status` | clean before each commit |
+
+**No actionlint** (not installed): the `yaml.safe_load` line is the only syntax check, and
+it is weaker — it does not know expressions, contexts or `needs`. No cargo command was run
+for this slice beyond the archive measurement below (no Rust file changed except
+`rust/.config/nextest.toml`, a comment).
+
+The new self-test covers: every accepted count 1 to 6 and `04`; `0`, `7`, `99`, `four`,
+`3.0`, `4 `, `-1` each giving 3 with a `::warning::`; the two outputs; an unusable
+`OUTPUT_NAME`; the `ci.yml` wiring (variable through `env:`, both outputs, matrix,
+`--partition count:PARTITION/TEST_PARTITIONS`, the sum loop, the 1-to-6 guard) with two
+negative fixtures; and the sum-check body **extracted from `ci.yml` and executed** against
+fake counts: 3 and 4 full partitions pass, a missing partition, a zero partition, a total
+under 6,826, an empty count and a count of 7 each fail.
+
+### The archive, measured on this ARM64 machine (once, then deleted)
+
+```bash
+export CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-2 CARGO_BUILD_JOBS=6
+cd rust && cargo nextest archive --workspace --locked --archive-file /home/rismana/rantai/ops30-archive.tar.zst
+```
+
+- **Size: 10,368,673,223 bytes (9.66 GiB) compressed.** `cargo nextest archive` reported
+  `Archiving 193 binaries (including 2 non-test binaries), 5 linked paths, and 1 standard
+  library`, then `Archived 668 files … in 3m 01.91s`.
+- `Finished test profile [unoptimized + debuginfo] target(s) in 5m 57s` (20 threads here;
+  the same compile is 8 to 9 minutes on a hosted runner, per §0.1), so compile + archive
+  was **9m 00.6s** wall, of which **3m 01.9s** is the archiving step alone. `line-tables-only`
+  was applied (a 424 MB test binary carries 23 MB `.debug_info`, 58 MB `.debug_line`,
+  56 MB `.debug_str`, 105 MB `.strtab`).
+- The 192 test binaries are **50.89 GiB raw** in total, which is what
+  `cargo nextest run --archive-file` unpacks under `$TMPDIR` before it runs.
+- **The unpacking was not timed here.** The first `nextest list --archive-file` failed with
+  `No space left on device` because this machine's disk was full (2.1 GB free; the compile
+  and the archive had taken 60 GB of it). So `D` — download plus extraction — is *not
+  measured*, and the plan's stop rule cannot be evaluated from this machine.
+- The archive run path was still proven with a one-crate archive
+  (`cargo nextest archive -p lakehouse-notify`, 24.7 MB): `cargo-nextest nextest list` and
+  `cargo-nextest nextest run` both accepted `--archive-file … --workspace-remap
+  "$PWD/rust" --profile ci --partition count:1/2`, ran 19 tests,
+  `Summary [ 5.381s] 19 tests run: 19 passed, 19 skipped`, so the count step's
+  `[0-9]+ tests run` grep still parses the summary of an archive run, and junit still lands
+  in `rust/target/nextest/ci/junit.xml`.
+
+**The stop rule (S2-D7) is the planner's to decide.** This measurement makes it plausible
+that `A + M × D` passes 1,054 s: `A` alone is one compile (≈ 540 s on 4 vCPU) plus 3 minutes
+of archiving plus a ~10 GB upload; `D` is a ~10 GB download plus ~51 GiB of unpacking, per
+partition. Nothing in this branch changes the design (S2-D5 kept `line-tables-only` for this
+first run); the numbers `A` and `D` have to come from the pull request's own run, which
+this developer cannot start.
+
+### What the pull request's own run must show
+
+| Job | Line to quote |
+|---|---|
+| `Rust · test build (compile once)` | `nextest archive: 10368673223 bytes` (the x64 number will differ) and the `ls -l` line after it; the `test binaries: count=… total_gib=…` and `largest binary: raw=… zstd3=…` measurement lines; both `df -h /` blocks |
+| `Rust · test build (compile once)` | the step `cargo test --workspace --locked --doc (doctests)` green, with its `test result: ok` lines |
+| `Rust · test build (compile once)` | `Upload the test archive` green, and the artifact `nextest-archive` of ~10 GB in the run's artifacts |
+| `Rust · test N/3 (stable)`, N = 1..3 | `Download the test archive` and `Pull the test images …` green; `partition N: <count> tests run`; the job summary `## Nextest partition N/3: <count> tests`; `Summary [ … s] <count> tests run: …` |
+| `ci-required` | `partition 1: …` … `nextest total across partitions: <total> (floor 6826)`, with `<total>` at or above 6,826 and each count above zero |
+| the run | three `Rust · test N/3` jobs and one `Rust · test build` job, all green; `ci-required` green; two dependent jobs (`test` `needs` `test-build`) not skipped |
+
+With `CI_TEST_PARTITIONS=4` set in the repository, the same run must show four
+`Rust · test N/4` jobs and four `partition N:` lines. Unset, it shows three, exactly as
+today.
+
+### Not verified
+
+- **No GitHub Actions run of this branch exists**, so: the x64 archive size, `A`, `D`,
+  the upload and download of a ~10 GB artifact (including whether the artifact service
+  accepts it — my only evidence is that the file is under 10 GiB), the unpacking into the
+  runner's `$TMPDIR` (~51 GiB) with **no disk step in the partitions** (the runner starts with
+  86 GB free, plan §0.1; ~61 GB is needed), and every job's wall time.
+- **The partition jobs were never run on a hosted runner.** Locally only a one-crate
+  archive was run, as above. The `docker` pre-pull step, `Setup Bun`, and the full run's
+  exit propagation through `tee`/`PIPESTATUS` are unchanged from `main` but were not run
+  with `--archive-file`.
+- **A proven push** (the cache-hit branch of `test-build` and the skipped partitions) needs
+  a real push to `main`; only the gate logic is exercised, by the self-tests.
+- **`cargo nextest archive` and `cargo-nextest nextest run` version skew**: both jobs
+  install nextest with the same pinned action in the same run, so they match; a release
+  landing between a job's start and the next job's start is not covered.
+- `actionlint` is not installed (see above).
+
+### MISMATCH (2b and today's workflow)
+
+1. **The starting count.** S2-D4 says "Start at 4"; today's `CI_TEST_PARTITIONS` is unset,
+   so this branch runs **3** — the `REL-20` count — until the owner sets the variable.
+   The script accepts 1 to 6 and defaults to 3; 4 was not made the default because a
+   repository variable is the owner's to set and 3 is what `main` runs today.
+2. **How the partition invokes nextest.** S2-D2 names `cargo-nextest nextest run …` and the
+   task summary writes `cargo nextest run …`; this branch uses `cargo-nextest` (S2-D2). A
+   `cargo` line in `rust/` would make rustup resolve `rust-toolchain.toml` and download a
+   toolchain the job does not need (`--archive-file` builds nothing). Verified locally.
+3. **The `test` job's shape is today's, not 2b's sketch.** `main` now carries OPS-24 T4/T5
+   and OPS-25, which 2b predates: two identical "Free runner disk" steps, the pre-pull step
+   with a `proven` condition, per-step `proven` conditions, and the `test-counts-N`
+   artifacts. The duplicate disk step is gone (one remains, in `test-build`); the
+   pre-pull step's `proven` condition moved to the job's `if:`, so the whole partition run
+   is excused at once.
+4. **The T5 size measurement moved.** 2b does not say to move the
+   "Report disk and test binary sizes" step; it moved from partition 1 to `test-build`,
+   because the partition no longer has a `target/` to measure. Same script, same `if:`
+   shape (`always() && proven != 'true'`).
+5. **`ci-required`'s sum check gained a rule.** S2-D6/S2-T3 say it keeps its floor and its
+   way of summing; the task's own rule ("fail when any partition … ran zero tests")
+   is implemented as a new per-partition error. Nothing was loosened: the floor is still
+   6,826 and the log line is unchanged.
+6. **Two gate-script inputs, not one.** S2-D6 names `RUST_TEST_BUILD_RESULT`; the `test`
+   job's proven-push skip also needs `test` to become excusable, so `required_gate.sh`
+   computes the partitions' requirement as `req_rust` minus a proven push. The self-test
+   restates the old line ("a skipped Rust test job on a proven push blocks gate") under the
+   new rule, as the OPS-24 D1 change did, and adds both directions (failed/cancelled is
+   still red; a skipped `test-build` is red).
+7. **`ops/lint/check_gate_groups.py` needed `test-build`.** Not in 2b: the lint treats every
+   `ci.yml` job outside its fixed non-gate set as a gate and would fail on the new job.
+8. **`docs/CI.md` beyond the test job.** 2b asks for the test job's description; the
+   proven-push paragraph, the "skipped is accepted" table and the cache-writer list also
+   described the old single compile-only leg, so they were corrected rather than left to
+   contradict the workflow.
