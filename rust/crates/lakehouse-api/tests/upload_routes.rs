@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
-use lakehouse_store::uploads::{self, LoadMode, NewUpload, Upload};
+use lakehouse_store::uploads::{self, LoadMode, NewTableDrop, NewUpload, Upload};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -2872,6 +2872,88 @@ async fn after_a_delete_the_claim_remains_and_a_new_upload_of_the_tenant_loads_i
             "up-first".to_owned()
         )],
         "still the claim the first upload made"
+    );
+}
+
+/// `DATA-55` D11 (QA `LH-DATA-15-06`, `TC-1731`): while a dropped table can
+/// still be restored, a file cannot be loaded into its name — a new table of
+/// that name would make the dropped one impossible to bring back.
+#[tokio::test]
+async fn a_load_into_a_table_that_was_dropped_and_can_still_be_restored_is_409_and_claims_marks_and_launches_nothing()
+ {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_registered(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-2").await;
+    stack.seed_ingested(GROUP, "up-first", "stock_raw").await;
+    uploads::record_table_drop(
+        &stack.app.pool,
+        &NewTableDrop {
+            bronze_table: "stock_raw",
+            tenant_id: GROUP.parse::<Uuid>().unwrap(),
+            asset_id: "stock-raw",
+            dropped_by: "Seeded Uploader",
+            row_count: Some(1),
+            kept_seconds: 604_800,
+        },
+    )
+    .await
+    .unwrap()
+    .expect("the drop is recorded");
+    let second = stack.upload(&bayu, "again.csv", b"id,name\n1,a\n").await;
+
+    let reply = stack
+        .ingest(&bayu, &id_of(&second), ingest_body("stock_raw"))
+        .await;
+
+    assert_eq!(reply.status, StatusCode::CONFLICT, "{}", reply.text);
+    assert_eq!(
+        reply.json["error"],
+        "That table was dropped and can still be restored. Restore it from its page in the Catalog, or choose another name."
+    );
+    assert_eq!(stack.status_of(&id_of(&second)).await.0, "uploaded");
+    assert!(stack.dagster.received_requests().await.unwrap().is_empty());
+}
+
+/// `DATA-55` D11: after the window the name takes a new load as before.
+#[tokio::test]
+async fn once_the_restore_window_has_passed_the_name_takes_a_new_load() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_registered(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-2").await;
+    stack.seed_ingested(GROUP, "up-first", "stock_raw").await;
+    uploads::record_table_drop(
+        &stack.app.pool,
+        &NewTableDrop {
+            bronze_table: "stock_raw",
+            tenant_id: GROUP.parse::<Uuid>().unwrap(),
+            asset_id: "stock-raw",
+            dropped_by: "Seeded Uploader",
+            row_count: Some(1),
+            kept_seconds: 604_800,
+        },
+    )
+    .await
+    .unwrap()
+    .expect("the drop is recorded");
+    sqlx::query(
+        "UPDATE upload_table_drop SET expires_at = now() - interval '1 second' \
+         WHERE bronze_table = 'stock_raw'",
+    )
+    .execute(&stack.app.pool)
+    .await
+    .unwrap();
+    let second = stack.upload(&bayu, "again.csv", b"id,name\n1,a\n").await;
+
+    let reply = stack
+        .ingest(&bayu, &id_of(&second), ingest_body("stock_raw"))
+        .await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(
+        requests_containing(&stack.dagster, "launchRun").await.len(),
+        1
     );
 }
 

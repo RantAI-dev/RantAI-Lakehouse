@@ -72,6 +72,11 @@
 //!   (`lakehouse_store::uploads::claim_table`, review finding B4), not the
 //!   upload rows'. When the API cannot tell, it answers 503 and does not guess
 //!   that the name is free ([`ensure_table_free`]).
+//!   A name whose table was dropped from the console and can still be
+//!   restored is closed too (`DATA-55` D11, QA `LH-DATA-15-06`, `TC-1731`):
+//!   a new load would create a table of that name, and the dropped one could
+//!   no longer come back, so the answer is [`TABLE_DROPPED`] until the window
+//!   ends.
 //! * **One load per upload, and the row is claimed before the job is
 //!   launched** (review finding B2): see [`ingest`].
 //!
@@ -312,6 +317,10 @@ const CONNECTOR_TABLE: &str = "A connector loads that table, so a file cannot be
 /// `SEC-16`'s, replacing a sentence that said "no upload of this tenant
 /// created it".
 const TABLE_NOT_FREE: &str = "That table name cannot be used. Choose another name.";
+/// A load into a table that was dropped from the console and can still be
+/// restored (`DATA-55` D11). A new table of that name would make the dropped
+/// one impossible to undrop, so the name stays closed until the window ends.
+const TABLE_DROPPED: &str = "That table was dropped and can still be restored. Restore it from its page in the Catalog, or choose another name.";
 const TABLE_UNCHECKED: &str =
     "Could not check whether that table already exists, so nothing was loaded.";
 const NO_QUERY_DATABASE: &str = "Uploads need ICEBERG_QUERY_DB to be set, so the API can check that a table name is free. Nothing was loaded.";
@@ -2603,8 +2612,12 @@ fn parse_ingest_request(
 ///    person that someone else has a connector writing a table of that name
 ///    (`SEC-16`).
 /// 2. The claim table's answer ([`uploads::table_claim`]): the name is this
-///    tenant's, and it is free to load into, whether or not the table exists
-///    yet; or it is another tenant's, and it is not.
+///    tenant's and no drop of it is on record inside its window, and it is
+///    free to load into, whether or not the table exists yet; or it is another
+///    tenant's, and it is not. A name this tenant's table was dropped from,
+///    while that table can still be restored, is [`TABLE_DROPPED`]
+///    (`DATA-55` D11): a new table of that name would make the dropped one
+///    impossible to bring back.
 /// 3. Nobody's claim: the table must not exist (a registry row or an Iceberg
 ///    table). Never "free" on a doubt.
 ///
@@ -2617,10 +2630,11 @@ fn parse_ingest_request(
 ///
 /// 409 for a connector's table ([`CONNECTOR_TABLE`] for the caller's own
 /// tenant's connector, otherwise [`TABLE_NOT_FREE`]), for a name another
-/// tenant holds, and for an existing table nobody claimed (those with the one
-/// sentence, [`TABLE_NOT_FREE`]); 503 when the question cannot be answered (Postgres,
-/// `ClickHouse` or the Iceberg query database did not give a definite
-/// answer, or there is no Iceberg query database to ask).
+/// tenant holds, for an existing table nobody claimed (those with the one
+/// sentence, [`TABLE_NOT_FREE`]), and for this tenant's table that was dropped
+/// and can still be restored ([`TABLE_DROPPED`]); 503 when the question
+/// cannot be answered (Postgres, `ClickHouse` or the Iceberg query database did
+/// not give a definite answer, or there is no Iceberg query database to ask).
 async fn ensure_table_free(
     state: &AppState,
     pool: &PgPool,
@@ -2652,8 +2666,22 @@ async fn ensure_table_free(
         .map_err(|err| unchecked(&err))?
     {
         // This tenant's own claim settles it, whether or not the table exists
-        // yet: replacing or adding to one's own table is the point.
-        TableClaim::Ours => return Ok(()),
+        // yet: replacing or adding to one's own table is the point — unless its
+        // table was dropped from the console and can still be restored
+        // (DATA-55 D11, QA LH-DATA-15-06, TC-1731). The load job would create a
+        // new table of that name, and the dropped one could no longer be
+        // undropped. An unreadable record is `unchecked` like its neighbours:
+        // 503, never an assumption that the name is free (fail closed).
+        TableClaim::Ours => {
+            if uploads::dropped_table(pool, table)
+                .await
+                .map_err(|err| unchecked(&err))?
+                .is_some()
+            {
+                return Err(ApiError::Conflict(TABLE_DROPPED.to_owned()));
+            }
+            return Ok(());
+        }
         // Another tenant's claim, or a claim whose tenant is gone. The same
         // sentence as for an existing table nobody claimed, so the answer does
         // not say which it is.
