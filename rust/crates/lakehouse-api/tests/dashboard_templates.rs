@@ -472,3 +472,92 @@ async fn a_reader_cannot_save_or_use_a_template() {
         assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
     }
 }
+
+/// Review round 1, BLOCKER 1: saving a template runs the dashboard file
+/// export's checks in its order, then needs `edit`. A hidden dashboard is the
+/// same 404 whatever else is true; with it visible, downloads switched off for
+/// the person's roles is the download refusal; with downloads on, `view`
+/// without `edit` is 403. Nothing is saved in any of the three.
+#[tokio::test]
+async fn saving_a_template_follows_the_dashboard_file_checks_then_needs_edit() {
+    let app = app().await;
+    let save = |cookie: String| {
+        let app = &app;
+        async move {
+            send(
+                app,
+                &cookie,
+                "POST",
+                "/api/dashboard/templates",
+                Some(json!({ "board": "b_src", "name": "Copy" })),
+            )
+            .await
+        }
+    };
+    // `b_src` is "only the people listed"; `viewer` is listed with view.
+    let viewer =
+        create_principal_with_permissions(&app.pool, "dashboard:read, dashboard:write").await;
+    let stranger =
+        create_principal_with_permissions(&app.pool, "dashboard:read, dashboard:write").await;
+    lakehouse_store::dashboard_access::replace_item(
+        &app.pool,
+        "board",
+        "b_src",
+        &[lakehouse_store::dashboard_access::NewRule {
+            user_id: Some(viewer),
+            role_id: None,
+            level: "view".to_owned(),
+        }],
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    let viewer = session_cookie_for_user(&app.pool, viewer).await;
+    let stranger = session_cookie_for_user(&app.pool, stranger).await;
+
+    // Downloads off for every role.
+    sqlx::query(
+        "INSERT INTO reporting_settings (singleton, time_zone, week_start, download_denied_roles) \
+         SELECT TRUE, 'UTC', 'monday', array_agg(r.name) FROM role r",
+    )
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    let (status, said) = save(stranger.clone()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "hidden first: {said}");
+    assert_eq!(said["error"], "dashboard not found.");
+    let (status, said) = save(viewer.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{said}");
+    assert!(
+        said["error"]
+            .as_str()
+            .unwrap()
+            .contains("Downloads are switched off"),
+        "{said}"
+    );
+
+    // Downloads on: the stranger still finds nothing, and view is not edit.
+    sqlx::query("DELETE FROM reporting_settings")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let (status, said) = save(stranger).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{said}");
+    assert_eq!(said["error"], "dashboard not found.");
+    let (status, said) = save(viewer).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{said}");
+    assert!(
+        said["error"]
+            .as_str()
+            .unwrap()
+            .contains("edit on this dashboard"),
+        "{said}"
+    );
+
+    let saved: i64 = sqlx::query_scalar("SELECT count(*) FROM dashboard_template")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(saved, 0, "nothing is saved");
+}

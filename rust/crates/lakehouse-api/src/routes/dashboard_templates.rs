@@ -18,9 +18,11 @@
 //! filters, tabs, layout, chart definitions and the tables they read) and, for
 //! each chart, its stored document (`store::stored_document`). No snapshot, no
 //! version history, no sharing state: the file refuses those fields, and the
-//! stored document is the chart's own row. Saving needs the dashboard to be
-//! one the person can see; the template is then for everyone with
-//! `dashboard:write` on this deployment (T4), with no access rules of its own.
+//! stored document is the chart's own row. Saving runs the dashboard file
+//! export's checks in its order (the dashboard visible, else the same 404; then
+//! the download switch) and also needs `edit` on the dashboard (review round 1,
+//! BLOCKER 1); the template is then for everyone with `dashboard:write` on this
+//! deployment (T4), with no access rules of its own.
 //!
 //! # Starting from one (T2)
 //!
@@ -177,10 +179,18 @@ pub(crate) async fn save_template(
     if board_id.is_empty() || board_id == store::DEFAULT_BOARD_ID {
         return Err(ApiError::BadRequest(BUILTIN_REFUSED.to_owned()));
     }
-    // Seeing the dashboard is enough to copy its definition; it is not changed.
+    // BI-18 D review round 1, BLOCKER 1: the checks of the dashboard file
+    // export (`dashboard_file::export_file`), in its order, because a template
+    // holds what that file holds. First the dashboard must be one the person
+    // sees (the same 404 as an unknown id, whatever else is true), then the
+    // per-role download switch (`BI-19` Q-D1), and then `edit` on it: the
+    // template is listed to every `dashboard:write` holder, including people
+    // who cannot see this dashboard, so copying it out is more than viewing it.
     let Some(board) = require_board_level(state, &scope, board_id, Level::View).await? else {
         return Err(ApiError::BadRequest(BUILTIN_REFUSED.to_owned()));
     };
+    crate::routes::settings::require_download(state, principal).await?;
+    scope.require_on_board(&board, Level::Edit)?;
     let charts: Vec<_> = store::list_stored_charts(&state.clickhouse, &scope.viewer)
         .await
         .map_err(|err| classify_ch_error(&err))?
@@ -221,8 +231,9 @@ pub(crate) async fn save_template(
 /// # Errors
 ///
 /// 400 for a blank or long name, the built-in dashboard, or a dashboard of more
-/// than 200 charts; 404 for a dashboard the person cannot see; 503 without the
-/// console database; the classified store error.
+/// than 200 charts; 404 for a dashboard the person cannot see; 403 when
+/// downloads are switched off for the person's roles, or without `edit` on the
+/// dashboard; 503 without the console database; the classified store error.
 pub async fn save(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,

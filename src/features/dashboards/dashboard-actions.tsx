@@ -71,7 +71,7 @@ export function DashboardActionsMenu({
   readonly onSubscriptions?: () => void;
   /** Downloads the dashboard as a file to import elsewhere (`BI-19` part D); left out when absent. */
   readonly onExportFile?: () => void;
-  /** Opens "Save as template" (`BI-18` part D, T6); left out when absent, without `dashboard:write` and on the built-in dashboard. */
+  /** Opens "Save as template" (`BI-18` part D, T6); left out when absent, without edit, when downloads are off, and on the built-in dashboard. */
   readonly onSaveTemplate?: () => void;
   readonly onDuplicate: () => void;
   readonly onDelete: () => void;
@@ -220,7 +220,8 @@ export function DashboardActionsMenu({
                 <Copy className="size-4" /> Duplicate
               </DropdownMenuItem>
             ) : null}
-            {canWrite && !isDefault && onSaveTemplate ? (
+            {/* BI-18 D review round 1, BLOCKER 1: a template holds what the dashboard file holds, so it follows the download switch too. */}
+            {canWrite && canDownload && !isDefault && onSaveTemplate ? (
               <DropdownMenuItem onClick={onSaveTemplate}>
                 <LayoutTemplate className="size-4" /> Save as template…
               </DropdownMenuItem>

@@ -163,8 +163,14 @@ describe("Save as template in the dashboard's menu", () => {
     expect(opened).toBe(true)
   })
 
-  it("is not offered without dashboard:write, nor on the built-in dashboard", async () => {
-    for (const over of [{ onSaveTemplate: undefined }, { isDefault: true, onSaveTemplate: () => {} }, { canWrite: false, onSaveTemplate: () => {} }]) {
+  it("is not offered without edit, with downloads off, nor on the built-in dashboard", async () => {
+    for (const over of [
+      { onSaveTemplate: undefined },
+      { isDefault: true, onSaveTemplate: () => {} },
+      { canWrite: false, onSaveTemplate: () => {} },
+      // BI-18 D review round 1, BLOCKER 1: a template follows the download switch.
+      { canDownload: false, onSaveTemplate: () => {} },
+    ]) {
       render(<DashboardActionsMenu {...base} {...over} />)
       fireEvent.click(screen.getByRole("button", { name: "More actions" }))
       await screen.findByText("Print…")
