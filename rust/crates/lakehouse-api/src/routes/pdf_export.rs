@@ -210,6 +210,9 @@ pub(crate) async fn make_pdf(state: &AppState, job: &PdfJob<'_>) -> Result<Vec<u
     // BI-53 (QA LH-BI-1-01 F3): the stages of one PDF, in order; durations
     // only, never a token or an address.
     tracing::info!(slot_wait_ms = millis(started), "pdf render started");
+    // BI-53 review fix (SHOULD-FIX) R3: `render_ms` counts from the slot, not
+    // from the wait for it.
+    let rendering = std::time::Instant::now();
     let (page_url, gotenberg) = render_page(
         state,
         &RenderPage {
@@ -229,7 +232,7 @@ pub(crate) async fn make_pdf(state: &AppState, job: &PdfJob<'_>) -> Result<Vec<u
     )
     .await;
     tracing::info!(
-        render_ms = millis(started),
+        render_ms = millis(rendering),
         ok = converted.is_ok(),
         "pdf render finished"
     );
@@ -237,8 +240,9 @@ pub(crate) async fn make_pdf(state: &AppState, job: &PdfJob<'_>) -> Result<Vec<u
 }
 
 /// [`std::time::Instant`]'s elapsed time in whole milliseconds, saturated
-/// rather than truncated (the line only reports a duration).
-fn millis(started: std::time::Instant) -> u64 {
+/// rather than truncated (the line only reports a duration). Shared with
+/// `routes::render`, which times the print view's read the same way.
+pub(crate) fn millis(started: std::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 

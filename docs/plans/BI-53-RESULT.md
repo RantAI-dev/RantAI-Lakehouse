@@ -9,8 +9,7 @@ seconds.
 
 ## 1. What was measured
 
-- Machine: ARM64 (`aarch64`), 20 CPUs, the checkout
-  `/home/rismana/rantai/lakehouse-agents-4`.
+- Machine: ARM64 (`aarch64`), 20 CPUs.
 - Renderer: `gotenberg/gotenberg:8.37.0` (the tag `docker-compose.yml` pins),
   which runs its own Chromium. The image was pulled for this architecture on
   2026-11-13.
@@ -61,7 +60,8 @@ reading stands and T12 is built.
 - The first conversion (A4 landscape, the container's first request, so it
   includes the browser's own start): 1966 ms.
 - The second (A4 portrait): 1721 ms.
-- The first minus the second, 245 ms, is the browser's start; the second is the
+- The first minus the second, 245 ms, is the browser's start (one run each, and
+  the two runs differ in orientation as well as in order); the second is the
   renderer's own time for this page. Each includes the page's own 1.5 s of
   waiting, so the conversion of this page itself is under 0.5 s.
 - No verdict on the 45 seconds QA measured.

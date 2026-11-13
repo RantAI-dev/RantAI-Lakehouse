@@ -15,13 +15,11 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use lakehouse_bi::bin::{BinMode, Range};
 use lakehouse_bi::grain::TimeContext;
 use lakehouse_bi::sources::SourceColumn;
 use lakehouse_bi::specs::ChartSource;
 use lakehouse_bi::store::{ChartInput, InlineSql, spec_from_inline_sql};
 use lakehouse_clickhouse::ChClient;
-use lakehouse_core::ident::Ident;
 use serde_json::Value;
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
@@ -33,10 +31,6 @@ const AVG_TABLE: &str = "default.bi55_avg";
 
 /// The source of the rounding chart: every row of [`AVG_TABLE`].
 const AVG_SOURCE: &str = "SELECT kab, v FROM default.bi55_avg";
-
-/// The table of the whole-number bins: five years, and a decimal column beside
-/// them so a fractional column keeps the width it always had.
-const YEARS_TABLE: &str = "default.bi55_years";
 
 /// ONE `ClickHouse` per test binary (the arrangement of
 /// `tests/breakdown_cap.rs`); the container is never stopped by the test.
@@ -84,24 +78,6 @@ async fn seed(ch: &ChClient) {
     )
     .await
     .expect("fill the rounding table");
-    ch.exec(
-        &format!(
-            "CREATE TABLE {YEARS_TABLE} (tahun UInt16, stay Float64) \
-             ENGINE = MergeTree ORDER BY tahun"
-        ),
-        None,
-    )
-    .await
-    .expect("create the years table");
-    ch.exec(
-        &format!(
-            "INSERT INTO {YEARS_TABLE} VALUES (2020, 1.5), (2021, 2.0), (2022, 2.5), \
-             (2023, 3.0), (2024, 4.5)"
-        ),
-        None,
-    )
-    .await
-    .expect("fill the years table");
 }
 
 /// A JSON number, or a number the engine quoted as a 64-bit integer, read as
@@ -194,71 +170,4 @@ async fn an_average_keeps_its_decimals_and_a_maximum_of_whole_numbers_stays_whol
     assert_eq!(number(b.get("v").expect("the sum column")), 10.0);
     assert_eq!(number(b.get("avg_v").expect("the average column")), 10.0);
     assert_eq!(number(b.get("max_v").expect("the maximum column")), 10.0);
-}
-
-/// Automatic bins of a year column are one year wide and carry `whole`; a
-/// fractional column keeps the width the nice rule gives it. The bins are then
-/// run on the engine: five years, one per bin.
-#[tokio::test]
-async fn automatic_bins_of_a_year_column_are_one_year_wide_and_a_fractional_column_keeps_its_width()
-{
-    let (url, _container) = shared_clickhouse().await;
-    let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
-
-    let tahun = Range::new(
-        &Ident::new("tahun").expect("a valid identifier"),
-        BinMode::Auto,
-    );
-    let read = ch
-        .query(&tahun.read_sql(YEARS_TABLE), None)
-        .await
-        .expect("the year column's read runs on the engine");
-    let row = &read.data[0];
-    assert_eq!(number(row.get("width").expect("the width")), 1.0);
-    assert_eq!(number(row.get("min").expect("the minimum")), 2020.0);
-    assert_eq!(number(row.get("max").expect("the maximum")), 2024.0);
-    assert_eq!(number(row.get("whole").expect("the whole flag")), 1.0);
-
-    let stay = Range::new(
-        &Ident::new("stay").expect("a valid identifier"),
-        BinMode::Auto,
-    );
-    let read = ch
-        .query(&stay.read_sql(YEARS_TABLE), None)
-        .await
-        .expect("the decimal column's read runs on the engine");
-    let row = &read.data[0];
-    assert_eq!(number(row.get("width").expect("the width")), 0.5);
-    assert_eq!(number(row.get("whole").expect("the whole flag")), 0.0);
-
-    // MISMATCH against the plan, measured on `ClickHouse` 26.8: the plan
-    // expects the binned statement to answer five rows (2020 to 2024, one row
-    // each); the engine answers four, 2020 and 2021 and 2022 once each and
-    // 2023 twice, because `Range::bin_expr` folds the maximum into the last
-    // bin when the maximum sits on a bin edge (`ceil(mx / w) - 1`): the 2023
-    // bin covers [2023, 2024] and holds both years. That is the rule of
-    // `BI-10` ("the maximum is never alone in a bin of its own") meeting the
-    // width-1 rule of `BI-55`, and the planner decides it. The statement is
-    // built here so the measurement is repeatable, and its answer is not
-    // asserted.
-    let statement = format!(
-        "SELECT {} AS b, count() AS n FROM (SELECT * FROM {YEARS_TABLE} CROSS JOIN ({}) AS rng) \
-         GROUP BY b ORDER BY b",
-        tahun.bin_expr(),
-        tahun.scalars_sql(YEARS_TABLE)
-    );
-    let result = ch
-        .query(&statement, None)
-        .await
-        .expect("the binned statement runs on the engine");
-    // The plan's own expectation ("five rows, `b` 2020 to 2024, each `n` 1")
-    // is not asserted: it is the mismatch above. What is asserted is the
-    // property the plan also implies — every row of the table lands in exactly
-    // one bin.
-    let total: f64 = result
-        .data
-        .iter()
-        .map(|row| number(row.get("n").expect("the bin's count")))
-        .sum();
-    assert_eq!(total, 5.0, "every year is in exactly one bin: {statement}");
 }

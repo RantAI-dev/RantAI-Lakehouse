@@ -134,7 +134,7 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
     // their first tenant, because the token carries no tenant (M5).
     let read = payload_for(&state, &principal, &query, &HeaderMap::new()).await;
     tracing::info!(
-        payload_ms = u64::try_from(read_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        payload_ms = crate::routes::pdf_export::millis(read_started),
         ok = read.is_ok(),
         "render data read"
     );

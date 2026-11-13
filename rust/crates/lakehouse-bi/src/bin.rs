@@ -42,12 +42,6 @@
 //! has width 1. Edges are multiples of the width, so `visitors` in bins of 500
 //! reads `0, 500, 1000, ...`.
 //!
-//! A column whose values are all whole numbers is never cut narrower than 1
-//! (a year cut at 0.5 would read `2,020 – 2,020.5`), and a bin of width 1 over
-//! such a column reads as its one value (`2020`). The read says so with
-//! `whole` in the tile's `bins` entry, for an automatic and a counted range
-//! only (`BI-55`).
-//!
 //! A histogram (`BI-16` part B) is cut differently, `BI-18` part C review fix
 //! (SHOULD-FIX) R21: a number of ranges is honoured ([`exact_width`]: the width
 //! is `(max - min) / n` rounded up to two significant digits), and automatic
@@ -257,15 +251,6 @@ pub enum WidthRule {
     Nearest(u32),
 }
 
-impl WidthRule {
-    /// Whether this rule finds its width with [`WidthRule::Nice`] — the rule
-    /// the whole-number floor of QA `LH-BI-2-02` (`BI-55`, D7) applies to.
-    #[must_use]
-    pub fn is_nice(&self) -> bool {
-        matches!(self, Self::Nice(_))
-    }
-}
-
 impl BinMode {
     /// The rule that finds this mode's width.
     #[must_use]
@@ -393,17 +378,8 @@ impl Range {
                 )
             }
             WidthRule::Nice(n) => {
-                // QA LH-BI-2-02 (BI-55, D5, D7): automatic and counted bins of
-                // a column whose values are all whole numbers are never
-                // narrower than 1 — a year column cut at 0.5 reads
-                // "2,020 – 2,020.5". `fr` is 1 when any value has a
-                // fraction; a NULL `fr` (no rows) leaves the width as it was.
-                let first = format!(
-                    "SELECT min(toFloat64({c})) AS mn, max(toFloat64({c})) AS mx, \
-                     max(toFloat64({c}) != floor(toFloat64({c}))) AS fr FROM {base}"
-                );
-                let second = format!(
-                    "SELECT mn, mx, fr, if(mx > mn, pow(10, floor(log10((mx - mn) / {n}))), 1) AS p FROM ({first})"
+                let l2 = format!(
+                    "SELECT mn, mx, if(mx > mn, pow(10, floor(log10((mx - mn) / {n}))), 1) AS p FROM ({l1})"
                 );
                 let fits = |k: u32| {
                     format!("ceil(mx / ({k} * p)) - floor(mn / ({k} * p)) <= {n}, {k} * p")
@@ -411,7 +387,7 @@ impl Range {
                 let mut branches: Vec<String> = NICE.iter().map(|k| fits(*k)).collect();
                 branches.push("1000 * p".to_owned());
                 format!(
-                    "SELECT mn, mx, fr, greatest(multiIf({}), if(fr = 0, 1, 0)) AS w FROM ({second})",
+                    "SELECT mn, mx, multiIf({}) AS w FROM ({l2})",
                     branches.join(", ")
                 )
             }
@@ -431,18 +407,14 @@ impl Range {
         )
     }
 
-    /// One row `(width, min, max[, whole])` over `base`: what the tile carries
-    /// so the console can label the bins and know which one is last. `whole`
-    /// (1 when every value of the column is a whole number) is present only
-    /// for an automatic or counted range — QA `LH-BI-2-02` (`BI-55`, D7).
+    /// One row `(width, min, max)` over `base`: what the tile carries so the
+    /// console can label the bins and know which one is last.
     #[must_use]
     pub fn read_sql(&self, base: &str) -> String {
-        let stats = self.stats_sql(base);
-        if self.rule.is_nice() {
-            format!("SELECT w AS width, mn AS min, mx AS max, fr = 0 AS whole FROM ({stats})")
-        } else {
-            format!("SELECT w AS width, mn AS min, mx AS max FROM ({stats})")
-        }
+        format!(
+            "SELECT w AS width, mn AS min, mx AS max FROM ({})",
+            self.stats_sql(base)
+        )
     }
 
     /// The bin's lower edge for each row, over a relation that carries the
@@ -713,41 +685,6 @@ mod tests {
         assert!(sql.contains("ceil(mx / (1 * p)) - floor(mn / (1 * p)) <= 10, 1 * p"));
         assert!(sql.contains("ceil(mx / (100 * p)) - floor(mn / (100 * p)) <= 10, 100 * p"));
         assert!(sql.contains("1000 * p"));
-    }
-
-    // QA LH-BI-2-02 (BI-55, D5, D7): a year column read under "Automatic"
-    // must not be cut at half a year, and the tile must be told the column
-    // holds whole numbers so it can label a bin of width 1 as "2020".
-    #[test]
-    fn a_column_of_whole_numbers_is_never_cut_narrower_than_one_and_the_tile_is_told() {
-        let r = Range::new(&col("tahun"), BinMode::Auto);
-        let sql = r.read_sql("serving.t");
-        assert!(
-            sql.starts_with("SELECT w AS width, mn AS min, mx AS max, fr = 0 AS whole FROM ("),
-            "{sql}"
-        );
-        assert!(
-            sql.contains("max(toFloat64(tahun) != floor(toFloat64(tahun))) AS fr FROM serving.t"),
-            "{sql}"
-        );
-        assert!(
-            sql.contains("greatest(multiIf(ceil(mx / (1 * p)) - floor(mn / (1 * p)) <= 10, 1 * p"),
-            "{sql}"
-        );
-        assert!(sql.contains("1000 * p), if(fr = 0, 1, 0)) AS w"), "{sql}");
-        assert_eq!(sql.matches("serving.t").count(), 1, "{sql}");
-
-        let scalars = r.scalars_sql("serving.t");
-        assert!(
-            scalars
-                .starts_with("SELECT w AS __bw_tahun, mn AS __bmn_tahun, mx AS __bmx_tahun FROM ("),
-            "{scalars}"
-        );
-        assert!(!scalars.contains("whole"), "{scalars}");
-
-        let typed = Range::new(&col("tahun"), BinMode::Width(500.0)).read_sql("serving.t");
-        assert!(!typed.contains("whole"), "{typed}");
-        assert!(!typed.contains(" fr"), "{typed}");
     }
 
     #[test]

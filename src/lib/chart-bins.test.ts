@@ -39,28 +39,12 @@ test("a bin reads 500 – 1,000 and keeps the decimals its edges need", () => {
   assert.equal(binLabel(1000, 1000), "1,000 – 2,000")
 })
 
-// QA LH-BI-2-02 (BI-55): a year column is never labelled as a range of one.
-test("a bin of width 1 over whole numbers reads as its one value, with no separator", () => {
-  assert.equal(binLabel(2020, 1, true), "2020")
-  assert.equal(binLabel(2020, 1), "2,020 – 2,021")
-  assert.equal(binLabel(2020, 5, true), "2,020 – 2,025")
-  assert.equal(binLabel(0.5, 1, true), "0.5 – 1.5")
-})
-
 test("rows are relabelled column by column and a value that is not a number is left alone", () => {
   const rows = [{ v: 0, n: 3 }, { v: 500, n: 4 }, { v: null, n: 1 }, { v: "x", n: 2 }]
   const out = relabelBins(rows, { v: { width: 500 } })
   assert.deepEqual(out.map((r) => r.v), ["0 – 500", "500 – 1,000", null, "x"])
   assert.deepEqual(out.map((r) => r.n), [3, 4, 1, 2])
   assert.deepEqual(relabelBins(rows, {}), rows)
-})
-
-// QA LH-BI-2-02 (BI-55): the tile tells the rows that the column is whole.
-test("a year in a bin of one reads as the year", () => {
-  assert.deepEqual(
-    relabelBins([{ tahun: 2020, v: 1 }], { tahun: { width: 1, whole: true } }),
-    [{ tahun: "2020", v: 1 }],
-  )
 })
 
 test("the tile's bins come from what the server read, else from a width the chart fixes", () => {
@@ -70,23 +54,6 @@ test("the tile's bins come from what the server read, else from a width the char
   const fixed = binsOfTile(undefined, { dimension: "visitors", bin: { mode: "width", width: 100 }, groupings: [{ column: "g", bin: { mode: "auto" } }] })
   assert.deepEqual(fixed, { visitors: { width: 100 } })
   assert.deepEqual(binsOfTile({ visitors: { width: 0 } }, { dimension: "visitors", bin: { mode: "auto" } }), {})
-})
-
-// QA LH-BI-2-02 (BI-55, D7): `whole` reaches the tile only when the server
-// said 1 (or true).
-test("the tile's bins say whole only when the server said so", () => {
-  assert.deepEqual(
-    binsOfTile({ tahun: { mode: "auto", width: 1, min: 2020, max: 2024, whole: 1 } }, undefined),
-    { tahun: { width: 1, max: 2024, whole: true } },
-  )
-  assert.deepEqual(
-    binsOfTile({ tahun: { mode: "auto", width: 1, min: 2020, max: 2024, whole: 0 } }, undefined),
-    { tahun: { width: 1, max: 2024 } },
-  )
-  assert.deepEqual(
-    binsOfTile({ tahun: { mode: "auto", width: 1, min: 2020, max: 2024 } }, undefined),
-    { tahun: { width: 1, max: 2024 } },
-  )
 })
 
 test("a clicked bin filters with the lower edge in and the upper out, except the last bin", () => {

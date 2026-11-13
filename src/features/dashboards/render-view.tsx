@@ -187,12 +187,15 @@ export function RenderView({ token, chart = false }: { token: string; chart?: bo
     );
   }
 
+  // QA LH-BI-1-01 F1, LH-BI-6-22, LH-BI-6-23 (BI-53, D17): laid out at the paper's width before a chart is drawn.
+  const width = paperContentWidth(data.render?.paper, data.render?.orientation);
+
   return (
     <ReportingProvider reporting={data.reporting}>
       <RenderModeProvider value={mode}>
         <div
           className={cn("mx-auto min-h-screen bg-background p-2 text-foreground", look.className)}
-          style={{ ...look.style, width: paperContentWidth(data.render?.paper, data.render?.orientation) }}
+          style={{ ...look.style, width }}
           data-render-view
         >
           <header className="mb-4 border-b pb-3">

@@ -30,7 +30,8 @@ export function filterLine(f: FilterDef): string {
 }
 
 /**
- * The paper's printable width in CSS pixels (`BI-53`, D17): the paper's width
+ * The paper's printable width in CSS pixels (`BI-53`, D17; QA `LH-BI-1-01`
+ * F1, `LH-BI-6-22`, `LH-BI-6-23`): the paper's width
  * less the two 0.5 in side margins the API sends, at 96 px per inch, rounded
  * down. A4 is 8.27 by 11.7 in and Letter 8.5 by 11 (anything else reads as
  * A4); `landscape` takes the longer side, anything else the shorter: 697, 1027,
