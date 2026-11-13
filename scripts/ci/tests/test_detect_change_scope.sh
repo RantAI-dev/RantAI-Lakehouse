@@ -36,7 +36,7 @@ trap 'rm -rf "$REPO_DIR"' EXIT
   git config user.email "ci-test@example.com"
   git config user.name "CI Test"
 
-  mkdir -p docs GTM src/lib src/components public rust/crates dagster ops/g6 ops/g9 ops/fixtures scripts .github/workflows
+  mkdir -p docs GTM src/lib src/components public/geo rust/crates dagster ops/g6 ops/g9 ops/fixtures ops/release/fixtures/sigstore scripts .github/workflows
 
   : > docs/test.md
   : > GTM/test.md
@@ -46,6 +46,7 @@ trap 'rm -rf "$REPO_DIR"' EXIT
   : > src/components/button.tsx
   : > src/lib/dashboard-specs.ts
   : > public/robots.txt
+  : > public/geo/id-provinces.geojson
   : > package.json
   : > bun.lock
   : > bunfig.toml
@@ -61,6 +62,8 @@ trap 'rm -rf "$REPO_DIR"' EXIT
   : > ops/g6/test.py
   : > ops/g9/upload_test.py
   : > ops/fixtures/upload_load_failure_reasons.json
+  : > ops/release/release.pub
+  : > ops/release/fixtures/sigstore/release.json
   mkdir -p scripts/ci
   : > scripts/ci/detect_change_scope.sh
   : > scripts/compose.sh
@@ -91,7 +94,8 @@ run_case() {
 
   (
     cd "$REPO_DIR"
-    EVENT_NAME="pull_request" \
+    EVENT_NAME="${CASE_EVENT:-pull_request}" \
+    FORCE_ALL="${CASE_FORCE_ALL:-}" \
     BASE_SHA="$BASE_SHA" \
     GITHUB_OUTPUT="$output" \
     bash "$SCRIPT" >/dev/null
@@ -172,10 +176,19 @@ assert_case "ops/g6/test.py is stack-only" "false" "false" "false" "true" "false
 # SRC-9 task 7: the upload gate's own files select the acceptance jobs (g9-upload) through stack.
 assert_case "ops/g9/upload_test.py is stack-only" "false" "false" "false" "true" "false" "false" "ops/g9/upload_test.py"
 assert_case "scripts/compose.sh is stack-only" "false" "false" "false" "true" "false" "false" "scripts/compose.sh"
-assert_case ".env.example is stack-only" "false" "false" "false" "true" "false" "false" ".env.example"
+# OPS-24 D1: .env.example is compiled into lakehousectl
+# (rust/crates/lakehousectl/src/secrets.rs:66, include_str!), so it sets rust
+# as well as stack. Wider than before, not weaker.
+assert_case ".env.example sets rust and stack" "true" "false" "false" "true" "false" "false" ".env.example"
 
 # Cross-cutting fixture tests
 assert_case "ops/fixtures forces all" "true" "true" "true" "true" "false" "true" "ops/fixtures/upload_load_failure_reasons.json"
+
+# OPS-24 R5: the three paths outside rust/ that Rust compiles in. Each sets
+# rust on top of the scope its own path already had.
+assert_case "ops/release/release.pub sets rust and stack" "true" "false" "false" "true" "false" "false" "ops/release/release.pub"
+assert_case "ops/release/fixtures/sigstore/release.json sets rust and stack" "true" "false" "false" "true" "false" "false" "ops/release/fixtures/sigstore/release.json"
+assert_case "public/geo/id-provinces.geojson sets rust and frontend" "true" "true" "false" "false" "false" "false" "public/geo/id-provinces.geojson"
 
 # CI script tests
 assert_case "scripts/ci forces all" "true" "true" "true" "true" "false" "true" "scripts/ci/detect_change_scope.sh"
@@ -190,23 +203,38 @@ assert_case "unclassified file forces all" "true" "true" "true" "true" "false" "
 assert_case "docs + rust sets rust and clears docs_only" "true" "false" "false" "false" "false" "false" "docs/test.md" "rust/crates/lib.rs"
 assert_case "frontend + dagster sets both" "false" "true" "true" "false" "false" "false" "src/components/button.tsx" "dagster/pipeline.py"
 
-# Push event test
-(
-  output="$REPO_DIR/github_output_push"
-  : > "$output"
-  cd "$REPO_DIR"
-  EVENT_NAME="push" \
-  BASE_SHA="$BASE_SHA" \
-  GITHUB_OUTPUT="$output" \
-  bash "$SCRIPT" >/dev/null
-  a="$(grep "^all=" "$output" | cut -d= -f2)"
-  r="$(grep "^rust=" "$output" | cut -d= -f2)"
-  if [ "$a" = "true" ] && [ "$r" = "true" ]; then
-    log_pass "push event forces all=true"
+# Push event tests (OPS-24 D1, D8): a push follows the scope like a pull
+# request, and only CI_PUSH_FULL=true (FORCE_ALL) widens it.
+CASE_EVENT=push assert_case "a documents-only push is documents-only" "false" "false" "false" "false" "true" "false" "docs/test.md"
+CASE_EVENT=push assert_case "a Rust push sets rust only" "true" "false" "false" "false" "false" "false" "rust/crates/lib.rs"
+CASE_EVENT=push assert_case "a workflow push forces all" "true" "true" "true" "true" "false" "true" ".github/workflows/ci.yml"
+CASE_EVENT=push CASE_FORCE_ALL=true assert_case "a documents-only push with CI_PUSH_FULL=true forces all" "true" "true" "true" "true" "false" "true" "docs/test.md"
+CASE_FORCE_ALL=true assert_case "CI_PUSH_FULL does not widen a pull request" "false" "false" "false" "false" "true" "false" "docs/test.md"
+
+# OPS-24 R4: only the exact string counts, and the script says which one it
+# read. `TRUE` and `1` are warnings, not switches -- the same answer the
+# workflow's `env:` value gets, because the comparison happens here only.
+CASE_EVENT=push CASE_FORCE_ALL=TRUE assert_case "CI_PUSH_FULL=TRUE does not widen a push" "false" "false" "false" "false" "true" "false" "docs/test.md"
+CASE_EVENT=push CASE_FORCE_ALL=1 assert_case "CI_PUSH_FULL=1 does not widen a push" "false" "false" "false" "false" "true" "false" "docs/test.md"
+
+# OPS-24 R4: `push_full` is the one answer the workflow reads to turn the push
+# proof off. It is true only for a push with CI_PUSH_FULL exactly `true`.
+assert_push_full() {
+  local label="$1" want="$2"
+  local output got
+  output="$(run_case docs/test.md)"
+  got="$(grep "^push_full=" <<< "$output" | cut -d= -f2)"
+  if [ "$got" = "$want" ]; then
+    log_pass "$label"
   else
-    log_fail "push event did not force all=true"
+    log_fail "$label (got push_full=${got}, want ${want})"
   fi
-)
+}
+
+CASE_EVENT=push CASE_FORCE_ALL=true assert_push_full "push_full is true for a push with CI_PUSH_FULL=true" "true"
+CASE_EVENT=push CASE_FORCE_ALL=TRUE assert_push_full "push_full is false for a push with CI_PUSH_FULL=TRUE" "false"
+CASE_EVENT=push assert_push_full "push_full is false for a push without CI_PUSH_FULL" "false"
+CASE_EVENT=pull_request CASE_FORCE_ALL=true assert_push_full "push_full is false on a pull request with CI_PUSH_FULL=true" "false"
 
 # Move test: file moved from rust/ into docs/ must set rust=true
 test_rename_rust_to_docs() {
@@ -297,22 +325,96 @@ test_empty_diff() {
 }
 test_empty_diff
 
-# Unreadable base commit test
-(
-  output="$REPO_DIR/github_output_badbase"
+# Unreadable base commit test.
+#
+# OPS-24 R2: each of these blocks reports through its exit status, and the
+# counters are incremented OUTSIDE the subshell. A subshell that sets PASS or
+# FAIL cannot change its parent's count, so the same block written that way
+# prints FAIL and the suite still reports "0 failed".
+test_unreadable_base() {
+  local output="$REPO_DIR/github_output_badbase"
   : > "$output"
-  cd "$REPO_DIR"
-  EVENT_NAME="pull_request" \
-  BASE_SHA="0000000000000000000000000000000000000000" \
-  GITHUB_OUTPUT="$output" \
-  bash "$SCRIPT" >/dev/null
-  a="$(grep "^all=" "$output" | cut -d= -f2)"
-  if [ "$a" = "true" ]; then
-    log_pass "unreadable base SHA forces all=true"
-  else
-    log_fail "unreadable base SHA did not force all=true"
-  fi
-)
+  (
+    cd "$REPO_DIR" || return 1
+    EVENT_NAME="pull_request" \
+    BASE_SHA="0000000000000000000000000000000000000000" \
+    GITHUB_OUTPUT="$output" \
+    bash "$SCRIPT" >/dev/null
+  ) || return 1
+  [ "$(grep "^all=" "$output" | cut -d= -f2)" = "true" ]
+}
+
+if test_unreadable_base; then
+  log_pass "unreadable base SHA forces all=true"
+else
+  log_fail "unreadable base SHA did not force all=true"
+fi
+
+# A push whose base commit is unreadable fails closed (OPS-24 D1): with the
+# scope following the push's own diff, a diff that cannot be read must run
+# everything.
+test_push_unreadable_base() {
+  local output="$REPO_DIR/github_output_push_badbase"
+  : > "$output"
+  (
+    cd "$REPO_DIR" || return 1
+    EVENT_NAME="push" \
+    BASE_SHA="0000000000000000000000000000000000000000" \
+    GITHUB_OUTPUT="$output" \
+    bash "$SCRIPT" >/dev/null
+  ) || return 1
+  [ "$(grep "^all=" "$output" | cut -d= -f2)" = "true" ]
+}
+
+if test_push_unreadable_base; then
+  log_pass "a push with an unreadable base forces all=true"
+else
+  log_fail "a push with an unreadable base did not force all=true"
+fi
+
+# A scheduled run has no base commit at all, so every job runs (OPS-24 D3).
+test_schedule_forces_all() {
+  local output="$REPO_DIR/github_output_schedule"
+  : > "$output"
+  (
+    cd "$REPO_DIR" || return 1
+    EVENT_NAME="schedule" \
+    BASE_SHA="" \
+    GITHUB_OUTPUT="$output" \
+    bash "$SCRIPT" >/dev/null
+  ) || return 1
+  [ "$(grep "^all=" "$output" | cut -d= -f2)" = "true" ]
+}
+
+if test_schedule_forces_all; then
+  log_pass "a scheduled run forces all=true"
+else
+  log_fail "a scheduled run did not force all=true"
+fi
+
+# OPS-24 R3: any event that is neither `push` nor `pull_request` forces all,
+# explicitly and with a log line, whatever base SHA it carries -- a base that
+# happens to be readable must not narrow the run.
+test_unknown_event_forces_all() {
+  local output="$REPO_DIR/github_output_unknown_event"
+  : > "$output"
+  (
+    cd "$REPO_DIR" || return 1
+    git reset --hard "$BASE_SHA" >/dev/null 2>&1
+    EVENT_NAME="release" \
+    BASE_SHA="$BASE_SHA" \
+    GITHUB_OUTPUT="$output" \
+    bash "$SCRIPT" >"$REPO_DIR/unknown_event.log" 2>&1
+  ) || return 1
+  [ "$(grep "^all=" "$output" | cut -d= -f2)" = "true" ] || return 1
+  grep -q "is neither push nor pull_request" "$REPO_DIR/unknown_event.log"
+}
+
+if test_unknown_event_forces_all; then
+  log_pass "an event other than push and pull_request forces all=true"
+else
+  log_fail "an event other than push and pull_request did not force all=true"
+fi
 
 echo "=== Results: $PASS passed, $FAIL failed ==="
 if [ "$FAIL" -gt 0 ]; then
