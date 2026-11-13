@@ -36,6 +36,7 @@ expect() {
   (
     # Clean subshell environment
     unset EVENT_NAME SCOPE_RUST SCOPE_FRONTEND SCOPE_DAGSTER SCOPE_STACK SCOPE_DOCS_ONLY SCOPE_ALL \
+          PUSH_PROVEN \
           CHANGES_RESULT REPO_LINTS_RESULT FRONTEND_RESULT RUST_FMT_RESULT RUST_CLIPPY_RESULT \
           RUST_BUILD_RESULT RUST_TEST_RESULT RUST_MSRV_RESULT DAGSTER_TESTS_RESULT DAGSTER_LOADER_TESTS_RESULT \
           G1_RUSTFS_RESULT G2_SEAWEEDFS_RESULT G3A_DAGSTER_RESULT G3_MAINTENANCE_RESULT \
@@ -132,6 +133,20 @@ base_push_green=(
   IMAGES_RESULT=success IMAGE_SMOKE_RESULT=success
 )
 
+# OPS-24 D5/D6: a push proven to repeat a passed pull request. The Rust jobs,
+# `images` and the lints ran; the acceptance jobs and `image-smoke` were
+# skipped because they repeated a run that passed.
+base_push_proven_green=(
+  EVENT_NAME=push SCOPE_RUST=true PUSH_PROVEN=true
+  CHANGES_RESULT=success REPO_LINTS_RESULT=success FRONTEND_RESULT=skipped
+  RUST_FMT_RESULT=success RUST_CLIPPY_RESULT=success RUST_BUILD_RESULT=success
+  RUST_TEST_RESULT=success RUST_MSRV_RESULT=success DAGSTER_TESTS_RESULT=skipped DAGSTER_LOADER_TESTS_RESULT=skipped
+  G1_RUSTFS_RESULT=skipped G2_SEAWEEDFS_RESULT=skipped G3A_DAGSTER_RESULT=skipped
+  G3_MAINTENANCE_RESULT=skipped G4_CDC_RESULT=skipped G4_MYSQL_RESULT=skipped G4_MSSQL_RESULT=skipped G4_MONGO_RESULT=skipped G4_ORACLE_RESULT=skipped G10_SSO_RESULT=skipped G6_INGEST_RESULT=skipped G6_INGEST_OTHER_RESULT=skipped G6_ORACLE_RESULT=skipped G9_UPLOAD_RESULT=skipped G6_ALERTS_RESULT=skipped G6_OPS_RESULT=skipped G6_CREDENTIALS_RESULT=skipped G6_SECRET_MANAGERS_RESULT=skipped G6_OAUTH_RESULT=skipped G6_DISCOVERY_SCALE_RESULT=skipped G6_SAAS_A_RESULT=skipped G6_SAAS_B_RESULT=skipped
+  GOLD_EXPORT_RESULT=skipped G8_GOVERNANCE_RESULT=skipped G8_TIME_TRAVEL_RESULT=skipped
+  IMAGES_RESULT=success IMAGE_SMOKE_RESULT=skipped
+)
+
 # 1. Happy path cases
 expect 0 "Docs-only green PR passes gate" "${base_docs_green[@]}"
 expect 0 "Frontend green PR passes gate" "${base_frontend_green[@]}"
@@ -178,7 +193,11 @@ expect 1 "Failing acceptance blocks stack PR" "${base_stack_green[@]}" G4_CDC_RE
 expect 1 "Failing SSO gate blocks rust PR" "${base_rust_green[@]}" G10_SSO_RESULT=failure
 expect 1 "Skipped SSO gate blocks stack PR" "${base_stack_green[@]}" G10_SSO_RESULT=skipped
 expect 1 "Cancelled job blocks gate" "${base_rust_green[@]}" RUST_TEST_RESULT=cancelled
-expect 1 "Skipped job on push blocks gate" "${base_push_green[@]}" RUST_TEST_RESULT=skipped
+# OPS-24 D1: the old two lines here asserted that the event `push` alone made
+# every job required. This plan replaces that rule with "the scope decides", so
+# the assertions are restated under the new rule: a skipped job the scope
+# requires is still an error.
+expect 1 "Skipped Rust test on a Rust push blocks gate" "${base_push_green[@]}" SCOPE_RUST=true RUST_TEST_RESULT=skipped
 expect 1 "Failing images job blocks rust PR" "${base_rust_green[@]}" IMAGES_RESULT=failure
 expect 1 "Cancelled images job blocks rust PR" "${base_rust_green[@]}" IMAGES_RESULT=cancelled
 expect 1 "Skipped images job blocks rust PR" "${base_rust_green[@]}" IMAGES_RESULT=skipped
@@ -186,7 +205,35 @@ expect 1 "Failing image smoke test blocks rust PR" "${base_rust_green[@]}" IMAGE
 expect 1 "Skipped image smoke test blocks rust PR" "${base_rust_green[@]}" IMAGE_SMOKE_RESULT=skipped
 expect 1 "Failing images job blocks dagster PR" "${base_dagster_green[@]}" IMAGES_RESULT=failure
 expect 1 "Failing images job blocks stack PR" "${base_stack_green[@]}" IMAGES_RESULT=failure
-expect 1 "Skipped image smoke test blocks push" "${base_push_green[@]}" IMAGE_SMOKE_RESULT=skipped
+expect 1 "Skipped image smoke test on a Rust push blocks gate" "${base_push_green[@]}" SCOPE_RUST=true IMAGE_SMOKE_RESULT=skipped
+
+# OPS-24 D1: a push is gated by its scope exactly like a pull request.
+expect 0 "Documents-only push with only the lints passes gate" "${base_docs_green[@]}" EVENT_NAME=push
+expect 1 "Failed job on a documents-only push blocks gate" "${base_docs_green[@]}" EVENT_NAME=push RUST_TEST_RESULT=failure
+expect 1 "Push that forces all with a skipped gate blocks gate" "${base_push_green[@]}" SCOPE_ALL=true G1_RUSTFS_RESULT=skipped
+# OPS-24 D3: the scheduled run has no base commit, so the scope is all=true.
+expect 0 "Scheduled run with everything green passes gate" "${base_all_green[@]}" EVENT_NAME=schedule
+expect 1 "Scheduled run with a skipped gate blocks gate" "${base_all_green[@]}" EVENT_NAME=schedule G4_CDC_RESULT=skipped
+# OPS-24 R3: the two all-jobs events require every job whatever the scope
+# says, so an empty scope with skipped jobs is red, not green.
+expect 1 "Scheduled run with empty scopes and skipped gates blocks gate" "${base_docs_green[@]}" EVENT_NAME=schedule
+expect 1 "Manual run with empty scopes and skipped gates blocks gate" "${base_docs_green[@]}" EVENT_NAME=workflow_dispatch
+expect 0 "Manual run with everything green passes gate" "${base_all_green[@]}" EVENT_NAME=workflow_dispatch
+
+# OPS-24 D5/D6: a proven push excuses the acceptance jobs and `image-smoke`,
+# and nothing else. A failure or a cancellation is still an error, and the
+# proof means nothing on another event or with any other value.
+expect 0 "Proven push with the gates skipped passes gate" "${base_push_proven_green[@]}"
+expect 0 "Proven push whose gates ran green passes gate" "${base_push_proven_green[@]}" G4_CDC_RESULT=success
+expect 1 "A failed gate on a proven push blocks gate" "${base_push_proven_green[@]}" G4_CDC_RESULT=failure
+expect 1 "A cancelled gate on a proven push blocks gate" "${base_push_proven_green[@]}" G6_OPS_RESULT=cancelled
+expect 1 "A skipped images job on a proven push blocks gate" "${base_push_proven_green[@]}" IMAGES_RESULT=skipped
+expect 1 "A skipped Rust test job on a proven push blocks gate" "${base_push_proven_green[@]}" RUST_TEST_RESULT=skipped
+expect 1 "A skipped clippy job on a proven push blocks gate" "${base_push_proven_green[@]}" RUST_CLIPPY_RESULT=skipped
+expect 1 "Skipped gates on a push that is not proven block gate" "${base_push_proven_green[@]}" PUSH_PROVEN=false
+expect 1 "Skipped gates on a push with no proof value block gate" "${base_push_proven_green[@]}" PUSH_PROVEN=
+expect 1 "The proof is ignored on a pull request" "${base_push_proven_green[@]}" EVENT_NAME=pull_request
+expect 1 "The proof is ignored on a scheduled run" "${base_push_proven_green[@]}" EVENT_NAME=schedule SCOPE_ALL=true
 # A failed `images` job makes every job that `needs: images` report
 # `skipped`, not `failure`. The gate must still be red: both `images` itself
 # and each skipped consumer are errors for a PR that required them.

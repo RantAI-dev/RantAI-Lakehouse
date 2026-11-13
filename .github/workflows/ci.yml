@@ -9,6 +9,13 @@ on:
     # filter means every PR above the first gets ZERO check runs and merges
     # unverified.
     branches: [main, 'lakehouse/**']
+  # OPS-24 D3: the full run that replaces "every push runs everything". The
+  # nightly run (19:23 UTC, an hour with no pull-request run) and the manual
+  # one are the backstop that still exercises every gate. Neither event has a
+  # base commit, so `scripts/ci/detect_change_scope.sh` forces `all=true`.
+  schedule:
+    - cron: '23 19 * * *'
+  workflow_dispatch:
 
 # Read-only token for every job. Nothing here writes to the repository, a
 # package registry or a PR: the image artifacts and the layer cache go
@@ -22,13 +29,22 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   # F4: a push to main must finish its run; cancelling it made its ci-required read as failed.
+  # OPS-24 D2: a run that is not a pull request's has its own group, because
+  # one group for all pushes left 5 of 30 push runs never started (each waited
+  # behind a run holding the group, then was replaced by the next push). With
+  # D1 a push covers only its own diff, so a replaced run is never covered by
+  # a later one.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
 
+# OPS-24 D1: no job's `if:` names the event any more. A push and a pull
+# request are both scoped by their own diff, so the scope outputs of `changes`
+# decide what runs. Before this, every `if:` began with an event test that
+# made a push run all 42 jobs.
 jobs:
   # ── Change Scope Detection ──────────────────────────────────────────
   # Classifies the pull request diff or push into change scopes. Downstream
@@ -38,6 +54,17 @@ jobs:
     name: Detect Change Scope
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # OPS-24 D7: read-only, and only this job asks for the two extra scopes.
+    # The push proof reads the merged pull request's check runs, which needs
+    # `checks: read`, and finds that pull request, which needs
+    # `pull-requests: read`. A job-level block replaces the workflow's, so
+    # `contents: read` is repeated. All three are read scopes, which is all a
+    # fork's pull request is given, and the proof script returns before any API
+    # call unless the event is `push`. No secret is used.
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
     outputs:
       rust: ${{ steps.scope.outputs.rust }}
       frontend: ${{ steps.scope.outputs.frontend }}
@@ -45,6 +72,24 @@ jobs:
       stack: ${{ steps.scope.outputs.stack }}
       docs_only: ${{ steps.scope.outputs.docs_only }}
       all: ${{ steps.scope.outputs.all }}
+      # OPS-24 D8, R4: `push_full` is the scope script's own answer to "is the
+      # kill switch on for this push?". The workflow never compares
+      # `CI_PUSH_FULL` itself, so an expression's case-insensitive `==` cannot
+      # call `TRUE` on when the script calls it off.
+      push_full: ${{ steps.scope.outputs.push_full }}
+      # OPS-24 D4/D8: `proven` is true only for a push whose own `ci-required`
+      # run repeated a passed pull request, and only while the kill switch is
+      # unset. The proof script returns `false` on every other event, and R4
+      # makes the off switch the scope script's output, so neither half is a
+      # second expression here. Anything else -- an error, an empty answer --
+      # is `false`, so the jobs run.
+      proven: ${{ (steps.scope.outputs.push_full != 'true' && steps.proof.outputs.proven == 'true') && 'true' || 'false' }}
+      proven_by: ${{ steps.proof.outputs.proven_by }}
+      proven_pr: ${{ steps.proof.outputs.proven_pr }}
+      proof_reason: ${{ steps.proof.outputs.reason }}
+      # OPS-24 D10: the runner of the small Rust jobs, chosen by
+      # scripts/ci/select_runner.sh. Default hosted; the switch is off.
+      compile_runner: ${{ steps.runner.outputs.compile_runner }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -61,7 +106,56 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          # OPS-24 D8: the kill switch, passed through raw. Exactly `true`
+          # (lower case) makes every push run everything again, from the next
+          # push, with no code change; the script, not an expression, is where
+          # that is compared (R4).
+          FORCE_ALL: ${{ vars.CI_PUSH_FULL }}
         run: ./scripts/ci/detect_change_scope.sh
+
+      - name: Self-test push proof
+        run: bash ./scripts/ci/tests/test_detect_push_proof.sh
+
+      # OPS-24 D4: on a push, ask whether this commit only repeats a pull
+      # request's run. Nothing reads `proven` yet in this task; the gate and
+      # the jobs use it in T4.
+      - name: Detect whether this push repeats a passed pull request
+        id: proof
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          BASE_BRANCH: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          SCOPE_RUST: ${{ steps.scope.outputs.rust }}
+          SCOPE_DAGSTER: ${{ steps.scope.outputs.dagster }}
+          SCOPE_STACK: ${{ steps.scope.outputs.stack }}
+          SCOPE_ALL: ${{ steps.scope.outputs.all }}
+        run: |
+          ./scripts/ci/detect_push_proof.sh || {
+            echo "::warning::the push-proof script failed; nothing is treated as proven"
+            echo "proven=false" >> "$GITHUB_OUTPUT"
+            echo "reason=the proof script failed" >> "$GITHUB_OUTPUT"
+          }
+
+      - name: Self-test runner selection
+        run: bash ./scripts/ci/tests/test_select_runner.sh
+
+      - name: Self-test worker preparation
+        run: bash ./scripts/ci/tests/test_worker_prepare.sh
+
+      # OPS-24 D10: hosted unless the repository variable CI_WORKER_COMPILE is
+      # exactly `true` and the run is not a fork's pull request. The labels are
+      # fixed in the script, so no variable can name another runner.
+      - name: Choose the runner of the small Rust jobs
+        id: runner
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          SWITCH: ${{ vars.CI_WORKER_COMPILE }}
+          OUTPUT_NAME: compile_runner
+        run: ./scripts/ci/select_runner.sh
 
   # ── Repo Lints (merged: parity corpus, R11, compose init, Dagster imports) ──
   # Folded into a single job with one step each: these four fast static checks
@@ -100,6 +194,14 @@ jobs:
       # task's own commit body.
       - name: Check compose init-container readiness (WS0)
         run: python3 ops/lint/check_compose_init_readiness.py
+
+      # OPS-24 R5: a file Rust compiles in with `include_str!`/`include_bytes!`
+      # is part of the Rust build even when it sits outside `rust/`, so a change
+      # to it must set the `rust` scope or the only jobs that compile it are
+      # skipped. The check reads the sources and asks the real scope script, so
+      # it fails when a new such path is added and the scope is not widened.
+      - name: Check every file compiled into Rust from outside rust/ sets the rust scope (OPS-24)
+        run: python3 ops/lint/check_rust_embedded_paths.py
 
       # A dangling `from dispar_orchestrate.X import Y` is an ImportError at
       # code-location load, which takes down EVERY job in the location — the
@@ -196,7 +298,7 @@ jobs:
   verify:
     name: Frontend · Lint · Typecheck · Test · Build
     needs: changes
-    if: github.event_name == 'push' || needs.changes.outputs.frontend == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.frontend == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -227,7 +329,7 @@ jobs:
   dagster-unit-tests:
     name: Dagster · unit tests
     needs: changes
-    if: github.event_name == 'push' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.dagster == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -263,7 +365,7 @@ jobs:
   dagster-loader-tests:
     name: Dagster · loader tests
     needs: changes
-    if: github.event_name == 'push' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.dagster == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -295,13 +397,31 @@ jobs:
         working-directory: dagster
 
   # ── Rust: fast feedback ─────────────────────────────────────────────
+  # OPS-24 D10: these four jobs can run on the CI worker when the repository
+  # variable CI_WORKER_COMPILE is `true` (scripts/ci/select_runner.sh picks the
+  # runner and hands it over in `needs.changes.outputs.compile_runner`). With
+  # the variable unset they run on `ubuntu-latest`, exactly as before. Each of
+  # them refuses a self-hosted runner that is not marked as the CI worker
+  # before checkout, and keeps its cache and disk steps to a hosted runner.
   fmt:
     name: Rust · fmt
     needs: changes
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
-    runs-on: ubuntu-latest
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ${{ fromJSON(needs.changes.outputs.compile_runner || '["ubuntu-latest"]') }}
     timeout-minutes: 5
     steps:
+      # OPS-24 D10: second line of defence. A self-hosted runner only takes
+      # this job if it carries the label, and this step refuses one that is
+      # not marked in its own `.env`. It runs BEFORE checkout, whose
+      # `git clean -ffdx` would delete that file.
+      - name: Refuse a self-hosted runner that is not the CI worker
+        if: runner.environment == 'self-hosted'
+        run: |
+          if [ "${LAKEHOUSE_CI_WORKER:-}" != "1" ]; then
+            echo "::error::this self-hosted runner is not marked as the CI worker (LAKEHOUSE_CI_WORKER=1 in the runner's .env); refusing before checkout"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v7
 
@@ -321,10 +441,19 @@ jobs:
   clippy:
     name: Rust · clippy
     needs: changes
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
-    runs-on: ubuntu-latest
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ${{ fromJSON(needs.changes.outputs.compile_runner || '["ubuntu-latest"]') }}
     timeout-minutes: 15
     steps:
+      # OPS-24 D10: see the `fmt` job's refuse step.
+      - name: Refuse a self-hosted runner that is not the CI worker
+        if: runner.environment == 'self-hosted'
+        run: |
+          if [ "${LAKEHOUSE_CI_WORKER:-}" != "1" ]; then
+            echo "::error::this self-hosted runner is not marked as the CI worker (LAKEHOUSE_CI_WORKER=1 in the runner's .env); refusing before checkout"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v7
 
@@ -333,6 +462,15 @@ jobs:
         with:
           components: clippy
 
+      # OPS-24 D10: the worker keeps its own target directory, so uploading and
+      # downloading a cache its disk already has would only cost time.
+      - name: Prepare the CI worker
+        if: runner.environment == 'self-hosted'
+        run: bash ./scripts/ci/worker_prepare.sh
+        env:
+          TARGET_MAX_GB: ${{ vars.CI_WORKER_TARGET_MAX_GB }}
+          WORKER_CARGO_JOBS: ${{ vars.CI_WORKER_CARGO_JOBS }}
+
       # Restore on every run, SAVE only on `main`. Measured 2026-10-09: PR #88
       # stored its own 980 MB `build` cache next to `main`'s identical one,
       # and the repository's Actions cache sat at 9.9 GB of its 10 GB cap,
@@ -340,6 +478,7 @@ jobs:
       # §4.2, §9). A PR still restores `main`'s cache; it just no longer adds
       # its own copy.
       - name: Cache cargo
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
@@ -352,18 +491,38 @@ jobs:
   build:
     name: Rust · build
     needs: changes
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
-    runs-on: ubuntu-latest
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ${{ fromJSON(needs.changes.outputs.compile_runner || '["ubuntu-latest"]') }}
     timeout-minutes: 15
     steps:
+      # OPS-24 D10: see the `fmt` job's refuse step.
+      - name: Refuse a self-hosted runner that is not the CI worker
+        if: runner.environment == 'self-hosted'
+        run: |
+          if [ "${LAKEHOUSE_CI_WORKER:-}" != "1" ]; then
+            echo "::error::this self-hosted runner is not marked as the CI worker (LAKEHOUSE_CI_WORKER=1 in the runner's .env); refusing before checkout"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v7
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # OPS-24 D10: see the `clippy` job's prepare step.
+      - name: Prepare the CI worker
+        if: runner.environment == 'self-hosted'
+        run: bash ./scripts/ci/worker_prepare.sh
+        env:
+          TARGET_MAX_GB: ${{ vars.CI_WORKER_TARGET_MAX_GB }}
+          WORKER_CARGO_JOBS: ${{ vars.CI_WORKER_CARGO_JOBS }}
+
       # Save on `main` only; see the `clippy` job's `Cache cargo` step.
+      # OPS-24 D10: a hosted runner only; the worker has its own target
+      # directory.
       - name: Cache cargo
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
@@ -377,7 +536,7 @@ jobs:
   test:
     name: Rust · test ${{ matrix.partition }}/3 (stable)
     needs: changes
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     strategy:
       # REL-20 (D4): three partitions. `count:` balances by test count rather
@@ -389,7 +548,10 @@ jobs:
       # `needs.test.result` is the worst of the three (D5).
       fail-fast: false
       matrix:
-        partition: [1, 2, 3]
+        # OPS-24 D5: a proven push keeps ONE leg of the matrix, so that the
+        # dependency cache pull requests restore is still refreshed (and
+        # nothing else is); any value but `true` gives the three legs.
+        partition: ${{ fromJSON(needs.changes.outputs.proven == 'true' && '[1]' || '[1, 2, 3]') }}
     # 60, not 40: the three last green runs of this job on `main` took 39m18s,
     # 30m07s and 36m12s (runs 40627697997, 40628462938, 40667618267), the
     # longest took 39m27s (40387475151), and the job was cancelled at the
@@ -451,8 +613,33 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           df -h /
 
+      # OPS-24 D13: the three images the tests start, pulled once here with a
+      # retry around the PULL only (a registry 502 was what failed a run; no
+      # test is ever retried). The tags are the ones the tests name:
+      # postgres:16-alpine (`lakehouse-test-support/src/lib.rs:279`),
+      # clickhouse/clickhouse-server:26.8 (`testcontainers-modules`' default
+      # repository with the tests' `.with_tag("26.8")`) and
+      # axllent/mailpit:v1.33.0 (`lakehouse-api/tests/email_settings_route.rs:52-53`).
+      # A tag that drifts only loses the retry: the test still pulls its own.
+      # The step ends with `docker images`, so it cannot fail the job.
+      # OPS-24 R12: each attempt is bounded by `timeout 180` (a pull that hangs
+      # would otherwise hold the job for its 30-minute limit), and the last
+      # attempt is not followed by a sleep nothing waits for.
+      - name: Pull the test images (the pull is retried, a test never is)
+        if: needs.changes.outputs.proven != 'true'
+        run: |
+          for image in postgres:16-alpine clickhouse/clickhouse-server:26.8 axllent/mailpit:v1.33.0; do
+            for attempt in 1 2 3; do
+              if timeout 180 docker pull --quiet "$image"; then break; fi
+              echo "pull of $image failed (attempt $attempt of 3)"
+              if [ "$attempt" -lt 3 ]; then sleep $((attempt * 10)); fi
+            done
+          done
+          docker images --format '{{.Repository}}:{{.Tag}}' | sort
+
       # Save on `main` only; see the `clippy` job's `Cache cargo` step.
       - name: Cache cargo
+        id: cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
@@ -477,17 +664,51 @@ jobs:
         with:
           tool: cargo-nextest
 
+      # OPS-24 D5: a proven push still compiles the workspace once, but does
+      # not run the tests, because the pull request's run already ran them on
+      # this tree. `rust-cache` saves only when its restore was not an exact
+      # hit, so only then is there something to build; on an exact hit this
+      # step is skipped and the cache is already what the pull requests read.
+      - name: Build the tests without running them (proven push, cache not current)
+        if: needs.changes.outputs.proven == 'true' && steps.cache.outputs.cache-hit != 'true'
+        run: cargo nextest run --workspace --locked --profile ci --no-run
+        working-directory: rust
+
       # ubuntu-latest ships Docker; lakehouse-test-support's integration
       # tests spin up real Postgres via testcontainers.
       #
       # REL-20 (D4): one of three partitions. `--color never` keeps the
       # summary line parseable (no ANSI); `tee` captures it for the count
       # step below while `PIPESTATUS` preserves nextest's own exit status.
+      # OPS-24 D5: a proven push does not run the tests at all.
       - name: cargo nextest run (partition ${{ matrix.partition }}/3)
+        if: needs.changes.outputs.proven != 'true'
         run: |
           cargo nextest run --workspace --locked --profile ci --color never \
             --partition "count:${{ matrix.partition }}/3" 2>&1 | tee nextest.log
           exit "${PIPESTATUS[0]}"
+        working-directory: rust
+
+      # OPS-24 (T5, measured for slice S2): a measurement, not a check. It
+      # prints the disk this job really used (the plan's §0.1 says 86 GB were
+      # free before "Free runner disk") and the size an archive of the test
+      # binaries would have, which is the number S2 starts from. No line of it
+      # may fail the job.
+      - name: Report disk and test binary sizes (OPS-24, measured for slice S2)
+        if: always() && matrix.partition == 1 && needs.changes.outputs.proven != 'true'
+        run: |
+          set +e   # a measurement: no line of it may fail the job
+          df -h / || true
+          du -sh target 2>/dev/null || true
+          find target/debug/deps -maxdepth 1 -type f -executable ! -name '*.so' -printf '%s %p\n' 2>/dev/null \
+            | sort -rn > "$RUNNER_TEMP/bins.txt" || true
+          awk '{s+=$1; n++} END {printf "test binaries: count=%d total_gib=%.2f\n", n, s/1073741824}' "$RUNNER_TEMP/bins.txt" || true
+          largest="$(head -1 "$RUNNER_TEMP/bins.txt" | cut -d' ' -f2-)"
+          if [ -n "$largest" ]; then
+            raw=$(stat -c %s "$largest"); packed=$(zstd -3 -T0 -c "$largest" | wc -c)
+            echo "largest binary: raw=$raw zstd3=$packed"
+          fi
+          true
         working-directory: rust
 
       # REL-20 (D3): nextest does not run doctests, so `cargo test --doc`
@@ -495,16 +716,18 @@ jobs:
       # (text/bash/json/sh/ignore), so it compiles and runs zero doctests
       # today, but the guarantee is kept. Run once, on partition 1, so the
       # doctest compile/run is not triplicated across the three partitions.
+      # OPS-24 D5: a proven push ran the doctests in the pull request's run.
       - name: cargo test --workspace --locked --doc (doctests)
-        if: matrix.partition == 1
+        if: matrix.partition == 1 && needs.changes.outputs.proven != 'true'
         run: cargo test --workspace --locked --doc
         working-directory: rust
 
       # REL-20 (D4): record this partition's test count (from nextest's
       # summary line) for the cross-partition sum check in `ci-required`,
       # and print it in this partition's job summary.
+      # OPS-24 D5: nothing ran, so there is no count to record.
       - name: Record nextest partition count (REL-20)
-        if: always()
+        if: always() && needs.changes.outputs.proven != 'true'
         run: |
           count=$(grep -oE '[0-9]+ tests run' nextest.log | head -1 | awk '{print $1}')
           if [ -z "$count" ]; then count=0; fi
@@ -518,7 +741,7 @@ jobs:
       # that already exists in the run, so the three cannot share one name.
       # `ci-required` downloads them by pattern, merges them and sums.
       - name: Upload nextest partition count (REL-20)
-        if: always()
+        if: always() && needs.changes.outputs.proven != 'true'
         uses: actions/upload-artifact@v7
         with:
           name: test-counts-${{ matrix.partition }}
@@ -537,10 +760,19 @@ jobs:
   msrv:
     name: Rust · MSRV check (1.99.0)
     needs: changes
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
-    runs-on: ubuntu-latest
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ${{ fromJSON(needs.changes.outputs.compile_runner || '["ubuntu-latest"]') }}
     timeout-minutes: 15
     steps:
+      # OPS-24 D10: see the `fmt` job's refuse step.
+      - name: Refuse a self-hosted runner that is not the CI worker
+        if: runner.environment == 'self-hosted'
+        run: |
+          if [ "${LAKEHOUSE_CI_WORKER:-}" != "1" ]; then
+            echo "::error::this self-hosted runner is not marked as the CI worker (LAKEHOUSE_CI_WORKER=1 in the runner's .env); refusing before checkout"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v7
 
@@ -549,8 +781,19 @@ jobs:
         with:
           toolchain: "1.99.0"
 
+      # OPS-24 D10: see the `clippy` job's prepare step.
+      - name: Prepare the CI worker
+        if: runner.environment == 'self-hosted'
+        run: bash ./scripts/ci/worker_prepare.sh
+        env:
+          TARGET_MAX_GB: ${{ vars.CI_WORKER_TARGET_MAX_GB }}
+          WORKER_CARGO_JOBS: ${{ vars.CI_WORKER_CARGO_JOBS }}
+
       # Save on `main` only; see the `clippy` job's `Cache cargo` step.
+      # OPS-24 D10: a hosted runner only; the worker has its own target
+      # directory.
       - name: Cache cargo
+        if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
@@ -569,7 +812,7 @@ jobs:
   g1-rustfs:
     name: Rust · G1 acceptance (RustFS)
     needs: changes
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -615,7 +858,7 @@ jobs:
   g2-seaweedfs:
     name: Rust · G2 storage boundary (SeaweedFS)
     needs: changes
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -689,11 +932,15 @@ jobs:
   # (docs/CI.md), and an artifact needs no registry credential, so it works
   # on a fork PR's read-only token too.
   #
-  # Same `if:` as the acceptance jobs: it builds what they run.
+  # OPS-24 D5: `images` also runs on a proven push, even though the gates that
+  # consume its artifacts do not. It is the only writer of the image layer
+  # cache (`type=gha`, scopes `api-image` and `dagster-image`), which the
+  # pull requests read; skipping it would stop `main` from refreshing that
+  # cache. So its `if:` is the acceptance one and not the gates' one.
   images:
     name: Images · build lakehouse-api + dagster once
     needs: changes
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -786,7 +1033,7 @@ jobs:
   g3a-dagster:
     name: Rust · G3a Dagster + dlt Bronze ingest
     needs: [changes, images]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     # BLD-2 review R1 SHOULD-FIX 16: raised to 45 for the BLD-2 D11 target lag
     # verification step inside G7, which takes 5 append iterations with settling
@@ -976,7 +1223,7 @@ jobs:
   g3-maintenance:
     name: Rust · G3 Bronze maintenance job
     needs: [changes, images]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -1064,7 +1311,7 @@ jobs:
   g4-cdc:
     name: Rust · G4 change capture into Bronze
     needs: [changes, images]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -1229,7 +1476,7 @@ jobs:
   g4-mysql:
     name: Rust · G4 MySQL change capture into Bronze
     needs: [changes, images]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -1379,7 +1626,7 @@ jobs:
   g4-mongo:
     name: Rust · G4 MongoDB change capture into Bronze
     needs: [changes, images]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -1530,7 +1777,7 @@ jobs:
   g4-oracle:
     name: Rust · G4 Oracle change capture into Bronze
     needs: [changes, images]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -1674,7 +1921,7 @@ jobs:
   g4-mssql:
     name: Rust · G4 SQL Server change capture into Bronze
     needs: [changes, images]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -1837,7 +2084,7 @@ jobs:
     # `scripts/ci/required_gate.sh` requires acceptance gates when Dagster
     # changed, so a trigger without `dagster` skipped this job and failed
     # `ci-required` on every Dagster-only PR (found on #251, `SEC-52`).
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -1919,7 +2166,7 @@ jobs:
   g6-ingest:
     name: Rust · G6 ingest matrix (SQL sources)
     needs: [changes, images]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     # 25, not 20, as the job timeout (PR #101, product owner 2026-10-10): it
     # is the cut-off, not the target. Before the split this one job took
@@ -2080,7 +2327,7 @@ jobs:
   g6-ingest-other:
     name: Rust · G6 ingest matrix (files, APIs, streams)
     needs: [changes, images]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     # The cut-off, as in `g6-ingest`; the target is under 20 minutes.
     timeout-minutes: 25
@@ -2245,7 +2492,7 @@ jobs:
   g6-oracle:
     name: Rust · G6 Oracle connector
     needs: [changes, images]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -2355,7 +2602,7 @@ jobs:
   g9-upload:
     name: Rust · G9 file upload
     needs: [changes, images]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -2455,7 +2702,7 @@ jobs:
   g6-alerts:
     name: Rust · SRC-17 alert delivery
     needs: [changes, images]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -2602,7 +2849,7 @@ jobs:
   g6-ops:
     name: Rust · SRC-11 connector operations
     needs: [changes, images]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -2733,7 +2980,7 @@ jobs:
   g6-credentials:
     name: Rust · SRC-12 credentials at rest
     needs: [changes, images]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -2883,7 +3130,7 @@ jobs:
   g6-secret-managers:
     name: Rust · SRC-12 secret managers (Vault, AWS)
     needs: [changes, images]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -3017,7 +3264,7 @@ jobs:
   g6-oauth:
     name: Rust · SRC-12 OAuth sign-in
     needs: [changes, images]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -3127,7 +3374,7 @@ jobs:
   g6-discovery-scale:
     name: Rust · SRC-13 discovery of 10,000 tables
     needs: [changes, images]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -3242,7 +3489,7 @@ jobs:
   g6-saas-a:
     name: Rust · SRC-3 business-app connectors (A)
     needs: [changes, images]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -3340,7 +3587,7 @@ jobs:
   g6-saas-b:
     name: Rust · SRC-3 business-app connectors (B)
     needs: [changes, images]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -3447,7 +3694,7 @@ jobs:
   gold-export:
     name: Rust · Gold export to Iceberg (ADR 0010)
     needs: [changes, images]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     # DATA-2: raised from 20 by measured acceptance test execution time
     # (327s, ~6 minutes) plus 5 minutes of slack (11 minutes total raise).
@@ -3561,7 +3808,7 @@ jobs:
   g8-governance:
     name: Rust · G8 governance masking (${{ matrix.engine }})
     needs: [changes, images]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     # Raised from 15: the `trino` leg's stack carries the whole Lakekeeper
     # chain (the coordinator's own `depends_on`), which takes a few
@@ -3671,7 +3918,7 @@ jobs:
   image-smoke:
     name: Image smoke test · lakehouse-api /health
     needs: [changes, images]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -3752,7 +3999,7 @@ jobs:
   g8-time-travel:
     name: Rust · G8 time travel keeps the policy (${{ matrix.engine }})
     needs: [changes, images]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true')
     runs-on: ubuntu-latest
     # Raised from 25: the `trino` leg's stack carries the Trino
     # coordinator, whose own startup (and the Lakekeeper chain behind it)
@@ -3900,6 +4147,30 @@ jobs:
       - name: Self-test required gate
         run: bash ./scripts/ci/tests/test_required_gate.sh
 
+      # OPS-24 D5/D6: say, on the run's own page, what a proven push skipped
+      # and on what proof. The values are only ever used inside double quotes:
+      # they come from the API (a pull-request number and a commit SHA the
+      # proof script validated), never from a pull request's own text.
+      - name: Say what this push did not repeat
+        if: github.event_name == 'push'
+        env:
+          PROVEN: ${{ needs.changes.outputs.proven }}
+          PROVEN_BY: ${{ needs.changes.outputs.proven_by }}
+          PROVEN_PR: ${{ needs.changes.outputs.proven_pr }}
+          PROOF_REASON: ${{ needs.changes.outputs.proof_reason }}
+        run: |
+          if [ "$PROVEN" = "true" ]; then
+            if [ -n "$PROVEN_PR" ]; then
+              line="Proven push: the test runs and the acceptance jobs were skipped. $PROOF_REASON (pull request #$PROVEN_PR, head $PROVEN_BY)."
+            else
+              line="Proven push: the test runs and the acceptance jobs were skipped. $PROOF_REASON (head $PROVEN_BY)."
+            fi
+          else
+            line="Not proven: $PROOF_REASON. Every job in scope ran."
+          fi
+          echo "$line"
+          echo "$line" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Enforce required gate
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -3909,6 +4180,7 @@ jobs:
           SCOPE_STACK: ${{ needs.changes.outputs.stack }}
           SCOPE_DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
           SCOPE_ALL: ${{ needs.changes.outputs.all }}
+          PUSH_PROVEN: ${{ needs.changes.outputs.proven }}
           CHANGES_RESULT: ${{ needs.changes.result }}
           REPO_LINTS_RESULT: ${{ needs.repo-lints.result }}
           FRONTEND_RESULT: ${{ needs.verify.result }}
@@ -3960,7 +4232,7 @@ jobs:
       # added; lower it only with a measured reason like this one.
       # Same scope as the `test` job: only when it actually ran.
       - name: Download nextest partition counts (REL-20)
-        if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
+        if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true')
         uses: actions/download-artifact@v8
         with:
           pattern: test-counts-*
@@ -3968,7 +4240,7 @@ jobs:
           path: ${{ runner.temp }}/counts
 
       - name: Check nextest partition sum (REL-20)
-        if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
+        if: needs.changes.outputs.proven != 'true' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true')
         run: |
           set -euo pipefail
           total=0
