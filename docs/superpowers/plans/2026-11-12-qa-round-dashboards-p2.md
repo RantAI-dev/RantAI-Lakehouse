@@ -1525,3 +1525,87 @@ table_access`; `--test sec11_guard`; `--test route_auth`; `bun run typecheck`; `
 lint`; `bun test src/features/dashboards src/lib`; `bun run test` once;
 `python3 ops/lint/check_bare_iceberg_count.py && python3 ops/lint/check_intra_package_imports.py`;
 and R9's four lines.
+
+### Round 1, developer's handoff
+
+**Merge.** `main` had not moved: `git merge origin/main` answered "Already up to date." (there
+is no merge commit). **Fix commit:** `0f40c62c` `fix(review): round 1 of dashboards-p2 (R1 to
+R8, R10, R11)`, pushed to `origin/fix/qa-round-dashboards-p2`. Sixteen files changed, none
+outside the round's list; `policy_engine.rs` changed comments only (R7, R8).
+
+**The failures seen before the fixes.**
+
+- R1: `cargo test -p lakehouse-api --lib only_the_gates_not_found`, after the two new rows
+  were added and before `explains` changed:
+  `panicked at crates/lakehouse-api/src/routes/layers_rewrite.rs:900:5: assertion failed:
+  !explains(&server("Code: 241. Memory limit exceeded"), Some(AccessCause::MaskedColumn))`
+  — `test result: FAILED. 0 passed; 1 failed`. Code 60 would have failed next.
+- R3: `bun test src/features/dashboards/dashboard-refused-param.test.tsx`, test "a failed
+  read of the parameter definitions keeps the address's values", before the page changed:
+  `expect(received).toEqual(expected)` `- []` `+ ["/dashboards/b_1"]` (the address was
+  written without `p=`).
+- R5: the guard was removed again after the fix and the one test run, to have the fact:
+  `panicked at crates/lakehouse-api/src/routes/dashboard.rs:8571:9: the chart kept its stored
+  statement, so nothing calls its grain missing:
+  {"columns":[],"rows":[],"grainNotApplied":"no_grain"}` — `0 passed; 1 failed`. The file was
+  restored byte for byte afterwards (`md5sum` identical, `git status` clean) and the module
+  re-run green.
+
+**Commands and counts** (foreground, `CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-3`,
+`CARGO_BUILD_JOBS=6`, from the root unless the line says `rust/`).
+
+- `rust/`: `cargo fmt --check` — clean, no diff.
+- `rust/`: `cargo clippy -p lakehouse-api --all-targets -- -D warnings` — clean, `Finished
+  dev profile` with no warning.
+- `rust/`: `cargo test -p lakehouse-api --lib layers_rewrite` — `8 passed; 0 failed; 7
+  ignored; 0 measured; 3634 filtered out` (the seven ignored are the ones that need the dev
+  engine, ignored on `main` too). Before R1's change: `0 passed; 1 failed` (above).
+- `rust/`: `cargo test -p lakehouse-api --lib time_grain` — `19 passed; 0 failed; 0 ignored;
+  0 measured; 3630 filtered out` (18 before this round, plus R5's test).
+- `rust/`: `cargo test -p lakehouse-api --test table_access` — `17 passed; 0 failed; 0
+  ignored; 0 measured; 0 filtered out`.
+- `rust/`: `cargo test -p lakehouse-api --test sec11_guard` — `4 passed; 0 failed`.
+- `rust/`: `cargo test -p lakehouse-api --test route_auth` — `94 passed; 0 failed`.
+- `bun install --frozen-lockfile` — `Checked 779 installs across 753 packages (no changes)`.
+- `bun run typecheck` — clean, no diagnostic.
+- `bun run lint` — `11 problems (0 errors, 11 warnings)`, the same eleven `main` carries
+  (none in a file this round touched).
+- `bun test src/features/dashboards src/lib` — `1977 pass; 1 skip; 0 fail`, 1978 tests across
+  212 files.
+- `bun run test` (once, then repeated only to name a flake) — the first run `4238 pass; 1
+  skip; 1 fail` with the log cut to its summary, so its test's name was not captured; a later
+  run `4239 pass; 1 skip; 0 fail`; the last run `4238 pass; 1 skip; 1 fail`, the failure being
+  `SchemaBrowser > keeps the table's name unknown on a Trino tab until its detail loads` at
+  `src/features/queries/schema-browser.test.tsx:360`, `expect(received).toBe(expected)`
+  `Expected: "SELECT * FROM "` `Received: "SELECT * FROM undefined.undefined"`. This branch
+  does not touch that file. Re-run once, alone: `bun test
+  src/features/queries/schema-browser.test.tsx` — `20 pass; 0 fail`, 56 expect() calls. It is
+  a flake on `main`'s own test, not a regression of this round.
+- `python3 ops/lint/check_bare_iceberg_count.py && python3
+  ops/lint/check_intra_package_imports.py` — `R11 guard: no bare count() against a Bronze
+  Iceberg table found.` and `OK: all intra-package dispar_orchestrate imports resolve`.
+
+**R9, the four lines.**
+
+- `grain-marker.test.tsx` runs 2 tests and `dashboard-page-role.test.tsx` runs 4 — 6 together,
+  not 4. (`bun test` on each: `2 pass; 0 fail` and `4 pass; 0 fail`.)
+- The T14 commit is `abb4f33e` `test(ai-eval): a standard request for a radar that compares two
+  measures`; its body says "BI-49, AI-15 (plan D9, T14)" and cites no QA case. Its case is
+  `LH-BI-6-25`.
+- `grep -n "export function deniedFor" src/services/errors.ts` prints
+  `121:export function deniedFor(status: number, body: unknown): ServiceError | null {`.
+- `src/services/clients/metrics.ts` is built with `deniedFor` (it throws its answer before the
+  client's own kind, and has no 403 sentence of its own), so it leaves the list of `WEB-11`
+  slice S2; the rest of that list — `dashboards.ts` and the other clients — is untouched.
+
+**Not verified.** `cargo test --workspace` was not run (the brief runs it per PR slice, not
+per commit); the Dagster tests and `docker compose` were not run, because this round touches
+neither `dagster/` nor `docker-compose.yml`. The rounded-average change a merge can bring did
+not apply: `main` had not moved, so no test expectation was touched for it. R2's mode was
+exercised by the mask test only (17 tests in that file, all green); the claim that stopping
+masking would now fail the test rests on the mode's own branch, which was not separately
+mutation-tested.
+
+**MISMATCH.** None. R5's code was shaped as the finding describes (`built` is
+`filtered.grain`, and `switch_skip` answers `NoGrain` for a `None` built with no column kind),
+so the guard went in where R5 says.
