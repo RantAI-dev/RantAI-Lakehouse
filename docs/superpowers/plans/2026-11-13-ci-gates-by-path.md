@@ -477,4 +477,158 @@ saving in minutes until a narrow pull request's run is read (step 1).
 
 ## 5. Handoff
 
+Developer: an OpenCode agent (DeepSeek V4.1 Flash), 2026-11-13, on the ARM64 build
+machine, checkout `/home/rismana/rantai/lakehouse-agents-2`, working directory
+`/home/rismana/rantai/lakehouse-agents-2`, branch `ci/gates-by-path` off
+`origin/ci/gates-by-path` (`b4cb8a984`, the plan commit). Five commits, one per task,
+each pushed to `ci/gates-by-path`. No pull request was opened, no label was added, no
+repository setting or variable was changed. No Rust, TypeScript, Python product code,
+compose file or migration was touched; no cargo, bun or Docker command was run.
+
+| Task | Commit |
+|---|---|
+| T1 the map and the scope script | `ea7748b4` ci(scope): select the gate groups a diff can affect, from one path map (OPS-25 D1/D2/D5) |
+| T2 `required_gate.sh` | `84917611` ci(gate): require a gate only when its group was selected (OPS-25 D7) |
+| T3 the workflow | `bae9e19b` ci(workflow): each gate job follows its group; ci-required reads the selection (OPS-25 D6/D7/D9) |
+| T4 the consistency lint | `f3459400` ci(lint): check that every gate job has one group and every gate file a path rule (OPS-25 D10) |
+| T5 `docs/CI.md` | `608833c8` docs(ci): how a pull request runs only the gates its files can affect (OPS-25 D1-D8) |
+
+### 5.1 Checks, on the last code commit (`608833c8`), in the foreground
+
+```
+scripts/ci/tests/test_detect_change_scope.sh   exit 0  === Results: 85 passed, 0 failed ===
+scripts/ci/tests/test_detect_push_proof.sh     exit 0  === Results: 38 passed, 0 failed ===
+scripts/ci/tests/test_required_gate.sh         exit 0  === Results: 90 passed, 0 failed ===
+scripts/ci/tests/test_select_runner.sh         exit 0  === Results: 23 passed, 0 failed ===
+scripts/ci/tests/test_worker_prepare.sh        exit 0  === Results: 12 passed, 0 failed ===
+bash -n scripts/ci/*.sh scripts/ci/tests/*.sh  exit 0
+python3 ops/lint/check_gate_groups.py          exit 0  ("gate groups are consistent: every gate
+                                                       job has one group, its if: names it, and every
+                                                       gate file maps to a group"; one warning,
+                                                       `rust/crates/*/benches/*` matches no tracked file)
+python3 ops/lint/check_rust_embedded_paths.py  exit 0  ("22 path(s) compiled into Rust from outside
+                                                       rust/, 0 without the rust scope")
+python3 ops/lint/check_bare_iceberg_count.py   exit 0  ("R11 guard: no bare count() ... found.")
+python3 ops/lint/check_intra_package_imports.py exit 0 ("OK: all intra-package dispar_orchestrate
+                                                       imports resolve")
+python3 -m unittest discover -s ops/lint -p 'test_*.py'
+                                               exit 0  ("Ran 40 tests ... OK"; 34 before this work,
+                                                       6 of them new in `test_check_gate_groups.py`)
+python3 -c "import yaml ... ci.yml etc."       exit 0  (every `.github/workflows/*.yml` parses)
+git status                                     clean   (nothing generated staged)
+```
+
+Before each commit, the same self-tests and lints were run for the files that commit
+touched (`test_detect_change_scope.sh` for T1, `test_required_gate.sh` for T2, both plus
+the YAML parse for T3, the new lint and its unit tests plus every self-test for T4), each
+exit 0. Because `changes` runs `test_detect_change_scope.sh` and `ci-required` runs
+`test_required_gate.sh` before the scripts themselves, those two suites are also a step
+of the pipeline they test.
+
+The workflow checks of §2 T3: `grep -c "needs.changes.outputs.gates_" ci.yml` is **25**
+(the 25 gate `if:` lines; no other line carries that text), and a YAML pass asserts each
+of the 25 gate `if:` expressions names exactly its own group's `gates_` output, that
+`changes.outputs` declares all nine plus `gate_groups`, and that the `ci-required` step
+running `required_gate.sh` passes `SELECTED_GATE_GROUPS`.
+
+### 5.2 Break-it-once (each broken locally, the suite seen red, then restored)
+
+| Rule broken | Command | Result |
+|---|---|---|
+| T1: `path ops/g4/* cdc` deleted from the real map | `bash scripts/ci/tests/test_detect_change_scope.sh` | exit **1**, 83 passed, 2 failed: `FAIL a G4 test selects only cdc (got gate_groups=,storage,pipelines,cdc,ingest,saas,secrets,alerts,upload,governance,, want ,cdc,)` and `FAIL --classify did not print the expected groups` (the file fell through to `path ops/* all`, which is the fail-closed answer) |
+| T2: `req_gate_for` returns `selected=false` for a selected group | `bash scripts/ci/tests/test_required_gate.sh` | exit **1**, 89 passed, 1 failed: `FAIL a pull request selecting only cdc fails when g4-mysql is skipped — expected exit 1, got 0` |
+| T4 (a): `gold-export` removed from `group pipelines` | `python3 ops/lint/check_gate_groups.py` | exit **1**: `FAIL: job 'gold-export' in ci.yml is in no gate group of gate_paths.txt` |
+| T4 (d): every `path` line naming `storage` removed | `python3 ops/lint/check_gate_groups.py` | exit **1**: `FAIL: gate group 'storage' has no path line` (plus the two `ops/g2`/`ops/seaweedfs` `(e)` findings) |
+| T4 (e): `path ops/g9/* upload` removed | `python3 ops/lint/check_gate_groups.py` | exit **1**: `FAIL: ops/g9/upload_test.py selects every gate group (a shared path rule caught it); add a narrower path line` (and the same for the other three `ops/g9` files) |
+
+Each break was restored; `git diff scripts/ci/gate_paths.txt` and `git diff
+scripts/ci/required_gate.sh` are empty afterwards and the suites are green again.
+
+### 5.3 Dry run of the map, with the real script
+
+For each pull request, `git diff --name-only <commit>^1 <commit>` (found with
+`git log --first-parent --oneline origin/main`), then
+`scripts/ci/detect_change_scope.sh --classify <files>` at `608833c8`. Gate jobs: a group
+contributes 2/3/5/5/2/4/1/1/2 jobs. "Today" is the planner's reading at `0b6650421`
+(§3b).
+
+| Pull request | Files (gate-relevant) | Groups selected | Gate jobs now (today) |
+|---|---|---|---|
+| #507 | documents (1 file) | none (documents-only) | 0 (0) |
+| #506 | `.github/`, `scripts/ci/`, `ops/lint/` (16) | all nine | 25 (25) |
+| #505 | documents (4) | none | 0 (0) |
+| #502 | `rust/crates/lakehouse-test-support/src/lib.rs`, docs (2) | none; `images`/`image-smoke` still run | **0 (25)** |
+| #500 | 11: `policy.rs`, `routes/mod.rs` → `all`; `pipeline_compile.rs`, `routes/authored_pipelines.rs`, `routes/pipeline_preview.rs` → `pipelines`; `routes/dashboard_sources.rs` → `governance,alerts`; console → none | all nine (shared) | 25 (25) |
+| #499 | console + documents (29) | none, no acceptance scope | 0 (0) |
+| #498 | documents (3) | none | 0 (0) |
+| #497 | console + documents (30) | none | 0 (0) |
+| #495 | documents (1) | none | 0 (0) |
+| #494 | documents (1) | none | 0 (0) |
+| #457 | `routes/ai/mod.rs`, `routes/ai/prompt.rs`, `tests/ai_sql_help.rs`, docs (5) | none | **0 (25)** |
+| #468 | `routes/catalog.rs` → `pipelines,governance` (15) | `pipelines,governance` | **5 (25)** |
+| #466 | `policy.rs`, `routes/mod.rs`, `routes/governance.rs`, `sql_rewrite.rs` → `all` (35) | all nine | 25 (25) |
+| #459 | `lib.rs`, `policy.rs`, `policy_engine.rs` → `all` (38) | all nine | 25 (25) |
+| #481 | `dagster/*` module not in the map → `all` (41) | all nine | 25 (25) |
+| #487 | `lib.rs`, `policy.rs`, `routes/mod.rs` → `all` (46) | all nine | 25 (25) |
+| #482 | `policy_engine.rs`, `sql_guard.rs` → `all` (23) | all nine | 25 (25) |
+| #483 | `routes/query.rs` → `all` (32) | all nine | 25 (25) |
+| #484 | `upstream_error.rs` → `all` (30) | all nine | 25 (25) |
+| #486 | `routes/mod.rs`, `routes/support.rs` → `all` (54) | all nine | 25 (25) |
+| #492 | `lakehouse-store/src/identity.rs` → `all` (22) | all nine | 25 (25) |
+| #493 | `routes/governance.rs`, store modules → `all` (46) | all nine | 25 (25) |
+| #485 | `docker-compose.yml`, `dagster.yaml` → `all` (36) | all nine | 25 (25) |
+| #490 | `routes/connectors.rs`, `connector_probe.rs` → `all` (41) | all nine | 25 (25) |
+| #467 | `.env.example`, `docker-compose.yml` → `all` (22) | all nine | 25 (25) |
+| #489 | `ops/fixtures/` → `all`, `dagster/*` → `all` (57) | all nine | 25 (25) |
+| #473 | `.env.staging` → `unmapped` (1) | all nine (logged `Unmapped file: .env.staging`) | 25 (25) |
+
+Every row agrees with §3b; no row differs, so no map line is reported as the cause of a
+difference. The saving is the same three pull requests the planner named (#502, #457,
+#468: 0, 0 and 5 of 25 gate jobs), and #502 and #457 still build both images.
+
+### 5.4 Not verified
+
+- **`actionlint` and `shellcheck` are not installed on this machine**, so `NOT
+  VERIFIED`: no expression-level validation of the 25 `if:` lines or the
+  `ALL_GATES_LABEL` expression beyond a YAML parse plus the structural checks of §5.1,
+  and no shell linting of the new functions. The `if:` lines are today's text with one
+  `&& needs.changes.outputs.gates_<group> == 'true'` appended.
+- **A real run of a narrow pull request** (§3b step 1) needs the pull request this branch
+  becomes; not run here. This branch itself touches `.github/` and `scripts/ci/`, so its
+  own run selects every group (`all=true`) and cannot prove a narrow selection.
+- **The label through GitHub's "Re-run jobs"** (D6): not verified, as the plan says;
+  `docs/CI.md` says to push or close and reopen.
+- **The map's reading of the gates themselves** (which group a gate belongs to) is
+  reviewed, not measured: no gate was run against a stack.
+
+### 5.5 MISMATCH / reading
+
+- **MISMATCH (D5, script side):** "a `group` line with an unknown job is an error: the
+  script exits 1". `detect_change_scope.sh` has no YAML reader, so it validates the map's
+  structure, an unknown *group* name, and a job declared in two groups, but it cannot know
+  whether a job exists in `ci.yml`. That half is `ops/lint/check_gate_groups.py` D10 (a),
+  which runs in `Repo lints` on every pull request and push and does fail on it. Nothing is
+  weaker for it: a `group` line naming a job that does not exist leaves every real gate
+  job with no group, and `required_gate.sh` requires a job with no `group` line (D7, fail
+  closed).
+- **Reading (D10 d):** "every group has at least one `path` line" is implemented as
+  "at least one `path` line **names** the group"; an `all` line does not count, because
+  `path ops/* all` and the other catch-alls make the literal reading true for every group
+  and the check vacuous. The docstring says so, and the T4 (d) break above shows it fires.
+- **Reading (T4, "a job in two groups fails"):** `read_gate_map` rejects it as a map
+  error, so `check_gate_groups.py` exits 2 with `FAIL: gate_paths.txt:NN: job '…' is in
+  groups …` rather than printing a one-line finding. Red either way.
+- **Reading (`--classify` with a missing or malformed map):** exits 1 with `::error::`
+  rather than printing `all`/`unmapped`; the fail-closed "every group" rule belongs to the
+  selection mode, and a caller asking for a classification with no map has no answer to be
+  given. Not exercised by CI: the map is in the checkout.
+- The T1 helper `assert_groups` uses the **real** `gate_paths.txt` through
+  `detect_change_scope.sh`'s default (`dirname $0/gate_paths.txt`), rather than copying it
+  into the throwaway repository; it copies the map only for the unknown-group case, where
+  the copy is the point.
+- `rust/crates/*/benches/*` (`none`) matches no tracked file today, so the T4 lint prints
+  one warning per run. Kept: the plan lists the rule, and no crate has a bench yet.
+
+
+
 ## 6. Review
