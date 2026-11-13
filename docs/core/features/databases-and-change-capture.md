@@ -6,7 +6,7 @@
 | Backlog | `SRC-4` |
 | Kind | Feature |
 | Spec | `docs/core/specs/src-4.md`. This page follows it row by row; three of its "Today" cells are out of date and are corrected under Problem. Its one *(proposed)* number, the 15-minute lag alert, is decision 7; decision 5's 2-minute target is the planner's, signed and measured in slice 0 |
-| Status | Building (#264). All thirteen decisions signed by the product owner on 2026-10-29, as the planner recommended ("saya setuju, jalankan sesuai dengan rekomendasi anda"). Nothing blocks it: `SEC-14` part B merged in #192 on 2026-10-28 (decision 10) |
+| Status | In Acceptance: merged in #264. The owner passed AC1 to AC7 on 2026-11-01, but no QA case covers it yet, so the backlog holds it In Acceptance (2026-11-13). All thirteen decisions signed by the product owner on 2026-10-29, as the planner recommended ("saya setuju, jalankan sesuai dengan rekomendasi anda"). Nothing blocks it: `SEC-14` part B merged in #192 on 2026-10-28 (decision 10) |
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |

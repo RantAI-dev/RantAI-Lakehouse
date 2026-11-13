@@ -208,7 +208,9 @@ As built in #216; every point is from documentation and mock vendors, none was t
 
 ## Acceptance checklist
 
-Run on a real deployment with real vendor accounts (decision 11). Mark each
+Run on a real deployment. The rows that need a real vendor account (decision 11)
+wait for one: so far the ten were tested against mock vendors only (`SRC-27`,
+`SRC-30`), and Workday and NetSuite stay not supported. Mark each
 Pass, Fail, or Not run with the reason. A step not performed is never Pass.
 Steps needing a terminal are marked (operator). Rows 1 to 10 are run once
 per vendor; record the vendor with the result.
