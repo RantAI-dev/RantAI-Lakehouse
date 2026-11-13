@@ -6136,5 +6136,298 @@
         ]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "create_report",
+      "description": "Write a report: a page of headings, paragraphs, lists and links with live charts between them, picked from existing dashboards by chart id (list_charts). Each reader sees every chart with their own access, as on its dashboard. At most 30 charts. Needs a confirm in this chat.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "the report's title"
+          },
+          "folderId": {
+            "type": "string",
+            "description": "a dashboard folder id to file it in; leave out for no folder"
+          },
+          "blocks": {
+            "type": "array",
+            "description": "the blocks in reading order",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "heading",
+                    "paragraph",
+                    "list",
+                    "link",
+                    "chart"
+                  ]
+                },
+                "text": {
+                  "type": "string",
+                  "description": "heading, paragraph or link words; plain text, never HTML or Markdown"
+                },
+                "level": {
+                  "type": "integer",
+                  "enum": [
+                    1,
+                    2,
+                    3
+                  ],
+                  "description": "heading size, 1 the largest; 2 when left out"
+                },
+                "items": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "a list's items"
+                },
+                "ordered": {
+                  "type": "boolean",
+                  "description": "a numbered list when true"
+                },
+                "url": {
+                  "type": "string",
+                  "description": "a link's address: https://, http://, mailto: or a console path such as /dashboards/<id>"
+                },
+                "chart": {
+                  "type": "string",
+                  "description": "a chart block's chart id, from list_charts"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            }
+          }
+        },
+        "required": [
+          "title"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "update_report",
+      "description": "Change a report: its title, its folder, all its blocks (blocks), blocks added at the end (append), or one chart added at the end (chart, for \"add this chart to the report\"). Give only what changes. Needs a confirm in this chat.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "the report's id, from create_report or the page context"
+          },
+          "title": {
+            "type": "string",
+            "description": "a new title"
+          },
+          "folderId": {
+            "type": "string",
+            "description": "a dashboard folder to move it to; \"\" for no folder"
+          },
+          "blocks": {
+            "type": "array",
+            "description": "every block, replacing the report's blocks in this order",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "heading",
+                    "paragraph",
+                    "list",
+                    "link",
+                    "chart"
+                  ]
+                },
+                "text": {
+                  "type": "string",
+                  "description": "heading, paragraph or link words; plain text, never HTML or Markdown"
+                },
+                "level": {
+                  "type": "integer",
+                  "enum": [
+                    1,
+                    2,
+                    3
+                  ],
+                  "description": "heading size, 1 the largest; 2 when left out"
+                },
+                "items": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "a list's items"
+                },
+                "ordered": {
+                  "type": "boolean",
+                  "description": "a numbered list when true"
+                },
+                "url": {
+                  "type": "string",
+                  "description": "a link's address: https://, http://, mailto: or a console path such as /dashboards/<id>"
+                },
+                "chart": {
+                  "type": "string",
+                  "description": "a chart block's chart id, from list_charts"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            }
+          },
+          "append": {
+            "type": "array",
+            "description": "blocks added after the last one",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "heading",
+                    "paragraph",
+                    "list",
+                    "link",
+                    "chart"
+                  ]
+                },
+                "text": {
+                  "type": "string",
+                  "description": "heading, paragraph or link words; plain text, never HTML or Markdown"
+                },
+                "level": {
+                  "type": "integer",
+                  "enum": [
+                    1,
+                    2,
+                    3
+                  ],
+                  "description": "heading size, 1 the largest; 2 when left out"
+                },
+                "items": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "a list's items"
+                },
+                "ordered": {
+                  "type": "boolean",
+                  "description": "a numbered list when true"
+                },
+                "url": {
+                  "type": "string",
+                  "description": "a link's address: https://, http://, mailto: or a console path such as /dashboards/<id>"
+                },
+                "chart": {
+                  "type": "string",
+                  "description": "a chart block's chart id, from list_charts"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            }
+          },
+          "chart": {
+            "type": "string",
+            "description": "one chart id, from list_charts, added as a chart block at the end"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "delete_report",
+      "description": "Delete a report: it goes to the trash and can be restored for 30 days. Needs human approval.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "the report's id"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_templates",
+      "description": "List the dashboard templates: saved dashboard layouts with their charts and filters (no data), with the id, name, the dashboard each was saved from, who saved it and when.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "create_dashboard_from_template",
+      "description": "Start a new dashboard from a template (list_templates): an independent copy of its layout, charts and filters, under a name you give, in a folder or none. A chart over a table that is gone keeps its tile and says the source is not available. Needs a confirm in this chat.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "template": {
+            "type": "string",
+            "description": "the template's id, from list_templates"
+          },
+          "name": {
+            "type": "string",
+            "description": "the new dashboard's name"
+          },
+          "folderId": {
+            "type": "string",
+            "description": "a dashboard folder id; leave out for no folder"
+          }
+        },
+        "required": [
+          "template",
+          "name"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "delete_template",
+      "description": "Delete a dashboard template for good. Dashboards already made from it stay. Needs human approval.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "the template's id, from list_templates"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
   }
 ]

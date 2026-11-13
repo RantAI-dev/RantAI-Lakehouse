@@ -506,8 +506,9 @@ MODE: BUILD. Besides answering, you can operate the lakehouse:
 - Saved queries: save_query, list_saved_queries, run_saved_query.
 - Governance: draft_policy, draft_classification_rule, draft_quality_rule always save a draft; activating it stays a human action in the console.
 - Embedding a dashboard on another site: get_embed_snippet describes the address template, its look options and the locked filters the token must set; enable_embed switches signed embedding on and adds the sites it names, and waits for human approval; set_embed_filter_modes sets what a viewer may do with each filter, and waits for approval too; withdraw_embed_tokens needs a confirm in this chat. You never sign a token and never show one: the customer's own server signs it with the embedding secret, so never write a token or a signing command in your answer. The copyable snippet with the resize listener is in the dashboard's Share > Embed.
+- Reports and templates: a report is a written page with live charts between the text. create_report takes a title, an optional folderId and blocks in reading order: heading {text, level 1 to 3}, paragraph {text}, list {items, ordered}, link {text, url: https://, http://, mailto: or a console path}, chart {chart: a chart id from list_charts}. Text is plain words, never HTML or Markdown. A report holds at most 30 charts, and every reader sees each chart with their own access, as on its dashboard. update_report changes one: `blocks` replaces every block, `append` adds blocks at the end and `chart` adds one chart at the end (\"add this chart to the report\"); delete_report needs approval and puts the report in the trash. A template is a saved dashboard layout with its charts and filters and no data: list_templates shows them, create_dashboard_from_template starts a new, independent dashboard from one (the template id, a name, an optional folderId), and delete_template needs approval. Saving a dashboard as a template is done in the dashboard's menu in the console. Name what you made, the report or the dashboard, and say its link is below; do not write the address yourself.
 - Gold export: export_gold_mart appends a mart to its Iceberg table (running it again appends again); get_gold_export reads it back.
-- These need human approval and do not run immediately: delete_alert_rule, delete_connector, rotate_connector_credential, pause_pipeline, cancel_pipeline_run, delete_chart, delete_tab, delete_board, delete_calculated_field, delete_metric, run_bronze_maintenance, kill_query, enable_embed, set_embed_filter_modes. Call the tool; the server then creates the approval. Only when a tool result says needs_approval, tell the user the request is waiting in Approvals (/agents/approvals). Never say a request is waiting if you did not call the tool, or if its result did not say needs_approval.
+- These need human approval and do not run immediately: delete_alert_rule, delete_connector, rotate_connector_credential, pause_pipeline, cancel_pipeline_run, delete_chart, delete_tab, delete_board, delete_calculated_field, delete_metric, run_bronze_maintenance, kill_query, enable_embed, set_embed_filter_modes, delete_report, delete_template. Call the tool; the server then creates the approval. Only when a tool result says needs_approval, tell the user the request is waiting in Approvals (/agents/approvals). Never say a request is waiting if you did not call the tool, or if its result did not say needs_approval.
 - needs_confirmation and needs_approval are different. needs_confirmation: the user confirms in this chat, with the Confirm button under your reply; never mention Approvals for it. needs_approval: a human must approve it in Approvals (/agents/approvals).
 - When a tool result says needs_confirmation, call no other tool that needs the drafted object (a chart, a board or a tab that does not exist yet, a calculated field): reply with ONE short sentence that names the draft the result is for (a chart, a board, a tab or a calculated field). Write a last line `NEXT: <the remaining steps, in one sentence>` only when the request needs another object after the draft, or another change to the drafted object (its cache rule, its format, its tab): for example a chart on the board being drafted, the charts moved to the tab being drafted, or the cache rule of the chart just drafted; never for confirming, saving or publishing the draft itself, and never when the draft is the whole request. Do not repeat the arguments and do not ask the user to type a confirmation: the console shows the preview with a confirm button. A user message that starts with `Confirmed and saved:` lists the objects that now exist: never draft them again; do only the step after `Continue:`; when nothing is left, answer in one sentence and call no tool.
 - A chart draft, and a created or updated chart, has `definition`: describe the chart only by what it lists, because a top N, a bin or a filter it does not list was not made. When a tool refused a call, say so in your first sentence, in plain words, and never present a workaround as what the person asked for. When a refusal says bins are for numbers and names the number columns, call ask_user with those columns as the options; when it says the source has no number column to bin, say that and ask nothing. \"Top N of X by Y\" is dimension X, breakdown Y, sort descending on the measure, limit N.
@@ -866,6 +867,22 @@ const DOMAINS: &[Domain] = &[
             "list_boards",
         ],
     },
+    // BI-18 part D (T4): written reports with live charts, and dashboard
+    // templates. `list_charts` gives the chart ids a report places; `list_boards`
+    // names the dashboard a request is about.
+    Domain {
+        words: &["report", "laporan", "write-up", "template", "templat"],
+        tools: &[
+            "create_report",
+            "update_report",
+            "delete_report",
+            "list_templates",
+            "create_dashboard_from_template",
+            "delete_template",
+            "list_charts",
+            "list_boards",
+        ],
+    },
     Domain {
         words: &["saved", "simpan", "tersimpan", "save "],
         tools: &["save_query", "list_saved_queries", "run_saved_query"],
@@ -1172,6 +1189,26 @@ mod tests {
                 !tools.contains("list_calculated_fields"),
                 "`{question}` should not offer list_calculated_fields: {tools:?}"
             );
+        }
+    }
+
+    /// `BI-18` part D (T4): a report or template request reaches its tools and
+    /// the chart list a report places charts from.
+    #[test]
+    fn a_report_or_template_request_reaches_its_tools() {
+        let tools = select_tools(
+            &["Write a report on visitors this quarter with the trend chart"],
+            false,
+        );
+        for tool in ["create_report", "update_report", "list_charts"] {
+            assert!(tools.contains(tool), "{tool}");
+        }
+        let tools = select_tools(
+            &["Start a dashboard from the Sales overview template"],
+            false,
+        );
+        for tool in ["list_templates", "create_dashboard_from_template"] {
+            assert!(tools.contains(tool), "{tool}");
         }
     }
 

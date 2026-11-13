@@ -1985,6 +1985,85 @@ fn get_embed_snippet_schema() -> Value {
             "required": ["board"] } } })
 }
 
+/// The blocks of a report (`BI-18` part D, `lakehouse_bi::reports::Block`),
+/// shared by [`create_report_schema`] and [`update_report_schema`].
+fn report_blocks_schema(description: &str) -> Value {
+    json!({
+        "type": "array",
+        "description": description,
+        "items": { "type": "object", "properties": {
+            "type": { "type": "string", "enum": ["heading", "paragraph", "list", "link", "chart"] },
+            "text": { "type": "string", "description": "heading, paragraph or link words; plain text, never HTML or Markdown" },
+            "level": { "type": "integer", "enum": [1, 2, 3], "description": "heading size, 1 the largest; 2 when left out" },
+            "items": { "type": "array", "items": { "type": "string" }, "description": "a list's items" },
+            "ordered": { "type": "boolean", "description": "a numbered list when true" },
+            "url": { "type": "string", "description": "a link's address: https://, http://, mailto: or a console path such as /dashboards/<id>" },
+            "chart": { "type": "string", "description": "a chart block's chart id, from list_charts" } },
+            "required": ["type"] }
+    })
+}
+
+fn create_report_schema() -> Value {
+    json!({ "type": "function", "function": {
+        "name": "create_report",
+        "description": "Write a report: a page of headings, paragraphs, lists and links with live charts between them, picked from existing dashboards by chart id (list_charts). Each reader sees every chart with their own access, as on its dashboard. At most 30 charts. Needs a confirm in this chat.",
+        "parameters": { "type": "object", "properties": {
+            "title": { "type": "string", "description": "the report's title" },
+            "folderId": { "type": "string", "description": "a dashboard folder id to file it in; leave out for no folder" },
+            "blocks": report_blocks_schema("the blocks in reading order") },
+            "required": ["title"] } } })
+}
+
+fn update_report_schema() -> Value {
+    json!({ "type": "function", "function": {
+        "name": "update_report",
+        "description": "Change a report: its title, its folder, all its blocks (blocks), blocks added at the end (append), or one chart added at the end (chart, for \"add this chart to the report\"). Give only what changes. Needs a confirm in this chat.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "the report's id, from create_report or the page context" },
+            "title": { "type": "string", "description": "a new title" },
+            "folderId": { "type": "string", "description": "a dashboard folder to move it to; \"\" for no folder" },
+            "blocks": report_blocks_schema("every block, replacing the report's blocks in this order"),
+            "append": report_blocks_schema("blocks added after the last one"),
+            "chart": { "type": "string", "description": "one chart id, from list_charts, added as a chart block at the end" } },
+            "required": ["id"] } } })
+}
+
+fn delete_report_schema() -> Value {
+    json!({ "type": "function", "function": {
+        "name": "delete_report",
+        "description": "Delete a report: it goes to the trash and can be restored for 30 days. Needs human approval.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "the report's id" } },
+            "required": ["id"] } } })
+}
+
+fn list_templates_schema() -> Value {
+    json!({ "type": "function", "function": {
+        "name": "list_templates",
+        "description": "List the dashboard templates: saved dashboard layouts with their charts and filters (no data), with the id, name, the dashboard each was saved from, who saved it and when.",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn create_dashboard_from_template_schema() -> Value {
+    json!({ "type": "function", "function": {
+        "name": "create_dashboard_from_template",
+        "description": "Start a new dashboard from a template (list_templates): an independent copy of its layout, charts and filters, under a name you give, in a folder or none. A chart over a table that is gone keeps its tile and says the source is not available. Needs a confirm in this chat.",
+        "parameters": { "type": "object", "properties": {
+            "template": { "type": "string", "description": "the template's id, from list_templates" },
+            "name": { "type": "string", "description": "the new dashboard's name" },
+            "folderId": { "type": "string", "description": "a dashboard folder id; leave out for no folder" } },
+            "required": ["template", "name"] } } })
+}
+
+fn delete_template_schema() -> Value {
+    json!({ "type": "function", "function": {
+        "name": "delete_template",
+        "description": "Delete a dashboard template for good. Dashboards already made from it stay. Needs human approval.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "the template's id, from list_templates" } },
+            "required": ["id"] } } })
+}
+
 /// The AI Copilot's full tool table, in the exact order the LLM sees them
 /// in — [`tool_schemas`] preserves this order verbatim, and it is
 /// load-bearing for the committed snapshot in
@@ -2791,6 +2870,46 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::Read,
         permission: "",
     },
+    // BI-18 part D (T4, decisions R5 and T5): reports and templates, behind the
+    // permission of their routes. Writing is a confirm in the chat; deleting a
+    // report or a template is an approval, as deleting a dashboard is. Listing
+    // the templates is a read, but the route it mirrors needs `dashboard:write`.
+    ToolSpec {
+        name: "create_report",
+        schema: create_report_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "update_report",
+        schema: update_report_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "delete_report",
+        schema: delete_report_schema,
+        risk: Risk::WriteHigh,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "list_templates",
+        schema: list_templates_schema,
+        risk: Risk::Read,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "create_dashboard_from_template",
+        schema: create_dashboard_from_template_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "delete_template",
+        schema: delete_template_schema,
+        risk: Risk::WriteHigh,
+        permission: "dashboard:write",
+    },
 ];
 
 /// The `OpenAI`-compatible `tools` schema array, matching
@@ -2986,8 +3105,9 @@ mod tests {
         // `update_report_subscription` and `delete_report_subscription`
         // (`AI-10`, with `RPT-1`) + `set_cache_rule` (`BI-4` part B)
         // + `list_maps` (`BI-16` part C2, `AI-5`) + `list_dashboard_comments`
-        // (`BI-37` D8) + the four signed-embed tools (`BI-26` slice 2).
-        assert_eq!(tool_schemas().len(), 115);
+        // (`BI-37` D8) + the four signed-embed tools (`BI-26` slice 2)
+        // + the six report and template tools (`BI-18` part D, T4).
+        assert_eq!(tool_schemas().len(), 121);
     }
 
     /// `RPT-1` (with `AI-10`): the report tools have the console's permission,
@@ -3004,6 +3124,24 @@ mod tests {
             let spec = find(name).expect("registered tool");
             assert_eq!(spec.risk, risk, "{name}");
             assert_eq!(spec.permission, "dashboard:read", "{name}");
+        }
+    }
+
+    /// `BI-18` part D (T4): the report and template tools carry the permission
+    /// of their routes, writing is a confirmation and deleting an approval.
+    #[test]
+    fn the_report_and_template_tools_have_the_risk_and_permission_of_their_routes() {
+        for (name, risk) in [
+            ("create_report", Risk::WriteLow),
+            ("update_report", Risk::WriteLow),
+            ("delete_report", Risk::WriteHigh),
+            ("list_templates", Risk::Read),
+            ("create_dashboard_from_template", Risk::WriteLow),
+            ("delete_template", Risk::WriteHigh),
+        ] {
+            let spec = find(name).expect("registered tool");
+            assert_eq!(spec.risk, risk, "{name}");
+            assert_eq!(spec.permission, "dashboard:write", "{name}");
         }
     }
 

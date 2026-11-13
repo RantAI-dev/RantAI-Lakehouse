@@ -173,6 +173,15 @@ fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
         "delete_report_subscription" => {
             format!("Menghapus laporan terjadwal {} secara permanen.", s("id"))
         }
+        // BI-18 part D (T4): a deleted report goes to the trash, a template away.
+        "delete_report" => format!(
+            "Memindahkan laporan {} ke tempat sampah; bisa dipulihkan selama 30 hari.",
+            s("id")
+        ),
+        "delete_template" => format!(
+            "Menghapus template dashboard {} secara permanen; dashboard yang sudah dibuat darinya tetap ada.",
+            s("id")
+        ),
         "delete_tab" => format!(
             "Menghapus tab {} dari dashboard {}; chart di dalamnya pindah ke tab pertama.",
             s("tab"),
@@ -499,6 +508,46 @@ fn alert_summary(name: &str, args: &Map<String, Value>) -> String {
     )
 }
 
+/// The Confirm card's sentence for the report and template writes (`BI-18`
+/// part D, T4): what is made or changed, and how many charts it places.
+fn written_summary(name: &str, args: &Map<String, Value>) -> String {
+    let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
+    let charts = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_array)
+            .map_or(0, |b| b.iter().filter(|b| b["type"] == "chart").count())
+    };
+    match name {
+        "create_report" => format!(
+            "Membuat laporan \"{}\" dengan {} chart langsung dari dashboard.",
+            s("title"),
+            charts("blocks")
+        ),
+        "update_report" => {
+            let added = charts("append") + usize::from(!s("chart").trim().is_empty());
+            if args.contains_key("blocks") {
+                format!(
+                    "Mengganti seluruh isi laporan {} ({} chart).",
+                    s("id"),
+                    charts("blocks")
+                )
+            } else if added > 0 || args.contains_key("append") {
+                format!(
+                    "Menambah isi di akhir laporan {} ({added} chart baru).",
+                    s("id")
+                )
+            } else {
+                format!("Mengubah laporan {}.", s("id"))
+            }
+        }
+        _ => format!(
+            "Membuat dashboard baru \"{}\" dari template {}; salinan ini tidak mengubah templatenya.",
+            s("name"),
+            s("template")
+        ),
+    }
+}
+
 fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
     let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
     match spec.name {
@@ -562,6 +611,10 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             report_summary(spec.name, args)
         }
         "create_alert_rule" | "update_alert_rule" => alert_summary(spec.name, args),
+        // BI-18 part D (T4): the Confirm card's text for the report and template writes.
+        "create_report" | "update_report" | "create_dashboard_from_template" => {
+            written_summary(spec.name, args)
+        }
         "create_calculated_field" => format!(
             "Membuat kolom hitung \"{}\" = {} (pada {}).",
             s("name"),
