@@ -101,9 +101,11 @@
 //! runs one test binary at a time, with its tests on the threads of one
 //! process. `cargo nextest` (CI since `REL-20`) gives every test a process
 //! of its own and runs several at once, and a second checkout on the same
-//! machine uses the same labelled container. Each of these processes runs
-//! this crate's constructor, so each makes a first pass when it starts
-//! and, if it lives that long, another pass every 30 seconds. The two-pass
+//! machine uses the same labelled container. Each test process that links
+//! this crate runs its constructor, so each makes a first pass when it
+//! starts and, if it lives that long, another pass every 30 seconds (this
+//! crate's own test binary makes the first pass only, see
+//! `spawn_sweep_loop`). The two-pass
 //! state is in the memory of the process, so the passes of two processes
 //! never add up: a database is dropped only by a process that saw it idle
 //! twice itself, 30 seconds apart. A process that ends before its second
@@ -403,7 +405,7 @@ struct Sweeper {
     /// `None`: every database on the server. That is the sweep of a test
     /// process (`start_sweep`), whose passes are `SWEEP_INTERVAL` apart.
     /// `Some`: only the databases with exactly these names (`OPS-22`, see
-    /// [`Sweeper::only`]).
+    /// `Sweeper::only`).
     only: Option<BTreeSet<String>>,
 }
 
@@ -412,10 +414,9 @@ impl Sweeper {
     /// database on the server.
     ///
     /// It is the server-wide sweeper, built by `start_sweep`. A test builds
-    /// it once, to assert that scope, and never runs two passes with it:
-    /// `OPS-22`, two passes with no time between them would drop every test
-    /// database that is idle at that instant, another test's included (see
-    /// [`Sweeper::only`]).
+    /// it for one pass at most, never two. `OPS-22`, two passes with no
+    /// time between them would drop every test database that is idle at
+    /// that instant, another test's included (see `Sweeper::only`).
     fn new() -> Self {
         Self {
             idle_seen_last_pass: BTreeSet::new(),
@@ -450,9 +451,10 @@ impl Sweeper {
         }
     }
 
-    /// Runs one pass: every database that carries one of the three test
-    /// prefixes, that nobody is connected to, and that was already idle on
-    /// the previous pass is dropped.
+    /// Runs one pass: every database in this sweeper's scope (`in_scope`:
+    /// all of them for the sweep of a test process) that carries one of the
+    /// three test prefixes, that nobody is connected to, and that was
+    /// already idle on the previous pass is dropped.
     ///
     /// The databases the pass picked are returned, and not only the ones
     /// that are gone: the server itself refuses to drop a database that has
@@ -542,8 +544,9 @@ async fn start_sweep(url: &str) {
 /// The repeating sweep, for the life of the test process.
 ///
 /// It is compiled out of this crate's own test binary: there the tests
-/// drive the passes explicitly, and a background sweeper would race them —
-/// it could drop a database between a test's creation and its first pass.
+/// drive the passes explicitly, and a background sweeper would be one
+/// more sweeper the tests have to reason about: it could drop a test's
+/// database once the test is older than `SWEEP_INTERVAL`.
 #[cfg(not(test))]
 fn spawn_sweep_loop(url: String, mut sweeper: Sweeper) {
     tokio::spawn(async move {
@@ -712,9 +715,10 @@ mod tests {
     ///
     /// The sweep is compiled out of this crate's own test binary (see
     /// `spawn_sweep_loop`), so a database that a test creates and does
-    /// not drop stays on the shared server for good. The tests drop their
-    /// own databases at the end of the test; this guard is the net for a
-    /// panic before that.
+    /// not drop is left to the sweep of another test process if it
+    /// carries a test prefix, and stays for good if it does not
+    /// (`untouched_db_…`). The tests drop their own databases at the end
+    /// of the test; this guard is the net for a panic before that.
     ///
     /// No other test can pick these databases up in the meantime: a test's
     /// sweeper sees only the test's own databases (`OPS-22`).
@@ -994,6 +998,34 @@ mod tests {
         assert!(scoped.in_scope("lakehouse_api_test_mine"));
         assert!(!scoped.in_scope("lakehouse_api_test_theirs"));
         assert!(!scoped.in_scope("_sqlx_test_anything"));
+    }
+
+    #[tokio::test]
+    async fn one_pass_of_the_server_wide_sweep_sees_an_idle_test_database_and_drops_nothing() {
+        // OPS-22 review (R1): the sweep of a test process (`Sweeper::new`) is
+        // still driven through `pass` once. One pass can drop nothing: a new
+        // sweeper has seen no database idle before.
+        let name = format!("lakehouse_api_test_{}", unique_suffix());
+        let _cleanup = Cleanup::new(&[name.as_str()]);
+        let created = Instant::now();
+        create_database(&name).await;
+
+        let mut sweeper = Sweeper::new();
+        let candidates = sweeper
+            .pass(&database_url())
+            .await
+            .expect("run the one server-wide pass");
+
+        assert!(
+            candidates.is_empty(),
+            "the first pass of a sweeper picks nothing"
+        );
+        assert_unless_another_sweep_had_time(
+            created,
+            sweeper.idle_seen_last_pass.contains(&name),
+            "the server-wide sweep sees an idle test database it was not given by name",
+        );
+        drop_database(&name).await;
     }
 
     #[tokio::test]
