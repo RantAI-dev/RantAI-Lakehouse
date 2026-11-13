@@ -250,8 +250,9 @@ pub enum Relation {
         predicates: Vec<String>,
     },
     /// `base` joined to the one-row range of a number column (`BI-10`): the
-    /// column's minimum, maximum and bin width over `base` itself, as
-    /// `__bmn_<c>`, `__bmx_<c>` and `__bw_<c>` beside every column of `base`.
+    /// column's minimum, maximum, whether every value is a whole number and
+    /// the bin width over `base` itself, as `__bmn_<c>`, `__bmx_<c>`,
+    /// `__bwh_<c>` and `__bw_<c>` beside every column of `base`.
     /// A [`Relation::Bucketed`] over it turns the column into its bin. The
     /// subquery reads the same `base` text as the outer query, so the edges
     /// come from the rows the bins hold, and the role rewrite substitutes the
@@ -2058,10 +2059,23 @@ where
             } else {
                 format!(" WHERE {}", predicates.join(" AND "))
             };
-            let max = crate::bin::max_scalar_sql(column, &format!("{from_sql}{others}"));
+            let base = format!("{from_sql}{others}");
+            let max = crate::bin::max_scalar_sql(column, &base);
+            // QA `LH-BI-2-02` (`BI-57`, D3): in bins of exactly 1 over whole
+            // numbers the maximum has a bin of its own, so the clicked bin is
+            // not closed above. The width is compared with a tolerance because
+            // `clippy::float_cmp` refuses `==`; the console sends `1` exactly.
+            let whole = ((width - 1.0).abs() < f64::EPSILON)
+                .then(|| crate::bin::whole_scalar_sql(column, &base));
             predicates.insert(
                 0,
-                crate::bin::bin_records_predicate(column, lower, width, Some(&max)),
+                crate::bin::bin_records_predicate(
+                    column,
+                    lower,
+                    width,
+                    Some(&max),
+                    whole.as_deref(),
+                ),
             );
         }
         Some(RecordsValue::Bucket {
@@ -5499,7 +5513,7 @@ mod tests {
             got.sql
         );
         assert!(
-            got.sql.contains("FROM (SELECT * FROM (SELECT * FROM serving.mart_x WHERE stay >= 10) AS flt CROSS JOIN (SELECT w AS __bw_stay, mn AS __bmn_stay, mx AS __bmx_stay FROM (SELECT mn, mx, 500 AS w FROM (SELECT min(toFloat64(stay)) AS mn, max(toFloat64(stay)) AS mx FROM (SELECT * FROM serving.mart_x WHERE stay >= 10) AS flt))) AS rng) AS ranged) AS bkt GROUP BY stay ORDER BY stay"),
+            got.sql.contains("FROM (SELECT * FROM (SELECT * FROM serving.mart_x WHERE stay >= 10) AS flt CROSS JOIN (SELECT w AS __bw_stay, mn AS __bmn_stay, mx AS __bmx_stay, wh AS __bwh_stay FROM (SELECT mn, mx, wh, 500 AS w FROM (SELECT min(toFloat64(stay)) AS mn, max(toFloat64(stay)) AS mx, min(toFloat64(stay) = floor(toFloat64(stay))) AS wh FROM (SELECT * FROM serving.mart_x WHERE stay >= 10) AS flt))) AS rng) AS ranged) AS bkt GROUP BY stay ORDER BY stay"),
             "{}",
             got.sql
         );
@@ -5509,7 +5523,7 @@ mod tests {
         assert!(
             got.bins[0]
                 .sql
-                .starts_with("SELECT w AS width, mn AS min, mx AS max FROM")
+                .starts_with("SELECT w AS width, mn AS min, mx AS max, wh AS whole FROM")
         );
         // The width statement reads the same filtered rows as the bins.
         assert!(
@@ -5613,6 +5627,53 @@ mod tests {
             "SELECT * FROM serving.t WHERE ((toFloat64(v) >= 500 AND toFloat64(v) < 1000) OR (toFloat64(v) = 1000 AND toFloat64(v) = (SELECT max(toFloat64(v)) FROM serving.t WHERE g IN ('a')))) AND g IN ('a') ORDER BY ALL LIMIT 50 OFFSET 0"
         );
         assert_eq!(got.count.matches("SELECT max").count(), 1);
+    }
+
+    // QA `LH-BI-2-02` (`BI-57`, D3): a clicked year in bins of 1 asks whether
+    // the column is whole, so the maximum's own bin is listed; a wider bin
+    // keeps the closed last bin and asks nothing.
+    #[test]
+    fn a_clicked_year_in_bins_of_one_asks_whether_the_column_is_whole_and_a_wider_bin_does_not() {
+        let time = TimeContext::default();
+        let cols = typed(&[("v", ColumnKind::Number), ("g", ColumnKind::Text)]);
+        let v = Ident::new("v").unwrap();
+        let got = super::records_sql(
+            &Relation::Mart(Ident::new("t").unwrap()),
+            &cols,
+            &[filter(r#"{"column":"g","values":["a"]}"#)],
+            Some(RecordsValue::Bin {
+                column: &v,
+                lower: 2023.0,
+                width: 1.0,
+            }),
+            50,
+            0,
+            &time,
+        );
+        assert_eq!(
+            got.rows,
+            "SELECT * FROM serving.t WHERE ((toFloat64(v) >= 2023 AND toFloat64(v) < 2024) OR (toFloat64(v) = 2024 AND toFloat64(v) = (SELECT max(toFloat64(v)) FROM serving.t WHERE g IN ('a')) AND (SELECT min(toFloat64(v) = floor(toFloat64(v))) FROM serving.t WHERE g IN ('a')) = 0)) AND g IN ('a') ORDER BY ALL LIMIT 50 OFFSET 0"
+        );
+        assert_eq!(got.count.matches("SELECT max").count(), 1, "{}", got.count);
+        assert_eq!(got.count.matches("SELECT min(").count(), 1, "{}", got.count);
+        let wider = super::records_sql(
+            &Relation::Mart(Ident::new("t").unwrap()),
+            &cols,
+            &[filter(r#"{"column":"g","values":["a"]}"#)],
+            Some(RecordsValue::Bin {
+                column: &v,
+                lower: 2022.0,
+                width: 2.0,
+            }),
+            50,
+            0,
+            &time,
+        );
+        assert!(
+            !wider.rows.contains("floor(toFloat64(v)))"),
+            "{}",
+            wider.rows
+        );
     }
 
     #[test]

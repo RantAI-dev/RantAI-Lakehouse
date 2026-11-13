@@ -1087,12 +1087,16 @@ pub(crate) fn annotate_grain_switch(
 }
 
 /// `BI-10`: what the tile of a binned chart carries so the console can label
-/// its bins: `bins: { <column>: { mode, width, min, max } }`, read by the
-/// statements the builder made over the same filtered relation as the bins,
+/// its bins: `bins: { <column>: { mode, width, min, max, whole? } }`, read by
+/// the statements the builder made over the same filtered relation as the bins,
 /// through the same role rewrite as the tile (the width of a viewer whose role
-/// filters rows comes from the rows that role may see). A read that fails or is
-/// refused leaves its column out: the tile then shows the bin's lower edges
-/// as plain numbers, and the failure is only logged under a reference id.
+/// filters rows comes from the rows that role may see). `whole` (`BI-57`, QA
+/// `LH-BI-2-02`) says every value of the column is a whole number, so a bin of
+/// width 1 reads as its one value; it is left out when the read did not answer
+/// it (an older statement, a mock), and the console then labels a range. A
+/// read that fails or is refused leaves its column out: the tile then shows the
+/// bin's lower edges as plain numbers, and the failure is only logged under a
+/// reference id.
 pub(crate) async fn annotate_bins(
     ch: &ChClient,
     gate: &crate::routes::query::StatementGate<'_>,
@@ -1128,15 +1132,20 @@ async fn add_bins(
         match try_run_spec_sql(ch, gate, &read.sql, roles, placeholders, obligations).await {
             Ok(result) => {
                 let row = &result["rows"][0];
-                out.insert(
-                    read.column.clone(),
-                    json!({
-                        "mode": read.mode,
-                        "width": row["width"],
-                        "min": row["min"],
-                        "max": row["max"],
-                    }),
-                );
+                let mut entry = json!({
+                    "mode": read.mode,
+                    "width": row["width"],
+                    "min": row["min"],
+                    "max": row["max"],
+                });
+                // QA LH-BI-2-02 (BI-57, D6): every value of the column is a
+                // whole number, so a bin of width 1 reads as its one value.
+                // A read that answers no `whole` adds no key, and an existing
+                // assertion on `bins` is unchanged.
+                if !row["whole"].is_null() {
+                    entry["whole"] = row["whole"].clone();
+                }
+                out.insert(read.column.clone(), entry);
             }
             Err(SpecRunFailure::Clickhouse(err)) => {
                 let _logged = upstream_error::report_ch(&upstream_error::TILE, &err);

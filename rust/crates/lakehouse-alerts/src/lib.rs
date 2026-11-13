@@ -1795,7 +1795,8 @@ fn coerce_number(v: Option<&Value>) -> f64 {
 /// The statement a mart rule's check runs — the ONE builder the run and the
 /// rule save share (`SEC-50` slice 2 D7a: extracted from `current_value`,
 /// never copied, so the gate at save time measures exactly the statement the
-/// scheduled run would execute).
+/// scheduled run would execute). The aggregate is rounded by
+/// [`lakehouse_bi::specs::Aggregate::rounded`], as a chart's is.
 ///
 /// `mart`/`measure` reach `ClickHouse` as raw, unquoted `SQL` identifiers
 /// (unlike every other field in this module, which is sent as a
@@ -1819,7 +1820,10 @@ pub fn mart_statement(mart: &str, measure: &str, agg: &str) -> Result<String, Al
     } else {
         let measure_ident = Ident::new(measure)
             .map_err(|e| AlertError::Validation(format!("invalid measure: {e}")))?;
-        format!("round({agg}({measure_ident}))")
+        // BI-57 (#503 review R7): the one rounding rule of charts (BI-55 D4);
+        // agg was checked against AGGS above, so the lossy parse never falls
+        // back.
+        lakehouse_bi::specs::Aggregate::from_str_lossy(agg).rounded(measure_ident.as_str())
     };
     Ok(format!("SELECT {expr} AS v FROM serving.{mart_ident}"))
 }
@@ -3599,6 +3603,32 @@ mod tests {
 
     // ── `BI-39` T1: the gate knows whose rule it is ──────────────────────
 
+    // BI-57 (#503 review R7): a table rule rounds as a chart does.
+    #[test]
+    fn a_table_rule_rounds_an_average_a_minimum_and_a_maximum_to_six_decimals_as_a_chart_does() {
+        assert_eq!(
+            mart_statement("mart_x", "amount", "avg").unwrap(),
+            "SELECT round(avg(amount), 6) AS v FROM serving.mart_x"
+        );
+        assert_eq!(
+            mart_statement("mart_x", "amount", "max").unwrap(),
+            "SELECT round(max(amount), 6) AS v FROM serving.mart_x"
+        );
+        assert_eq!(
+            mart_statement("mart_x", "amount", "min").unwrap(),
+            "SELECT round(min(amount), 6) AS v FROM serving.mart_x"
+        );
+        assert_eq!(
+            mart_statement("mart_x", "amount", "sum").unwrap(),
+            "SELECT round(sum(amount)) AS v FROM serving.mart_x"
+        );
+        assert_eq!(
+            mart_statement("mart_x", "amount", "count").unwrap(),
+            "SELECT count() AS v FROM serving.mart_x"
+        );
+        assert!(mart_statement("mart_x", "amount", "median").is_err());
+    }
+
     #[tokio::test]
     async fn an_owned_rules_statement_reaches_the_gate_with_its_owner() {
         let engine = engine_answering(7.0).await;
@@ -3619,6 +3649,30 @@ mod tests {
         assert_eq!(
             seen[0].1,
             "SELECT round(sum(amount)) AS v FROM serving.mart_x"
+        );
+    }
+
+    /// `BI-57` (`#503 review R7`): an average rule sends the six-decimal
+    /// statement to the gate, as the chart whose number it compares reads it.
+    #[tokio::test]
+    async fn an_average_rule_sends_the_six_decimal_statement_to_the_gate() {
+        let engine = engine_answering(7.0).await;
+        let ch = ChClient::new(engine.uri(), "default".to_owned(), String::new());
+        let gate = RecordingGate::default();
+        let mut rule = legacy_rule("http://hooks.test");
+        rule.agg = "avg".to_owned();
+        let http = test_webhook_sender();
+        let email = no_smtp_email_sender();
+        let state = FakeState::default();
+
+        let result = run_one(&ch, &http, &email, None, (None, Some(&state)), &gate, &rule).await;
+
+        assert_eq!(result.value, Some(7.0), "the read is the engine's answer");
+        let seen = gate.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "one statement per check: {seen:?}");
+        assert_eq!(
+            seen[0].1,
+            "SELECT round(avg(amount), 6) AS v FROM serving.mart_x"
         );
     }
 
