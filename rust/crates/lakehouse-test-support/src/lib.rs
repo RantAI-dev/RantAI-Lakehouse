@@ -142,6 +142,13 @@ const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const READY_RETRY: Duration = Duration::from_millis(200);
 const READY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the repeating sweep waits between two passes.
+///
+/// It is also the least time any process needs before its sweep can drop
+/// a database: the two sightings of one sweeper are this far apart, and
+/// each process has its own sweeper (`OPS-22`).
+const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Returns the `DATABASE_URL` of the per-process test Postgres container.
 ///
 /// # Panics
@@ -526,9 +533,6 @@ async fn start_sweep(url: &str) {
 /// it could drop a database between a test's creation and its first pass.
 #[cfg(not(test))]
 fn spawn_sweep_loop(url: String, mut sweeper: Sweeper) {
-    /// How often the sweep runs.
-    const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
-
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(SWEEP_INTERVAL).await;
@@ -589,11 +593,11 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use sqlx::{Connection, PgConnection};
 
-    use super::{Sweeper, database_url, error_kind, is_sweepable};
+    use super::{SWEEP_INTERVAL, Sweeper, database_url, error_kind, is_sweepable};
 
     /// The turn token: the tests share one server and one sweep rule.
     ///
@@ -758,6 +762,29 @@ mod tests {
         }
     }
 
+    /// Asserts `holds`, unless the sweep of another process has had the time
+    /// to change it.
+    ///
+    /// `OPS-22`: a test's own sweeper sees only the test's databases, but the
+    /// databases carry the real prefixes, so the repeating sweep of another
+    /// test process may drop one. That sweep needs two sightings
+    /// `SWEEP_INTERVAL` apart, so nothing it does can be seen before the test
+    /// is that old. `created` is taken before the test creates its first
+    /// database. After `SWEEP_INTERVAL` the statement is no longer the
+    /// sweeper's promise, and the line on stderr says it was not asserted.
+    #[track_caller]
+    fn assert_unless_another_sweep_had_time(created: Instant, holds: bool, what: &str) {
+        if holds {
+            return;
+        }
+        assert!(created.elapsed() >= SWEEP_INTERVAL, "{what}");
+        eprintln!(
+            "lakehouse-test-support: not asserted, the test is {} s old and the sweep of \
+             another process may have dropped its database: {what}",
+            created.elapsed().as_secs()
+        );
+    }
+
     #[test]
     fn only_a_test_prefix_and_a_plain_charset_may_be_dropped() {
         // sqlx's own names carry UPPERCASE letters and digits (the hash is
@@ -786,6 +813,7 @@ mod tests {
         // The sweep below drops both databases; the guard is the net for
         // a panic before that.
         let _cleanup = Cleanup::new(&[lakehouse_name.as_str(), sqlx_name.as_str()]);
+        let created = Instant::now();
         create_database(&lakehouse_name).await;
         create_database(&sqlx_name).await;
 
@@ -799,13 +827,15 @@ mod tests {
             .await
             .expect("run the second sweep pass");
 
-        assert!(
+        assert_unless_another_sweep_had_time(
+            created,
             candidates.contains(&lakehouse_name),
-            "a `lakehouse_api_test_` database with no connection is picked after two passes"
+            "a `lakehouse_api_test_` database with no connection is picked after two passes",
         );
-        assert!(
+        assert_unless_another_sweep_had_time(
+            created,
             candidates.contains(&sqlx_name),
-            "a `_sqlx_test_` database with no connection is picked after two passes"
+            "a `_sqlx_test_` database with no connection is picked after two passes",
         );
         assert!(
             !database_exists(&lakehouse_name).await,
@@ -833,6 +863,7 @@ mod tests {
         // The sweep below drops the database; the guard is the net for a
         // panic before that.
         let _cleanup = Cleanup::new(&[name.as_str()]);
+        let created = Instant::now();
         create_database(&name).await;
 
         let mut sweeper = Sweeper::only(&[name.as_str()]);
@@ -845,9 +876,10 @@ mod tests {
             .await
             .expect("run the second sweep pass");
 
-        assert!(
+        assert_unless_another_sweep_had_time(
+            created,
             candidates.contains(&name),
-            "a `lakehouse_api_main_test_` database with no connection is picked after two passes"
+            "a `lakehouse_api_main_test_` database with no connection is picked after two passes",
         );
         assert!(
             !database_exists(&name).await,
@@ -956,6 +988,7 @@ mod tests {
         let _turn = take_turn().await;
         let name = format!("lakehouse_api_test_{}", unique_suffix());
         let _cleanup = Cleanup::new(&[name.as_str()]);
+        let created = Instant::now();
         create_database(&name).await;
 
         let mut sweeper = Sweeper::only(&[name.as_str()]);
@@ -968,9 +1001,11 @@ mod tests {
             candidates.is_empty(),
             "the first sight of a database must leave it alone"
         );
-        assert!(
-            database_exists(&name).await,
-            "the first sight of a database must leave it alone"
+        let name_exists = database_exists(&name).await;
+        assert_unless_another_sweep_had_time(
+            created,
+            name_exists,
+            "the first sight of a database must leave it alone",
         );
 
         drop_database(&name).await;
@@ -999,6 +1034,7 @@ mod tests {
         let mine = format!("_sqlx_test_{}", unique_suffix());
         let theirs = format!("lakehouse_api_test_{}", unique_suffix());
         let _cleanup = Cleanup::new(&[mine.as_str(), theirs.as_str()]);
+        let created = Instant::now();
         create_database(&mine).await;
         create_database(&theirs).await;
 
@@ -1021,17 +1057,19 @@ mod tests {
             .await
             .expect("run this test's second pass");
 
-        assert!(
+        assert_unless_another_sweep_had_time(
+            created,
             my_candidates.contains(&mine),
-            "a database is still picked by its own test after another test's two passes"
+            "a database is still picked by its own test after another test's two passes",
         );
         assert!(
             !their_candidates.contains(&mine),
             "another test's sweep never picks this test's database"
         );
-        assert!(
+        assert_unless_another_sweep_had_time(
+            created,
             their_candidates.contains(&theirs),
-            "the other test's sweep picks its own database"
+            "the other test's sweep picks its own database",
         );
         assert!(
             !my_candidates.contains(&theirs),
@@ -1060,6 +1098,7 @@ mod tests {
         let mine = format!("lakehouse_api_test_{}", unique_suffix());
         let theirs = format!("_sqlx_test_{}", unique_suffix());
         let _cleanup = Cleanup::new(&[mine.as_str(), theirs.as_str()]);
+        let created = Instant::now();
         create_database(&mine).await;
         create_database(&theirs).await;
 
@@ -1077,13 +1116,16 @@ mod tests {
             !candidates.contains(&theirs),
             "a test's sweep never picks the idle database of another test"
         );
-        assert!(
-            database_exists(&theirs).await,
-            "the idle database of another test survives a test's two passes"
+        let theirs_exists = database_exists(&theirs).await;
+        assert_unless_another_sweep_had_time(
+            created,
+            theirs_exists,
+            "the idle database of another test survives a test's two passes",
         );
-        assert!(
+        assert_unless_another_sweep_had_time(
+            created,
             candidates.contains(&mine),
-            "the test's own database is picked after two passes"
+            "the test's own database is picked after two passes",
         );
         assert!(
             !database_exists(&mine).await,
