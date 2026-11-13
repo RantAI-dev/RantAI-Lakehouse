@@ -76,6 +76,11 @@ function markReady() {
  * its data shows the sentence and raises an uncaught exception, which fails the
  * conversion (R3); it is marked ready so Gotenberg checks at once.
  *
+ * QA `LH-BI-1-01` (`BI-53`, D15): the PDF is always printed light, whatever
+ * the dashboard's theme — a dark box on the white page of a PDF leaves white
+ * bands at the margins and under the last tile. A chart image is the whole
+ * picture and keeps the dashboard's theme.
+ *
  * `chart` (`BI-19` part D, plan D13): the view behind a chart's PNG, opened at
  * `/render/chart/<token>`. The data route answers with one chart, so the page
  * is that chart's title, the applied filters and the chart in a box 1200 px
@@ -144,7 +149,10 @@ export function RenderView({ token, chart = false }: { token: string; chart?: bo
   }
   if (!data) return <div className="p-4 text-sm text-muted-foreground">{chart ? "Preparing the image…" : "Preparing the PDF…"}</div>;
 
-  const look = dashboardLook(data, false, data.reporting?.fonts);
+  // QA LH-BI-1-01 (BI-53, D15): the PDF is printed light, so the page, the
+  // cards and the charts draw light whatever the dashboard's theme; a chart
+  // image (the whole picture) keeps the dashboard's theme.
+  const look = dashboardLook(chart ? data : { theme: "light", font: data.font }, false, data.reporting?.fonts);
   const locale = data.reporting?.numberLocale ?? "en-US";
   const name = data.boards?.find((b) => b.id === data.board)?.name ?? (data.board === "default" ? "Main" : data.board);
   const filters = normalizeFilters(data.filters ?? []).map(filterLine);

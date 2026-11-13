@@ -9,10 +9,12 @@ import { useRenderMode, type RenderMode } from "./render-mode"
 const tileBody = { ...realTileBody }
 const grid = { ...realGrid }
 const rendered: string[] = []
+/** The `dark` each chart was drawn with, so a test can see what the print view told it. */
+const darks: boolean[] = []
 let captured: RenderMode | null = null
 mock.module("./tile-body", () => ({
   ...tileBody,
-  TileBody: function Body({ spec }: { spec: { id: string } }) {
+  TileBody: function Body({ spec, dark }: { spec: { id: string }; dark?: boolean }) {
     const mode = useRenderMode()
     React.useEffect(() => {
       if (spec.id !== "c_chart" || !mode) return
@@ -20,6 +22,7 @@ mock.module("./tile-body", () => ({
       mode.chartMounted()
     }, [mode, spec.id])
     rendered.push(spec.id)
+    darks.push(dark === true)
     return <div data-testid={`tile-${spec.id}`} />
   },
 }))
@@ -49,6 +52,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup()
   rendered.length = 0
+  darks.length = 0
   global.fetch = originalFetch
 })
 
@@ -105,6 +109,31 @@ describe("the PDF print view", () => {
     expect(sections[1].className).toContain("render-tab-break")
     expect(screen.getByTestId("item-c_text")).toBeTruthy()
     expect(screen.getByTestId("item-c_chart")).toBeTruthy()
+  })
+
+  // QA LH-BI-1-01 F2 (BI-53, D15): a dark dashboard printed as a dark box on
+  // the white page left white bands.
+  it("a dark dashboard is printed light: the page, the cards and the charts", async () => {
+    serve(payload({ theme: "dark" }))
+    const { container } = render(<RenderView token="t" />)
+    await screen.findByRole("heading", { name: "Visits" })
+    const view = container.querySelector("[data-render-view]")
+    expect(view).not.toBeNull()
+    expect(view!.className).toContain("theme-light")
+    expect(view!.className).not.toContain("dark")
+    await waitFor(() => expect(darks.length).toBeGreaterThan(0))
+    expect(darks.every((d) => d === false)).toBe(true)
+  })
+
+  it("a chart image keeps the dashboard's dark theme", async () => {
+    serve(payload({ theme: "dark" }))
+    const { container } = render(<RenderView token="t" chart />)
+    await screen.findByRole("heading", { name: "Note" })
+    const box = container.querySelector("[data-render-chart]")
+    expect(box).not.toBeNull()
+    expect(box!.className).toContain("dark")
+    await waitFor(() => expect(darks.length).toBeGreaterThan(0))
+    expect(darks.every((d) => d === true)).toBe(true)
   })
 
   it("prints an image or web-page card as a placeholder and never mounts it", async () => {
