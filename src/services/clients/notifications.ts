@@ -1,6 +1,6 @@
 import type { Notifications, NotificationsService } from "../contracts/notifications";
 import { apiFetch } from "../http";
-import { ServiceError } from "../errors";
+import { ServiceError, deniedFor } from "../errors";
 
 /**
  * `GET /api/notifications` (WS5 item F1). The `supported: false` branch is
@@ -12,6 +12,9 @@ export const notificationsService: NotificationsService = {
     const res = await apiFetch("/api/notifications", { signal });
     const json = await res.json();
     if (!res.ok) {
+      // WEB-12: a refusal is a refusal, not the service being unavailable.
+      const denied = deniedFor(res.status, json);
+      if (denied) throw denied;
       throw new ServiceError("unavailable", json?.error ?? "Failed to load notifications");
     }
     return json as Notifications;
@@ -25,6 +28,11 @@ export const notificationsService: NotificationsService = {
       signal,
     });
     if (!res.ok) {
+      // WEB-12 (D5): a refusal names the permission; every other failure keeps
+      // the fixed sentence the two callers treat as "still unread".
+      const json = await res.json().catch(() => null);
+      const denied = deniedFor(res.status, json);
+      if (denied) throw denied;
       throw new ServiceError("unavailable", "The mentions could not be marked as read");
     }
   },
