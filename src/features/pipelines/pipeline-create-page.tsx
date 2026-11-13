@@ -301,7 +301,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                 // switching one off CLEARS its stored upstream instead
                 // of leaving it behind (an omitted field would have kept
                 // the stored chain).
-                dependsOn: dependsOnFor(input.sourceZone),
+                dependsOn: dependsOnFor(input.sourceZone ?? ""),
                 // BLD-9 / decision 7: sent on every save, so "No
                 // connector" clears the stored one -- an omitted field
                 // would mean "unchanged" and the connector could never

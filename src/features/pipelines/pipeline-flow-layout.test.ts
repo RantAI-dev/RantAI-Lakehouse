@@ -52,6 +52,9 @@ describe("authoredFlow", () => {
   test("source, the transforms stacked in one column, then target", () => {
     const { nodes, edges } = authoredFlow(
       {
+        // BLD-1 part 1 / D3: the API returns both forms of the definition.
+        inputs: [{ name: "events", zone: "silver", table: "events" }],
+        steps: [{ name: "transformed", kind: "transform", reads: "events", transforms: ["dedupe(id)", "select(id,name)"] }],
         sourceZone: "silver",
         sourceTable: "events",
         incrementalColumn: null,
@@ -78,6 +81,8 @@ describe("authoredFlow", () => {
   test("a pipeline with no transform copies its source, and the target says so", () => {
     const { nodes, edges } = authoredFlow(
       {
+        inputs: [{ name: "orders_raw", zone: "bronze", table: "orders_raw" }],
+        steps: [],
         sourceZone: "bronze",
         sourceTable: "orders_raw",
         incrementalColumn: null,
