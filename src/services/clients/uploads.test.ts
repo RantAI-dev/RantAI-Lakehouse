@@ -363,7 +363,7 @@ describe("uploadService errors", () => {
     expect(err.code).toBe("invalid_request")
   })
 
-  it("keeps a 409's status and a 403's own words", async () => {
+  it("keeps a 409's status, and says a 403 in words that name the permission", async () => {
     stubFetch(() => json({ error: "That table name cannot be used. Choose another name." }, 409))
     const conflict = await rejection(
       uploadService.ingest("up-1", { bronzeTable: "x", encoding: "utf-8", delimiter: ",", headerRow: 0 })
@@ -376,7 +376,8 @@ describe("uploadService errors", () => {
     stubFetch(() => json({ error: "permission_denied: connector:manage" }, 403))
     const refused = await rejection(uploadService.list())
     expect(refused.code).toBe("permission_denied")
-    expect(refused.message).toBe("permission_denied: connector:manage")
+    expect(refused.status).toBe(403)
+    expect(refused.message).toBe("You don't have access. This needs the connector:manage permission.")
   })
 
   it("says what failed when the body is not the API's JSON, and invents no sentence", async () => {
