@@ -18,9 +18,9 @@ This repo's CI is split into workflows under `.github/workflows/`:
   throwaway registry and a throwaway key. See "Release pipeline" below.
 - **`coverage.yml`** — `cargo llvm-cov` (lcov, uploaded as a workflow
   artifact) and a CycloneDX SBOM per crate (also uploaded as an artifact,
-  for Phase 6's release attachment). Runs on `push` to `main` and manual dispatch
-  only to avoid spending ~30 runner minutes per PR run when no PR checks consume
-  the artifact.
+  for Phase 6's release attachment). Runs on a `push` to `main` that changes a file
+  the Rust tests read, and on manual dispatch; never on a pull request, which would
+  spend ~30 runner minutes per PR run when no PR check consumes the artifact.
 - **`security-all-branches.yml`** — daily scheduled (`cron: '17 3 * * *'`) and manual
   dispatch scan of all git branches using `gitleaks` (`--log-opts="--all"`).
   Deliberately separate from pull-request checks so findings on one branch do
