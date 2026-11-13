@@ -113,6 +113,13 @@ jobs:
       # OPS-24 D10: the runner of the small Rust jobs, chosen by
       # scripts/ci/select_runner.sh. Default hosted; the switch is off.
       compile_runner: ${{ steps.runner.outputs.compile_runner }}
+      # OPS-24 S2, OPS-30: how many partitions the Rust tests are split into.
+      # `test_partitions` is the count `ci-required`'s sum check loops over and
+      # `test_partition_list` is the JSON array the `test` job's matrix
+      # expands; both come from one script, so the legs that run and the
+      # counts the gate expects cannot disagree.
+      test_partitions: ${{ steps.partitions.outputs.test_partitions }}
+      test_partition_list: ${{ steps.partitions.outputs.test_partition_list }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -173,6 +180,9 @@ jobs:
       - name: Self-test worker preparation
         run: bash ./scripts/ci/tests/test_worker_prepare.sh
 
+      - name: Self-test test partitions
+        run: bash ./scripts/ci/tests/test_partitions.sh
+
       # OPS-24 D10: hosted unless the repository variable CI_WORKER_COMPILE is
       # exactly `true` and the run is not a fork's pull request. The labels are
       # fixed in the script, so no variable can name another runner.
@@ -185,6 +195,18 @@ jobs:
           SWITCH: ${{ vars.CI_WORKER_COMPILE }}
           OUTPUT_NAME: compile_runner
         run: ./scripts/ci/select_runner.sh
+
+      # OPS-24 S2, OPS-30: the number of nextest partitions. The raw
+      # repository variable CI_TEST_PARTITIONS (1 to 6, unset means 3, today's
+      # REL-20 count) crosses into the script through `env:` and is compared
+      # there; anything it rejects is a warning and 3, so one variable cannot
+      # turn every Rust run red (the rule CI_PUSH_FULL follows, D8/R4).
+      - name: Choose the number of test partitions
+        id: partitions
+        env:
+          PARTITIONS: ${{ vars.CI_TEST_PARTITIONS }}
+          OUTPUT_NAME: test_partitions
+        run: ./scripts/ci/test_partitions.sh
 
   # ── Repo Lints (merged: parity corpus, R11, compose init, Dagster imports) ──
   # Folded into a single job with one step each: these four fast static checks
