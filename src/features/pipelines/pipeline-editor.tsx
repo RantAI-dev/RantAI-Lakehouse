@@ -146,8 +146,12 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
     ? { connectorId: connectorId.trim(), targets: connectorTargets, failed: connectorSpec.status === "error" }
     : null
   // The inputs as they will be saved: with a connector, its own first input.
+  // BLD-1 part 1 S3 review R1-S4: until the connector's tables are read (or
+  // when that read fails) nothing is known about them, so the stored input
+  // stays as it is; otherwise the page would empty its table, flag it and
+  // count a change nobody made (D17a's sentence with it).
   const inputs = React.useMemo(
-    () => effectiveInputs(editor.inputs, hasConnector ? (connectorTargets ?? []) : null),
+    () => effectiveInputs(editor.inputs, hasConnector ? connectorTargets : null),
     [editor.inputs, hasConnector, connectorTargets]
   )
   const shownState = React.useMemo(() => ({ ...editor, inputs }), [editor, inputs])

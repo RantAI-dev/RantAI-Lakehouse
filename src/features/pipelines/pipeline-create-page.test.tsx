@@ -45,6 +45,8 @@ const sent: { method: string; path: string; body: Record<string, unknown> }[] = 
 /** The connector a QA report made its pipeline from, and its ingest targets. */
 const SEED_CONNECTOR = "conn-pg-lakehouse"
 let ingestTargets: { name: string; target: string }[] = []
+/** When set, the connector's ingest spec cannot be read (R1-S4). */
+let ingestSpecFails = false
 let connectorList: { id: string; name: string }[] = []
 /** The person signed in (`GET /api/auth/me`). */
 const ME = "u-me"
@@ -81,6 +83,7 @@ beforeEach(() => {
   sent.length = 0
   pushed.length = 0
   search = ""
+  ingestSpecFails = false
   saveAnswer = { status: 200, body: { id: "pl-1", name: "orders_clean" } }
   previewAnswer = {
     status: 200,
@@ -99,6 +102,9 @@ beforeEach(() => {
     sent.push({ method, path: url.split("?")[0] ?? url, body })
     if (url.startsWith("/api/auth/me")) {
       return jsonResponse({ id: ME, name: "Me", email: null, roles: [], permissions: ["pipeline:write"], tenants: [] })
+    }
+    if (url.includes("/ingest-spec") && ingestSpecFails) {
+      return jsonResponse({ error: "connector service unavailable" }, 503)
     }
     if (url.includes("/ingest-spec")) {
       // BLD-7 decision 5: the connector the page already reads through
@@ -524,6 +530,26 @@ describe("changing a pipeline's connector on the edit form (BLD-9)", () => {
     // owns one upstream at a time, and `ingest_job` is still accepted on a
     // Bronze first input.
     expect(body.dependsOn).toEqual(["ingest_job", "pl-raw-loads-2"])
+  })
+
+  // BLD-1 part 1 S3 review R1-S4: an unread connector table list is not a
+  // change; the stored input stays, unflagged, and D17a is not said.
+  it("keeps the stored input, flags nothing and counts no change while the connector's tables cannot be read", async () => {
+    ingestSpecFails = true
+    const stored = withInput(
+      { name: "orders", zone: "bronze", table: "orders" },
+      { dependsOn: ["ingest_job"], runAs: "u-author", runAsName: "Author" }
+    )
+    stored.definition = { ...stored.definition, connectorId: SEED_CONNECTOR }
+    renderEditor(stored)
+
+    expect(await screen.findByText(/Could not read this connector/)).toBeTruthy()
+    await waitFor(() => expect(sent.some((c) => c.path === "/api/auth/me")).toBe(true))
+    await act(async () => {})
+    const item = within(screen.getByRole("group", { name: /^Inputs/ })).getByRole("button", { name: /orders/ })
+    expect(item.textContent).toContain("bronze.orders")
+    expect(item.textContent).not.toContain("needs attention")
+    expect(screen.queryByText("This pipeline will read as you from now on.")).toBeNull()
   })
 
   it("sets the connector picked in the edit form", async () => {
