@@ -6,6 +6,14 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
+    # OPS-24 follow-up (product owner, 2026-11-13): Dependabot does not
+    # rebase its own pull requests when `main` moves. Each rebase started a
+    # full CI run (42 jobs) on the same 20 runner slots every other pull
+    # request waits for; with about nine Dependabot pull requests open, every
+    # merge to `main` queued nine runs nobody was reading. A Dependabot pull
+    # request now runs CI when it is opened, and once more when a person
+    # updates it before merging.
+    rebase-strategy: "disabled"
     groups:
       # arrow and parquet must move with the iceberg crate: iceberg 0.10.1
       # pins arrow 58, so arrow 60 alone fails to compile with two arrow
@@ -33,6 +41,14 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
+    # OPS-24 follow-up (product owner, 2026-11-13): Dependabot does not
+    # rebase its own pull requests when `main` moves. Each rebase started a
+    # full CI run (42 jobs) on the same 20 runner slots every other pull
+    # request waits for; with about nine Dependabot pull requests open, every
+    # merge to `main` queued nine runs nobody was reading. A Dependabot pull
+    # request now runs CI when it is opened, and once more when a person
+    # updates it before merging.
+    rebase-strategy: "disabled"
     groups:
       npm-patch-and-minor:
         update-types: ["patch", "minor"]
@@ -55,5 +71,13 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
+    # OPS-24 follow-up (product owner, 2026-11-13): Dependabot does not
+    # rebase its own pull requests when `main` moves. Each rebase started a
+    # full CI run (42 jobs) on the same 20 runner slots every other pull
+    # request waits for; with about nine Dependabot pull requests open, every
+    # merge to `main` queued nine runs nobody was reading. A Dependabot pull
+    # request now runs CI when it is opened, and once more when a person
+    # updates it before merging.
+    rebase-strategy: "disabled"
     commit-message:
       prefix: "chore(ci)"

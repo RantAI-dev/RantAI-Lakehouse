@@ -162,6 +162,12 @@ Which outputs each job group runs on:
 
 On `push` to `main`, run everything regardless of scope.
 
+> Changed 2026-11-13 by `OPS-24` (D1, D3): a `push` to `main` now follows the same
+> change scope as a pull request, over its own diff (`github.event.before` to the pushed
+> commit), and every job runs on the nightly run at 19:23 UTC instead. The sentence above
+> is kept as the state this plan was written against. See
+> `docs/superpowers/plans/2026-11-13-ci-faster-runs.md`.
+
 ### 4.2 Build each image once per run
 
 Add an `images` job that builds the `lakehouse-api` image and the Dagster
@@ -387,3 +393,9 @@ the target.
 | A path rule wrongly skips a job | Fail-safe `all` default, script self-tests, and every job runs on `main` |
 | Queueing still inflates wall-clock when several PRs push together | Not fully solvable on free runners; fewer jobs and path filters reduce it |
 | Conflicts with concurrent work in `ci.yml` and `docker-compose.yml` | Small PRs, rebase before each push |
+
+> Changed 2026-11-13 by `OPS-24` (D1, D3): the row above about a path rule is kept as
+> written, and its mitigation no longer describes the rule — a job now needs
+> `all=true` (a workflow or fixture change, an unreadable base, or the nightly run) to
+> run on `main`, not the push itself. The nightly run at 19:23 UTC is the backstop that
+> exercises every job once a day; a bad path rule is caught there, not on every push.
