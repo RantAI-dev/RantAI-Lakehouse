@@ -8,6 +8,7 @@ import { downloadCsv, toCsv } from "@/lib/csv";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import { RowsTable } from "@/components/patterns/rows-table";
 import type { FilterSkip } from "@/services/clients/bi-store";
+import type { GrainNotApplied } from "@/lib/grain-switch";
 import type { TileLimit } from "@/services/contracts/settings";
 import { visibleColumns } from "@/lib/chart-shape";
 import { TileBody } from "./tile-body";
@@ -32,6 +33,8 @@ export type Rows = {
   bins?: Record<string, BinMeta>;
   /** A dashboard grain switch this chart could not take; it kept its own (BI-9). */
   grainSkipped?: string;
+  /** Why the dashboard's grain did not apply to this chart (`BI-50`; QA `LH-BI-9-05`). */
+  grainNotApplied?: GrainNotApplied | string;
   /** More buckets existed than the chart's limit; the latest are shown (BI-9). A pivot: more cells than it may return, so the first are shown (BI-16). */
   truncated?: boolean;
   /**

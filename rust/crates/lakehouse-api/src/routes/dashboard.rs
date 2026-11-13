@@ -77,6 +77,14 @@ pub struct DashboardQuery {
     /// from one tile (a chart alert's check, the PDF's chart image).
     #[serde(skip)]
     only: Option<String>,
+    /// `BI-52` (plan D23): whether a parameter value that does not fit refuses
+    /// the whole read. `serde(skip)` for the same reason as `only`: no request
+    /// can set it. A read that produces a document (the PDF's print view) or
+    /// decides something from the numbers sets it, and then a refused value is
+    /// a 400 as it always was; the dashboard page's own read leaves it false
+    /// and gets the refusal listed instead.
+    #[serde(skip)]
+    strict_params: bool,
 }
 
 impl DashboardQuery {
@@ -96,6 +104,7 @@ impl DashboardQuery {
             params: params.map(str::to_owned),
             fresh: None,
             only: None,
+            strict_params: true,
         }
     }
 
@@ -243,8 +252,9 @@ pub(crate) fn pdf_supported(config: &crate::config::Config) -> bool {
 ///
 /// # Errors
 ///
-/// The response to send instead: 400 for filters, grain or parameters that do
-/// not fit, a fixed sentence for a store failure.
+/// The response to send instead: 400 for filters or grain that do not fit,
+/// and for a parameter value that does not fit when the read is strict
+/// (`BI-52`, `q.strict_params`); a fixed sentence for a store failure.
 #[allow(
     clippy::result_large_err,
     reason = "the Err is a ready Response the caller returns verbatim; boxing it would change every call site for no gain on the success path (REL-9 decision D2, PR #204 CI)"
@@ -462,14 +472,27 @@ async fn get_body(
         }
     };
     // BI-11: this read's parameter values (the request's, else the board's
-    // saved ones, else each default). A value that does not fit is a 400
-    // before any tile is read; a store that cannot be read leaves the values
-    // empty, so only a chart that names a parameter shows an error.
+    // saved ones, else each default). BI-52 (plan D23-D26): the dashboard
+    // page's own read keeps going when a value does not fit — that parameter
+    // takes the value it has without the request and the refusal is listed in
+    // `refusedParams` — while a read that produces a document or decides from
+    // the numbers (`strict_params`) still refuses the whole read with a 400. A
+    // store that cannot be read leaves the values empty, so only a chart that
+    // names a parameter shows an error.
     let shown: Vec<lakehouse_bi::params::BoardParam> =
         board_obj.and_then(|b| b.params.clone()).unwrap_or_default();
-    let loaded = crate::routes::params::load(ch, &shown, q.params.as_deref())
-        .await
-        .map_err(BodyError::Params)?;
+    let loaded = crate::routes::params::load(
+        ch,
+        &shown,
+        q.params.as_deref(),
+        if q.strict_params {
+            crate::routes::params::OnRefusal::Fail
+        } else {
+            crate::routes::params::OnRefusal::Report
+        },
+    )
+    .await
+    .map_err(BodyError::Params)?;
     if let Some(message) = &loaded.store_error {
         store_error.get_or_insert_with(|| message.clone());
     }
@@ -628,6 +651,15 @@ async fn get_body(
                 let skipped = &filtered.skipped;
                 crate::routes::support::annotate_params(&mut val, c, values_ref);
                 crate::routes::support::annotate_grain(&mut val, &filtered, c);
+                // BI-50 (QA LH-BI-9-05): the mark a chart the dashboard's
+                // grain switch left unchanged carries, with its reason.
+                crate::routes::support::annotate_grain_switch(
+                    &mut val,
+                    c,
+                    filtered.grain,
+                    read_ref.grain,
+                    (cols_ref, sources_ref),
+                );
                 crate::routes::support::annotate_table(
                     ch,
                     gate,
@@ -787,6 +819,11 @@ async fn get_body(
         "params": crate::routes::params::controls(&shown, &loaded.values),
         "defaultParams": crate::routes::params::saved_values(&loaded.defs, &shown),
         "appliedParams": loaded.values.values_json(),
+        // BI-52 (QA LH-BI-11-05, plan D26): the parameters whose requested
+        // value did not fit, with the fixed sentence; empty when there are
+        // none. Never on a read that refused the whole request (that one
+        // answers 400 before here).
+        "refusedParams": loaded.refused,
         "boards": boards_out,
         "kpis": kpis_out,
         "charts": charts_out,
@@ -1106,7 +1143,15 @@ pub async fn specs_preview(
     let time = crate::routes::settings::time_context(&state).await?;
     let loaded = if sent_params.is_some() || input.uses_params() {
         let text = sent_params.as_ref().map(ToString::to_string);
-        Some(crate::routes::params::load(&state.clickhouse, &[], text.as_deref()).await?)
+        Some(
+            crate::routes::params::load(
+                &state.clickhouse,
+                &[],
+                text.as_deref(),
+                crate::routes::params::OnRefusal::Fail,
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -2933,7 +2978,13 @@ pub async fn records(
     };
     let obligations = PolicyEngineObligations::new(state.pg.as_deref(), &state.clickhouse);
     let time = crate::routes::settings::time_context(&state).await?;
-    let loaded = crate::routes::params::load(&state.clickhouse, &[], q.params.as_deref()).await?;
+    let loaded = crate::routes::params::load(
+        &state.clickhouse,
+        &[],
+        q.params.as_deref(),
+        crate::routes::params::OnRefusal::Fail,
+    )
+    .await?;
     let time = time.with_params(loaded.values);
     records_for_roles(
         &state.clickhouse,
@@ -4150,7 +4201,13 @@ async fn export_tile_statement(
     // BI-18 part C: a filter tied to another tab is not in this tile's file.
     let dashboard_filters = filters_for_chart_tab(ch, &chart, dashboard_filters).await;
     let time = crate::routes::settings::time_context(state).await?;
-    let loaded = crate::routes::params::load(ch, &[], q.params.as_deref()).await?;
+    let loaded = crate::routes::params::load(
+        ch,
+        &[],
+        q.params.as_deref(),
+        crate::routes::params::OnRefusal::Fail,
+    )
+    .await?;
     let time = time.with_params(loaded.values);
     let (statement, labels) = if rows_mode {
         rows_export_statement(ch, &chart, q, dashboard_filters, &time).await?
@@ -6992,6 +7049,7 @@ mod typed_filters {
             params: None,
             fresh: None,
             only: None,
+            strict_params: false,
         };
         let parsed = parse_filters_param(q.filters.as_deref()).expect("valid filters");
         let state = crate::state::AppState::without_a_database();
@@ -8210,14 +8268,28 @@ mod time_grain {
     }
 
     fn chart_row(id: &str, grain: &str, kind: &str, dimension: &str) -> Value {
+        chart_row_with(id, Some(grain), kind, dimension)
+    }
+
+    /// QA `LH-BI-9-05` (`BI-50`, plan T4): a stored chart whose definition
+    /// carries no `grain` key at all, which is exactly a chart with no date
+    /// grouping for the dashboard's control to change.
+    fn chart_row_without_grain(id: &str, kind: &str, dimension: &str) -> Value {
+        chart_row_with(id, None, kind, dimension)
+    }
+
+    fn chart_row_with(id: &str, grain: Option<&str>, kind: &str, dimension: &str) -> Value {
         let spec = json!({
             "id": id, "title": id, "kind": kind, "mart": "mart_a",
             "sql": "SELECT stored", "x": dimension, "y": "visitors"
         });
-        let def = json!({
+        let mut def = json!({
             "title": id, "mart": "mart_a", "kind": kind, "dimension": dimension,
-            "measures": ["visitors"], "limit": 3, "order": "none", "grain": grain,
+            "measures": ["visitors"], "limit": 3, "order": "none",
         });
+        if let Some(grain) = grain {
+            def["grain"] = json!(grain);
+        }
         json!({
             "id": id, "board": "b1", "created_by": "ui", "created_at": "2026-01-01 00:00:00",
             "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
@@ -8228,8 +8300,32 @@ mod time_grain {
     /// date, and a day-of-week bar; `mart_a` has a `Date` `day` and a
     /// `DateTime` `seen_at`.
     async fn mount_board(server: &MockServer, board_grain: &str) {
-        let col = |n: &str| (n.to_owned(), "String".to_owned());
-        let _ = col;
+        mount_board_with(
+            server,
+            board_grain,
+            vec![
+                chart_row("c_line", "day", "line", "day"),
+                chart_row("c_month", "month", "bar", "day"),
+                chart_row("c_dow", "day_of_week", "bar", "day"),
+            ],
+            vec![
+                json!({"table": "mart_a", "name": "day", "type": "Date"}),
+                json!({"table": "mart_a", "name": "seen_at", "type": "DateTime"}),
+                json!({"table": "mart_a", "name": "visitors", "type": "UInt32"}),
+            ],
+        )
+        .await;
+    }
+
+    /// [`mount_board`] with a board of the caller's own charts and columns
+    /// (`BI-50`, plan T4): the stored charts are `charts`, and `columns` is what
+    /// `FROM system.columns` answers for the marts.
+    async fn mount_board_with(
+        server: &MockServer,
+        board_grain: &str,
+        charts: Vec<Value>,
+        columns: Vec<Value>,
+    ) {
         answer(
             server,
             "FROM console.bi_chart FINAL",
@@ -8240,11 +8336,7 @@ mod time_grain {
                 ("created_at", "String"),
                 ("spec_json", "String"),
             ],
-            vec![
-                chart_row("c_line", "day", "line", "day"),
-                chart_row("c_month", "month", "bar", "day"),
-                chart_row("c_dow", "day_of_week", "bar", "day"),
-            ],
+            charts,
         )
         .await;
         answer(
@@ -8264,11 +8356,7 @@ mod time_grain {
             server,
             "SELECT table, name, type FROM system.columns",
             &[("table", "String"), ("name", "String"), ("type", "String")],
-            vec![
-                json!({"table": "mart_a", "name": "day", "type": "Date"}),
-                json!({"table": "mart_a", "name": "seen_at", "type": "DateTime"}),
-                json!({"table": "mart_a", "name": "visitors", "type": "UInt32"}),
-            ],
+            columns,
         )
         .await;
         // The tiles: every grained statement carries `AS bkt`; three buckets
@@ -8315,6 +8403,7 @@ mod time_grain {
             params: None,
             fresh: None,
             only: None,
+            strict_params: false,
         };
         let state = crate::state::AppState::without_a_database();
         get_body(
@@ -8382,6 +8471,290 @@ mod time_grain {
         assert_eq!(body["appliedGrain"], json!("month"));
     }
 
+    /// The board of T4's `grainNotApplied` tests: a chart the switch changes
+    /// (`c_line`), one that groups by a part of the date (`c_dow`), one whose
+    /// dimension is not a date (`c_city`), one with no date grouping of its own
+    /// (`c_plain`) and a KPI, whose type takes no date grouping (`c_kpi`).
+    async fn mount_grain_switch_board(server: &MockServer) {
+        mount_board_with(
+            server,
+            "",
+            vec![
+                chart_row("c_line", "day", "line", "day"),
+                chart_row("c_dow", "day_of_week", "bar", "day"),
+                chart_row_without_grain("c_city", "bar", "city"),
+                chart_row_without_grain("c_plain", "bar", "day"),
+                chart_row_without_grain("c_kpi", "kpi", ""),
+            ],
+            vec![
+                json!({"table": "mart_a", "name": "day", "type": "Date"}),
+                json!({"table": "mart_a", "name": "city", "type": "String"}),
+                json!({"table": "mart_a", "name": "visitors", "type": "UInt32"}),
+            ],
+        )
+        .await;
+    }
+
+    /// QA `LH-BI-9-05` (`BI-50`, plan D10, T4): while the dashboard's switch is
+    /// on, every chart it does not change says why, in the four typed reasons.
+    #[tokio::test]
+    async fn while_the_switch_is_on_every_chart_it_does_not_change_says_why() {
+        let server = MockServer::start().await;
+        mount_grain_switch_board(&server).await;
+        let body = dashboard(&server, Some(Grain::Month), &TimeContext::default()).await;
+        let results = &body["results"];
+        assert!(
+            results["c_line"].get("grainNotApplied").is_none(),
+            "the switch changed it: {results}"
+        );
+        assert_eq!(results["c_dow"]["grainNotApplied"], json!("part"));
+        assert_eq!(results["c_city"]["grainNotApplied"], json!("not_a_date"));
+        assert_eq!(results["c_plain"]["grainNotApplied"], json!("no_grain"));
+        assert_eq!(results["c_kpi"]["grainNotApplied"], json!("kind"));
+    }
+
+    /// QA `LH-BI-9-05` (`BI-50`, plan D13): with no dashboard grain there is no
+    /// control in play, so no tile carries the mark.
+    #[tokio::test]
+    async fn without_a_dashboard_grain_no_tile_carries_the_mark() {
+        let server = MockServer::start().await;
+        mount_grain_switch_board(&server).await;
+        let body = dashboard(&server, None, &TimeContext::default()).await;
+        for (id, tile) in body["results"]
+            .as_object()
+            .expect("the results are an object")
+        {
+            assert!(
+                tile.get("grainNotApplied").is_none(),
+                "{id} carries the mark without a grain: {tile}"
+            );
+        }
+    }
+
+    /// QA `LH-BI-9-05` (`BI-50`, plan D10): a chart that kept its own grain
+    /// because the requested one does not fit its column keeps the older
+    /// `grainSkipped` and is not marked twice.
+    #[tokio::test]
+    async fn a_chart_that_kept_its_grain_because_the_new_one_does_not_fit_carries_only_grain_skipped()
+     {
+        let server = MockServer::start().await;
+        mount_board(&server, "").await;
+        let body = dashboard(&server, Some(Grain::Hour), &TimeContext::default()).await;
+        let line = &body["results"]["c_line"];
+        assert_eq!(line["grainSkipped"], json!("hour"));
+        assert!(line.get("grainNotApplied").is_none(), "{line}");
+    }
+
+    /// R5 (rule 14): a chart whose definition has a grain but which kept its
+    /// stored statement — this read could not rebuild it — carries no mark:
+    /// the switch never decided its grain, so "no date grouping of its own"
+    /// would be a reason it did not find.
+    #[tokio::test]
+    async fn a_chart_that_kept_its_stored_statement_says_nothing_about_its_grain() {
+        let server = MockServer::start().await;
+        mount_board_with(
+            &server,
+            "",
+            vec![json!({
+                "id": "c_stored", "board": "b1", "created_by": "ui",
+                "created_at": "2026-01-01 00:00:00",
+                "spec_json": json!({
+                    "spec": {
+                        "id": "c_stored", "title": "c_stored", "kind": "line", "mart": "",
+                        "sql": "SELECT day, visitors FROM serving.mart_a",
+                        "x": "day", "y": "visitors",
+                    },
+                    "def": {
+                        "title": "c_stored", "mart": "", "kind": "line",
+                        "dimension": "day", "measures": ["visitors"], "limit": 3,
+                        "order": "none", "grain": "day",
+                    },
+                    "hasYear": false,
+                }).to_string(),
+            })],
+            vec![json!({"table": "mart_a", "name": "day", "type": "Date"})],
+        )
+        .await;
+        let body = dashboard(&server, Some(Grain::Month), &TimeContext::default()).await;
+        let tile = &body["results"]["c_stored"];
+        assert!(
+            tile.get("grainNotApplied").is_none(),
+            "the chart kept its stored statement, so nothing calls its grain missing: {tile}"
+        );
+    }
+
+    /// The one `target` parameter (`BI-52`, plan T5): a number with default 30
+    /// and a maximum of 50. Mounted before [`mount_board`], which ends with a
+    /// catch-all.
+    async fn mount_target_param(server: &MockServer) {
+        answer(
+            server,
+            "FROM console.bi_param FINAL",
+            &[
+                ("id", "String"),
+                ("name", "String"),
+                ("def_json", "String"),
+                ("created_by", "String"),
+                ("updated_at", "String"),
+            ],
+            vec![json!({
+                "id": "p_target", "name": "target",
+                "def_json": json!({
+                    "name": "target", "label": "Target", "type": "number",
+                    "default": 30, "min": 0, "max": 50,
+                })
+                .to_string(),
+                "created_by": "ui", "updated_at": "2026-01-01 00:00:00",
+            })],
+        )
+        .await;
+    }
+
+    /// [`dashboard`] with a request's `params` text and the strict flag
+    /// (`BI-52`, plan T5), keeping the error so a test can see the 400.
+    async fn dashboard_with_params(
+        server: &MockServer,
+        params: Option<&str>,
+        strict_params: bool,
+        time: &TimeContext,
+    ) -> Result<Value, super::BodyError> {
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(None, &ch);
+        let q = DashboardQuery {
+            board: Some("b1".to_owned()),
+            year: None,
+            filters: None,
+            grain: None,
+            params: params.map(str::to_owned),
+            fresh: None,
+            only: None,
+            strict_params,
+        };
+        let state = crate::state::AppState::without_a_database();
+        get_body(
+            &ch,
+            &crate::routes::query::StatementGate::unrestricted(&state),
+            &q,
+            None,
+            &[],
+            &PlaceholderValues::none(),
+            &obligations,
+            (
+                time,
+                GrainRequest::Saved,
+                &lakehouse_bi::access::Viewer::system(),
+                &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
+            ),
+        )
+        .await
+    }
+
+    /// QA `LH-BI-11-05` (`BI-52`, plan D26, T5): a value that does not fit is
+    /// listed for that parameter alone, the parameter takes the value in force
+    /// and every tile is still read.
+    #[tokio::test]
+    async fn a_parameter_value_that_does_not_fit_is_listed_and_the_dashboard_is_still_read() {
+        let server = MockServer::start().await;
+        mount_target_param(&server).await;
+        mount_board(&server, "").await;
+        let body = dashboard_with_params(
+            &server,
+            Some(r#"{"target":51}"#),
+            false,
+            &TimeContext::default(),
+        )
+        .await
+        .expect("a refused value no longer fails the page's read");
+        let refused = body["refusedParams"]
+            .as_array()
+            .expect("refusedParams is a list");
+        assert_eq!(refused.len(), 1, "{body}");
+        assert_eq!(refused[0]["name"], json!("target"));
+        let reason = refused[0]["reason"].as_str().expect("a sentence");
+        assert!(reason.contains("at most 50"), "{reason}");
+        assert!(
+            !reason.contains("51"),
+            "the value is not repeated: {reason}"
+        );
+        assert_eq!(
+            body["appliedParams"]["target"].as_f64(),
+            Some(30.0),
+            "the default, the value in force: {body}"
+        );
+        assert!(
+            body["results"]["c_line"].get("rows").is_some(),
+            "the rest of the dashboard is drawn: {body}"
+        );
+    }
+
+    /// QA `LH-BI-11-05` (`BI-52`, plan D25, T5): a name no definition has is
+    /// ignored by the page's read and is not listed as a refusal.
+    #[tokio::test]
+    async fn a_name_that_is_not_a_parameter_is_ignored_by_the_dashboards_read() {
+        let server = MockServer::start().await;
+        mount_target_param(&server).await;
+        mount_board(&server, "").await;
+        let body = dashboard_with_params(
+            &server,
+            Some(r#"{"gone":1}"#),
+            false,
+            &TimeContext::default(),
+        )
+        .await
+        .expect("an unknown name does not fail the page's read");
+        assert_eq!(body["refusedParams"], json!([]));
+    }
+
+    /// QA `LH-BI-11-05` (`BI-52`, plan D23, T5): a read that makes a document
+    /// still refuses the whole read, so the file cannot show another value.
+    #[tokio::test]
+    async fn a_read_that_makes_a_document_still_refuses_the_whole_read() {
+        let server = MockServer::start().await;
+        mount_target_param(&server).await;
+        mount_board(&server, "").await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(None, &ch);
+        let q = DashboardQuery::for_render("b1", None, Some(r#"{"target":51}"#), None);
+        let state = crate::state::AppState::without_a_database();
+        let time = TimeContext::default();
+        let got = get_body(
+            &ch,
+            &crate::routes::query::StatementGate::unrestricted(&state),
+            &q,
+            None,
+            &[],
+            &PlaceholderValues::none(),
+            &obligations,
+            (
+                &time,
+                GrainRequest::Saved,
+                &lakehouse_bi::access::Viewer::system(),
+                &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
+            ),
+        )
+        .await;
+        match got {
+            Err(super::BodyError::Params(ApiError::BadRequest(message))) => {
+                assert!(message.contains("at most 50"), "{message}");
+            }
+            other => panic!("expected the parameter 400, got {other:?}"),
+        }
+    }
+
+    /// QA `LH-BI-11-06` (`BI-52`, plan D25, T5): `params` that is not a JSON
+    /// object is still a 400 — the console never sends one.
+    #[tokio::test]
+    async fn params_that_are_not_an_object_are_still_a_bad_request() {
+        let server = MockServer::start().await;
+        mount_target_param(&server).await;
+        mount_board(&server, "").await;
+        let got = dashboard_with_params(&server, Some("[1]"), false, &TimeContext::default()).await;
+        assert!(
+            matches!(got, Err(super::BodyError::Params(_))),
+            "expected the parameter 400"
+        );
+    }
+
     /// `BI-4` part B T5 (plan D8, `BI-4-AC1`): the second open is served from
     /// memory and says so, with the first open's `computedAt`; `fresh=1`
     /// computes again; the payload names the rule in force.
@@ -8439,6 +8812,7 @@ mod time_grain {
             params: None,
             fresh: None,
             only: None,
+            strict_params: false,
         };
         let state = crate::state::AppState::without_a_database();
         let body = get_body(
@@ -8836,6 +9210,7 @@ mod table_tiles {
             params: None,
             fresh: None,
             only: None,
+            strict_params: false,
         };
         let state = crate::state::AppState::without_a_database();
         get_body(

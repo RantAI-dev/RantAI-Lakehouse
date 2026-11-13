@@ -79,6 +79,31 @@ test("a horizontal bar with several measures reverses every series with its cate
   assert.deepEqual((option.yAxis as { data: string[] }).data, ["b", "a"])
 })
 
+// QA LH-BI-6-25 (BI-49): a radar compares measures on one shared scale and
+// names each in the legend, instead of drawing only the first.
+test("a radar draws one shape per measure on one shared scale and names each in the legend", () => {
+  const rows = [{ kota: "X", a: 10, b: 2000 }, { kota: "Y", a: 30, b: 1000 }]
+  const option = buildOption({ kind: "radar", x: "kota", y: ["a", "b"] }, rows, false)
+  const series = option.series as { data: { name: string; value: number[] }[] }[]
+  assert.equal(series.length, 1)
+  assert.deepEqual(series[0].data.map((d) => d.name), ["a", "b"])
+  assert.deepEqual(series[0].data.map((d) => d.value), [[10, 30], [2000, 1000]])
+  const radar = option.radar as { indicator: { max: number }[] }
+  assert.deepEqual(radar.indicator.map((i) => i.max), [2200, 2200])
+  const legend = option.legend as { data: string[] }
+  assert.deepEqual(legend.data, ["a", "b"])
+})
+
+test("a radar with one measure has no legend and keeps the scale of its own values", () => {
+  const rows = [{ kota: "X", a: 10 }, { kota: "Y", a: 30 }]
+  const option = buildOption({ kind: "radar", x: "kota", y: "a" }, rows, false)
+  const series = option.series as { data: { value: number[] }[] }[]
+  assert.equal(series[0].data.length, 1)
+  const radar = option.radar as { indicator: { max: number }[] }
+  assert.deepEqual(radar.indicator.map((i) => i.max), [33, 33])
+  assert.equal("legend" in option, false)
+})
+
 test("a combo and a stacked bar name their series and axes by the label", () => {
   const rows = [{ c: "a", visitors: 10, avg_stay: 2 }]
   const labels = { avg_stay: "avg of stay" }

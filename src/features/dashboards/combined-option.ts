@@ -37,6 +37,13 @@ export type LayerCell = {
   error?: string;
   errorId?: string;
   truncated?: boolean;
+  /**
+   * Why the question failed, when the viewer's own access is the reason
+   * (`BI-51`, QA `LH-BI-13-03`): `"access"`, mirroring
+   * `routes::layers::LayerCause`. Such a question is in the legend, greyed,
+   * and says so in one line under the chart, never with a reference.
+   */
+  cause?: "access" | string;
 };
 
 export type CombinedInput = {
@@ -81,9 +88,22 @@ const ISO_DATE = /^\d{4}-\d{2}-\d{2}/;
 const answered = (l: LayerCell) => !l.error && l.rows.length > 0;
 const dimensionOf = (l: LayerCell) => l.dimension ?? l.columns[0] ?? "";
 
-/** The layers that failed, with the sentence the tile lists for each. */
+/**
+ * QA `LH-BI-13-03` (`BI-51`, plan D20): the sentence the server gives a
+ * question the viewer's access does not cover, as the legend entry and the
+ * line under the chart say it. Not `NO_ACCESS`: that name is the shared
+ * refused-request sentence, "You don't have access.", in `services/errors.ts`.
+ */
+export const NOT_AVAILABLE_WITH_YOUR_ACCESS = "Not available with your access";
+
+/** The labels of the layers the viewer's access does not cover (`BI-51`). */
+export function unavailableLayers(layers: readonly LayerCell[] | undefined): string[] {
+  return (layers ?? []).filter((l) => l.cause === "access").map((l) => l.label);
+}
+
+/** The layers that failed, with the sentence the tile lists for each. A question the viewer's access does not cover is named in its own line instead (`BI-51`). */
 export function failedLayers(layers: readonly LayerCell[] | undefined): { label: string; error: string; errorId?: string }[] {
-  return (layers ?? []).filter((l) => l.error).map((l) => ({ label: l.label, error: l.error ?? "", errorId: l.errorId }));
+  return (layers ?? []).filter((l) => l.error && l.cause !== "access").map((l) => ({ label: l.label, error: l.error ?? "", errorId: l.errorId }));
 }
 
 /** The labels of the layers that were cut off (BI-13 review fix (SHOULD-FIX) R1): the tile says so under the chart. */
@@ -105,7 +125,7 @@ export function categoryKeys(baseRows: readonly Row[], x: string, layers: readon
   return keys.length && keys.every((k) => ISO_DATE.test(k)) ? [...keys].sort() : keys;
 }
 
-type Series = { name: string; type: LayerDraw; axis: LayerAxis; values: (number | null)[]; owner: number; area: boolean };
+type Series = { name: string; type: LayerDraw; axis: LayerAxis; values: (number | null)[]; owner: number; area: boolean; off: boolean };
 
 function valuesOf(rows: readonly Row[], x: string, column: string, keys: readonly string[]): (number | null)[] {
   const byKey = new Map<string, number>();
@@ -129,22 +149,42 @@ export function buildCombinedOption(input: CombinedInput, dark: boolean): Combin
     values: valuesOf(rows, x, col, keys),
     owner: -1,
     area: input.kind === "area",
+    off: false,
   }));
   layers.forEach((l, index) => {
-    if (!answered(l)) return;
+    if (!answered(l)) {
+      // BI-51 (QA LH-BI-13-03): a question the viewer's access does not cover
+      // keeps its place in the legend, greyed and silent, with no point on the
+      // axis the chart's own first series uses — so it adds no axis.
+      if (l.cause === "access") {
+        series.push({
+          name: `${l.label} (not available with your access)`,
+          type: l.draw,
+          axis: series[0]?.axis ?? "left",
+          values: keys.map(() => null),
+          owner: index,
+          area: false,
+          off: true,
+        });
+      }
+      return;
+    }
     const dim = dimensionOf(l);
     const cols = l.columns.filter((c) => c !== dim && c !== "__other");
     const labelsOf = tileMeasureLabels(input.layerMeasures?.[index], cols, undefined, input.metricLabels);
     for (const col of cols) {
       series.push({
         name: cols.length === 1 ? l.label : `${l.label} · ${labelsOf[col] ?? displayColumn(col)}`,
-        type: l.draw, axis: l.axis, values: valuesOf(l.rows, dim, col, keys), owner: index, area: false,
+        type: l.draw, axis: l.axis, values: valuesOf(l.rows, dim, col, keys), owner: index, area: false, off: false,
       });
     }
   });
 
   const ink = dark ? "#a1a1aa" : "#71717a";
   const split = dark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.06)";
+  // The muted colour of a question the viewer's access does not cover (BI-51).
+  const muted = dark ? "#52525b" : "#a1a1aa";
+  const hasOff = series.some((s) => s.off);
   const sides: LayerAxis[] = [];
   if (series.some((s) => s.axis === "left") || !series.some((s) => s.axis === "right")) sides.push("left");
   if (series.some((s) => s.axis === "right")) sides.push("right");
@@ -160,7 +200,16 @@ export function buildCombinedOption(input: CombinedInput, dark: boolean): Combin
       textStyle: { color: dark ? "#e4e4e7" : "#18181b", fontSize: 12 },
       trigger: "axis", axisPointer: { type: "cross" },
     },
-    legend: { top: 0, type: "scroll", textStyle: { color: ink, fontSize: 11, ...LEGEND_TEXT }, tooltip: { show: true }, icon: "circle" },
+    legend: {
+      top: 0, type: "scroll", textStyle: { color: ink, fontSize: 11, ...LEGEND_TEXT }, tooltip: { show: true }, icon: "circle",
+      // BI-51: only a greyed question changes the legend's data; without one
+      // the legend is exactly what it was.
+      ...(hasOff ? {
+        data: series.map((s) => (s.off
+          ? { name: s.name, textStyle: { color: muted }, itemStyle: { color: muted } }
+          : { name: s.name })),
+      } : {}),
+    },
     grid: { left: 8, right: 16, top: 34, bottom: 8, containLabel: true },
     xAxis: {
       type: "category", data: labels,
@@ -189,6 +238,9 @@ export function buildCombinedOption(input: CombinedInput, dark: boolean): Combin
             smooth: false, showSymbol: showsPointMarkers("line", keys.length), symbolSize: 6, lineStyle: { width: 2 },
             ...(s.area ? { areaStyle: { opacity: 0.12 } } : {}),
           }),
+      // BI-51: a question the viewer's access does not cover keeps its legend
+      // entry but draws nothing and answers no pointer.
+      ...(s.off ? { silent: true, itemStyle: { color: muted }, lineStyle: { color: muted } } : {}),
     })),
   } as EChartsOption;
   return { option, keys, labels, owners: series.map((s) => s.owner) };

@@ -12,10 +12,20 @@ mock.module("next/navigation", () => ({
 }))
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
-import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { afterAll, afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { toast } from "sonner"
 import { TableProviders } from "@/components/app-shell/table-providers"
 import { AuthProvider } from "@/features/auth/auth-provider"
+import * as realEchart from "./echart"
+
+// A tile the date grouping does not change needs rows, and a chart needs a
+// canvas; the mark does not. The real module is put back for the files after
+// this one, as chart-builder.test.tsx does for its own mock.
+mock.module("./echart", () => ({ EChart: () => <div data-testid="chart" /> }))
+afterAll(() => {
+  mock.module("./echart", () => realEchart)
+})
+
 import { DashboardPage } from "./dashboard-page"
 
 afterEach(() => {
@@ -82,6 +92,65 @@ describe("DashboardPage per-role rendering without CopilotProvider (ADM-13 revie
 
     // Assert that the page rendered in view mode without errors
     expect(screen.queryByRole("alert")).toBeNull()
+  })
+})
+
+// QA LH-BI-9-05 (BI-50): the mark a chart the dashboard's date grouping does
+// not change carries is drawn only while the control applied a grain.
+describe("DashboardPage date grouping mark (QA LH-BI-9-05)", () => {
+  const sentence = "Group dates by does not apply: this chart's dimension is not a date."
+  const grained = {
+    id: "c_line", title: "Visitors", kind: "line", mart: "mart_x", x: "day", y: "visitors",
+    source: "ui", span: 1,
+    def: { title: "Visitors", kind: "line", mart: "mart_x", dimension: "day", measures: ["visitors"], grain: "day" },
+  }
+  const byCity = {
+    id: "c_city", title: "By city", kind: "bar", mart: "mart_x", x: "city", y: "visitors",
+    source: "ui", span: 1,
+    def: { title: "By city", kind: "bar", mart: "mart_x", dimension: "city", measures: ["visitors"] },
+  }
+
+  function mount(appliedGrain: string | null) {
+    spyOn(globalThis, "fetch").mockImplementation(((input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.includes("/api/auth/me")) {
+        return Promise.resolve(json({
+          id: "u_viewer", name: "Dashboard Viewer", email: null,
+          roles: ["Dashboard Viewer"], permissions: ["dashboard:read"], tenants: [],
+        }))
+      }
+      if (path.startsWith("/api/dashboard?")) {
+        return Promise.resolve(json({
+          board: "b_1", boardName: "Quarterly Sales", boards: [{ id: "b_1", name: "Quarterly Sales" }],
+          charts: [grained, byCity], kpis: [], filterColumns: [], layout: { c_line: { x: 0, y: 0, w: 6, h: 4 }, c_city: { x: 0, y: 4, w: 6, h: 4 } },
+          grain: "", appliedGrain, canDownload: true,
+          results: {
+            c_line: { columns: ["day", "visitors"], rows: [{ day: "2026-01-01", visitors: 1 }], grain: appliedGrain ?? "day" },
+            c_city: { columns: ["city", "visitors"], rows: [{ city: "Bali", visitors: 2 }], grainNotApplied: "not_a_date" },
+          },
+        }))
+      }
+      if (path.includes("/api/dashboard/folders")) return Promise.resolve(json([]))
+      if (path.includes("/api/dashboard/shortcuts")) return Promise.resolve(json({ favourites: [], recent: [] }))
+      return Promise.resolve(json({}))
+    }) as unknown as typeof fetch)
+    render(
+      <AuthProvider>
+        <TableProviders>
+          <DashboardPage boardId="b_1" />
+        </TableProviders>
+      </AuthProvider>,
+    )
+  }
+
+  it("the mark is drawn only while the dashboard applied a grain", async () => {
+    mount("month")
+    expect(await screen.findByLabelText(sentence)).toBeTruthy()
+
+    cleanup()
+    mount(null)
+    expect(await screen.findByText("By city")).toBeTruthy()
+    expect(screen.queryByLabelText(sentence)).toBeNull()
   })
 })
 

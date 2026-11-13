@@ -584,6 +584,316 @@ async fn a_dashboard_tile_on_a_hidden_table_is_not_found_while_the_other_tiles_r
     );
 }
 
+// ── Combined charts: a question outside the viewer's access ─────────────
+
+/// QA `LH-BI-13-03` (`BI-51`, plan T7): a board with one bar question on
+/// [`LAYER_BASE`] and one line question on [`LAYER_MART`], so the second
+/// question can be hidden from the viewer or masked for their role.
+const LAYER_BASE: &str = "mart_bi51_base";
+const LAYER_MART: &str = "mart_bi51_cost";
+const LAYER_TILE: &str = "c_bi51";
+
+fn layered_board_chart() -> Value {
+    let spec = json!({
+        "id": LAYER_TILE, "title": LAYER_TILE, "kind": "bar",
+        "mart": LAYER_BASE,
+        "sql": format!("SELECT kota, round(sum(n)) AS n FROM serving.{LAYER_BASE} GROUP BY kota"),
+        "x": "kota", "y": "n",
+    });
+    let def = json!({
+        "title": LAYER_TILE, "kind": "bar", "mart": LAYER_BASE, "dimension": "kota",
+        "measures": ["n"], "aggregate": "sum", "limit": 20,
+        "layers": [{
+            "mart": LAYER_MART, "dimension": "kota", "measures": ["omzet"],
+            "aggregate": "sum", "draw": "line", "axis": "right",
+        }],
+    });
+    json!({
+        "id": LAYER_TILE, "board": "", "created_by": "ui",
+        "created_at": "2026-01-01 00:00:00",
+        "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
+    })
+}
+
+/// The engine's refusal of a sum over the `***` a mask produces (`BI-51`).
+const MASKED_SUM_REFUSAL: &str = "Code: 43. DB::Exception: Illegal type String of argument for \
+     aggregate function sum. (ILLEGAL_TYPE_OF_ARGUMENT)";
+
+/// How the fake answers a read of the second mart (`R2`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MartRead {
+    /// Only a statement that carries the mask's own rewrite
+    /// (`replaceRegexpOne`) is refused; any other read of the mart gets no
+    /// rows. A test on this mode fails when masking stops, which an
+    /// unconditional refusal would hide.
+    MaskedOnly,
+    /// Every read of the mart is refused, masked or not.
+    Always,
+}
+
+/// A `ClickHouse` serving the one combined chart: both marts' columns, the
+/// base question with one row, and a refusal for the second question's read.
+#[derive(Clone)]
+struct LayerFake {
+    log: Arc<Mutex<Vec<String>>>,
+    mart_read: MartRead,
+}
+
+impl LayerFake {
+    fn new() -> Self {
+        Self {
+            log: Arc::new(Mutex::new(Vec::new())),
+            mart_read: MartRead::Always,
+        }
+    }
+
+    /// R2: only the masked read of the second mart fails.
+    fn masked_only() -> Self {
+        Self {
+            log: Arc::new(Mutex::new(Vec::new())),
+            mart_read: MartRead::MaskedOnly,
+        }
+    }
+
+    fn statements(&self) -> Vec<String> {
+        self.log.lock().expect("the statement log").clone()
+    }
+
+    async fn serve(&self) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(self.clone())
+            .mount(&server)
+            .await;
+        server
+    }
+}
+
+impl Respond for LayerFake {
+    fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+        let sql = String::from_utf8_lossy(&request.body).into_owned();
+        self.log
+            .lock()
+            .expect("the statement log")
+            .push(sql.clone());
+        if sql.contains("FROM console.bi_chart") {
+            return rows(
+                &["id", "board", "created_by", "created_at", "spec_json"],
+                &[layered_board_chart()],
+            );
+        }
+        if sql.contains("FROM console.bi_board") {
+            return rows(&["id", "name"], &[]);
+        }
+        if sql.contains("FROM system.columns") {
+            let column = |table: &str, name: &str, ty: &str| {
+                json!({"table": table, "name": name, "type": ty,
+                       "default_kind": "", "default_expression": ""})
+            };
+            let meta = &[
+                "table",
+                "name",
+                "type",
+                "default_kind",
+                "default_expression",
+            ];
+            // The rewrite asks one table at a time with `AND table=`: answer
+            // with that mart's columns only.
+            if sql.contains("AND table=") {
+                if sql.contains(LAYER_BASE) {
+                    return rows(
+                        meta,
+                        &[
+                            column(LAYER_BASE, "kota", "String"),
+                            column(LAYER_BASE, "n", "UInt64"),
+                        ],
+                    );
+                }
+                if sql.contains(LAYER_MART) {
+                    return rows(
+                        meta,
+                        &[
+                            column(LAYER_MART, "kota", "String"),
+                            column(LAYER_MART, "omzet", "UInt64"),
+                        ],
+                    );
+                }
+            }
+            return rows(
+                meta,
+                &[
+                    column(LAYER_BASE, "kota", "String"),
+                    column(LAYER_BASE, "n", "UInt64"),
+                    column(LAYER_MART, "kota", "String"),
+                    column(LAYER_MART, "omzet", "UInt64"),
+                ],
+            );
+        }
+        // No table is a view: the rewrite's view refusal stays out of the way.
+        if sql.contains("FROM system.tables") {
+            return rows(&["database", "name", "engine", "create_table_query"], &[]);
+        }
+        // The second question's read: what the engine says when a mask turned
+        // the number into `***`. R2: in `MaskedOnly` mode only a statement
+        // that carries the mask's rewrite is refused; a read without it gets
+        // no rows, so a change that stops masking shows up as a pass-through.
+        if sql.contains(&format!("FROM serving.{LAYER_MART}")) {
+            return match self.mart_read {
+                MartRead::MaskedOnly if !sql.contains("replaceRegexpOne") => rows(&[], &[]),
+                MartRead::MaskedOnly | MartRead::Always => {
+                    ResponseTemplate::new(500).set_body_string(MASKED_SUM_REFUSAL)
+                }
+            };
+        }
+        if sql.contains(&format!("FROM serving.{LAYER_BASE}")) {
+            return rows(&["kota", "n"], &[json!({"kota": "A", "n": 1})]);
+        }
+        rows(&[], &[])
+    }
+}
+
+/// A `GET /api/dashboard` as `cookie`, with its body and status.
+async fn dashboard_as(router: &axum::Router, cookie: &str) -> (StatusCode, Value) {
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/dashboard")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+    let body: Value = serde_json::from_slice(&bytes).expect("a JSON body");
+    (status, body)
+}
+
+/// QA `LH-BI-13-03` (`BI-51`, D16, D18): a question on a table the viewer's
+/// role does not read is marked as access, without the gate's text, and that
+/// table is never read.
+#[tokio::test]
+async fn a_question_on_a_table_the_viewers_role_does_not_read_is_marked_as_access() {
+    let fake = LayerFake::new();
+    let server = fake.serve().await;
+    let TestApp { router, pool } = app(&server).await;
+    let user = narrowed(&pool, "dashboard:read", &[("serving", LAYER_BASE)]).await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let (status, body) = dashboard_as(&router, &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let tile = &body["results"][LAYER_TILE];
+    assert!(
+        tile.get("rows").is_some(),
+        "the base question renders: {body}"
+    );
+    let layer = &tile["layers"][0];
+    assert_eq!(layer["cause"], json!("access"), "{layer}");
+    assert_eq!(layer["error"], "Not available with your access.", "{layer}");
+    assert!(layer.get("errorId").is_none(), "{layer}");
+    let text = layer.to_string();
+    assert!(!text.contains("Table not found"), "{text}");
+    assert!(
+        fake.statements()
+            .iter()
+            .all(|sql| !sql.contains(&format!("FROM serving.{LAYER_MART}"))),
+        "the hidden question never reaches the engine: {:?}",
+        fake.statements()
+    );
+}
+
+/// QA `LH-BI-13-03` (`BI-51`, D16): a question that sums a column masked for
+/// the viewer is marked as access, and the mask's name and the engine's text
+/// stay out of the entry.
+#[tokio::test]
+async fn a_question_that_sums_a_column_masked_for_the_viewer_is_marked_as_access() {
+    let fake = LayerFake::masked_only();
+    let server = fake.serve().await;
+    let TestApp { router, pool } = app(&server).await;
+    let user = narrowed(
+        &pool,
+        "dashboard:read",
+        &[("serving", LAYER_BASE), ("serving", LAYER_MART)],
+    )
+    .await;
+    let role: String = sqlx::query_scalar(
+        "SELECT r.name FROM role r JOIN app_user_role a ON a.role_id = r.id WHERE a.user_id = $1",
+    )
+    .bind(user)
+    .fetch_one(&pool)
+    .await
+    .expect("the user's role name");
+    governance::create_policy(
+        &pool,
+        &CreatePolicyInput {
+            name: "bi51-mask".to_owned(),
+            kind: "Row filter".to_owned(),
+            subjects: role.clone(),
+            resources: format!("serving.{LAYER_MART}"),
+            effect: "Permit with obligation".to_owned(),
+            conditions: Some(
+                json!({
+                    "roles": [role],
+                    "table": format!("serving.{LAYER_MART}"),
+                    "mask": ["omzet"],
+                })
+                .to_string(),
+            ),
+            activate: true,
+            owner: None,
+        },
+    )
+    .await
+    .expect("seed the mask");
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let (status, body) = dashboard_as(&router, &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let layer = &body["results"][LAYER_TILE]["layers"][0];
+    assert_eq!(layer["cause"], json!("access"), "{layer}");
+    assert_eq!(layer["error"], "Not available with your access.", "{layer}");
+    assert!(layer.get("errorId").is_none(), "{layer}");
+    let text = layer.to_string();
+    for needle in ["omzet", "Code: 43", "Illegal"] {
+        assert!(!text.contains(needle), "{needle} leaked: {text}");
+    }
+    // R2: the refusal was the masked read's own — the statement the rewrite
+    // produced carries `replaceRegexpOne` over the mart this question sums.
+    assert!(
+        fake.statements()
+            .iter()
+            .any(|sql| sql.contains("replaceRegexpOne")
+                && sql.contains(&format!("FROM serving.{LAYER_MART}"))),
+        "the masked read reached the engine: {:?}",
+        fake.statements()
+    );
+}
+
+/// QA `LH-BI-13-03` (`BI-51`, D16): an engine failure the viewer's access does
+/// not explain keeps its sentence and its reference.
+#[tokio::test]
+async fn a_question_the_engine_refuses_for_a_viewer_without_a_mask_keeps_its_reference() {
+    let fake = LayerFake::new();
+    let server = fake.serve().await;
+    let TestApp { router, pool } = app(&server).await;
+    let user = narrowed(
+        &pool,
+        "dashboard:read",
+        &[("serving", LAYER_BASE), ("serving", LAYER_MART)],
+    )
+    .await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let (status, body) = dashboard_as(&router, &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let layer = &body["results"][LAYER_TILE]["layers"][0];
+    assert_eq!(layer["error"], "This chart could not be loaded.", "{layer}");
+    assert!(layer["errorId"].is_string(), "{layer}");
+    assert!(layer.get("cause").is_none(), "{layer}");
+}
+
 // ── Embeds ──────────────────────────────────────────────────────────────
 
 /// The board an embed token names, and the secret the token is signed with.

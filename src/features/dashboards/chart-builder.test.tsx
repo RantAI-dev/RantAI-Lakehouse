@@ -777,3 +777,28 @@ describe("ChartBuilder breakdown grain and limit label (QA LH-BI-6-01)", () => {
     expect(screen.queryByText("Breakdown values (Top N)")).toBeNull()
   })
 })
+
+// QA `LH-BI-6-25` (`BI-49`): a radar compares measures like a bar does, so the
+// builder offers "Add measure" and the preview carries both.
+describe("ChartBuilder radar measures (QA LH-BI-6-25)", () => {
+  /** A base-ui Select choice: open, focus the option, click it (as format-section does). */
+  function choose(trigger: HTMLElement, option: string) {
+    fireEvent.click(trigger)
+    const target = screen.getByRole("option", { name: option })
+    fireEvent.focus(target)
+    fireEvent.click(target)
+  }
+
+  it("a radar offers Add measure and sends both measures", async () => {
+    renderBuilder({ ...barDef, kind: "radar" })
+    await screen.findByLabelText("Measure (Y)")
+    fireEvent.click(screen.getByRole("button", { name: /What to show/ }))
+    fireEvent.click(await screen.findByRole("button", { name: /Add measure/ }))
+    await waitFor(() => expect(screen.queryAllByRole("option")).toHaveLength(0))
+    choose(await screen.findByLabelText("Measure 2"), "stay")
+    await waitFor(() => expect(bodies.some((b) => Array.isArray(b.measures) && b.measures.length === 2)).toBe(true))
+    const body = bodies[bodies.length - 1]!
+    expect(body.kind).toBe("radar")
+    expect(body.measures).toEqual(["visitors", "stay"])
+  })
+})

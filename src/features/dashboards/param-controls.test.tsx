@@ -49,4 +49,36 @@ describe("ParamControls", () => {
     rerender(<ParamControls controls={[{ ...number, value: 250 }]} onChange={mock(() => {})} />)
     expect((screen.getByLabelText("Target") as HTMLInputElement).value).toBe("250")
   })
+
+  // QA LH-BI-11-05 (BI-52): the refusal is under its own control, and the
+  // control goes back to the value in force.
+  it("a refusal is shown under its control and the control goes back to the value in force", () => {
+    const { rerender } = render(<ParamControls controls={[number]} onChange={mock(() => {})} />)
+    const input = screen.getByLabelText("Target") as HTMLInputElement
+    fireEvent.change(input, { target: { value: "999" } })
+    fireEvent.blur(input)
+    rerender(
+      <ParamControls
+        controls={[number]}
+        onChange={mock(() => {})}
+        refusals={{ target: "parameter 'target' must be at most 5000." }}
+      />,
+    )
+    expect(screen.getByRole("alert").textContent).toBe("parameter 'target' must be at most 5000.")
+    expect((screen.getByLabelText("Target") as HTMLInputElement).value).toBe("1000")
+    // The refusal stays under the control it belongs to.
+    const field = document.querySelector('[data-param="target"]') as HTMLElement
+    expect(field.textContent).toContain("parameter 'target' must be at most 5000.")
+  })
+
+  it("a refusal for a parameter the dashboard does not show is listed after the controls", () => {
+    render(<ParamControls controls={[number]} onChange={mock(() => {})} refusals={{ hidden: "parameter 'hidden' must be a number." }} />)
+    expect(screen.getByRole("alert").textContent).toBe("parameter 'hidden' must be a number.")
+    expect(document.querySelector('[data-param="hidden"]')).toBeNull()
+  })
+
+  it("without a refusal no alert is drawn", () => {
+    render(<ParamControls controls={[number]} onChange={mock(() => {})} />)
+    expect(screen.queryByRole("alert")).toBeNull()
+  })
 })
