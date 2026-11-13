@@ -1585,6 +1585,159 @@ async fn the_assistant_lists_only_the_rules_on_tables_the_person_may_read() {
     assert_eq!(assets, ["silver.orders"], "the tool reads as the person");
 }
 
+/// `GOV-15` (`GOV-12` plan, section 4): a person outside the tenant that owns
+/// the shared catalog cannot set or reset a schedule, and the refusal stores
+/// and records nothing. The two answers are equal, so a schedule says nothing
+/// about which tables exist.
+#[tokio::test]
+async fn a_caller_outside_the_catalog_tenant_cannot_set_or_reset_a_schedule_and_nothing_is_stored()
+{
+    let (router, pool, _ch) = app().await;
+    let cookie = admin(&pool).await;
+    let body = json!({"mode": "interval", "intervalMinutes": 180});
+    let (code, stored) = call(
+        &router,
+        &cookie,
+        "PUT",
+        "/api/governance/quality/schedules/silver.orders",
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{stored}");
+
+    let cookie = outsider(&pool).await;
+    let (code, set) = call(
+        &router,
+        &cookie,
+        "PUT",
+        "/api/governance/quality/schedules/silver.customers",
+        Some(body),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{set}");
+    let (code, reset) = call(
+        &router,
+        &cookie,
+        "DELETE",
+        "/api/governance/quality/schedules/silver.orders",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{reset}");
+    assert_eq!(
+        set, reset,
+        "the tenant refusal is the same for every table, so it names none"
+    );
+
+    let rows: Vec<String> =
+        sqlx::query_scalar("SELECT asset || '|' || interval_minutes::text FROM quality_schedule")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, ["silver.orders|180"], "a refusal stores nothing");
+    assert_eq!(
+        audit_events(&pool, "quality.schedule_update").await,
+        1,
+        "only the permitted setting is recorded"
+    );
+    assert_eq!(
+        audit_events(&pool, "quality.schedule_reset").await,
+        0,
+        "a refused reset records nothing"
+    );
+}
+
+/// `GOV-15` (`GOV-12` plan, section 4): a schedule on a table the caller's
+/// role does not read is refused with the sentence a rule on that table gets
+/// (`DATA-54`'s create), and the table's existence is not checked then — so
+/// neither refusal says which tables exist.
+#[tokio::test]
+async fn a_schedule_on_a_table_the_role_may_not_read_is_refused_with_the_rule_sentence() {
+    let (router, pool, _ch) = app().await;
+    let cookie = narrowed(&pool).await;
+    let body = json!({"mode": "interval", "intervalMinutes": 180});
+
+    let (code, set) = call(
+        &router,
+        &cookie,
+        "PUT",
+        "/api/governance/quality/schedules/silver.customers",
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{set}");
+    let (code, refused_rule) = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/governance/quality",
+        Some(json!({
+            "name": "g15_s", "asset": "silver.customers", "dimension": "volume",
+            "threshold": "rows >= 1", "severity": "high",
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{refused_rule}");
+    assert_eq!(
+        set["error"], refused_rule["error"],
+        "a schedule gives the sentence a rule on that table gets"
+    );
+    let (code, reset) = call(
+        &router,
+        &cookie,
+        "DELETE",
+        "/api/governance/quality/schedules/silver.customers",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{reset}");
+    assert_eq!(reset["error"], set["error"], "resetting says the same");
+
+    let (code, missing) = call(
+        &router,
+        &cookie,
+        "PUT",
+        "/api/governance/quality/schedules/silver.no_such_table",
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{missing}");
+    let sentence = |body: &Value, asset: &str| body["error"].as_str().unwrap().replace(asset, "T");
+    assert_eq!(
+        sentence(&missing, "silver.no_such_table"),
+        sentence(&set, "silver.customers"),
+        "a hidden table and a missing one read alike"
+    );
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM quality_schedule")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "a refused schedule stores nothing");
+    assert_eq!(audit_events(&pool, "quality.schedule_update").await, 0);
+    assert_eq!(audit_events(&pool, "quality.schedule_reset").await, 0);
+
+    // Their own table is unchanged by the gate.
+    let (code, stored) = call(
+        &router,
+        &cookie,
+        "PUT",
+        "/api/governance/quality/schedules/silver.orders",
+        Some(body),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{stored}");
+    let (code, _) = call(
+        &router,
+        &cookie,
+        "DELETE",
+        "/api/governance/quality/schedules/silver.orders",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::NO_CONTENT);
+}
+
 /// QA `LH-DATA-14-01` F2 (`DATA-54`): a rewrite that changes the table is
 /// checked, and a refusal leaves the rule on its old table. A rewrite that
 /// keeps the table is not checked, so a rule on a dropped table can still be
