@@ -97,24 +97,37 @@
 //! `pg_stat_activity` shows the backend of an open connection, and a
 //! database with a backend on it is never picked for dropping.
 //!
-//! Two test processes can share the server at the same time: `cargo test`
-//! runs one test binary at a time, but two cargo processes (a second
-//! worktree, another session) run against the same labelled container.
-//! Each of them sweeps on its own schedule and with its own two-pass
-//! state, so the sweep of one process can drop a database that a test of
-//! another process has just created and has not connected to yet.
+//! Several test processes share the server at the same time. `cargo test`
+//! runs one test binary at a time, with its tests on the threads of one
+//! process. `cargo nextest` (CI since `REL-20`) gives every test a process
+//! of its own and runs several at once, and a second checkout on the same
+//! machine uses the same labelled container. Each of these processes runs
+//! this crate's constructor, so each makes a first pass when it starts
+//! and, if it lives that long, another pass every 30 seconds. The two-pass
+//! state is in the memory of the process, so the passes of two processes
+//! never add up: a database is dropped only by a process that saw it idle
+//! twice itself, 30 seconds apart. A process that ends before its second
+//! pass drops nothing.
 //!
-//! That is the rule above, seen from the other side: a database that
-//! still has a backend on it is left alone by every sweep, its own
-//! process's and another process's alike. A backend lasts only as long
-//! as its connection is open, and the pool closes an idle connection
-//! after one second, so a test that pauses for more than about a second
-//! between two queries has no backend on its database in between. A test
-//! must therefore not leave its database without a backend for two
-//! passes in a row — between 30 and 60 seconds — or a sweep, its own
-//! process's or another process's, may take it away. The tests of this
-//! crate therefore take a turn, one test at a time, so that they do not
-//! drop each other's databases.
+//! So a database that still has a backend on it is left alone by every
+//! sweep, its own process's and another process's alike. A backend lasts
+//! only as long as its connection is open, and the pool closes an idle
+//! connection after one second, so a test that pauses for more than about
+//! a second between two queries has no backend on its database in
+//! between. A test must therefore not leave its database without a
+//! backend for two passes in a row, between 30 and 60 seconds, or a
+//! sweep, its own process's or another process's, may take it away.
+//!
+//! `OPS-22`: this crate's own tests are the one place where two passes
+//! run with no time between them. Until that fix each of them swept the
+//! whole server twice within milliseconds and dropped whatever had no
+//! backend at that instant, a database another test had only just
+//! created included (CI runs 43033910245, 43250741080, 43344075791,
+//! 43349333080); the sentence that stood here, that the sweep of one
+//! process can drop a database another process has just created, was
+//! true of those tests only. A test's sweeper now sees only the
+//! databases the test created (`Sweeper::only`), and the tests run side
+//! by side.
 //!
 //! # Requirements
 //!
@@ -592,47 +605,12 @@ fn init() {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use sqlx::{Connection, PgConnection};
 
     use super::{SWEEP_INTERVAL, Sweeper, database_url, error_kind, is_sweepable};
-
-    /// The turn token: the tests share one server and one sweep rule.
-    ///
-    /// Every sweep drops every idle test database it has seen twice, and a
-    /// database that another test has just created is idle — so two tests
-    /// running at once drop each other's databases. One test at a time,
-    /// from the creation of its database to its last assertion.
-    ///
-    /// `tokio`'s `sync` feature (an async mutex) is not enabled in this
-    /// crate, and a `std` mutex cannot be held across an `await`, so the
-    /// turn is a flag the tests take with a compare-and-swap.
-    static TURN: AtomicBool = AtomicBool::new(false);
-
-    /// Holds the turn and gives it back when it is dropped, also when the
-    /// test panicked.
-    struct TurnGuard;
-
-    impl Drop for TurnGuard {
-        fn drop(&mut self) {
-            TURN.store(false, Ordering::Release);
-        }
-    }
-
-    /// Waits for the turn and takes it.
-    async fn take_turn() -> TurnGuard {
-        loop {
-            if TURN
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                return TurnGuard;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
 
     /// A suffix that makes a test database name unique and keeps it inside
     /// the `[A-Za-z0-9_]` charset the sweep allows.
@@ -738,9 +716,8 @@ mod tests {
     /// own databases at the end of the test; this guard is the net for a
     /// panic before that.
     ///
-    /// The guard is declared after the turn token, so the cleanup runs
-    /// while the test still holds the turn: no other test of this binary
-    /// can pick the database up in the meantime.
+    /// No other test can pick these databases up in the meantime: a test's
+    /// sweeper sees only the test's own databases (`OPS-22`).
     struct Cleanup {
         names: Vec<String>,
     }
@@ -807,7 +784,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_database_with_a_test_prefix_is_gone_after_two_passes() {
-        let _turn = take_turn().await;
         let lakehouse_name = format!("lakehouse_api_test_{}", unique_suffix());
         let sqlx_name = format!("_sqlx_test_{}", unique_suffix());
         // The sweep below drops both databases; the guard is the net for
@@ -854,7 +830,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_database_with_the_bin_crate_prefix_is_gone_after_two_passes() {
-        let _turn = take_turn().await;
         // OPS-13: the `lakehouse-api` binary's own unit tests create their
         // per-test database with a third prefix
         // (`rust/crates/lakehouse-api/src/main.rs:1644`) and never drop it,
@@ -893,7 +868,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_database_with_an_open_connection_survives_two_passes() {
-        let _turn = take_turn().await;
         let name = format!("lakehouse_api_test_{}", unique_suffix());
         let _cleanup = Cleanup::new(&[name.as_str()]);
         create_database(&name).await;
@@ -929,7 +903,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_database_without_a_test_prefix_survives_two_passes() {
-        let _turn = take_turn().await;
         let name = format!("untouched_db_{}", unique_suffix());
         // The sweep never touches this name, so nothing else drops the
         // database: the guard is the only net for a panic before the drop
@@ -964,7 +937,6 @@ mod tests {
 
     #[tokio::test]
     async fn the_cleanup_drops_the_database_of_a_test_that_panicked() {
-        let _turn = take_turn().await;
         let name = format!("untouched_db_{}", unique_suffix());
         create_database(&name).await;
 
@@ -985,7 +957,6 @@ mod tests {
 
     #[tokio::test]
     async fn one_pass_does_not_drop_a_database_seen_for_the_first_time() {
-        let _turn = take_turn().await;
         let name = format!("lakehouse_api_test_{}", unique_suffix());
         let _cleanup = Cleanup::new(&[name.as_str()]);
         let created = Instant::now();
