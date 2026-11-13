@@ -13,7 +13,9 @@
 //! The result value of a bin is its **lower edge**, a number, so it sorts and
 //! draws like any number. A bin includes its lower edge and excludes its
 //! upper edge, except the last bin, which also includes the maximum: the
-//! maximum is never alone in a bin of its own (`BI-10-AC1`).
+//! maximum is never alone in a bin of its own (`BI-10-AC1`) — except over a
+//! column of whole numbers in bins of width 1, where each value, the maximum
+//! too, is a bin of its own (`BI-57`, QA `LH-BI-2-02`).
 //!
 //! # One statement, no pre-read round trip
 //!
@@ -29,8 +31,8 @@
 //! - no call site needs a second, asynchronous, read.
 //!
 //! The tile still needs the width to label `500 – 1,000`, so the builder also
-//! returns [`Range::read_sql`], one row `(width, min, max)` over the same
-//! relation, which the API runs through the same rewrite
+//! returns [`Range::read_sql`], one row `(width, min, max, whole)` over the
+//! same relation, which the API runs through the same rewrite
 //! (`routes::support::annotate_bins`).
 //!
 //! # How the width is chosen
@@ -41,6 +43,14 @@
 //! `n` (alignment can cost one bin over `(max - min) / width`). A range of zero
 //! has width 1. Edges are multiples of the width, so `visitors` in bins of 500
 //! reads `0, 500, 1000, ...`.
+//!
+//! Automatic and counted bins of a column whose values are all whole numbers
+//! are never narrower than 1 (`BI-57`, QA `LH-BI-2-02`): below 1 a bin could
+//! not hold a value of its own. They are one value per bin only when that many
+//! bins fit the count; when one bin per value from the minimum to the maximum
+//! would be more than `n`, the width is 2. A width of 1 then holds exactly one
+//! value, so each bin reads as it, and the tile carries whether the column is
+//! whole (`whole`) to say so.
 //!
 //! A histogram (`BI-16` part B) is cut differently, `BI-18` part C review fix
 //! (SHOULD-FIX) R21: a number of ranges is honoured ([`exact_width`]: the width
@@ -237,6 +247,12 @@ fn literal(v: f64) -> String {
     format!("{v}")
 }
 
+/// `1` when `c` is a whole number, `0` otherwise, as one expression the engine
+/// evaluates per row: what [`Range::stats_sql`] and [`whole_scalar_sql`] read.
+fn whole_test(c: &str) -> String {
+    format!("toFloat64({c}) = floor(toFloat64({c}))")
+}
+
 /// How a bin's width is found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WidthRule {
@@ -351,20 +367,30 @@ impl Range {
         format!("__bw_{}", self.column)
     }
 
-    /// `SELECT mn, mx, w FROM ...` over `base`: the column's minimum and
-    /// maximum and the bin width, one row.
+    /// `1` when every value of the column over the read rows is a whole
+    /// number, beside the width (`BI-57`).
+    fn wh(&self) -> String {
+        format!("__bwh_{}", self.column)
+    }
+
+    /// `SELECT mn, mx, wh, w FROM ...` over `base`: the column's minimum,
+    /// maximum, whether every value is a whole number, and the bin width, one
+    /// row.
     fn stats_sql(&self, base: &str) -> String {
         let c = &self.column;
-        let l1 = format!("SELECT min(toFloat64({c})) AS mn, max(toFloat64({c})) AS mx FROM {base}");
+        let l1 = format!(
+            "SELECT min(toFloat64({c})) AS mn, max(toFloat64({c})) AS mx, min({}) AS wh FROM {base}",
+            whole_test(c)
+        );
         match &self.rule {
-            WidthRule::Fixed(w) => format!("SELECT mn, mx, {w} AS w FROM ({l1})"),
+            WidthRule::Fixed(w) => format!("SELECT mn, mx, wh, {w} AS w FROM ({l1})"),
             WidthRule::Exact(n) => {
                 // BI-18 part C review fix (SHOULD-FIX) R21: (max - min) / n, rounded
                 // UP to two significant digits (`exact_width` in Rust). `round(.., 6)`
                 // keeps 24.000000000000004 from rounding up to 25.
                 let scale = "pow(10, floor(log10(raw)) - 1)";
                 format!(
-                    "SELECT mn, mx, if(mx > mn, ceil(round(raw / {scale}, 6)) * {scale}, 1) AS w FROM (SELECT mn, mx, (mx - mn) / {n} AS raw FROM ({l1}))"
+                    "SELECT mn, mx, wh, if(mx > mn, ceil(round(raw / {scale}, 6)) * {scale}, 1) AS w FROM (SELECT mn, mx, wh, (mx - mn) / {n} AS raw FROM ({l1}))"
                 )
             }
             WidthRule::Nearest(n) => {
@@ -374,20 +400,24 @@ impl Range {
                 // on a tie the one with fewer ranges.
                 let count = "ceil(mx / c) - floor(mn / c)";
                 format!(
-                    "SELECT mn, mx, if(mx > mn, arraySort(c -> abs({count} - {n}) * 2 + if({count} > {n}, 1, 0), [p, 2 * p, 2.5 * p, 5 * p, 10 * p])[1], 1) AS w FROM (SELECT mn, mx, if(mx > mn, pow(10, floor(log10((mx - mn) / {n}))), 1) AS p FROM ({l1}))"
+                    "SELECT mn, mx, wh, if(mx > mn, arraySort(c -> abs({count} - {n}) * 2 + if({count} > {n}, 1, 0), [p, 2 * p, 2.5 * p, 5 * p, 10 * p])[1], 1) AS w FROM (SELECT mn, mx, wh, if(mx > mn, pow(10, floor(log10((mx - mn) / {n}))), 1) AS p FROM ({l1}))"
                 )
             }
             WidthRule::Nice(n) => {
                 let l2 = format!(
-                    "SELECT mn, mx, if(mx > mn, pow(10, floor(log10((mx - mn) / {n}))), 1) AS p FROM ({l1})"
+                    "SELECT mn, mx, wh, if(mx > mn, pow(10, floor(log10((mx - mn) / {n}))), 1) AS p FROM ({l1})"
                 );
                 let fits = |k: u32| {
                     format!("ceil(mx / ({k} * p)) - floor(mn / ({k} * p)) <= {n}, {k} * p")
                 };
                 let mut branches: Vec<String> = NICE.iter().map(|k| fits(*k)).collect();
                 branches.push("1000 * p".to_owned());
+                // QA `LH-BI-2-02` (`BI-57`, D4): a whole-number column is never
+                // cut narrower than 1, and one bin per value only when that many
+                // fit `n` (`mx - mn + 1 > n` is `mx - mn >= n` over all-whole
+                // values, so `mx - mn < n` keeps one value per bin).
                 format!(
-                    "SELECT mn, mx, multiIf({}) AS w FROM ({l2})",
+                    "SELECT mn, mx, wh, multiIf(wh = 1 AND round(w0, 10) <= 1 AND mx - mn < {n}, 1, wh = 1 AND round(w0, 10) <= 1, 2, w0) AS w FROM (SELECT mn, mx, wh, multiIf({}) AS w0 FROM ({l2}))",
                     branches.join(", ")
                 )
             }
@@ -395,36 +425,40 @@ impl Range {
     }
 
     /// The one-row subquery a [`crate::builder::Relation::Ranged`] joins in:
-    /// `__bmn_<c>`, `__bmx_<c>`, `__bw_<c>` over the filtered `base`.
+    /// `__bmn_<c>`, `__bmx_<c>`, `__bw_<c>` and `__bwh_<c>` over the filtered
+    /// `base`.
     #[must_use]
     pub fn scalars_sql(&self, base: &str) -> String {
         format!(
-            "SELECT w AS {}, mn AS {}, mx AS {} FROM ({})",
+            "SELECT w AS {}, mn AS {}, mx AS {}, wh AS {} FROM ({})",
             self.w(),
             self.mn(),
             self.mx(),
+            self.wh(),
             self.stats_sql(base)
         )
     }
 
-    /// One row `(width, min, max)` over `base`: what the tile carries so the
-    /// console can label the bins and know which one is last.
+    /// One row `(width, min, max, whole)` over `base`: what the tile carries so
+    /// the console can label the bins and know which one is last.
     #[must_use]
     pub fn read_sql(&self, base: &str) -> String {
         format!(
-            "SELECT w AS width, mn AS min, mx AS max FROM ({})",
+            "SELECT w AS width, mn AS min, mx AS max, wh AS whole FROM ({})",
             self.stats_sql(base)
         )
     }
 
     /// The bin's lower edge for each row, over a relation that carries the
     /// scalars. Lower edge included, upper excluded, the maximum in the last
-    /// bin (`ceil(max / w) - 1` when the range is not a point).
+    /// bin (`ceil(max / w) - 1` when the range is not a point) — except over
+    /// whole numbers in bins of width 1, where the maximum has a bin of its own
+    /// (D3), so no bin is closed above.
     #[must_use]
     pub fn bin_expr(&self) -> String {
-        let (c, mn, mx, w) = (&self.column, self.mn(), self.mx(), self.w());
+        let (c, mn, mx, w, wh) = (&self.column, self.mn(), self.mx(), self.w(), self.wh());
         format!(
-            "round(least(floor(toFloat64({c}) / {w}), if({mx} > {mn}, ceil({mx} / {w}) - 1, floor({mx} / {w}))) * {w}, 10)"
+            "round(least(floor(toFloat64({c}) / {w}), if({mx} > {mn} AND NOT ({wh} = 1 AND {w} = 1), ceil({mx} / {w}) - 1, floor({mx} / {w}))) * {w}, 10)"
         )
     }
 }
@@ -433,12 +467,17 @@ impl Range {
 /// `column`, with the last bin closed: a row equal to the upper edge belongs
 /// to the bin when that edge is the maximum of the same filtered rows
 /// (`max_sql` is a scalar subquery over them).
+///
+/// The closed clause is left out by the engine when the column is whole and the
+/// width is 1 (`whole_sql`, D3): every value then has a bin of its own, the
+/// maximum too. The caller passes `whole_sql` only for a width of 1.
 #[must_use]
 pub fn bin_records_predicate(
     column: &Ident,
     lower: f64,
     width: f64,
     max_sql: Option<&str>,
+    whole_sql: Option<&str>,
 ) -> String {
     // The same arithmetic as `bin_expr`, so a row is in the clicked bin
     // exactly when the bin expression gave it this lower edge.
@@ -449,12 +488,16 @@ pub fn bin_records_predicate(
         literal(lower),
         literal(upper)
     );
-    match max_sql {
-        Some(max) => format!(
+    match (max_sql, whole_sql) {
+        (Some(max), Some(whole)) => format!(
+            "({open} OR (toFloat64({column}) = {} AND toFloat64({column}) = ({max}) AND ({whole}) = 0))",
+            literal(upper)
+        ),
+        (Some(max), None) => format!(
             "({open} OR (toFloat64({column}) = {} AND toFloat64({column}) = ({max})))",
             literal(upper)
         ),
-        None => open,
+        (None, _) => open,
     }
 }
 
@@ -466,6 +509,17 @@ fn round10(v: f64) -> f64 {
 #[must_use]
 pub fn max_scalar_sql(column: &Ident, base: &str) -> String {
     format!("SELECT max(toFloat64({column})) FROM {base}")
+}
+
+/// `1` when every value of `column` over `base` is a whole number (`BI-57`), as
+/// a scalar subquery; the same test [`Range::stats_sql`] reads, over the same
+/// rows.
+#[must_use]
+pub fn whole_scalar_sql(column: &Ident, base: &str) -> String {
+    format!(
+        "SELECT min({}) FROM {base}",
+        whole_test(&column.to_string())
+    )
 }
 
 // ── grid ────────────────────────────────────────────────────────────────
@@ -673,7 +727,7 @@ mod tests {
         let sql = r.read_sql("serving.t");
         assert_eq!(
             sql,
-            "SELECT w AS width, mn AS min, mx AS max FROM (SELECT mn, mx, 500 AS w FROM (SELECT min(toFloat64(visitors)) AS mn, max(toFloat64(visitors)) AS mx FROM serving.t))"
+            "SELECT w AS width, mn AS min, mx AS max, wh AS whole FROM (SELECT mn, mx, wh, 500 AS w FROM (SELECT min(toFloat64(visitors)) AS mn, max(toFloat64(visitors)) AS mx, min(toFloat64(visitors) = floor(toFloat64(visitors))) AS wh FROM serving.t))"
         );
         assert_eq!(sql.matches("serving.t").count(), 1);
     }
@@ -687,13 +741,36 @@ mod tests {
         assert!(sql.contains("1000 * p"));
     }
 
+    // QA `LH-BI-2-02` (`BI-57`, D4): a whole-number column is never cut
+    // narrower than 1 under automatic or counted bins, and it says so on the
+    // same read (`wh`) so the tile can label each value on its own.
+    #[test]
+    fn automatic_bins_read_whether_the_column_is_whole_and_never_go_below_one_for_it() {
+        let auto = Range::new(&col("tahun"), BinMode::Auto);
+        let sql = auto.read_sql("serving.t");
+        assert_eq!(
+            sql,
+            "SELECT w AS width, mn AS min, mx AS max, wh AS whole FROM (SELECT mn, mx, wh, multiIf(wh = 1 AND round(w0, 10) <= 1 AND mx - mn < 10, 1, wh = 1 AND round(w0, 10) <= 1, 2, w0) AS w FROM (SELECT mn, mx, wh, multiIf(ceil(mx / (1 * p)) - floor(mn / (1 * p)) <= 10, 1 * p, ceil(mx / (2 * p)) - floor(mn / (2 * p)) <= 10, 2 * p, ceil(mx / (5 * p)) - floor(mn / (5 * p)) <= 10, 5 * p, ceil(mx / (10 * p)) - floor(mn / (10 * p)) <= 10, 10 * p, ceil(mx / (20 * p)) - floor(mn / (20 * p)) <= 10, 20 * p, ceil(mx / (50 * p)) - floor(mn / (50 * p)) <= 10, 50 * p, ceil(mx / (100 * p)) - floor(mn / (100 * p)) <= 10, 100 * p, 1000 * p) AS w0 FROM (SELECT mn, mx, wh, if(mx > mn, pow(10, floor(log10((mx - mn) / 10))), 1) AS p FROM (SELECT min(toFloat64(tahun)) AS mn, max(toFloat64(tahun)) AS mx, min(toFloat64(tahun) = floor(toFloat64(tahun))) AS wh FROM serving.t))))"
+        );
+        assert_eq!(sql.matches("serving.t").count(), 1, "{sql}");
+        let counted = Range::new(&col("tahun"), BinMode::Count(50)).read_sql("serving.t");
+        assert!(counted.contains("AND mx - mn < 50, 1,"), "{counted}");
+        assert!(
+            auto.scalars_sql("serving.t").starts_with(
+                "SELECT w AS __bw_tahun, mn AS __bmn_tahun, mx AS __bmx_tahun, wh AS __bwh_tahun FROM ("
+            ),
+            "{}",
+            auto.scalars_sql("serving.t")
+        );
+    }
+
     #[test]
     fn the_bin_is_the_lower_edge_and_the_maximum_stays_in_the_last_bin() {
         let r = Range::new(&col("visitors"), BinMode::Width(500.0));
         let e = r.bin_expr();
         assert_eq!(
             e,
-            "round(least(floor(toFloat64(visitors) / __bw_visitors), if(__bmx_visitors > __bmn_visitors, ceil(__bmx_visitors / __bw_visitors) - 1, floor(__bmx_visitors / __bw_visitors))) * __bw_visitors, 10)"
+            "round(least(floor(toFloat64(visitors) / __bw_visitors), if(__bmx_visitors > __bmn_visitors AND NOT (__bwh_visitors = 1 AND __bw_visitors = 1), ceil(__bmx_visitors / __bw_visitors) - 1, floor(__bmx_visitors / __bw_visitors))) * __bw_visitors, 10)"
         );
     }
 
@@ -711,13 +788,30 @@ mod tests {
     #[test]
     fn a_clicked_bin_is_closed_above_only_when_it_ends_at_the_maximum() {
         let c = col("visitors");
-        let plain = bin_records_predicate(&c, 500.0, 500.0, None);
+        // QA `LH-BI-2-02` (`BI-57`, D3): no whole read here, so the closed
+        // clause is the one `BI-10` had.
+        let plain = bin_records_predicate(&c, 500.0, 500.0, None, None);
         assert_eq!(
             plain,
             "(toFloat64(visitors) >= 500 AND toFloat64(visitors) < 1000)"
         );
-        let last = bin_records_predicate(&c, 500.0, 500.0, Some("SELECT 1"));
+        let last = bin_records_predicate(&c, 500.0, 500.0, Some("SELECT 1"), None);
         assert!(last.contains("toFloat64(visitors) = 1000 AND toFloat64(visitors) = (SELECT 1)"));
+    }
+
+    // QA `LH-BI-2-02` (`BI-57`, D3): over whole numbers a bin of width 1 holds
+    // one value, the maximum too, so the clicked bin is not closed above.
+    #[test]
+    fn a_clicked_bin_of_one_over_whole_numbers_is_not_closed_above() {
+        let c = col("tahun");
+        assert_eq!(
+            bin_records_predicate(&c, 2023.0, 1.0, Some("SELECT 9"), Some("SELECT 1")),
+            "((toFloat64(tahun) >= 2023 AND toFloat64(tahun) < 2024) OR (toFloat64(tahun) = 2024 AND toFloat64(tahun) = (SELECT 9) AND (SELECT 1) = 0))"
+        );
+        assert_eq!(
+            whole_scalar_sql(&c, "serving.t"),
+            "SELECT min(toFloat64(tahun) = floor(toFloat64(tahun))) FROM serving.t"
+        );
     }
 
     #[test]

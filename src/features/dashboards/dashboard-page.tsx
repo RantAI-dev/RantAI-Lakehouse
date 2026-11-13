@@ -1065,7 +1065,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       followClick(saved, target.value, target.grain);
       return;
     }
-    const bin = target.bin ? { width: target.bin.width, last: isLastBin(Number(target.value), target.bin.width, target.bin.max) } : undefined;
+    const bin = target.bin ? { width: target.bin.width, last: isLastBin(Number(target.value), target.bin.width, target.bin.max, target.bin.whole) } : undefined;
     // BI-13: a mark of one of the chart's other questions lists that question's own rows and
     // filters the dashboard by that question's dimension; the server needs the chart and the question's index.
     const layer = ctx.layer;
