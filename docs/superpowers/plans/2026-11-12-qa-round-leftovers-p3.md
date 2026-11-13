@@ -845,3 +845,69 @@ own.
 None. Every anchor was found by its quoted text and behaved as the plan says.
 
 ## 6. Review
+
+### Round 1 (planner, 2026-11-13, at `e54b1a27`)
+
+Reviewed by reading the whole diff against sections 1 to 4 (an independent reviewer's notes,
+then the planner's rulings). Nothing was built on the planner's machine; the run is CI on the
+pull request (#496), which had no failed check on `e54b1a27` when this was written and was
+still going. The code does what the plan says and nothing the plan forbids was touched:
+`run_rule` calls the unchanged `ensure_rule_table` after the 404 and before `evaluate`, the
+move into `close_run_record` keeps the sensor's behaviour for `SUCCESS` and `FAILURE`, the
+list read is bounded and can only change a record that still says `running`, and no
+assertion of an existing test changed. Test counts by attribute: 18, 37 and 12, as the
+handoff says.
+
+One BLOCKER, a comment. Six smaller items. The fixes go in ONE commit, `fix(review): round 1
+of leftovers-p3 (R1, R2, R3, R4, R6)`, after `main` is merged into the branch (it moved:
+`be2c92910`).
+
+- **R1. BLOCKER (rule 1): the doc of `close_run_record` says the opposite of what "Run now"
+  does.** `routes/load_alerts.rs`, the doc comment above `close_run_record`: "a `CANCELED`
+  run (cancelled before its limit, which is what "Run now" does) closes as failed with the
+  reason `other`". "Run now" cancels only a run that is past its limit plus the grace; such a
+  run closes as `timed_out` by the branch above (D12, and test 1 asserts it). Replace the
+  parenthesis so the sentence reads: "… and a `CANCELED` run that was stopped before its
+  limit (by something other than "Run now", which cancels only a run already past its limit
+  and so closes as `timed_out`) closes as failed with the reason `other`." Change nothing
+  else in that comment.
+- **R2. SHOULD-FIX: test 1's second read asserts less than "the same answer".**
+  `tests/ingest_run.rs`, `a_record_left_running_after_its_run_was_cancelled_is_closed_by_one_read_of_the_run_list`:
+  after the second `GET`, compare the whole answers, `assert_eq!(again, listed, "a second
+  read answers the same")` (use the test's own variable names), and keep the existing
+  assertions. Where the store's record is checked, also assert its end time is set.
+- **R3. SHOULD-FIX: `two_reads_at_once_close_a_record_once` does not show the reads
+  overlapped.** Every assertion in it also holds when the second read starts after the first
+  finished. In this test only: mount the run-status answer inline with a delay
+  (`.set_delay(Duration::from_millis(300))` on the `ResponseTemplate`, same matcher and body
+  as `mount_run_status`), and add `assert_eq!(run_status_requests(&server).await.len(), 2,
+  "both reads saw the record running")`. If that count is not 2, do NOT change the number:
+  report what it was in the handoff (it would mean the reads do not overlap, which is a
+  finding about the test, not about the code).
+- **R4. SHOULD-FIX: "the same answer for every rule and every table" is wider than the code.**
+  `routes/quality.rs`, `run_rule`'s `# Errors`, the 403 line. The asset's shape is checked
+  before the tenant rule (D4), so a stored rule whose asset is not a table key answers the
+  400 to everyone. New text for the end of that line: "— the same answer whatever the table,
+  for every rule whose asset is a table key; an asset that is not one is the `400` below for
+  everyone." The plan's D5 row carried the wide wording: the planner's error, corrected here.
+  No behaviour changes and nothing leaks (the stored text is on the rule list already).
+- **R5. Accepted, written down (no code).** A run marked `CANCELED` in the orchestrator while
+  its worker is still alive is closed by the next read of the run list as `failed` / `other`;
+  if the load then completes, the job's own end report finds the record closed and answers
+  `recorded: false`. Before this change the record stayed `running` and that report closed it
+  as `succeeded`. "Run now" already had this property for an overdue run. Whether a worker
+  can outlive a cancel was not established from this repository. D13 stands; this is added
+  to open question 1 for the owner.
+- **R6. SHOULD-FIX: two comments not brought along.** (a) `routes/connector_runs.rs`, the doc
+  of `report_end`: "an end after the run sensor already closed the run" becomes "an end after
+  the run sensor or a read of the run list already closed the run". (b)
+  `routes/load_alerts.rs`, in `close_run_record`: the moved `SRC-11` D7 comment sits inside
+  the `Success` arm but describes `settle_run` in both arms; move it above the `match`.
+- **R7. Note, no change.** The body of `fc5398000` says "eight" integration tests; there are
+  nine, as the handoff says. The history is not rewritten for it.
+
+The developer's handoff for this round, appended below this entry: the commit, each command
+with its counts (`cargo fmt --check`; `cargo clippy -p lakehouse-api --all-targets -- -D
+warnings`; `cargo test -p lakehouse-api --test ingest_run`; `--test quality_incidents`;
+`--test sec11_guard`; `--test route_auth`; `--lib only_success_failure_and_canceled_end_a_run`),
+the count R3 saw, and the result of merging `main` (conflicts, if any, by file).
