@@ -15,6 +15,8 @@ const props = {
 }
 
 describe("JoinsSection", () => {
+  // QA LH-BI-7-06 (BI-54): the rule changed — the button used to vanish at the
+  // limit; it now stays, off, with the sentence under it.
   it("adds a blank join, up to four, and removes one", () => {
     const onChange = mock<(next: JoinDraft[]) => void>(() => {})
     const { rerender } = render(<JoinsSection {...props} joins={[]} onChange={onChange} onPickTable={() => {}} />)
@@ -22,9 +24,17 @@ describe("JoinsSection", () => {
     expect(onChange.mock.calls[0][0]).toEqual([emptyJoin()])
     const four = [emptyJoin(), emptyJoin(), emptyJoin(), emptyJoin()]
     rerender(<JoinsSection {...props} joins={four} onChange={onChange} onPickTable={() => {}} />)
-    expect(screen.queryByText("Join a table")).toBeNull()
+    expect((screen.getByText("Join a table") as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByText("A chart joins at most four tables.")).toBeTruthy()
     fireEvent.click(screen.getByLabelText("Remove join 2"))
     expect(onChange.mock.calls[1][0]).toHaveLength(3)
+  })
+
+  it("keeps the button on and says nothing about a limit below four joins", () => {
+    const three = [emptyJoin(), emptyJoin(), emptyJoin()]
+    render(<JoinsSection {...props} joins={three} onChange={mock(() => {})} onPickTable={() => {}} />)
+    expect((screen.getByText("Join a table") as HTMLButtonElement).disabled).toBe(false)
+    expect(screen.queryByText("A chart joins at most four tables.")).toBeNull()
   })
 
   it("shows the pairs of a picked table, adds and removes a pair, and no more than four", () => {
