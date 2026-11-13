@@ -229,7 +229,8 @@ denied, `missing_docs` warned (`rust/Cargo.toml` `[workspace.lints]`).
 ### 3.7 Tests
 
 - Unit tests in-module under `#[cfg(test)]`; integration tests in the crate's
-  `tests/` with a shared `tests/common/mod.rs`.
+  `tests/`, declared as modules of one `tests/it.rs` binary (`OPS-32`), with a
+  shared `tests/common/mod.rs` that `it.rs` declares once.
 - Names are assertions in `snake_case`:
   `out_of_scope_env_ref_is_rejected_not_silently_resolved`,
   `tenant_membership_is_not_used_to_scope_any_domain_query`.

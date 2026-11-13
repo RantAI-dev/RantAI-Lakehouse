@@ -216,6 +216,15 @@ for it on every step.
   (`REL-20`): the single `cargo test --workspace` became three parallel
   nextest partitions plus `cargo test --doc`. Local developers may keep
   `cargo test`; only the CI command changed.
+- **Integration tests are one binary per crate** (`OPS-32`): `lakehouse-api`,
+  `lakehouse-store` and `lakehouse-auth` build `tests/it.rs`, which declares
+  every test file as a module. Run one file with
+  `cargo test -p lakehouse-api --test it route_auth::` (or
+  `cargo nextest run -p lakehouse-api --test it -E 'test(/^route_auth::/)'`);
+  `--test <file>` works only for `hostile_uploads`, `identity_password` and
+  `parity`, which stay separate. A new test file gets a `mod <name>;` line in
+  `tests/it.rs` (and `use crate::common;` instead of `mod common;`), or the
+  `Repo lints` job fails.
 - **Batch Rust work.** Plans order tasks so the Rust changes sit together,
   and a migration lands in the same sitting as the code that uses it
   (`sqlx::test` embeds migrations at compile time, so each migration edit

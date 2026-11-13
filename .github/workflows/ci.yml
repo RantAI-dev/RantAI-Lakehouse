@@ -616,6 +616,10 @@ jobs:
     # keeps the file:line a backtrace prints and drops the rest of the debug
     # information, so the same binaries take a fraction of the space.
     #
+    # Since `OPS-32` the integration tests of `lakehouse-api`, `lakehouse-store`
+    # and `lakehouse-auth` are one binary per crate (`tests/it.rs`); the
+    # `line-tables-only` setting stays.
+    #
     # Both profiles are named because the `test` profile inherits from `dev`:
     # dependencies are built with `dev`, the test binaries themselves with
     # `test`.
