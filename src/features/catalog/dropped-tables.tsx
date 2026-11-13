@@ -8,7 +8,10 @@ import { daysLeft } from "@/lib/dashboard-organise"
 import { formatNumber } from "@/lib/format"
 import { assetService } from "@/services"
 
-/** The clock the days left are measured against; `now` pins it in a test. */
+/**
+ * The clock the days left are measured against: read while the list renders,
+ * and only when a test did not pin `now`.
+ */
 function clockNow(): number {
   return Date.now()
 }
@@ -23,9 +26,10 @@ function clockNow(): number {
  * dashboards' trash — and `now` is a parameter so a test can pin it.
  */
 export function DroppedTablesNote({ now }: { now?: number }) {
-  // The impure `Date.now()` lives in a plain function's default, never in a
-  // component's render body (`react-hooks/purity`; the same shape
-  // `freshness-strip.tsx` uses).
+  // The impure `Date.now()` is reached through a module function, never written
+  // in this component's render body, where `react-hooks/purity` would refuse it
+  // (`freshness-strip.tsx` uses the same shape). A test pins the clock with
+  // `now`, so this call does not run there.
   const nowMs = now ?? clockNow()
   const list = useService((s) => assetService.listDroppedTables(s), [])
 
@@ -60,7 +64,9 @@ export function DroppedTablesNote({ now }: { now?: number }) {
               </Link>
               <span className="text-xs text-muted-foreground">{`dropped by ${entry.droppedBy}`}</span>
               <span className="text-xs text-muted-foreground tabular-nums">
-                {entry.rowCount === null ? "rows not counted" : `${formatNumber(entry.rowCount)} rows`}
+                {entry.rowCount === null
+                  ? "rows not counted"
+                  : `${formatNumber(entry.rowCount)} ${entry.rowCount === 1 ? "row" : "rows"}`}
               </span>
               <span className="text-xs text-muted-foreground">{left}</span>
             </li>

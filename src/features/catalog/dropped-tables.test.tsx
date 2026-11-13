@@ -57,7 +57,15 @@ describe("DroppedTablesNote", () => {
     expect(screen.queryByText("0 rows")).toBeNull()
   })
 
-  it("says less than a day is left on the last day", async () => {
+  it("says one row in the singular, as the dialog does", async () => {
+    stubFetch(() => json({ tables: [{ ...ENTRY, rowCount: 1 }] }))
+    render(<DroppedTablesNote now={NOW} />)
+
+    expect(await screen.findByText("1 row")).toBeTruthy()
+    expect(screen.queryByText("1 rows")).toBeNull()
+  })
+
+  it("says less than a day is left for a row at its end", async () => {
     stubFetch(() => json({ tables: [{ ...ENTRY, expiresAt: "2026-11-14T00:00:00Z" }] }))
     render(<DroppedTablesNote now={NOW} />)
 

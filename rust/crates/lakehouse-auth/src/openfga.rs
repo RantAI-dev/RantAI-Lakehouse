@@ -537,11 +537,18 @@ impl LakekeeperAdminClient {
     /// [`OpenfgaError::Transport`], and every other status is classified by
     /// [`classify_status`].
     ///
+    /// The request has a bound of its own ([`DROP_TABLE_TIMEOUT`]): a catalog
+    /// that never answers ends as [`OpenfgaError::Transport`] rather than
+    /// holding the caller until its own deadline.
+    ///
     /// # Errors
     ///
-    /// [`OpenfgaError::Transport`] if the request never reaches the catalog;
-    /// [`OpenfgaError::Rejected`] on a `4xx`, or on a name that is not a plain
-    /// identifier; [`OpenfgaError::Server`] on a `5xx`.
+    /// [`OpenfgaError::Transport`] if the request never reaches the catalog, or
+    /// the connection is lost, or the bound passes — including a connection lost
+    /// AFTER the catalog acted, which is why a caller treats this as "the
+    /// outcome is not known" rather than "nothing happened"; [`OpenfgaError::Rejected`]
+    /// on a `4xx`, or on a name that is not a plain identifier;
+    /// [`OpenfgaError::Server`] on a `5xx`.
     pub async fn drop_table(
         &self,
         warehouse_id: &str,

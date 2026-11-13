@@ -22,7 +22,8 @@
 //! unit-tested without a server. Nothing `Lakekeeper` says reaches a
 //! response: its failures are logged and answered with fixed sentences.
 //!
-//! # The audit trail, and the record (`DATA-55` D8)
+//! # The audit trail, and the record (`DATA-55` D8, QA `LH-DATA-15-06`,
+//! `TC-1731`)
 //!
 //! The drop route (`DATA-55`) makes this restore reachable from the console,
 //! so the restore now follows the same order as the drop: `catalog.restore`
@@ -71,7 +72,8 @@ const COULD_NOT_TELL: &str =
     "could not tell whether a dropped copy of this table is kept (the deleted list is too long)";
 const EXPIRED: &str = "the 7-day window to restore this table has passed";
 const UNREACHABLE: &str = "the catalog could not be asked about this table; try again shortly";
-/// The `allowed` audit entry could not be written; nothing was restored (D8).
+/// The `allowed` audit entry could not be written; nothing was restored
+/// (`DATA-55` D8, QA `LH-DATA-15-06`, `TC-1731`).
 const NOT_AUDITED_RESTORE: &str =
     "The restore could not be written to the audit trail, so nothing was restored.";
 /// The restore's own task did not finish (`DATA-55` review R1): the handler
@@ -344,7 +346,8 @@ pub async fn restore(
     let (assessment, warehouse) = inspect(&state, &admin, &table).await?;
     let (tabular, expires_at) = match assessment {
         Assessment::Exists => {
-            // D8: a table that is there is not dropped, whatever a leftover
+            // `DATA-55` D8 (QA `LH-DATA-15-06`, `TC-1731`): a table that
+            // is there is not dropped, whatever a leftover
             // record says. Best effort: the 409 below is the same either way.
             if let Err(err) = uploads::forget_table_drop(&pool, &table).await {
                 tracing::warn!(?err, %table, "restore: a leftover drop record could not be cleared");
@@ -426,7 +429,8 @@ impl Restore {
     /// `409` when the catalog refuses the undrop, `503` when it cannot be
     /// asked, and the store's error when the record cannot be cleared.
     async fn run(&self) -> Result<Value, ApiError> {
-        // D8: the `allowed` entry first, or the restore does not happen.
+        // `DATA-55` D8 (QA `LH-DATA-15-06`, `TC-1731`): the `allowed`
+        // entry first, or the restore does not happen.
         audit_first(&self.pool, self.event("allowed", None), NOT_AUDITED_RESTORE).await?;
         if let Err(err) = self
             .admin
@@ -480,7 +484,8 @@ impl Restore {
     /// The table is back: clear the drop's record (best effort) and write the
     /// `executed` entry, both inside the awaited task.
     async fn finish_restore(&self) {
-        // The record of the drop is cleared: a table that is there is not
+        // `DATA-55` D8 (QA `LH-DATA-15-06`, `TC-1731`): the record of the
+        // drop is cleared, because a table that is there is not
         // dropped. A failure is logged, not turned into a failed restore — the
         // table IS back, and the next status read heals a leftover record.
         if let Err(err) = uploads::forget_table_drop(&self.pool, &self.table).await {

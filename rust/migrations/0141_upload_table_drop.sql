@@ -30,8 +30,10 @@
 --
 -- A row COUNTS while `expires_at > now()`: that is the same 7-day window the
 -- catalog's soft delete profile keeps (`DELETE_RETENTION_SECONDS`,
--- `lakekeeper-auth/src/openfga.rs`), written by the database clock so the API
--- and the catalog agree on when the window ends. A drop whose window has
+-- `lakehouse-auth/src/openfga.rs`). The record's end is the API's own clock —
+-- the database's clock at the insert — and it may differ from the catalog's by
+-- the seconds between that insert and the `DELETE`, so it is not an agreement
+-- on the same instant, only the same seven days. A drop whose window has
 -- passed no longer counts, and the next drop of the same name replaces the
 -- row (`record_table_drop`).
 

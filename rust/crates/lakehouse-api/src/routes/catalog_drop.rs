@@ -11,6 +11,8 @@
 //! - `POST /api/catalog/{id}/drop` (`governance:write`) drops it, keeping the
 //!   catalog's soft delete so the existing restore can bring it back for 7
 //!   days.
+//! - `GET /api/catalog/dropped/tables` (`catalog:read`) lists the caller's
+//!   tenants' dropped tables while each can still be restored (D13).
 //!
 //! # What can be dropped (D4)
 //!
@@ -27,10 +29,20 @@
 //! As the catalog's admin principal — the identity that also undrops, so "who
 //! drops is who undrops" — and never without the 7-day keep: the soft delete
 //! profile is written before every drop, and if that write fails nothing is
-//! dropped. Each failure before the catalog answers leaves nothing behind: the
-//! audit entry `catalog.drop` with outcome `allowed` is written first (a drop
-//! that cannot be audited does not happen), then the record, then the catalog
-//! is asked; a failure removes the record again and writes `failed`.
+//! dropped. The audit entry `catalog.drop` with outcome `allowed` is written
+//! first (a drop that cannot be audited does not happen), then the record, then
+//! the catalog is asked, and the closing `executed` or `failed` entry is written
+//! last. The whole stretch runs in ONE task the handler awaits, so the route's
+//! deadline or a caller that disconnects stops only the waiting (`DATA-55`
+//! review R1).
+//!
+//! What a failure leaves behind depends on what is known (`DATA-55` review R2):
+//! a drop the catalog definitely refused removes the record again; an outcome
+//! nobody knows keeps it, so the name stays closed and a table that was dropped
+//! is not mistaken for one that is absent; and a record that cannot be written
+//! leaves the `allowed` entry and its `failed` ending, never an entry with no
+//! ending (review R7). A record is believed only while the table is absent
+//! ([`dropped_now`]), so a stale one cannot close a live table's name.
 //!
 //! # What never happens
 //!
@@ -274,9 +286,11 @@ pub struct DropQuery {
 ///
 /// # Errors
 ///
-/// `400` for an over-long id; `403` with the tenant gate's reason; `404` when
-/// no dataset has that slug or the caller's roles may not read it; `503` when
-/// the store or the pool cannot be reached.
+/// `400` for an over-long id; `404` when no dataset has that slug or the
+/// caller's roles may not read it; `503` when the store or the pool cannot be
+/// reached. A caller outside the tenant that owns the shared catalog is NOT an
+/// error here: the answer is `200` with `supported: false` and the gate's
+/// reason ([`super::catalog::catalog_tenant_refusal`]).
 pub async fn status(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -750,12 +764,16 @@ fn drop_answer(
 /// shows what can be restored, and restoring needs `governance:write`.
 ///
 /// Rows the caller's roles may not read are dropped from the list, not
-/// marked: the answer must not say which hidden tables exist (fail closed).
+/// marked: the answer must not say which hidden tables exist (fail closed). An
+/// unrestricted caller that belongs to no tenant is shown nothing, because the
+/// list is read per tenant and "every tenant" is not, and never was, an answer
+/// here (`list_dropped_tables`).
 ///
 /// # Errors
 ///
-/// `403` with the tenant gate's reason; `503` when the pool or the store
-/// cannot be reached.
+/// `503` when the pool or the store cannot be reached. A caller outside the
+/// tenant that owns the shared catalog is NOT an error here: the answer is
+/// `200` with `supported: false`, the gate's reason and no tables.
 pub async fn list(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,

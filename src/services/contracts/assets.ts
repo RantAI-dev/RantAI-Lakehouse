@@ -526,7 +526,8 @@ export type AssetRestoreStatus =
     }
 
 /**
- * `GET /api/catalog/{id}/drop` (`DATA-55`): whether this table may be dropped
+ * `GET /api/catalog/{id}/drop` (`DATA-55`, QA `LH-DATA-15-06`, `TC-1731`):
+ * whether this table may be dropped
  * from its page, and, only when asked for, how many rows it holds.
  *
  * `rowCount` is absent when the count was not asked for (`withRowCount`) and
@@ -538,7 +539,10 @@ export type AssetDropStatus =
   | { supported?: undefined; droppable: false; reason: string }
   | { supported?: undefined; droppable: true; table: string; keptDays: number; rowCount?: number | null }
 
-/** `POST /api/catalog/{id}/drop` (`DATA-55`): what was dropped and until when. */
+/**
+ * `POST /api/catalog/{id}/drop` (`DATA-55`, QA `LH-DATA-15-06`, `TC-1731`):
+ * what was dropped and until when.
+ */
 export type AssetDropResult = {
   table: string
   rowCount: number | null
@@ -547,7 +551,8 @@ export type AssetDropResult = {
 }
 
 /**
- * One row of `GET /api/catalog/dropped/tables` (`DATA-55` D13): a table the
+ * One row of `GET /api/catalog/dropped/tables` (`DATA-55` D13, QA
+ * `LH-DATA-15-06`, `TC-1731`): a table the
  * caller's tenant dropped from the console, while it can still be restored.
  * `rowCount` is `null` when the rows could not be counted.
  */

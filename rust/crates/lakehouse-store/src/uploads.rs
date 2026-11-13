@@ -121,7 +121,8 @@
 //! starts at the same moment cannot both take the last large place. A load that is
 //! not large never counts against it and is never refused by it.
 //!
-//! # Dropped tables (`DATA-55`, `0141_upload_table_drop.sql`)
+//! # Dropped tables (`DATA-55`, QA `LH-DATA-15-06`, `TC-1731`,
+//! `0141_upload_table_drop.sql`), and the functions below
 //!
 //! A table a file upload made can be dropped from its page in the console and
 //! restored there for 7 days (`DEC-21`). [`record_table_drop`] is the record of
@@ -1728,7 +1729,10 @@ pub async fn forget_table_drop(pool: &PgPool, table: &str) -> Result<bool, Store
 /// The unexpired drops of `tenant_ids`, newest first, at most `limit` — the
 /// Catalog's list (`DATA-55` D13). An empty `tenant_ids` lists nothing: the
 /// tenant rule has no "every tenant" reading here, unlike the unscoped
-/// [`list_claims`], because no caller of the list has none.
+/// [`list_claims`]. A caller of the list CAN have none — an unrestricted
+/// principal that belongs to no tenant — and such a caller is shown nothing,
+/// not everything: the list is read per tenant, and "every tenant" is exactly
+/// the answer that rule must not give.
 ///
 /// # Errors
 ///

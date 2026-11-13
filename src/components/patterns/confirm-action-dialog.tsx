@@ -22,7 +22,8 @@ export function ConfirmActionDialog({
   confirmLabel = "Confirm",
   confirming = false,
   /** Keeps the confirm button disabled for a reason other than a request in
-   * flight (a value the dialog is still reading, `DATA-55`). */
+   * flight (a value the dialog is still reading, `DATA-55`, QA
+   * `LH-DATA-15-06`, `TC-1731`). */
   confirmDisabled = false,
   destructive = false,
   onConfirm,

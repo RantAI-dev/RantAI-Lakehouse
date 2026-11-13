@@ -607,7 +607,7 @@ async fn the_drop_status_names_an_uploads_table_and_counts_its_rows_only_when_as
 /// `DATA-55` D7: an uncounted table is `null`, never 0 — the dialog says the
 /// rows could not be counted, and 0 is a real answer for an empty table. The
 /// `null` comes from a count query the stand-in answers with a 500, not from a
-/// registry row without a count (review R5).
+/// registry row that answers without a row count; review R5.
 #[tokio::test]
 async fn the_drop_status_says_null_when_the_rows_cannot_be_counted_and_never_zero() {
     let server = MockServer::start().await;

@@ -2118,7 +2118,8 @@ describe("Activity tab: dropping a table (DATA-55)", () => {
     url.search = "tab=activity"
     renderTabs()
 
-    expect(await screen.findByRole("button", { name: "Drop table" })).toBeTruthy()
+    const card = (await screen.findByText("Snapshots")).closest("[data-slot=card]") as HTMLElement
+    expect(await within(card).findByRole("button", { name: "Drop table" })).toBeTruthy()
   })
 
   it("offers no Drop table, and asks the API nothing about it, without governance:write", async () => {
