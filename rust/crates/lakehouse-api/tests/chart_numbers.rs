@@ -454,3 +454,49 @@ async fn a_clicked_year_lists_that_year_and_the_last_year_lists_itself() {
         "the closed last bin of a fractional column is unchanged: {statement}"
     );
 }
+
+/// `BI-57 (D3), review round 1 R1`: a typed width of 1 over a fractional column
+/// whose maximum happens to be a whole number is still not a whole column
+/// (1.5 and 2.5 are not), so the maximum joins the closed last bin instead of
+/// getting one of its own, and a click on that bin lists it.
+#[tokio::test]
+async fn a_fractional_column_in_bins_of_one_keeps_today_s_bins_and_its_click_lists_the_maximum() {
+    let (url, _container) = shared_clickhouse().await;
+    let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
+    let stay = Ident::new("stay").expect("a column name");
+    let b = format!("(SELECT * FROM {STAY_TABLE} WHERE stay <= 3) AS flt");
+
+    assert_eq!(
+        range_read(&ch, &stay, BinMode::Width(1.0), &b).await,
+        (1.0, 1.5, 3.0, 0.0),
+        "a fractional column is not whole, even when its maximum is"
+    );
+    let statement = bins_statement(&stay, BinMode::Width(1.0), &b);
+    assert_eq!(
+        bins_of(&ch, &statement).await,
+        vec![(1.0, 1.0), (2.0, 3.0)],
+        "the maximum sits in the closed last bin: {statement}"
+    );
+    let predicate = bin_records_predicate(
+        &stay,
+        2.0,
+        1.0,
+        Some(&max_scalar_sql(&stay, &b)),
+        Some(&whole_scalar_sql(&stay, &b)),
+    );
+    let statement = format!("SELECT stay FROM {b} WHERE {predicate} ORDER BY stay");
+    let result = ch
+        .query(&statement, None)
+        .await
+        .expect("the records statement runs on the engine");
+    let listed: Vec<f64> = result
+        .data
+        .iter()
+        .map(|row| number(row.get("stay").expect("the stay column")))
+        .collect();
+    assert_eq!(
+        listed,
+        vec![2.0, 2.5, 3.0],
+        "the clicked closed last bin lists the maximum: {statement}"
+    );
+}
