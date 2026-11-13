@@ -7,7 +7,7 @@ import type {
   DigitalEmployee,
 } from "../contracts/agents"
 import { apiFetch } from "../http"
-import { ServiceError } from "../errors"
+import { ServiceError, deniedFor } from "../errors"
 
 /**
  * AgentService is real: employee definitions, run history and the approval
@@ -22,11 +22,14 @@ import { ServiceError } from "../errors"
  * assistant's tools still use them, and `WEB-4` retires them.
  */
 
-function errorFor(status: number, message: string): ServiceError {
+function errorFor(status: number, body: { error?: string } | null, fallback: string): ServiceError {
+  // WEB-12: a refusal goes through deniedFor (errors.ts).
+  const denied = deniedFor(status, body)
+  if (denied) return denied
+  const message = body?.error ?? fallback
   if (status === 404) return new ServiceError("not_found", message)
   if (status === 400 || status === 409 || status === 422)
     return new ServiceError("invalid_request", message)
-  if (status === 401 || status === 403) return new ServiceError("permission_denied", message)
   return new ServiceError("unavailable", message)
 }
 
@@ -34,7 +37,7 @@ async function request<T>(url: string, init: RequestInit, fallback: string): Pro
   const res = await apiFetch(url, init)
   const json = await res.json().catch(() => null)
   if (!res.ok) {
-    throw errorFor(res.status, json?.error ?? fallback)
+    throw errorFor(res.status, json, fallback)
   }
   return json as T
 }

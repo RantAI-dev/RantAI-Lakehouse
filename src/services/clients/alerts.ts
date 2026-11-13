@@ -6,7 +6,7 @@ import type {
   SaveAlertRuleInput,
 } from "../contracts/alerts";
 import { apiFetch } from "../http";
-import { ServiceError } from "../errors";
+import { ServiceError, deniedFor } from "../errors";
 
 /**
  * AlertRuleService over `/api/alerts` (rule CRUD) and `/api/alerts/test`
@@ -27,14 +27,15 @@ async function request<T>(
   const res = await apiFetch(url, init);
   const json = await res.json();
   if (!res.ok) {
+    // WEB-12: a refusal goes through deniedFor (errors.ts).
+    const denied = deniedFor(res.status, json);
+    if (denied) throw denied;
     const kind =
-      res.status === 401 || res.status === 403
-        ? "permission_denied"
-        : res.status === 404
-          ? "not_found"
-          : res.status >= 500 || res.status === 503
-            ? "unavailable"
-            : "invalid_request";
+      res.status === 404
+        ? "not_found"
+        : res.status >= 500 || res.status === 503
+          ? "unavailable"
+          : "invalid_request";
     throw new ServiceError(kind, json?.error ?? fallbackMessage);
   }
   return json as T;

@@ -22,7 +22,7 @@ import type { UsedBy,
   RowFilterGrammar,
 } from "../contracts/governance";
 import { apiFetch } from "../http";
-import { ServiceError } from "../errors";
+import { ServiceError, deniedFor } from "../errors";
 
 /**
  * GovernanceService: quality/lineage/audit/classification/residency are real,
@@ -38,20 +38,24 @@ import { ServiceError } from "../errors";
  * results), per the Rust backend's design.
  */
 
-/** Map an error response body onto the ServiceError code its status implies. */
-function errorFor(status: number, message: string): ServiceError {
+/**
+ * Map an error response body onto the ServiceError code its status implies.
+ * A 401 or 403 goes through `deniedFor` (QA `TC-1724`, WEB-12).
+ */
+function errorFor(status: number, body: { error?: string } | null, fallback: string): ServiceError {
+  const denied = deniedFor(status, body);
+  if (denied) return denied;
+  const message = body?.error ?? fallback;
   if (status === 404) return new ServiceError("not_found", message);
   if (status === 400 || status === 409 || status === 422)
     return new ServiceError("invalid_request", message);
-  if (status === 401 || status === 403)
-    return new ServiceError("permission_denied", message);
   return new ServiceError("unavailable", message);
 }
 
 async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
   const res = await apiFetch(url, { signal });
   const json = await res.json().catch(() => null);
-  if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to load governance");
+  if (!res.ok) throw errorFor(res.status, json, "Failed to load governance");
   return json as T;
 }
 
@@ -63,7 +67,7 @@ async function post<T>(url: string, body: unknown, signal?: AbortSignal): Promis
     signal,
   });
   const json = await res.json().catch(() => null);
-  if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to save governance");
+  if (!res.ok) throw errorFor(res.status, json, "Failed to save governance");
   return json as T;
 }
 
@@ -71,7 +75,7 @@ async function post<T>(url: string, body: unknown, signal?: AbortSignal): Promis
 async function del(url: string, failure: string, signal?: AbortSignal): Promise<void> {
   const res = await apiFetch(url, { method: "DELETE", signal });
   const json = await res.json().catch(() => null);
-  if (!res.ok) throw errorFor(res.status, json?.error ?? failure);
+  if (!res.ok) throw errorFor(res.status, json, failure);
 }
 
 // WS5 item E1 (judge amendment 2): the plan's `putDatasetSla` calls a
@@ -87,7 +91,7 @@ async function put<T>(url: string, body: unknown, signal?: AbortSignal): Promise
     signal,
   });
   const json = await res.json().catch(() => null);
-  if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to save governance");
+  if (!res.ok) throw errorFor(res.status, json, "Failed to save governance");
   return json as T;
 }
 
@@ -139,7 +143,7 @@ export const clickhouseGovernanceService: GovernanceService = {
       signal,
     });
     const json = await res.json().catch(() => null);
-    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to delete the policy");
+    if (!res.ok) throw errorFor(res.status, json, "Failed to delete the policy");
   },
   createQualityRule(input: CreateQualityRuleInput, signal) {
     return post<QualityRule>("/api/governance/quality", input, signal);
@@ -153,7 +157,7 @@ export const clickhouseGovernanceService: GovernanceService = {
       signal,
     });
     const json = await res.json().catch(() => null);
-    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to delete the rule");
+    if (!res.ok) throw errorFor(res.status, json, "Failed to delete the rule");
   },
   runQualityRule(id, signal) {
     return post<QualityRunResult>(

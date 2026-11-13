@@ -397,10 +397,9 @@ export function ConnectorCreatePage() {
   // nothing to create from, so the page shows the header and the state alone —
   // no Name, Direction, Previous or Next. A refusal says what the person can do;
   // anything else offers Retry. The server refuses the create for the same
-  // person already (`POST /api/connectors` is `connector:manage`). The signal
-  // is the `ServiceError` this client really produces: `getJson` maps a 403 to
-  // `invalid_request` and keeps the status, so a refusal is `code` or `status`
-  // (`home-cards.ts`'s `cardRead` reads it the same way).
+  // person already (`POST /api/connectors` is `connector:manage`). A refusal is
+  // `permission_denied`: the connector client maps a 401 or 403 through
+  // `deniedFor` (WEB-11, WEB-12).
   if (types.status === "error") {
     return (
       <div className="flex flex-col gap-4">
@@ -413,7 +412,7 @@ export function ConnectorCreatePage() {
             </Button>
           }
         />
-        {types.error.code === "permission_denied" || types.error.status === 403 ? (
+        {types.error.code === "permission_denied" ? (
           <EmptyState
             title="You cannot create a connector"
             description="Creating a connector needs the connector:manage permission. Ask a workspace administrator."
