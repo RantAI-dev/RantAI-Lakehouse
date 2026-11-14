@@ -70,6 +70,24 @@
      asserted the veil); screenshots `/` at 1366×800 light and dark into
      `docs/plans/web-17-screens/after-dim-*` if a browser is free (else write *not verified*).
 
+10. **T10, light band without the cream; dim to a middle (owner QA 2026-11-15).** Owner, on
+    T9's result: "ini tu emang gradient ke kuning kah? dan redup sih tapi jadi ga keliatan".
+    - **Light base = the page background.** The day base `#f3eee2` (cream) fading into the
+      page reads as a yellow gradient. Use the light theme's page background colour (resolve
+      the `--background` token to sRGB; keep a test that pins it) as the day base, so the band
+      has no tint of its own and nothing fades. The sun and its glints keep their warm ink. The
+      night base (`#061230`) stays. The phase blend between them stays continuous.
+    - **Dim less.** T9's factors (0.75 day, 0.8 night) left the ASCII scene invisible and turned
+      the navy whale grey in daylight. New window, per style and per phase, at the rest states:
+      the most contrasting ink against its base is **between 2.5:1 and 3.0:1**. ASCII glyphs are
+      thin, so ASCII may use its own factor and sit at the top of the window; Dither sits nearer
+      2.5. With the neutral day base, mixing keeps each ink's hue (no greying).
+    - Keep: greeting text **at least 4.5:1** against every ink and the base at the rest states;
+      no veil, no halo.
+    - Check: update the contrast tests to the window above (both bounds, both styles, both rest
+      states, ink-to-base also at the in-between phases with only the upper bound) and to the
+      new day base; existing scene tests pass.
+
 ## 4. Machine rules (owner)
 
 - No Rust. Never the full `bun run test` or `bun run lint`. Run `bun run typecheck`, `bun test src/features/home src/lib/home-*.test.ts` (and any test you touch), `bun x eslint <changed files>`.
