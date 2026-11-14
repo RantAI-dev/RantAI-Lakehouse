@@ -76,4 +76,4 @@ Run by the product owner on a running console. A step not performed is never a p
 - `BI-9-AC4` Changing the report time zone moves a timestamp near midnight to the other day on an existing chart, without re-saving the chart.
 - `BI-9-AC5` Clicking "March 2026" on a monthly chart lists exactly March's rows, and "Filter" sets a 1 to 31 March range on the dashboard.
 - `BI-9-AC6` A chart grouped by hour over more than 1000 hours shows the latest 1000 and the cut-off mark.
-- `AI-3-AC1` "Make this monthly." turns a daily chart into a monthly one.
+- `AI-3-AC1` "Make this monthly." turns a daily chart into a monthly one. Accepted by the AI owner, 2026-11-13 (staging `80fb2f68`)

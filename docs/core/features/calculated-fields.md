@@ -70,4 +70,4 @@ Part 2:
 - `BI-8-AC3` A formula with a typo shows the error at its position and cannot be saved.
 - `BI-8-AC4` A user without `dashboard:write` cannot create a field; a failure shows a plain message.
 - `BI-8-AC5` A formula over a masked column shows the masked value to a masked role.
-- `AI-4-AC1` "Add profit as revenue minus cost." creates the field through the formula language.
+- `AI-4-AC1` "Add profit as revenue minus cost." creates the field through the formula language. Accepted by the AI owner, 2026-11-13 (staging `80fb2f68`)

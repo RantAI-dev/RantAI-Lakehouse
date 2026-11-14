@@ -41,7 +41,7 @@ BI-8.
 Run on a running console by the product owner. A step not performed is never a pass.
 
 - `AI-4-AC1` The quoted request adds a working profit field
-- `AI-4-AC2` An impossible request is explained, not faked
+- `AI-4-AC2` An impossible request is explained, not faked. Accepted by the AI owner, 2026-11-13 (staging `80fb2f68`)
 
 ## Not included
 
