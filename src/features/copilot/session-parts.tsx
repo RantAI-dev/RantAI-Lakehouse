@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { Check, MessageSquare, MoreHorizontal, Pencil, Plus, Search, Sparkles, Trash2 } from "lucide-react";
+import { Check, Hammer, MessageSquare, MoreHorizontal, Pencil, Plus, Search, Trash2 } from "lucide-react";
 
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
 import { Button } from "@/components/ui/button";
@@ -39,7 +39,7 @@ export function SessionModeIcon({ mode, className }: { readonly mode: string; re
         className
       )}
     >
-      {build ? <Sparkles className="size-3.5" /> : <MessageSquare className="size-3.5" />}
+      {build ? <Hammer className="size-3.5" /> : <MessageSquare className="size-3.5" />}
       <span className="sr-only">{build ? "Build" : "Ask"}</span>
     </span>
   );

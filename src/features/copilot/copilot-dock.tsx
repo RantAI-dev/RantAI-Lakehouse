@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { usePathname } from "next/navigation";
-import { Sparkles, Plus, ChevronDown, PanelRight } from "lucide-react";
+import { Bot, Plus, ChevronDown, PanelRight } from "lucide-react";
 import { SuggestionButton } from "@/features/copilot/suggestion-button";
 import { useCopilot } from "./use-copilot";
 import { ChatMessages } from "./chat-messages";
@@ -54,7 +54,7 @@ export function CopilotDock() {
         <div className="mb-2 flex max-h-[58vh] flex-col overflow-hidden rounded-2xl border border-border/70 bg-card/90 shadow-[0_8px_40px_rgba(0,0,0,0.18)] backdrop-blur-xl supports-backdrop-filter:bg-card/80">
           <div className="flex items-center gap-2 border-b border-border px-3 py-2">
             <span className="grid size-6 place-items-center rounded-md bg-primary/10 text-primary">
-              <Sparkles className="size-3.5" />
+              <Bot className="size-3.5" aria-hidden />
             </span>
             <span className="text-sm font-semibold">AI Copilot</span>
             <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">

@@ -10,7 +10,7 @@ import {
   ChevronDown,
   CircleHelp,
   MessageSquare,
-  Sparkles,
+  Bot,
 } from "lucide-react"
 
 import { Skeleton } from "@/components/ui/skeleton"
@@ -844,7 +844,7 @@ function AiButton({
       // dark theme's card background.
       className="inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-[var(--brand-1)] transition-colors hover:bg-[color-mix(in_oklch,var(--brand-1),transparent_88%)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
     >
-      <Sparkles className="size-3" />
+      <Bot className="size-3" aria-hidden />
       {children}
     </button>
   )
