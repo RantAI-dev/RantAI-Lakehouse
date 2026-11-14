@@ -182,25 +182,34 @@ describe("Home background choice (WEB-17 T4)", () => {
     expect(scene()?.getAttribute("data-variant")).toBe("dither")
   })
 
-  it("Off from Customize removes the scene at once, is remembered, and still holds after a reload", async () => {
+  // The page's band and the box under it that holds the greeting, composer and chips.
+  const band = () => scene()?.closest("[data-slot=lake-band]") ?? null
+  const heroTop = () => screen.getByRole("heading", { level: 1 }).closest("section")?.parentElement?.className
+
+  it("Off from Customize hides the art in place, keeps the hero where it was, is remembered, and holds after a reload", async () => {
     resetHomeBackgroundMemory()
     stubFetch()
     renderHome()
     expect(await screen.findByText(/Alice Viewer/)).toBeTruthy()
     expect(scene()).not.toBeNull()
+    const before = heroTop()
 
     fireEvent.click(screen.getByRole("button", { name: /Customize/ }))
     fireEvent.click(await screen.findByRole("menuitemradio", { name: /Off/ }))
 
-    await waitFor(() => expect(scene()).toBeNull())
+    // Owner QA 2026-11-14: Off must not move the composer up; the art fades out, nothing moves.
+    await waitFor(() => expect(band()?.getAttribute("data-state")).toBe("off"))
+    expect(band()?.className).toContain("opacity-0")
+    expect(heroTop()).toBe(before)
     expect(window.localStorage.getItem("home-background")).toBe("off")
 
-    // A reload: a fresh page reads the choice back before drawing anything.
+    // A reload: a fresh page reads the choice back and never mounts the scene, at the same place.
     cleanup()
     resetHomeBackgroundMemory()
     renderHome()
     expect(await screen.findByText(/Alice Viewer/)).toBeTruthy()
     expect(scene()).toBeNull()
+    expect(heroTop()).toBe(before)
   })
 
   it("ASCII draws the scene as glyphs", async () => {

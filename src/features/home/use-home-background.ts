@@ -13,7 +13,7 @@ import {
 
 /**
  * Home's Background choice (`WEB-17` D2), read from this browser before the
- * first paint of Home so the band is never drawn and then closed up.
+ * first paint of Home so an Off page never shows the band's colour.
  *
  * `useSyncExternalStore`: the server and the hydration pass see the default
  * (the console's markup is the same for everyone), and the stored choice

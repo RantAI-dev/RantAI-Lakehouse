@@ -22,7 +22,7 @@ On 2026-11-14 the owner compared three mockups (`design/chart-builder-mockups` a
   - **Recent AI chats:** the latest four, with "N more" to the history page.
   - **Pipelines:** each pipeline's last status and time; a failed one offers "Ask why", which fills the composer.
   - **Needs attention:** open alerts, unhealthy sources and stale assets, the checks behind today's status pill.
-- A **Background** choice in Home's Customize menu: Dither (default), ASCII, or Off. It is remembered in this browser. Off gives a plain page with no empty band.
+- A **Background** choice in Home's Customize menu: Dither (default), ASCII, or Off. It is remembered in this browser. Off hides the art and keeps the layout: nothing moves (owner QA 2026-11-14).
 - Light and dark themes; a still scene under reduced motion.
 
 ## Target specs
@@ -31,7 +31,7 @@ On 2026-11-14 the owner compared three mockups (`design/chart-builder-mockups` a
 | --- | --- | --- |
 | Above the fold at 1366×800 | Greeting and composer only | Composer, chips and the top of the bento; the focal dashboard's first row of tiles is visible without scrolling |
 | Scene cost | None | Drawn once to a canvas or static image after first paint; never blocks the composer. Optional motion is cheap (no per-frame full redraw above ~10 fps), paused off-screen and in a hidden tab, and none under `prefers-reduced-motion` |
-| Background off | n/a | One click in Customize; the layout closes up and there is no empty band |
+| Background off | n/a | One click in Customize; the art fades out in place and nothing moves (owner QA 2026-11-14) |
 | Data honesty | n/a | Every number comes from an existing API; no widget shows sample data |
 | AI icons | Sparkles | `Bot`, as elsewhere since `BI-61` |
 

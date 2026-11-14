@@ -58,10 +58,12 @@ describe("AppShellSkeleton", () => {
     shell("/")
     expect(screen.getByRole("status", { name: "Loading Home" })).toBeTruthy()
     expect(screen.queryByRole("status", { name: "Loading" })).toBeNull()
-    // The band in its solid base colour, no drawing yet; hidden by CSS when this browser chose Off.
+    // The band in its solid base colour, no drawing yet; transparent by CSS when this browser
+    // chose Off, but still there, so the hero keeps its place (owner QA 2026-11-14).
     const band = document.querySelector("[data-slot='lake-band']")
     expect(band).not.toBeNull()
-    expect(band?.className).toContain("in-data-[home-bg=off]:hidden")
+    expect(band?.className).toContain("in-data-[home-bg=off]:opacity-0")
+    expect(band?.className).not.toContain("hidden")
     expect(document.querySelector("canvas[data-slot='lake-scene']")).toBeNull()
     // The composer's own component, inert so nothing typed before the page mounts is lost.
     const box = screen.getByLabelText("Message AI Copilot", { selector: "textarea" })
