@@ -130,6 +130,14 @@
      name swaps in after mount without moving the row (same height, same icon slot).
    - Check: unit tests for the label with and without a remembered board, an old id-only value,
      forget, and the update when another board is opened.
+   - **Browse resets it** (owner, 2026-11-15: "kalo misalnya user pencet browse dashboard. berarti
+     menu Dashboardnya kembali lagi dan kalo user klik halaman dashboard dia ke browse"). Opening
+     `/dashboards/browse` (by the right part or any other way) forgets the last board, so the
+     row reads "Dashboards" again. With nothing remembered, the row's label part links straight
+     to `/dashboards/browse`; with a board remembered it links to that board
+     (`/dashboards/<id>`), so the row never depends on the resolver's guess. Opening a board
+     remembers it again. Check: a test that visiting Browse clears the name and the row's href
+     becomes `/dashboards/browse`; opening a board sets both back.
 
 ## 4. Machine rules (owner, 2026-11-14)
 
