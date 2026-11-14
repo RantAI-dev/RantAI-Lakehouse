@@ -215,6 +215,144 @@ async fn deleting_referenced_approval_nulls_out_approval_id(pool: PgPool) -> sql
     Ok(())
 }
 
+/// Asserts that a statement was refused by the append-only trigger of
+/// `audit_event` (migration `0142_audit_event_append_only.sql`), not by some
+/// other error such as a typo in the SQL.
+fn assert_refused_as_append_only(result: Result<sqlx::postgres::PgQueryResult, sqlx::Error>) {
+    let err = result.unwrap_err();
+    let message = err
+        .as_database_error()
+        .map(|db| db.message().to_owned())
+        .unwrap_or_default();
+    assert!(
+        message.contains("audit_event is append-only"),
+        "expected the append-only trigger to refuse the statement, got: {err}"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn deleting_an_audit_event_is_refused(pool: PgPool) -> sqlx::Result<()> {
+    let written = insert(&pool, sample("query_sql")).await.unwrap();
+
+    assert_refused_as_append_only(
+        sqlx::query("DELETE FROM audit_event WHERE id = $1")
+            .bind(&written.id)
+            .execute(&pool)
+            .await,
+    );
+
+    let events = list(&pool, AuditFilter::default()).await.unwrap();
+    assert_eq!(events.len(), 1);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn truncating_audit_event_is_refused(pool: PgPool) -> sqlx::Result<()> {
+    insert(&pool, sample("query_sql")).await.unwrap();
+
+    assert_refused_as_append_only(sqlx::query("TRUNCATE audit_event").execute(&pool).await);
+
+    let events = list(&pool, AuditFilter::default()).await.unwrap();
+    assert_eq!(events.len(), 1);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn updating_any_other_column_of_an_audit_event_is_refused(pool: PgPool) -> sqlx::Result<()> {
+    let written = insert(&pool, sample("query_sql")).await.unwrap();
+
+    for statement in [
+        "UPDATE audit_event SET outcome = 'failed' WHERE id = $1",
+        "UPDATE audit_event SET action = 'rewritten' WHERE id = $1",
+        "UPDATE audit_event SET args = '{\"foo\": \"changed\"}'::jsonb WHERE id = $1",
+        "UPDATE audit_event SET detail = 'edited afterwards' WHERE id = $1",
+        "UPDATE audit_event SET actor_label = 'someone else' WHERE id = $1",
+        "UPDATE audit_event SET at = now() + interval '1 day' WHERE id = $1",
+    ] {
+        assert_refused_as_append_only(
+            sqlx::query(statement)
+                .bind(&written.id)
+                .execute(&pool)
+                .await,
+        );
+    }
+
+    // A change to a link column rides along with a forbidden change: the
+    // whole statement is refused, the link is not nulled as a side effect.
+    sqlx::query(
+        "INSERT INTO agent_run (id, employee_id, status, trigger, actor, steps) \
+         VALUES ('run-append-only', 'emp-inventory', 'running', 'test', 'test-actor', \
+         '[]'::jsonb)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut linked = sample("run_tool");
+    linked.run_id = Some("run-append-only".to_owned());
+    let linked = insert(&pool, linked).await.unwrap();
+    assert_refused_as_append_only(
+        sqlx::query("UPDATE audit_event SET run_id = NULL, outcome = 'failed' WHERE id = $1")
+            .bind(&linked.id)
+            .execute(&pool)
+            .await,
+    );
+
+    let events = list(&pool, AuditFilter::default()).await.unwrap();
+    let row = events.iter().find(|e| e.id == written.id).unwrap();
+    assert_eq!(row, &written);
+    let row = events.iter().find(|e| e.id == linked.id).unwrap();
+    assert_eq!(row, &linked);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_audit_event_link_can_be_cleared_but_never_pointed_elsewhere(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    for id in ["run-link-a", "run-link-b"] {
+        sqlx::query(
+            "INSERT INTO agent_run (id, employee_id, status, trigger, actor, steps) \
+             VALUES ($1, 'emp-inventory', 'running', 'test', 'test-actor', '[]'::jsonb)",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let mut event = sample("run_tool");
+    event.run_id = Some("run-link-a".to_owned());
+    let written = insert(&pool, event).await.unwrap();
+
+    assert_refused_as_append_only(
+        sqlx::query("UPDATE audit_event SET run_id = 'run-link-b' WHERE id = $1")
+            .bind(&written.id)
+            .execute(&pool)
+            .await,
+    );
+    // Attaching a link to a row that has none is a change too, not a clearing.
+    let unlinked = insert(&pool, sample("query_sql")).await.unwrap();
+    assert_refused_as_append_only(
+        sqlx::query("UPDATE audit_event SET run_id = 'run-link-b' WHERE id = $1")
+            .bind(&unlinked.id)
+            .execute(&pool)
+            .await,
+    );
+
+    sqlx::query("UPDATE audit_event SET run_id = NULL WHERE id = $1")
+        .bind(&written.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let events = list(&pool, AuditFilter::default()).await.unwrap();
+    let row = events.iter().find(|e| e.id == written.id).unwrap();
+    assert_eq!(row.run_id, None);
+    assert_eq!(row.action, "run_tool");
+    let row = events.iter().find(|e| e.id == unlinked.id).unwrap();
+    assert_eq!(row.run_id, None);
+    Ok(())
+}
+
 /// An unknown `run_id` is a foreign-key violation, not a silent insert.
 #[sqlx::test(migrations = "../../migrations")]
 async fn insert_with_unknown_run_id_is_a_foreign_key_violation(pool: PgPool) -> sqlx::Result<()> {
