@@ -92,6 +92,6 @@ Run by the product owner on a running console. A step not performed is never a p
 - `BI-17-AC6` A user without `dashboard:write` cannot change a chart's format, a user without `settings:write` cannot change the palette, fonts or locale, and a failure shows a plain sentence.
 - `BI-17-AC7` A table colours cells below 1,000 red, and a KPI turns green above its goal.
 - `BI-17-AC8` A dashboard set to the dark theme stays dark in a public link while the console is light.
-- `AI-8-AC1` "Show values in rupiah, make the bars green, add a target line at 1,000." applies all three changes.
+- `AI-8-AC1` "Show values in rupiah, make the bars green, add a target line at 1,000." applies all three changes. Accepted by the AI owner, 2026-11-13 (staging `80fb2f68`)
 
 `BI-17-AC4` and `BI-17-AC5` (forecast and clustering) belong to part B.

@@ -58,4 +58,4 @@ nothing to compare it to. A row in the drill-down list cannot be opened.
 - `BI-16A-AC4` A KPI comparing months shows the change as amount and percent, coloured, with a trend line; with a goal it shows the distance to the goal.
 - `BI-16A-AC5` A record opens from the list and next/previous walk the list.
 - `BI-16A-AC6` A user without `dashboard:write` cannot save any of it; a failure shows a plain message.
-- `AI-5-AC1` "Show this as a pivot table with totals." works.
+- `AI-5-AC1` "Show this as a pivot table with totals." works. Accepted by the AI owner, 2026-11-13 (staging `80fb2f68`)
