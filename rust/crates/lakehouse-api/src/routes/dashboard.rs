@@ -3776,12 +3776,23 @@ pub(crate) fn file_slug(title: &str, fallback: &str) -> String {
 
 /// A file name from a tile's title (see [`file_slug`]). A file that was cut at
 /// the row cap says so in its name (feature decision 8).
-pub(crate) fn export_file_name(title: &str, extension: &str, cut_at: Option<u32>) -> String {
+///
+/// `BI-28`: a file made while an active filter did not apply to the tile ends
+/// its name with `-filters-not-applied`, so the reader sees it outside the
+/// file; the body of a CSV or TSV is not changed.
+pub(crate) fn export_file_name(
+    title: &str,
+    extension: &str,
+    (cut_at, filters_skipped): (Option<u32>, bool),
+) -> String {
     let slug = file_slug(title, "table");
-    match cut_at {
-        Some(rows) => format!("{slug}-first-{rows}-rows.{extension}"),
-        None => format!("{slug}.{extension}"),
-    }
+    let cut = cut_at.map_or_else(String::new, |rows| format!("-first-{rows}-rows"));
+    let note = if filters_skipped {
+        "-filters-not-applied"
+    } else {
+        ""
+    };
+    format!("{slug}{cut}{note}.{extension}")
 }
 
 /// What one download did, for the audit record.
@@ -3789,9 +3800,13 @@ struct ExportOutcome {
     action: &'static str,
     rows: usize,
     cut: bool,
+    /// Which limit cut the file (`rows` or `bytes`), `None` when it was whole.
+    cut_by: Option<&'static str>,
     cap: u32,
     format: crate::export::FileFormat,
     values: crate::export::Values,
+    /// `BI-28`: a dashboard filter was left out of the file.
+    filters_skipped: bool,
 }
 
 /// The audit entry of one download (a chart's file or a dashboard's PDF),
@@ -3843,9 +3858,16 @@ async fn record_export_audit(
             "tile": chart.spec.id,
             "rows": outcome.rows,
             "cut": outcome.cut,
+            // BI-27: a file the byte cap cut says so in the audit row, with
+            // the cap it met, as the row cap does.
+            "cutBy": outcome.cut_by,
             "cap": outcome.cap,
+            "byteCap": crate::export::EXPORT_BYTE_CAP,
             "format": outcome.format.extension(),
             "values": if outcome.values == crate::export::Values::Raw { "raw" } else { "formatted" },
+            // BI-28: the same sentence the file carries, so the record says
+            // what the file did not apply.
+            "note": outcome.filters_skipped.then_some(crate::export::FILTERS_NOT_APPLIED),
         }),
     )
     .await
@@ -3894,7 +3916,7 @@ fn export_statement(
     q: &ChartExportQuery,
     (shown, filters): (&[String], &[FilterDef]),
     time: &TimeContext,
-) -> Result<String, ApiError> {
+) -> Result<(String, bool), ApiError> {
     let chosen_sort = q.sort_column.clone().filter(|c| !c.is_empty());
     let fields = lakehouse_bi::tables::TableFields {
         columns: Some(shown.to_vec()),
@@ -3910,15 +3932,15 @@ fn export_statement(
     };
     let known: HashSet<String> = relation.cols.keys().cloned().collect();
     let plan = lakehouse_bi::tables::plan_rows(&fields, &known).map_err(ApiError::BadRequest)?;
-    Ok(lakehouse_bi::builder::rows_page_sql(
+    let page = lakehouse_bi::builder::rows_page_sql(
         &relation.from,
         &relation.cols,
         filters,
         &plan,
         (crate::export::EXPORT_ROW_CAP + 1, 0),
         time,
-    )
-    .rows)
+    );
+    Ok((page.rows, !page.skipped.is_empty()))
 }
 
 /// The statement of a raw table's rows, with the labels of its columns.
@@ -3928,10 +3950,21 @@ async fn rows_export_statement(
     q: &ChartExportQuery,
     dashboard_filters: Vec<FilterDef>,
     time: &TimeContext,
-) -> Result<(String, HashMap<String, String>), ApiError> {
+) -> Result<(String, HashMap<String, String>, bool), ApiError> {
+    let (shown, labels) = export_columns(chart);
+    // BI-28: the columns the file shows and the one it sorts by go into the
+    // relation's query, so a calculated field among them is added to the
+    // relation as it is for the records list (it is not a column of the mart).
+    let sort_column = q
+        .sort_column
+        .clone()
+        .filter(|c| !c.is_empty())
+        .or_else(|| chart.def.tables.sort_column.clone());
     let relation_query = RecordsQuery {
         mart: Some(chart.def.mart.clone()),
         sql_source: chart.def.sql_source.clone(),
+        columns: Some(shown.join(",")),
+        sort_column,
         ..RecordsQuery::default()
     };
     let relation = records_relation(ch, &relation_query, chart.def.shape.joins_list()).await?;
@@ -3947,9 +3980,8 @@ async fn rows_export_statement(
     let own = own.as_slice();
     let relation = with_calculated_columns(ch, relation, (&relation_query, own), time).await?;
     let filters = with_chart_filters(own, dashboard_filters, &relation.cols, time)?;
-    let (shown, labels) = export_columns(chart);
-    let statement = export_statement(chart, &relation, q, (&shown, &filters), time)?;
-    Ok((statement, shown.into_iter().zip(labels).collect()))
+    let (statement, skipped) = export_statement(chart, &relation, q, (&shown, &filters), time)?;
+    Ok((statement, shown.into_iter().zip(labels).collect(), skipped))
 }
 
 /// The statement a grouped tile (a chart, a pivot, a summary table, a KPI)
@@ -3962,7 +3994,7 @@ async fn grouped_export_statement(
     q: &ChartExportQuery,
     filters: &[FilterDef],
     time: &TimeContext,
-) -> Result<String, ApiError> {
+) -> Result<(String, bool), ApiError> {
     let years: Vec<i64> = q
         .year
         .as_deref()
@@ -4005,7 +4037,7 @@ async fn grouped_export_statement(
     };
     let effective = effective_chart(chart, &cols, &sources, &read).map_err(ApiError::BadRequest)?;
     stored_chart_sql(&effective, &years, filters, &cols, &sources, &read)
-        .map(|filtered| filtered.sql)
+        .map(|filtered| (filtered.sql, !filtered.skipped.is_empty()))
         .map_err(|message| ApiError::Unprocessable(message.to_owned()))
 }
 
@@ -4047,7 +4079,7 @@ fn export_response(
     written: crate::export::Written,
     file_name: &str,
     format: crate::export::FileFormat,
-    cap: u32,
+    (cap, cut_by): (u32, Option<&'static str>),
 ) -> Response {
     let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(written.file));
     (
@@ -4071,10 +4103,25 @@ fn export_response(
                 header::HeaderName::from_static("x-export-cap"),
                 cap.to_string(),
             ),
+            (
+                header::HeaderName::from_static("x-export-cut-by"),
+                cut_by.unwrap_or("none").to_owned(),
+            ),
         ],
         body,
     )
         .into_response()
+}
+
+/// The row count a cut file names: the row cap when that cut it, the rows it
+/// holds when the byte cap did (`BI-27`), so "first N rows" is always true of
+/// the file and the console's sentence stays right. `X-Export-Cap` carries
+/// the same number.
+pub(crate) fn cut_rows(written: &crate::export::Written, row_cap: u32) -> u32 {
+    match written.cut_by(row_cap as usize) {
+        Some("bytes") => u32::try_from(written.rows).unwrap_or(row_cap),
+        _ => row_cap,
+    }
 }
 
 /// `GET /api/dashboard/chart-export?chart=&format=&values=` — the whole result
@@ -4171,7 +4218,7 @@ async fn export_tile_statement(
     principal: &Principal,
     q: &ChartExportQuery,
     rows_only: bool,
-) -> Result<(StoredChartSpec, String, HashMap<String, String>), ApiError> {
+) -> Result<TileStatement, ApiError> {
     let ch = &state.clickhouse;
     let chart_id = q
         .chart
@@ -4209,12 +4256,12 @@ async fn export_tile_statement(
     )
     .await?;
     let time = time.with_params(loaded.values);
-    let (statement, labels) = if rows_mode {
+    let (statement, labels, filters_skipped) = if rows_mode {
         rows_export_statement(ch, &chart, q, dashboard_filters, &time).await?
     } else {
-        let statement =
+        let (statement, skipped) =
             grouped_export_statement(ch, (&viewer, &chart), q, &dashboard_filters, &time).await?;
-        (statement, HashMap::new())
+        (statement, HashMap::new(), skipped)
     };
     // BI-5 review S4: a grouped file holds what the tile shows, so it runs under
     // the same limits the tile ran under. An unreadable setting leaves the text.
@@ -4222,11 +4269,22 @@ async fn export_tile_statement(
         .limits()
         .await
         .ok();
-    Ok((
+    Ok(TileStatement {
         chart,
-        export_statement_settings(rows_mode, statement, limits.as_ref()),
+        statement: export_statement_settings(rows_mode, statement, limits.as_ref()),
         labels,
-    ))
+        filters_skipped,
+    })
+}
+
+/// What a download reads: the tile, its statement, the header label of each
+/// column, and whether an active dashboard filter did not apply to the tile's
+/// data and was left out (`BI-28`).
+struct TileStatement {
+    chart: StoredChartSpec,
+    statement: String,
+    labels: HashMap<String, String>,
+    filters_skipped: bool,
 }
 
 /// The statement as the download sends it. A raw table's rows lift a SQL
@@ -4258,6 +4316,10 @@ pub(crate) struct ChartFile {
     pub written: crate::export::Written,
     pub format: crate::export::FileFormat,
     pub values: crate::export::Values,
+    /// An active dashboard filter did not apply to this tile's data, so the
+    /// file is not narrowed by it (`BI-28`). The routes say so; see
+    /// [`crate::export::FILTERS_NOT_APPLIED`].
+    pub filters_skipped: bool,
 }
 
 /// Read the chart's rows as `principal` and write them to a file: the one
@@ -4268,6 +4330,12 @@ pub(crate) struct ChartFile {
 /// The caller has checked that the person may download (the routes call
 /// `require_download`, the runner checks the owner's rights) and records the
 /// audit entry before the file is handed over.
+///
+/// This does not take a download slot (`BI-34`, plan D5 decision 5): the
+/// routes take one in [`take_export_slot`] before they call it, and a
+/// scheduled report never does, so a send is never refused for concurrency.
+/// The report has the byte cap, the engine's time and memory limits like any
+/// download.
 ///
 /// # Errors
 ///
@@ -4291,7 +4359,12 @@ pub(crate) async fn build_chart_file(
         .as_deref()
         .map_or(Some(Values::Formatted), Values::parse)
         .ok_or_else(|| ApiError::BadRequest("values must be formatted or raw.".to_owned()))?;
-    let (chart, statement, labels) = export_tile_statement(state, principal, q, rows_only).await?;
+    let TileStatement {
+        chart,
+        statement,
+        labels,
+        filters_skipped,
+    } = export_tile_statement(state, principal, q, rows_only).await?;
 
     let placeholders = crate::sql_rewrite::PlaceholderValues {
         principal_id: Some(principal.id.uuid().to_string()),
@@ -4318,9 +4391,18 @@ pub(crate) async fn build_chart_file(
     // GOV-7 D5: one mapping for every refusal (BI-16 C3's `RegionOf`
     // sentence is inside it), so a hidden table answers 404.
     .map_err(|err| crate::routes::support::enforcement_refusal(&statement, &err))?;
+    // BI-27 (plan D3): the engine stops the statement at its own time limit,
+    // also over a mart, which carries no limit in its text. A statement-level
+    // `SETTINGS` (a SQL source's, a grouped tile's) still wins.
+    let options = lakehouse_clickhouse::QueryOptions {
+        max_execution_time: Some(crate::export::EXPORT_ENGINE_TIME),
+        // BI-34 (plan D3): the engine's own memory limit for the statement.
+        max_memory_usage: Some(crate::export::EXPORT_MEMORY_BYTES),
+        ..lakehouse_clickhouse::QueryOptions::default()
+    };
     let mut stream = state
         .clickhouse
-        .query_stream(&rewritten, crate::export::EXPORT_TIMEOUT)
+        .query_stream_with_options(&rewritten, crate::export::EXPORT_TIMEOUT, &options)
         .await
         .map_err(|err| classify_dashboard_ch_error(&err))?;
     let (labels, formats) =
@@ -4328,7 +4410,7 @@ pub(crate) async fn build_chart_file(
     let locale = crate::routes::settings::format_settings(state)
         .await?
         .number_locale;
-    let written = crate::export::write_export(
+    let written = crate::export::write_export_with_byte_cap(
         &mut stream,
         &crate::export::ExportOptions {
             format,
@@ -4337,7 +4419,9 @@ pub(crate) async fn build_chart_file(
             locale: &locale,
             labels: &labels,
             formats: &formats,
+            note: filters_skipped.then_some(crate::export::FILTERS_NOT_APPLIED),
         },
+        Some(crate::export::EXPORT_BYTE_CAP),
     )
     .await
     .map_err(|err| super::export_failure(&DASHBOARD_QUERY, &err))?;
@@ -4346,7 +4430,23 @@ pub(crate) async fn build_chart_file(
         written,
         format,
         values,
+        filters_skipped,
     })
+}
+
+/// One of the process's download slots, or the 429 a person is told
+/// (`BI-34`, plan D3). Try-acquire: a download that cannot start now is
+/// refused with a fixed sentence, it does not queue behind a long one.
+fn take_export_slot(
+    slots: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
+    slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::TooManyRequests {
+            message: crate::export::EXPORT_BUSY.to_owned(),
+            retry_after_secs: 10,
+        })
 }
 
 async fn export_chart(
@@ -4358,13 +4458,18 @@ async fn export_chart(
     gate: &crate::routes::query::StatementGate<'_>,
 ) -> ApiResult<Response> {
     crate::routes::settings::require_download(state, principal).await?;
+    // Held until the file is written; the stream to the client that follows
+    // reads a file on disk and holds no memory on the engine.
+    let _slot = take_export_slot(&state.export_slots)?;
     let ChartFile {
         chart,
         written,
         format,
         values,
+        filters_skipped,
     } = build_chart_file(state, principal, q, rows_only, gate).await?;
     let cap = crate::export::EXPORT_ROW_CAP;
+    let cut_by = written.cut_by(cap as usize);
 
     record_export_audit(
         state,
@@ -4374,19 +4479,29 @@ async fn export_chart(
             action,
             rows: written.rows,
             cut: written.cut,
+            cut_by,
             cap,
             format,
             values,
+            filters_skipped,
         },
     )
     .await?;
 
+    let shown = cut_rows(&written, cap);
     let file_name = export_file_name(
         &chart.spec.title,
         format.extension(),
-        written.cut.then_some(cap),
+        (written.cut.then_some(shown), filters_skipped),
     );
-    Ok(export_response(written, &file_name, format, cap))
+    let mut response = export_response(written, &file_name, format, (shown, cut_by));
+    if filters_skipped {
+        response.headers_mut().insert(
+            header::HeaderName::from_static("x-export-note"),
+            header::HeaderValue::from_static(crate::export::FILTERS_NOT_APPLIED),
+        );
+    }
+    Ok(response)
 }
 
 // ── /api/dashboard/values ───────────────────────────────────────────────
@@ -5680,6 +5795,108 @@ mod tests {
             serde_json::from_str(r#"{"id":"default","refreshSeconds":300}"#).unwrap();
         assert!(board_edit_allowed(&body));
         assert_eq!(body.refresh_seconds, Some(300));
+    }
+
+    /// `BI-34`: a third concurrent download is refused with a 429 and a fixed
+    /// sentence, and a slot freed by a finished one is taken again.
+    #[test]
+    fn a_third_concurrent_download_is_refused_with_a_429() {
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(crate::state::EXPORT_AT_ONCE));
+        let held: Vec<_> = (0..crate::state::EXPORT_AT_ONCE)
+            .map(|_| take_export_slot(&slots).unwrap())
+            .collect();
+        let refused = take_export_slot(&slots).unwrap_err();
+        assert_eq!(refused.status(), 429);
+        assert_eq!(refused.to_string(), crate::export::EXPORT_BUSY);
+        drop(held);
+        assert!(take_export_slot(&slots).is_ok());
+    }
+
+    /// `BI-27`: the file name and the headers of a download the byte cap cut
+    /// name the rows the file holds, not the row cap it never reached.
+    #[tokio::test]
+    async fn a_download_cut_by_bytes_names_the_rows_it_holds() {
+        use crate::export::{
+            ExportOptions, FileFormat, RowSource, Values, write_export_with_byte_cap,
+        };
+
+        struct Rows(usize);
+        impl RowSource for Rows {
+            fn names(&self) -> &[String] {
+                static NAMES: std::sync::LazyLock<Vec<String>> =
+                    std::sync::LazyLock::new(|| vec!["n".to_owned()]);
+                &NAMES
+            }
+            fn types(&self) -> &[String] {
+                static TYPES: std::sync::LazyLock<Vec<String>> =
+                    std::sync::LazyLock::new(|| vec!["String".to_owned()]);
+                &TYPES
+            }
+            fn next_row(
+                &mut self,
+            ) -> impl std::future::Future<
+                Output = Result<Option<Vec<Value>>, lakehouse_clickhouse::ChError>,
+            > + Send {
+                let row = (self.0 > 0).then(|| {
+                    self.0 -= 1;
+                    vec![json!("xxxx")]
+                });
+                std::future::ready(Ok(row))
+            }
+        }
+        let (labels, formats) = (HashMap::new(), HashMap::new());
+        let options = ExportOptions {
+            format: FileFormat::Csv,
+            values: Values::Raw,
+            cap: 100,
+            locale: "en-US",
+            labels: &labels,
+            formats: &formats,
+            note: None,
+        };
+        // The byte-order mark and "n\r\n" are 6 bytes, a row 6: room for two.
+        let written = write_export_with_byte_cap(&mut Rows(10), &options, Some(18))
+            .await
+            .unwrap();
+        assert_eq!((written.rows, written.cut), (2, true));
+        assert_eq!(cut_rows(&written, 100), 2);
+        assert_eq!(written.cut_by(100), Some("bytes"));
+        assert_eq!(
+            export_file_name(
+                "Visits",
+                "csv",
+                (written.cut.then_some(cut_rows(&written, 100)), false)
+            ),
+            "Visits-first-2-rows.csv"
+        );
+        let response = export_response(
+            written,
+            "Visits-first-2-rows.csv",
+            FileFormat::Csv,
+            (2, Some("bytes")),
+        );
+        let headers = response.headers();
+        assert_eq!(headers["x-export-cut"], "true");
+        assert_eq!(headers["x-export-cap"], "2");
+        assert_eq!(headers["x-export-cut-by"], "bytes");
+    }
+
+    /// BI-28: a file made while a dashboard filter did not apply says so in its
+    /// name, after the cut, and a file with no skipped filter is named as before.
+    #[test]
+    fn a_file_name_says_when_a_filter_was_not_applied() {
+        assert_eq!(
+            export_file_name("Visits", "csv", (None, false)),
+            "Visits.csv"
+        );
+        assert_eq!(
+            export_file_name("Visits", "xlsx", (None, true)),
+            "Visits-filters-not-applied.xlsx"
+        );
+        assert_eq!(
+            export_file_name("Visits", "csv", (Some(50), true)),
+            "Visits-first-50-rows-filters-not-applied.csv"
+        );
     }
 
     /// BI-6: the export lists a chart's own filters, sort, "Other", groupings

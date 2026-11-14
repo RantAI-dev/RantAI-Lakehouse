@@ -239,6 +239,10 @@ pub struct AppState {
     /// feature decision 5); a third request waits for a slot. Shared across
     /// clones.
     pub pdf_slots: Arc<tokio::sync::Semaphore>,
+    /// At most [`EXPORT_AT_ONCE`] dashboard downloads run at once per process
+    /// (`BI-34`, plan D3); a further one is refused with a 429, it does not
+    /// wait. Scheduled reports do not take these slots. Shared across clones.
+    pub export_slots: Arc<tokio::sync::Semaphore>,
     /// At most `TILE_CONCURRENCY_MAX` (default 24) dashboard tiles are
     /// computed at once per process, across every request (`BI-4` part A,
     /// plan D2); a request also caps itself at 6. Shared across clones.
@@ -298,6 +302,12 @@ pub struct AppState {
 /// PDFs made at once per API process (`BI-1` D5). Chromium is heavy, and the
 /// Gotenberg container has 1 GiB; a third request waits its turn.
 pub const PDF_AT_ONCE: usize = 2;
+
+/// Dashboard downloads at once per API process (`BI-34`, plan D3): the same
+/// number as the PDF's, because a download holds a statement on the engine
+/// ([`crate::export::EXPORT_MEMORY_BYTES`] each) and a file in the temporary
+/// directory ([`crate::export::EXPORT_BYTE_CAP`] at most) for as long as it runs.
+pub const EXPORT_AT_ONCE: usize = 2;
 
 /// Build the admin-scoped [`LakekeeperAdminClient`] from the token file at
 /// `token_path`, or `None` when this deployment has no usable admin token.
@@ -877,6 +887,7 @@ impl AppState {
             upload_receive,
             conversion_runner,
             pdf_slots: Arc::new(tokio::sync::Semaphore::new(PDF_AT_ONCE)),
+            export_slots: Arc::new(tokio::sync::Semaphore::new(EXPORT_AT_ONCE)),
             tile_slots: Arc::new(crate::tile_pool::slots_from_env()),
             result_cache: Arc::new(crate::result_cache::ResultCache::new(
                 crate::result_cache::max_mb_from(

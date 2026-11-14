@@ -3387,6 +3387,7 @@ async fn write_download_rows<S: crate::export::RowSource>(
         locale,
         labels: &labels,
         formats: &formats,
+        note: None,
     };
     crate::export::write_export_with_byte_cap(source, &options, Some(byte_cap)).await
 }
@@ -3637,6 +3638,9 @@ pub async fn download(
         query_id: Some(download_query_id(caller.id.uuid(), run_id)),
         // A download keeps the engine's own formatting (out of scope of `DATA-53`).
         quote_decimals: false,
+        // `BI-34` covers the dashboard's downloads; Query Studio's keeps the
+        // engine's default until it has its own decision.
+        max_memory_usage: None,
     };
     let statement = download_statement(&rewritten);
 

@@ -74,6 +74,7 @@ async fn answer(ch: &MockServer, has: &str, meta: Value, data: Vec<Value>) {
 
 /// Store reads, the column list (for the route's own check and the policy
 /// engine), then the page of rows `data`.
+#[allow(clippy::too_many_lines)] // one fixture: the stored charts and the engine's answers
 async fn mount(ch: &MockServer, data: Vec<Value>) {
     let chart_meta = json!([
         {"name": "id", "type": "String"}, {"name": "board", "type": "String"},
@@ -125,6 +126,15 @@ async fn mount(ch: &MockServer, data: Vec<Value>) {
                     "valueFormats": {
                         "amount": { "style": "compact", "currency": "IDR", "decimals": 2 }
                     },
+                }),
+            ),
+            // BI-28: a raw table that shows and sorts by a calculated field.
+            chart_row(
+                "c_calc",
+                "table",
+                &json!({
+                    "tableMode": "rows", "columns": ["email", "twice"],
+                    "sortColumn": "twice", "sortDir": "desc",
                 }),
             ),
             chart_row("c_text", "text", &json!({ "text": "hello" })),
@@ -884,4 +894,96 @@ async fn a_grouped_chart_downloads_and_the_refusals_read_and_audit_nothing() {
     .await
     .unwrap();
     assert_eq!(audited, 1, "only the download that was handed over");
+}
+
+/// BI-28: a raw table that shows a calculated field exports (200, not the 400
+/// the sort check gave when the field was not a column of the relation), and a
+/// dashboard filter that does not apply to the tile is said so in the file's
+/// name, in `X-Export-Note` and in the audit row, while the body is unchanged.
+#[tokio::test]
+async fn a_calculated_column_exports_and_a_skipped_filter_is_said_outside_the_body() {
+    let ch = MockServer::start().await;
+    answer(
+        &ch,
+        "FROM console.bi_field FINAL",
+        json!([
+            {"name": "id", "type": "String"}, {"name": "source_kind", "type": "String"},
+            {"name": "source_id", "type": "String"}, {"name": "name", "type": "String"},
+            {"name": "formula", "type": "String"}, {"name": "level", "type": "String"},
+            {"name": "data_type", "type": "String"}, {"name": "created_by", "type": "String"},
+            {"name": "updated_at", "type": "String"}
+        ]),
+        vec![json!({
+            "id": "f1", "source_kind": "mart", "source_id": "serving.mart_x",
+            "name": "twice", "formula": "[amount] * 2", "level": "row",
+            "data_type": "number", "created_by": "u", "updated_at": "2026-01-01 00:00:00"
+        })],
+    )
+    .await;
+    // PR #527 CI: the formula `[amount] * 2` needs a number, and `mount`'s
+    // column list types every column as text (422). This test's own list,
+    // mounted first so it wins, has `amount` as an `Int64`.
+    answer(
+        &ch,
+        "system.columns",
+        json!([
+            {"name": "name", "type": "String"}, {"name": "type", "type": "String"},
+            {"name": "default_kind", "type": "String"}, {"name": "default_expression", "type": "String"}
+        ]),
+        [("email", "String"), ("region", "String"), ("secret", "String"), ("amount", "Int64")]
+            .iter()
+            .map(|(n, t)| json!({"name": n, "type": t, "default_kind": "", "default_expression": ""}))
+            .collect(),
+    )
+    .await;
+    mount(&ch, vec![json!({"email": "a@x", "twice": "2"})]).await;
+    let (router, pool, cookie) = app(&ch).await;
+
+    let resp = get(&router, "/api/dashboard/table-export?chart=c_calc", &cookie).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers().get("x-export-note").is_none());
+    let sent: Vec<String> = statements(&ch)
+        .await
+        .into_iter()
+        .filter(|s| s.contains("serving.mart_x") && !s.contains("system."))
+        .collect();
+    assert!(
+        sent.iter()
+            .any(|s| s.contains("amount") && s.contains("twice")),
+        "the calculated field is computed in the statement: {sent:?}"
+    );
+
+    // A filter on a column the table does not have is left out, and said.
+    let filters = urlencoding_free(r#"[{"column":"nope","values":["x"]}]"#);
+    let resp = get(
+        &router,
+        &format!("/api/dashboard/table-export?chart=c_rows&filters={filters}"),
+        &cookie,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let disposition = resp.headers()["content-disposition"].to_str().unwrap();
+    assert!(
+        disposition.contains("-filters-not-applied.csv"),
+        "{disposition}"
+    );
+    let note = resp.headers()["x-export-note"].to_str().unwrap().to_owned();
+    assert_eq!(
+        note,
+        "Some dashboard filters do not apply to this table, so they were not used for this file."
+    );
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        !text.contains(&note),
+        "the note is not in the CSV body: {text}"
+    );
+    let args: Value = sqlx::query_scalar(
+        "SELECT args FROM audit_event WHERE action = 'dashboard.table_export' \
+         ORDER BY at DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(args["note"], json!(note));
 }

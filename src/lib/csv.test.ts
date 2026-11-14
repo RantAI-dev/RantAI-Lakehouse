@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert"
 import { test } from "node:test"
-import { toCsv, toTsv } from "./csv"
+import { readFileSync } from "node:fs"
+import { toCsv, toTsv, neutralizeFormula } from "./csv"
 
 /**
  * `downloadCsv` menyentuh DOM dan tidak diuji di sini; yang penting dan
@@ -166,3 +167,24 @@ test("toTsv membiarkan koma di dalam sel apa adanya", () => {
   assert.equal(toTsv(["v"], [{ v: "a,b" }]), "v\r\na,b")
 })
 
+
+/**
+ * The same vectors as the Rust twin of this rule (`csv_safe::neutralise` in
+ * `rust/crates/lakehouse-api`), read from one file, so the two cannot drift.
+ */
+const VECTORS: { text: string; neutralised: string }[] = JSON.parse(
+  readFileSync(
+    new URL(
+      "../../rust/crates/lakehouse-api/tests/fixtures/csv_neutralise_vectors.json",
+      import.meta.url
+    ),
+    "utf8"
+  )
+)
+
+test("neutralizeFormula agrees with the shared vectors of the Rust rule", () => {
+  assert.ok(VECTORS.length > 10)
+  for (const { text, neutralised } of VECTORS) {
+    assert.equal(neutralizeFormula(text), neutralised, JSON.stringify(text))
+  }
+})
