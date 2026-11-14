@@ -51,7 +51,7 @@ owner's request) and keeps new items in line when it adds them.
 
 **Blocked by** (was "Waits for"). An item that cannot start until another
 merges says so in its text: **Blocked by `BI-18`**, or for one part of it,
-**Blocked by `<ID>` (<part>)**, so the rest can start. Only open
+**Blocked by `<ID>` (`<part>`)**, so the rest can start. Only open
 blockers are written; a blocker that ships is removed from the text. The
 reverse direction (**Blocks**) is listed under Dependencies below, derived
 from these markers and never written by hand. A blocker is a dependency, not
@@ -208,7 +208,7 @@ estimate (S, M, L), which the base has no field for.
 | `BI-8` | Feature | Calculated fields and custom expressions: maths, text, dates, conditions, running totals | Dashboards | P2 | In Acceptance | #104 | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-9` | Feature | Group by day, week, month, quarter, year | Dashboards | P2 | In Acceptance | #104 | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-10` | Feature | Bins, groups and hierarchies | Dashboards | P2 | In Acceptance | [#160](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/160) | `reference/competitive-comparison.md` (BI matrix) |
-| `BI-11` | Feature | Parameters, usable in charts, SQL and dashboards. Was blocked by `QS-5` part 1 (released 2026-11-14) | Dashboards | P2 | In Acceptance | [#160](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/160) | `reference/competitive-comparison.md` (BI matrix) |
+| `BI-11` | Feature | Parameters, usable in charts, SQL and dashboards. | Dashboards | P2 | In Acceptance | [#160](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/160) | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-13` | Feature | Combine two sources on one chart | Dashboards | P2 | In Acceptance | [#160](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/160) | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-14` | Feature | Lineage from a chart to its sources, reachable from the dashboard. Built in #246: the chart-lineage route, a "used by" route and a side panel on the dashboard. | Dashboards | P2 | In Acceptance | [#246](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/246) | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-16` | Feature | Every chart type Tableau and Metabase have that we lack: progress bar, histogram, Gantt, bullet graph, KPI with comparison and sparkline, raw-row table, pivot table with totals, record detail, world maps and uploaded boundaries, image and web-page cards, spatial analysis, custom chart plugins. Part A (tables and KPI) in #104; parts B and C in #199, #246 and #265. Custom chart plugins are not built: no plugin runs customer code (decision 9 of `features/gantt-world-maps-spatial.md`, signed 2026-10-24). **Blocked by `BI-10` (histogram bins)** | Dashboards | P2 | Building | #104, #199, [#246](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/246), [#265](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/265) | `reference/competitive-comparison.md` (BI matrix) |
@@ -217,7 +217,7 @@ estimate (S, M, L), which the base has no field for.
 | `AI-7` | Feature | The assistant uses named metrics before it writes SQL, so the same question gives the same number. **Blocked by `BI-2`** **Owner QA, 2026-10-15:** the assistant ran SQL before looking for a metric (fails `AI-7-AC1` on `reusable-metrics.md`), and the chart draft card showed `sum(<column>)` instead of the metric's label. Both stay open under this item. Its task work is done (2026-11-07); the feature waits for the owner's checklist. | AI Copilot | P2 | In Acceptance | [#160](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/160), [#200](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/200) | `AGENTS.md` (assistant parity) |
 | `AI-8` | Feature | The assistant changes number formats, colours, axes and labels, and adds trend and forecast lines. `format_chart` and `set_dashboard_theme` in #199 (`BI-17` part A); the forecast reference line (the series continued `horizon` periods ahead) is in #246's chart schema and the build prompt names it. Accepted by the product owner on 2026-11-13 on staging (`80fb2f68`). | AI Copilot | P2 | Released | #199, #222, #239, #288 | `AGENTS.md` (assistant parity) |
 | `AI-11` | Feature | The assistant creates share and embed links only with approval, respects dashboard permissions, and never grants permissions. **Blocked by `DEC-8`** The embed half (`enable_embed`, `set_embed_filter_modes`, `withdraw_embed_tokens`, `get_embed_snippet`) shipped with `BI-26` slice 2 (#363). What is left here is the public-link half (`create_public_link`, `revoke_public_link`, `list_dashboard_access`, the `move_chart` elevation). | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
-| `AI-12` | Feature | The assistant fixes and explains SQL inside the editor; variables. Was blocked by `QS-5` part 1 (released 2026-11-14). Accepted by the product owner on 2026-11-13 on staging (`80fb2f68`). | AI Copilot | P2 | Released | #127, #128 | `AGENTS.md` (assistant parity) |
+| `AI-12` | Feature | The assistant fixes and explains SQL inside the editor; variables. Accepted by the product owner on 2026-11-13 on staging (`80fb2f68`). | AI Copilot | P2 | Released | #127, #128 | `AGENTS.md` (assistant parity) |
 | `AI-13` | Feature | The assistant answers "where does this number come from" from the chart's lineage (`get_lineage` exists today). **Blocked by `BI-14`** | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
 | `AI-14` | Feature | Ongoing, with every BI item. What the dashboard page sends to the assistant grows with the features: filters, tabs, metrics, formats. Filters and the time grain are sent since #188; since #360 the page fits its context into the server's 6,000-character cut, dropping the raw filters and then the last tiles first; since #378 the parameter line has its own 600-character budget. Needs an acceptance checklist before it can be accepted. | AI Copilot | P2 | Building | #188, #222, #360, #378 | `AGENTS.md` (assistant parity) |
 | `BI-26` | Feature | Better embedding, without overdoing it: a single-chart embed that really shows only that chart, light/dark theme and our logo optional, filters passed through the link or token, sizing that fits the host page. Token hardening is `SEC-12`. No embedding SDK and no editing inside embeds. **Blocked by `BI-18` (locking a dashboard filter in an embed)** | Dashboards | P2 | In Acceptance | [#235](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/235), #363 (slice 2) | `reference/competitive-comparison.md` (BI matrix) |
@@ -494,9 +494,7 @@ parity), built after it.
 | `BLD-1` | Building | — | `REL-6` |
 | `DATA-4` | Planned | — | `DATA-3` |
 | `DEC-8` | Decided | — | `AI-11` |
-| `QS-5` | Released | — | — (was `AI-12` variables part, released 2026-11-14) |
 | `AI-11` | Planned | `DEC-8` | — |
-| `AI-12` | Released | Was `QS-5` part 1 (released 2026-11-14) | — |
 | `AI-13` | Planned | `BI-14` | — |
 | `AI-2` | Released | `BI-18` | — |
 | `AI-5` | Released | `BI-16` (per chart type as it lands) | — |

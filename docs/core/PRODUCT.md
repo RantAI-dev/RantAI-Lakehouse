@@ -264,8 +264,10 @@ in `docs/KNOWN-LIMITATIONS.md` (moved from the README, 2026-11-05).
   at large sizes are not measured, `DATA-33`, `DATA-34`), no row cap, and
   guessed, editable column types.
 - Dashboards filter by year only; there are no calculated fields.
-- Query Studio shows up to 64,000 rows or 10 MB of row data, whichever comes first, and the banner says which limit cut the result. The administrator's row limit ranges from 100 to 100,000. A chart built on a saved query is
-  limited to 2,000 rows and 30 seconds.
+- Query Studio shows up to 64,000 rows by default, or 10 MB of row data,
+  whichever comes first, and the banner says which limit cut the result. The
+  administrator's row limit ranges from 100 to 100,000. A chart built on a
+  saved query is limited to 2,000 rows and 30 seconds.
 - PDF export and scheduled reports are built but in acceptance, and off on a
   fresh install until `CONSOLE_INTERNAL_URL` is set (`REL-18`). A PDF has no
   image or web cards (`BI-42`) and may miss an uploaded map (`BI-36`).
