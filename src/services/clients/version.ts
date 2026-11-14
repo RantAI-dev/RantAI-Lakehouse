@@ -1,6 +1,6 @@
 import type { ServerHealth, VersionService } from "../contracts/version"
 import { apiFetch } from "../http"
-import { ServiceError } from "../errors"
+import { ServiceError, deniedFor } from "../errors"
 
 /**
  * The server's health answer, over the console's own origin.
@@ -14,12 +14,18 @@ import { ServiceError } from "../errors"
  *
  * A failure here is not worth an error state in the UI: the console
  * simply does not know the server's version, and the version banner stays
- * hidden (the caller decides what to do with a missing answer).
+ * hidden (the caller decides what to do with a missing answer). A 401 or
+ * 403 (only a proxy sends one; `/health` is public) goes through
+ * `deniedFor` like every other client (WEB-12 D5); the banner still
+ * ignores it.
  */
 async function getServerHealth(signal?: AbortSignal): Promise<ServerHealth> {
   const res = await apiFetch("/api/health", { signal })
   const json = await res.json()
   if (!res.ok) {
+    // WEB-12 (D5): a refusal goes through deniedFor, like every other client.
+    const denied = deniedFor(res.status, json)
+    if (denied) throw denied
     throw new ServiceError("unavailable", json?.error ?? "Failed to read the server's health")
   }
   return json as ServerHealth

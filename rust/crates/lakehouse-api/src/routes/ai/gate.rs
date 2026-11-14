@@ -241,11 +241,39 @@ fn embed_write_high_reason(name: &str, args: &Map<String, Value>) -> String {
     )
 }
 
-/// Fixed Indonesian risk statement stored on every `WriteHigh` approval —
-/// there is exactly one `WriteHigh` tool today (`delete_chart`); a future
-/// one gets this same generic statement unless refined.
+/// The generic Indonesian risk statement stored on a `WriteHigh` approval: it
+/// tells the reader the action cannot be undone once executed.
+///
+/// Today it is the sentence [`risk_for_write_high`] gives every `WriteHigh`
+/// tool except `delete_chart` — a deleted chart goes to the trash and can be
+/// restored, so it gets [`WRITE_HIGH_RISK_TRASHED_CHART`] instead;
+/// [`risk_for_write_high`] picks between the two sentences (`AI-1`).
 const WRITE_HIGH_RISK: &str =
     "Tindakan berisiko tinggi (WriteHigh): tidak dapat dibatalkan setelah dijalankan.";
+
+/// The risk statement for `delete_chart`: the chart is not gone, it is in the
+/// trash and can be restored, so the generic sentence would contradict the
+/// reason on the very same approval card (`AI-1`).
+///
+/// The `30` is the trash's retention, `lakehouse_bi::trash::RETENTION_DAYS`
+/// (30 days). It is a literal because [`risk_for_write_high`] returns a
+/// `&'static str` and a `u32` cannot be interpolated into one; the approval
+/// stores the sentence as it stands (`NewApprovalRequest.risk` is a `&str`).
+/// The constant is named here so the two are changed together.
+const WRITE_HIGH_RISK_TRASHED_CHART: &str = "Tindakan berisiko tinggi (WriteHigh): chart masuk tempat sampah dan bisa dipulihkan selama 30 hari.";
+
+/// The risk sentence stored on a `WriteHigh` approval, chosen per tool.
+///
+/// One sentence for every tool hid the mismatch: `delete_chart` goes to the
+/// trash and stays restorable, so the generic "tidak dapat dibatalkan"
+/// sentence contradicted the reason line on the same card (`AI-1`). Every
+/// other `WriteHigh` tool keeps [`WRITE_HIGH_RISK`] word for word.
+fn risk_for_write_high(spec: &ToolSpec) -> &'static str {
+    match spec.name {
+        "delete_chart" => WRITE_HIGH_RISK_TRASHED_CHART,
+        _ => WRITE_HIGH_RISK,
+    }
+}
 
 /// T0.5: the real approvals-inbox flow for a [`Risk::WriteHigh`] call that
 /// [`decide`] has already flagged with [`write_high_pending_marker`] (mode
@@ -294,7 +322,7 @@ pub async fn create_write_high_approval(
         actor,
         resource: resource_id,
         reason: &reason,
-        risk: WRITE_HIGH_RISK,
+        risk: risk_for_write_high(spec),
         redacted_args,
         requested_by,
     };
@@ -1270,6 +1298,43 @@ mod tests {
         assert!(is_write_high_pending(&pending));
         assert!(pending.get("refused").is_none());
         assert!(pending.get("needs_confirmation").is_none());
+    }
+
+    /// The card a person reads before approving a chart deletion must not
+    /// contradict its own reason sentence: a deleted chart goes to the trash
+    /// and can be restored, so the risk line says so instead of claiming the
+    /// action cannot be undone (`AI-1`).
+    ///
+    /// **Planned**: giving `delete_chart` the generic [`WRITE_HIGH_RISK`]
+    /// sentence makes this test fail.
+    #[test]
+    fn a_deleted_chart_says_it_can_be_restored_for_thirty_days() {
+        let risk = risk_for_write_high(spec("delete_chart"));
+        assert_eq!(
+            risk,
+            "Tindakan berisiko tinggi (WriteHigh): chart masuk tempat sampah dan bisa dipulihkan selama 30 hari."
+        );
+        assert!(
+            !risk.contains("tidak dapat dibatalkan"),
+            "the card must not say the action cannot be undone: {risk}"
+        );
+        assert!(risk.contains("30 hari"), "{risk}");
+    }
+
+    /// Every other `WriteHigh` tool keeps today's sentence, word for word
+    /// (`AI-1`).
+    ///
+    /// **Planned**: giving `delete_board` the trash sentence makes this test
+    /// fail.
+    #[test]
+    fn the_other_write_high_tools_keep_the_generic_risk_sentence() {
+        for name in ["delete_board", "delete_metric"] {
+            assert_eq!(
+                risk_for_write_high(spec(name)),
+                "Tindakan berisiko tinggi (WriteHigh): tidak dapat dibatalkan setelah dijalankan.",
+                "{name}"
+            );
+        }
     }
 
     /// A non-write tool is never refused for ask-mode reasons, in either

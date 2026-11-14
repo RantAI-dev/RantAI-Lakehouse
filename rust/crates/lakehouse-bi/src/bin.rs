@@ -846,7 +846,7 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT __cy AS lat, __cx AS lon, round(sum(visitors)) AS visitors, count() AS cell_points, max(__cs) AS cell_size FROM (SELECT round(floor(lat / 1) * 1 + 1 / 2, 10) AS __cy, round(floor(lon / 1) * 1 + 1 / 2, 10) AS __cx, visitors, 1 AS __cs FROM serving.t) GROUP BY __cy, __cx ORDER BY visitors DESC, __cy, __cx LIMIT 5000"
+            "SELECT __cy AS lat, __cx AS lon, round(sum(visitors), 6) AS visitors, count() AS cell_points, max(__cs) AS cell_size FROM (SELECT round(floor(lat / 1) * 1 + 1 / 2, 10) AS __cy, round(floor(lon / 1) * 1 + 1 / 2, 10) AS __cx, visitors, 1 AS __cs FROM serving.t) GROUP BY __cy, __cx ORDER BY visitors DESC, __cy, __cx LIMIT 5000"
         );
     }
 

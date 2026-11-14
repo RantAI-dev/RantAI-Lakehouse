@@ -1220,7 +1220,7 @@ mod tests {
                 || sql.contains("sumIf(v, (g IN ('it''s')))"),
             "{sql}"
         );
-        assert!(sql.contains("round(sum(v)) AS v"), "{sql}");
+        assert!(sql.contains("round(sum(v), 6) AS v"), "{sql}");
         assert!(sql.contains("GROUP BY g"), "{sql}");
     }
 

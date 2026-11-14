@@ -821,4 +821,220 @@ One wording note for the reviewer: D4's `mx - mn < n` is the plan's own form of
 non-integer value sits at one end, which `wh = 1` excludes), so the statement
 is the plan's literal text and the comment at the site says why.
 
+### S2 handoff
+
+Slice S2 (T5 only) on `fix/dashboards-p4-s2`, base `51e7df40` (`origin/main`
+at the start: #514 and #504 merged). The brief named this branch; T5 of the
+plan names `fix/dashboards-p4-sums`, so the brief's name was used (MISMATCH
+1). Every commit was pushed to `origin/fix/dashboards-p4-s2`; no pull
+request was opened.
+
+#### Commits
+
+| Commit | What |
+| --- | --- |
+| `97debf83` | T5 `fix(sums)`: `Aggregate::rounded` renders `round(sum(x), 6)`, the doc comments that quoted the old text, 46 pinned statements (47 occurrences), the `chart_numbers` engine test, the two documents |
+| this commit | `docs(plan): handoff for dashboards-p4 S2` |
+
+#### The new test and the failure it showed before the fix
+
+`rust/crates/lakehouse-api/tests/chart_numbers.rs`,
+`a_sum_of_decimals_keeps_them_and_a_sum_of_whole_numbers_is_unchanged_on_the_engine`.
+Seeds `default.bi57_sums (kab String, n UInt32, f Float64, d Decimal(18, 2))`
+with the plan's four rows, builds the bar through `spec_from_inline_sql`, then
+runs it.
+
+Pre-fix run on the base code (test added, engine not yet changed):
+
+```
+$ cargo test -p lakehouse-api --test chart_numbers a_sum_of_decimals_keeps_them
+test a_sum_of_decimals_keeps_them_and_a_sum_of_whole_numbers_is_unchanged_on_the_engine ... FAILED
+thread '...' panicked at crates/lakehouse-api/tests/chart_numbers.rs:287:9:
+the saved statement rounds the sum of n to six decimals: SELECT kab, round(sum(n)) AS n,
+round(sum(f)) AS f, round(sum(d)) AS d FROM ( SELECT kab, n, f, d FROM default.bi57_sums
+) AS src GROUP BY kab ORDER BY n DESC LIMIT 20 SETTINGS ...
+test result: FAILED. 0 passed; 1 failed; 7 filtered out
+```
+
+After the fix the engine answers the plan's numbers: row `a` `n` 3.0,
+`f` 3.75, `d` 3.75; row `b` `n` 7.0, `f` 0.3, `d` 0.3. No expected value was
+changed. Part 1's test in the same file (its sum of `v` is 5.0) passes
+unchanged.
+
+#### Pinned statements changed (46 lines, 47 occurrences)
+
+The rule changed, so the pinned text changed (rule 2). The count is the plan's
+44 plus T3's new `sum` line in `lakehouse-alerts` and #504's test in
+`store.rs`; `types_b.rs:1023` carries two occurrences on one line. (The T5
+commit body says "45 assertions": that number is wrong, it counted the plan's
+44 and one of the two extras; the accurate count is this one.) Every change is
+the exact fragment `round(sum(X))` → `round(sum(X), 6)`; the alias and the rest
+of each pin are byte for byte as they were, except where noted (the two
+`store.rs` pins rustfmt re-wrapped, MISMATCH 4, and `types_b.rs:1023`, which
+holds two occurrences on one line).
+
+`lakehouse-bi/src/specs.rs` (1)
+
+1. `every_aggregate_but_a_count_keeps_six_decimals` (renamed from
+   `a_sum_is_a_whole_number_and_…`, as T5 asks): old `round(sum(v))` → new
+   `round(sum(v), 6)`. Its comment above was corrected too (it said a sum and
+   a count stay whole).
+
+`lakehouse-bi/src/bin.rs` (1)
+
+2. `a_grid_statement_groups_by_cell_and_keeps_the_cap`: old
+   `round(sum(visitors)) AS visitors` → new `round(sum(visitors), 6) AS visitors`
+   (inside the pinned grid statement; nothing else on the line moved).
+
+`lakehouse-bi/src/builder.rs` (24 lines, plus one comment)
+
+3. `kpi_kind_routes_to_kpi_builder` `:3386` — old `round(sum(jumlah)) AS v` → new `round(sum(jumlah), 6) AS v`
+4. `a_kpi_over_a_sql_source_is_capped_too` `:3588` — old `round(sum(n)) AS v` → new `round(sum(n), 6) AS v`
+5. `a_point_map_selects_coordinates_label_and_value_largest_first` `:3689` — old `round(sum(visitors)) AS visitors` → new `round(sum(visitors), 6) AS visitors`
+6. `a_stored_point_map_is_rebuilt_with_the_year_filter_and_its_coordinates` `:3719` — old `round(sum(visitors)) AS visitors` → new `round(sum(visitors), 6) AS visitors`
+7. `a_filter_on_an_aliased_measure_is_applied_inside_the_relation` `:4182` — old `round(sum(visitors)) AS visitors` → new `round(sum(visitors), 6) AS visitors`
+8. `a_filter_on_another_column_keeps_the_plain_where` `:4203` — old `round(sum(visitors)) AS visitors` → new `round(sum(visitors), 6) AS visitors`
+9. `a_grained_chart_buckets_the_dimension_in_an_inner_relation_and_keeps_the_latest` `:4391` — old `round(sum(v)) AS v` → new `round(sum(v), 6) AS v`
+10. `a_dashboard_filter_on_the_grained_column_reads_the_raw_column` `:4443` — old `round(sum(v)) AS v` → new `round(sum(v), 6) AS v`
+11. `a_breakdown_beside_a_time_grain_keeps_every_bucket_and_the_top_breakdown_values` `:4475` — old `round(sum(v)) AS v` → new `round(sum(v), 6) AS v`
+12. `a_heatmap_a_sankey_and_a_sunburst_keep_their_statements_…` `:4676` — old `round(sum(visitors)) AS visitors` → new `round(sum(visitors), 6) AS visitors`
+13. `a_value_order_is_the_editors_choice_and_keeps_the_top_buckets_not_the_latest` `:4726` — old `round(sum(v)) AS v` → new `round(sum(v), 6) AS v`
+14. `charts_saved_before_bi_6_build_the_statement_they_always_did` `:5153` — old `round(sum(visitors)) AS visitors` → new `round(sum(visitors), 6) AS visitors`
+15. the same test `:5170` — old `round(sum(visitors)) AS visitors` → new `round(sum(visitors), 6) AS visitors`
+16. `two_aggregations_of_one_column_are_two_result_columns` `:5206` — old `round(sum(visitors)) AS visitors` → new `round(sum(visitors), 6) AS visitors`
+17. `a_measure_beside_another_aggregation_of_its_column_is_renamed_outside_the_aggregate` `:5223` — old `round(sum(visitors)) AS __m0` → new `round(sum(visitors), 6) AS __m0`; its comment `:5213` reads `round(sum(visitors), 6) AS visitors` (T5 step 2)
+18. `a_chart_filter_and_a_dashboard_filter_on_one_column_both_apply` `:5244` — old `round(sum(visitors)) AS visitors` → new `round(sum(visitors), 6) AS visitors`
+19. `a_grained_chart_sorted_by_its_dimension_descending_keeps_the_latest_buckets_newest_first` `:5356` — old `round(sum(visitors)) AS visitors` → new `round(sum(visitors), 6) AS visitors`
+20. `a_breakdown_sorted_by_a_measure_keeps_and_shows_the_dimensions_in_that_order` `:5372` — old `round(sum(visitors)) AS __m0` → new `round(sum(visitors), 6) AS __m0`
+21. `other_is_aggregated_over_the_rows_outside_the_kept_groups_and_flagged` `:5394` — old `round(sum(visitors)) AS __m0` → new `round(sum(visitors), 6) AS __m0`
+22. `a_table_grouped_by_several_columns_lists_them_in_order_with_a_grain_on_a_date` `:5448` — old `round(sum(visitors)) AS visitors` → new `round(sum(visitors), 6) AS visitors`
+23. the same test `:5462` — old `round(sum(visitors)) AS visitors` → new `round(sum(visitors), 6) AS visitors`
+24. `steps_are_nested_statements_and_the_sort_and_limit_belong_to_the_last_one` `:5478` — old `round(sum(visitors)) AS visitors` → new `round(sum(visitors), 6) AS visitors`
+25. the same test `:5489` — old `round(sum(visitors)) AS visitors` (inside the `round(max(visitors), 6)` statement) → new `round(sum(visitors), 6) AS visitors`; the `round(max(visitors), 6)` fragment did not move
+26. `a_binned_dimension_reads_the_range_and_the_filters_under_the_bin` `:5510` — old `round(sum(visitors)) AS visitors` → new `round(sum(visitors), 6) AS visitors`
+
+`lakehouse-bi/src/fields.rs` (3)
+
+27. `a_row_level_field_is_a_column_of_the_relation_the_chart_aggregates` `:1315` — old `round(sum(profit)) AS profit` → new `round(sum(profit), 6) AS profit`
+28. `a_field_can_be_the_dimension_and_a_breakdown` `:1344` — old `round(sum(v)) AS v` → new `round(sum(v), 6) AS v`
+29. `period_comparisons_join_the_grouped_result_to_itself_on_the_calendar_shift` `:1766` — old `round(sum(visitors)) AS __m0` → new `round(sum(visitors), 6) AS __m0`
+
+`lakehouse-bi/src/metrics.rs` (1)
+
+30. `a_metric_with_a_filter_sits_beside_an_unfiltered_measure_in_one_statement` `:1223` — old `round(sum(v)) AS v` → new `round(sum(v), 6) AS v`
+
+`lakehouse-bi/src/tables.rs` (1)
+
+31. `a_previous_period_statement_keeps_the_latest_twelve_periods_with_data_in_the_report_zone` `:1294` — old `round(sum(v)) AS v` → new `round(sum(v), 6) AS v`
+
+`lakehouse-bi/src/types_b.rs` (6 lines, 7 occurrences)
+
+32. `a_progress_bar_reads_its_value_and_a_goal_that_is_a_value_in_one_row` `:933` — old `round(sum(visitors)) AS v` → new `round(sum(visitors), 6) AS v`
+33. the same test `:948` — old `round(sum(visitors)) AS __m0` → new `round(sum(visitors), 6) AS __m0`
+34. the same test `:949` — old `round(sum(target)) AS __m1` → new `round(sum(target), 6) AS __m1`
+35. `a_progress_value_named_like_a_result_column_is_not_read_as_its_own_alias` `:975` — old `round(sum(visitors)) AS v` → new `round(sum(visitors), 6) AS v`
+36. `a_bullet_is_one_row_without_a_category_and_one_row_per_category_with_one` `:1011` — old `round(sum(visitors)) AS visitors` → new `round(sum(visitors), 6) AS visitors`
+37. the same test `:1023` (two on the line) — old `round(sum(visitors)) AS visitors, round(sum(target)) AS target` → new `round(sum(visitors), 6) AS visitors, round(sum(target), 6) AS target`
+
+`lakehouse-bi/src/store.rs` (5, plus #504's test)
+
+38. `a_chart_naming_a_calculated_field_is_saved_over_the_relation_that_carries_it` `:7296` — old `round(sum(double)) AS double` → new `round(sum(double), 6) AS double`
+39. `a_kpi_with_a_previous_period_is_stored_as_its_trend_and_a_goal_as_the_plain_number` `:7906` — old `round(sum(visitors)) AS v` → new `round(sum(visitors), 6) AS v`
+40. `a_measure_with_its_own_aggregate_is_saved_named_by_aggregate_and_column` `:7973` — old `round(sum(visitors)) AS visitors` → new `round(sum(visitors), 6) AS visitors`
+41. `a_radar_with_two_measures_is_saved_with_both_columns` `:8004` (#504's test) — old `round(sum(visitors)) AS visitors` → new `round(sum(visitors), 6) AS visitors`
+42. `a_chart_without_a_breakdown_is_saved_with_the_statement_it_always_had` `:8069` — old `round(sum(visitors)) AS visitors` (in the exact statement) → new `round(sum(visitors), 6) AS visitors`
+43. `a_progress_bar_is_saved_as_a_single_row_and_keeps_its_goal` `:9106` — old `round(sum(visitors)) AS v` → new `round(sum(visitors), 6) AS v`
+
+`lakehouse-api/src/routes/ai/tools/dashboards.rs` (1)
+
+44. `the_request_for_a_progress_bar_against_a_goal_of_a_million_creates_one` `:1737` — old `round(sum(visitors)) AS v` → new `round(sum(visitors), 6) AS v`
+
+`lakehouse-alerts/src/lib.rs` (2)
+
+45. `a_table_rule_rounds_an_average_a_minimum_and_a_maximum_to_six_decimals_as_a_chart_does` `:3623` (T3's `sum` line) — old `round(sum(amount)) AS v` → new `round(sum(amount), 6) AS v`
+46. `an_owned_rules_statement_reaches_the_gate_with_its_owner` `:3651` (T3's model test) — old `round(sum(amount)) AS v` → new `round(sum(amount), 6) AS v`
+
+Doc comments that quoted the old text (T5 step 2, not pins):
+
+- `lakehouse-bi/src/builder.rs:980`, `:1147` (two occurrences) and the
+  comment at `:5213`; `builder/staged.rs:94`; `builder/ranked.rs:30`;
+  `lakehouse-api/src/routes/alerts.rs:2249`.
+
+After the change, `grep -rn "round(sum(" rust/crates src ops` shows only the
+six-decimal form and: `store.rs:6110`, `store.rs:6382`,
+`routes/dashboard.rs:6858`, `routes/layers_rewrite.rs:335`/`:346`,
+`tests/dashboard_tenant_scope.rs:214`, `specs/builtin-default.json` (five
+lines), `src/lib/dashboard-specs.ts` (five lines) — the plan's not-changed
+list — plus `tests/table_access.rs:600` (MISMATCH 2) and
+`ops/ai_eval/ai_eval.py:1433` (a Python `round(sum(...) / n, 3)`, not a chart
+statement; outside `rust/crates`). The built-in specs are untouched, so
+`specs_match_typescript` and `tool_schemas.json` are untouched (D2a).
+
+#### Commands run, with counts
+
+From `rust/` with
+`CARGO_TARGET_DIR=/home/rismana/rantai/cargo-target-4 CARGO_BUILD_JOBS=6`,
+per commit (T5 touches all three Rust crates and one integration test file):
+
+- `cargo fmt --check` — first run failed on two `store.rs` assertions (the
+  longer pin no longer fits one line, MISMATCH 4); `cargo fmt` was run, it
+  re-wrapped only those two, and `cargo fmt --check` afterwards is clean.
+- `cargo clippy -p lakehouse-bi --all-targets -- -D warnings` — clean.
+- `cargo clippy -p lakehouse-api --all-targets -- -D warnings` — clean.
+- `cargo clippy -p lakehouse-alerts --all-targets -- -D warnings` — clean.
+- `cargo test -p lakehouse-bi --lib` → `ok. 647 passed; 0 failed; 4 ignored`.
+- `cargo test -p lakehouse-alerts --lib` → `ok. 132 passed; 0 failed; 1 ignored`.
+- `cargo test -p lakehouse-api --test chart_numbers` → `ok. 8 passed; 0 failed`
+  (part 1's seven and the new one).
+- `cargo test -p lakehouse-api --test sec11_guard` → `ok. 4 passed; 0 failed`
+  (the commit touches `routes/alerts.rs`, a comment only).
+- `cargo test -p lakehouse-api --test route_auth` → `ok. 96 passed; 0 failed`.
+- `cargo test -p lakehouse-api --lib ai::tools::dashboards` → `ok. 79 passed; 0 failed; 3580 filtered out`.
+- Before the handoff, once, on `97debf83`: `cargo test -p lakehouse-api --lib`
+  → `ok. 3641 passed; 0 failed; 18 ignored; finished in 574.99s`.
+
+From the root:
+
+- `bun install --frozen-lockfile` — 779 installs, 753 packages, no changes.
+- `bun run typecheck` — clean.
+- `bun run lint` — exit 0, `11 problems (0 errors, 11 warnings)`, the same
+  files as S1 recorded; none of them is touched by this slice.
+- `bun run test` → `4365 pass, 1 skip, 0 fail; 13433 expect() calls; Ran 4366
+  tests across 397 files`. `specs_match_typescript` is in this run and passes.
+- `python3 ops/lint/check_bare_iceberg_count.py` (`R11 guard: no bare count() …`),
+  `python3 ops/lint/check_intra_package_imports.py` (`OK: all intra-package
+  dispar_orchestrate imports resolve`), `python3 ops/lint/check_rust_embedded_paths.py`
+  (`22 path(s) compiled into Rust from outside rust/, 0 without the rust scope`),
+  `python3 ops/lint/check_gate_groups.py` (`gate groups are consistent`) — all pass.
+- `git status` — clean, nothing generated staged.
+
+#### Not verified, and why
+
+- **Nothing in a browser.** No console behaviour changes in S2 (no console
+  file is touched); the owner sees the decimals on staging after the merge.
+- **No compose or migration is touched**, so no `docker compose` run.
+- The `chart_numbers` container is the harness's own; nothing was left
+  running and no container was started by hand.
+
+#### MISMATCH
+
+1. **Branch name.** The brief names `fix/dashboards-p4-s2`, T5 of the plan
+   names `fix/dashboards-p4-sums`. The brief's name was used, as it is the
+   instruction for this slice.
+2. **`tests/table_access.rs:600`** holds a stored row's hand-written
+   `"sql": "SELECT kota, round(sum(n)) AS n FROM serving.{LAYER_BASE} …"`.
+   It is in neither the plan's 44 nor its not-changed list, but it is a
+   stored row like `store.rs:6110`/`:6382` (not built by
+   `Aggregate::rounded`), so it was left unchanged; the plan's final `grep`
+   therefore also shows this line.
+3. **Line numbers drifted** (the plan says to re-find by text): `store.rs`'s
+   two pins are at `:8069` and `:9106`, not the plan's `:8027`/`:9064`, and
+   #504's new test sits at `:8004`; `builder.rs`'s pins are 8 to 20 lines
+   past the plan's anchors; `lakehouse-alerts/src/lib.rs`'s model test is at
+   `:3651`, not `:3621`. Every anchor was re-found by its quoted text.
+4. **rustfmt re-wrapped two `store.rs` pins** (`spec.spec.sql.contains(…)` →
+   `spec.spec` / `.sql` / `.contains(…)`) because the longer pin no longer
+   fits one line. The pinned text itself is the exact change; the wrapping is
+   the only other difference in those two assertions.
+
 ## 6. Review

@@ -17,7 +17,7 @@ import type {
   SsoTestResult,
   SsoTestStartResult,
 } from "../contracts/settings"
-import { ServiceError } from "../errors"
+import { ServiceError, deniedFor } from "../errors"
 import { apiFetch } from "../http"
 
 /**
@@ -39,12 +39,10 @@ async function call<T = ReportingSettings>(
   })
   const json = await res.json().catch(() => null)
   if (!res.ok) {
-    const kind =
-      res.status === 401 || res.status === 403
-        ? "permission_denied"
-        : res.status >= 500
-          ? "unavailable"
-          : "invalid_request"
+    // WEB-12: a refusal goes through deniedFor (errors.ts).
+    const denied = deniedFor(res.status, json)
+    if (denied) throw denied
+    const kind = res.status >= 500 ? "unavailable" : "invalid_request"
     throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`, res.status)
   }
   return json as T

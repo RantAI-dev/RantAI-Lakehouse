@@ -70,3 +70,14 @@ describe("identityService: a role's table access (GOV-7 D7)", () => {
     })
   })
 })
+
+describe("identity refusals (LH-BLD-2-03, WEB-12)", () => {
+  it("a refused user list rejects with permission_denied, the status and the sentence", async () => {
+    stubFetch(() => json({ error: "permission_denied: identity:read" }, 403))
+    await expect(service.listUsers()).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the identity:read permission.",
+    })
+  })
+})
