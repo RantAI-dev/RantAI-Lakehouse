@@ -10,7 +10,7 @@ const item = (over: Partial<GridItem> = {}): GridItem => ({
   title: "Visitors per year",
   body: <div>chart</div>,
   badge: <span>Manual</span>,
-  menuNotes: ["Data from 12:47 · auto-refresh off", "Reads mart_wisman · made by hand"],
+  menuNote: { label: "12:47 · mart_wisman", detail: "Data from 12:47, remembered. Reads mart_wisman." },
   dataFrom: "Data from 12:47",
   menu: [
     { label: "Edit chart", icon: null, onSelect: () => {} },
@@ -40,11 +40,17 @@ describe("TileCard, the dashboard page's soft look (BI-61 T4)", () => {
     expect(line.className).toContain("group-hover/tile:opacity-100")
   })
 
-  it("puts the data time, the refresh mode and the source at the top of its ⋯, and the downloads in a submenu", async () => {
+  // BI-61 review round 1, SHOULD-FIX 3: one short line that never wraps, the full sentence as its tooltip.
+  it("puts one short line with the data time and the source at the top of its ⋯, and the downloads in a submenu", async () => {
     render(<TileCard item={item()} editable={false} look="soft" />)
     fireEvent.click(screen.getByRole("button", { name: "Actions for Visitors per year" }))
-    const notes = await screen.findByText("Data from 12:47 · auto-refresh off")
-    expect(notes.closest("[data-slot='tile-menu-notes']")?.textContent).toContain("Reads mart_wisman · made by hand")
+    const note = await screen.findByText("12:47 · mart_wisman")
+    expect(note.getAttribute("data-slot")).toBe("tile-menu-notes")
+    expect(note.tagName).toBe("P")
+    expect(note.className).toContain("truncate")
+    expect(note.getAttribute("title")).toBe("Data from 12:47, remembered. Reads mart_wisman.")
+    expect(document.querySelectorAll("[data-slot='tile-menu-notes']")).toHaveLength(1)
+    expect(screen.queryByText(/auto-refresh|made by hand/)).toBeNull()
     fireEvent.click(screen.getByText("Download"))
     expect(await screen.findByText("Download data…")).toBeTruthy()
     expect(screen.getByText("Download PNG")).toBeTruthy()

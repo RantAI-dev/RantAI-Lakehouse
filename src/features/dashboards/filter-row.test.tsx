@@ -40,6 +40,19 @@ describe("FilterRow (BI-18 part C review fix R5, BI-61 T3)", () => {
     expect(line().className).toContain("flex-wrap")
   })
 
+  // BI-61 review round 1, SHOULD-FIX 5: with no tabs beside them, the chips start at the left.
+  it("starts the chips at the left when asked (a dashboard with no tabs), and at the right by default", () => {
+    atWidth(900)
+    render(<FilterRow align="start"><span>controls</span></FilterRow>)
+    expect(line().dataset.align).toBe("start")
+    expect(line().className).toContain("justify-start")
+    expect(line().className).not.toContain("justify-end")
+    cleanup()
+    render(<FilterRow><span>controls</span></FilterRow>)
+    expect(line().dataset.align).toBe("end")
+    expect(line().className).toContain("justify-end")
+  })
+
   it("draws no box around the chips", () => {
     atWidth(900)
     render(<FilterRow><span>controls</span></FilterRow>)

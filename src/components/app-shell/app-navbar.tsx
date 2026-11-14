@@ -2,9 +2,8 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { Search, Bell, LogOut, KeyRound, CircleUserRound, Sparkles, Sun, Moon, Monitor } from "lucide-react"
+import { Search, Bell, Sparkles } from "lucide-react"
 import { usePathname, useRouter } from "next/navigation"
-import { useTheme } from "next-themes"
 import { SidebarTrigger } from "@/components/ui/sidebar"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -12,14 +11,8 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
-  DropdownMenuSub,
-  DropdownMenuSubTrigger,
-  DropdownMenuSubContent,
-  DropdownMenuRadioGroup,
-  DropdownMenuRadioItem,
 } from "@/components/ui/dropdown-menu"
 import { cn } from "@/lib/utils"
 import { formatRelativeTime } from "@/lib/format"
@@ -31,18 +24,18 @@ import { useService } from "@/hooks/use-service"
 import { notificationsService } from "@/services"
 import { TenantSwitcher } from "./tenant-switcher"
 import { useCopilot } from "@/features/copilot/use-copilot"
-import { CONSOLE_VERSION } from "@/features/version/console-version"
 
 /**
  * Sticky top navbar rendered on every page.
  * Left: sidebar toggle + current page title (derived from nav config) + search.
- * Right: theme toggle + notifications entry point.
+ * Right: the Copilot, notifications. The account menu is the sidebar's footer
+ * card (BI-61 review round 1, SHOULD-FIX 7).
  */
 export function AppNavbar() {
   const pathname = usePathname()
   const pageTitle = pageTitleFor(pathname)
   const router = useRouter()
-  const { user, logout, activeTenantId, setActiveTenant, hasPermission } = useAuth()
+  const { user, activeTenantId, setActiveTenant, hasPermission } = useAuth()
   const copilot = useCopilot()
   const hasAssistant = hasPermission("assistant:use") || hasPermission("assistant:ask")
   const isCopilotPage = pathname?.startsWith("/copilot")
@@ -81,8 +74,11 @@ export function AppNavbar() {
         "sticky top-0 z-20 flex h-16 shrink-0 items-center gap-4 border-b border-border bg-background/90 px-4 backdrop-blur-md sm:px-5"
       )}
     >
-      <div className="flex min-h-0 min-w-0 flex-1 items-center justify-between gap-3">
-        <div className="flex min-w-0 flex-1 items-center gap-3">
+      {/* BI-61 review round 1, SHOULD-FIX 8 (owner decision 2026-11-14): three columns, so the
+          search sits in the middle of the navbar's own width (the content right of the sidebar),
+          whether the sidebar is expanded or collapsed and the side panel open or not. */}
+      <div className="grid min-h-0 min-w-0 flex-1 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-3">
+        <div className="flex min-w-0 items-center gap-3">
           <SidebarTrigger
             variant="outline"
             size="icon"
@@ -101,27 +97,28 @@ export function AppNavbar() {
               {pageTitle}
             </p>
           </div>
-          <div className="relative ml-auto hidden w-full max-w-90 md:block">
-            <Search
-              className="pointer-events-none absolute left-3 top-1/2 size-4 shrink-0 -translate-y-1/2 text-muted-foreground"
-              aria-hidden
-            />
-            <Input
-              type="search"
-              readOnly
-              onClick={() => openCommandPalette()}
-              onFocus={() => openCommandPalette()}
-              placeholder="Search pages, tables, columns… (⌘K)"
-              className="h-9 w-full cursor-pointer rounded-lg border-border bg-muted/40 py-2 pl-9 pr-14 text-sm leading-5 shadow-none placeholder:text-muted-foreground focus-visible:bg-background"
-              aria-label="Open command palette"
-            />
-            <kbd className="pointer-events-none absolute right-2 top-1/2 hidden h-5 -translate-y-1/2 items-center rounded border border-border bg-background px-1.5 font-mono text-[10px] text-muted-foreground lg:flex">
-              ⌘ K
-            </kbd>
-          </div>
+        </div>
+        {/* About 400 px, narrower on a small laptop; hidden on a phone as before. */}
+        <div className="relative hidden w-72 md:block lg:w-[25rem]">
+          <Search
+            className="pointer-events-none absolute left-3 top-1/2 size-4 shrink-0 -translate-y-1/2 text-muted-foreground"
+            aria-hidden
+          />
+          <Input
+            type="search"
+            readOnly
+            onClick={() => openCommandPalette()}
+            onFocus={() => openCommandPalette()}
+            placeholder="Search pages, tables, columns"
+            className="h-9 w-full cursor-pointer rounded-lg border-border bg-muted/40 py-2 pl-9 pr-14 text-sm leading-5 shadow-none placeholder:text-muted-foreground focus-visible:bg-background"
+            aria-label="Open command palette"
+          />
+          <kbd className="pointer-events-none absolute right-2 top-1/2 hidden h-5 -translate-y-1/2 items-center rounded border border-border bg-background px-1.5 font-mono text-[10px] text-muted-foreground lg:flex">
+            ⌘ K
+          </kbd>
         </div>
 
-        <div className="flex shrink-0 items-center gap-1">
+        <div className="flex min-w-0 items-center justify-end gap-1">
           <TenantSwitcher
             tenants={user?.tenants ?? []}
             activeTenantId={activeTenantId}
@@ -228,121 +225,8 @@ export function AppNavbar() {
               }
             />
           )}
-          <UserMenu userName={user?.name} userEmail={user?.email} onLogout={logout} />
         </div>
       </div>
     </header>
-  )
-}
-
-/** Sun until mounted, so the server render and the first client render agree. */
-function ThemeIcon({
-  mounted,
-  theme,
-  resolvedTheme,
-}: Readonly<{
-  mounted: boolean
-  theme: string | undefined
-  resolvedTheme: string | undefined
-}>) {
-  if (mounted && theme === "system") return <Monitor className="size-4" />
-  if (mounted && resolvedTheme === "dark") return <Moon className="size-4" />
-  return <Sun className="size-4" />
-}
-
-/**
- * Who's signed in, with a logout affordance and theme selection. Renders once `AuthProvider` has resolved a user (see `AppFrame`).
- *
- * Exported for its own test: the account menu's version line (REL-2
- * S1-T5) is the one thing here that says which build the console is, and
- * rendering the whole navbar around it would need the auth, copilot and
- * sidebar providers the menu does not use.
- */
-export function UserMenu({
-  userName,
-  userEmail,
-  onLogout,
-}: Readonly<{
-  userName: string | undefined
-  userEmail: string | null | undefined
-  onLogout: () => void | Promise<void>
-}>) {
-  const { theme, setTheme, resolvedTheme } = useTheme()
-  const [mounted, setMounted] = React.useState(false)
-
-  React.useEffect(() => {
-    setMounted(true)
-  }, [])
-
-  React.useEffect(() => {
-    if (!mounted) return
-    const meta = document.querySelector('meta[name="theme-color"]')
-    if (meta) {
-      meta.setAttribute(
-        "content",
-        resolvedTheme === "dark" ? "#050A30" : "#ffffff"
-      )
-    }
-  }, [mounted, resolvedTheme])
-
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger
-        render={
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-9 rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
-            aria-label="Account menu"
-          />
-        }
-      >
-        <CircleUserRound className="size-5" />
-      </DropdownMenuTrigger>
-      <DropdownMenuContent>
-        <DropdownMenuLabel>
-          <p className="truncate text-sm font-medium text-foreground">{userName ?? "Signed in"}</p>
-          {userEmail ? <p className="truncate text-xs font-normal text-muted-foreground">{userEmail}</p> : null}
-        </DropdownMenuLabel>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem render={<Link href="/account/change-password" />}>
-          <KeyRound />
-          Change password
-        </DropdownMenuItem>
-        <DropdownMenuSub>
-          <DropdownMenuSubTrigger>
-            <ThemeIcon mounted={mounted} theme={theme} resolvedTheme={resolvedTheme} />
-            <span>Theme</span>
-          </DropdownMenuSubTrigger>
-          <DropdownMenuSubContent>
-            <DropdownMenuRadioGroup value={mounted ? theme : undefined} onValueChange={(val) => setTheme(val)}>
-              <DropdownMenuRadioItem value="light">
-                <Sun className="size-4" />
-                <span>Light</span>
-              </DropdownMenuRadioItem>
-              <DropdownMenuRadioItem value="dark">
-                <Moon className="size-4" />
-                <span>Dark</span>
-              </DropdownMenuRadioItem>
-              <DropdownMenuRadioItem value="system">
-                <Monitor className="size-4" />
-                <span>System</span>
-              </DropdownMenuRadioItem>
-            </DropdownMenuRadioGroup>
-          </DropdownMenuSubContent>
-        </DropdownMenuSub>
-        <DropdownMenuSeparator />
-        {/* REL-2 S1-T5: the console's own version, so a person can say
-            which build they are looking at. Disabled — it is a fact, not
-            an action. */}
-        <DropdownMenuItem disabled>
-          Version {CONSOLE_VERSION}
-        </DropdownMenuItem>
-        <DropdownMenuItem variant="destructive" onClick={() => void onLogout()}>
-          <LogOut />
-          Sign out
-        </DropdownMenuItem>
-      </DropdownMenuContent>
-    </DropdownMenu>
   )
 }

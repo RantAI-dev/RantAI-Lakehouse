@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { usePathname } from "next/navigation";
-import { Sparkles, Plus, PanelBottom, PanelRightClose, X } from "lucide-react";
+import { Bot, Sparkles, Plus, PanelBottom, PanelRightClose, X } from "lucide-react";
 import { useSidePanel } from "@/components/app-shell/side-panel";
 import { SuggestionButton } from "@/features/copilot/suggestion-button";
 import { useCopilot } from "./use-copilot";
@@ -265,7 +265,8 @@ function PanelTabs({
       <div role="tablist" aria-label="Side panel" className="flex min-w-0 items-center gap-0.5 overflow-x-auto [scrollbar-width:none]">
         {withCopilot ? (
           <button type="button" role="tab" aria-selected={active === null} onClick={onCopilot} className={tab(active === null)}>
-            <Sparkles className="size-3.5 text-primary" aria-hidden /> AI Copilot
+            {/* BI-61 review round 1, SHOULD-FIX 2: no sparkles icon on what this branch adds (DESIGN.md, AI slop). */}
+            <Bot className="size-3.5 text-muted-foreground" aria-hidden /> AI Copilot
           </button>
         ) : null}
         {tabs.map((t) => (

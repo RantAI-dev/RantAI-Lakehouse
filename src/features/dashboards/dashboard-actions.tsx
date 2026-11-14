@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import {
-  Check, Clock, Copy, Download, FileDown, History, LayoutTemplate, Mail, Printer, Maximize2, Minimize2, MoreHorizontal, Palette, Pencil, Plus, RefreshCw, Save, Timer, Trash2,
+  Check, Clock, Copy, Download, FileDown, History, LayoutTemplate, Mail, Printer, Maximize2, Minimize2, Palette, Pencil, Plus, RefreshCw, Save, Settings, Timer, Trash2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -87,9 +87,20 @@ export function DashboardActionsMenu({
   return (
     <div className="relative">
       <DropdownMenu>
-        <DropdownMenuTrigger render={<Button variant="ghost" size="icon-lg" aria-label="More actions" className="text-muted-foreground hover:text-foreground aria-expanded:text-foreground" />}>
-          <MoreHorizontal className="size-4" />
-        </DropdownMenuTrigger>
+        {/* BI-61 review round 1, SHOULD-FIX 10 (owner): the menu is the dashboard's settings, a gear
+            between Edit and Share; 32 px like the console's other page headers (SHOULD-FIX 9). */}
+        <Tooltip>
+          <DropdownMenuTrigger
+            render={
+              <TooltipTrigger
+                render={<Button variant="ghost" size="icon" aria-label="Dashboard settings" className="text-muted-foreground hover:text-foreground aria-expanded:text-foreground" />}
+              />
+            }
+          >
+            <Settings className="size-4" aria-hidden />
+          </DropdownMenuTrigger>
+          <TooltipContent>Dashboard settings</TooltipContent>
+        </Tooltip>
         <DropdownMenuContent align="end" className="w-60">
           <DropdownMenuGroup>
             <DropdownMenuGroupLabel>View</DropdownMenuGroupLabel>
@@ -105,8 +116,10 @@ export function DashboardActionsMenu({
             {/* The seven intervals in one submenu; the trigger says the one in force. */}
             <DropdownMenuSub>
               <DropdownMenuSubTrigger>
-                <Timer /> Auto-refresh
-                <span className="ml-auto text-xs text-muted-foreground">{autoLabel === "Manual" ? "Off" : autoLabel.replace("Every ", "")}</span>
+                {/* BI-61 review round 1, SHOULD-FIX 6: the label grows, so the value sits right beside
+                    the chevron (the base trigger's own `ml-auto` chevron would otherwise split the space). */}
+                <Timer /> <span className="flex-1">Auto-refresh</span>
+                <span data-slot="menu-value" className="text-xs text-muted-foreground">{autoLabel === "Manual" ? "Off" : autoLabel.replace("Every ", "")}</span>
               </DropdownMenuSubTrigger>
               <DropdownMenuSubContent className="w-52">
                 {REFRESH_OPTIONS.map((opt) => {
@@ -310,7 +323,7 @@ export function RenameDashboardDialog({
  * "Add chart", the primary button of edit mode and of the empty dashboard
  * (`BI-61` T5); left out without `dashboard:write` (R18).
  */
-export function NewChartButton({ canWrite, onClick, size = "lg" }: { readonly canWrite: boolean; readonly onClick: () => void; readonly size?: "sm" | "lg" }) {
+export function NewChartButton({ canWrite, onClick, size = "default" }: { readonly canWrite: boolean; readonly onClick: () => void; readonly size?: "sm" | "default" }) {
   if (!canWrite) return null;
   return (
     <Button size={size} onClick={onClick}>

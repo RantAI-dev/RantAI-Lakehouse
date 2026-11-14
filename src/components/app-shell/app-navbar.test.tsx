@@ -20,7 +20,8 @@ import { AuthProvider } from "@/features/auth/auth-provider"
 import { CopilotProvider } from "@/features/copilot/use-copilot"
 import { SidebarProvider } from "@/components/ui/sidebar"
 import { notificationsService } from "@/services"
-import { AppNavbar, UserMenu } from "./app-navbar"
+import { AppNavbar } from "./app-navbar"
+import { UserMenu } from "./user-menu"
 import { CONSOLE_VERSION } from "@/features/version/console-version"
 
 afterEach(() => {

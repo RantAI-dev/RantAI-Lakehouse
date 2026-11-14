@@ -10,9 +10,10 @@
  * API.
  */
 import * as React from "react";
-import { ChevronRight, Clock, Code2, Globe, History, Mail, RefreshCw, UserPlus, Users, type LucideIcon } from "lucide-react";
+import { ChevronRight, Clock, Code2, Globe, History, Mail, PencilLine, RefreshCw, UserPlus, Users, type LucideIcon } from "lucide-react";
 
 import { useService } from "@/hooks/use-service";
+import { formatDateTime, formatRelativeTime } from "@/lib/format";
 import { ruleLabel, type CacheRule } from "@/lib/result-cache";
 import { cn } from "@/lib/utils";
 import { dashboardService, reportService, type Board } from "@/services";
@@ -20,17 +21,19 @@ import { EASE, FOCUS } from "./dashboard-header";
 import { describeSchedule } from "./report-words";
 
 /** One fact: an icon, its name and its value; a button when it opens the dialog that changes it. */
-function Row({ icon: Icon, label, value, onClick }: {
+function Row({ icon: Icon, label, value, onClick, title }: {
   readonly icon: LucideIcon;
   readonly label: string;
   readonly value: React.ReactNode;
   readonly onClick?: () => void;
+  /** The value in full, as its tooltip (a date behind "5h ago"). */
+  readonly title?: string;
 }) {
   const inner = (
     <>
       <Icon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
       <span className="min-w-0 flex-1 truncate text-sm">{label}</span>
-      <span className="min-w-0 max-w-[55%] truncate text-right text-sm text-muted-foreground tabular-nums">{value}</span>
+      <span title={title} className="min-w-0 max-w-[55%] truncate text-right text-sm text-muted-foreground tabular-nums">{value}</span>
       {onClick ? <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" aria-hidden /> : null}
     </>
   );
@@ -137,6 +140,12 @@ export function DetailsPanel({
       ) : null}
 
       <Section title="Version history" action={<SectionLink onClick={onHistory}>All versions…</SectionLink>}>
+        {/* BI-61 review round 1, SHOULD-FIX 11 (owner): the last edit lives here, not beside "Data from"
+            in the header; who made it is the newest version's author, when the history has one. */}
+        {listed?.updatedAt ? (
+          <Row icon={PencilLine} label="Edited" title={formatDateTime(listed.updatedAt)}
+            value={`${formatRelativeTime(listed.updatedAt)}${versions.status === "success" && versions.data.versions[0]?.author ? ` by ${versions.data.versions[0].author}` : ""}`} />
+        ) : null}
         {versions.status === "loading" ? <Quiet>Loading…</Quiet> : null}
         {versions.status === "error" ? <Quiet>{versions.error.message}</Quiet> : null}
         {versions.status === "success" && versions.data.versions.length === 0 ? <Quiet>No versions yet. The next change is the first.</Quiet> : null}

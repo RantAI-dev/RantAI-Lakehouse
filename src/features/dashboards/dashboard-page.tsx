@@ -4,7 +4,7 @@ import * as React from "react";
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { ArrowRightLeft, Bell, Check, ChartColumn, Download, GitFork, ImageDown, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, RefreshCw, Smartphone, SlidersHorizontal, Sparkles, Table2, Trash2, Rows3 } from "lucide-react";
+import { ArrowRightLeft, Bell, Check, ChartColumn, Download, GitFork, ImageDown, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, Pointer, RefreshCw, Smartphone, SlidersHorizontal, Bot, Table2, Trash2, Rows3 } from "lucide-react";
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@rantai/design-system/ui/empty";
 import { Button } from "@/components/ui/button";
@@ -21,14 +21,13 @@ import { PART_NO_CLICK_REASON, isGrain, isTruncation, switchChoices, type Column
 import { REFRESH_OPTIONS, effectiveRefresh, canSaveRefresh as refreshIsSaveable, listedInterval } from "@/lib/dashboard-refresh";
 import { enterFullscreen, leaveFullscreen, readFullscreenDark, writeFullscreenDark } from "@/lib/dashboard-fullscreen";
 import { notifyFailure, notifyInfo, notifySuccess } from "@/lib/notify";
-import { formatRelativeTime } from "@/lib/format";
 import { dataFromLabel } from "@/lib/result-cache";
 import { readableErrorMessage } from "@/lib/notify-message";
 import { buildDashboardPageContext, summarizeFilters, summarizeFilterJson, summarizeGrain, summarizeParams, summarizeTabs, summarizeTiles } from "@/lib/page-context-summary";
 import { FILTER_PARAM, decodeFilters, dropInertFilters, enforceRequired, filtersEqual, filtersToParam, normalizeFilters, toggleValue } from "@/lib/dashboard-filter-state";
 import { extractViewFiltersFromChat } from "@/lib/dashboard-view-filter-from-chat";
 import { canDrill, drillTarget, offersTileRecords, type ChartClickHandler, type ClickSpec } from "@/lib/chart-click";
-import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
+import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import {
   TAB_PARAM, addTab, bottomOfTab, defaultTileHeight, deleteTab, filtersOnTab, isSingleValueChart, isStaticKind, moveTab, moveTileToTab, placeCopyBelow, placeUnboxed, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, type TabEdit,
 } from "@/lib/dashboard-tabs";
@@ -37,6 +36,7 @@ import type { ChartClick, FilterDef, FilterField } from "@/services/clients/bi-s
 import { useAuth } from "@/features/auth/auth-provider";
 import { useCopilot } from "@/features/copilot/use-copilot";
 import { useService } from "@/hooks/use-service";
+import { useScrollFade } from "@/hooks/use-scroll-fade";
 import { dashboardService, queryService } from "@/services";
 import { newRunId, RUN_ID_HEADER } from "@/lib/run-id";
 import { STOPPED_SENTENCE } from "@/lib/query-limits";
@@ -141,16 +141,6 @@ type Payload = {
   charts: ChartCard[]; results: Record<string, Cell>; storeError?: string | null;
 };
 
-/**
- * Who made a tile, said in its ⋯ (`BI-61` T4). It was the "AI" / "Manual"
- * badge on every tile face, which read as a refresh mode; the words say what
- * it is.
- */
-const SOURCE_NOTE: Record<ChartSource, string | null> = {
-  builtin: null,
-  ai: "made with AI",
-  ui: "made by hand",
-};
 const NO_CHARTS: ChartCard[] = [];
 const NO_KPIS: KpiMeta[] = [];
 const NO_RESULTS: Record<string, Cell> = {};
@@ -186,15 +176,17 @@ const NO_PANEL_TABS: readonly SidePanelTab[] = [];
 type Frame = "bar" | "padded" | "plain";
 function frameClass(frame: Frame): string {
   const giveBack = "mb-[calc(var(--content-bottom,0px)-6rem)] lg:mb-[calc(var(--content-bottom,0px)-7rem)]";
-  const scroll = "overflow-y-auto lg:overflow-hidden print:h-auto print:overflow-visible print:m-0";
+  // Below lg the frame itself scrolls, header included, so its cut edges fade too (review round 1, SHOULD-FIX 1).
+  const scroll = "scroll-fade overflow-y-auto lg:overflow-hidden print:h-auto print:overflow-visible print:m-0";
   if (frame === "bar") {
     return cn(scroll, giveBack, "h-[calc(100dvh-5rem-var(--content-bottom,5rem))] sm:h-[calc(100dvh-5.25rem-var(--content-bottom,5rem))] lg:h-[calc(100dvh-5.5rem-var(--content-bottom,5rem))]");
   }
   const own = "h-[calc(100dvh-5rem-var(--content-bottom,1rem))] sm:h-[calc(100dvh-5.25rem-var(--content-bottom,1.25rem))] lg:h-[calc(100dvh-5.5rem-var(--content-bottom,1.5rem))]";
   return cn(scroll, own, frame === "padded" && giveBack);
 }
-/** The part of the frame that scrolls on a laptop; its bottom edge fades instead of cutting a tile in half. */
-const SCROLL_REGION = "lg:min-h-0 lg:flex-1 lg:overflow-y-auto lg:pb-5 lg:[mask-image:linear-gradient(to_bottom,black_calc(100%-20px),transparent)] print:overflow-visible print:[mask-image:none]";
+/** The part of the frame that scrolls on a laptop; an edge that cuts a tile fades instead (review round 1, SHOULD-FIX 1). */
+// BI-61 review round 1, SHOULD-FIX 1: both edges fade, each only while it hides something (`scroll-fade`, `useScrollFade`).
+const SCROLL_REGION = "scroll-fade lg:min-h-0 lg:flex-1 lg:overflow-y-auto lg:pb-5 print:overflow-visible";
 const SECTION_TEXT_MAX = 120;
 
 /** "open the Sales dashboard", for the hover cue of a chart with a saved click. */
@@ -1039,6 +1031,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // floats at the bottom; the shell's padding while the Copilot sits in the side
   // panel or a page tab has the panel; none of it without the assistant.
   const hasAssistant = hasPermission("assistant:use") || hasPermission("assistant:ask");
+  const frameFade = useScrollFade<HTMLDivElement>();
+  const scrollFade = useScrollFade<HTMLDivElement>();
   const frame: Frame = !hasAssistant ? "plain" : dockPosition === "bottom" && sidePanel.active === null ? "bar" : "padded";
   // AI-2 (plan 20): a `set_board_view_filters` step in the most recent
   // assistant answer applies when its `board` matches the board on screen —
@@ -1296,13 +1290,23 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       ...moveItems(spec.id).map((m, i) => (i === 0 && otherWrites.length === 0 ? m : { ...m, separatorBefore: false })),
       ...write.remove,
     ];
-    // BI-61 T4: what the tile face used to carry, now in its ⋯: when the data is
-    // from, the refresh mode, what it reads and who made it (the old badge).
+    // BI-61 review round 1, SHOULD-FIX 3: one short line at the top of the tile ⋯,
+    // "12:47 · mart_wisman", that never wraps; the full sentence ("Data from 12:47,
+    // remembered. Reads mart_wisman.") is its tooltip and accessible name. The
+    // dashboard's auto-refresh is the header's, not a tile's, and who made the
+    // chart is the mark beside an AI-made tile's title.
     const tileFrom = hasRows(cell) ? dataFromLabel(cell.computedAt, data?.reporting?.timeZone, cell.remembered) : null;
-    const menuNotes = [
-      [tileFrom, autoSec > 0 ? `refreshes ${(REFRESH_OPTIONS.find((o) => o.seconds === autoSec)?.label ?? "").toLowerCase()}` : "auto-refresh off"].filter(Boolean).join(" · "),
-      [spec.sqlSource ? "Reads a SQL source" : spec.mart ? `Reads ${spec.mart}` : null, SOURCE_NOTE[spec.source]].filter(Boolean).join(" · "),
-    ].filter((line) => line.length > 0);
+    const tileClock = tileFrom?.replace(/^Data from /, "").replace(/ · remembered$/, "");
+    const reads = spec.sqlSource ? "SQL source" : spec.mart || null;
+    const menuNote = tileClock || reads
+      ? {
+          label: [tileClock, reads].filter(Boolean).join(" · "),
+          detail: [
+            tileClock ? `Data from ${tileClock}${hasRows(cell) && cell.remembered ? ", remembered" : ""}.` : null,
+            reads ? `Reads ${spec.sqlSource ? "a SQL source" : reads}.` : null,
+          ].filter(Boolean).join(" "),
+        }
+      : undefined;
     return {
       id: spec.id,
       span: spec.span,
@@ -1322,10 +1326,22 @@ export function DashboardPage({ boardId }: { boardId: string }) {
                 limit={typeof spec.def?.limit === "number" ? spec.def.limit : undefined}
                 notApplied={notApplied ?? undefined}
               /> : null}
+          {/* BI-61 review round 1, SHOULD-FIX 2: a chart made with the assistant says so with a quiet,
+              muted mark (no sparkles, DESIGN.md); one made by hand, the default, says nothing. */}
+          {spec.source === "ai" ? (
+            <Tooltip>
+              <TooltipTrigger render={<span className="inline-flex shrink-0 text-muted-foreground/70" />}>
+                <Bot className="size-3.5" aria-label="Made with the assistant" />
+              </TooltipTrigger>
+              <TooltipContent>Made with the assistant</TooltipContent>
+            </Tooltip>
+          ) : null}
           {drillable ? (
         <Tooltip>
           <TooltipTrigger render={<span className="inline-flex shrink-0 text-muted-foreground/70" />}>
-            <MousePointerClick className="size-3.5" aria-label="Clickable chart" />
+            {/* BI-61 review round 1, SHOULD-FIX 2: a pointing hand. The pointer with rays read as the
+                sparkles DESIGN.md lists as AI slop, and as an "AI-made" mark it never was. */}
+            <Pointer className="size-3.5" aria-label="Clickable chart" />
           </TooltipTrigger>
           <TooltipContent>
             {spec.source === "builtin"
@@ -1338,8 +1354,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
           ) : null}
         </>
       ),
-      // BI-61 T3: no badge on the tile face; its facts are in `menuNotes`.
-      menuNotes,
+      // BI-61 T3: no badge on the tile face; its facts are in `menuNote`.
+      menuNote,
       dataFrom: tileFrom?.replace(/ · remembered$/, ""),
       menu,
       body: drilled ? (
@@ -1387,6 +1403,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   return (
     <ReportingProvider reporting={data?.reporting}>
     <div
+      ref={frameFade}
       data-slot="dashboard-frame"
       data-frame={fullscreen ? "fullscreen" : frame}
       className={cn(
@@ -1416,7 +1433,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         }
         facts={{
           owner: listed?.createdBy || undefined,
-          updated: listed?.updatedAt ? formatRelativeTime(listed.updatedAt) : undefined,
+          // BI-61 review round 1, SHOULD-FIX 11 (owner): one time in the header, the data's; when the
+          // dashboard was last edited is in Details ("Edited 5h ago").
           dataFrom: pageDataFrom,
           comments: isDefault ? undefined : commentCount,
         }}
@@ -1429,8 +1447,9 @@ export function DashboardPage({ boardId }: { boardId: string }) {
             {/* BI-18 part C review fix (SHOULD-FIX) R2: the hint's colour is its own; the buttons beside it keep theirs. */}
             <span className="min-w-0 flex-1 basis-[calc(100%-2rem)] text-primary sm:basis-0 dark:text-sky-200">
               {phoneEdit
-                ? "Phone layout: move tiles up or down and change their height. Saved automatically."
-                : "Editing the layout. Drag a tile by its header to move it, or by its corner to resize it. Changes save as you go."}
+                // BI-61 review round 1, SHOULD-FIX 4: a short line, not sentences.
+                ? "Move tiles up or down · saves automatically"
+                : "Drag tiles to move · drag a corner to resize · saves automatically"}
             </span>
             {canWrite && !isDefault && !phoneEdit ? (
               <DropdownMenu>
@@ -1456,7 +1475,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         actions={
           <>
             {fullscreen ? (
-              <Button variant="outline" size="lg" aria-pressed={fsDark} onClick={toggleFsDark}>
+              <Button variant="outline" aria-pressed={fsDark} onClick={toggleFsDark}>
                 <Moon className="size-4" /> Dark
               </Button>
             ) : null}
@@ -1464,14 +1483,13 @@ export function DashboardPage({ boardId }: { boardId: string }) {
               // BI-61 T5: edit mode's own two controls; Done is the one way back (one action, one button).
               <>
                 <NewChartButton canWrite={canWrite} onClick={() => router.push(chartNewHref(board, data?.appliedParams))} />
-                <Button variant="outline" size="lg" className="min-w-20" onClick={() => setEdit(false)}>
+                <Button variant="outline" className="min-w-20" onClick={() => setEdit(false)}>
                   <Check data-icon="inline-start" aria-hidden /> Done
                 </Button>
               </>
             ) : (
               <>
                 <EditPencil canWrite={canWrite} onEdit={() => setEdit(true)} />
-                <ShareButton isDefault={isDefault} isPrivate={Boolean(ownerId)} canManage={canManage} onShare={() => setShareOpen(true)} />
                 <DashboardActionsMenu
                   isDefault={isDefault}
                   canWrite={canWrite}
@@ -1501,6 +1519,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
                   onDuplicate={() => void duplicateDashboard()}
                   onDelete={() => void deleteDashboard()}
                 />
+                {/* BI-61 review round 1, SHOULD-FIX 10: Share, the primary, last, as New is on the Dashboards page. */}
+                <ShareButton isDefault={isDefault} isPrivate={Boolean(ownerId)} canManage={canManage} onShare={() => setShareOpen(true)} />
               </>
             )}
           </>
@@ -1512,7 +1532,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         <div className="flex min-w-0 shrink-0 flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
           <TabBar tabs={tabs} selected={selTab} onSelect={selectTab} editing={tabEditing} />
           {hasFilterRow ? (
-            <FilterRow className="sm:flex-1">
+            // BI-61 review round 1, SHOULD-FIX 5: with no tabs beside them the chips start at the left.
+            <FilterRow className="sm:flex-1" align={tabs.length > 0 || tabEditing ? "end" : "start"}>
               {grainedCharts.length > 0 ? (
                 <GrainSwitch
                   choices={grainChoices}
@@ -1553,7 +1574,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
 
       {/* BI-61 T7: on a laptop only the tiles scroll, inside the frame, so the
           header and the filter row stay and the composer never covers a tile. */}
-      <div className={cn("flex min-w-0 flex-col gap-4", !fullscreen && SCROLL_REGION)} data-slot="dashboard-scroll">
+      <div ref={scrollFade} className={cn("flex min-w-0 flex-col gap-4", !fullscreen && SCROLL_REGION)} data-slot="dashboard-scroll">
         {/* KPI row (builtin dashboard) */}
         {kpis.length ? (
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
@@ -1598,7 +1619,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
                   setCopilotExpanded(true);
                 }}
               >
-                <Sparkles className="size-4" /> Ask AI Copilot
+                {/* BI-61 review round 1, SHOULD-FIX 2: no sparkles icon (DESIGN.md, AI slop). */}
+              <Bot className="size-4" aria-hidden /> Ask AI Copilot
               </Button>
             </EmptyContent>
           </Empty>

@@ -15,7 +15,7 @@ function renderMenu(over: Partial<React.ComponentProps<typeof DashboardActionsMe
     ...over,
   }
   render(<DashboardActionsMenu {...props} />)
-  fireEvent.click(screen.getByRole("button", { name: "More actions" }))
+  fireEvent.click(screen.getByRole("button", { name: "Dashboard settings" }))
 }
 
 /** BI-61 T2: the intervals and the exports are submenus; their entries show once the submenu opens. */
@@ -42,6 +42,17 @@ describe("DashboardActionsMenu groups (BI-61 T2)", () => {
       "Rename", "Duplicate", "Theme and font…", "Version history…", "Save as template…", "Delete dashboard",
     ])
     expect(top.length).toBeLessThanOrEqual(14)
+  })
+
+  // BI-61 review round 1, SHOULD-FIX 6: the value sits beside the chevron, not in the middle.
+  it("lets the Auto-refresh label grow so its value sits at the right, beside the chevron", async () => {
+    renderMenu(all)
+    const label = await screen.findByText("Auto-refresh")
+    expect(label.className).toContain("flex-1")
+    const value = label.parentElement?.querySelector("[data-slot='menu-value']") as HTMLElement
+    expect(value.textContent).toBe("Off")
+    expect(value.className).not.toContain("ml-auto")
+    expect(value.nextElementSibling?.tagName.toLowerCase()).toBe("svg")
   })
 
   it("keeps every entry of the old flat menu reachable: the intervals and Save as default in Auto-refresh, both exports in Export", async () => {

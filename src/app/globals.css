@@ -162,6 +162,28 @@
   }
 }
 
+/* BI-61 review round 1, SHOULD-FIX 1 (DESIGN.md §3: an area that scrolls fades
+   at the edge where it is cut). `useScrollFade` sets `data-fade-top` while
+   something is scrolled out above and `data-fade-bottom` while something is
+   still below; the mask fades only those edges. The two lengths are registered
+   so the fade can ease in and out; under reduced motion it changes at once. */
+@property --fade-top { syntax: "<length>"; inherits: false; initial-value: 0px; }
+@property --fade-bottom { syntax: "<length>"; inherits: false; initial-value: 0px; }
+.scroll-fade {
+  --fade-top: 0px;
+  --fade-bottom: 0px;
+  mask-image: linear-gradient(to bottom, transparent 0, #000 var(--fade-top), #000 calc(100% - var(--fade-bottom)), transparent 100%);
+  transition: --fade-top 150ms cubic-bezier(0.2, 0, 0, 1), --fade-bottom 150ms cubic-bezier(0.2, 0, 0, 1);
+}
+.scroll-fade[data-fade-top] { --fade-top: 20px; }
+.scroll-fade[data-fade-bottom] { --fade-bottom: 20px; }
+@media (prefers-reduced-motion: reduce) {
+  .scroll-fade { transition: none; }
+}
+@media print {
+  .scroll-fade { mask-image: none; }
+}
+
 /* ── Print / Export PDF ──────────────────────────────────────────────────────
    Sembunyikan chrome konsol; ubah kanvas dashboard (tile absolut) jadi tumpukan
    vertikal yang rapi agar "Save as PDF" dari dialog print menghasilkan snapshot

@@ -65,13 +65,14 @@ function TileMenu({ item, triggerClassName }: { item: GridItem; triggerClassName
         >
           <MoreHorizontal className="size-4" />
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className={item.menuNotes?.length ? "w-64" : "w-48"}>
-          {item.menuNotes?.length ? (
+        <DropdownMenuContent align="end" className={item.menuNote ? "w-60" : "w-48"}>
+          {item.menuNote ? (
             <>
-              {/* BI-61 T4: what used to sit on the tile face (its data time, the refresh mode, the source). */}
-              <div className="grid gap-0.5 px-2 pt-1.5 pb-2" data-slot="tile-menu-notes">
-                {item.menuNotes.map((n) => <p key={n} className="text-[12px] leading-snug text-muted-foreground">{n}</p>)}
-              </div>
+              {/* BI-61 T4, review round 1 SHOULD-FIX 3: one line that never wraps; a long name ends in "…" and the tooltip says it all. */}
+              <p className="truncate px-2 pt-1.5 pb-2 text-[12px] text-muted-foreground tabular-nums" data-slot="tile-menu-notes"
+                title={item.menuNote.detail} aria-label={item.menuNote.detail}>
+                {item.menuNote.label}
+              </p>
               <DropdownMenuSeparator />
             </>
           ) : item.menuLabel ? (
