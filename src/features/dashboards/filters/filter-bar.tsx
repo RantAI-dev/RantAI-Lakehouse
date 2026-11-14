@@ -159,7 +159,7 @@ export function FilterBar({
             <Plus className="size-3.5" aria-hidden /> Filter
           </button>
         </PopoverTrigger>
-        <PopoverContent align="start" className="w-72">
+        <PopoverContent align="start" collisionPadding={16} className="w-72">
           {picked ? (
             <>
               <p className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
@@ -249,7 +249,7 @@ function FilterChip({
         <PopoverTrigger asChild>
           <ChipTrigger value={label} tone={tone} title={label} className={cn("max-w-72", onRemove && "pr-1.5")} />
         </PopoverTrigger>
-        <PopoverContent align="start" className="w-72">
+        <PopoverContent align="start" collisionPadding={16} className="w-72">
           {open ? (
             <Editor
               kind={kind}

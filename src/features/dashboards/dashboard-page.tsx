@@ -161,6 +161,40 @@ const NO_TABS: BoardTab[] = [];
 /** The dashboard's tabs of the shell's side panel (`BI-61` T6); the built-in dashboard has neither. */
 const PANEL_TABS: readonly SidePanelTab[] = [{ id: "comments", label: "Comments" }, { id: "details", label: "Details" }];
 const NO_PANEL_TABS: readonly SidePanelTab[] = [];
+
+/**
+ * BI-61 T7: the page is a frame that ends above the assistant's bar, so the
+ * bar never covers a tile (spec T5); the tiles scroll inside it from `lg` up,
+ * and below `lg` the whole frame scrolls, header included, so a phone keeps
+ * its room for the tiles. Its height is the viewport less the navbar (4rem),
+ * the shell's top padding (1, 1.25 or 1.5rem) and the room kept under it.
+ *
+ * That room is read from the app shell's `--content-bottom`, the token BI-58
+ * adds (`c4d87211`, `50295df6`: the composer's measured height plus its offset
+ * and gap while it shows, 1.5rem when it hides), the way BI-59's `PageFrame`
+ * reads it; no BI-58 code is copied. Until it lands the variable is absent
+ * and the fallbacks are today's shell:
+ * - `bar`: the composer floats at the bottom. A 5rem dock spacer follows
+ *   `main`, and the negative margin gives back `main`'s `pb-24` / `lg:pb-28`.
+ * - `padded`: the assistant is on but its bar is not (docked in the side
+ *   panel, or a page tab has the panel). No spacer; the margin still gives
+ *   back `main`'s bottom padding and the frame keeps the shell's own gap.
+ * - `plain`: no assistant, no bottom padding on `main`.
+ * With the token present the frame's height alone puts its end where the
+ * shell says, as in BI-59; the margin then only shortens `main` below it.
+ */
+type Frame = "bar" | "padded" | "plain";
+function frameClass(frame: Frame): string {
+  const giveBack = "mb-[calc(var(--content-bottom,0px)-6rem)] lg:mb-[calc(var(--content-bottom,0px)-7rem)]";
+  const scroll = "overflow-y-auto lg:overflow-hidden print:h-auto print:overflow-visible print:m-0";
+  if (frame === "bar") {
+    return cn(scroll, giveBack, "h-[calc(100dvh-5rem-var(--content-bottom,5rem))] sm:h-[calc(100dvh-5.25rem-var(--content-bottom,5rem))] lg:h-[calc(100dvh-5.5rem-var(--content-bottom,5rem))]");
+  }
+  const own = "h-[calc(100dvh-5rem-var(--content-bottom,1rem))] sm:h-[calc(100dvh-5.25rem-var(--content-bottom,1.25rem))] lg:h-[calc(100dvh-5.5rem-var(--content-bottom,1.5rem))]";
+  return cn(scroll, own, frame === "padded" && giveBack);
+}
+/** The part of the frame that scrolls on a laptop; its bottom edge fades instead of cutting a tile in half. */
+const SCROLL_REGION = "lg:min-h-0 lg:flex-1 lg:overflow-y-auto lg:pb-5 lg:[mask-image:linear-gradient(to_bottom,black_calc(100%-20px),transparent)] print:overflow-visible print:[mask-image:none]";
 const SECTION_TEXT_MAX = 120;
 
 /** "open the Sales dashboard", for the hover cue of a chart with a saved click. */
@@ -999,7 +1033,13 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const {
     messages: messagesFromCopilot,
     setPageContext, setMode: setCopilotMode, setExpanded: setCopilotExpanded,
+    dockPosition,
   } = useCopilot();
+  // BI-61 T7: the room the frame leaves under itself: the composer's while its bar
+  // floats at the bottom; the shell's padding while the Copilot sits in the side
+  // panel or a page tab has the panel; none of it without the assistant.
+  const hasAssistant = hasPermission("assistant:use") || hasPermission("assistant:ask");
+  const frame: Frame = !hasAssistant ? "plain" : dockPosition === "bottom" && sidePanel.active === null ? "bar" : "padded";
   // AI-2 (plan 20): a `set_board_view_filters` step in the most recent
   // assistant answer applies when its `board` matches the board on screen —
   // mirror what it set into the page address (`?f=`) with the same helper a
@@ -1346,7 +1386,17 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // console, and anything portalled out of this element, keeps its theme.
   return (
     <ReportingProvider reporting={data?.reporting}>
-    <div className={cn("flex flex-col gap-4", fullscreen && "fixed inset-0 z-40 overflow-auto bg-background p-4 sm:p-6", look.className || (fullscreen && fsDark && "dark"), look.className && !fullscreen && "rounded-lg p-4")} style={look.style}>
+    <div
+      data-slot="dashboard-frame"
+      data-frame={fullscreen ? "fullscreen" : frame}
+      className={cn(
+        "flex min-h-0 flex-col gap-4",
+        fullscreen ? "fixed inset-0 z-40 overflow-auto bg-background p-4 sm:p-6" : frameClass(frame),
+        look.className || (fullscreen && fsDark && "dark"),
+        look.className && !fullscreen && "rounded-lg p-4",
+      )}
+      style={look.style}
+    >
       <DashboardHeader
         folderPath={folderChain}
         title={dashName}
@@ -1377,10 +1427,10 @@ export function DashboardPage({ boardId }: { boardId: string }) {
           <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl bg-primary/8 px-3 py-2 text-sm" data-print-hide>
             <Move className="size-4 shrink-0 text-primary dark:text-sky-300" aria-hidden />
             {/* BI-18 part C review fix (SHOULD-FIX) R2: the hint's colour is its own; the buttons beside it keep theirs. */}
-            <span className="min-w-0 flex-1 text-primary dark:text-sky-200">
+            <span className="min-w-0 flex-1 basis-[calc(100%-2rem)] text-primary sm:basis-0 dark:text-sky-200">
               {phoneEdit
                 ? "Phone layout: move tiles up or down and change their height. Saved automatically."
-                : "Editing the layout. Drag a tile by its header to move it, and by its bottom-right corner to resize it. Saved automatically."}
+                : "Editing the layout. Drag a tile by its header to move it, or by its corner to resize it. Changes save as you go."}
             </span>
             {canWrite && !isDefault && !phoneEdit ? (
               <DropdownMenu>
@@ -1501,73 +1551,77 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       {error ? <div className="rounded-lg border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive">{readableErrorMessage(error)}</div> : null}
       {data?.storeError ? <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 px-4 py-2 text-xs text-amber-600 dark:text-amber-400">Could not load saved charts: {data.storeError}</div> : null}
 
-      {/* KPI row (builtin dashboard) */}
-      {kpis.length ? (
-        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-          {kpis.map((k) => {
-            const cell = data?.results[k.id];
-            const v = hasRows(cell) ? Number(cell.rows[0]?.v ?? 0) : null;
-            return (
-              <div key={k.id} className="rounded-xl border bg-card p-4 shadow-[0px_1px_2px_0px_rgba(0,0,0,0.05)]">
-                <p className="text-xs font-medium text-muted-foreground">{k.title}</p>
-                {loading && v === null ? <div className="mt-2 h-7 w-24 animate-pulse rounded bg-muted" /> : <p className="mt-1 text-2xl font-semibold tabular-nums text-foreground">{v === null ? "—" : fmtInt(v)}</p>}
-                {k.caption ? <p className="mt-1 text-[11px] text-muted-foreground">{k.caption}</p> : null}
-              </div>
-            );
-          })}
-        </div>
-      ) : null}
+      {/* BI-61 T7: on a laptop only the tiles scroll, inside the frame, so the
+          header and the filter row stay and the composer never covers a tile. */}
+      <div className={cn("flex min-w-0 flex-col gap-4", !fullscreen && SCROLL_REGION)} data-slot="dashboard-scroll">
+        {/* KPI row (builtin dashboard) */}
+        {kpis.length ? (
+          <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+            {kpis.map((k) => {
+              const cell = data?.results[k.id];
+              const v = hasRows(cell) ? Number(cell.rows[0]?.v ?? 0) : null;
+              return (
+                <div key={k.id} className="rounded-2xl bg-muted/45 p-4 dark:bg-card">
+                  <p className="text-xs font-medium text-muted-foreground">{k.title}</p>
+                  {loading && v === null ? <div className="mt-2 h-7 w-24 animate-pulse rounded bg-muted" /> : <p className="mt-1 text-2xl font-semibold tabular-nums text-foreground">{v === null ? "—" : fmtInt(v)}</p>}
+                  {k.caption ? <p className="mt-1 text-[11px] text-muted-foreground">{k.caption}</p> : null}
+                </div>
+              );
+            })}
+          </div>
+        ) : null}
 
-      {/* Canvas */}
-      {stopped ? (
-        <p role="status" className="text-sm text-muted-foreground">{STOPPED_SENTENCE}. Press Refresh to load the dashboard again.</p>
-      ) : null}
-      {loading && charts.length === 0 ? (
-        <DashboardTilesSkeleton />
-      ) : !loading && charts.length === 0 && !stopped ? (
-        <Empty className="border border-dashed">
-          <EmptyHeader>
-            <EmptyMedia variant="icon">
-              <ChartColumn />
-            </EmptyMedia>
-            <EmptyTitle>No charts yet</EmptyTitle>
-            <EmptyDescription>
-              Build one yourself, or ask AI Copilot — for example “a bar chart of foreign visitors by region”.
-            </EmptyDescription>
-          </EmptyHeader>
-          <EmptyContent className="flex-row justify-center gap-2">
-            <NewChartButton size="sm" canWrite={canWrite} onClick={() => router.push(chartNewHref(board, data?.appliedParams))} />
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => {
-                setCopilotMode("build");
-                setCopilotExpanded(true);
-              }}
-            >
-              <Sparkles className="size-4" /> Ask AI Copilot
-            </Button>
-          </EmptyContent>
-        </Empty>
-      ) : (
-        <>
-          <DashboardGrid
-            items={items} layout={shownLayout} editable={edit && !phoneEdit} onLayoutChange={persistLayout}
-            tabs={tabs} tab={selTab} phone={phone} phoneEdit={edit && phoneEdit} onPhoneChange={persistPhone}
-            foldKey={board}
-            look="soft"
-          />
-          {tabs.length > 0 && selTab && tilesOnTab(tabs, layout, chartIds, selTab).length === 0 ? (
-            // BI-18 part C review fix (SHOULD-FIX) R3: the page's own empty state.
-            <Empty className="border border-dashed">
-              <EmptyHeader>
-                <EmptyTitle>No tiles on this tab</EmptyTitle>
-                {edit ? <EmptyDescription>Use “Move to” in a tile&apos;s menu on another tab.</EmptyDescription> : null}
-              </EmptyHeader>
-            </Empty>
-          ) : null}
-        </>
-      )}
+        {/* Canvas */}
+        {stopped ? (
+          <p role="status" className="text-sm text-muted-foreground">{STOPPED_SENTENCE}. Press Refresh to load the dashboard again.</p>
+        ) : null}
+        {loading && charts.length === 0 ? (
+          <DashboardTilesSkeleton />
+        ) : !loading && charts.length === 0 && !stopped ? (
+          <Empty className="rounded-2xl bg-muted/45 dark:bg-card">
+            <EmptyHeader>
+              <EmptyMedia variant="icon">
+                <ChartColumn />
+              </EmptyMedia>
+              <EmptyTitle>No charts yet</EmptyTitle>
+              <EmptyDescription>
+                Build one yourself, or ask AI Copilot — for example “a bar chart of foreign visitors by region”.
+              </EmptyDescription>
+            </EmptyHeader>
+            <EmptyContent className="flex-row justify-center gap-2">
+              <NewChartButton size="sm" canWrite={canWrite} onClick={() => router.push(chartNewHref(board, data?.appliedParams))} />
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  setCopilotMode("build");
+                  setCopilotExpanded(true);
+                }}
+              >
+                <Sparkles className="size-4" /> Ask AI Copilot
+              </Button>
+            </EmptyContent>
+          </Empty>
+        ) : (
+          <>
+            <DashboardGrid
+              items={items} layout={shownLayout} editable={edit && !phoneEdit} onLayoutChange={persistLayout}
+              tabs={tabs} tab={selTab} phone={phone} phoneEdit={edit && phoneEdit} onPhoneChange={persistPhone}
+              foldKey={board}
+              look="soft"
+            />
+            {tabs.length > 0 && selTab && tilesOnTab(tabs, layout, chartIds, selTab).length === 0 ? (
+              // BI-18 part C review fix (SHOULD-FIX) R3: the page's own empty state.
+              <Empty className="rounded-2xl bg-muted/45 dark:bg-card">
+                <EmptyHeader>
+                  <EmptyTitle>No tiles on this tab</EmptyTitle>
+                  {edit ? <EmptyDescription>Use “Move to” in a tile&apos;s menu on another tab.</EmptyDescription> : null}
+                </EmptyHeader>
+              </Empty>
+            ) : null}
+          </>
+        )}
+      </div>
 
       {lineDialog ? (
         <LineDialog

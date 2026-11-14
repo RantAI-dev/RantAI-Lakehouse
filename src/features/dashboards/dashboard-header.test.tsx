@@ -111,3 +111,17 @@ describe("edit mode (BI-61 T5)", () => {
     expect(screen.queryByRole("button", { name: "Parameters" })).toBeNull()
   })
 })
+
+// BI-61 T7: the page is a frame that ends above the assistant's bar; without the
+// assistant there is no bar, so it keeps only the shell's own gap.
+describe("the page frame (BI-61 T7)", () => {
+  it("keeps the shell's gap, not the bar's room, for someone without the assistant, and scrolls only the tiles on a laptop", async () => {
+    mount({ permissions: ["dashboard:read"], level: "view" })
+    await screen.findByText("Quarterly Sales")
+    const frame = document.querySelector("[data-slot='dashboard-frame']") as HTMLElement
+    expect(frame.dataset.frame).toBe("plain")
+    expect(frame.className).toContain("var(--content-bottom,1.5rem)")
+    expect(frame.className).not.toContain("var(--content-bottom,5rem)")
+    expect((document.querySelector("[data-slot='dashboard-scroll']") as HTMLElement).className).toContain("lg:overflow-y-auto")
+  })
+})

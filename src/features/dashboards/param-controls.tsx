@@ -79,7 +79,7 @@ function ParamField({ control, refusal, onChange, changed }: {
             <ChipTrigger label={name} value={shownValue} tone={tone} />
           </PopoverTrigger>
         </span>
-        <PopoverContent align="start" className="w-64 gap-2 p-3">
+        <PopoverContent align="start" collisionPadding={16} className="w-64 gap-2 p-3">
           <ChipPanelLabel htmlFor={param.type === "list" ? undefined : id}>{name}</ChipPanelLabel>
           {param.type === "list" ? (
             <div role="radiogroup" aria-label={name} className="-mx-1 grid gap-0.5">

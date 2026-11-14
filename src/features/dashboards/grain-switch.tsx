@@ -34,7 +34,7 @@ export function GrainSwitch({
           <ChipTrigger label="Group by" value={value ? GRAIN_LABELS[value] : OWN_LABEL} tone={tone} aria-label="Group dates by" />
         </PopoverTrigger>
       </span>
-      <PopoverContent align="start" className="w-56 gap-2 p-3">
+      <PopoverContent align="start" collisionPadding={16} className="w-56 gap-2 p-3">
         <ChipPanelLabel>Group dates by</ChipPanelLabel>
         <div role="radiogroup" aria-label="Group dates by" className="-mx-1 grid gap-0.5">
           <ChoiceRow on={value === ""} label={OWN_LABEL} onClick={() => pick("")} />

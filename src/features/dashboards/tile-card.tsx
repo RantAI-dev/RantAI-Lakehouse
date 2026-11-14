@@ -65,12 +65,12 @@ function TileMenu({ item, triggerClassName }: { item: GridItem; triggerClassName
         >
           <MoreHorizontal className="size-4" />
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className={item.menuNotes?.length ? "w-60" : "w-48"}>
+        <DropdownMenuContent align="end" className={item.menuNotes?.length ? "w-64" : "w-48"}>
           {item.menuNotes?.length ? (
             <>
               {/* BI-61 T4: what used to sit on the tile face (its data time, the refresh mode, the source). */}
-              <div className="px-2 pt-1.5 pb-2 text-xs leading-relaxed text-muted-foreground" data-slot="tile-menu-notes">
-                {item.menuNotes.map((n) => <p key={n} className="truncate">{n}</p>)}
+              <div className="grid gap-0.5 px-2 pt-1.5 pb-2" data-slot="tile-menu-notes">
+                {item.menuNotes.map((n) => <p key={n} className="text-[12px] leading-snug text-muted-foreground">{n}</p>)}
               </div>
               <DropdownMenuSeparator />
             </>
