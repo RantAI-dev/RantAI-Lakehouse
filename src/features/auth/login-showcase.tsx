@@ -25,6 +25,7 @@ import { TileBody } from "@/features/dashboards/tile-body";
 import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import { cn } from "@/lib/utils";
+import { useOnScreen, usePageVisible } from "./use-in-view";
 
 /* ------------------------------------------------------------------ */
 /* Sample data (labelled as such on the page)                          */
@@ -85,20 +86,6 @@ const COUNT_MS = 1_300;
 /** The dim before a redraw; the root's opacity transition is 200 ms. */
 const FADE_MS = 240;
 
-function subscribeVisibility(onChange: () => void): () => void {
-  document.addEventListener("visibilitychange", onChange);
-  return () => document.removeEventListener("visibilitychange", onChange);
-}
-
-/** Whether the tab is the one in front (`document.visibilityState`). */
-function usePageVisible(): boolean {
-  return React.useSyncExternalStore(
-    subscribeVisibility,
-    () => document.visibilityState === "visible",
-    () => true,
-  );
-}
-
 /**
  * Plays the preview's loop: `run` changes to remount the charts (ECharts
  * animates a chart's first draw), `t` runs the KPI's count-up from 0 to 1,
@@ -111,16 +98,8 @@ function usePreviewLoop(ref: React.RefObject<HTMLElement | null>, reduced: boole
   const [run, setRun] = React.useState(0);
   const [t, setT] = React.useState(0);
   const [fading, setFading] = React.useState(false);
-  const [onScreen, setOnScreen] = React.useState(false);
+  const onScreen = useOnScreen(ref, 0.2);
   const pageVisible = usePageVisible();
-
-  React.useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    const io = new IntersectionObserver(([e]) => setOnScreen(e.isIntersecting), { threshold: 0.2 });
-    io.observe(el);
-    return () => io.disconnect();
-  }, [ref]);
 
   // The count-up of each run: an ease-out cubic, so it lands softly.
   React.useEffect(() => {

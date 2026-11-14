@@ -23,6 +23,7 @@ import * as authClient from "@/services/clients/auth";
 import { toServiceError } from "@/services/errors";
 import { useAuth } from "./auth-provider";
 import { ChangePasswordStep } from "./change-password-step";
+import { LoginContours } from "./login-contours";
 import { LOGIN_DISPLAY, loginDisplay } from "./login-fonts";
 import { SsoNotice } from "./sso-notice";
 import "./login.css";
@@ -319,6 +320,8 @@ export function LoginPage() {
         aria-label="A preview of the console (sample data)"
         className="relative hidden flex-[1.15] overflow-hidden rounded-3xl bg-muted/55 lg:block dark:bg-card/45"
       >
+        {/* The lake under the product: depth lines, server-rendered, behind the card. */}
+        <LoginContours />
         <div aria-hidden className="absolute top-[11%] left-[8%] h-[74%] w-[104%] min-w-[640px]">
           {showcaseReady && desktop ? <LoginShowcase /> : null}
         </div>

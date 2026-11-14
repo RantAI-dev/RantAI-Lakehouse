@@ -19,3 +19,72 @@
   60% { transform: translateX(-3px); }
   80% { transform: translateX(2px); }
 }
+
+/*
+ * The lake depth lines behind the preview (`login-contours.tsx`, WEB-15 T1).
+ * The drawings are 1600 x 1400 px at 1:1 with the card's top-left corner at
+ * (400, 320); the card sits at 8% / 11% of the panel, so the drawing is
+ * placed to put that point under the card's corner at every panel size.
+ * The lines are a mask over one solid colour, a faint lake blue from the
+ * theme; the container's own mask fades them out toward the panel's edges,
+ * so they are densest around the card (DESIGN.md: no gradient fill, no glow).
+ */
+.login-contours {
+  --login-contour-ink: color-mix(in oklch, var(--primary) 42%, transparent);
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  mask-image:
+    linear-gradient(to right, transparent, #000 6%),
+    linear-gradient(to bottom, transparent, #000 8%, #000 90%, transparent);
+  mask-composite: intersect;
+}
+
+.dark .login-contours {
+  --login-contour-ink: color-mix(in oklch, var(--chart-1) 30%, transparent);
+}
+
+.login-contour {
+  position: absolute;
+  left: calc(8% - 400px);
+  top: calc(11% - 320px);
+  width: 1600px;
+  height: 1400px;
+  background-color: var(--login-contour-ink);
+  mask: url("/login-contours-0.svg") 0 0 / 1600px 1400px no-repeat;
+}
+.login-contour[data-phase="1"] {
+  mask-image: url("/login-contours-1.svg");
+  opacity: 0;
+}
+.login-contour[data-phase="2"] {
+  mask-image: url("/login-contours-2.svg");
+  opacity: 0;
+}
+
+/*
+ * The water moving: the three drawings take turns (0, then 2, then 1, each a
+ * third of a step shallower than the last), so the rings creep outward, one
+ * slow crossfade every 12 s. Opacity only, on the compositor. Paused until
+ * the page says the panel is on screen and the tab is in front
+ * (`data-playing`), and absent with reduced motion: the first drawing stays.
+ */
+@media (prefers-reduced-motion: no-preference) {
+  .login-contour {
+    animation: login-contour-turn 36s cubic-bezier(0.45, 0, 0.55, 1) infinite paused;
+  }
+  .login-contour[data-phase="1"] {
+    animation-delay: -12s;
+  }
+  .login-contour[data-phase="2"] {
+    animation-delay: -24s;
+  }
+  .login-contours[data-playing] .login-contour {
+    animation-play-state: running;
+  }
+}
+
+@keyframes login-contour-turn {
+  0%, 100% { opacity: 1; }
+  33.333%, 66.667% { opacity: 0; }
+}
