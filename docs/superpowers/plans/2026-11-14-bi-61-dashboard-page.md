@@ -227,6 +227,19 @@ Measured: frame bottom / composer top 720/738 px at 1190x800, 820/838 at 1366x90
 - No round-1 screenshots. Port 28622 was held by another developer, then 28620 ran a Next dev server, and the owner's rule is one Next dev server at a time. The coordinator screenshots from 28605 after deploy.
 - The fade, the footer menu (collapsed and in the phone sheet), the centred search and the 32 px header were checked by tests only, not in a browser.
 
+### T9 handoff, 2026-11-15 (Sonnet developer agent)
+
+**Commit** `71b81eb7` (`fix(console): BI-61 T9, the route loading fallback draws the page's own placeholder`; not pushed).
+
+- New `src/components/app-shell/shell-main-placeholder.tsx`: `ShellMainPlaceholder({ pathname })`, the main-area switch lifted out of `AppShellSkeleton`; it draws no padding.
+- `app-shell-skeleton.tsx` uses it inside its existing `p-4 sm:p-5 lg:p-6` wrapper.
+- `src/app/loading.tsx` is a client component: `null` on `isPublicPath`, else `ShellMainPlaceholder`. No wrapper padding, because it renders inside `AuthenticatedFrame`'s `<main>`, which already pads (the same box as the skeleton's wrapper).
+- New `src/app/loading.test.tsx`: `/dashboards/b1`, `/dashboards/browse`, `/login` (empty), `/alerts` (generic).
+
+**Checks** (each under `systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0 nice -n 15`, one at a time, after `free -m` showed over 3 GB available): `bun run typecheck` clean; `bun test src/components/app-shell src/app/loading.test.tsx` 58 pass, 0 fail (10 files); `bun x eslint` on the 4 changed files clean.
+
+**Not verified:** a real browser on a slow network (no dev server run); the full test and lint runs. The skeleton's wrapper has no `pb-24` as `<main>` has when the Copilot dock shows, as before this change.
+
 ## Micro-interaction audit (emil), 2026-11-14
 
 Owner request (2026-11-14): audit the revamped pages' micro-animations with the
