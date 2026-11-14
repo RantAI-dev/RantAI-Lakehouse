@@ -92,8 +92,8 @@ export function AppShellSkeleton({ pathname }: { pathname: string }) {
       <SidebarInset className="min-w-0 bg-muted/25">
         <header className={NAVBAR_CLASS}>
           <div className={NAVBAR_GRID_CLASS}>
-            <div className="flex min-w-0 items-center gap-3">
-              <SidebarTrigger variant="outline" size="icon" className={NAVBAR_TRIGGER_CLASS} />
+            <div className="flex min-w-0 items-center gap-2">
+              <SidebarTrigger variant="ghost" size="icon" className={NAVBAR_TRIGGER_CLASS} />
               <NavbarTitle title={pageTitleFor(pathname)} />
             </div>
             <NavbarSearch />

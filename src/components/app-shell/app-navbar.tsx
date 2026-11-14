@@ -34,12 +34,12 @@ import { useCopilot } from "@/features/copilot/use-copilot"
 // As tall as `--app-navbar-h` (set on the shell root in `app-frame.tsx`; 48 px since owner
 // 2026-11-14, "navbar ini terlalu tinggi"): its 32 px controls, the console's height, with 8 px
 // above and below. The sidebar's logo row (`SidebarBrand`) reads the same variable, so their bottom
-// borders make one straight line, and so does every offset under the navbar.
+// borders make one straight line (the toggle sits 8 px from the left edge, as far from it as from the top), and so does every offset under the navbar.
 export const NAVBAR_CLASS =
-  "sticky top-0 z-20 flex h-(--app-navbar-h) shrink-0 items-center gap-4 border-b border-border bg-background/90 px-4 backdrop-blur-md sm:px-5"
+  "sticky top-0 z-20 flex h-(--app-navbar-h) shrink-0 items-center gap-4 border-b border-border bg-background/90 pr-4 pl-2 backdrop-blur-md sm:pr-5"
 export const NAVBAR_GRID_CLASS =
   "grid min-h-0 min-w-0 flex-1 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-3"
-export const NAVBAR_TRIGGER_CLASS = "size-8 shrink-0 rounded-lg border-border bg-background shadow-xs"
+export const NAVBAR_TRIGGER_CLASS = "size-8 shrink-0 rounded-lg"
 
 /** The page's title at the navbar's left, from the nav config (never from the session). */
 export function NavbarTitle({ title }: { readonly title: string }) {
@@ -168,9 +168,9 @@ export function AppNavbar() {
           search sits in the middle of the navbar's own width (the content right of the sidebar),
           whether the sidebar is expanded or collapsed and the side panel open or not. */}
       <div className={NAVBAR_GRID_CLASS}>
-        <div className="flex min-w-0 items-center gap-3">
+        <div className="flex min-w-0 items-center gap-2">
           <SidebarTrigger
-            variant="outline"
+            variant="ghost"
             size="icon"
             className={NAVBAR_TRIGGER_CLASS}
           />
