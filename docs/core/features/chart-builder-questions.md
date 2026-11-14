@@ -42,12 +42,12 @@ Part 2:
 
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
-| 1 | Up to five groupings on a table; a visual chart stays at dimension plus breakdown | Spec *(proposed)*, narrowed for visual charts | Owner to confirm at QA |
-| 2 | A chart's own filters are part of the chart: viewers see them listed on the tile but cannot remove them; dashboard filters add to them | Planner default (Metabase) | Owner to confirm at QA |
-| 3 | "Other" is computed from the underlying rows, so an average or a distinct count of "Other" is right, not a sum of the hidden bars | Planner default | Owner to confirm at QA |
-| 4 | Up to three steps in all (the summary and two more) | Planner default | Owner to confirm at QA |
-| 5 | The builder shows up to 2,000 result rows | Spec | Owner to confirm at QA |
-| 6 | A click on "Other" offers no drill-down; a click on any other value lists the rows with the chart's own filters applied | Planner default | Owner to confirm at QA |
+| 1 | Up to five groupings on a table; a visual chart stays at dimension plus breakdown | Spec *(proposed)*, narrowed for visual charts | Owner, 2026-11-13 |
+| 2 | A chart's own filters are part of the chart: viewers see them listed on the tile but cannot remove them; dashboard filters add to them | Planner default (Metabase) | Owner, 2026-11-13 |
+| 3 | "Other" is computed from the underlying rows, so an average or a distinct count of "Other" is right, not a sum of the hidden bars | Planner default | Owner, 2026-11-13 |
+| 4 | Up to three steps in all (the summary and two more) | Planner default | Owner, 2026-11-13 |
+| 5 | The builder shows up to 2,000 result rows | Spec | Owner, 2026-11-13 |
+| 6 | A click on "Other" offers no drill-down; a click on any other value lists the rows with the chart's own filters applied | Planner default | Owner, 2026-11-13 |
 | 7 | Top N of the breakdown on a bar, hbar, line or area chart: the limit keeps the N breakdown values with the largest total of the measure over the chart's filtered rows; the others are left out. A dimension with a time grain keeps every period | Owner, QA round 2026-11-12 (`BI-46`) | Accepted by the owner, 2026-11-12 (`BI-46`) |
 | 8 | A dimension without a grain keeps its own top N, counted over the rows of the kept breakdown values | Planner default (open question 1) | *(proposed, not yet signed)* |
 | 9 | A date breakdown can be grouped by day, week, month, quarter or year | Planner default (`BI-46`) | *(proposed, not yet signed)* |
