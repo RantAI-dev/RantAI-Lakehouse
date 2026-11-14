@@ -285,12 +285,14 @@ export function LoginShowcase({ compact = false }: { compact?: boolean }) {
         compact
           ? "shadow-2xl shadow-black/10 ring-foreground/6 dark:shadow-black/40"
           : "shadow-[0_28px_70px_-24px_rgb(1_3_18/0.7)] ring-white/10",
-        // Entrance once: the window settles 8 px up as it arrives (240 ms,
-        // a strong ease-out), and the same opacity dims it before each
-        // redraw, faster, in 150 ms (WEB-15 T5, emil-design-eng: exits are
-        // quicker than entrances). Nothing moves under reduced motion.
-        "transition-[opacity,translate] ease-[cubic-bezier(0.23,1,0.32,1)] starting:translate-y-2 starting:opacity-0 motion-reduce:transition-none",
-        fading ? "opacity-0 duration-150" : "opacity-100 duration-[240ms]",
+        // Entrance once: the window rises 12 px onto the lake and lands
+        // (360 ms, a strong ease-out; T9, the first look's card beat, longer
+        // than a control's 240 ms because it travels further), and the same
+        // opacity dims it before each redraw, faster, in 150 ms (T5,
+        // emil-design-eng: exits are quicker than entrances). Nothing moves
+        // under reduced motion.
+        "transition-[opacity,translate] ease-[cubic-bezier(0.23,1,0.32,1)] starting:translate-y-3 starting:opacity-0 motion-reduce:transition-none",
+        fading ? "opacity-0 duration-150" : "opacity-100 duration-[360ms]",
       )}
     >
       <RenderModeProvider value={reduced ? STILL : null}>{body}</RenderModeProvider>
