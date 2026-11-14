@@ -83,7 +83,10 @@ import type { RecordsRequest } from "./records";
 import { forgetLastBoard, rememberLastBoard } from "./last-board";
 import { offerFor } from "@/lib/access-level";
 import { ShareDialog } from "./share-dialog";
-import { CommentsDialog } from "./comments-panel";
+import { CommentsPanel } from "./comments-panel";
+import { DetailsPanel } from "./details-panel";
+import { useSidePanel, useSidePanelTabs, type SidePanelTab } from "@/components/app-shell/side-panel";
+import { createPortal } from "react-dom";
 import { TileBody } from "./tile-body";
 import { exportNotice } from "./table-export";
 import { downloadChartData, downloadChartPng, downloadDashboardFile, downloadDashboardPdf, downloadMenuKind, type DataChoice, type PdfChoice, type ReadState } from "./chart-download";
@@ -155,6 +158,9 @@ const NO_FILTERS: FilterDef[] = [];
 const NO_FIELDS: FilterField[] = [];
 const NO_CONTROLS: ParamControl[] = [];
 const NO_TABS: BoardTab[] = [];
+/** The dashboard's tabs of the shell's side panel (`BI-61` T6); the built-in dashboard has neither. */
+const PANEL_TABS: readonly SidePanelTab[] = [{ id: "comments", label: "Comments" }, { id: "details", label: "Details" }];
+const NO_PANEL_TABS: readonly SidePanelTab[] = [];
 const SECTION_TEXT_MAX = 120;
 
 /** "open the Sales dashboard", for the hover cue of a chart with a saved click. */
@@ -268,24 +274,36 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const commentCount = comments.status === "success" && comments.data ? comments.data.comments.length : null;
   const folders = React.useMemo(() => labelledFolders(foldersState.data ?? [], user?.id), [foldersState.data, user?.id]);
   const [shareOpen, setShareOpen] = React.useState(false);
-  const [commentsOpen, setCommentsOpen] = React.useState(false);
-  // BI-19 owner QA 2026-10-28, QA-3: a mention in the bell links to `?comments=1`. The dialog
-  // opens once the board is loaded (also when the reader is already on this board and only the
-  // parameter is new), and closing it removes the parameter, keeping the others.
+  // BI-61 T6: Comments and Details are tabs of the shell's one side panel, the
+  // panel the AI Copilot docks in, so the two never show side by side.
+  const sidePanel = useSidePanel();
+  useSidePanelTabs(isDefault ? NO_PANEL_TABS : PANEL_TABS);
+  const openSide = sidePanel.open;
+  const commentsOpen = sidePanel.active === "comments";
+  // BI-19 owner QA 2026-10-28, QA-3: a mention in the bell links to `?comments=1`. The comments
+  // open once the board is loaded (also when the reader is already on this board and only the
+  // parameter is new), and closing them removes the parameter, keeping the others.
   const commentsAsked = searchParams.get("comments") === "1";
   const boardLoaded = data !== null;
+  const askedOpened = React.useRef(false);
   React.useEffect(() => {
-    if (commentsAsked && boardLoaded && !isDefault) setCommentsOpen(true);
-  }, [commentsAsked, boardLoaded, isDefault]);
-  const changeCommentsOpen = React.useCallback((open: boolean) => {
-    setCommentsOpen(open);
-    if (open) return;
+    if (!commentsAsked) { askedOpened.current = false; return; }
+    if (boardLoaded && !isDefault && !askedOpened.current) {
+      askedOpened.current = true;
+      openSide("comments");
+    }
+  }, [commentsAsked, boardLoaded, isDefault, openSide]);
+  const wasCommentsOpen = React.useRef(false);
+  React.useEffect(() => {
+    const was = wasCommentsOpen.current;
+    wasCommentsOpen.current = commentsOpen;
+    if (!was || commentsOpen) return;
     const q = new URLSearchParams(searchParams.toString());
     if (!q.has("comments")) return;
     q.delete("comments");
     const qs = q.toString();
     router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
-  }, [router, pathname, searchParams]);
+  }, [commentsOpen, router, pathname, searchParams]);
   const [historyOpen, setHistoryOpen] = React.useState(false);
   // BI-18 part C, part 2: favourites, and "recent" noted once per dashboard opened.
   const shortcuts = useService((signal) => dashboardService.shortcuts(signal), []);
@@ -1383,7 +1401,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
             {phoneEdit && phone?.length ? <Button variant="ghost" size="sm" onClick={() => void resetPhone()}>Use the computed order</Button> : null}
           </div>
         ) : undefined}
-        onComments={isDefault ? undefined : () => setCommentsOpen(true)}
+        onComments={isDefault ? undefined : () => openSide("comments")}
+        onDetails={isDefault ? undefined : () => openSide("details")}
         actions={
           <>
             {fullscreen ? (
@@ -1634,7 +1653,30 @@ export function DashboardPage({ boardId }: { boardId: string }) {
           onReverted={() => { notifyDashboardsChanged(); void load(); }}
         />
       ) : null}
-      {!isDefault ? <CommentsDialog board={board} dashName={dashName} open={commentsOpen} onOpenChange={changeCommentsOpen} onChanged={comments.reload} /> : null}
+      {/* BI-61 T6: drawn by this page into the shared side panel's body, so they keep this page's state. */}
+      {!isDefault && sidePanel.host && sidePanel.active === "comments"
+        ? createPortal(<CommentsPanel board={board} onChanged={comments.reload} className="flex-1 p-4" />, sidePanel.host)
+        : null}
+      {!isDefault && sidePanel.host && sidePanel.active === "details"
+        ? createPortal(
+            <DetailsPanel
+              board={board}
+              listed={listed}
+              canManage={canManage}
+              canShare={canManage && !ownerId}
+              canWrite={canWrite}
+              canDownload={canDownload}
+              dataFrom={pageDataFrom}
+              autoRefresh={autoSec > 0 ? (REFRESH_OPTIONS.find((o) => o.seconds === autoSec)?.label ?? "On") : "Off"}
+              cacheRule={data?.cacheRule}
+              onShare={() => setShareOpen(true)}
+              onFreshness={() => { setFreshError(null); setFreshOpen(true); }}
+              onSubscriptions={() => setSubsOpen(true)}
+              onHistory={() => setHistoryOpen(true)}
+            />,
+            sidePanel.host,
+          )
+        : null}
       {!isDefault ? <ShareDialog board={board} dashName={dashName} open={shareOpen && canManage} onOpenChange={setShareOpen} /> : null}
       {themeOpen ? (
         <ThemeFontDialog open={themeOpen} onOpenChange={setThemeOpen} theme={data?.theme} font={data?.font}

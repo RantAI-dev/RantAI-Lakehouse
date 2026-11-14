@@ -11,7 +11,7 @@
  */
 import * as React from "react";
 import Link from "next/link";
-import { ChevronRight, MessageSquare, Pencil, Share2 } from "lucide-react";
+import { ChevronRight, Info, MessageSquare, Pencil, Share2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -115,8 +115,10 @@ export type HeaderFacts = {
  * right of the title on a laptop and under the facts on a phone.
  */
 export function DashboardHeader({
-  folderPath, title, titleAccessory, facts, loading, onStop, onComments, actions, notice,
+  folderPath, title, titleAccessory, facts, loading, onStop, onComments, onDetails, actions, notice,
 }: {
+  /** Opens the Details tab of the side panel (sharing, freshness, subscriptions, versions); absent on the built-in dashboard. */
+  readonly onDetails?: () => void;
   /** The folder names from the root, empty when the dashboard is in no folder. */
   readonly folderPath: readonly string[];
   readonly title: string;
@@ -155,6 +157,14 @@ export function DashboardHeader({
         className={cn("inline-flex items-center gap-1 rounded-sm underline-offset-4 hover:text-foreground hover:underline", EASE, FOCUS)}>
         <MessageSquare className="size-3.5" aria-hidden />
         {n === null ? "Comments" : `${n.toLocaleString()} comment${n === 1 ? "" : "s"}`}
+      </button>,
+    );
+  }
+  if (onDetails) {
+    parts.push(
+      <button key="details" type="button" onClick={onDetails}
+        className={cn("inline-flex items-center gap-1 rounded-sm underline-offset-4 hover:text-foreground hover:underline", EASE, FOCUS)}>
+        <Info className="size-3.5" aria-hidden /> Details
       </button>,
     );
   }

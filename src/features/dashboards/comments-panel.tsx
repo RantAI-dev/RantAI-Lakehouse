@@ -1,12 +1,9 @@
 "use client";
 
 import * as React from "react";
-import { MessageSquare } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog, DialogClose, DialogContent, DialogFooter, DialogHeader, DialogTitle,
-} from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
+import { cn } from "@/lib/utils";
 import { readableErrorMessage } from "@/lib/notify-message";
 import { notifyMentionsRead } from "@/lib/mention-events";
 import { useService } from "@/hooks/use-service";
@@ -64,8 +61,10 @@ function when(at: string): string {
  * rendered as a React child (never as HTML or Markdown), with line breaks kept.
  * The @ picker offers only people who can see the dashboard.
  */
-export function CommentsPanel({ board, onChanged }: {
+export function CommentsPanel({ board, onChanged, className }: {
   readonly board: string;
+  /** The side panel (`BI-61` T6) gives the list the room it has, with the composer kept at the bottom. */
+  readonly className?: string;
   /** Called after a comment was posted, edited or deleted, so a count elsewhere can follow (`BI-61` facts line). */
   readonly onChanged?: () => void;
 }) {
@@ -146,73 +145,70 @@ export function CommentsPanel({ board, onChanged }: {
   const truncated = list.status === "success" && list.data.truncated;
 
   return (
-    <div className="space-y-3">
+    <div className={cn("flex min-h-0 flex-col gap-3", className)} data-slot="comments-panel">
       {list.status === "loading" ? <p className="text-xs text-muted-foreground">Loading comments…</p> : null}
       {list.status === "error" ? (
         <p role="alert" className="text-xs text-destructive">{sentence(list.error)}</p>
       ) : null}
       {list.status === "success" && comments.length === 0 ? (
-        <p className="text-xs text-muted-foreground">No comments yet.</p>
+        <p className="text-sm text-muted-foreground">No comments yet. Start the conversation below.</p>
       ) : null}
       {truncated ? (
         // BI-19 E review E-6c: the list is the newest 200; say so rather than look complete.
         <p className="text-xs text-muted-foreground">Older comments are not shown.</p>
       ) : null}
-      <ul className="max-h-72 space-y-3 overflow-y-auto" aria-label="Comments">
+      <ul className="-mx-1 min-h-0 flex-1 space-y-1 overflow-y-auto px-1" aria-label="Comments">
         {comments.map((c) => (
-          <li key={c.id} className="rounded-md border border-border p-2 text-sm">
-            <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-              <span>
-                {c.author?.name ?? "Deleted user"} · {when(c.createdAt)}
-                {c.editedAt ? " (edited)" : ""}
-              </span>
-              <span className="flex gap-1">
-                {c.canEdit ? (
-                  <Button size="xs" variant="ghost" disabled={busy} onClick={() => setEditing({ id: c.id, text: c.body })}>
-                    Edit
-                  </Button>
-                ) : null}
-                {c.canDelete ? (
-                  <Button size="xs" variant="ghost" disabled={busy} onClick={() => void act(() => dashboardService.deleteComment(c.id))}>
-                    Delete
-                  </Button>
-                ) : null}
-              </span>
-            </div>
-            {editing?.id === c.id ? (
-              <div className="mt-1 space-y-1">
-                <Textarea
-                  aria-label="Edit comment"
-                  value={editing.text}
-                  onChange={(e) => setEditing({ id: c.id, text: e.target.value })}
-                  maxLength={MAX_COMMENT_CHARS}
-                />
-                <div className="flex gap-1">
-                  <Button size="xs" disabled={busy || editing.text.trim() === ""} onClick={saveEdit}>Save</Button>
-                  <Button size="xs" variant="ghost" onClick={() => setEditing(null)}>Cancel</Button>
-                </div>
+          <li key={c.id} className="group/comment flex gap-2.5 rounded-lg py-2">
+            <Initials name={c.author?.name ?? "?"} />
+            <div className="min-w-0 flex-1">
+              <div className="flex min-h-6 items-center justify-between gap-2 text-xs text-muted-foreground">
+                <span className="min-w-0 truncate">
+                  <span className="font-medium text-foreground">{c.author?.name ?? "Deleted user"}</span> · {when(c.createdAt)}
+                  {c.editedAt ? " (edited)" : ""}
+                </span>
+                <span className="flex shrink-0 gap-0.5">
+                  {c.canEdit ? (
+                    <Button size="xs" variant="ghost" className="text-muted-foreground" disabled={busy} onClick={() => setEditing({ id: c.id, text: c.body })}>
+                      Edit
+                    </Button>
+                  ) : null}
+                  {c.canDelete ? (
+                    <Button size="xs" variant="ghost" className="text-muted-foreground hover:text-destructive" disabled={busy} onClick={() => void act(() => dashboardService.deleteComment(c.id))}>
+                      Delete
+                    </Button>
+                  ) : null}
+                </span>
               </div>
-            ) : (
-              // Plain text: a React child is escaped, never parsed as HTML or Markdown.
-              <p className="mt-1 whitespace-pre-wrap break-words">{c.body}</p>
-            )}
+              {editing?.id === c.id ? (
+                <div className="mt-1 space-y-1.5">
+                  <Textarea
+                    aria-label="Edit comment"
+                    value={editing.text}
+                    onChange={(e) => setEditing({ id: c.id, text: e.target.value })}
+                    maxLength={MAX_COMMENT_CHARS}
+                  />
+                  <div className="flex justify-end gap-1">
+                    <Button size="xs" variant="ghost" onClick={() => setEditing(null)}>Cancel</Button>
+                    <Button size="xs" disabled={busy || editing.text.trim() === ""} onClick={saveEdit}>Save</Button>
+                  </div>
+                </div>
+              ) : (
+                // Plain text: a React child is escaped, never parsed as HTML or Markdown.
+                <p className="mt-0.5 text-sm leading-relaxed whitespace-pre-wrap break-words">{c.body}</p>
+              )}
+            </div>
           </li>
         ))}
       </ul>
-      <div className="space-y-1">
-        <Textarea
-          aria-label="Write a comment"
-          placeholder="Write a comment. Type @ to mention someone who can see this dashboard."
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-        />
+      <div className="shrink-0 space-y-1.5">
         {word !== null && people.length > 0 ? (
-          <ul aria-label="People you can mention" className="rounded-md border border-border bg-background p-1 text-sm">
+          <ul aria-label="People you can mention" className="rounded-lg bg-popover p-1 text-sm shadow-md ring-1 ring-foreground/10">
             {people.map((p) => (
               <li key={p.id}>
                 <button
                   type="button"
-                  className="w-full rounded px-2 py-1 text-left hover:bg-muted"
+                  className="w-full rounded-md px-2 py-1.5 text-left hover:bg-muted"
                   onClick={() => {
                     setText(insertMention(text, p));
                     setPicked((cur) => (cur.some((x) => x.id === p.id) ? cur : [...cur, p]));
@@ -229,44 +225,36 @@ export function CommentsPanel({ board, onChanged }: {
             Nobody who can see this dashboard matches “{word}”.
           </p>
         ) : null}
+        <div className="rounded-xl bg-muted/70 p-1.5 dark:bg-input/30">
+          <Textarea
+            aria-label="Write a comment"
+            placeholder="Write a comment. Type @ to mention someone."
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            className="min-h-16 resize-none border-0 bg-transparent shadow-none focus-visible:ring-0 dark:bg-transparent"
+          />
+          <div className="flex items-center justify-between gap-2 pl-2">
+            <span className={tooLong ? "text-xs text-destructive" : "text-xs text-muted-foreground tabular-nums"}>
+              {trimmed.length.toLocaleString()}/{MAX_COMMENT_CHARS.toLocaleString()}
+            </span>
+            <Button size="sm" disabled={busy || trimmed === "" || tooLong} onClick={post}>Post</Button>
+          </div>
+        </div>
         {notifyNames.length > 0 ? (
           <p className="text-xs text-muted-foreground">Will notify: {notifyNames.join(", ")}</p>
         ) : null}
-        <div className="flex items-center justify-between">
-          <span className={tooLong ? "text-xs text-destructive" : "text-xs text-muted-foreground"}>
-            {trimmed.length}/{MAX_COMMENT_CHARS}
-          </span>
-          <Button size="sm" disabled={busy || trimmed === "" || tooLong} onClick={post}>Post</Button>
-        </div>
       </div>
       {message ? <p role="alert" className="text-xs text-destructive">{message}</p> : null}
     </div>
   );
 }
 
-/** The panel in a dialog, opened from the dashboard's toolbar. */
-export function CommentsDialog({
-  board, dashName, open, onOpenChange, onChanged,
-}: {
-  readonly board: string;
-  readonly onChanged?: () => void;
-  readonly dashName: string;
-  readonly open: boolean;
-  readonly onOpenChange: (open: boolean) => void;
-}) {
+/** A person's initials in a circle, beside their comment. */
+function Initials({ name }: { readonly name: string }) {
+  const initials = name.split(/\s+/).map((w) => w[0]).filter(Boolean).slice(0, 2).join("").toUpperCase() || "?";
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
-            <MessageSquare className="size-4" /> Comments on {dashName}
-          </DialogTitle>
-        </DialogHeader>
-        {open ? <CommentsPanel board={board} onChanged={onChanged} /> : null}
-        <DialogFooter>
-          <DialogClose render={<Button variant="outline" size="sm" />}>Close</DialogClose>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+    <span aria-hidden className="mt-0.5 grid size-6 shrink-0 place-items-center rounded-full bg-primary/12 text-[10px] font-semibold text-primary dark:text-sky-200">
+      {initials}
+    </span>
   );
 }
