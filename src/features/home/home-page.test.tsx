@@ -15,6 +15,8 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import { CopilotProvider } from "@/features/copilot/use-copilot"
+import { forgetRow, rememberRow } from "@/features/dashboards/dashboards-row"
+import { readLastBoard, rememberLastBoard } from "@/features/dashboards/last-board"
 import { HomePage } from "./home-page"
 import { resetHomeBackgroundMemory } from "./use-home-background"
 
@@ -331,5 +333,16 @@ describe("Ask why on a failed pipeline (WEB-17 T6)", () => {
     expect(document.activeElement).toBe(box)
     expect(screen.getByRole("button", { name: "Ask", pressed: true })).toBeTruthy()
     expect(requested.some((p) => p.includes("/api/ai/chat"))).toBe(false)
+  })
+})
+
+// BI-61 T11: Browse clears the sidebar row's memory only, so Home's focal board, which follows the
+// last board, is not lost by a visit to Browse.
+describe("Home's focal board and Browse (BI-61 T11)", () => {
+  it("still reads the last board after Browse clears the Dashboards row", () => {
+    rememberLastBoard("b1")
+    rememberRow("dashboard", "b1", "Revenue")
+    forgetRow()
+    expect(readLastBoard()).toBe("b1")
   })
 })

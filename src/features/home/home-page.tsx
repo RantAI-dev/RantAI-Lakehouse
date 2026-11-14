@@ -61,7 +61,6 @@ import {
   BentoSkeleton,
   ContextStrip,
   GREETING,
-  GREETING_TEXT,
   HERO,
   HomeFrame,
   TOOLBAR_ROW,
@@ -439,10 +438,8 @@ export function HomePage() {
     <HomeFrame background={background}>
         <section aria-label="AI Copilot" className={HERO}>
           <h1 className={GREETING}>
-            <span data-scene-veil="" className={GREETING_TEXT}>
-              {greeting()}
-              {displayName ? `, ${displayName}` : ""}
-            </span>
+            {greeting()}
+            {displayName ? `, ${displayName}` : ""}
           </h1>
           <div className="mt-4">
             <ChatComposer
