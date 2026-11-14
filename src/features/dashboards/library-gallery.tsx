@@ -112,7 +112,9 @@ function Card({ item, actions, myName, pictures, onOpenTemplate }: {
   return (
     <li
       className={cn(
-        "group relative flex flex-col rounded-2xl bg-card p-2 shadow-[0_1px_2px_rgba(0,0,0,0.04)] ring-1 ring-foreground/5 hover:-translate-y-0.5 hover:ring-foreground/10",
+        // Micro-interaction audit 2026-11-14: the lift now eases (EASE names `translate`), and a press on
+        // the card's link settles it back a little (`:active` holds on the card while its link is pressed).
+        "group relative flex flex-col rounded-2xl bg-card p-2 shadow-[0_1px_2px_rgba(0,0,0,0.04)] ring-1 ring-foreground/5 hover:-translate-y-0.5 hover:ring-foreground/10 active:translate-y-0 active:scale-[0.99]",
         SOFT_LIFT, EASE,
       )}
     >
