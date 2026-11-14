@@ -62,7 +62,8 @@ function BrandLogo() {
   return (
     // A 32 px slot (the rail's icon column) holds the 24 px mark, centred in it.
     <div className="grid size-8 shrink-0 place-items-center" aria-hidden>
-      <span className="relative block aspect-[196/167] h-6">
+      {/* Explicit width too: a grid item centred in its slot would otherwise size to its (absolutely placed) image, i.e. 0, and the mark would not show. */}
+      <span className="relative block h-6 w-[28.17px] shrink-0">
         <Image src="/logo-light.svg" alt="RantAI Lakehouse" fill unoptimized sizes="28px" className="object-contain dark:hidden" priority />
         <Image src="/logo-dark.svg" alt="" fill unoptimized sizes="28px" className="hidden object-contain dark:block" priority />
       </span>
