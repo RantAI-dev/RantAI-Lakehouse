@@ -422,3 +422,41 @@ profile folder), stopped by PID afterwards. No dev server was started or stopped
 **Not verified:** the full suite (CI); a real iPhone Safari check; the phone drawer and the composer
 on a phone, beyond the code path (with no `--content-left` the composer is centred on the window as
 before).
+
+### Handoff, BI-58 review round 3 (Opus developer agent, 2026-11-14)
+
+**SHOULD-FIX 8, the type gallery always shows pictures.** The fix is in this entry's commit.
+- **Before any data,** every type is drawn from a fixed sample shaped for it (`src/lib/kind-sample.ts`):
+  five categories, eight months, two or three values, a split, a box plot, six weeks of days, eight
+  ranges, a four-task Gantt plan, a KPI, a gauge, a progress bar, bullets, a pivot and a note. The
+  sample is never requested and never saved. A quiet line above the grid says "Pick a source and
+  columns to see your own numbers."
+- **With data,** types that can be drawn from the preview's rows use them. The others use the sample
+  at 0.7 opacity. Types the source cannot make stay greyed out with their reason.
+- **Drawings:** the region, point and density maps, the image and the web page need a file or an
+  address to draw, so they get small inline SVG drawings in the theme's colours.
+- **Cards:**
+  - short titles with no leading icon (`KIND_SHORT`); the long labels stay for the toolbar, the
+    tooltips and the search;
+  - descriptions wrap without an ellipsis;
+  - the picture sits flush on the card's own fill, with no box inside the card;
+  - the selected card has a ring around the whole card;
+  - the gallery is three columns of about 330 px at 1366 wide.
+
+**Checks**, each run alone with `nice -n 15` under the 3G cap:
+- `bun test` on 23 files: **274 pass, 0 fail, 1,578 expect() calls**;
+- `bun run typecheck`: **0 errors**;
+- `bun run lint`: **0 errors, 11 warnings** (the existing 11);
+- the full `bun run test`: **not verified (CI)**.
+
+**Tests:**
+- With no data, all 33 cards draw something (a chart, a table, a drawing or the note), none says
+  "No data", none is dimmed, each title is its short name, and no request is made.
+- With data, a KPI card shows the sample at reduced emphasis while Donut and Line draw the
+  person's rows.
+- The earlier no-request and 200-row checks still pass.
+- `chart-builder.test.tsx` now stubs ECharts (no canvas in the test DOM) and restores it after.
+
+**Screenshots:** `docs/plans/bi-58-screens/review-gallery-1366x900-dark.png` (no data) and
+`review-gallery-data-1366x900-dark.png` (Edit chart on "jumlah by tahun"). They were taken on the
+28620 preview with one headless Chrome, stopped by PID afterwards. No server was started.

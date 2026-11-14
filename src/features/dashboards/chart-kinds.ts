@@ -136,3 +136,23 @@ const KIND_ICONS: Partial<Record<ChartKind, LucideIcon>> = {
 export function kindIcon(kind: ChartKind): LucideIcon {
   return KIND_ICONS[kind] ?? Type;
 }
+
+/**
+ * BI-58 review round 3, SHOULD-FIX 8 (owner): the gallery's card titles, short enough never to be
+ * cut off. The long labels above stay for the toolbar's names and tooltips and for the search.
+ */
+export const KIND_SHORT: Partial<Record<ChartKind, string>> = {
+  bar: "Bar", hbar: "Horizontal bar", stacked: "Stacked bar", combo: "Combo",
+  line: "Line", area: "Area", waterfall: "Waterfall", calendar: "Calendar heatmap",
+  pie: "Donut", rose: "Rose", funnel: "Funnel", treemap: "Treemap", sunburst: "Sunburst",
+  scatter: "Scatter", bubble: "Bubble", heatmap: "Heatmap", radar: "Radar", boxplot: "Box plot", histogram: "Histogram",
+  gantt: "Gantt", sankey: "Sankey",
+  geomap: "Region map", pointmap: "Point map", geoheat: "Density map",
+  kpi: "KPI", gauge: "Gauge", progress: "Progress bar", bullet: "Bullet graph",
+  table: "Data table", pivot: "Pivot table", text: "Text note", image: "Image", web: "Web page",
+};
+
+/** A kind's short name, or its label when it has none. */
+export function kindShort(kind: ChartKind): string {
+  return KIND_SHORT[kind] ?? KIND_LABELS[kind] ?? kind;
+}

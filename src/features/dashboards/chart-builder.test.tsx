@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
 
 import * as realAuth from "@/features/auth/auth-provider"
+import * as realEchartModule from "./echart"
 
 // The builder reads the signed-in user's permissions; a plain editor without `dashboard:sql` is enough here.
 // PR #160 CI fix: `mock.module` outlives this file in `bun test src`, so the real exports are kept and only
@@ -9,11 +10,17 @@ import * as realAuth from "@/features/auth/auth-provider"
 // `tenant-switcher.test.tsx`, which runs later, without `AuthProvider`.
 const real = { ...realAuth }
 mock.module("@/features/auth/auth-provider", () => ({ ...real, useAuth: () => ({ hasPermission: () => false }) }))
+// BI-58 review round 3, SHOULD-FIX 8: the type gallery always draws pictures, with ECharts, which
+// needs a canvas the test DOM does not have; each chart is a marker, and the real module goes back.
+const realEchart = { ...realEchartModule }
+mock.module("./echart", () => ({ EChart: () => <div data-testid="chart" /> }))
 afterAll(() => {
   mock.module("@/features/auth/auth-provider", () => real)
+  mock.module("./echart", () => realEchart)
 })
 
 import { ChartBuilder, KIND_GROUPS, type ChartDef } from "./chart-builder"
+import { kindShort } from "./chart-kinds"
 
 const originalFetch = global.fetch
 let bodies: Record<string, unknown>[] = []
@@ -263,7 +270,8 @@ describe("ChartBuilder type list (phase 2 QA R9, BI-58 T3)", () => {
     fireEvent.click(screen.getByRole("button", { name: "More chart types" }))
     await screen.findByLabelText("Search chart types")
     for (const g of KIND_GROUPS) for (const item of g.items) {
-      expect(within(gallery()).getByRole("button", { name: item.label }), item.value).toBeTruthy()
+      // BI-58 review round 3, SHOULD-FIX 8 (owner): gallery cards are named by their short names.
+      expect(within(gallery()).getByRole("button", { name: kindShort(item.value) }), item.value).toBeTruthy()
     }
   })
 
@@ -560,7 +568,7 @@ describe("ChartBuilder scatter (BI-17 B QA fix F2)", () => {
     renderBuilder(barDef)
     await screen.findByLabelText("Aggregation of visitors")
     fireEvent.click(screen.getByRole("button", { name: "More chart types" }))
-    fireEvent.click(await screen.findByRole("button", { name: "Scatter (X vs Y)" }))
+    fireEvent.click(await screen.findByRole("button", { name: "Scatter" }))
     await waitFor(() => expect(screen.getByText("X metric")).toBeTruthy())
     expect(screen.getByText("Y metric")).toBeTruthy()
     expect(screen.queryByText("Size metric")).toBeNull()
@@ -569,7 +577,7 @@ describe("ChartBuilder scatter (BI-17 B QA fix F2)", () => {
   it("does the same when the chart is new and the data source is picked after the kind", async () => {
     renderBuilder()
     fireEvent.click(screen.getByRole("button", { name: "More chart types" }))
-    const scatter = await screen.findByRole("button", { name: "Scatter (X vs Y)" })
+    const scatter = await screen.findByRole("button", { name: "Scatter" })
     fireEvent.click(scatter)
     await waitFor(() => expect(screen.getByText("X metric")).toBeTruthy())
     expect(screen.getByText("Y metric")).toBeTruthy()
@@ -578,7 +586,7 @@ describe("ChartBuilder scatter (BI-17 B QA fix F2)", () => {
   it("keeps the Y metric when the data source is picked after the kind (it used to reset to one row)", async () => {
     renderBuilder()
     fireEvent.click(screen.getByRole("button", { name: "More chart types" }))
-    fireEvent.click(await screen.findByRole("button", { name: "Bubble (X, Y, size)" }))
+    fireEvent.click(await screen.findByRole("button", { name: "Bubble" }))
     fireEvent.click(await screen.findByRole("combobox", { name: /pick a mart/i }).catch(() => screen.getByText(/pick a mart/)))
     fireEvent.click(await screen.findByRole("option", { name: /mart_visits/ }))
     await screen.findByText("Data source")

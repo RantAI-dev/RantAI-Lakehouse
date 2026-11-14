@@ -24,7 +24,7 @@ afterAll(() => {
 
 import { dashboardService, metricService, paramService } from "@/services"
 import { formatLocaleNumber } from "@/lib/format"
-import { ChartBuilder, type ChartDef } from "./chart-builder"
+import { ChartBuilder, KIND_GROUPS, type ChartDef } from "./chart-builder"
 import { ReportingProvider } from "./reporting-context"
 
 // `BI-58`: the builder's new layout keeps every saved chart as it was (spec T5).
@@ -240,10 +240,15 @@ describe("the chart-type gallery (BI-58 T3, spec T3)", () => {
       fireEvent.click(screen.getByRole("button", { name: "More chart types" }))
       const gallery = await screen.findByRole("dialog", { name: "Chart types" })
       const card = (name: string) => within(gallery).getByRole("button", { name })
-      // Drawn from the rows: a pie and a line; a KPI needs its own query, so it shows its icon until it is picked.
-      await waitFor(() => expect(within(card("Donut / pie")).getByTestId("chart")).toBeTruthy())
+      // Drawn from the rows: a pie and a line. A KPI needs its own query, so it is drawn from the
+      // sample, quieter (BI-58 review round 3, SHOULD-FIX 8).
+      await waitFor(() => expect(within(card("Donut")).getByTestId("chart")).toBeTruthy())
       expect(within(card("Line")).getByTestId("chart")).toBeTruthy()
-      expect(within(card("KPI — big number")).queryByTestId("chart")).toBeNull()
+      expect(card("Donut").querySelector("[data-picture]")?.getAttribute("data-picture")).toBe("data")
+      const kpi = card("KPI").querySelector("[data-picture]") as HTMLElement
+      expect(kpi.getAttribute("data-picture")).toBe("sample")
+      expect(kpi.className).toContain("opacity-70")
+      expect(kpi.textContent).toContain((1284).toLocaleString("en-US"))
       // At most 200 of the 250 rows reach a picture.
       const pie = drawn.find((o) => o.series?.[0]?.type === "pie")
       expect(pie?.series?.[0]?.data?.length).toBe(200)
@@ -267,13 +272,13 @@ describe("the chart-type gallery (BI-58 T3, spec T3)", () => {
     await waitFor(() => expect(previews.length).toBeGreaterThan(0))
     fireEvent.click(screen.getByRole("button", { name: "More chart types" }))
     const gallery = await screen.findByRole("dialog", { name: "Chart types" })
-    for (const name of ["Calendar heatmap (daily)", "Gantt (tasks over time)"]) {
+    for (const name of ["Calendar heatmap", "Gantt"]) {
       const card = within(gallery).getByRole("button", { name }) as HTMLButtonElement
       expect(card.disabled, name).toBe(true)
       expect(document.getElementById(card.getAttribute("aria-describedby") ?? "")?.textContent, name).toBe("Needs a date column")
     }
     // The stub source has three number columns: a bubble chart (three values) can be made, so it is not greyed.
-    expect((within(gallery).getByRole("button", { name: "Bubble (X, Y, size)" }) as HTMLButtonElement).disabled).toBe(false)
+    expect((within(gallery).getByRole("button", { name: "Bubble" }) as HTMLButtonElement).disabled).toBe(false)
     const asked = previews.length
     fireEvent.click(within(gallery).getByRole("button", { name: "Area" }))
     await waitFor(() => expect(previews.length).toBeGreaterThan(asked))
@@ -426,5 +431,36 @@ describe("leaving and the target dashboard (BI-58 review round 1)", () => {
     } finally {
       save.mockRestore()
     }
+  })
+})
+
+// BI-58 review round 3, SHOULD-FIX 8 (owner): the gallery always shows pictures, also before any data.
+describe("the chart-type gallery before any data (BI-58 review round 3)", () => {
+  it("draws every type from the sample, says so once, and asks for nothing", async () => {
+    renderBuilder()
+    await screen.findByRole("complementary", { name: "Data" })
+    const before = fetches.length
+    drawn = []
+    fireEvent.click(screen.getByRole("button", { name: "More chart types" }))
+    const gallery = await screen.findByRole("dialog", { name: "Chart types" })
+    expect(within(gallery).getByText("Pick a source and columns to see your own numbers.")).toBeTruthy()
+    const cards = within(gallery).getAllByRole("button").filter((b) => b.hasAttribute("aria-pressed"))
+    expect(cards.length).toBe(KIND_GROUPS.flatMap((g) => g.items).length)
+    for (const card of cards) {
+      const name = card.getAttribute("aria-label")
+      expect((card as HTMLButtonElement).disabled, `${name} greyed out`).toBe(false)
+      const picture = card.querySelector("[data-picture]") as HTMLElement
+      expect(["sample", "drawing"].includes(picture.getAttribute("data-picture") ?? ""), `${name} picture`).toBe(true)
+      // A picture, not an empty box or a "No data" note: a chart, a table, a drawing or the note's text.
+      const shown = !!picture.querySelector("[data-testid=chart], table, svg") || (picture.textContent ?? "").trim().length > 0
+      expect(shown, `${name} draws something`).toBe(true)
+      expect(picture.textContent ?? "", `${name} has data`).not.toMatch(/No data|No task|No dated rows/)
+      // Sample pictures are not dimmed when there is no data of the person's own yet.
+      expect(picture.className, `${name} emphasis`).not.toContain("opacity-70")
+      // The card's title is the short name, whole.
+      expect(card.querySelector(".text-sm.font-medium")?.textContent, `${name} title`).toBe(name ?? "-")
+    }
+    expect(drawn.length).toBeGreaterThan(15)
+    expect(fetches.length).toBe(before)
   })
 })
