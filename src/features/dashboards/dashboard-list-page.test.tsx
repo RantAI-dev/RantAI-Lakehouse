@@ -434,10 +434,10 @@ describe("bulk actions, facts and empty states (BI-59 T5)", () => {
     const search = screen.getByRole("searchbox")
     fireEvent.change(search, { target: { value: "zzz" } })
     expect(await screen.findByText("Nothing matches “zzz”")).toBeTruthy()
-    // The empty state's own button (the search field has an ✕ of the same name).
+    // One control clears the search: the ✕ in the search box (DESIGN.md §3 "Satu aksi, satu tombol").
     const clear = screen.getAllByRole("button", { name: "Clear search" })
-    expect(clear).toHaveLength(2)
-    fireEvent.click(clear[1])
+    expect(clear).toHaveLength(1)
+    fireEvent.click(clear[0])
     expect((search as HTMLInputElement).value).toBe("")
     fireEvent.click(screen.getByRole("button", { name: "Folder: All folders" }))
     fireEvent.click(await screen.findByRole("menuitem", { name: /Tourism/ }))

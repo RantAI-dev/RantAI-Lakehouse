@@ -106,8 +106,10 @@ export function MoveItemsDialog({
             {single ? single.name : `${items.length.toLocaleString("en-US")} items`}
           </DialogDescription>
         </DialogHeader>
+        {/* DESIGN.md §3 (owner, 2026-11-14): a visible label, and the control as wide as the dialog. */}
+        <p id="move-items-folder" className="-mb-1 text-sm font-medium">Folder</p>
         <Select value={target} onValueChange={(v) => setTarget(v ?? ROOT)}>
-          <SelectTrigger aria-label="Folder">
+          <SelectTrigger aria-label="Folder" aria-describedby="move-items-folder" className="w-full">
             <SelectValue>{folderOptionText(choices, destination, "Top level (no folder)")}</SelectValue>
           </SelectTrigger>
           <SelectContent>

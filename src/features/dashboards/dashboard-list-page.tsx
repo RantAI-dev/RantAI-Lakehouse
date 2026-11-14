@@ -137,7 +137,7 @@ function ViewSwitch({ value, onChange }: { readonly value: ViewMode; readonly on
 }
 
 /** What the list says when it has no row: why, in words that fit the filter (T5's designed states). */
-function ListEmpty({ kind, query, folderFilter, folderPathOf, isPersonal, canWrite, anyOfKind, onClearQuery, onShowAll }: {
+function ListEmpty({ kind, query, folderFilter, folderPathOf, isPersonal, canWrite, anyOfKind, onShowAll }: {
   readonly kind: KindFilter
   readonly query: string
   readonly folderFilter: FolderFilter
@@ -146,10 +146,9 @@ function ListEmpty({ kind, query, folderFilter, folderPathOf, isPersonal, canWri
   readonly canWrite: boolean
   /** Whether anything of this kind exists at all, before the search and folder. */
   readonly anyOfKind: boolean
-  readonly onClearQuery: () => void
   readonly onShowAll: () => void
 }) {
-  if (query.trim()) return <NoMatch query={query.trim()} onClear={onClearQuery} />
+  if (query.trim()) return <NoMatch query={query.trim()} />
   if (folderFilter !== null && anyOfKind) {
     return (
       <EmptyFolder
@@ -528,7 +527,6 @@ export function DashboardListPage() {
                   isPersonal={folderLookup.isPersonal}
                   canWrite={canFile}
                   anyOfKind={items.some((i) => kind === "all" || i.kind === kind)}
-                  onClearQuery={() => setQuery("")}
                   onShowAll={() => setFolderFilter(null)}
                 />
               ) : view === "gallery" ? (

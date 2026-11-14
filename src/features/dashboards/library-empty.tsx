@@ -67,14 +67,18 @@ export function EmptyFolder({ path, personal, compact, onShowAll }: {
   )
 }
 
-/** Nothing matches the search: say what was searched and offer to clear it. */
-export function NoMatch({ query, onClear }: { readonly query: string; readonly onClear: () => void }) {
+/**
+ * Nothing matches the search: say what was searched. No "Clear search"
+ * button here: the search box's ✕ right above does that, and DESIGN.md
+ * §3 "Satu aksi, satu tombol" (owner, 2026-11-14) asks for one control
+ * per action.
+ */
+export function NoMatch({ query }: { readonly query: string }) {
   return (
     <LibraryEmpty
       icon={Search}
       title={`Nothing matches “${query}”`}
-      body="Search looks at names, owners, folders and types."
-      action={<Button variant="outline" size="sm" onClick={onClear}>Clear search</Button>}
+      body="Search looks at names, owners, folders and types. Clear it with ✕ in the search box, or press Esc."
     />
   )
 }
