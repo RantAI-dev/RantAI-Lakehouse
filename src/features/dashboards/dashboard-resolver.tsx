@@ -3,9 +3,10 @@
 import * as React from "react"
 import { useRouter } from "next/navigation"
 
-import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
+import { ErrorState } from "@/components/patterns/page-states"
 import { useService } from "@/hooks/use-service"
 import { dashboardService } from "@/services"
+import { DashboardPageSkeleton } from "./dashboard-skeleton"
 import { forgetLastBoard, readLastBoard } from "./last-board"
 
 /**
@@ -68,9 +69,9 @@ export function DashboardResolver() {
 
   // Termasuk saat status sudah "success": `replace` baru jalan setelah efek,
   // dan menampilkan daftar sekejap di sini justru kedipan yang ingin dihindari.
-  return (
-    <div className="p-4">
-      <LoadingSkeleton />
-    </div>
-  )
+  // The dashboard's own placeholder, the one the loading shell draws for this
+  // route (`shellPlaceholderFor`) and the board page keeps until its data
+  // lands: the usual way on from here is a board, so a refresh of
+  // `/dashboards` is one loading state, not three (owner QA 2026-11-14).
+  return <DashboardPageSkeleton />
 }

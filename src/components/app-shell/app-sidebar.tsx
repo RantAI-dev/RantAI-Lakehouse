@@ -29,6 +29,20 @@ import { cn } from "@/lib/utils"
 import { NAV_GROUPS, activeNavHref, canOpen, type NavGroup, type NavItem } from "./nav-config"
 import { UserMenu } from "./user-menu"
 
+/*
+ * The sidebar's boxes, shared with the loading shell (`AppShellSkeleton`),
+ * which draws the same frame with grey rows while the session is checked:
+ * one set of classes, so the skeleton cannot drift from the real sidebar.
+ */
+export const SIDEBAR_CLASS = "border-r border-sidebar-border bg-sidebar shadow-sm"
+export const SIDEBAR_CONTENT_CLASS = "group-data-[collapsible=icon]:flex group-data-[collapsible=icon]:flex-col group-data-[collapsible=icon]:items-center group-data-[collapsible=icon]:gap-0"
+export const SIDEBAR_GROUP_CLASS = "gap-0 px-2 py-2 group-data-[collapsible=icon]:w-full group-data-[collapsible=icon]:items-center group-data-[collapsible=icon]:px-2"
+export const SIDEBAR_MENU_CLASS = "mt-0 flex flex-col gap-0.5 group-data-[collapsible=icon]:w-full group-data-[collapsible=icon]:items-center group-data-[collapsible=icon]:gap-1.5"
+export const SIDEBAR_FOOTER_CLASS = "border-t border-sidebar-border p-2"
+export const ACCOUNT_CARD_CLASS = "h-14 rounded-lg px-2 group-data-[collapsible=icon]:size-10! group-data-[collapsible=icon]:h-10!"
+export const NAV_ROW_CLASS = "h-8 rounded-md px-2.5 py-1.5 text-sm tracking-normal"
+export const SIDEBAR_SUB_CLASS = "mr-0 gap-0.5 border-sidebar-border pr-0"
+
 function BrandLogo() {
   // Logo follows the theme: navy for a light sidebar, white for a dark one.
   return (
@@ -36,6 +50,31 @@ function BrandLogo() {
       <Image src="/logo-light.png" alt="Rantai Lake" fill sizes="32px" className="object-contain dark:hidden" priority />
       <Image src="/logo-dark.png" alt="" fill sizes="32px" className="hidden object-contain dark:block" priority />
     </div>
+  )
+}
+
+/**
+ * The sidebar's header: the logo and the product's name. Nothing in it
+ * depends on who is signed in, so the loading shell (`AppShellSkeleton`)
+ * draws this same component while the session is checked, and the header
+ * does not change at all when the real sidebar mounts.
+ */
+export function SidebarBrand() {
+  // `h-16` supaya persis setinggi navbar (`app-navbar.tsx` juga `h-16`),
+  // sehingga garis bawah keduanya menyambung jadi satu garis lurus di seluruh
+  // lebar layar. Sebelumnya tinggi header ini dihitung dari isinya (padding +
+  // baris logo) dan jatuh di 69px — 5px lebih rendah dari navbar, dan
+  // patahannya terlihat tepat di pertemuan sidebar dengan konten.
+  return (
+    <SidebarHeader className="flex h-16 shrink-0 flex-col justify-center border-b border-sidebar-border px-3 py-0 group-data-[collapsible=icon]:px-2">
+      <div className="flex min-w-0 items-center justify-start gap-2 group-data-[collapsible=icon]:justify-center">
+        <BrandLogo />
+        <div className="grid min-w-0 flex-1 gap-0.5 leading-none group-data-[collapsible=icon]:hidden">
+          <span className="text-sm font-semibold tracking-[-0.084px] text-sidebar-foreground">Rantai Lake</span>
+          <span className="text-[11px] font-normal tracking-[-0.04px] text-sidebar-foreground/60">Enterprise Lakehouse Console</span>
+        </div>
+      </div>
+    </SidebarHeader>
   )
 }
 
@@ -119,7 +158,7 @@ export function AppSidebar() {
 
   const menuBtnClass = (active: boolean) =>
     cn(
-      "h-8 rounded-md px-2.5 py-1.5 text-sm tracking-normal transition-colors duration-150",
+      NAV_ROW_CLASS, "transition-colors duration-150",
       active
         ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
         : "font-normal text-sidebar-foreground/70 hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
@@ -246,7 +285,7 @@ export function AppSidebar() {
             }
           />
           {expanded ? (
-            <SidebarMenuSub className="mr-0 gap-0.5 border-sidebar-border pr-0">
+            <SidebarMenuSub className={SIDEBAR_SUB_CLASS}>
               {group.items.map((item) => (
                 <SidebarMenuSubItem key={item.href}>
                   {linkRow(item, item.href === activeHref, false)}
@@ -284,26 +323,12 @@ export function AppSidebar() {
   const openGroup = groups.find((g) => g.label === flyout?.label)
 
   return (
-    <Sidebar data-print-hide collapsible="icon" side="left" className="border-r border-sidebar-border bg-sidebar shadow-sm">
-      {/* `h-16` supaya persis setinggi navbar (`app-navbar.tsx` juga
-          `h-16`), sehingga garis bawah keduanya menyambung jadi satu
-          garis lurus di seluruh lebar layar. Sebelumnya tinggi header ini
-          dihitung dari isinya (padding + baris logo) dan jatuh di 69px —
-          5px lebih rendah dari navbar, dan patahannya terlihat tepat di
-          pertemuan sidebar dengan konten. */}
-      <SidebarHeader className="flex h-16 shrink-0 flex-col justify-center border-b border-sidebar-border px-3 py-0 group-data-[collapsible=icon]:px-2">
-        <div className="flex min-w-0 items-center justify-start gap-2 group-data-[collapsible=icon]:justify-center">
-          <BrandLogo />
-          <div className="grid min-w-0 flex-1 gap-0.5 leading-none group-data-[collapsible=icon]:hidden">
-            <span className="text-sm font-semibold tracking-[-0.084px] text-sidebar-foreground">Rantai Lake</span>
-            <span className="text-[11px] font-normal tracking-[-0.04px] text-sidebar-foreground/60">Enterprise Lakehouse Console</span>
-          </div>
-        </div>
-      </SidebarHeader>
+    <Sidebar data-print-hide collapsible="icon" side="left" className={SIDEBAR_CLASS}>
+      <SidebarBrand />
 
-      <SidebarContent className="group-data-[collapsible=icon]:flex group-data-[collapsible=icon]:flex-col group-data-[collapsible=icon]:items-center group-data-[collapsible=icon]:gap-0">
-        <SidebarGroup className="gap-0 px-2 py-2 group-data-[collapsible=icon]:w-full group-data-[collapsible=icon]:items-center group-data-[collapsible=icon]:px-2">
-          <SidebarMenu className="mt-0 flex flex-col gap-0.5 group-data-[collapsible=icon]:w-full group-data-[collapsible=icon]:items-center group-data-[collapsible=icon]:gap-1.5">
+      <SidebarContent className={SIDEBAR_CONTENT_CLASS}>
+        <SidebarGroup className={SIDEBAR_GROUP_CLASS}>
+          <SidebarMenu className={SIDEBAR_MENU_CLASS}>
             {groups.map(renderEntry)}
           </SidebarMenu>
         </SidebarGroup>
@@ -338,7 +363,7 @@ export function AppSidebar() {
           )
         : null}
 
-      <SidebarFooter className="border-t border-sidebar-border p-2">
+      <SidebarFooter className={SIDEBAR_FOOTER_CLASS}>
         <SidebarMenu>
           <SidebarMenuItem>
             {/* BI-61 review round 1, SHOULD-FIX 7 (owner decision 2026-11-14): the card is the
@@ -353,7 +378,7 @@ export function AppSidebar() {
                   size="lg"
                   tooltip={user?.name ?? "Signed in"}
                   aria-label={`Account menu, ${user?.name ?? "signed in"}`}
-                  className="h-14 rounded-lg px-2 hover:bg-sidebar-accent data-[popup-open]:bg-sidebar-accent group-data-[collapsible=icon]:size-10! group-data-[collapsible=icon]:h-10!"
+                  className={cn(ACCOUNT_CARD_CLASS, "hover:bg-sidebar-accent data-[popup-open]:bg-sidebar-accent")}
                 />
               }
             >

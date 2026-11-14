@@ -876,6 +876,12 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // the dashboard list (the page's own read carries neither); a failed read
   // leaves them out rather than guessing.
   const listed = boardList.status === "success" ? boardList.data.find((b) => b.id === board) : undefined;
+  // Owner QA 2026-11-14: until the board's name is known (from this page's read or the
+  // dashboard list, whichever lands first) the header holds a title-sized placeholder,
+  // not "Dashboards" switching to the name. Once both reads have answered, the old
+  // stand-in is kept, so a placeholder never stays on a page that is not loading.
+  const knownName = boards.find((b) => b.id === board)?.name ?? listed?.name;
+  const headerTitle = knownName ?? (data === null && (loading || boardList.status === "loading") ? null : dashName);
   const folderId = boards.find((b) => b.id === board)?.folderId;
   const folderChain = React.useMemo(() => {
     const names: string[] = [];
@@ -1416,7 +1422,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     >
       <DashboardHeader
         folderPath={folderChain}
-        title={dashName}
+        title={headerTitle}
         titleAccessory={
           <>
             {!isDefault ? (

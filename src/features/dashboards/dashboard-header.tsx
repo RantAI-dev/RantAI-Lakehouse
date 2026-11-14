@@ -122,7 +122,11 @@ export function DashboardHeader({
   readonly onDetails?: () => void;
   /** The folder names from the root, empty when the dashboard is in no folder. */
   readonly folderPath: readonly string[];
-  readonly title: string;
+  /**
+   * The dashboard's name; null while it is not known yet (the session check, the first read):
+   * the title's line then holds a grey bar of its size, never a stand-in name that changes.
+   */
+  readonly title: string | null;
   /** The star and the Private badge, beside the title. */
   readonly titleAccessory?: React.ReactNode;
   readonly facts: HeaderFacts;
@@ -182,19 +186,31 @@ export function DashboardHeader({
       <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-3">
         <div className="grid w-full min-w-0 gap-1 sm:w-auto sm:flex-1">
           <div className="flex min-w-0 items-start gap-1.5 sm:items-center">
-            <h1 className="line-clamp-2 min-w-0 text-xl font-semibold tracking-tight text-foreground sm:truncate sm:text-2xl">{title}</h1>
+            <h1 className="line-clamp-2 min-w-0 text-xl font-semibold tracking-tight text-foreground sm:truncate sm:text-2xl">
+              {title ?? (
+                // Owner QA 2026-11-14: the name is not known yet, so a bar where it will be, at the
+                // title's own line height, rather than "Dashboards" switching to the real name.
+                <>
+                  <span className="sr-only">Loading dashboard</span>
+                  <span aria-hidden data-slot="title-placeholder" className="inline-block h-6 w-56 max-w-full animate-pulse rounded-md bg-muted align-middle" />
+                </>
+              )}
+            </h1>
             {titleAccessory ? <span className="flex shrink-0 items-center gap-1.5" data-print-hide>{titleAccessory}</span> : null}
           </div>
-          {parts.length > 0 ? (
-            <p className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-sm text-muted-foreground">
-              {parts.map((p, i) => (
-                <React.Fragment key={i}>
-                  {i > 0 ? <span aria-hidden>·</span> : null}
-                  {p}
-                </React.Fragment>
-              ))}
-            </p>
-          ) : null}
+          {/* The facts line keeps its line while it has nothing to say yet (owner QA 2026-11-14:
+              the meta row's height stays the same from the first loading frame to the loaded page). */}
+          <p className="flex min-h-5 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-sm text-muted-foreground">
+            {parts.length === 0 && title === null ? (
+              <span aria-hidden data-slot="facts-placeholder" className="inline-block h-3.5 w-64 max-w-full animate-pulse rounded-md bg-muted" />
+            ) : null}
+            {parts.map((p, i) => (
+              <React.Fragment key={i}>
+                {i > 0 ? <span aria-hidden>·</span> : null}
+                {p}
+              </React.Fragment>
+            ))}
+          </p>
         </div>
         <div className="flex shrink-0 items-center gap-1.5" data-slot="dashboard-header-actions" data-print-hide>{actions}</div>
       </div>

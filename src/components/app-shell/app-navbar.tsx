@@ -25,6 +25,55 @@ import { notificationsService } from "@/services"
 import { TenantSwitcher } from "./tenant-switcher"
 import { useCopilot } from "@/features/copilot/use-copilot"
 
+/*
+ * The navbar's boxes, shared with the loading shell (`AppShellSkeleton`),
+ * which draws the same bar while the session is checked: one set of classes,
+ * so the skeleton cannot drift from the real navbar.
+ */
+export const NAVBAR_CLASS =
+  "sticky top-0 z-20 flex h-16 shrink-0 items-center gap-4 border-b border-border bg-background/90 px-4 backdrop-blur-md sm:px-5"
+export const NAVBAR_GRID_CLASS =
+  "grid min-h-0 min-w-0 flex-1 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-3"
+export const NAVBAR_TRIGGER_CLASS = "size-9 shrink-0 rounded-lg border-border bg-background shadow-xs"
+
+/** The page's title at the navbar's left, from the nav config (never from the session). */
+export function NavbarTitle({ title }: { readonly title: string }) {
+  return (
+    <div className="hidden min-w-0 sm:block">
+      <p className="truncate text-sm font-semibold text-foreground">{title}</p>
+    </div>
+  )
+}
+
+/**
+ * The search box in the middle of the navbar. It holds nothing about the
+ * person signed in, so the loading shell draws it too; a click there before
+ * the palette is mounted does nothing.
+ * About 400 px, narrower on a small laptop; hidden on a phone as before.
+ */
+export function NavbarSearch() {
+  return (
+    <div className="relative hidden w-72 md:block lg:w-[25rem]">
+      <Search
+        className="pointer-events-none absolute left-3 top-1/2 size-4 shrink-0 -translate-y-1/2 text-muted-foreground"
+        aria-hidden
+      />
+      <Input
+        type="search"
+        readOnly
+        onClick={() => openCommandPalette()}
+        onFocus={() => openCommandPalette()}
+        placeholder="Search pages, tables, columns"
+        className="h-9 w-full cursor-pointer rounded-lg border-border bg-muted/40 py-2 pl-9 pr-14 text-sm leading-5 shadow-none placeholder:text-muted-foreground focus-visible:bg-background"
+        aria-label="Open command palette"
+      />
+      <kbd className="pointer-events-none absolute right-2 top-1/2 hidden h-5 -translate-y-1/2 items-center rounded border border-border bg-background px-1.5 font-mono text-[10px] text-muted-foreground lg:flex">
+        ⌘ K
+      </kbd>
+    </div>
+  )
+}
+
 /**
  * Sticky top navbar rendered on every page.
  * Left: sidebar toggle + current page title (derived from nav config) + search.
@@ -70,19 +119,17 @@ export function AppNavbar() {
   return (
     <header
       data-print-hide
-      className={cn(
-        "sticky top-0 z-20 flex h-16 shrink-0 items-center gap-4 border-b border-border bg-background/90 px-4 backdrop-blur-md sm:px-5"
-      )}
+      className={NAVBAR_CLASS}
     >
       {/* BI-61 review round 1, SHOULD-FIX 8 (owner decision 2026-11-14): three columns, so the
           search sits in the middle of the navbar's own width (the content right of the sidebar),
           whether the sidebar is expanded or collapsed and the side panel open or not. */}
-      <div className="grid min-h-0 min-w-0 flex-1 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-3">
+      <div className={NAVBAR_GRID_CLASS}>
         <div className="flex min-w-0 items-center gap-3">
           <SidebarTrigger
             variant="outline"
             size="icon"
-            className="size-9 shrink-0 rounded-lg border-border bg-background shadow-xs"
+            className={NAVBAR_TRIGGER_CLASS}
           />
           {/* Page title only. There used to be a second line reading
               "Rantai Lake workspace" — fixed text that never changed, so
@@ -92,31 +139,9 @@ export function AppNavbar() {
               name, so a static label there would promise a
               multi-workspace feature that does not exist yet
               (`workspaceName` is only used in Settings). */}
-          <div className="hidden min-w-0 sm:block">
-            <p className="truncate text-sm font-semibold text-foreground">
-              {pageTitle}
-            </p>
-          </div>
+          <NavbarTitle title={pageTitle} />
         </div>
-        {/* About 400 px, narrower on a small laptop; hidden on a phone as before. */}
-        <div className="relative hidden w-72 md:block lg:w-[25rem]">
-          <Search
-            className="pointer-events-none absolute left-3 top-1/2 size-4 shrink-0 -translate-y-1/2 text-muted-foreground"
-            aria-hidden
-          />
-          <Input
-            type="search"
-            readOnly
-            onClick={() => openCommandPalette()}
-            onFocus={() => openCommandPalette()}
-            placeholder="Search pages, tables, columns"
-            className="h-9 w-full cursor-pointer rounded-lg border-border bg-muted/40 py-2 pl-9 pr-14 text-sm leading-5 shadow-none placeholder:text-muted-foreground focus-visible:bg-background"
-            aria-label="Open command palette"
-          />
-          <kbd className="pointer-events-none absolute right-2 top-1/2 hidden h-5 -translate-y-1/2 items-center rounded border border-border bg-background px-1.5 font-mono text-[10px] text-muted-foreground lg:flex">
-            ⌘ K
-          </kbd>
-        </div>
+        <NavbarSearch />
 
         <div className="flex min-w-0 items-center justify-end gap-1">
           <TenantSwitcher

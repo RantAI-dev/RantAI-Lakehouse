@@ -15,6 +15,7 @@ import { GeoChart } from "./geo-chart";
 import type { MapLoader } from "./echarts-maps";
 import { useReporting } from "./reporting-context";
 import { KpiCard } from "./kpi-card";
+import { TileBodyPlaceholder } from "./dashboard-skeleton";
 import { PivotTable } from "./pivot-table";
 import { RawTable } from "./raw-table";
 import { cellClass, CellValue, columnStyle, conditionalCss } from "./table-cell";
@@ -127,7 +128,8 @@ function TileBodyOf({
       </p>
     );
   }
-  if (loading && !cell) return <div className="h-full animate-pulse rounded bg-muted/40" />;
+  // The same body placeholder as a tile drawn before the layout is known (`DashboardTilesSkeleton`).
+  if (loading && !cell) return <TileBodyPlaceholder />;
 
   if (spec.kind === "kpi" && hasRows(cell) && def?.compare) {
     return <KpiCard def={def} cell={cell} caption={spec.caption} />;
