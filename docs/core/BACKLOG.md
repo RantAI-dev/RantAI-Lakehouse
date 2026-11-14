@@ -516,7 +516,7 @@ set by the product owner and are left empty until they are.
 
 | ID | Started | Shipped | Due |
 | --- | --- | --- | --- |
-| `QS-14` | 2026-11-14 | | |
+| `QS-14` | 2026-11-14 | 2026-11-14 (#532) | |
 | `GOV-6` | | | |
 | `DATA-58` | | | |
 | `DATA-59` | | | |
