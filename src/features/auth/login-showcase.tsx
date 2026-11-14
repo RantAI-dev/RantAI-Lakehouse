@@ -2,9 +2,9 @@
 
 /**
  * The sign-in page's living preview of the console (`WEB-15`, mockup A): a
- * small dashboard drawn with the console's real `TileBody` (ECharts bars
- * grow, a line draws, the KPI counts up), which rests and draws itself again
- * every 9 s while it is on screen and the tab is visible. Its charts answer
+ * small dashboard whose charts are the console's real `TileBody` (ECharts
+ * bars grow, a line draws) beside a KPI that counts up; it rests and draws
+ * itself again every 9 s while it is on screen and the tab is visible. Its charts answer
  * the pointer like the real ones. The numbers are fixed sample values, made
  * up for this page and described as sample data by the panel label: no API call, no
  * customer data (feature page decision 2).
@@ -15,7 +15,7 @@
  */
 import * as React from "react";
 import { useTheme } from "next-themes";
-import { Code2, Database, LayoutDashboard, MessageSquare, Workflow } from "lucide-react";
+import { ArrowUp, Code2, Database, LayoutDashboard, MessageSquare, Workflow } from "lucide-react";
 import Image from "next/image";
 import { RenderModeProvider, type RenderMode } from "@/features/dashboards/render-mode";
 import type { Rows } from "@/features/dashboards/tile-dialogs";
@@ -24,6 +24,8 @@ import { TileBody } from "@/features/dashboards/tile-body";
 // which the console image does not contain (`.dockerignore`, WEB-2).
 import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
+import { signedPercent, sparklinePoints } from "@/lib/kpi-compare";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { useOnScreen, usePageVisible } from "./use-in-view";
 
@@ -53,26 +55,25 @@ function kpiValue(total: number, t: number): number {
   return Math.round(total * (COUNT_FROM + (1 - COUNT_FROM) * t));
 }
 
-/** The KPI's cell at a point of its count-up: both years scale together, so the change keeps its sign and percent. */
-function kpiCell(t: number): Rows {
-  return {
-    columns: ["year", "v"],
-    rows: [
-      { year: "2023-01-01", v: kpiValue(VISITORS_2023, t) },
-      { year: "2024-01-01", v: kpiValue(VISITORS_2024, t) },
-    ],
-    grain: "year",
-  };
-}
+/** The change against 2023, at the final values: the KPI's tooltip and its one-line delta. */
+const DELTA = VISITORS_2024 - VISITORS_2023;
+const DELTA_PERCENT = (DELTA / VISITORS_2023) * 100;
 
-const KPI_SPEC = spec("visitors", "Foreign visitors, 2024", "kpi", "year", "v", { compare: { kind: "previous", dateColumn: "year" } });
+/**
+ * Day and month names read flat (WEB-15 T2, owner's screenshot): the
+ * console tilts category labels past six, but here twelve short months and
+ * seven days fit the tiles' width level. The chart style's own axis setting
+ * (`style-option.ts`) keeps every label and its overlap check, which hides a
+ * label rather than letting two collide on a narrow window.
+ */
+const FLAT_X = { x: { rotate: 0 as const } };
 // The console's blue chart palette (mockup A's final version).
 const BARS: Tile = {
-  spec: spec("monthly", "Visitors per month", "bar", "Month", "Visitors", { colors: { palette: "sequential-blue" } }),
+  spec: spec("monthly", "Visitors per month", "bar", "Month", "Visitors", { colors: { palette: "sequential-blue" }, axes: FLAT_X }),
   cell: { columns: ["Month", "Visitors"], rows: MONTHS.map((m, i) => ({ Month: m, Visitors: MONTHLY[i] })) },
 };
 const LINE: Tile = {
-  spec: spec("gold", "Rows landed in Gold", "line", "Day", "Rows", { colors: { palette: "sequential-blue" } }),
+  spec: spec("gold", "Rows landed in Gold", "line", "Day", "Rows", { colors: { palette: "sequential-blue" }, axes: FLAT_X }),
   cell: { columns: ["Day", "Rows"], rows: GOLD_ROWS.map((v, i) => ({ Day: DAYS[i], Rows: v })) },
 };
 
@@ -166,6 +167,50 @@ function SidebarLogo() {
   );
 }
 
+/**
+ * The KPI tile: the number, and its change against 2023 on one line.
+ *
+ * Drawn here rather than by the console's `KpiCard` (WEB-15 T2, owner's
+ * screenshot): that card repeats the period under the number ("2024"), which
+ * this tile's title already names, and its "+254,284 (+19.3%) vs 2023" wraps
+ * to two lines at the tile's width. The change is the same reading with the
+ * same helper (`signedPercent`); the line keeps the percent, and the
+ * amount moves to the tooltip. The trend under it is the bars' own months.
+ */
+function ShowcaseKpi({ t, run }: { t: number; run: number }) {
+  return (
+    <div className="grid h-full place-content-center justify-items-center px-2 text-center">
+      <p className="text-4xl font-semibold tracking-tight tabular-nums text-foreground" data-slot="showcase-kpi">
+        {kpiValue(VISITORS_2024, t).toLocaleString("en-US")}
+      </p>
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <p className="mt-1.5 inline-flex items-center gap-1 whitespace-nowrap text-sm font-medium tabular-nums text-emerald-600 dark:text-emerald-400" />
+          }
+        >
+          <ArrowUp className="size-4" aria-hidden />
+          {signedPercent(DELTA_PERCENT)}
+          <span className="font-normal text-muted-foreground">vs 2023</span>
+        </TooltipTrigger>
+        <TooltipContent>{DELTA.toLocaleString("en-US")} more visitors than in 2023</TooltipContent>
+      </Tooltip>
+      <svg key={run} viewBox="0 0 120 28" aria-hidden className="mt-2.5 h-7 w-32 text-emerald-600 dark:text-emerald-400">
+        <polyline
+          points={sparklinePoints(MONTHLY, 120, 28)}
+          pathLength={1}
+          className="login-draw"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.5"
+          strokeLinejoin="round"
+          strokeLinecap="round"
+        />
+      </svg>
+    </div>
+  );
+}
+
 const PLACES = [LayoutDashboard, Database, Code2, Workflow, MessageSquare];
 
 /**
@@ -215,7 +260,7 @@ export function LoginShowcase({ compact = false }: { compact?: boolean }) {
         </div>
         <div className="grid min-h-0 flex-1 grid-cols-5 grid-rows-[0.9fr_1.25fr] gap-3">
           <PreviewTile title="Foreign visitors, 2024" className="col-span-2">
-            <TileBody spec={KPI_SPEC} cell={kpiCell(t)} dark={dark} loading={false} />
+            <ShowcaseKpi t={t} run={run} />
           </PreviewTile>
           <PreviewTile title="Rows landed in Gold, this week" className="col-span-3">
             <TileBody key={`line-${run}-${dark}`} spec={LINE.spec} cell={LINE.cell} dark={dark} loading={false} hideLegend />

@@ -107,6 +107,14 @@ describe("the sign-in page's sample dashboard (WEB-15 T2)", () => {
     expect(drawn.every((c) => c.still)).toBe(true)
   })
 
+  it("says the KPI's change on one line and does not repeat the year under the number (WEB-15 T2)", () => {
+    stubReducedMotion(true)
+    const { container } = render(<LoginShowcase />)
+    // The tile's title already says 2024; the number, then "+19.3% vs 2023".
+    const tile = container.querySelector("[data-slot=showcase-kpi]")?.parentElement
+    expect(tile?.textContent).toBe(`${FINAL}+19.3%vs 2023`)
+  })
+
   it("redraws every 9 s only while it is on screen and the tab is visible", () => {
     stubReducedMotion(false)
     const { container } = render(<LoginShowcase />)

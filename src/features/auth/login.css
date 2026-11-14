@@ -88,3 +88,21 @@
   0%, 100% { opacity: 1; }
   33.333%, 66.667% { opacity: 0; }
 }
+
+/*
+ * The KPI tile's trend line draws itself with each redraw of the sample
+ * dashboard (`login-showcase.tsx`, WEB-15 T2), as the line chart beside it
+ * does; `pathLength="1"` makes the dash the line's whole length. Still with
+ * reduced motion.
+ */
+@media (prefers-reduced-motion: no-preference) {
+  .login-draw {
+    stroke-dasharray: 1;
+    animation: login-draw 1100ms cubic-bezier(0.23, 1, 0.32, 1) 150ms both;
+  }
+}
+
+@keyframes login-draw {
+  from { stroke-dashoffset: 1; }
+  to { stroke-dashoffset: 0; }
+}
