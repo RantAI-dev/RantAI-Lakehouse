@@ -1874,7 +1874,7 @@ export function ChartBuilder({
             </aside>
           )}
 
-          <section aria-label="Chart" className="flex min-h-[26rem] min-w-0 flex-col rounded-xl bg-card ring-1 ring-foreground/6">
+          <section aria-label="Chart" className="@container/canvas flex min-h-[26rem] min-w-0 flex-col rounded-xl bg-card ring-1 ring-foreground/6">
             <div data-slot="canvas-toolbar" className={cn("flex items-center gap-2 border-b border-border/60 px-3", ZONE_HEADER)}>
               {isStaticTile ? null : (
                 <Button

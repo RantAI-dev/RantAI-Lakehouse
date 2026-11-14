@@ -51,9 +51,13 @@ export function KindPicker({ kind, onPick, facts, preview, dark }: {
   return (
     // `BI-58` T5: the icons wrap to a second row on a phone rather than hide "More" past the edge.
     <div role="group" aria-label="Chart type" className="flex min-w-0 flex-1 flex-wrap items-center gap-0.5">
-      {MAIN_KINDS.map((k) => {
+      {MAIN_KINDS.map((k, index) => {
         const on = k === kind;
         const need = kindNeed(k, facts);
+        // BI-58 review round 2, SHOULD-FIX 7 follow-up: the toolbar is one 44 px row, so in a narrow
+        // canvas (the Copilot panel open beside it, a phone) the last toolbar types step back into
+        // "More", which lists every type. The type in use always stays.
+        const fold = on ? "grid" : index >= 6 ? "hidden @[36rem]/canvas:grid" : index >= 4 ? "hidden @[26rem]/canvas:grid" : "grid";
         return (
           <Tooltip key={k}>
             <TooltipTrigger
@@ -61,7 +65,7 @@ export function KindPicker({ kind, onPick, facts, preview, dark }: {
                 <button
                   type="button" aria-pressed={on} aria-label={KIND_LABELS[k]} onClick={() => onPick(k)}
                   className={cn(
-                    "grid size-8 shrink-0 place-items-center rounded-md", EASE, FOCUS,
+                    "size-8 shrink-0 place-items-center rounded-md", fold, EASE, FOCUS,
                     on ? "bg-primary/12 text-primary dark:text-sky-300" : "text-muted-foreground hover:bg-muted hover:text-foreground",
                     need && !on && "opacity-50",
                   )}
