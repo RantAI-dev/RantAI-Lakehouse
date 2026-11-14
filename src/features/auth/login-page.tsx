@@ -203,7 +203,7 @@ export function LoginPage() {
             <span className="relative size-7">
               <Image
                 src="/logo-light.png"
-                alt="Rantai Lake"
+                alt="RantAI Lakehouse"
                 fill
                 sizes="28px"
                 className="object-contain dark:hidden"
@@ -218,7 +218,7 @@ export function LoginPage() {
                 priority
               />
             </span>
-            <span className="text-sm font-semibold">Rantai Lake</span>
+            <span className="text-sm font-semibold">RantAI Lakehouse</span>
           </span>
           <ThemeToggle />
         </header>
@@ -234,7 +234,7 @@ export function LoginPage() {
               <SsoNotice />
             </React.Suspense>
             <h1 className="text-3xl leading-[1.2] font-semibold tracking-[-0.02em] text-foreground">
-              Sign in to Rantai Lake
+              Sign in to RantAI Lakehouse
             </h1>
             <p className="mt-2 text-sm text-muted-foreground">
               Use your account credentials to continue.
@@ -364,7 +364,7 @@ export function LoginPage() {
         </div>
 
         <footer className="flex flex-col gap-1 text-sm text-muted-foreground sm:flex-row sm:items-center sm:justify-between">
-          <span>© {new Date().getFullYear()} Rantai Lake</span>
+          <span>© {new Date().getFullYear()} RantAI Lakehouse</span>
           {/* Placeholder destination — point this at the docs site (or
               wherever support lives) once that URL exists. */}
           <Link href="#" className="transition-colors hover:text-foreground">

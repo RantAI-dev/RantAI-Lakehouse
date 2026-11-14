@@ -175,7 +175,7 @@ export function AppNavbar() {
             className={NAVBAR_TRIGGER_CLASS}
           />
           {/* Page title only. There used to be a second line reading
-              "Rantai Lake workspace" — fixed text that never changed, so
+              "RantAI Lakehouse workspace" — fixed text that never changed, so
               it conveyed nothing while repeating the brand already shown
               in the sidebar header right next to it. That slot is
               normally used for a breadcrumb or the active workspace

@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { PublicDashboard } from "@/features/dashboards/public-dashboard";
 
 export const metadata: Metadata = {
-  title: "Shared dashboard · Rantai Lake",
+  title: "Shared dashboard · RantAI Lakehouse",
   robots: { index: false, follow: false },
 };
 

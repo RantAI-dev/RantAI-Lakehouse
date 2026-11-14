@@ -255,14 +255,14 @@ export function activeNavHref(pathname: string): string | undefined {
 
 /**
  * Resolves the product page title for a pathname by longest matching href.
- * Secondary routes win over their parent nav item. Falls back to "Rantai Lake".
+ * Secondary routes win over their parent nav item. Falls back to "RantAI Lakehouse".
  */
 export function pageTitleFor(pathname: string): string {
   const match = bestMatch(pathname, [
     ...SECONDARY_ROUTES,
     ...ALL_NAV_ITEMS.map(({ title, href }) => ({ title, href })),
   ])
-  return match?.title ?? "Rantai Lake"
+  return match?.title ?? "RantAI Lakehouse"
 }
 
 export type RouteAccessEntry = {

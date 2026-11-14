@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { ReportRenderView } from "@/features/dashboards/report-render-view";
 
 export const metadata: Metadata = {
-  title: "Report PDF · Rantai Lake",
+  title: "Report PDF · RantAI Lakehouse",
   robots: { index: false, follow: false },
   referrer: "no-referrer",
 };
