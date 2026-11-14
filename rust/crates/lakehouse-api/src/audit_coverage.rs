@@ -35,7 +35,8 @@
 //! query scope. It acts only when the matched `(method, pattern)` is
 //! `Central`. After the handler answers it writes one row: the principal,
 //! the entry's `action` and `resource_kind`, the `resource_id` read from the
-//! path parameter the entry names, the outcome by status (`2xx` is
+//! path parameter or the query-string parameter the entry names
+//! ([`IdParam`]), the outcome by status (`2xx` is
 //! `executed`, `5xx` is `failed`, every other status is `refused`), and the
 //! status code as `detail`. `args` is `{"fields": [...]}`: the sorted
 //! top-level key names of a JSON object body, never a value (feature page
@@ -68,10 +69,13 @@
 //!
 //! - A request the outer timeout layer cuts off writes no row: the
 //!   handler's future is dropped before this layer can write.
-//! - `resource_id` is null for a create whose id exists only in the
-//!   response, and for a route whose id travels in the query string or the
-//!   body (`DELETE /api/dashboard/boards?id=`): only a path parameter is
-//!   read. The row then names the kind and the action, not the object.
+//! - `resource_id` is read from a path parameter or a query-string parameter
+//!   (`DELETE /api/dashboard/boards?id=`), percent-decoded and cut to 200
+//!   characters. It is null for a create whose id exists only in the response,
+//!   for a route whose id travels in the body, and for a request that did not
+//!   send the query parameter. A value in a body or in a response is never
+//!   read for it (feature page Decision 3): the row then names the kind and
+//!   the action, not the object.
 //! - A key name in a body is recorded as sent. At most [`MAX_FIELD_NAMES`]
 //!   names of at most [`MAX_FIELD_NAME_CHARS`] characters are kept, so one
 //!   request cannot write a megabyte row.
@@ -114,15 +118,31 @@ pub enum Coverage {
         action: &'static str,
         /// The kind of object the route changes.
         resource_kind: &'static str,
-        /// The path parameter that holds the object's id, `None` when the id
-        /// is not in the path (see the module doc comment, "Limits").
-        id_param: Option<&'static str>,
+        /// Where the object's id is in the request (see the module doc
+        /// comment, "Limits").
+        id_param: IdParam,
     },
     /// No row, for a reason the feature page's Decision 1 lists.
     Excluded {
         /// Which Decision 1 item the route falls under, and why.
         reason: &'static str,
     },
+}
+
+/// Where a `Central` route's object id is found in the request. The id is
+/// never read from a body or a response (module doc comment, "Limits").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdParam {
+    /// The id is not in the path or the query string: the row names the kind
+    /// but not the object.
+    None,
+    /// The id is the path parameter of this name, as the router matched it.
+    Path(&'static str),
+    /// The id is the query-string parameter of this name, percent-decoded
+    /// (`DELETE /api/dashboard/boards?id=`). The table marks these
+    /// explicitly so the guard test can still hold a [`IdParam::Path`] name
+    /// to the route's own pattern.
+    Query(&'static str),
 }
 
 /// The largest JSON body [`audit_gate`] reads to name its fields: axum's own
@@ -181,12 +201,12 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("DELETE", "/api/catalog/{id}/grants/{grant_id}", Coverage::Handler { action: "catalog.revoke" }),
     ("POST", "/api/catalog/{id}/restore", Coverage::Handler { action: "catalog.restore" }),
     ("POST", "/api/catalog/{id}/drop", Coverage::Handler { action: "catalog.drop" }),
-    ("POST", "/api/lakehouse/tables/{ns}/{table}/maintenance", Coverage::Central { action: "table.maintenance_set", resource_kind: "iceberg_table", id_param: Some("table") }),
+    ("POST", "/api/lakehouse/tables/{ns}/{table}/maintenance", Coverage::Central { action: "table.maintenance_set", resource_kind: "iceberg_table", id_param: IdParam::Path("table") }),
     ("POST", "/api/overview", Coverage::Excluded { reason: EX_OVERVIEW }),
-    ("POST", "/api/overview/alerts/{id}/acknowledge", Coverage::Central { action: "overview_alert.acknowledge", resource_kind: "overview_alert", id_param: Some("id") }),
-    ("POST", "/api/overview/alerts/{id}/resolve", Coverage::Central { action: "overview_alert.resolve", resource_kind: "overview_alert", id_param: Some("id") }),
-    ("POST", "/api/overview/alerts/{id}/silence", Coverage::Central { action: "overview_alert.silence", resource_kind: "overview_alert", id_param: Some("id") }),
-    ("POST", "/api/ops/workloads/{id}/cancel", Coverage::Central { action: "workload.cancel", resource_kind: "workload", id_param: Some("id") }),
+    ("POST", "/api/overview/alerts/{id}/acknowledge", Coverage::Central { action: "overview_alert.acknowledge", resource_kind: "overview_alert", id_param: IdParam::Path("id") }),
+    ("POST", "/api/overview/alerts/{id}/resolve", Coverage::Central { action: "overview_alert.resolve", resource_kind: "overview_alert", id_param: IdParam::Path("id") }),
+    ("POST", "/api/overview/alerts/{id}/silence", Coverage::Central { action: "overview_alert.silence", resource_kind: "overview_alert", id_param: IdParam::Path("id") }),
+    ("POST", "/api/ops/workloads/{id}/cancel", Coverage::Central { action: "workload.cancel", resource_kind: "workload", id_param: IdParam::Path("id") }),
     ("POST", "/api/governance/policies", Coverage::Handler { action: "policy.create" }),
     ("POST", "/api/governance/policies/preview", Coverage::Excluded { reason: EX_READ_LIKE }),
     ("PUT", "/api/governance/policies/{id}/status", Coverage::Handler { action: "policy.enforce" }),
@@ -200,32 +220,32 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("POST", "/api/governance/quality/incidents/{id}/resolve", Coverage::Handler { action: "quality.incident_resolve" }),
     ("PUT", "/api/governance/quality/schedules/{asset}", Coverage::Handler { action: "quality.schedule_update" }),
     ("DELETE", "/api/governance/quality/schedules/{asset}", Coverage::Handler { action: "quality.schedule_reset" }),
-    ("POST", "/api/governance/quality/{id}/run", Coverage::Central { action: "quality.rule_run", resource_kind: "quality_rule", id_param: Some("id") }),
+    ("POST", "/api/governance/quality/{id}/run", Coverage::Central { action: "quality.rule_run", resource_kind: "quality_rule", id_param: IdParam::Path("id") }),
     ("PUT", "/api/governance/quality/{id}", Coverage::Handler { action: "quality.rule_update" }),
     ("DELETE", "/api/governance/quality/{id}", Coverage::Handler { action: "quality.rule_delete" }),
     ("POST", "/api/governance/{kind}", Coverage::Handler { action: "quality.rule_create" }),
-    ("POST", "/api/storage/policies", Coverage::Central { action: "storage.policy_create", resource_kind: "storage_policy", id_param: None }),
-    ("POST", "/api/storage/restore", Coverage::Central { action: "storage.restore", resource_kind: "storage", id_param: None }),
-    ("POST", "/api/alerts", Coverage::Central { action: "alert.create", resource_kind: "alert", id_param: None }),
-    ("PUT", "/api/alerts", Coverage::Central { action: "alert.update", resource_kind: "alert", id_param: None }),
-    ("DELETE", "/api/alerts", Coverage::Central { action: "alert.delete", resource_kind: "alert", id_param: None }),
+    ("POST", "/api/storage/policies", Coverage::Central { action: "storage.policy_create", resource_kind: "storage_policy", id_param: IdParam::None }),
+    ("POST", "/api/storage/restore", Coverage::Central { action: "storage.restore", resource_kind: "storage", id_param: IdParam::None }),
+    ("POST", "/api/alerts", Coverage::Central { action: "alert.create", resource_kind: "alert", id_param: IdParam::None }),
+    ("PUT", "/api/alerts", Coverage::Central { action: "alert.update", resource_kind: "alert", id_param: IdParam::None }),
+    ("DELETE", "/api/alerts", Coverage::Central { action: "alert.delete", resource_kind: "alert", id_param: IdParam::Query("id") }),
     ("POST", "/api/alerts/test", Coverage::Excluded { reason: EX_TEST_BUTTON }),
-    ("POST", "/api/alerts/run", Coverage::Central { action: "alert.run", resource_kind: "alert", id_param: None }),
-    ("POST", "/api/gold/export/{mart}", Coverage::Central { action: "gold.export", resource_kind: "gold_mart", id_param: Some("mart") }),
+    ("POST", "/api/alerts/run", Coverage::Central { action: "alert.run", resource_kind: "alert", id_param: IdParam::Query("id") }),
+    ("POST", "/api/gold/export/{mart}", Coverage::Central { action: "gold.export", resource_kind: "gold_mart", id_param: IdParam::Path("mart") }),
     ("PUT", "/api/gold/export/{mart}/publication", Coverage::Handler { action: "gold.publication_set" }),
     ("POST", "/api/query/run", Coverage::Handler { action: "query.run" }),
     ("POST", "/api/query/estimate", Coverage::Excluded { reason: EX_READ_LIKE }),
-    ("POST", "/api/query/saved", Coverage::Central { action: "saved_query.create", resource_kind: "saved_query", id_param: None }),
-    ("PATCH", "/api/query/saved/{id}", Coverage::Central { action: "saved_query.update", resource_kind: "saved_query", id_param: Some("id") }),
-    ("DELETE", "/api/query/saved/{id}", Coverage::Central { action: "saved_query.delete", resource_kind: "saved_query", id_param: Some("id") }),
-    ("POST", "/api/query/saved/{id}/duplicate", Coverage::Central { action: "saved_query.duplicate", resource_kind: "saved_query", id_param: Some("id") }),
-    ("POST", "/api/query/saved/{id}/restore", Coverage::Central { action: "saved_query.restore", resource_kind: "saved_query", id_param: Some("id") }),
-    ("POST", "/api/query/saved/{id}/versions/{version}/revert", Coverage::Central { action: "saved_query.revert", resource_kind: "saved_query", id_param: Some("id") }),
-    ("POST", "/api/query/folders", Coverage::Central { action: "query_folder.create", resource_kind: "query_folder", id_param: None }),
-    ("PATCH", "/api/query/folders/{id}", Coverage::Central { action: "query_folder.update", resource_kind: "query_folder", id_param: Some("id") }),
-    ("DELETE", "/api/query/folders/{id}", Coverage::Central { action: "query_folder.delete", resource_kind: "query_folder", id_param: Some("id") }),
-    ("PUT", "/api/query/saved/{id}/access", Coverage::Central { action: "saved_query.access_update", resource_kind: "saved_query", id_param: Some("id") }),
-    ("PUT", "/api/query/folders/{id}/access", Coverage::Central { action: "query_folder.access_update", resource_kind: "query_folder", id_param: Some("id") }),
+    ("POST", "/api/query/saved", Coverage::Central { action: "saved_query.create", resource_kind: "saved_query", id_param: IdParam::None }),
+    ("PATCH", "/api/query/saved/{id}", Coverage::Central { action: "saved_query.update", resource_kind: "saved_query", id_param: IdParam::Path("id") }),
+    ("DELETE", "/api/query/saved/{id}", Coverage::Central { action: "saved_query.delete", resource_kind: "saved_query", id_param: IdParam::Path("id") }),
+    ("POST", "/api/query/saved/{id}/duplicate", Coverage::Central { action: "saved_query.duplicate", resource_kind: "saved_query", id_param: IdParam::Path("id") }),
+    ("POST", "/api/query/saved/{id}/restore", Coverage::Central { action: "saved_query.restore", resource_kind: "saved_query", id_param: IdParam::Path("id") }),
+    ("POST", "/api/query/saved/{id}/versions/{version}/revert", Coverage::Central { action: "saved_query.revert", resource_kind: "saved_query", id_param: IdParam::Path("id") }),
+    ("POST", "/api/query/folders", Coverage::Central { action: "query_folder.create", resource_kind: "query_folder", id_param: IdParam::None }),
+    ("PATCH", "/api/query/folders/{id}", Coverage::Central { action: "query_folder.update", resource_kind: "query_folder", id_param: IdParam::Path("id") }),
+    ("DELETE", "/api/query/folders/{id}", Coverage::Central { action: "query_folder.delete", resource_kind: "query_folder", id_param: IdParam::Path("id") }),
+    ("PUT", "/api/query/saved/{id}/access", Coverage::Central { action: "saved_query.access_update", resource_kind: "saved_query", id_param: IdParam::Path("id") }),
+    ("PUT", "/api/query/folders/{id}/access", Coverage::Central { action: "query_folder.access_update", resource_kind: "query_folder", id_param: IdParam::Path("id") }),
     ("POST", "/api/pipelines", Coverage::Handler { action: "pipeline.create" }),
     ("POST", "/api/pipelines/generate", Coverage::Excluded { reason: EX_READ_LIKE }),
     ("POST", "/api/pipelines/preview", Coverage::Excluded { reason: EX_READ_LIKE }),
@@ -235,69 +255,69 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("POST", "/api/pipelines/runnable/{id}/lag-check", Coverage::Excluded { reason: EX_READ_LIKE }),
     ("POST", "/api/pipelines/runnable/{id}/compile", Coverage::Excluded { reason: EX_READ_LIKE }),
     ("POST", "/api/pipelines/{id}/trigger", Coverage::Handler { action: "pipeline.trigger" }),
-    ("POST", "/api/pipelines/{id}/status", Coverage::Central { action: "pipeline.status_set", resource_kind: "pipeline", id_param: Some("id") }),
+    ("POST", "/api/pipelines/{id}/status", Coverage::Central { action: "pipeline.status_set", resource_kind: "pipeline", id_param: IdParam::Path("id") }),
     ("POST", "/api/pipelines/{id}/pause", Coverage::Handler { action: "pipeline.pause" }),
     ("POST", "/api/pipelines/{id}/resume", Coverage::Handler { action: "pipeline.resume" }),
-    ("POST", "/api/pipelines/runs/{runId}/cancel", Coverage::Central { action: "pipeline.run_cancel", resource_kind: "pipeline_run", id_param: Some("runId") }),
-    ("POST", "/api/pipelines/runs/{runId}/retry", Coverage::Central { action: "pipeline.run_retry", resource_kind: "pipeline_run", id_param: Some("runId") }),
-    ("PUT", "/api/pipelines/{id}/tenant", Coverage::Central { action: "pipeline.tenant_assign", resource_kind: "pipeline", id_param: Some("id") }),
+    ("POST", "/api/pipelines/runs/{runId}/cancel", Coverage::Central { action: "pipeline.run_cancel", resource_kind: "pipeline_run", id_param: IdParam::Path("runId") }),
+    ("POST", "/api/pipelines/runs/{runId}/retry", Coverage::Central { action: "pipeline.run_retry", resource_kind: "pipeline_run", id_param: IdParam::Path("runId") }),
+    ("PUT", "/api/pipelines/{id}/tenant", Coverage::Central { action: "pipeline.tenant_assign", resource_kind: "pipeline", id_param: IdParam::Path("id") }),
     ("PUT", "/api/pipelines/{id}/run-as", Coverage::Handler { action: "pipeline.run_as.assign" }),
     ("POST", "/api/pipelines/events/run-failed", Coverage::Excluded { reason: EX_MACHINE }),
     ("POST", "/api/pipelines/events/run-finished", Coverage::Excluded { reason: EX_MACHINE }),
     ("PUT", "/api/pipelines/{id}/sla", Coverage::Handler { action: "pipeline.sla_set" }),
     ("POST", "/api/pipelines/{id}/versions/{version}/restore", Coverage::Handler { action: "pipeline.restore.version" }),
     ("POST", "/api/dashboard/specs/preview", Coverage::Excluded { reason: EX_READ_LIKE }),
-    ("POST", "/api/dashboard/specs", Coverage::Central { action: "dashboard_tile.create", resource_kind: "dashboard_tile", id_param: None }),
-    ("PUT", "/api/dashboard/specs", Coverage::Central { action: "dashboard_tile.update", resource_kind: "dashboard_tile", id_param: None }),
-    ("DELETE", "/api/dashboard/specs", Coverage::Central { action: "dashboard_tile.delete", resource_kind: "dashboard_tile", id_param: None }),
-    ("POST", "/api/dashboard/boards", Coverage::Central { action: "dashboard.create", resource_kind: "dashboard", id_param: None }),
-    ("PUT", "/api/dashboard/boards", Coverage::Central { action: "dashboard.update", resource_kind: "dashboard", id_param: None }),
-    ("DELETE", "/api/dashboard/boards", Coverage::Central { action: "dashboard.delete", resource_kind: "dashboard", id_param: None }),
-    ("POST", "/api/dashboard/folders", Coverage::Central { action: "dashboard_folder.create", resource_kind: "dashboard_folder", id_param: None }),
-    ("PUT", "/api/dashboard/folders", Coverage::Central { action: "dashboard_folder.update", resource_kind: "dashboard_folder", id_param: None }),
-    ("DELETE", "/api/dashboard/folders", Coverage::Central { action: "dashboard_folder.delete", resource_kind: "dashboard_folder", id_param: None }),
-    ("POST", "/api/dashboard/personal", Coverage::Central { action: "dashboard_folder.personal_create", resource_kind: "dashboard_folder", id_param: None }),
-    ("POST", "/api/dashboard/versions/revert", Coverage::Central { action: "dashboard.version_revert", resource_kind: "dashboard", id_param: None }),
-    ("POST", "/api/dashboard/trash/restore", Coverage::Central { action: "dashboard.restore", resource_kind: "dashboard", id_param: None }),
+    ("POST", "/api/dashboard/specs", Coverage::Central { action: "dashboard_tile.create", resource_kind: "dashboard_tile", id_param: IdParam::None }),
+    ("PUT", "/api/dashboard/specs", Coverage::Central { action: "dashboard_tile.update", resource_kind: "dashboard_tile", id_param: IdParam::None }),
+    ("DELETE", "/api/dashboard/specs", Coverage::Central { action: "dashboard_tile.delete", resource_kind: "dashboard_tile", id_param: IdParam::Query("id") }),
+    ("POST", "/api/dashboard/boards", Coverage::Central { action: "dashboard.create", resource_kind: "dashboard", id_param: IdParam::None }),
+    ("PUT", "/api/dashboard/boards", Coverage::Central { action: "dashboard.update", resource_kind: "dashboard", id_param: IdParam::None }),
+    ("DELETE", "/api/dashboard/boards", Coverage::Central { action: "dashboard.delete", resource_kind: "dashboard", id_param: IdParam::Query("id") }),
+    ("POST", "/api/dashboard/folders", Coverage::Central { action: "dashboard_folder.create", resource_kind: "dashboard_folder", id_param: IdParam::None }),
+    ("PUT", "/api/dashboard/folders", Coverage::Central { action: "dashboard_folder.update", resource_kind: "dashboard_folder", id_param: IdParam::None }),
+    ("DELETE", "/api/dashboard/folders", Coverage::Central { action: "dashboard_folder.delete", resource_kind: "dashboard_folder", id_param: IdParam::Query("id") }),
+    ("POST", "/api/dashboard/personal", Coverage::Central { action: "dashboard_folder.personal_create", resource_kind: "dashboard_folder", id_param: IdParam::None }),
+    ("POST", "/api/dashboard/versions/revert", Coverage::Central { action: "dashboard.version_revert", resource_kind: "dashboard", id_param: IdParam::None }),
+    ("POST", "/api/dashboard/trash/restore", Coverage::Central { action: "dashboard.restore", resource_kind: "dashboard", id_param: IdParam::None }),
     ("PUT", "/api/dashboard/favourites", Coverage::Excluded { reason: EX_UI_STATE }),
     ("POST", "/api/dashboard/recent", Coverage::Excluded { reason: EX_UI_STATE }),
-    ("POST", "/api/dashboard/sources", Coverage::Central { action: "dashboard_source.create", resource_kind: "dashboard_source", id_param: None }),
-    ("PUT", "/api/dashboard/sources", Coverage::Central { action: "dashboard_source.update", resource_kind: "dashboard_source", id_param: None }),
-    ("DELETE", "/api/dashboard/sources", Coverage::Central { action: "dashboard_source.delete", resource_kind: "dashboard_source", id_param: None }),
+    ("POST", "/api/dashboard/sources", Coverage::Central { action: "dashboard_source.create", resource_kind: "dashboard_source", id_param: IdParam::None }),
+    ("PUT", "/api/dashboard/sources", Coverage::Central { action: "dashboard_source.update", resource_kind: "dashboard_source", id_param: IdParam::None }),
+    ("DELETE", "/api/dashboard/sources", Coverage::Central { action: "dashboard_source.delete", resource_kind: "dashboard_source", id_param: IdParam::Query("id") }),
     ("POST", "/api/dashboard/sources/preview", Coverage::Excluded { reason: EX_READ_LIKE }),
-    ("POST", "/api/dashboard/calc-fields", Coverage::Central { action: "calculated_field.create", resource_kind: "calculated_field", id_param: None }),
-    ("PUT", "/api/dashboard/calc-fields", Coverage::Central { action: "calculated_field.update", resource_kind: "calculated_field", id_param: None }),
-    ("DELETE", "/api/dashboard/calc-fields", Coverage::Central { action: "calculated_field.delete", resource_kind: "calculated_field", id_param: None }),
+    ("POST", "/api/dashboard/calc-fields", Coverage::Central { action: "calculated_field.create", resource_kind: "calculated_field", id_param: IdParam::None }),
+    ("PUT", "/api/dashboard/calc-fields", Coverage::Central { action: "calculated_field.update", resource_kind: "calculated_field", id_param: IdParam::None }),
+    ("DELETE", "/api/dashboard/calc-fields", Coverage::Central { action: "calculated_field.delete", resource_kind: "calculated_field", id_param: IdParam::Query("id") }),
     ("POST", "/api/dashboard/calc-fields/validate", Coverage::Excluded { reason: EX_READ_LIKE }),
-    ("POST", "/api/dashboard/metrics", Coverage::Central { action: "metric.create", resource_kind: "metric", id_param: None }),
-    ("PUT", "/api/dashboard/metrics", Coverage::Central { action: "metric.update", resource_kind: "metric", id_param: None }),
-    ("DELETE", "/api/dashboard/metrics", Coverage::Central { action: "metric.delete", resource_kind: "metric", id_param: None }),
+    ("POST", "/api/dashboard/metrics", Coverage::Central { action: "metric.create", resource_kind: "metric", id_param: IdParam::None }),
+    ("PUT", "/api/dashboard/metrics", Coverage::Central { action: "metric.update", resource_kind: "metric", id_param: IdParam::None }),
+    ("DELETE", "/api/dashboard/metrics", Coverage::Central { action: "metric.delete", resource_kind: "metric", id_param: IdParam::Query("id") }),
     ("POST", "/api/dashboard/metrics/validate", Coverage::Excluded { reason: EX_READ_LIKE }),
-    ("POST", "/api/dashboard/segments", Coverage::Central { action: "segment.create", resource_kind: "segment", id_param: None }),
-    ("PUT", "/api/dashboard/segments", Coverage::Central { action: "segment.update", resource_kind: "segment", id_param: None }),
-    ("DELETE", "/api/dashboard/segments", Coverage::Central { action: "segment.delete", resource_kind: "segment", id_param: None }),
-    ("POST", "/api/dashboard/hierarchies", Coverage::Central { action: "hierarchy.create", resource_kind: "hierarchy", id_param: None }),
-    ("PUT", "/api/dashboard/hierarchies", Coverage::Central { action: "hierarchy.update", resource_kind: "hierarchy", id_param: None }),
-    ("DELETE", "/api/dashboard/hierarchies", Coverage::Central { action: "hierarchy.delete", resource_kind: "hierarchy", id_param: None }),
-    ("POST", "/api/dashboard/params", Coverage::Central { action: "dashboard_param.create", resource_kind: "dashboard_param", id_param: None }),
-    ("PUT", "/api/dashboard/params", Coverage::Central { action: "dashboard_param.update", resource_kind: "dashboard_param", id_param: None }),
-    ("DELETE", "/api/dashboard/params", Coverage::Central { action: "dashboard_param.delete", resource_kind: "dashboard_param", id_param: None }),
+    ("POST", "/api/dashboard/segments", Coverage::Central { action: "segment.create", resource_kind: "segment", id_param: IdParam::None }),
+    ("PUT", "/api/dashboard/segments", Coverage::Central { action: "segment.update", resource_kind: "segment", id_param: IdParam::None }),
+    ("DELETE", "/api/dashboard/segments", Coverage::Central { action: "segment.delete", resource_kind: "segment", id_param: IdParam::Query("id") }),
+    ("POST", "/api/dashboard/hierarchies", Coverage::Central { action: "hierarchy.create", resource_kind: "hierarchy", id_param: IdParam::None }),
+    ("PUT", "/api/dashboard/hierarchies", Coverage::Central { action: "hierarchy.update", resource_kind: "hierarchy", id_param: IdParam::None }),
+    ("DELETE", "/api/dashboard/hierarchies", Coverage::Central { action: "hierarchy.delete", resource_kind: "hierarchy", id_param: IdParam::Query("id") }),
+    ("POST", "/api/dashboard/params", Coverage::Central { action: "dashboard_param.create", resource_kind: "dashboard_param", id_param: IdParam::None }),
+    ("PUT", "/api/dashboard/params", Coverage::Central { action: "dashboard_param.update", resource_kind: "dashboard_param", id_param: IdParam::None }),
+    ("DELETE", "/api/dashboard/params", Coverage::Central { action: "dashboard_param.delete", resource_kind: "dashboard_param", id_param: IdParam::Query("id") }),
     ("POST", "/api/dashboard/import/preview", Coverage::Excluded { reason: EX_READ_LIKE }),
-    ("POST", "/api/dashboard/import", Coverage::Central { action: "dashboard.import", resource_kind: "dashboard", id_param: None }),
-    ("POST", "/api/reports/subscriptions", Coverage::Central { action: "report_subscription.create", resource_kind: "report_subscription", id_param: None }),
-    ("PUT", "/api/reports/subscriptions/{id}", Coverage::Central { action: "report_subscription.update", resource_kind: "report_subscription", id_param: Some("id") }),
-    ("DELETE", "/api/reports/subscriptions/{id}", Coverage::Central { action: "report_subscription.delete", resource_kind: "report_subscription", id_param: Some("id") }),
-    ("POST", "/api/reports/subscriptions/{id}/send", Coverage::Central { action: "report_subscription.send", resource_kind: "report_subscription", id_param: Some("id") }),
-    ("POST", "/api/dashboard/embed-revoke", Coverage::Central { action: "dashboard.embed_revoke", resource_kind: "dashboard", id_param: None }),
+    ("POST", "/api/dashboard/import", Coverage::Central { action: "dashboard.import", resource_kind: "dashboard", id_param: IdParam::None }),
+    ("POST", "/api/reports/subscriptions", Coverage::Central { action: "report_subscription.create", resource_kind: "report_subscription", id_param: IdParam::None }),
+    ("PUT", "/api/reports/subscriptions/{id}", Coverage::Central { action: "report_subscription.update", resource_kind: "report_subscription", id_param: IdParam::Path("id") }),
+    ("DELETE", "/api/reports/subscriptions/{id}", Coverage::Central { action: "report_subscription.delete", resource_kind: "report_subscription", id_param: IdParam::Path("id") }),
+    ("POST", "/api/reports/subscriptions/{id}/send", Coverage::Central { action: "report_subscription.send", resource_kind: "report_subscription", id_param: IdParam::Path("id") }),
+    ("POST", "/api/dashboard/embed-revoke", Coverage::Central { action: "dashboard.embed_revoke", resource_kind: "dashboard", id_param: IdParam::None }),
     ("PUT", "/api/dashboard/embed-settings", Coverage::Handler { action: "dashboard.embed_settings" }),
     ("PUT", "/api/dashboard/access", Coverage::Handler { action: "dashboard.access_change" }),
     ("PUT", "/api/dashboard/public-link", Coverage::Handler { action: "dashboard.public_link_create" }),
     ("DELETE", "/api/dashboard/public-link", Coverage::Handler { action: "dashboard.public_link_delete" }),
-    ("POST", "/api/dashboard/comments", Coverage::Central { action: "dashboard_comment.create", resource_kind: "dashboard_comment", id_param: None }),
+    ("POST", "/api/dashboard/comments", Coverage::Central { action: "dashboard_comment.create", resource_kind: "dashboard_comment", id_param: IdParam::None }),
     ("POST", "/api/dashboard/comments/mentions/read", Coverage::Excluded { reason: EX_UI_STATE }),
-    ("PUT", "/api/dashboard/comments/{id}", Coverage::Central { action: "dashboard_comment.update", resource_kind: "dashboard_comment", id_param: Some("id") }),
-    ("DELETE", "/api/dashboard/comments/{id}", Coverage::Central { action: "dashboard_comment.delete", resource_kind: "dashboard_comment", id_param: Some("id") }),
-    ("PUT", "/api/settings/reporting", Coverage::Central { action: "settings.reporting.update", resource_kind: "settings", id_param: None }),
+    ("PUT", "/api/dashboard/comments/{id}", Coverage::Central { action: "dashboard_comment.update", resource_kind: "dashboard_comment", id_param: IdParam::Path("id") }),
+    ("DELETE", "/api/dashboard/comments/{id}", Coverage::Central { action: "dashboard_comment.delete", resource_kind: "dashboard_comment", id_param: IdParam::Path("id") }),
+    ("PUT", "/api/settings/reporting", Coverage::Central { action: "settings.reporting.update", resource_kind: "settings", id_param: IdParam::None }),
     ("PUT", "/api/settings/email", Coverage::Handler { action: "settings.email.update" }),
     ("POST", "/api/settings/email/test", Coverage::Excluded { reason: EX_TEST_BUTTON }),
     ("PUT", "/api/settings/sign-in", Coverage::Handler { action: "settings.sign_in.update" }),
@@ -305,15 +325,15 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("POST", "/api/settings/assistant/test", Coverage::Excluded { reason: EX_TEST_BUTTON }),
     ("PUT", "/api/settings/sso", Coverage::Handler { action: "settings.sso.update" }),
     ("POST", "/api/settings/sso/test", Coverage::Excluded { reason: EX_TEST_BUTTON }),
-    ("POST", "/api/query/cancel", Coverage::Central { action: "query.cancel", resource_kind: "query_run", id_param: None }),
-    ("PUT", "/api/settings/limits", Coverage::Central { action: "settings.limits.update", resource_kind: "settings", id_param: None }),
-    ("POST", "/api/ai/chat", Coverage::Handler { action: "create_chart" }),
-    ("POST", "/api/ai/tool", Coverage::Handler { action: "create_chart" }),
+    ("POST", "/api/query/cancel", Coverage::Central { action: "query.cancel", resource_kind: "query_run", id_param: IdParam::None }),
+    ("PUT", "/api/settings/limits", Coverage::Central { action: "settings.limits.update", resource_kind: "settings", id_param: IdParam::None }),
+    ("POST", "/api/ai/chat", Coverage::Handler { action: crate::routes::ASSISTANT_CHAT_ACTION }),
+    ("POST", "/api/ai/tool", Coverage::Handler { action: crate::routes::ASSISTANT_TOOL_ACTION }),
     ("POST", "/api/ai/sessions", Coverage::Excluded { reason: EX_UI_STATE }),
     ("PATCH", "/api/ai/sessions", Coverage::Excluded { reason: EX_UI_STATE }),
     ("DELETE", "/api/ai/sessions", Coverage::Excluded { reason: EX_UI_STATE }),
-    ("PUT", "/api/ai/terms", Coverage::Central { action: "ai_term.set", resource_kind: "ai_term", id_param: None }),
-    ("DELETE", "/api/ai/terms", Coverage::Central { action: "ai_term.delete", resource_kind: "ai_term", id_param: None }),
+    ("PUT", "/api/ai/terms", Coverage::Central { action: "ai_term.set", resource_kind: "ai_term", id_param: IdParam::None }),
+    ("DELETE", "/api/ai/terms", Coverage::Central { action: "ai_term.delete", resource_kind: "ai_term", id_param: IdParam::Query("term") }),
     ("PUT", "/api/home/layout", Coverage::Excluded { reason: EX_UI_STATE }),
     ("DELETE", "/api/home/layout", Coverage::Excluded { reason: EX_UI_STATE }),
     ("POST", "/api/identity/users", Coverage::Handler { action: "identity.user.invite" }),
@@ -324,12 +344,12 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("POST", "/api/identity/users/{id}/deactivate", Coverage::Handler { action: "identity.user.deactivate" }),
     ("POST", "/api/identity/users/{id}/reactivate", Coverage::Handler { action: "identity.user.reactivate" }),
     ("POST", "/api/identity/users/{id}/reset-password", Coverage::Handler { action: "identity.user.password_reset" }),
-    ("POST", "/api/identity/roles", Coverage::Central { action: "identity.role.create", resource_kind: "role", id_param: None }),
+    ("POST", "/api/identity/roles", Coverage::Central { action: "identity.role.create", resource_kind: "role", id_param: IdParam::None }),
     ("PUT", "/api/identity/roles/{id}", Coverage::Handler { action: "identity.role.update" }),
     ("DELETE", "/api/identity/roles/{id}", Coverage::Handler { action: "identity.role.delete" }),
     ("PUT", "/api/identity/roles/{id}/table-access", Coverage::Handler { action: "identity.role.table_access.update" }),
     ("POST", "/api/identity/tenants", Coverage::Handler { action: "identity.tenant.create" }),
-    ("POST", "/api/identity/service-identities", Coverage::Central { action: "identity.service_identity.create", resource_kind: "service_identity", id_param: None }),
+    ("POST", "/api/identity/service-identities", Coverage::Central { action: "identity.service_identity.create", resource_kind: "service_identity", id_param: IdParam::None }),
     ("POST", "/api/identity/service-identities/{id}/rotate", Coverage::Handler { action: "identity.service_identity.rotate" }),
     ("POST", "/api/connectors", Coverage::Handler { action: "connector.create" }),
     ("DELETE", "/api/connectors/{id}", Coverage::Handler { action: "connector.delete" }),
@@ -337,7 +357,7 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("POST", "/api/connectors/{id}/test", Coverage::Handler { action: "connector.test" }),
     ("PUT", "/api/connectors/{id}/secret", Coverage::Handler { action: "connector.secret_rotate" }),
     ("PUT", "/api/connectors/{id}/credential", Coverage::Handler { action: "connector.credential_set" }),
-    ("POST", "/api/connectors/{id}/discovery/{kind}", Coverage::Central { action: "connector.discover", resource_kind: "connector", id_param: Some("id") }),
+    ("POST", "/api/connectors/{id}/discovery/{kind}", Coverage::Central { action: "connector.discover", resource_kind: "connector", id_param: IdParam::Path("id") }),
     ("PUT", "/api/connectors/{id}/ingest-spec", Coverage::Handler { action: "connector.update" }),
     ("POST", "/api/connectors/{id}/ingest/run", Coverage::Handler { action: "connector.ingest.run" }),
     ("POST", "/api/connectors/{id}/schema-observations", Coverage::Excluded { reason: EX_MACHINE }),
@@ -355,13 +375,13 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("POST", "/api/connectors/{id}/oauth/sign-out", Coverage::Handler { action: "connector.oauth_signed_out" }),
     ("POST", "/api/connectors/{id}/oauth/refresh-token", Coverage::Handler { action: "connector.oauth_refresh_token_rotated" }),
     ("POST", "/api/connectors/{id}/schema-changes/approve", Coverage::Handler { action: "connector.schema_change.approve" }),
-    ("PUT", "/api/connectors/{id}/tenant", Coverage::Central { action: "connector.tenant_assign", resource_kind: "connector", id_param: Some("id") }),
+    ("PUT", "/api/connectors/{id}/tenant", Coverage::Central { action: "connector.tenant_assign", resource_kind: "connector", id_param: IdParam::Path("id") }),
     ("POST", "/api/uploads", Coverage::Handler { action: "upload.create" }),
     ("DELETE", "/api/uploads/{id}", Coverage::Handler { action: "upload.delete" }),
     ("POST", "/api/uploads/{id}/ingest", Coverage::Handler { action: "upload.ingest" }),
     ("POST", "/api/uploads/{id}/check", Coverage::Excluded { reason: EX_READ_LIKE }),
     ("POST", "/api/uploads/{id}/compare", Coverage::Excluded { reason: EX_READ_LIKE }),
-    ("POST", "/api/uploads/sessions", Coverage::Central { action: "upload.session_start", resource_kind: "upload", id_param: None }),
+    ("POST", "/api/uploads/sessions", Coverage::Central { action: "upload.session_start", resource_kind: "upload", id_param: IdParam::None }),
     ("PUT", "/api/uploads/{id}/parts/{n}", Coverage::Excluded { reason: EX_PART }),
     ("POST", "/api/uploads/{id}/complete", Coverage::Handler { action: "upload.create" }),
     ("POST", "/api/uploads/folders", Coverage::Handler { action: "upload.folder.create" }),
@@ -371,14 +391,14 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("POST", "/api/maps", Coverage::Handler { action: "map_upload" }),
     ("PATCH", "/api/maps/{id}", Coverage::Handler { action: "map_rename" }),
     ("DELETE", "/api/maps/{id}", Coverage::Handler { action: "map_delete" }),
-    ("POST", "/api/knowledge/sources", Coverage::Central { action: "knowledge_source.create", resource_kind: "knowledge_source", id_param: None }),
-    ("POST", "/api/knowledge/vector-jobs", Coverage::Central { action: "knowledge_vector_job.create", resource_kind: "knowledge_vector_job", id_param: None }),
-    ("POST", "/api/agents/workflows", Coverage::Central { action: "agent_workflow.create", resource_kind: "agent_workflow", id_param: None }),
-    ("POST", "/api/agents/employees", Coverage::Central { action: "digital_employee.create", resource_kind: "digital_employee", id_param: None }),
-    ("POST", "/api/agents/employees/{id}/suspend", Coverage::Central { action: "digital_employee.suspend", resource_kind: "digital_employee", id_param: Some("id") }),
-    ("POST", "/api/agents/employees/{id}/resume", Coverage::Central { action: "digital_employee.resume", resource_kind: "digital_employee", id_param: Some("id") }),
-    ("POST", "/api/agents/employees/{id}/revoke", Coverage::Central { action: "digital_employee.revoke", resource_kind: "digital_employee", id_param: Some("id") }),
-    ("POST", "/api/agents/employees/{id}/run", Coverage::Central { action: "digital_employee.run", resource_kind: "digital_employee", id_param: Some("id") }),
+    ("POST", "/api/knowledge/sources", Coverage::Central { action: "knowledge_source.create", resource_kind: "knowledge_source", id_param: IdParam::None }),
+    ("POST", "/api/knowledge/vector-jobs", Coverage::Central { action: "knowledge_vector_job.create", resource_kind: "knowledge_vector_job", id_param: IdParam::None }),
+    ("POST", "/api/agents/workflows", Coverage::Central { action: "agent_workflow.create", resource_kind: "agent_workflow", id_param: IdParam::None }),
+    ("POST", "/api/agents/employees", Coverage::Central { action: "digital_employee.create", resource_kind: "digital_employee", id_param: IdParam::None }),
+    ("POST", "/api/agents/employees/{id}/suspend", Coverage::Central { action: "digital_employee.suspend", resource_kind: "digital_employee", id_param: IdParam::Path("id") }),
+    ("POST", "/api/agents/employees/{id}/resume", Coverage::Central { action: "digital_employee.resume", resource_kind: "digital_employee", id_param: IdParam::Path("id") }),
+    ("POST", "/api/agents/employees/{id}/revoke", Coverage::Central { action: "digital_employee.revoke", resource_kind: "digital_employee", id_param: IdParam::Path("id") }),
+    ("POST", "/api/agents/employees/{id}/run", Coverage::Central { action: "digital_employee.run", resource_kind: "digital_employee", id_param: IdParam::Path("id") }),
     ("POST", "/api/agents/approvals/{id}/decide", Coverage::Handler { action: crate::routes::agents::APPROVAL_DECIDE_ACTION }),
 ];
 
@@ -440,12 +460,26 @@ pub(crate) async fn path_params(parts: &mut Parts) -> Vec<(String, String)> {
     }
 }
 
-/// The value of path parameter `name` cut to [`MAX_RESOURCE_ID_CHARS`].
-fn param_value(params: &[(String, String)], name: &str) -> Option<String> {
-    params
-        .iter()
-        .find(|(key, _)| key == name)
-        .map(|(_, value)| value.chars().take(MAX_RESOURCE_ID_CHARS).collect())
+/// The object id a request names, cut to [`MAX_RESOURCE_ID_CHARS`]: the path
+/// parameter, or the first query-string parameter of that name,
+/// percent-decoded as the handler's own `Query` extractor decodes it. `None`
+/// when the route has no id there, or the request did not send one.
+fn object_id(
+    id_param: IdParam,
+    params: &[(String, String)],
+    query: Option<&str>,
+) -> Option<String> {
+    let value = match id_param {
+        IdParam::None => return None,
+        IdParam::Path(name) => params
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())?,
+        IdParam::Query(name) => url::form_urlencoded::parse(query?.as_bytes())
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.into_owned())?,
+    };
+    Some(value.chars().take(MAX_RESOURCE_ID_CHARS).collect())
 }
 
 /// The audit columns that name who did it.
@@ -464,8 +498,8 @@ fn actor(principal: Option<&Principal>) -> (Option<String>, Option<String>, Stri
 /// (see the module doc comment, "Refused at the gate"). Writes nothing for a
 /// route that is not in [`AUDIT_TABLE`] or is `Excluded`.
 ///
-/// `params` are the request's path parameters; the id of a `Central` route is
-/// read from them. `detail` is the missing permission or the fixed
+/// `params` are the request's path parameters and `query` its raw query
+/// string; the id of a `Central` route is read from them. `detail` is the missing permission or the fixed
 /// password-rotation sentence, text the gate wrote itself.
 pub async fn record_gate_refusal(
     state: &AppState,
@@ -473,6 +507,7 @@ pub async fn record_gate_refusal(
     method: &str,
     pattern: &str,
     params: &[(String, String)],
+    query: Option<&str>,
     detail: &str,
 ) {
     let (action, resource_kind, resource_id) = match coverage_for(method, pattern) {
@@ -484,7 +519,7 @@ pub async fn record_gate_refusal(
         }) => (
             action,
             Some(resource_kind.to_owned()),
-            id_param.and_then(|name| param_value(params, name)),
+            object_id(id_param, params, query),
         ),
         Some(Coverage::Excluded { .. }) | None => return,
     };
@@ -610,7 +645,7 @@ pub async fn audit_gate(
     let (mut parts, body) = req.into_parts();
     let principal = parts.extensions.get::<Principal>().cloned();
     let params = path_params(&mut parts).await;
-    let resource_id = id_param.and_then(|name| param_value(&params, name));
+    let resource_id = object_id(id_param, &params, parts.uri.query());
     let req = Request::from_parts(parts, body);
 
     let (fields, response) = match peek_fields(req).await {

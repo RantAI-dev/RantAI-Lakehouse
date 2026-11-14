@@ -4235,6 +4235,22 @@ pub(crate) const GRANT_DAYS: i64 = 30;
 /// permission), which is chosen at run time and so cannot be the table's name.
 pub(crate) const ACCESS_DECIDE_ACTION: &str = "catalog.access_decide";
 
+/// `args` of an access decision's audit row: the comment, and for an approval
+/// the grant it made: who received which permission until when (`GOV-1`
+/// Decision 3). A rejection grants nothing, so it names no grantee.
+fn decision_args(
+    comment: Option<&str>,
+    grant: Option<&lakehouse_store::agents::AccessGrant>,
+) -> Value {
+    let mut args = json!({ "comment": comment });
+    if let (Some(args), Some(grant)) = (args.as_object_mut(), grant) {
+        args.insert("permission".to_owned(), json!(grant.permission));
+        args.insert("grantee".to_owned(), json!(grant.user_id.to_string()));
+        args.insert("expiresAt".to_owned(), json!(grant.expires_at));
+    }
+    args
+}
+
 /// See [`DecideAccessRequestBody`]'s doc comment — reuses
 /// `routes::agents::DecideApprovalBody`'s exact shape (WS7 item E3, N1),
 /// never a redefined struct.
@@ -4354,7 +4370,7 @@ pub async fn decide_access_request(
             action: existing.action.clone(),
             resource_kind: Some("approval".to_owned()),
             resource_id: Some(id.clone()),
-            args: Some(json!({ "comment": body.comment })),
+            args: Some(decision_args(body.comment.as_deref(), grant.as_ref())),
             outcome: decide_outcome.to_owned(),
             approval_id: Some(id.clone()),
             ..Default::default()

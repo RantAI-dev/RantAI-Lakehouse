@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
-use lakehouse_api::audit_coverage::{AUDIT_TABLE, Coverage};
+use lakehouse_api::audit_coverage::{AUDIT_TABLE, Coverage, IdParam};
 use lakehouse_api::policy::{ANY_METHOD, POLICY_TABLE};
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -160,7 +160,8 @@ fn every_handler_action_is_a_string_literal_in_a_route_source() {
 
 /// Check 4: a `Central` action is `module.verb`, no two `Central` routes (or
 /// a `Central` and a `Handler` route) share one, and its `id_param` is a
-/// parameter of its own pattern.
+/// path parameter of its own pattern, or a query-string name the table marks
+/// as such.
 ///
 /// The `module.verb` shape is asked of `Central` actions only: a `Handler`
 /// action is whatever its handler has written since before this table (the
@@ -168,7 +169,7 @@ fn every_handler_action_is_a_string_literal_in_a_route_source() {
 /// `map_upload`, `map_rename` and `map_delete`), and renaming one would split
 /// the history an auditor reads.
 #[test]
-fn central_actions_are_module_verb_unique_and_read_their_id_from_the_path() {
+fn central_actions_are_module_verb_unique_and_read_their_id_from_the_path_or_the_query() {
     let handler_actions: BTreeSet<&str> = AUDIT_TABLE
         .iter()
         .filter_map(|(_, _, coverage)| match coverage {
@@ -202,11 +203,20 @@ fn central_actions_are_module_verb_unique_and_read_their_id_from_the_path() {
         if let Some(previous) = seen.insert(action, route.clone()) {
             panic!("{route}: Central action {action:?} is already {previous}'s");
         }
-        if let Some(param) = id_param {
-            assert!(
+        // A path id must be a parameter of the route's own pattern; a query
+        // id is marked explicitly, and cannot also be a path parameter (that
+        // row would read a name the router never set).
+        match id_param {
+            IdParam::None => {}
+            IdParam::Path(param) => assert!(
                 pattern.contains(&format!("{{{param}}}")),
                 "{route}: id_param {param:?} is not a path parameter of the pattern"
-            );
+            ),
+            IdParam::Query(param) => assert!(
+                !pattern.contains(&format!("{{{param}}}")),
+                "{route}: id_param {param:?} is marked as a query parameter but is a path \
+                 parameter of the pattern"
+            ),
         }
     }
 }
@@ -424,6 +434,65 @@ async fn dashboard_and_alert_changes_write_a_row_even_when_they_fail() {
     assert_eq!(alert["args"], json!({"fields": ["kind", "name"]}));
 }
 
+/// An object whose id travels in the query string is named on its row: the
+/// value is percent-decoded, and a missing or empty `id` leaves the id null.
+#[tokio::test]
+async fn a_delete_names_the_object_whose_id_is_in_the_query_string() {
+    let TestApp { router, pool } = spin_up().await;
+    let user = create_principal_with_permissions(&pool, "dashboard:write").await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let (_, _) = call(
+        &router,
+        "DELETE",
+        "/api/dashboard/boards?id=board%2042&other=ignored",
+        &cookie,
+        None,
+    )
+    .await;
+    let (_, _) = call(&router, "DELETE", "/api/dashboard/boards", &cookie, None).await;
+    let long = "b".repeat(300);
+    let (_, _) = call(
+        &router,
+        "DELETE",
+        &format!("/api/dashboard/boards?id={long}"),
+        &cookie,
+        None,
+    )
+    .await;
+
+    let rows = audit_rows(&pool, "dashboard.delete").await;
+    assert_eq!(rows.len(), 3, "{rows:#?}");
+    let ids: Vec<&Value> = rows.iter().map(|row| &row["resource_id"]).collect();
+    assert!(ids.contains(&&json!("board 42")), "decoded id: {ids:?}");
+    assert!(ids.contains(&&Value::Null), "no id in the query: {ids:?}");
+    assert!(
+        ids.contains(&&json!("b".repeat(200))),
+        "an id is cut at 200 characters: {ids:?}"
+    );
+}
+
+/// The same id is named on the `refused` row the gate writes when it turns
+/// the caller away before the handler runs.
+#[tokio::test]
+async fn a_refusal_at_the_gate_names_the_object_in_the_query_string() {
+    let TestApp { router, pool } = spin_up().await;
+    let nobody = create_zero_permission_principal(&pool).await;
+    let cookie = session_cookie_for_user(&pool, nobody).await;
+    let (status, _) = call(
+        &router,
+        "DELETE",
+        "/api/dashboard/boards?id=board-7",
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let row = the_row(&pool, "dashboard.delete").await;
+    assert_eq!(row["outcome"], "refused");
+    assert_eq!(row["resource_id"], json!("board-7"));
+}
+
 /// AC4: the query-limits save names the fields it carried and none of the
 /// values, not a number and not the role it named.
 #[tokio::test]
@@ -554,6 +623,38 @@ async fn a_refusal_at_the_gate_on_a_handler_route_writes_one_refused_row() {
     assert_eq!(row["outcome"], "refused");
     assert_eq!(row["detail"], "identity:write");
     assert_eq!(row["principal_id"], json!(nobody.to_string()));
+}
+
+/// The assistant's routes write one row per tool call under the tool's own
+/// name, so the name the table gives them is only the label of a refusal at
+/// the gate. It must not be a tool's name: a refused request to the chat or
+/// tool route would read as a refused `create_chart`.
+#[tokio::test]
+async fn a_refusal_at_the_gate_on_the_assistant_routes_is_named_for_the_route() {
+    let TestApp { router, pool } = spin_up().await;
+    let nobody = create_zero_permission_principal(&pool).await;
+    let cookie = session_cookie_for_user(&pool, nobody).await;
+    for (path, action) in [
+        ("/api/ai/tool", "assistant.tool"),
+        ("/api/ai/chat", "assistant.chat"),
+    ] {
+        let (status, _) = call(
+            &router,
+            "POST",
+            path,
+            &cookie,
+            Some(json!({"tool": "create_chart"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+        let row = the_row(&pool, action).await;
+        assert_eq!(row["outcome"], "refused", "{path}");
+        assert_eq!(row["principal_id"], json!(nobody.to_string()));
+    }
+    assert!(
+        audit_rows(&pool, "create_chart").await.is_empty(),
+        "a refused route is not a refused create_chart"
+    );
 }
 
 /// A caller that has to rotate its password is turned away from every route
@@ -712,4 +813,89 @@ async fn a_body_with_no_declared_length_is_not_read_and_still_reaches_the_handle
     let row = the_row(&pool, "saved_query.create").await;
     assert_eq!(row["args"], json!({"fields": null}));
     assert_eq!(row["outcome"], "executed");
+}
+
+// ── Old and new values of a policy change ───────────────────────────────────
+
+/// Authors a policy that binds no table, so its rows sit on the policy
+/// itself, and returns its id.
+async fn author_policy(app: &axum::Router, cookie: &str, name: &str, activate: bool) -> String {
+    let (status, created) = call(
+        app,
+        "POST",
+        "/api/governance/policies",
+        cookie,
+        Some(json!({
+            "name": name,
+            "kind": "Agent autonomy",
+            "subjects": "Every digital employee",
+            "resources": "Every tool",
+            "effect": "Permit with obligation",
+            "activate": activate,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    created["id"].as_str().expect("the policy id").to_owned()
+}
+
+/// A policy change names what it changed from and to: creating one records
+/// the definition it created (also for a policy that binds no table, which
+/// used to leave no row), switching it on and off records both statuses, and
+/// deleting it records what it was.
+#[tokio::test]
+async fn a_policy_change_records_the_old_and_the_new_value() {
+    let TestApp { router, pool } = spin_up().await;
+    let admin = create_principal_with_permissions(&pool, "policy:write").await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+
+    let id = author_policy(&router, &cookie, "Hold writes at night", false).await;
+    let create = the_row(&pool, "policy.create").await;
+    assert_eq!(create["resource_kind"], "policy");
+    assert_eq!(create["resource_id"], json!(id));
+    assert_eq!(create["args"]["name"], "Hold writes at night");
+    assert_eq!(create["args"]["newStatus"], "draft");
+    assert_eq!(create["args"]["kind"], "Agent autonomy");
+    assert_eq!(create["args"]["effect"], "Permit with obligation");
+
+    let (status, _) = call(
+        &router,
+        "PUT",
+        &format!("/api/governance/policies/{id}/status"),
+        &cookie,
+        Some(json!({"status": "ready"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let enforce = the_row(&pool, "policy.enforce").await;
+    assert_eq!(enforce["args"]["oldStatus"], "draft");
+    assert_eq!(enforce["args"]["newStatus"], "ready");
+
+    let (status, _) = call(
+        &router,
+        "PUT",
+        &format!("/api/governance/policies/{id}/status"),
+        &cookie,
+        Some(json!({"status": "draft"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let suspend = the_row(&pool, "policy.suspend").await;
+    assert_eq!(suspend["args"]["oldStatus"], "ready");
+    assert_eq!(suspend["args"]["newStatus"], "draft");
+
+    let (status, _) = call(
+        &router,
+        "DELETE",
+        &format!("/api/governance/policies/{id}"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let delete = the_row(&pool, "policy.delete").await;
+    assert_eq!(delete["args"]["name"], "Hold writes at night");
+    assert_eq!(delete["args"]["oldStatus"], "draft");
+    assert_eq!(delete["args"]["kind"], "Agent autonomy");
+    assert_eq!(delete["args"]["effect"], "Permit with obligation");
 }

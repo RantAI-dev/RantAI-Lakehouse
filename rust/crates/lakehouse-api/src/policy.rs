@@ -1376,6 +1376,7 @@ pub async fn auth_gate(
                     &method,
                     matched_path.as_str(),
                     &params,
+                    parts.uri.query(),
                     &detail,
                 )
                 .await;

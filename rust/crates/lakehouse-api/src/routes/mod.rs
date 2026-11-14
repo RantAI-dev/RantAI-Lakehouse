@@ -1887,6 +1887,22 @@ fn gated(routes: Router<AppState>, state: AppState) -> Router {
         .with_state(state)
 }
 
+/// The name `crate::audit_coverage::AUDIT_TABLE` gives `POST /api/ai/tool`,
+/// and the action of the `refused` row `auth_gate` writes when it turns the
+/// call away (`GOV-1`). The handler writes one row per tool call under the
+/// tool's own name, through the assistant's own gate, so the table's name is
+/// only the label of a refusal at the gate. It lives here, outside
+/// `routes::ai`, because the table's guard test looks for each `Handler`
+/// action as a literal in `src/routes/`, and the tool names that are already
+/// literals there (`create_chart`) would make a refused call read as a
+/// refused tool.
+pub(crate) const ASSISTANT_TOOL_ACTION: &str = "assistant.tool";
+
+/// The name `crate::audit_coverage::AUDIT_TABLE` gives `POST /api/ai/chat`;
+/// see [`ASSISTANT_TOOL_ACTION`]. A chat turn writes its rows per tool call
+/// under each tool's own name.
+pub(crate) const ASSISTANT_CHAT_ACTION: &str = "assistant.chat";
+
 /// The sentence a request for a method no route serves is told (`SEC-72`,
 /// decision `DEC-19`; QA `LH-BI-13-02`, `LH-BLD-2-03`, `LH-DATA-14-04`,
 /// `LH-RPT-1-11`). One sentence for every path, like every other error.
