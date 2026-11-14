@@ -302,6 +302,20 @@ Measured: frame bottom / composer top 720/738 px at 1190x800, 820/838 at 1366x90
 
 **Not verified:** no browser check; the Browse-mount effect in `DashboardListPage` has no test of its own (the sidebar test covers the forget).
 
+### T11 handoff, 2026-11-15 (Sonnet developer agent)
+
+**Commit** `45aa4e1e` (`feat(console): BI-61 T11, the Dashboards row remembers dashboards and reports`; not pushed).
+
+- `last-board.ts` is restored to its pre-T10 content (id only). T10's name key and hooks are gone.
+- New `dashboards-row.ts`: key `dashboards:menu-row` = `{kind, id, name}`; `rememberRow`, `forgetRow` (no argument clears; with an item clears only if it is the remembered one), `useDashboardsRow` (`useSyncExternalStore`, server snapshot `null`, event plus `storage`).
+- Set by the dashboard page (also on rename), the report reader and the report editor (existing report). Cleared by Browse mount, the page's delete, Browse's dashboard delete, the report list's delete and the reader's delete. Trash only restores, so it needs nothing. Metrics and templates never call it.
+- Sidebar: name, `aria-label` "Dashboard: <n>" or "Report: <n>", `LayoutGrid` or `FileText` icon (the Browse tab icons), href `/dashboards/<id>` or `/dashboards/reports/<id>`; nothing remembered gives "Dashboards", the row's icon, `/dashboards/browse`.
+- Tests (`app-sidebar.test.tsx`, 7 for the row): none, dashboard, report then dashboard (icons, hrefs), Browse clears the row but not the last board, delete of remembered vs other item, rename, malformed value.
+
+**Checks:** typecheck clean; `bun test src/components/app-shell src/features/dashboards` 791 pass, 0 fail; eslint on the 9 changed files clean.
+
+**Not verified:** no browser; the page-level calls (reader, editor, list, delete) have no tests of their own, only the store and the sidebar are tested.
+
 ## Micro-interaction audit (emil), 2026-11-14
 
 Owner request (2026-11-14): audit the revamped pages' micro-animations with the
