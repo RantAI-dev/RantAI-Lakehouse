@@ -4,7 +4,9 @@
  * The sign-in page's living preview of the console (`WEB-15`, mockup A): a
  * small dashboard whose charts are the console's real `TileBody` (ECharts
  * bars grow, a line draws) beside a KPI that counts up; it rests and draws
- * itself again every 9 s while it is on screen and the tab is visible. Its charts answer
+ * lives on every 9 s while it is on screen and the tab is visible: the bars
+ * ease to new heights, the line moves, the KPI counts to its new total, and
+ * the window itself never leaves. Its charts answer
  * the pointer like the real ones. The numbers are fixed sample values, made
  * up for this page and described as sample data by the panel label: no API call, no
  * customer data (feature page decision 2).
@@ -43,6 +45,19 @@ const GOLD_ROWS = [468, 494, 503, 497, 521, 538, 571].map((k) => k * 1_000);
 
 type Tile = { spec: ChartRenderSpec; cell: Rows };
 
+/**
+ * One live tick's sample values: step 0 is the base data above (what a still
+ * dashboard shows); later steps move each value by up to 7 % on a smooth,
+ * deterministic wave, so the dashboard changes the way a live one does
+ * without a random number or a blank frame.
+ */
+function wave(step: number, i: number, base: number): number {
+  return step === 0 ? base : Math.round(base * (1 + 0.07 * Math.sin(step * 1.7 + i * 1.1)));
+}
+const monthlyAt = (step: number) => MONTHLY.map((v, i) => wave(step, i, v));
+const goldAt = (step: number) => GOLD_ROWS.map((v, i) => wave(step, i + 3, v));
+const sumOf = (xs: number[]) => xs.reduce((a, b) => a + b, 0);
+
 function spec(id: string, title: string, kind: ChartRenderSpec["kind"], x: string, y: string, def?: unknown): ChartRenderSpec {
   return { id, title, kind, mart: "mart_sample", source: "ui", x, y, def };
 }
@@ -50,14 +65,9 @@ function spec(id: string, title: string, kind: ChartRenderSpec["kind"], x: strin
 /** Where the count-up starts, as a share of the final value. */
 const COUNT_FROM = 0.55;
 
-/** The KPI's value at a point `t` (0 to 1) of its count-up. */
-function kpiValue(total: number, t: number): number {
-  return Math.round(total * (COUNT_FROM + (1 - COUNT_FROM) * t));
-}
-
-/** The change against 2023, at the final values: the KPI's tooltip and its one-line delta. */
-const DELTA = VISITORS_2024 - VISITORS_2023;
-const DELTA_PERCENT = (DELTA / VISITORS_2023) * 100;
+/** The change against 2023 at a total: the KPI's tooltip and its one-line delta. */
+const deltaOf = (total: number) => total - VISITORS_2023;
+const percentOf = (total: number) => (deltaOf(total) / VISITORS_2023) * 100;
 
 /**
  * Day and month names read flat (WEB-15 T2, owner's screenshot): the
@@ -72,6 +82,14 @@ const BARS: Tile = {
   spec: spec("monthly", "Visitors per month", "bar", "Month", "Visitors", { colors: { palette: "sequential-blue" }, axes: FLAT_X }),
   cell: { columns: ["Month", "Visitors"], rows: MONTHS.map((m, i) => ({ Month: m, Visitors: MONTHLY[i] })) },
 };
+const barsCell = (step: number): Rows => ({
+  columns: ["Month", "Visitors"],
+  rows: MONTHS.map((m, i) => ({ Month: m, Visitors: monthlyAt(step)[i] })),
+});
+const lineCell = (step: number): Rows => ({
+  columns: ["Day", "Rows"],
+  rows: DAYS.map((d, i) => ({ Day: d, Rows: goldAt(step)[i] })),
+});
 const LINE: Tile = {
   spec: spec("gold", "Rows landed in Gold", "line", "Day", "Rows", { colors: { palette: "sequential-blue" }, axes: FLAT_X }),
   cell: { columns: ["Day", "Rows"], rows: GOLD_ROWS.map((v, i) => ({ Day: DAYS[i], Rows: v })) },
@@ -81,61 +99,65 @@ const LINE: Tile = {
 /* The loop                                                            */
 /* ------------------------------------------------------------------ */
 
-/** How long one drawing stays before the preview draws itself again (spec: 9 s). */
+/** How long one reading stays before the preview moves to the next (spec: 9 s). */
 export const LOOP_MS = 9_000;
+/** The first count-up, then the shorter, eased move to each new total. */
 const COUNT_MS = 1_300;
-/** The dim before a redraw: the root's opacity falls in 150 ms, then a beat at rest. */
-const FADE_MS = 240;
+const MOVE_MS = 600;
 
 /**
- * Plays the preview's loop: `run` changes to remount the charts (ECharts
- * animates a chart's first draw), `t` runs the KPI's count-up from 0 to 1,
- * and `fading` dims the window just before it starts over. The redraw runs
- * only while the preview is on screen (IntersectionObserver) and the tab is
- * visible; with reduced motion nothing is scheduled and the KPI shows its
- * final value from the first frame.
+ * Plays the preview's life: `step` advances every `LOOP_MS` and the data
+ * follows it (the charts animate their own change; nothing remounts and
+ * nothing dims). The tick runs only while the preview is on screen
+ * (IntersectionObserver) and the tab is visible; with reduced motion nothing
+ * is scheduled and step 0, the base data, stays.
  */
 function usePreviewLoop(ref: React.RefObject<HTMLElement | null>, reduced: boolean) {
-  const [run, setRun] = React.useState(0);
-  const [t, setT] = React.useState(0);
-  const [fading, setFading] = React.useState(false);
+  const [step, setStep] = React.useState(0);
   const onScreen = useOnScreen(ref, 0.2);
   const pageVisible = usePageVisible();
 
-  // The count-up of each run: an ease-out cubic, so it lands softly.
   React.useEffect(() => {
-    if (reduced) return;
+    if (reduced || !onScreen || !pageVisible) return;
+    const id = window.setInterval(() => setStep((n) => n + 1), LOOP_MS);
+    return () => window.clearInterval(id);
+  }, [reduced, onScreen, pageVisible]);
+
+  return reduced ? 0 : step;
+}
+
+/**
+ * The KPI's shown number: it counts up from 55 % on the first look, then
+ * eases (cubic ease-out, never linear) to each new total, starting from
+ * wherever it is, so it never jumps and never blanks.
+ */
+function useCountedTotal(target: number, reduced: boolean): number {
+  const [shown, setShown] = React.useState(() => (reduced ? target : Math.round(target * COUNT_FROM)));
+  const shownRef = React.useRef(shown);
+  const first = React.useRef(true);
+  React.useEffect(() => {
+    if (reduced) {
+      shownRef.current = target;
+      setShown(target);
+      return;
+    }
+    const from = shownRef.current;
+    const wasFirst = first.current;
+    first.current = false;
+    const duration = wasFirst ? COUNT_MS : MOVE_MS;
+    const start = performance.now() + (wasFirst ? 150 : 0);
     let frame = 0;
-    const start = performance.now() + 150;
     const tick = (now: number) => {
-      const p = Math.min(1, Math.max(0, (now - start) / COUNT_MS));
-      setT(1 - Math.pow(1 - p, 3));
+      const p = Math.min(1, Math.max(0, (now - start) / duration));
+      const v = Math.round(from + (target - from) * (1 - Math.pow(1 - p, 3)));
+      shownRef.current = v;
+      setShown(v);
       if (p < 1) frame = requestAnimationFrame(tick);
     };
     frame = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(frame);
-  }, [run, reduced]);
-
-  // The loop itself.
-  React.useEffect(() => {
-    if (reduced || !onScreen || !pageVisible) return;
-    let fadeTimer = 0;
-    const id = window.setInterval(() => {
-      setFading(true);
-      fadeTimer = window.setTimeout(() => {
-        setFading(false);
-        setT(0);
-        setRun((r) => r + 1);
-      }, FADE_MS);
-    }, LOOP_MS);
-    return () => {
-      window.clearInterval(id);
-      window.clearTimeout(fadeTimer);
-      setFading(false);
-    };
-  }, [reduced, onScreen, pageVisible]);
-
-  return { run, t: reduced ? 1 : t, fading };
+  }, [target, reduced]);
+  return reduced ? target : shown;
 }
 
 /**
@@ -177,11 +199,11 @@ function SidebarLogo() {
  * same helper (`signedPercent`); the line keeps the percent, and the
  * amount moves to the tooltip. The trend under it is the bars' own months.
  */
-function ShowcaseKpi({ t, run }: { t: number; run: number }) {
+function ShowcaseKpi({ value, total }: { value: number; total: number }) {
   return (
     <div className="grid h-full place-content-center justify-items-center px-2 text-center">
       <p className="text-4xl font-semibold tracking-tight tabular-nums text-foreground" data-slot="showcase-kpi">
-        {kpiValue(VISITORS_2024, t).toLocaleString("en-US")}
+        {value.toLocaleString("en-US")}
       </p>
       <Tooltip>
         <TooltipTrigger
@@ -190,12 +212,12 @@ function ShowcaseKpi({ t, run }: { t: number; run: number }) {
           }
         >
           <ArrowUp className="size-4" aria-hidden />
-          {signedPercent(DELTA_PERCENT)}
+          {signedPercent(percentOf(total))}
           <span className="font-normal text-muted-foreground">vs 2023</span>
         </TooltipTrigger>
-        <TooltipContent>{DELTA.toLocaleString("en-US")} more visitors than in 2023</TooltipContent>
+        <TooltipContent>{deltaOf(total).toLocaleString("en-US")} more visitors than in 2023</TooltipContent>
       </Tooltip>
-      <svg key={run} viewBox="0 0 120 28" aria-hidden className="mt-2.5 h-7 w-32 text-emerald-600 dark:text-emerald-400">
+      <svg viewBox="0 0 120 28" aria-hidden className="mt-2.5 h-7 w-32 text-emerald-600 dark:text-emerald-400">
         <polyline
           points={sparklinePoints(MONTHLY, 120, 28)}
           pathLength={1}
@@ -222,15 +244,17 @@ export function LoginShowcase({ compact = false }: { compact?: boolean }) {
   const reduced = useReducedMotionSafe();
   const { resolvedTheme } = useTheme();
   const dark = resolvedTheme === "dark";
-  const { run, t, fading } = usePreviewLoop(ref, reduced);
-  const bars = <TileBody key={`bars-${run}-${dark}`} spec={BARS.spec} cell={BARS.cell} dark={dark} loading={false} hideLegend />;
+  const step = usePreviewLoop(ref, reduced);
+  const total = sumOf(monthlyAt(step));
+  const value = useCountedTotal(total, reduced);
+  const bars = <TileBody key={`bars-${dark}`} spec={BARS.spec} cell={barsCell(step)} dark={dark} loading={false} hideLegend />;
 
   const body = compact ? (
     <div className="flex h-full flex-col p-3">
       <div className="flex items-baseline justify-between gap-3">
         <p className="truncate text-xs font-medium text-muted-foreground">Foreign visitors, 2024</p>
         <p className="text-lg font-semibold tabular-nums" data-slot="showcase-kpi">
-          {kpiValue(VISITORS_2024, t).toLocaleString("en-US")}
+          {value.toLocaleString("en-US")}
         </p>
       </div>
       <div className="min-h-0 flex-1">{bars}</div>
@@ -260,10 +284,10 @@ export function LoginShowcase({ compact = false }: { compact?: boolean }) {
         </div>
         <div className="grid min-h-0 flex-1 grid-cols-5 grid-rows-[0.9fr_1.25fr] gap-3">
           <PreviewTile title="Foreign visitors, 2024" className="col-span-2">
-            <ShowcaseKpi t={t} run={run} />
+            <ShowcaseKpi value={value} total={total} />
           </PreviewTile>
           <PreviewTile title="Rows landed in Gold, this week" className="col-span-3">
-            <TileBody key={`line-${run}-${dark}`} spec={LINE.spec} cell={LINE.cell} dark={dark} loading={false} hideLegend />
+            <TileBody key={`line-${dark}`} spec={LINE.spec} cell={lineCell(step)} dark={dark} loading={false} hideLegend />
           </PreviewTile>
           <PreviewTile title="Visitors per month, 2024" className="col-span-5">
             {bars}
@@ -287,12 +311,10 @@ export function LoginShowcase({ compact = false }: { compact?: boolean }) {
           : "shadow-[0_28px_70px_-24px_rgb(1_3_18/0.7)] ring-white/10",
         // Entrance once: the window rises 12 px onto the lake and lands
         // (360 ms, a strong ease-out; T9, the first look's card beat, longer
-        // than a control's 240 ms because it travels further), and the same
-        // opacity dims it before each redraw, faster, in 150 ms (T5,
-        // emil-design-eng: exits are quicker than entrances). Nothing moves
-        // under reduced motion.
-        "transition-[opacity,translate] ease-[cubic-bezier(0.23,1,0.32,1)] starting:translate-y-3 starting:opacity-0 motion-reduce:transition-none",
-        fading ? "opacity-0 duration-150" : "opacity-100 duration-[360ms]",
+        // than a control's 240 ms because it travels further). After that
+        // the window never fades or moves again (owner, 2026-11-14: "dashboardnya
+        // jangan hilang"). Nothing moves under reduced motion.
+        "transition-[opacity,translate] duration-[360ms] ease-[cubic-bezier(0.23,1,0.32,1)] starting:translate-y-3 starting:opacity-0 motion-reduce:transition-none",
       )}
     >
       <RenderModeProvider value={reduced ? STILL : null}>{body}</RenderModeProvider>

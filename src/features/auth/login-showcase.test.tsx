@@ -115,7 +115,7 @@ describe("the sign-in page's sample dashboard (WEB-15 T2)", () => {
     expect(tile?.textContent).toBe(`${FINAL}+19.3%vs 2023`)
   })
 
-  it("redraws every 9 s only while it is on screen and the tab is visible", () => {
+  it("ticks every 9 s only while it is on screen and the tab is visible", () => {
     stubReducedMotion(false)
     const { container } = render(<LoginShowcase />)
     expect(container.querySelector("[data-motion]")?.getAttribute("data-motion")).toBe("live")
