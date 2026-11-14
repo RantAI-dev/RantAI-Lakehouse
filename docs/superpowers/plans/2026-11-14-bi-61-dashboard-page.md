@@ -95,6 +95,23 @@
    - Screenshots at 1190×800, 1366×900 and 390×844, light and dark, reading and editing, plus
      the ⋯ menu and the Comments panel, into `docs/plans/bi-61-screens/`. Check them yourself.
 8. **T8, handoff.**
+9. **T9, the route loading fallback draws the page's own placeholder (owner QA 2026-11-15).**
+   Owner: "ini pas aku ketiga halaman ini skeleton yang list itu masih ada… pas logout juga ada
+   tu skeletonnya". `src/app/loading.tsx` draws the generic `LoadingSkeleton rows={8}` for every
+   route while a segment loads (visible on a slow network on every navigation), so Home and a
+   dashboard show the generic list first and then their own placeholder, and `/login` after
+   sign-out shows the list full width. Fix:
+   - Lift the main-area switch of `AppShellSkeleton` (`app-shell-skeleton.tsx`, the
+     `placeholder === …` branch) into one exported component (e.g. `ShellMainPlaceholder`
+     taking `pathname`), used by both `AppShellSkeleton` and `src/app/loading.tsx`. One source,
+     so the auth check, the route fallback and the page's own loading look are the same shapes.
+   - `loading.tsx` becomes a client component: on a public path (`isPublicPath`, e.g. `/login`,
+     the landing, public dashboards, embed, render) it draws nothing on the page background (no
+     list); inside the app it draws `ShellMainPlaceholder` for `usePathname()`, with the same
+     outer padding/frame as the real main area so nothing jumps when the page replaces it.
+   - Check: unit tests that `loading.tsx` draws the dashboard placeholder on `/dashboards/<id>`,
+     the list placeholder on `/dashboards/browse`, nothing on `/login`, and the generic one on
+     another page; the shell skeleton tests still pass.
 
 ## 4. Machine rules (owner, 2026-11-14)
 
