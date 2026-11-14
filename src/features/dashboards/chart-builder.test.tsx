@@ -240,7 +240,7 @@ describe("ChartBuilder kind switch (phase 2 QA R6)", () => {
 
 /** The pressed type in the canvas toolbar (`BI-58` T3). */
 const pressedKind = () => within(screen.getByRole("group", { name: "Chart type" })).getAllByRole("button").find((b) => b.getAttribute("aria-pressed") === "true")?.getAttribute("aria-label")
-const gallery = () => screen.getByRole("dialog", { name: "Chart types" })
+const gallery = () => screen.getByRole("dialog", { name: "Chart type" })
 
 describe("ChartBuilder type list (phase 2 QA R9, BI-58 T3)", () => {
   // `BI-58` T1, T3: the long chart-type column is gone; the type is an icon above the canvas, for a new chart and an edited one.
@@ -275,7 +275,8 @@ describe("ChartBuilder type list (phase 2 QA R9, BI-58 T3)", () => {
     }
   })
 
-  it("closes the gallery on Escape and on an outside press, and focus returns to its trigger (phase 2 QA R17)", async () => {
+  // BI-58 review round 4, SHOULD-FIX 9: the gallery is a modal dialog, so an outside press lands on its backdrop.
+  it("closes the gallery on Escape and on a press on its backdrop, and focus returns to its trigger (phase 2 QA R17)", async () => {
     renderBuilder(barDef)
     const trigger = () => screen.getByRole("button", { name: "More chart types" })
     fireEvent.click(trigger())
@@ -288,10 +289,10 @@ describe("ChartBuilder type list (phase 2 QA R9, BI-58 T3)", () => {
     expect(screen.getByText("Edit chart")).toBeTruthy()
     fireEvent.click(trigger())
     await screen.findByLabelText("Search chart types")
-    const heading = screen.getByText("Edit chart")
-    fireEvent.pointerDown(heading)
-    fireEvent.mouseDown(heading)
-    fireEvent.click(heading)
+    const backdrop = document.querySelector("[data-slot=dialog-overlay]") as HTMLElement
+    fireEvent.pointerDown(backdrop)
+    fireEvent.mouseDown(backdrop)
+    fireEvent.click(backdrop)
     await waitFor(() => expect(screen.queryByLabelText("Search chart types") === null).toBe(true))
     expect(screen.getByText("Edit chart")).toBeTruthy()
   })

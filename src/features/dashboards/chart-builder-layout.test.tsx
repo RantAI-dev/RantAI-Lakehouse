@@ -238,7 +238,7 @@ describe("the chart-type gallery (BI-58 T3, spec T3)", () => {
     drawn = []
     try {
       fireEvent.click(screen.getByRole("button", { name: "More chart types" }))
-      const gallery = await screen.findByRole("dialog", { name: "Chart types" })
+      const gallery = await screen.findByRole("dialog", { name: "Chart type" })
       const card = (name: string) => within(gallery).getByRole("button", { name })
       // Drawn from the rows: a pie and a line. A KPI needs its own query, so it is drawn from the
       // sample, quieter (BI-58 review round 3, SHOULD-FIX 8).
@@ -271,7 +271,7 @@ describe("the chart-type gallery (BI-58 T3, spec T3)", () => {
     renderBuilder(SAVED.bar)
     await waitFor(() => expect(previews.length).toBeGreaterThan(0))
     fireEvent.click(screen.getByRole("button", { name: "More chart types" }))
-    const gallery = await screen.findByRole("dialog", { name: "Chart types" })
+    const gallery = await screen.findByRole("dialog", { name: "Chart type" })
     for (const name of ["Calendar heatmap", "Gantt"]) {
       const card = within(gallery).getByRole("button", { name }) as HTMLButtonElement
       expect(card.disabled, name).toBe(true)
@@ -442,7 +442,7 @@ describe("the chart-type gallery before any data (BI-58 review round 3)", () => 
     const before = fetches.length
     drawn = []
     fireEvent.click(screen.getByRole("button", { name: "More chart types" }))
-    const gallery = await screen.findByRole("dialog", { name: "Chart types" })
+    const gallery = await screen.findByRole("dialog", { name: "Chart type" })
     expect(within(gallery).getByText("Pick a source and columns to see your own numbers.")).toBeTruthy()
     const cards = within(gallery).getAllByRole("button").filter((b) => b.hasAttribute("aria-pressed"))
     expect(cards.length).toBe(KIND_GROUPS.flatMap((g) => g.items).length)
@@ -462,5 +462,52 @@ describe("the chart-type gallery before any data (BI-58 review round 3)", () => 
     }
     expect(drawn.length).toBeGreaterThan(15)
     expect(fetches.length).toBe(before)
+  })
+})
+
+// BI-58 review round 4, SHOULD-FIX 9 (owner): the gallery is a dialog, with cards and a list.
+describe("the chart-type dialog (BI-58 review round 4)", () => {
+  const typeCards = (dialog: HTMLElement) => within(dialog).getAllByRole("button").filter((b) => b.hasAttribute("aria-pressed"))
+
+  it("opens from More as a dialog, closes on Esc, and gives focus back to More", async () => {
+    renderBuilder(SAVED.bar)
+    await waitFor(() => expect(previews.length).toBeGreaterThan(0))
+    const more = screen.getByRole("button", { name: "More chart types" })
+    fireEvent.click(more)
+    const dialog = await screen.findByRole("dialog", { name: "Chart type" })
+    // Modal: the page behind it is out of reach (base-ui hides it rather than setting aria-modal).
+    expect(screen.queryByRole("button", { name: "Back to dashboard" }) === null).toBe(true)
+    fireEvent.keyDown(within(dialog).getByLabelText("Search chart types"), { key: "Escape" })
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Chart type" }) === null).toBe(true))
+    await waitFor(() => expect(document.activeElement === screen.getByRole("button", { name: "More chart types" })).toBe(true))
+  })
+
+  it("shows the same types as a list, remembers the view, and picking one closes the dialog and sets it", async () => {
+    const { unmount } = renderBuilder(SAVED.bar)
+    await waitFor(() => expect(previews.length).toBeGreaterThan(0))
+    fireEvent.click(screen.getByRole("button", { name: "More chart types" }))
+    let dialog = await screen.findByRole("dialog", { name: "Chart type" })
+    const asCards = typeCards(dialog).map((b) => b.getAttribute("aria-label"))
+    expect(within(dialog).getByRole("radio", { name: "Cards" }).getAttribute("aria-checked")).toBe("true")
+    fireEvent.click(within(dialog).getByRole("radio", { name: "List" }))
+    const asList = typeCards(dialog)
+    expect(asList.map((b) => b.getAttribute("aria-label"))).toEqual(asCards)
+    expect(asList.length).toBe(KIND_GROUPS.flatMap((g) => g.items).length)
+    // Every row has the same small picture the cards have.
+    for (const row of asList) expect(row.querySelector("[data-picture]") !== null, row.getAttribute("aria-label") ?? "").toBe(true)
+    expect(window.localStorage.getItem("lh.chartBuilder.galleryView")).toBe("list")
+    unmount()
+    cleanup()
+    renderBuilder(SAVED.bar)
+    await waitFor(() => expect(previews.length).toBeGreaterThan(0))
+    fireEvent.click(screen.getByRole("button", { name: "More chart types" }))
+    dialog = await screen.findByRole("dialog", { name: "Chart type" })
+    expect(within(dialog).getByRole("radio", { name: "List" }).getAttribute("aria-checked")).toBe("true")
+    const asked = previews.length
+    fireEvent.click(within(dialog).getByRole("button", { name: "Funnel" }))
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Chart type" }) === null).toBe(true))
+    await waitFor(() => expect(previews.length).toBeGreaterThan(asked))
+    expect(previews[previews.length - 1]!.kind).toBe("funnel")
+    expect(screen.getByRole("button", { name: /More chart types, now Funnel/ })).toBeTruthy()
   })
 })

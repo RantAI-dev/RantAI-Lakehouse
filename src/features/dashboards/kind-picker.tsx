@@ -5,23 +5,24 @@
  * icons in a row; "More" opens a gallery of every type, grouped as the
  * builder groups them (`KIND_GROUPS`), with the search the old type list had.
  *
- * Each gallery card is a small picture of the chosen data in that type,
- * drawn by the dashboard's own `TileBody` from the rows the live preview
- * already fetched (decision L2: no request of its own, at most
- * `GALLERY_ROW_CAP` rows). A type that cannot be drawn from those rows shows
- * its icon until it is picked; one the chosen source cannot make at all is
- * greyed out with one line saying why (`lib/kind-gallery`).
+ * The gallery is a dialog (review round 4) with two views, cards and a
+ * compact list. Every type is a small picture drawn by the dashboard's own
+ * `TileBody`: from the rows the live preview already fetched when they fit
+ * the type (decision L2: no request of its own, at most `GALLERY_ROW_CAP`
+ * rows), else from a fixed sample (`lib/kind-sample`, round 3). A type the
+ * chosen source cannot make at all is greyed out with one line saying why
+ * (`lib/kind-gallery`).
  */
 import * as React from "react";
-import { ChevronDown, MoreHorizontal, Search } from "lucide-react";
-import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
+import { ChevronDown, LayoutGrid, List, MoreHorizontal, Search } from "lucide-react";
+import { Dialog, DialogContent, DialogDescription, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { ChartKind, ChartRenderSpec } from "@/lib/dashboard-specs";
 import { filterKindGroups } from "@/lib/chart-kind-search";
 import { GALLERY_ROW_CAP, MAIN_KINDS, drawsFrom, kindNeed, previewShape, type SourceFacts } from "@/lib/kind-gallery";
 import { cn } from "@/lib/utils";
-import { KIND_DESCRIPTIONS, KIND_GROUPS, KIND_KEYWORDS, KIND_LABELS, kindIcon, kindShort } from "./chart-kinds";
+import { KIND_DESCRIPTIONS, KIND_GROUPS, KIND_KEYWORDS, KIND_LABELS, kindBlurb, kindIcon, kindShort } from "./chart-kinds";
 import { kindSample } from "@/lib/kind-sample";
 import { TileBody } from "./tile-body";
 
@@ -73,8 +74,11 @@ export function KindPicker({ kind, onPick, facts, preview, dark }: {
           </Tooltip>
         );
       })}
-      <PopoverPrimitive.Root open={open} onOpenChange={setOpen}>
-        <PopoverPrimitive.Trigger
+      {/* BI-58 review round 4, SHOULD-FIX 9 (owner): the gallery is a centred dialog over a dim
+          backdrop (it covered the inspector as a popover). The console's Dialog traps focus, closes
+          on Esc and its close button, and gives focus back to "More". */}
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogTrigger
           aria-label={inMain ? "More chart types" : `More chart types, now ${KIND_LABELS[kind]}`}
           className={cn(
             "inline-flex h-8 min-w-0 shrink-0 items-center gap-1.5 rounded-md px-2 text-sm", EASE, FOCUS,
@@ -83,24 +87,32 @@ export function KindPicker({ kind, onPick, facts, preview, dark }: {
         >
           {inMain ? <MoreHorizontal aria-hidden className="size-4 shrink-0" /> : <KindIcon kind={kind} className="size-4 shrink-0" />}
           <span className="truncate">{inMain ? "More" : KIND_LABELS[kind]}</span>
-          <ChevronDown aria-hidden className={cn("size-3.5 shrink-0", EASE, open && "rotate-180")} />
-        </PopoverPrimitive.Trigger>
-        <PopoverPrimitive.Portal>
-          <PopoverPrimitive.Positioner side="bottom" align="start" sideOffset={6} collisionPadding={16} className="z-[60]">
-            <PopoverPrimitive.Popup
-              aria-label="Chart types"
-              className={cn(
-                "flex max-h-[min(40rem,75vh)] w-[min(64rem,calc(100vw-2rem))] flex-col rounded-xl border border-border bg-popover text-popover-foreground shadow-lg outline-hidden",
-                "origin-(--transform-origin) transition duration-200 ease-out data-ending-style:scale-[0.98] data-ending-style:opacity-0 data-starting-style:scale-[0.98] data-starting-style:opacity-0",
-              )}
-            >
-              <KindGallery kind={kind} onPick={choose} facts={facts} preview={preview} dark={dark} />
-            </PopoverPrimitive.Popup>
-          </PopoverPrimitive.Positioner>
-        </PopoverPrimitive.Portal>
-      </PopoverPrimitive.Root>
+          <ChevronDown aria-hidden className="size-3.5 shrink-0" />
+        </DialogTrigger>
+        <DialogContent className="flex max-h-[80vh] w-[calc(100%-2rem)] max-w-[60rem] flex-col gap-0 overflow-hidden p-0 sm:max-w-[60rem]">
+          <KindGallery kind={kind} onPick={choose} facts={facts} preview={preview} dark={dark} />
+        </DialogContent>
+      </Dialog>
     </div>
   );
+}
+
+/** BI-58 review round 4, SHOULD-FIX 9 (owner): the gallery's view, remembered per browser. */
+type GalleryView = "cards" | "list";
+const VIEW_KEY = "lh.chartBuilder.galleryView";
+function readView(): GalleryView {
+  try {
+    return window.localStorage.getItem(VIEW_KEY) === "list" ? "list" : "cards";
+  } catch {
+    return "cards";
+  }
+}
+function writeView(view: GalleryView) {
+  try {
+    window.localStorage.setItem(VIEW_KEY, view);
+  } catch {
+    // Not remembered; the choice still holds while the dialog is open.
+  }
 }
 
 function KindGallery({ kind, onPick, facts, preview, dark }: {
@@ -111,6 +123,8 @@ function KindGallery({ kind, onPick, facts, preview, dark }: {
   readonly dark: boolean;
 }) {
   const [query, setQuery] = React.useState("");
+  const [view, setView] = React.useState<GalleryView>(readView);
+  const pickView = (next: GalleryView) => { setView(next); writeView(next); };
   const groups = React.useMemo(() => filterKindGroups(KIND_GROUPS, KIND_DESCRIPTIONS, query, KIND_KEYWORDS), [query]);
   const def = (preview?.spec.def ?? undefined) as Record<string, unknown> | undefined;
   const shape = preview ? previewShape(preview.spec, Array.isArray(def?.layers) && def.layers.length > 0) : null;
@@ -118,7 +132,24 @@ function KindGallery({ kind, onPick, facts, preview, dark }: {
   const rows = React.useMemo(() => preview?.rows.slice(0, GALLERY_ROW_CAP) ?? [], [preview]);
   return (
     <>
-      <div className="grid gap-2 border-b border-border/60 p-3">
+      {/* The title, the view switch (clear of the dialog's close button), then the search; they stay put while the types scroll. */}
+      <div className="grid shrink-0 gap-3 border-b border-border/60 px-5 pt-4 pb-3">
+        <div className="flex items-center justify-between gap-3 pr-10">
+          <DialogTitle className="text-base font-semibold">Chart type</DialogTitle>
+          <div role="radiogroup" aria-label="View" className="inline-flex rounded-lg bg-muted p-0.5">
+            {([["cards", "Cards", LayoutGrid], ["list", "List", List]] as const).map(([value, label, Icon]) => (
+              <button
+                key={value} type="button" role="radio" aria-checked={view === value} onClick={() => pickView(value)}
+                className={cn(
+                  "inline-flex h-7 items-center gap-1.5 rounded-md px-2.5 text-xs font-medium", EASE, FOCUS,
+                  view === value ? "bg-background text-foreground shadow-sm dark:bg-input/40" : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                <Icon aria-hidden className="size-3.5" /> {label}
+              </button>
+            ))}
+          </div>
+        </div>
         <div className="relative">
           <Search aria-hidden className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
           <Input
@@ -132,18 +163,20 @@ function KindGallery({ kind, onPick, facts, preview, dark }: {
           />
         </div>
         {/* BI-58 review round 3, SHOULD-FIX 8 (owner): before any data, every picture is the sample. */}
-        {preview ? null : <p className="text-xs text-muted-foreground">Pick a source and columns to see your own numbers.</p>}
+        {preview ? null : <DialogDescription className="text-xs">Pick a source and columns to see your own numbers.</DialogDescription>}
       </div>
-      <div className="grid min-h-0 gap-5 overflow-y-auto p-3">
-        {groups.length === 0 ? <p className="px-1 py-2 text-sm text-muted-foreground">No chart type matches “{query.trim()}”.</p> : null}
+      <div className="grid min-h-0 gap-5 overflow-y-auto px-5 pt-4 pb-5">
+        {groups.length === 0 ? <p className="py-2 text-sm text-muted-foreground">No chart type matches “{query.trim()}”.</p> : null}
         {groups.map((g) => (
           <section key={g.group} aria-label={g.group} className="grid gap-2">
-            <h3 className="px-1 text-xs font-medium text-muted-foreground">{g.group}</h3>
-            <ul className="grid grid-cols-2 gap-2.5 sm:grid-cols-3">
+            <h3 className="text-xs font-medium text-muted-foreground">{g.group}</h3>
+            {/* Cards: four to a row at the dialog's width, all rows the same height and gaps, so a group
+                that ends with one card leaves no larger gap. List: one compact row per type. */}
+            <ul className={view === "cards" ? "grid grid-cols-2 gap-2.5 sm:grid-cols-3 md:grid-cols-4" : "grid gap-1"}>
               {g.items.map((item) => (
                 <li key={item.value}>
                   <KindCard
-                    kind={item.value} on={item.value === kind} need={kindNeed(item.value, facts)}
+                    view={view} kind={item.value} on={item.value === kind} need={kindNeed(item.value, facts)}
                     picture={preview && drawsFrom(item.value, shape) ? { ...preview, rows, def } : null}
                     hasData={!!preview} dark={dark} onPick={onPick}
                   />
@@ -165,7 +198,47 @@ function pictureSpec(base: Record<string, unknown>, kind: ChartKind, def: Record
   } as unknown as ChartRenderSpec & { def?: unknown; text?: string };
 }
 
-function KindCard({ kind, on, need, picture, hasData, dark, onPick }: {
+/**
+ * One type's picture. BI-58 review round 3, SHOULD-FIX 8 (owner): always a picture. The person's rows
+ * when they can be drawn as this kind; otherwise the kind's sample (lib/kind-sample), quieter when
+ * there are rows of the person's own; a drawing for maps, a picture and a web page, which need a file
+ * to draw. The same picture is the card's and, smaller, the list row's.
+ */
+function KindPicture({ kind, picture, hasData, dark, className, zoom = 2 }: {
+  readonly kind: ChartKind;
+  /** How many times larger the chart is drawn before it is scaled down: more for a smaller picture. */
+  readonly zoom?: 2 | 4;
+  readonly picture: (GalleryPreview & { def: Record<string, unknown> | undefined }) | null;
+  readonly hasData: boolean;
+  readonly dark: boolean;
+  readonly className: string;
+}) {
+  const sample = React.useMemo(() => kindSample(kind), [kind]);
+  const drawn = React.useMemo(() => {
+    if (picture) return { spec: pictureSpec(picture.spec as unknown as Record<string, unknown>, kind, picture.def), cell: { columns: picture.columns, rows: picture.rows }, from: "data" as const };
+    if (sample.kind === "illustration") return null;
+    return { spec: pictureSpec(sample.spec, kind, sample.def), cell: { columns: sample.columns, rows: sample.rows }, from: "sample" as const };
+  }, [picture, sample, kind]);
+  return (
+    <span
+      aria-hidden data-picture={drawn?.from ?? "drawing"}
+      className={cn("pointer-events-none relative block overflow-hidden", className, drawn?.from === "sample" && hasData && "opacity-70")}
+    >
+      {drawn ? (
+        // Drawn at twice the size and scaled down: the chart's own margins are fixed in pixels, so at
+        // card size they left the shape a sliver; scaled, it keeps the proportions of the real chart.
+        <span className={cn("absolute top-0 left-0 block origin-top-left p-2", zoom === 4 ? "h-[400%] w-[400%] scale-25" : "h-[200%] w-[200%] scale-50")}>
+          <TileBody spec={drawn.spec} cell={drawn.cell} dark={dark} loading={false} hideLegend />
+        </span>
+      ) : sample.kind === "illustration" ? (
+        <KindDrawing picture={sample.picture} />
+      ) : null}
+    </span>
+  );
+}
+
+function KindCard({ view, kind, on, need, picture, hasData, dark, onPick }: {
+  readonly view: GalleryView;
   readonly kind: ChartKind;
   readonly on: boolean;
   readonly need: string | null;
@@ -179,43 +252,36 @@ function KindCard({ kind, on, need, picture, hasData, dark, onPick }: {
   const id = React.useId();
   const disabled = !!need && !on;
   const name = kindShort(kind);
-  // BI-58 review round 3, SHOULD-FIX 8 (owner): always a picture. The person's rows when they can be
-  // drawn as this kind; otherwise the kind's sample (lib/kind-sample), quieter when there are rows of
-  // the person's own; a drawing for maps, a picture and a web page, which need a file to draw.
-  const sample = React.useMemo(() => kindSample(kind), [kind]);
-  const drawn = React.useMemo(() => {
-    if (picture) return { spec: pictureSpec(picture.spec as unknown as Record<string, unknown>, kind, picture.def), cell: { columns: picture.columns, rows: picture.rows }, from: "data" as const };
-    if (sample.kind === "illustration") return null;
-    return { spec: pictureSpec(sample.spec, kind, sample.def), cell: { columns: sample.columns, rows: sample.rows }, from: "sample" as const };
-  }, [picture, sample, kind]);
+  const words = need ?? kindBlurb(kind);
+  const state = cn(
+    EASE, FOCUS, "disabled:pointer-events-none disabled:opacity-50",
+    on ? "bg-primary/8 ring-2 ring-primary dark:ring-sky-400" : "bg-muted/50 hover:bg-muted",
+  );
+  if (view === "list") {
+    return (
+      <button
+        type="button" aria-pressed={on} aria-label={name} aria-describedby={id} disabled={disabled} title={KIND_LABELS[kind]}
+        onClick={() => onPick(kind)} className={cn("flex w-full items-center gap-3 rounded-lg p-1.5 pr-3 text-left", state)}
+      >
+        <KindPicture kind={kind} picture={picture} hasData={hasData} dark={dark} zoom={4} className="h-11 w-[4.5rem] shrink-0 rounded-md" />
+        <span className="grid min-w-0 flex-1 gap-0.5">
+          <span className="text-sm font-medium">{name}</span>
+          <span id={id} className={cn("text-xs", need ? "text-muted-foreground/80" : "text-muted-foreground")}>{words}</span>
+        </span>
+      </button>
+    );
+  }
   return (
     <button
       type="button" aria-pressed={on} aria-label={name} aria-describedby={id} disabled={disabled} title={KIND_LABELS[kind]}
       onClick={() => onPick(kind)}
-      className={cn(
-        "grid w-full gap-2 overflow-hidden rounded-xl pb-2.5 text-left", EASE, FOCUS,
-        on ? "bg-primary/8 ring-2 ring-primary dark:ring-sky-400" : "bg-muted/50 hover:-translate-y-0.5 hover:bg-muted hover:shadow-sm",
-        "disabled:pointer-events-none disabled:opacity-50",
-      )}
+      className={cn("grid h-full w-full content-start gap-1.5 overflow-hidden rounded-xl pb-2.5 text-left", state, !on && "hover:-translate-y-0.5 hover:shadow-sm")}
     >
       {/* The picture sits flush in the card's top, on the card's own fill: no box inside the card. */}
-      <span
-        aria-hidden data-picture={drawn?.from ?? "drawing"}
-        className={cn("pointer-events-none relative block h-28 overflow-hidden", drawn?.from === "sample" && hasData && "opacity-70")}
-      >
-        {drawn ? (
-          // Drawn at twice the size and scaled down: the chart's own margins are fixed in pixels, so at
-          // card size they left the shape a sliver; scaled, it keeps the proportions of the real chart.
-          <span className="absolute top-0 left-0 block h-[200%] w-[200%] origin-top-left scale-50 p-2">
-            <TileBody spec={drawn.spec} cell={drawn.cell} dark={dark} loading={false} hideLegend />
-          </span>
-        ) : sample.kind === "illustration" ? (
-          <KindDrawing picture={sample.picture} />
-        ) : null}
-      </span>
+      <KindPicture kind={kind} picture={picture} hasData={hasData} dark={dark} className="h-24" />
       <span className="grid min-w-0 gap-0.5 px-3">
         <span className="text-sm font-medium">{name}</span>
-        <span id={id} className="text-xs text-muted-foreground">{need ?? KIND_DESCRIPTIONS[kind]}</span>
+        <span id={id} className="text-xs text-muted-foreground">{words}</span>
       </span>
     </button>
   );

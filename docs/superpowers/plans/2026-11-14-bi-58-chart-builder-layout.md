@@ -460,3 +460,46 @@ before).
 **Screenshots:** `docs/plans/bi-58-screens/review-gallery-1366x900-dark.png` (no data) and
 `review-gallery-data-1366x900-dark.png` (Edit chart on "jumlah by tahun"). They were taken on the
 28620 preview with one headless Chrome, stopped by PID afterwards. No server was started.
+
+### Handoff, BI-58 review round 4 (Opus developer agent, 2026-11-14)
+
+**SHOULD-FIX 9, the type gallery as a dialog with two views** (this entry's commit):
+- **Dialog:**
+  - "More" opens the console's `Dialog`: centred, a dim backdrop, the title "Chart type", a close
+    button and Esc;
+  - focus stays inside and returns to "More" on close;
+  - about 960 px wide at 1366 and at most 80 vh tall. The title, the view switch and the search stay
+    at the top while the types scroll. Without data, the "Pick a source…" line sits under the
+    search as the dialog's description.
+  - Picking a type closes the dialog and applies it.
+- **Views:** a Cards / List switch (a radio group with icons and labels) at the top right. The choice
+  is remembered per browser (`lh.chartBuilder.galleryView`, inside try/catch).
+  - Cards: four to a row, with the picture on top, the short name, and a description of at most two
+    lines. Seven long descriptions are shortened for the gallery (`kindBlurb`); the full ones stay as
+    tooltips and search text.
+  - List: compact rows with a 72×44 picture (drawn at 4× and scaled), the name, the description and
+    the greyed reason where the type is unavailable.
+  - Both views keep the groups and the search.
+- **No orphan rows:** every card in a row has the same height and gap, so a group that ends with a
+  single card adds no larger gap.
+
+**Checks**, each run alone with `nice -n 15` under the 3G cap:
+- `bun test` on 23 files: **276 pass, 0 fail, 1,658 expect() calls**;
+- `bun run typecheck`: **0 errors**;
+- `bun run lint`: **0 errors, 11 warnings** (the existing 11);
+- the full `bun run test`: **not verified (CI)**.
+
+**Tests:**
+- "More" opens a modal dialog (the page behind is out of reach), Esc closes it, and focus returns to
+  "More".
+- The List view shows the same 33 types in the same order, each with its picture. The view is
+  remembered across a remount.
+- Picking Funnel in the list closes the dialog and sets the kind.
+- The no-request tests still pass.
+- Phase 2 QA R17's outside-press test now presses the dialog's backdrop, which is where an outside
+  press lands on a modal.
+
+**Screenshots:** `docs/plans/bi-58-screens/review-gallery-dialog-cards-1366x900-dark.png` and
+`review-gallery-dialog-list-1366x900-dark.png`. Both are the Edit chart page on the 28620 preview;
+the dialog measures 960 × 720 px. They were taken with one headless Chrome, stopped by PID
+afterwards. No server was started.

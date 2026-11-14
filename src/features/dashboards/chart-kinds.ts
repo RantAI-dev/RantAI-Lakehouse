@@ -156,3 +156,25 @@ export const KIND_SHORT: Partial<Record<ChartKind, string>> = {
 export function kindShort(kind: ChartKind): string {
   return KIND_SHORT[kind] ?? KIND_LABELS[kind] ?? kind;
 }
+
+/**
+ * BI-58 review round 4, SHOULD-FIX 9 (owner): the gallery's description of a kind, at most two
+ * lines on its card (about 220 px at 1366). The kinds whose full sentence is longer say it shorter
+ * here; the full one stays the tooltip and the search text.
+ */
+const KIND_BLURB: Partial<Record<ChartKind, string>> = {
+  gantt: "Tasks on a time axis, from start to end",
+  bullet: "A value against a target and its ranges",
+  progress: "A value against its goal, in percent",
+  pointmap: "Places as points, sized by a value",
+  sankey: "How a total flows between two groups",
+  boxplot: "The spread of a value in each category",
+  histogram: "How many rows fall in each range",
+  bubble: "Two values with a third as the size",
+  stacked: "Totals and their parts",
+  combo: "Two values on different scales",
+};
+
+export function kindBlurb(kind: ChartKind): string {
+  return KIND_BLURB[kind] ?? KIND_DESCRIPTIONS[kind];
+}
