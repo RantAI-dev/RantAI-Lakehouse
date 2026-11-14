@@ -423,6 +423,65 @@ pub async fn mount_existing_iceberg_table(server: &wiremock::MockServer, table: 
         .await;
 }
 
+/// `ClickHouse` for a `run_sql` whose statement the engine answers with
+/// `answer`: the dry run (`EXPLAIN AST`) confirms a `SELECT`, a statement
+/// that contains `failing` gets the engine's own answer, and any other
+/// statement succeeds with one row.
+///
+/// The mocks are mounted in that order because `wiremock` answers with the
+/// FIRST matching mock in mount order: the dry run's body carries the
+/// statement too, so its mock has to come first to keep the statement's own
+/// answer out of the dry run.
+pub async fn mock_clickhouse_refusing(
+    failing: &str,
+    answer: wiremock::ResponseTemplate,
+) -> wiremock::MockServer {
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let ch = wiremock::MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("EXPLAIN AST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("SelectWithUnionQuery (children 1)\n ExpressionList ...\n"),
+        )
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(failing))
+        .respond_with(answer)
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "meta": [{"name": "n", "type": "UInt64"}],
+            "data": [{"n": 5}],
+            "rows": 1,
+        })))
+        .mount(&ch)
+        .await;
+    ch
+}
+
+/// The last tool result the model had in front of it in the request at
+/// `index` (`0` is the first request), exactly as the model received it: the
+/// tool's own result, with the model's copy of a failure in `error`.
+pub async fn model_tool_result(llm: &wiremock::MockServer, index: usize) -> serde_json::Value {
+    let requests = llm.received_requests().await.expect("recording is on");
+    let request: serde_json::Value =
+        serde_json::from_slice(&requests[index].body).expect("a JSON model request");
+    let message = request["messages"]
+        .as_array()
+        .expect("messages are a list")
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "tool")
+        .unwrap_or_else(|| panic!("the model read a tool result: {request}"));
+    serde_json::from_str(message["content"].as_str().unwrap_or_default())
+        .expect("the tool result is a JSON object")
+}
+
 /// Swaps the database name in `postgres://user:pass@host:port/dbname` for
 /// `new_db`, without pulling in a URL-parsing crate for one substitution.
 fn swap_database_name(url: &str, new_db: &str) -> String {
