@@ -21,7 +21,6 @@ import { PART_NO_CLICK_REASON, isGrain, isTruncation, switchChoices, type Column
 import { REFRESH_OPTIONS, effectiveRefresh, canSaveRefresh as refreshIsSaveable, listedInterval } from "@/lib/dashboard-refresh";
 import { enterFullscreen, leaveFullscreen, readFullscreenDark, writeFullscreenDark } from "@/lib/dashboard-fullscreen";
 import { notifyFailure, notifyInfo, notifySuccess } from "@/lib/notify";
-import { formatRelativeTime } from "@/lib/format";
 import { dataFromLabel } from "@/lib/result-cache";
 import { readableErrorMessage } from "@/lib/notify-message";
 import { buildDashboardPageContext, summarizeFilters, summarizeFilterJson, summarizeGrain, summarizeParams, summarizeTabs, summarizeTiles } from "@/lib/page-context-summary";
@@ -1434,7 +1433,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         }
         facts={{
           owner: listed?.createdBy || undefined,
-          updated: listed?.updatedAt ? formatRelativeTime(listed.updatedAt) : undefined,
+          // BI-61 review round 1, SHOULD-FIX 11 (owner): one time in the header, the data's; when the
+          // dashboard was last edited is in Details ("Edited 5h ago").
           dataFrom: pageDataFrom,
           comments: isDefault ? undefined : commentCount,
         }}

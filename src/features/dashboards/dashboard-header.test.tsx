@@ -95,12 +95,13 @@ describe("the dashboard header (BI-61 T1)", () => {
       .toEqual(["Dashboard settings"]))
   })
 
-  it("names the folder in the breadcrumb, and the owner, the update and the comments in the facts line", async () => {
+  it("names the folder in the breadcrumb, and the owner and the comments in the facts line, with no second time", async () => {
     mount({ permissions: ["dashboard:read"], level: "view" })
     const crumbs = await screen.findByRole("navigation", { name: "Breadcrumb" })
     await waitFor(() => expect(crumbs.textContent).toBe("DashboardsFinanceSales"))
     expect(await screen.findByText("Rina Putri")).toBeTruthy()
-    expect(screen.getByText("Updated 2h ago")).toBeTruthy()
+    // BI-61 review round 1, SHOULD-FIX 11: one time in the header, the data's; the last edit is in Details.
+    expect(screen.queryByText(/Updated/)).toBeNull()
     expect(await screen.findByRole("button", { name: "2 comments" })).toBeTruthy()
   })
 })

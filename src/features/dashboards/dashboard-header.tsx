@@ -105,8 +105,6 @@ export function ShareButton({
 export type HeaderFacts = {
   /** Who made the dashboard (`Board.createdBy`); absent for an older board. */
   readonly owner?: string;
-  /** "Updated 2h ago"; absent when the list did not say. */
-  readonly updated?: string;
   /** "Data from 12:47"; absent while nothing has a time. */
   readonly dataFrom?: string | null;
   /** The number of comments; null while not known, undefined on the built-in dashboard. */
@@ -139,7 +137,6 @@ export function DashboardHeader({
 }) {
   const parts: React.ReactNode[] = [];
   if (facts.owner) parts.push(<span key="owner">{facts.owner}</span>);
-  if (facts.updated) parts.push(<span key="updated">Updated {facts.updated}</span>);
   if (loading) {
     parts.push(
       <span key="loading" className="inline-flex items-center gap-1">
