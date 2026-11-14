@@ -78,6 +78,7 @@ and the last result) keeps working, and follows the active query tab.
 | 12 | Explain, Fix with AI, Estimate, Save query and Save as SQL source work on one statement: the selection when there is one, else the whole tab when it holds one statement. With several statements and no selection they are disabled, and the button's title says to select one statement. A saved query or SQL source with several statements would fail where it is run later (the server runs one statement per request) | none | Planner's choice, 2026-10-23 |
 | 13 | Fix with AI is offered on a failed statement's result tab and proposes a fix for that statement; Accept replaces that statement's text in the editor and nothing else | none | Planner's choice, 2026-10-23 |
 | 14 | On a Trino tab, Estimate sends no request. The panel says "No pre-run estimate for Trino queries." in place of every other state, because the estimate route explains ClickHouse statements only. A Trino `EXPLAIN` route is not built | none | Planner's choice, 2026-11-12 |
+| 15 | An engine failure in Query Studio, on a run or on the cost estimate, shows a fixed sentence for its cause followed by ` Reference: <id>`, never the engine's own text. The raw text goes to the log under the same reference. Outages, timeouts and Stop keep their own fixed sentences. The sentences for each cause are the ones the query history keeps (`query-history.md`, decision 3) | none | Owner, 2026-11-12, LH-QS-2-08 |
 
 ## Limits to tell a customer
 
@@ -107,7 +108,7 @@ a pass.
 | `QS-1-AC2` | Write three statements separated by `;` and press Run all | Three result tabs, one per statement, in order | Not run |
 | `QS-1-AC3` | Open three query tabs with different SQL, close the browser, open Query Studio again | The three tabs are back with their names and SQL | Not run |
 | `QS-1-AC4` | Sign in as a user without `query:read`, open Query Studio and press Run all | Every statement is refused with a permission message, and nothing runs on the engine (`POST /api/query/run` needs `query:read`, `policy.rs:412`) | Not run |
-| `QS-1-AC5` | Write three statements where the second fails, press Run all | Tab 1 shows rows, tab 2 shows the engine's error as the console reports it today, tab 3 says "Not run" | Not run |
+| `QS-1-AC5` | Write three statements where the second fails, press Run all | Tab 1 shows rows, tab 2 shows a fixed sentence for the failure and a reference (for a missing table: "This query reads a table that does not exist or that you cannot read. Reference: …"), with no engine text (`Code:`, `DB::Exception`), and tab 3 says "Not run" | Not run |
 | `QS-1-AC6` | Select the second of three statements and press ⌘/Ctrl+Enter | Only that statement runs | Not run |
 | `QS-1-AC7` | In the schema browser, expand a layer, a table, and click a column | The column name is inserted at the cursor; each column shows its type | Not run |
 | `QS-1-AC8` | Set keyword case to lower and indent to 4, press Format, reload, press Format again | Both times keywords are lower case and indented by 4 | Not run |

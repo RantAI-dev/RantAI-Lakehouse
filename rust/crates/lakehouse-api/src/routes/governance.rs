@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 
-use crate::error::ApiResult;
+use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
 use crate::routes::catalog::NOT_IN_PRIMARY;
 use crate::routes::lakehouse::{is_unknown_table_error, is_unknown_table_or_database_error};
@@ -115,15 +115,60 @@ enum GovError {
 }
 
 /// `GET /api/governance/{kind}`.
-pub async fn get(State(state): State<AppState>, Path(kind): Path<String>) -> Response {
-    match Kind::parse(&kind) {
+///
+/// The quality list names rules of every table; it is narrowed by the
+/// catalog's tenant rule and the caller's table access, as
+/// [`read_kind`] does (`GOV-15`).
+pub async fn get(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    Path(kind): Path<String>,
+) -> Response {
+    read_kind(&state, Some(&principal), &headers, &kind).await
+}
+
+/// The `{kind}` dispatch as one person reads it.
+///
+/// The route is one caller; the assistant's tools are the other, with the
+/// person behind the chat and no request headers of their own. A quality list
+/// is narrowed by the catalog's tenant rule and by the caller's table access
+/// (`GOV-15 (GOV-12 plan, section 4)`), because every row is a rule on a
+/// table. The other kinds are not narrowed by this change — classification
+/// and maintenance rows do name tables, but the plan's scope is the quality
+/// rules (`GOV-15`); narrowing them is a separate item. No principal is a
+/// system call and is not narrowed, which
+/// [`crate::routes::quality::quality_table_access`] documents.
+pub(crate) async fn read_kind(
+    state: &AppState,
+    principal: Option<&Principal>,
+    headers: &HeaderMap,
+    kind: &str,
+) -> Response {
+    let parsed = Kind::parse(kind);
+    // The gate runs before `run`, so a caller the catalog refuses causes no
+    // `ClickHouse` query at all (`GOV-15` D8).
+    let narrowing = if parsed == Kind::Quality {
+        match crate::routes::quality::quality_table_access(state, principal, headers).await {
+            Ok(access) => Some(access),
+            Err(err) => return ApiRejection(err).into_response(),
+        }
+    } else {
+        None
+    };
+    match parsed {
         Kind::Unknown => (
             StatusCode::BAD_REQUEST,
             ApiJson(json!({ "error": format!("unknown kind: {kind}") })),
         )
             .into_response(),
-        parsed => match run(&state, parsed).await {
-            Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
+        parsed => match run(state, parsed).await {
+            Ok(mut body) => {
+                if let Some(access) = narrowing {
+                    retain_readable_rules(&access, &mut body);
+                }
+                (StatusCode::OK, ApiJson(body)).into_response()
+            }
             // Every branch shares one outer `catch (e)` returning
             // `{ error: String(e) }` at 503.
             Err(err) => (
@@ -132,6 +177,47 @@ pub async fn get(State(state): State<AppState>, Path(kind): Path<String>) -> Res
             )
                 .into_response(),
         },
+    }
+}
+
+/// Drops every quality row whose `asset` the caller's table access hides, in
+/// place — the rule [`crate::routes::catalog::retain_visible`] applies to the
+/// catalog's own rows (`GOV-15` D6) — and gives the kept observed rows
+/// positional ids from the kept order, so an id says nothing about hidden rows
+/// (`GOV-15`, review round 1 (R1)).
+///
+/// `retain_visible` itself cannot be called: it reads a row's `tableKey` or
+/// dotted `id`, while a quality row's key is its `asset` (an authored rule's
+/// `id` is a UUID, an observed row's `q-<n>`). A row with no `asset` string is
+/// hidden from a narrowed caller, as is an `asset` with no schema: nothing
+/// proves the grant covers it (fail closed).
+fn retain_readable_rules(access: &crate::table_access::TableAccess, body: &mut Value) {
+    if access.is_all() {
+        return;
+    }
+    let Some(rows) = body.get_mut("quality").and_then(Value::as_array_mut) else {
+        return;
+    };
+    rows.retain(|row| {
+        row.get("asset")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|asset| access.allows_key(asset))
+    });
+    // The kept observed rows take their positional ids from the kept order
+    // (`q-0`, `q-1`, …): an id from the list before the filter would tell the
+    // caller how many hidden rows sorted before a visible one (`GOV-15`,
+    // review round 1 (R1)). An authored rule's id is a UUID and is left alone.
+    for (index, row) in rows
+        .iter_mut()
+        .filter(|row| {
+            row.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.starts_with("q-"))
+        })
+        .enumerate()
+    {
+        row["id"] = json!(format!("q-{index}"));
     }
 }
 
@@ -2908,6 +2994,23 @@ mod tests {
         assert_eq!(severity_of("pass"), "info");
     }
 
+    /// The principal the auth gate always inserts before [`get`] runs. An
+    /// administrator is the right caller here: `replication` is not narrowed
+    /// by role (`GOV-15` covers the quality rules only). `tag_key_handlers`'s
+    /// own `admin()` lives in a sibling module and is not reachable from here,
+    /// so this is the same principal inline.
+    fn replication_admin() -> Principal {
+        Principal {
+            id: lakehouse_auth::PrincipalId::User(uuid::Uuid::new_v4()),
+            tenant_ids: Vec::new(),
+            display_name: "Rina Admin".to_owned(),
+            permissions: lakehouse_auth::PermissionSet::parse("governance:write,*:*"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
     /// `GET /api/governance/replication` against a `ClickHouse` stub that
     /// answers every query with `status` and `body`; returns the route's
     /// status and JSON body.
@@ -2936,6 +3039,7 @@ mod tests {
         let cfg = crate::config::Config::from_map(&env).unwrap();
         let router = axum::Router::new()
             .route("/api/governance/{kind}", axum::routing::get(get))
+            .layer(Extension(replication_admin()))
             .with_state(AppState::new(cfg));
 
         let resp = router

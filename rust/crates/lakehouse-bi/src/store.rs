@@ -7313,7 +7313,7 @@ mod tests {
             spec.spec.sql
         );
         assert!(
-            spec.spec.sql.contains("round(sum(double)) AS double"),
+            spec.spec.sql.contains("round(sum(double), 6) AS double"),
             "{}",
             spec.spec.sql
         );
@@ -7923,7 +7923,7 @@ mod tests {
         assert!(
             goal.spec
                 .sql
-                .starts_with("SELECT round(sum(visitors)) AS v FROM"),
+                .starts_with("SELECT round(sum(visitors), 6) AS v FROM"),
             "{}",
             goal.spec.sql
         );
@@ -7990,7 +7990,9 @@ mod tests {
             spec.spec.sql
         );
         assert!(
-            spec.spec.sql.contains("round(sum(visitors)) AS visitors"),
+            spec.spec
+                .sql
+                .contains("round(sum(visitors), 6) AS visitors"),
             "{}",
             spec.spec.sql
         );
@@ -8019,7 +8021,9 @@ mod tests {
             ChartY::Multi(vec!["visitors".to_owned(), "avg_stay".to_owned()])
         );
         assert!(
-            spec.spec.sql.contains("round(sum(visitors)) AS visitors"),
+            spec.spec
+                .sql
+                .contains("round(sum(visitors), 6) AS visitors"),
             "{}",
             spec.spec.sql
         );
@@ -8082,7 +8086,7 @@ mod tests {
         assert!(!spec.def.caps_breakdown());
         assert_eq!(
             spec.spec.sql,
-            "SELECT place, round(sum(visitors)) AS visitors FROM (\n\
+            "SELECT place, round(sum(visitors), 6) AS visitors FROM (\n\
              SELECT place, cat, d, visitors, stay FROM serving.mart_x\n\
              ) AS src GROUP BY place ORDER BY visitors DESC LIMIT 3 SETTINGS \
              max_result_rows = 2000, result_overflow_mode = 'break', max_execution_time = 60"
@@ -9119,7 +9123,7 @@ mod tests {
             fixed
                 .spec
                 .sql
-                .starts_with("SELECT round(sum(visitors)) AS v FROM")
+                .starts_with("SELECT round(sum(visitors), 6) AS v FROM")
         );
         assert_eq!(
             fixed.def.types.goal,

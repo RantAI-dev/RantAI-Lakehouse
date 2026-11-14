@@ -214,17 +214,39 @@ pub struct ResolveBody {
 /// # Errors
 ///
 /// `400` when the body is malformed or the reason is empty or too long;
-/// `404` when no incident has that id; `409` when it was resolved before;
-/// `503`/`500` on a store failure.
+/// `403` when the caller is outside the tenant that owns the shared catalog;
+/// `404` when no incident has that id, and for an incident on a table the
+/// caller's role does not read (it answers as an unknown incident,
+/// `GOV-15`); `409` when it was resolved before; `503`/`500` on a store
+/// failure.
 pub async fn resolve_incident(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     body: axum::body::Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    // GOV-15 (GOV-12 plan, section 4): the tenant gate comes first, before the
+    // body is read and before anything is looked up, so a caller outside it
+    // learns nothing about an incident id (D4).
+    let access =
+        crate::routes::quality::quality_table_access(&state, Some(&principal), &headers).await?;
     let body: ResolveBody = serde_json::from_slice(&body)
         // SEC-11 (CI run on DATA-14): a fixed sentence, not serde's text.
         .map_err(|_| ApiError::BadRequest("Body must be JSON {resolution}.".to_owned()))?;
+    match quality::get(pool(&state)?, &id).await? {
+        None => {
+            return Err(ApiError::NotFound("Quality incident not found".to_owned()).into());
+        }
+        // GOV-15 (GOV-12 plan, section 4): resolving is refused for an
+        // incident on a table the caller's role does not read, and it reads as
+        // an unknown id (the same 404). The incident list itself is not
+        // narrowed by role (D5).
+        Some(incident) if !access.allows_key(incident.asset.trim()) => {
+            return Err(ApiError::NotFound("Quality incident not found".to_owned()).into());
+        }
+        Some(_) => {}
+    }
     let incident = match quality::resolve(pool(&state)?, &id, principal.id.uuid(), &body.resolution)
         .await?
     {

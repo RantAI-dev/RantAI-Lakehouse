@@ -1,6 +1,6 @@
 import type { SemanticEntryInput, SemanticEntries, SemanticService } from "../contracts/semantic"
 import { apiFetch } from "../http"
-import { ServiceError } from "../errors"
+import { ServiceError, deniedFor } from "../errors"
 
 /**
  * The semantic entries over `/api/semantic/{asset}`. An error body's text is
@@ -49,11 +49,10 @@ function bodyOf(input: SemanticEntryInput): Record<string, unknown> {
 }
 
 function errorFor(status: number, json: { error?: string } | null): ServiceError {
-  const kind =
-    status === 401 || status === 403
-      ? "permission_denied"
-      : status >= 500
-        ? "unavailable"
-        : "invalid_request"
+  // QA TC-1724 (WEB-12): a refusal goes through deniedFor. A 200 with
+  // `supported: false` is a refusal of another kind and is untouched.
+  const denied = deniedFor(status, json)
+  if (denied) return denied
+  const kind = status >= 500 ? "unavailable" : "invalid_request"
   return new ServiceError(kind, json?.error ?? `Failed (${status})`, status)
 }

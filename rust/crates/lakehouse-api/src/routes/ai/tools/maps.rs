@@ -93,9 +93,10 @@ pub(super) async fn list_maps(state: &AppState) -> Value {
 /// ids are the ones this module owns: a built-in one, an uploaded one, or a
 /// country's map (`adm1-` and its ISO 3166-1 alpha-3 code in lower case).
 ///
-/// A call that names no `map` (an `update_chart` that keeps the stored one),
-/// a `null` map and a blank map are not checked: `lakehouse_bi`'s
-/// `geo_fields` stores nothing for a blank one.
+/// A new region map chart (`create_chart` of kind `geomap`) has no stored map
+/// to keep, so it must name one: without a map its tile draws no region at
+/// all. An `update_chart` that names no map keeps the stored one, and a chart
+/// of another kind draws from its columns, so neither is checked.
 ///
 /// # Errors
 ///
@@ -110,6 +111,13 @@ pub(super) async fn require_known_map(
     }
     let map = super::arg_str(args, "map").trim().to_owned();
     if map.is_empty() {
+        // A new region map chart has no stored map to keep, so it must name
+        // one; the other kinds draw from their columns and an update keeps
+        // the map it was saved with.
+        if name == "create_chart" && super::arg_str(args, "kind").trim() == "geomap" {
+            let uploaded = uploaded_maps(state).await?;
+            return Err(json!({ "error": missing_map_sentence(&uploaded) }));
+        }
         return Ok(());
     }
     let uploaded = uploaded_maps(state).await?;
@@ -140,14 +148,34 @@ fn is_country_map(id: &str) -> bool {
 /// The sentence a chart call is refused with when its `map` names no map that
 /// exists: the id the model used and the maps it may use.
 fn refusal_sentence(id: &str, uploaded: &[GeoMap]) -> String {
+    format!(
+        "map '{id}' does not exist. {choices}",
+        id = echoed(id),
+        choices = map_choices(uploaded)
+    )
+}
+
+/// The sentence a new region map chart is refused with when it names no map:
+/// there is no stored map to keep, and the maps it may use.
+fn missing_map_sentence(uploaded: &[GeoMap]) -> String {
+    format!(
+        "a geomap chart needs `map`. {choices}",
+        choices = map_choices(uploaded)
+    )
+}
+
+/// The maps the model may use, as the clause both refusals end with: the
+/// built-in ids, the uploaded ones when there are few enough of them to name,
+/// the per-country rule and a pointer to `list_maps` for the rest. ONE list,
+/// so the two refusals cannot name different maps.
+fn map_choices(uploaded: &[GeoMap]) -> String {
     let mut choices: Vec<&str> = BUILT_IN.iter().map(|(built_in, _, _)| *built_in).collect();
     if uploaded.len() <= MAX_NAMED_UPLOADED {
         choices.extend(uploaded.iter().map(|m| m.id.as_str()));
     }
     choices.push("adm1-<iso3> for a country's provinces");
     format!(
-        "map '{id}' does not exist. Use one of: {choices}, or an uploaded map from list_maps.",
-        id = echoed(id),
+        "Use one of: {choices}, or an uploaded map from list_maps.",
         choices = choices.join(", ")
     )
 }
@@ -256,6 +284,20 @@ mod tests {
             sentence.contains("world, adm1-<iso3> for a country's provinces"),
             "{sentence}"
         );
+    }
+
+    /// The refusal for a new region map chart names the same maps the
+    /// unknown-id refusal names, the uploaded ones included: one list of the
+    /// maps the model may use, so the two refusals cannot drift apart.
+    #[test]
+    fn the_missing_map_refusal_names_the_uploaded_maps_too() {
+        let uploaded = vec![fixture_map("m_0123456789ab")];
+        let sentence = missing_map_sentence(&uploaded);
+        assert!(
+            sentence.starts_with("a geomap chart needs `map`."),
+            "{sentence}"
+        );
+        assert!(sentence.contains("m_0123456789ab"), "{sentence}");
     }
 
     /// A state whose Postgres is the test pool and whose `ClickHouse` is

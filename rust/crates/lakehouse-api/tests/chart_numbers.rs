@@ -47,6 +47,10 @@ const YEARS_TABLE: &str = "default.bi57_years";
 /// `BI-57`: a fractional column, where the maximum keeps the closed last bin.
 const STAY_TABLE: &str = "default.bi57_stay";
 
+/// `BI-57` (D9): a whole column, a `Float64` one and a `Decimal` one, so a
+/// sum of each is read from the engine.
+const SUMS_TABLE: &str = "default.bi57_sums";
+
 /// ONE `ClickHouse` per test binary (the arrangement of
 /// `tests/breakdown_cap.rs`); the container is never stopped by the test.
 static CLICKHOUSE: tokio::sync::OnceCell<(String, testcontainers::ContainerAsync<ClickHouse>)> =
@@ -120,6 +124,26 @@ async fn seed(ch: &ChClient) {
     )
     .await
     .expect("fill the stay table");
+    // `BI-57` (D9): a whole column, a `Float64` one and a `Decimal` one, over
+    // two `a` rows and two `b` rows, so a sum of each is proven per group.
+    ch.exec(
+        &format!(
+            "CREATE TABLE {SUMS_TABLE} (kab String, n UInt32, f Float64, d Decimal(18, 2)) \
+             ENGINE = MergeTree ORDER BY kab"
+        ),
+        None,
+    )
+    .await
+    .expect("create the sums table");
+    ch.exec(
+        &format!(
+            "INSERT INTO {SUMS_TABLE} VALUES \
+             ('a', 1, 1.25, 1.25), ('a', 2, 2.5, 2.50), ('b', 7, 0.1, 0.10), ('b', 0, 0.2, 0.20)"
+        ),
+        None,
+    )
+    .await
+    .expect("fill the sums table");
 }
 
 /// A JSON number, or a number the engine quoted as a 64-bit integer, read as
@@ -212,6 +236,93 @@ async fn an_average_keeps_its_decimals_and_a_maximum_of_whole_numbers_stays_whol
     assert_eq!(number(b.get("v").expect("the sum column")), 10.0);
     assert_eq!(number(b.get("avg_v").expect("the average column")), 10.0);
     assert_eq!(number(b.get("max_v").expect("the maximum column")), 10.0);
+}
+
+/// `BI-57` (D9): a sum of a `Float64` or a `Decimal` column keeps its six
+/// decimals, and a sum of whole numbers is the whole number it always was —
+/// `round(x, 6)` of an integer is that integer in `ClickHouse`, so the builder
+/// does not need to know the column's type.
+#[tokio::test]
+async fn a_sum_of_decimals_keeps_them_and_a_sum_of_whole_numbers_is_unchanged_on_the_engine() {
+    let (url, _container) = shared_clickhouse().await;
+    let ch = ChClient::new(url.clone(), "default".to_owned(), String::new());
+    let input: ChartInput = serde_json::from_value(serde_json::json!({
+        "title": "BI-57 sums",
+        "kind": "bar",
+        "dimension": "kab",
+        "measures": ["n", "f", "d"],
+    }))
+    .expect("a bar chart with three measures decodes");
+    let columns = [
+        SourceColumn {
+            name: "kab".to_owned(),
+            ty: "String".to_owned(),
+        },
+        SourceColumn {
+            name: "n".to_owned(),
+            ty: "UInt32".to_owned(),
+        },
+        SourceColumn {
+            name: "f".to_owned(),
+            ty: "Float64".to_owned(),
+        },
+        SourceColumn {
+            name: "d".to_owned(),
+            ty: "Decimal(18, 2)".to_owned(),
+        },
+    ];
+    let spec = spec_from_inline_sql(
+        &input,
+        InlineSql {
+            sql: "SELECT kab, n, f, d FROM default.bi57_sums",
+            columns: &columns,
+        },
+        ChartSource::Ui,
+        "ui",
+        &TimeContext::default(),
+    )
+    .expect("the chart is saved");
+    let statement = spec.spec.sql;
+    for measure in ["n", "f", "d"] {
+        assert!(
+            statement.contains(&format!("round(sum({measure}), 6)")),
+            "the saved statement rounds the sum of {measure} to six decimals: {statement}"
+        );
+    }
+    let result = ch
+        .query(&statement, None)
+        .await
+        .expect("the saved statement runs on the engine");
+
+    let a = row(&result.data, "a");
+    assert_eq!(
+        number(a.get("n").expect("the whole sum")),
+        3.0,
+        "a sum of whole numbers is unchanged: {statement}"
+    );
+    assert_eq!(
+        number(a.get("f").expect("the float sum")),
+        3.75,
+        "1.25 + 2.5 keeps its decimals: {statement}"
+    );
+    assert_eq!(
+        number(a.get("d").expect("the decimal sum")),
+        3.75,
+        "1.25 + 2.50 keeps its decimals: {statement}"
+    );
+
+    let b = row(&result.data, "b");
+    assert_eq!(number(b.get("n").expect("the whole sum")), 7.0);
+    assert_eq!(
+        number(b.get("f").expect("the float sum")),
+        0.3,
+        "0.1 + 0.2 reads 0.3, not 0.30000000000000004: {statement}"
+    );
+    assert_eq!(
+        number(b.get("d").expect("the decimal sum")),
+        0.3,
+        "0.10 + 0.20 reads 0.3: {statement}"
+    );
 }
 
 /// The last years of [`YEARS_TABLE`], as the filtered base a chart reads.

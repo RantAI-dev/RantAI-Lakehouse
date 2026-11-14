@@ -1,7 +1,7 @@
 import type { ParamDef } from "@/lib/params"
 import type { ParamInput, ParamService } from "../contracts/params"
 import { apiFetch } from "../http"
-import { ServiceError } from "../errors"
+import { ServiceError, deniedFor } from "../errors"
 
 /**
  * ParamService over `/api/dashboard/params`. A non-OK answer becomes a
@@ -12,14 +12,15 @@ async function call<T>(url: string, init: RequestInit, fallback: string): Promis
   const res = await apiFetch(url, init)
   const json = await res.json().catch(() => null)
   if (!res.ok) {
+    // WEB-12: a refusal goes through deniedFor (errors.ts).
+    const denied = deniedFor(res.status, json)
+    if (denied) throw denied
     const kind =
-      res.status === 401 || res.status === 403
-        ? "permission_denied"
-        : res.status === 404
-          ? "not_found"
-          : res.status >= 500
-            ? "unavailable"
-            : "invalid_request"
+      res.status === 404
+        ? "not_found"
+        : res.status >= 500
+          ? "unavailable"
+          : "invalid_request"
     throw new ServiceError(kind, json?.error ?? fallback)
   }
   return json as T
