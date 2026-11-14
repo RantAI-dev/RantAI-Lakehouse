@@ -5,7 +5,7 @@ import { createPortal } from "react-dom"
 import Image from "next/image"
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
-import { CircleUserRound, ChevronRight } from "lucide-react"
+import { CircleUserRound, ChevronRight, ChevronsUpDown } from "lucide-react"
 import { useAuth } from "@/features/auth/auth-provider"
 import { rememberTableHref } from "@/hooks/use-table-memory"
 import {
@@ -27,6 +27,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { useSidebarGroups } from "@/hooks/use-sidebar-groups"
 import { cn } from "@/lib/utils"
 import { NAV_GROUPS, activeNavHref, canOpen, type NavGroup, type NavItem } from "./nav-config"
+import { UserMenu } from "./user-menu"
 
 function BrandLogo() {
   // Logo follows the theme: navy for a light sidebar, white for a dark one.
@@ -58,7 +59,7 @@ export function AppSidebar() {
   const activeHref = activeNavHref(pathname)
   const { state } = useSidebar()
   const iconMode = state === "collapsed"
-  const { user, hasPermission } = useAuth()
+  const { user, hasPermission, logout } = useAuth()
   const groups = React.useMemo(() => {
     return NAV_GROUPS.map((g) => ({
       ...g,
@@ -340,22 +341,31 @@ export function AppSidebar() {
       <SidebarFooter className="border-t border-sidebar-border p-2">
         <SidebarMenu>
           <SidebarMenuItem>
-            <SidebarMenuButton
-              size="lg"
-              tooltip={user?.name ?? "Signed in"}
-              className="h-14 rounded-lg px-2 hover:bg-sidebar-accent group-data-[collapsible=icon]:size-10! group-data-[collapsible=icon]:h-10!"
-              render={
-                <div role="group" aria-label="Current user">
-                  <div className="flex size-9 shrink-0 items-center justify-center rounded-full bg-primary/12 text-primary ring-1 ring-primary/20">
-                    <CircleUserRound className="size-5" aria-hidden />
-                  </div>
-                  <div className="grid min-w-0 flex-1 text-left leading-tight group-data-[collapsible=icon]:hidden">
-                    <span className="truncate text-sm font-semibold text-sidebar-foreground">{user?.name ?? "Signed in"}</span>
-                    <span className="truncate text-xs text-sidebar-foreground/60">{user?.email ?? ""}</span>
-                  </div>
-                </div>
+            {/* BI-61 review round 1, SHOULD-FIX 7 (owner decision 2026-11-14): the card is the
+                account menu's one trigger. It looked clickable and did nothing; the navbar's
+                profile button that held the menu is gone. Collapsed, the avatar alone opens it. */}
+            <UserMenu
+              userName={user?.name}
+              userEmail={user?.email}
+              onLogout={logout}
+              trigger={
+                <SidebarMenuButton
+                  size="lg"
+                  tooltip={user?.name ?? "Signed in"}
+                  aria-label={`Account menu, ${user?.name ?? "signed in"}`}
+                  className="h-14 rounded-lg px-2 hover:bg-sidebar-accent data-[popup-open]:bg-sidebar-accent group-data-[collapsible=icon]:size-10! group-data-[collapsible=icon]:h-10!"
+                />
               }
-            />
+            >
+              <div className="flex size-9 shrink-0 items-center justify-center rounded-full bg-primary/12 text-primary ring-1 ring-primary/20">
+                <CircleUserRound className="size-5" aria-hidden />
+              </div>
+              <div className="grid min-w-0 flex-1 text-left leading-tight group-data-[collapsible=icon]:hidden">
+                <span className="truncate text-sm font-semibold text-sidebar-foreground">{user?.name ?? "Signed in"}</span>
+                <span className="truncate text-xs text-sidebar-foreground/60">{user?.email ?? ""}</span>
+              </div>
+              <ChevronsUpDown className="ml-auto size-4 shrink-0 text-sidebar-foreground/60 group-data-[collapsible=icon]:hidden" aria-hidden />
+            </UserMenu>
           </SidebarMenuItem>
         </SidebarMenu>
       </SidebarFooter>
