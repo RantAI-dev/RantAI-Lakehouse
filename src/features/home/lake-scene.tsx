@@ -168,14 +168,14 @@ function field(u: number, v: number, aspect: number, t: number, i: number, j: nu
 /**
  * A calm patch under the greeting, so the words never sit on busy ink:
  * centred where Home puts the greeting (its top padding is 43 % of the
- * band), wide enough for a long name. Below 560 px a long greeting takes two
- * lines, so the patch is taller and a little lower there.
+ * band), wide enough for a long name. Below 560 px a greeting may take one
+ * line or two, so the patch is taller there and covers both.
  */
 function clearing(u: number, v: number, w: number): number {
   const narrow = w < 560
-  const rx = Math.min(0.48, Math.max(0.17, 270 / Math.max(1, w)))
+  const rx = narrow ? 0.62 : Math.min(0.48, Math.max(0.17, 270 / Math.max(1, w)))
   const dx = (u - 0.5) / rx
-  const dy = (v - (narrow ? 0.53 : 0.48)) / (narrow ? 0.11 : 0.065)
+  const dy = (v - (narrow ? 0.52 : 0.48)) / (narrow ? 0.12 : 0.065)
   const d2 = dx * dx + dy * dy
   return d2 < 2 ? Math.min(1, Math.max(0, (d2 - 0.4) / 1.6)) : 1
 }
