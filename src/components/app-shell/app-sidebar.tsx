@@ -5,7 +5,7 @@ import { createPortal } from "react-dom"
 import Image from "next/image"
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
-import { ChevronDown, ChevronRight, FileText, LayoutGrid } from "lucide-react"
+import { ChevronDown, ChevronRight, FileText } from "lucide-react"
 import { useAuth } from "@/features/auth/auth-provider"
 import { rememberTableHref } from "@/hooks/use-table-memory"
 import {
@@ -233,8 +233,9 @@ export function AppSidebar() {
       : first.href === "/dashboards"
         ? (first.action?.href ?? first.href)
         : first.href
-    // The icon follows the kind, the same ones the Browse tabs use.
-    const RowIcon = remembered ? (remembered.kind === "report" ? FileText : LayoutGrid) : Icon
+    // The icon follows the kind. BI-61 T11 review: a dashboard keeps the row's own chart icon
+    // (the Browse part beside it already uses the grid); a report gets the document icon.
+    const RowIcon = remembered?.kind === "report" ? FileText : Icon
     const active = group.items.some((it) => it.href === activeHref)
 
     // One page, or icon mode with one page: nothing to expand.
