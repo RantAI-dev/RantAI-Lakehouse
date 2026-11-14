@@ -59,4 +59,50 @@ Owner: "halaman menu history itu dihapus aja, dan cukup ditampilkan dari menu Ho
 
 ## 6. Handoff
 
-(developer)
+### Slice 1 (T1–T6), developer (Opus, console design work), 2026-11-14
+
+**Commits** (on `feat/web-18-chat-sidebar`, not pushed):
+
+| Task | Commit | What |
+| --- | --- | --- |
+| T1 | `268477d7` | Before screenshots, `/copilot?id=` and `/copilot/history`, 1366×900 light and dark |
+| T2 | `1ef8bf85` | `SidebarChats` (Back to menu, New chat, Search, AI settings, chats by day, paging, ⋯ Rename/Delete), "AI chats" row on `/copilot` only, `use-chat-list.ts`, `sidebar-classes.ts` |
+| T3 | `106ee83f` | The slide between the two views, focus follows, collapsed icons, phone sheet |
+| T4 | `f03d8eae` | History entry, page, panel and switcher removed; `/copilot/history` → `/copilot?open=latest`; links repointed |
+| T5 | `43a65ac4` | `AppShellSkeleton` draws the chat list on `/copilot` (`SidebarChatsSkeleton`, shared `ChatListSkeleton`) |
+| T6 | `89a64333` | After screenshots and the slide's 0/80/160/240 ms frames, both ways |
+
+**How it works.**
+- `AppSidebar` keeps both views mounted side by side in `SidebarContent` (`relative overflow-hidden`), each `absolute inset-0` (`SIDEBAR_VIEW_PANE_CLASS`). On `/copilot` (with an assistant permission) the chats are shown; "Back to menu" sets `menuOnConversation`, which any pathname change resets, so it never leaves the page. The menu then has an active "AI chats" row (`Bot`, chevron) right under Home, only on `/copilot`, which slides the chats back.
+- Slide: `transform` only, 240 ms, `cubic-bezier(0.23,1,0.32,1)` (the sidebar's curve); the menu goes to `-translate-x-full` while the chats come from `translate-x-full`, both at once, so the frame is never empty and the width never changes. The out-of-view pane is `inert`. Reduced motion: `motion-reduce:transition-none`, an instant swap. The chat pane mounts off-screen the first time it is wanted (forced layout, then flipped) so arriving from Home also slides; it stays mounted after. Focus moves to the control that leads back (AI chats / Back to menu).
+- Collapsed: the four actions are the same rows, narrowed to their icons with tooltips (`SidebarMenuButton tooltip`); Search's row becomes a button that opens the sidebar and focuses the field; the chat list fades and is `inert`.
+- Phone: the sheet holds the same `AppSidebar`, so it opens on the chat list on `/copilot`, with Back to menu; picking a chat, New chat or AI settings closes the sheet.
+- Search: server-side `q` (title and message text, as History did), debounced 300 ms; "/" focuses it while the list is shown unless typing in a field; Esc clears, a second Esc blurs.
+- The list: `useChatList` (the History page's infinite query, 30 a page, `IntersectionObserver` inside the list's own scroller, `.scroll-fade` edges); `useFollowRecentSessions` invalidates it whenever the Copilot's recent list changes (a chat saved, renamed, deleted or answered). Rows: title only, one line, active highlighted like a nav item, ⋯ on hover/focus (always shown on touch) with the existing `SessionActionsMenu` (Rename dialog; Delete is the existing confirm dialog, there was no undo toast).
+- AI settings is `/admin/settings?section=assistant` (`ADM-9`'s Assistant section), shown only with `settings:write`, which that section requires.
+
+**Links repointed, and `/copilot/history`.**
+- `nav-config.ts`: History group, `HIGHLIGHT_UNDER`, the `/copilot/history` `ROUTE_ACCESS` entry removed; `/copilot` highlights no menu row.
+- `/copilot/history` is an HTTP 307 in `next.config.ts` `redirects()` to `/copilot?open=latest`; `SessionUrlSync` then lists one conversation and replaces the address with `/copilot?id=<newest>`, or `/` when there is none or the list fails (verified in the browser: it landed on `/copilot?id=c_d3b4a531`). The page file is deleted. **Plan mismatch:** the plan said "keeps working as a redirect" with the guard entry removed; a page calling `redirect()` does not work here, because the redirect is only thrown when the client renders the page and `RouteGuard` renders "You don't have access" for an address without a `ROUTE_ACCESS` entry. **Pre-existing bug, not fixed:** `/admin/maps` (checked in the browser, it stays on "You don't have access") and the other legacy redirect pages have the same problem.
+- `session-parts.tsx` (AI Copilot panel's history menu): "View all history" → "View all chats", `/copilot?id=<open or newest>`, hidden with no chats.
+- `history-menu.tsx`: `CopilotHistoryMenu` (with its History link) deleted; `CopilotHistoryButton` kept for the dock and side panel.
+- `recent-card.tsx` (Home): "History" → "Chats", the newest conversation the card lists, hidden with none.
+- `conversation-panel.tsx` (its "All history" link) and `copilot-history-page.tsx` deleted.
+- `docs/OPERATIONS.md` role notes updated. **Not touched:** `docs/core/features/copilot-chat.md` open question 2 still says the entry is "History" (planner's page).
+
+**Judgment calls to review.**
+1. The conversation page's own **New chat** button was removed too, not only History ("satu aksi, satu tombol": the sidebar's New chat is beside it). The bar holds the title alone, 36 px high as before, so the chat did not move.
+2. Groups use the existing `groupSessions` (Today / Yesterday / Previous 7 days / **Previous 30 days** / Earlier), one more bucket than the plan lists, so History and the sidebar agree.
+3. No mode (Ask/Build) icon on rows: the row is title only.
+4. The class constants moved from `app-sidebar.tsx` to `sidebar-classes.ts` (no import cycle with `sidebar-chats.tsx`).
+
+**Commands** (on the final commit `89a64333`'s code; each heavy one under `systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0 nice -n 15`):
+- `bun run typecheck`: exit 0.
+- `bun test src/components/app-shell src/features/copilot src/features/home`: 215 pass, 0 fail, 24 files.
+- `bun x eslint <the 19 added or modified .ts/.tsx files>`: 0 problems.
+- Per commit: `bun test src/components/app-shell src/features/copilot` (T2 201/0, T3 204/0, T4 212/0 with `src/features/home`, T5 213/0), typecheck and eslint on the touched files, all clean.
+- Not run (machine rules): full `bun run test`, `bun run lint`, any Rust.
+
+**Screenshots:** `docs/plans/web-18-screens/before-*` (4) and `after-*` (19, including `after-slide-out-{000,080,160,240}ms` and `after-slide-in-…`), taken against the QA API on 28604 through a dev server on 28699 and headless Chrome on 28691, both stopped by PID afterwards. The QA model answers 401, so a question asked on Home is never saved; the four QA conversations were saved through `POST /api/ai/sessions` as the QA user, with an assistant line saying so. All are "Today", so the other day groups were not seen in the browser (unit-tested through `groupSessions`). `after-row-hover-light` and `after-search-light` predate the title bar's 40→36 px correction.
+
+**Not verified:** a real phone (iPhone Safari), only Chrome's mobile emulation and happy-dom; infinite paging past 30 chats in the browser (QA has 4); Rename/Delete from the sidebar in the browser (unit paths are the existing ones); keyboard-only walkthrough in the browser beyond the "/" and focus tests; dark-mode shots of hover, search, collapsed and the slide.
