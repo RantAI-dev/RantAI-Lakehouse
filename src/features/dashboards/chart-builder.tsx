@@ -1817,12 +1817,12 @@ export function ChartBuilder({
     // comes from and goes, and the two actions), then three zones: the data panel, the canvas and
     // the inspector. The zones follow the builder's own width (a container query), not the
     // window's, because the app's sidebar takes a different share of each window.
-    // `BI-58` T5: from two columns up the builder fits the window instead of scrolling it. The
-    // assistant dock keeps a 5rem spacer under `main` for pages that scroll; the inner frame cancels
-    // it (on the child: a container query never matches its own container), so the zones end just
-    // above the dock, and `main`'s own bottom padding still keeps the dock clear of them.
+    // `BI-58` T5: from two columns up the builder fits the window instead of scrolling it: the
+    // navbar (4rem) and `main`'s top padding (1.5rem) above, and the frame's `--content-bottom` below.
+    // Owner QA 2026-11-14, composer: that bottom room is now just the composer and a small gap, the
+    // same token `main` pads with, so the zones end about 14 px above the composer.
     <div className="@container" data-slot="chart-builder" onPointerDownCapture={markTouched} onKeyDownCapture={markTouched} onInputCapture={markTouched}>
-      <div className="flex flex-col gap-4 @3xl:-mb-20 @3xl:h-[calc(100dvh-12.5rem)] @3xl:min-h-[34rem]">
+      <div className="flex flex-col gap-4 @3xl:h-[calc(100dvh-5.5rem-var(--content-bottom,1.5rem))] @3xl:min-h-[30rem]">
         {/*
           BI-58 review round 1, SHOULD-FIX 4 and 5 (owner): one action, one button. The back arrow
           leaves (asking first when something changed), the dashboard name in the breadcrumb is

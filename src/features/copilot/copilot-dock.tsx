@@ -41,10 +41,12 @@ export function CopilotDock() {
 
   return (
     <>
-    {/* The bar floats over the page; this keeps the last row of content
-        scrollable out from under it. */}
-    <div aria-hidden className="h-20 shrink-0 print:hidden" />
-    <div className={`fixed bottom-4 left-1/2 z-50 -translate-x-1/2 print:hidden transition-all duration-200 ${showPanel ? "w-[min(92vw,560px)]" : "w-[min(88vw,460px)]"}`}>
+    {/* The bar floats over the page. Owner QA 2026-11-14, composer: it is centred on the content
+        area, right of the sidebar (`--content-left`, set by AppFrame), not on the window, and it
+        follows the sidebar as it folds. The room under the page is AppFrame's `--content-bottom`;
+        the 5rem spacer this rendered on top of that is gone. */}
+    <div className="pointer-events-none fixed right-0 bottom-4 left-(--content-left,0px) z-50 flex justify-center px-4 transition-[left] duration-200 ease-linear print:hidden">
+    <div className={`pointer-events-auto w-full transition-all duration-200 ${showPanel ? "max-w-[560px]" : "max-w-[460px]"}`}>
       {showPanel ? (
         <div className="mb-2 flex max-h-[58vh] flex-col overflow-hidden rounded-2xl border border-border/70 bg-card/90 shadow-[0_8px_40px_rgba(0,0,0,0.18)] backdrop-blur-xl supports-backdrop-filter:bg-card/80">
           <div className="flex items-center gap-2 border-b border-border px-3 py-2">
@@ -134,6 +136,7 @@ export function CopilotDock() {
         toggleCap={c.toggleCap}
         onFocus={() => c.setExpanded(true)}
       />
+    </div>
     </div>
     </>
   );
