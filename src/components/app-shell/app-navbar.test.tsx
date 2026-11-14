@@ -128,11 +128,14 @@ describe("the account menu", () => {
     expect(screen.getByText(`Version ${CONSOLE_VERSION}`)).toBeTruthy()
   })
 
-  it("heads the menu with the email, muted, and ends with Sign out", () => {
+  it("heads the menu with the role above the email, muted, and ends with Sign out", () => {
     render(<UserMenu userName="Ada Lovelace" userEmail="ada@example.com" roles={["platform_admin", "viewer", "editor"]} onLogout={() => {}} />)
     fireEvent.click(screen.getByRole("button", { name: /Account menu/ }))
     expect(screen.getByText("ada@example.com")).toBeTruthy()
     expect(screen.getByText("Platform admin, Viewer +1")).toBeTruthy()
+    // Owner QA 2026-11-15: the role comes first, the email below it.
+    const role = screen.getByText("Platform admin, Viewer +1")
+    expect(role.nextElementSibling?.textContent).toBe("ada@example.com")
     const items = screen.getAllByRole("menuitem")
     expect(items[items.length - 1].textContent).toBe("Sign out")
   })
