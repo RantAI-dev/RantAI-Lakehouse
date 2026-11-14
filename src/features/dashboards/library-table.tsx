@@ -15,6 +15,7 @@ import { cn } from "@/lib/utils"
 import { KIND_LABEL, libraryHref, type LibraryItem, type SortColumn, type SortState } from "./library-items"
 import { ItemMenu, type ItemActions } from "./library-menus"
 import { Avatar, EASE, FOCUS, ItemBadges, KindIcon, StarButton, ownerLabel } from "./library-parts"
+import { ItemPicture, chartsOf, type PictureSource } from "./library-picture"
 
 /** What the table needs to know about folders: a path for a folder id, and whether it is a personal space. */
 export type FolderLookup = {
@@ -29,10 +30,11 @@ type RowProps = {
   readonly myName: string | undefined
   /** Opening a template asks for a name first; the page owns that dialog. */
   readonly onOpenTemplate: (item: LibraryItem) => void
+  readonly pictures: PictureSource
 }
 
 export function LibraryTable({
-  items, sort, onSort, actions, folders, myName, onOpenTemplate,
+  items, sort, onSort, actions, folders, myName, onOpenTemplate, pictures,
 }: {
   readonly items: readonly LibraryItem[]
   readonly sort: SortState
@@ -41,6 +43,7 @@ export function LibraryTable({
   readonly folders: FolderLookup
   readonly myName: string | undefined
   readonly onOpenTemplate: (item: LibraryItem) => void
+  readonly pictures: PictureSource
 }) {
   return (
     <div className="rounded-2xl bg-card ring-1 ring-foreground/5">
@@ -58,7 +61,7 @@ export function LibraryTable({
         </thead>
         <tbody>
           {items.map((item) => (
-            <TableRow key={item.key} item={item} actions={actions} folders={folders} myName={myName} onOpenTemplate={onOpenTemplate} />
+            <TableRow key={item.key} item={item} actions={actions} folders={folders} myName={myName} onOpenTemplate={onOpenTemplate} pictures={pictures} />
           ))}
         </tbody>
       </table>
@@ -126,15 +129,13 @@ export function FolderCell({ item, folders }: { readonly item: LibraryItem; read
   )
 }
 
-function TableRow({ item, actions, folders, myName, onOpenTemplate }: RowProps) {
+function TableRow({ item, actions, folders, myName, onOpenTemplate, pictures }: RowProps) {
   const fav = item.kind === "dashboard" && actions.isFavourite(item)
   return (
     <tr className={cn("group relative border-t border-border/60 hover:bg-muted/40", EASE)}>
       <td className="py-2 pr-3 pl-4">
         <div className="flex min-w-0 items-center gap-3">
-          <span aria-hidden className="grid h-8 w-11 shrink-0 place-items-center rounded-md bg-muted/70 dark:bg-muted/40">
-            <KindIcon kind={item.kind} />
-          </span>
+          <ItemPicture item={item} charts={chartsOf(pictures, item.id)} size="sm" className="h-8 w-11 shrink-0 rounded-md" />
           <ItemName item={item} onOpenTemplate={onOpenTemplate} />
         </div>
       </td>

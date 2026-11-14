@@ -24,6 +24,8 @@ import {
 import { FolderPicker, NewMenu, PageMenu, type FolderChoice, type ItemActions } from "./library-menus"
 import { PageFrame, ScrollRegion, SearchField, Segmented } from "./library-parts"
 import { LibraryTable, type FolderLookup } from "./library-table"
+import { ItemPicture, pictureSource } from "./library-picture"
+import { RecentRow } from "./library-recent"
 import { MoveItemsDialog } from "./move-items-dialog"
 import { UseTemplateDialog } from "./template-dialogs"
 import { forgetLastBoard } from "./last-board"
@@ -149,7 +151,15 @@ export function DashboardListPage() {
     () => (templatesState.status === "success" ? templatesState.data.list.templates : templatesState.status === "error" ? null : []),
     [templatesState.status, templatesState.data],
   )
-  // Favourites (best effort: the list works without them).
+  // The pictures (decision P3): every stored chart's board, kind and width,
+  // read once for the whole page; no dashboard is read and no query runs.
+  // When it fails the pictures fall back to glyphs and the list still works.
+  const outlinesState = useService((s) => dashboardService.listChartOutlines(s), [])
+  const pictures = React.useMemo(
+    () => pictureSource(outlinesState.status === "success" ? outlinesState.data : outlinesState.status === "error" ? null : []),
+    [outlinesState.status, outlinesState.data],
+  )
+  // Favourites and recent items (best effort: the list works without them).
   const shortcuts = useService((s) => dashboardService.shortcuts(s), [])
   const favouriteIds = React.useMemo(
     () => new Set((shortcuts.status === "success" ? shortcuts.data.favourites : []).filter((f) => f.kind === "board").map((f) => f.id)),
@@ -307,8 +317,13 @@ export function DashboardListPage() {
   // leaves the dashboards usable.
   // Until the session is known the templates read is a stand-in (`canFile` is
   // still false), so the list also waits for it.
-  const loading = auth.status === "loading" || state.status === "loading" || reportsState.status === "loading" || !templatesReady
+  const loading = auth.status === "loading" || state.status === "loading" || reportsState.status === "loading" || !templatesReady || outlinesState.status === "loading"
   const tabs = tabValues.map((v) => ({ value: v, label: TAB_LABEL[v] }))
+  const boardsById = React.useMemo(
+    () => new Map(items.filter((i) => i.kind === "dashboard").map((i) => [i.id, i])),
+    [items],
+  )
+  const recent = shortcuts.status === "success" ? shortcuts.data.recent : []
 
   return (
     <PageFrame>
@@ -324,6 +339,9 @@ export function DashboardListPage() {
             {canFile ? (
               <NewMenu
                 templates={templates}
+                renderPicture={(t) => (
+                  <ItemPicture item={templateItem(t)} charts={null} size="sm" className="h-10 w-16 shrink-0" />
+                )}
                 onDashboard={() => setCreateOpen(true)}
                 onTemplate={setUsing}
                 onImport={() => setImportOpen(true)}
@@ -335,59 +353,65 @@ export function DashboardListPage() {
       </header>
 
       <ScrollRegion className="-mx-2 mt-5 px-2 pb-6">
-        <section aria-label="Dashboards, reports and templates" className="grid grid-cols-[minmax(0,1fr)] gap-3">
-          <div className="flex min-h-9 flex-wrap items-center justify-between gap-2">
-            <Segmented<TabValue> label="Type" value={tab} onChange={setTab} options={tabs} />
-            <FolderPicker
-              value={folderFilter}
-              onChange={setFolderFilter}
-              choices={folderChoicesList}
-              noFolderCount={items.filter((i) => i.kind !== "template" && !i.folderId).length}
-            />
-          </div>
+        <div className="grid grid-cols-[minmax(0,1fr)] gap-7">
+          {!query.trim() && state.status === "success" && !loading ? (
+            <RecentRow recent={recent} boards={boardsById} source={pictures} />
+          ) : null}
+          <section aria-label="Dashboards, reports and templates" className="grid grid-cols-[minmax(0,1fr)] gap-3">
+            <div className="flex min-h-9 flex-wrap items-center justify-between gap-2">
+              <Segmented<TabValue> label="Type" value={tab} onChange={setTab} options={tabs} />
+              <FolderPicker
+                value={folderFilter}
+                onChange={setFolderFilter}
+                choices={folderChoicesList}
+                noFolderCount={items.filter((i) => i.kind !== "template" && !i.folderId).length}
+              />
+            </div>
 
-          {state.status === "error" ? <ErrorState error={state.error} onRetry={reload} /> : null}
-          {state.status !== "error" && loading ? <LoadingSkeleton /> : null}
-          {state.status === "success" && !loading ? (
-            rows.length === 0 ? (
-              <ListEmpty
-                kind={kind}
-                query={query}
-                folderFilter={folderFilter}
-                canWrite={canFile}
-                anyOfKind={items.some((i) => kind === "all" || i.kind === kind)}
-              />
-            ) : (
-              <LibraryTable
-                items={rows}
-                sort={sort}
-                onSort={sortBy}
-                actions={actions}
-                folders={folderLookup}
-                myName={myName}
-                onOpenTemplate={(item) => item.template && setUsing(item.template)}
-              />
-            )
-          ) : null}
-          {reportsState.status === "error" ? (
-            <p className="text-xs text-destructive">
-              Reports could not be listed: {reportsState.error.message}{" "}
-              <button type="button" className="underline underline-offset-4" onClick={reloadReports}>Try again</button>
-            </p>
-          ) : null}
-          {templatesState.status === "error" ? (
-            <p className="text-xs text-destructive">
-              Templates could not be listed: {templatesState.error.message}{" "}
-              <button type="button" className="underline underline-offset-4" onClick={reloadTemplates}>Try again</button>
-            </p>
-          ) : null}
-          {reportsState.data?.truncated ? (
-            <p className="text-xs text-muted-foreground">Showing the 1,000 most recently changed reports. Search to find an older one.</p>
-          ) : null}
-          {templatesState.data?.list.truncated ? (
-            <p className="text-xs text-muted-foreground">Showing the 500 newest templates.</p>
-          ) : null}
-        </section>
+            {state.status === "error" ? <ErrorState error={state.error} onRetry={reload} /> : null}
+            {state.status !== "error" && loading ? <LoadingSkeleton /> : null}
+            {state.status === "success" && !loading ? (
+              rows.length === 0 ? (
+                <ListEmpty
+                  kind={kind}
+                  query={query}
+                  folderFilter={folderFilter}
+                  canWrite={canFile}
+                  anyOfKind={items.some((i) => kind === "all" || i.kind === kind)}
+                />
+              ) : (
+                <LibraryTable
+                  items={rows}
+                  sort={sort}
+                  onSort={sortBy}
+                  actions={actions}
+                  folders={folderLookup}
+                  myName={myName}
+                  onOpenTemplate={(item) => item.template && setUsing(item.template)}
+                  pictures={pictures}
+                />
+              )
+            ) : null}
+            {reportsState.status === "error" ? (
+              <p className="text-xs text-destructive">
+                Reports could not be listed: {reportsState.error.message}{" "}
+                <button type="button" className="underline underline-offset-4" onClick={reloadReports}>Try again</button>
+              </p>
+            ) : null}
+            {templatesState.status === "error" ? (
+              <p className="text-xs text-destructive">
+                Templates could not be listed: {templatesState.error.message}{" "}
+                <button type="button" className="underline underline-offset-4" onClick={reloadTemplates}>Try again</button>
+              </p>
+            ) : null}
+            {reportsState.data?.truncated ? (
+              <p className="text-xs text-muted-foreground">Showing the 1,000 most recently changed reports. Search to find an older one.</p>
+            ) : null}
+            {templatesState.data?.list.truncated ? (
+              <p className="text-xs text-muted-foreground">Showing the 500 newest templates.</p>
+            ) : null}
+          </section>
+        </div>
       </ScrollRegion>
 
       <BoardFormDialog

@@ -203,3 +203,41 @@ describe("the one list (BI-59 T2)", () => {
     expect(screen.getByRole("button", { name: "Actions for Main" })).toBeTruthy()
   })
 })
+
+describe("the pictures and Recent (BI-59 T3)", () => {
+  it("reads the chart definitions once for the whole page and reads no dashboard", async () => {
+    const calls = serve(["dashboard:read", "dashboard:write"], {
+      "GET /api/dashboard/specs": () => json({ charts: [{ id: "u1", board: "b1", kind: "bar" }, { id: "u2", board: "b1", kind: "line" }] }),
+      "GET /api/dashboard/shortcuts": () => json({ favourites: [], recent: [{ kind: "board", id: "b1", name: "QA BI" }] }),
+    })
+    renderPage()
+    await screen.findByRole("heading", { name: "Recent" })
+    expect(calls.filter((c) => c.url.startsWith("/api/dashboard/specs"))).toHaveLength(1)
+    expect(calls.filter((c) => /^\/api\/dashboard(\?|$)/.test(c.url))).toHaveLength(0)
+    expect(document.querySelectorAll("tbody svg").length).toBeGreaterThan(0)
+  })
+
+  it("shows the four items opened last as picture cards, leaving out one no longer listed", async () => {
+    serve(["dashboard:read"], {
+      "GET /api/dashboard/shortcuts": () => json({
+        favourites: [],
+        recent: [
+          { kind: "board", id: "b1", name: "QA BI" },
+          { kind: "board", id: "gone", name: "Deleted board" },
+          { kind: "chart", id: "u9", name: "Arrivals", board: "b1", boardName: "QA BI" },
+          { kind: "board", id: "default", name: "Main" },
+        ],
+      }),
+    })
+    renderPage()
+    const recent = (await screen.findByRole("heading", { name: "Recent" })).closest("section")
+    if (!recent) throw new Error("no section")
+    const links = within(recent).getAllByRole("link").map((a) => [a.textContent, a.getAttribute("href")])
+    expect(links).toEqual([
+      ["QA BI", "/dashboards/b1"],
+      ["Arrivals", "/dashboards/b1"],
+      ["Main", "/dashboards/default"],
+    ])
+    expect(within(recent).getByText("Chart on QA BI")).toBeTruthy()
+  })
+})
