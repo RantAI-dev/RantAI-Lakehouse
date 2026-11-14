@@ -7,6 +7,49 @@
 @import "../../design-system/globals.css";
 
 /*
+ * Console motion (owner taste, DESIGN.md §3: 150–250 ms, eased, never linear;
+ * the 2026-11-14 micro-interaction audit). Tailwind's own `ease-out` is weak
+ * (0, 0, 0.2, 1): it barely moves in the first frames, which is the moment the
+ * eye checks that a click was heard. These three give the `ease-ui`,
+ * `ease-move` and `ease-drawer` utilities:
+ * - `ease-ui` for anything that enters, leaves, is pressed or changes colour;
+ * - `ease-move` for something that travels across the screen (a tab
+ *   indicator, a switch thumb);
+ * - `ease-drawer` for a panel or sheet sliding in from an edge.
+ */
+@theme {
+  --ease-ui: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-move: cubic-bezier(0.65, 0, 0.35, 1);
+  --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+  /* `animate-pop`: a one-off "that took" on a toggle that turns on (a star). */
+  --animate-pop: pop 260ms var(--ease-ui);
+  @keyframes pop {
+    0% { scale: 1; }
+    35% { scale: 1.28; }
+    100% { scale: 1; }
+  }
+}
+
+/*
+ * DESIGN.md §3: when the system asks for less motion, every movement stops.
+ * One rule here instead of a `motion-reduce:` on each element, so a component
+ * added later cannot forget it. A near-zero duration (not `none`) keeps
+ * `transitionend`/`animationend` firing for code that waits on them.
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/*
  * BI-17 part A (D6): a dashboard fixed to the light theme inside a dark
  * console. `design-system/tokens/colors.css` gives `.theme-light` the light
  * tokens (one definition, not a copy); this stops the `dark:` variants of
