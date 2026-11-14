@@ -920,6 +920,22 @@ async fn a_calculated_column_exports_and_a_skipped_filter_is_said_outside_the_bo
         })],
     )
     .await;
+    // PR #527 CI: the formula `[amount] * 2` needs a number, and `mount`'s
+    // column list types every column as text (422). This test's own list,
+    // mounted first so it wins, has `amount` as an `Int64`.
+    answer(
+        &ch,
+        "system.columns",
+        json!([
+            {"name": "name", "type": "String"}, {"name": "type", "type": "String"},
+            {"name": "default_kind", "type": "String"}, {"name": "default_expression", "type": "String"}
+        ]),
+        [("email", "String"), ("region", "String"), ("secret", "String"), ("amount", "Int64")]
+            .iter()
+            .map(|(n, t)| json!({"name": n, "type": t, "default_kind": "", "default_expression": ""}))
+            .collect(),
+    )
+    .await;
     mount(&ch, vec![json!({"email": "a@x", "twice": "2"})]).await;
     let (router, pool, cookie) = app(&ch).await;
 

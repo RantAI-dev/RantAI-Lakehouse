@@ -594,7 +594,7 @@ pub(crate) fn xlsx_row_cap(caller_cap: usize) -> usize {
 fn xlsx_cell_bytes(value: &Value, numeric_column: bool) -> u64 {
     match cell_number(value, numeric_column) {
         Some(n) => n.to_string().len() as u64,
-        None => csv_export::cell_text(Some(value)).len() as u64,
+        None => text_cell(value, numeric_column).len() as u64,
     }
 }
 
@@ -1011,9 +1011,22 @@ mod tests {
         )
         .await
         .unwrap();
-        // 9 one-digit, 90 two-digit and 900 three-digit rows take 6,885 of
-        // the 7,510 bytes; the 8-byte rows after them fill the rest.
-        assert_eq!((cut.rows, cut.cut), (1_077, true));
+        // PR #527 CI: the count is derived from the byte accounting, not
+        // hard-coded. The cap counts the header's text first ("name" and
+        // "amount", 10 bytes), then each row: "xxxx" (4) and the digits of the
+        // number. Rows are numbered from 1; the cut is at the last whole row.
+        let mut used = 10_u64;
+        let mut expected = 0_usize;
+        for i in 1_usize..=2_500 {
+            let row = 4 + i.to_string().len() as u64;
+            if used + row > 7_510 {
+                break;
+            }
+            used += row;
+            expected += 1;
+        }
+        assert_eq!(expected, 1_075, "the header's 10 bytes are in the sum");
+        assert_eq!((cut.rows, cut.cut), (expected, true));
     }
 
     /// BI-27: a cut file says which limit cut it, and the row count a cut file
@@ -1321,13 +1334,16 @@ mod tests {
         .unwrap();
         let bytes = read_all(w).await;
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
-        let mut strings = String::new();
-        zip.by_name("xl/sharedStrings.xml")
+        // PR #527 CI: the data sheet is written in constant-memory mode, which
+        // keeps a string in the sheet itself (an inline string) and has no
+        // `sharedStrings.xml` when no other sheet has text.
+        let mut sheet = String::new();
+        zip.by_name("xl/worksheets/sheet1.xml")
             .unwrap()
-            .read_to_string(&mut strings)
+            .read_to_string(&mut sheet)
             .unwrap();
-        assert!(strings.contains(&format!(">{long}<")), "{strings}");
-        assert!(!strings.contains('\''), "{strings}");
+        assert!(sheet.contains(&format!(">{long}<")), "{sheet}");
+        assert!(!sheet.contains(&format!(">'{long}<")), "{sheet}");
     }
 
     /// BI-28: a note rides in a `Note` sheet of a workbook after the data; the
