@@ -34,9 +34,9 @@ import { useCopilot } from "@/features/copilot/use-copilot"
 // As tall as `--app-navbar-h` (set on the shell root in `app-frame.tsx`; 48 px since owner
 // 2026-11-14, "navbar ini terlalu tinggi"): its 32 px controls, the console's height, with 8 px
 // above and below. The sidebar's logo row (`SidebarBrand`) reads the same variable, so their bottom
-// borders make one straight line (the toggle sits 8 px from the left edge, as far from it as from the top), and so does every offset under the navbar.
+// borders make one straight line (the controls sit 8 px from both side edges, as far as from the top), and so does every offset under the navbar.
 export const NAVBAR_CLASS =
-  "sticky top-0 z-20 flex h-(--app-navbar-h) shrink-0 items-center gap-4 border-b border-border bg-background/90 pr-4 pl-2 backdrop-blur-md sm:pr-5"
+  "sticky top-0 z-20 flex h-(--app-navbar-h) shrink-0 items-center gap-4 border-b border-border bg-background/90 px-2 backdrop-blur-md"
 export const NAVBAR_GRID_CLASS =
   "grid min-h-0 min-w-0 flex-1 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-3"
 export const NAVBAR_TRIGGER_CLASS = "size-8 shrink-0 rounded-lg"
@@ -87,7 +87,7 @@ export function NavbarSearch() {
  * never sparkles (DESIGN.md). Below `lg` it is the mark alone, the name in its tooltip and label.
  * There is no keyboard shortcut for the panel, so the tooltip names none.
  */
-export const COPILOT_BUTTON_CLASS = "h-8 gap-1.5 rounded-lg px-2 lg:px-2.5"
+export const COPILOT_BUTTON_CLASS = "h-8 gap-1.5 rounded-lg px-[7px] lg:px-[9px]" // the 1 px border adds the rest: 32 px icon-only, the same widths as the skeleton
 export function CopilotButton({ open, onToggle }: { readonly open: boolean; readonly onToggle: () => void }) {
   const label = open ? "Collapse AI Copilot" : "Open AI Copilot"
   return (
@@ -101,10 +101,12 @@ export function CopilotButton({ open, onToggle }: { readonly open: boolean; read
             onClick={onToggle}
             className={cn(
               COPILOT_BUTTON_CLASS,
-              "font-medium transition-[background-color,color,transform] duration-200 ease-out active:scale-[0.97]",
+              // Closed: outlined, the label and mark in the primary blue. Open: the soft primary
+              // tint. The border stays (transparent when open), so the width never changes.
+              "border font-medium transition-[background-color,color,border-color,transform] duration-200 ease-out active:scale-[0.97]",
               open
-                ? "bg-primary text-primary-foreground hover:bg-primary/90 hover:text-primary-foreground"
-                : "bg-primary/10 text-primary hover:bg-primary/15 hover:text-primary dark:bg-primary/20 dark:text-sky-200 dark:hover:bg-primary/30",
+                ? "border-transparent bg-primary/10 text-primary hover:bg-primary/15 hover:text-primary dark:bg-primary/20 dark:text-sky-200 dark:hover:bg-primary/30"
+                : "border-border bg-transparent text-primary hover:bg-primary/10 hover:text-primary dark:text-sky-200 dark:hover:bg-primary/20",
             )}
           />
         }
