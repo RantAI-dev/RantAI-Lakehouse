@@ -10,6 +10,7 @@ import {
   HeartPulse,
   LayoutGrid,
   Home,
+  MessagesSquare,
   KeyRound,
   Library,
   ListChecks,
@@ -30,9 +31,11 @@ export type NavItem = {
    * A second destination for this entry, shown as an icon button at the
    * right end of its row (where a section's chevron sits). The row itself
    * still goes to `href`. Only rendered for a single-page entry in the
-   * expanded sidebar.
+   * expanded sidebar. With `href` the part is a link; with `opens: "chats"`
+   * (Home, `WEB-18`) it is a button that slides the sidebar to the chat list
+   * in place, on any page, without navigating.
    */
-  action?: { title: string; href: string; icon: LucideIcon }
+  action?: { title: string; icon: LucideIcon } & ({ href: string; opens?: never } | { opens: "chats"; href?: never })
   /** Permissions required to open this nav entry (any-of). Empty means any authenticated user. */
   requires: readonly string[]
 }
@@ -86,6 +89,8 @@ export const NAV_GROUPS: NavGroup[] = [
         title: "Home",
         href: "/",
         icon: Home,
+        // The icon slides the sidebar to the chat list (`WEB-18`, owner QA 2026-11-14).
+        action: { title: "AI chats", opens: "chats", icon: MessagesSquare },
         requires: ["assistant:use", "assistant:ask"],
       },
     ],

@@ -45,6 +45,10 @@ Owner: "halaman menu history itu dihapus aja, dan cukup ditampilkan dari menu Ho
 6. **T6, after screenshots** (same sizes; plus a 0/80/160/240 ms frame sequence of the slide) into `docs/plans/web-18-screens/after-*`.
 7. **T7, handoff** in §6.
 
+### Slice 2 (owner QA, 2026-11-14)
+
+8. **T8, Home becomes a split row; the "AI chats" row goes.** Owner: "di menu Home ini tu, buat button split juga untuk ke history copilot". Home gets the same split as the Dashboards row (`action` in `nav-config.ts`, drawn by the split branch of `renderEntry` in `app-sidebar.tsx`): the label part goes to `/`, the square right part (icon `MessagesSquare`, label and delayed tooltip "AI chats") **slides the sidebar to the chat list in place, on any page, without navigating**. Opening a chat from the list navigates to the conversation as today. Back to menu slides back. The view state is no longer only route-driven: on `/copilot` the list is the default as today; elsewhere the menu is the default; the right part opens the list; any navigation resets to that route's default. The right part is lit (`aria-current`) on `/copilot`, and the Home label part is then not lit. Remove `aiChatsEntry`. Collapsed icon mode hides the right part, as with Dashboards. The skeleton draws the Home row split too. Tests: the right part opens the list on `/` and on another page without a route change; Back to menu returns; no "AI chats" row anywhere; the focus lands on Back to menu after the slide in and on the right part after the slide out.
+
 ## 4. Machine rules (owner)
 
 - No Rust. Never the full `bun run test` or `bun run lint`. Run `bun run typecheck`, the touched test files (`bun test src/components/app-shell src/features/copilot` and others you change), `bun x eslint <changed files>`.
@@ -106,3 +110,16 @@ Owner: "halaman menu history itu dihapus aja, dan cukup ditampilkan dari menu Ho
 **Screenshots:** `docs/plans/web-18-screens/before-*` (4) and `after-*` (19, including `after-slide-out-{000,080,160,240}ms` and `after-slide-in-…`), taken against the QA API on 28604 through a dev server on 28699 and headless Chrome on 28691, both stopped by PID afterwards. The QA model answers 401, so a question asked on Home is never saved; the four QA conversations were saved through `POST /api/ai/sessions` as the QA user, with an assistant line saying so. All are "Today", so the other day groups were not seen in the browser (unit-tested through `groupSessions`). `after-row-hover-light` and `after-search-light` predate the title bar's 40→36 px correction.
 
 **Not verified:** a real phone (iPhone Safari), only Chrome's mobile emulation and happy-dom; infinite paging past 30 chats in the browser (QA has 4); Rename/Delete from the sidebar in the browser (unit paths are the existing ones); keyboard-only walkthrough in the browser beyond the "/" and focus tests; dark-mode shots of hover, search, collapsed and the slide.
+
+### Slice 2 (T8), developer, 2026-11-14
+
+**Commit:** `11c7772b` `feat(copilot): WEB-18 T8, Home split row opens the chat list` (not pushed).
+
+- `nav-config.ts`: `NavItem.action` is now `{title, icon}` plus either `href` (link, Dashboards) or `opens: "chats"` (Home, `MessagesSquare`, "AI chats"). Home carries it, so it is shown only with `assistant:use` or `assistant:ask`.
+- `app-sidebar.tsx`: one split branch for both rows; the chats action renders a `<button data-view-focus="menu">` in the same tooltip provider, 32 px square, separator and colours. `menuOnConversation` became `chatsChoice` (`boolean | null`, reset to `null` on any pathname change); `showChats = hasAssistant && (chatsChoice ?? onConversation)`. Lit (`aria-current="page"`) on `/copilot`, so the Home label part is not. `aiChatsEntry`, its `menuEntries` case and the `Bot` import are gone. The slide, mount-then-move and focus handoff are unchanged.
+- `app-shell-skeleton.tsx`: no change needed, it already draws a split row for any item with `action`, so Home is drawn split; its test does not count rows.
+- `sidebar-chats.test.tsx`: right part opens the list on `/`, `/dashboards` and returns, with no `router.push/replace`; the one "AI chats" button is Home's part (no row); lit on `/copilot`; hidden without the assistant; focus on Back to menu after sliding in and on the part after sliding out. `app-sidebar.test.tsx` unchanged (Dashboards split tests pass).
+
+**Commands:** `bun run typecheck`: no errors. `bun test src/components/app-shell`: 72 pass, 0 fail, 10 files. `bun x eslint nav-config.ts app-sidebar.tsx sidebar-chats.test.tsx`: 0 problems. Each under `systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0 nice -n 15`.
+
+**Not verified:** in a browser (no dev server run), the tooltip and lit state visually, the phone sheet, dark mode, `src/features/copilot`/`home` tests (not run), and the Home label's "not lit" check is weak (`data-active` is not asserted positively elsewhere).

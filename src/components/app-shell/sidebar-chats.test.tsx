@@ -1,7 +1,7 @@
 /**
  * `WEB-18`: on a conversation (`/copilot`) the sidebar lists the chats
  * instead of the menu; "Back to menu" brings the menu back without leaving
- * the conversation, and the menu's "AI chats" row returns to the list.
+ * the conversation, and Home's split row (its "AI chats" part) opens the list on any page.
  *
  * `next/navigation` is stubbed at the module boundary with an address the
  * test sets, and the API with a fetch stub that answers the session check
@@ -130,12 +130,14 @@ describe("the sidebar's chat list on a conversation (WEB-18)", () => {
 
     expect(await screen.findByRole("link", { name: "Catalog" })).toBeTruthy()
     expect(screen.queryByRole("button", { name: "Back to menu" })).toBeNull()
-    expect(screen.queryByRole("button", { name: "AI chats" })).toBeNull()
+    // Home's right part is the only way in, and it is not a row of its own.
+    expect(screen.getAllByRole("button", { name: "AI chats" })).toHaveLength(1)
+    expect(screen.getByRole("button", { name: "AI chats" }).getAttribute("aria-current")).toBeNull()
     // The Copilot's own recent list (`limit=20`) loads on every page; the chat list does not.
     expect(listCalls.filter((u) => u.includes("limit=30"))).toHaveLength(0)
   })
 
-  it("Back to menu shows the menu and keeps the conversation; AI chats brings the list back", async () => {
+  it("Back to menu shows the menu and keeps the conversation; Home's AI chats part brings the list back", async () => {
     currentPathname = "/copilot"
     stubApi(["assistant:ask", "catalog:read"])
     renderSidebar()
@@ -143,6 +145,9 @@ describe("the sidebar's chat list on a conversation (WEB-18)", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Back to menu" }))
     const aiChats = await screen.findByRole("button", { name: "AI chats" })
     expect(visible(aiChats)).toBe(true)
+    // On /copilot the part is lit, and the Home label is not.
+    expect(aiChats.getAttribute("aria-current")).toBe("page")
+    expect(screen.getByRole("link", { name: "Home" }).getAttribute("data-active")).not.toBe("true")
     expect(screen.getAllByRole("link", { name: "Catalog" }).some(visible)).toBe(true)
     // The page is not left: no navigation happened.
     expect(router.push).not.toHaveBeenCalled()
@@ -151,6 +156,38 @@ describe("the sidebar's chat list on a conversation (WEB-18)", () => {
     fireEvent.click(aiChats)
     const back = await screen.findByRole("button", { name: "Back to menu" })
     expect(visible(back)).toBe(true)
+    expect(router.push).not.toHaveBeenCalled()
+  })
+
+  for (const path of ["/", "/dashboards"]) {
+    it(`Home's AI chats part opens the list in place on ${path}, and Back to menu returns`, async () => {
+      currentPathname = path
+      stubApi(["assistant:ask", "dashboard:read"])
+      renderSidebar()
+
+      const aiChats = await screen.findByRole("button", { name: "AI chats" })
+      expect(aiChats.getAttribute("aria-current")).toBeNull()
+      expect(screen.queryByRole("button", { name: "Back to menu" })).toBeNull()
+      fireEvent.click(aiChats)
+
+      const back = await screen.findByRole("button", { name: "Back to menu" })
+      expect(visible(back)).toBe(true)
+      expect(await screen.findByRole("link", { name: "Quarterly revenue" })).toBeTruthy()
+      expect(router.push).not.toHaveBeenCalled()
+      expect(router.replace).not.toHaveBeenCalled()
+
+      fireEvent.click(back)
+      await waitFor(() => expect(visible(screen.getByRole("button", { name: "AI chats" }))).toBe(true))
+    })
+  }
+
+  it("shows no AI chats part to someone without the assistant", async () => {
+    currentPathname = "/catalog"
+    stubApi(["catalog:read"])
+    renderSidebar()
+
+    await screen.findByRole("link", { name: "Catalog" })
+    expect(screen.queryByRole("button", { name: "AI chats" })).toBeNull()
   })
 
   it("Search filters the list on titles and message text", async () => {
@@ -241,7 +278,13 @@ describe("the slide between the sidebar's two views (WEB-18 T3)", () => {
     expect(view("menu").className).not.toContain("-translate-x-full")
     expect(view("menu").hasAttribute("inert")).toBe(false)
     // The focus follows to the control that leads back.
-    await waitFor(() => expect(document.activeElement?.textContent).toContain("AI chats"))
+    // The focus follows to the control that leads back: Home's AI chats part.
+    await waitFor(() => expect(document.activeElement?.getAttribute("aria-label")).toBe("AI chats"))
+
+    // And the other way, from the menu: Back to menu gets the focus once the list is in.
+    fireEvent.click(screen.getByRole("button", { name: "AI chats" }))
+    await waitFor(() => expect(view("menu").hasAttribute("inert")).toBe(true))
+    await waitFor(() => expect(document.activeElement?.textContent).toContain("Back to menu"))
   })
 
   it("collapsed: the four actions stay as icons with tooltips and the chats fold away", async () => {
