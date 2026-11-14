@@ -266,6 +266,20 @@ Measured: frame bottom / composer top 720/738 px at 1190x800, 820/838 at 1366x90
 
 **Not verified:** a real browser on a slow network (no dev server run); the full test and lint runs. The skeleton's wrapper has no `pb-24` as `<main>` has when the Copilot dock shows, as before this change.
 
+### T10 handoff, 2026-11-15 (Sonnet developer agent)
+
+**Commit** `9b47f01b` (`feat(console): BI-61 T10, the Dashboards row is named after the dashboard it opens`; not pushed). Includes the "Browse resets it" bullet.
+
+- `last-board.ts`: the name is stored in a separate key `dashboards:last-board-name` as `{ id, name }`, so the id key, `readLastBoard` and its readers (resolver, Home) are unchanged and an old id-only value still works. The name is read only when its id matches the remembered id. `rememberLastBoard(id, name?)`, `forgetLastBoard` (clears both) announce through a window event (this tab) and `storage` (other tabs). New hooks `useLastBoardName` and `useLastBoardId` (`useSyncExternalStore`, server snapshot `null`).
+- `dashboard-page.tsx`: a new effect after `knownName` remembers `(board, knownName)`, so it also runs after a rename.
+- `dashboard-list-page.tsx`: mount calls `forgetLastBoard()`.
+- `app-sidebar.tsx`: only the `/dashboards` row changes: label = name, `aria-label` "Dashboard: <name>", tooltip = name, href = `/dashboards/<id>` when an id is remembered, else `/dashboards/browse`. Same icon and slot; the name truncates.
+- Tests (`app-sidebar.test.tsx`, 5 new): no board, remembered name, old id-only, forget (what Browse does), another board / rename / name of another id.
+
+**Checks:** `bun run typecheck` clean; `bun test src/components/app-shell src/features/dashboards` 789 pass, 0 fail; eslint on the changed files clean.
+
+**Not verified:** no browser check; the Browse-mount effect in `DashboardListPage` has no test of its own (the sidebar test covers the forget).
+
 ## Micro-interaction audit (emil), 2026-11-14
 
 Owner request (2026-11-14): audit the revamped pages' micro-animations with the
