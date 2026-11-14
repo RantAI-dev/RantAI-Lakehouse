@@ -1,11 +1,13 @@
 import { describe, expect, it } from "bun:test"
 import { readFileSync } from "node:fs"
-import { BASE, bodies, field, HZ, sceneInks } from "./lake-scene"
+import { BASE, BLINK, bodies, eventAt, field, HZ, poseFor, REST, sceneInks, SPOUT, waterlineAt, whalePose } from "./lake-scene"
 
-// Regions of `field`: 1 whale, 4 moon, 6 sun.
+// Regions of `field`: 1 whale, 3 the eye (and moonlight), 4 moon, 6 sun, 8 the spout.
 const WHALE = 1
+const EYE = 3
 const MOON = 4
 const SUN = 6
+const SPRAY = 8
 
 describe("the lake's day and night (WEB-17 S2, owner 2026-11-14)", () => {
   it("by day the sun is up and the moon is down; by night the reverse", () => {
@@ -106,5 +108,157 @@ describe("the lake is a middle-dim background (WEB-17 T9 and T10, owner 2026-11-
   it("keeps each ink's hue: the day whale is still blue, not grey", () => {
     const [r, , b] = sceneInks(0, "dither").inks[1]
     expect(b - r).toBeGreaterThan(10)
+  })
+})
+
+// WEB-17 T11 (owner QA 2026-11-15): "entah kurang detail atau kek statis dan ga gerak".
+describe("the whale lives in the water (WEB-17 T11)", () => {
+  const aspect = 1110 / 400
+  const wx = 0
+  const R = 0.2
+
+  /** Event starts and lengths over `span` seconds, sampled every 5 ms. */
+  const events = (e: typeof BLINK | typeof SPOUT, seed: number, span: number) => {
+    const starts: number[] = []
+    const lengths: number[] = []
+    let since = -1
+    for (let t = 0; t <= span; t += 0.005) {
+      const on = eventAt(t, e, seed) >= 0
+      if (on && since < 0) {
+        since = t
+        starts.push(t)
+      }
+      if (!on && since >= 0) {
+        lengths.push(t - since)
+        since = -1
+      }
+    }
+    return { starts, lengths }
+  }
+
+  it("meets the water along a line that follows the ripples, never a straight edge", () => {
+    // Where the head ends going down, across its width, at a 400 px band (one cell is 3 px).
+    for (const t of [6, 9.3, 14.1]) {
+      const pose = whalePose(t)
+      const bottoms: number[] = []
+      for (let u = 0.5 - 0.8 * R / aspect; u <= 0.5 + 0.8 * R / aspect; u += 0.004) {
+        let v = HZ - 0.1
+        while (field(u, v, aspect, t, 1, 0, 0, pose)[1] === WHALE || field(u, v, aspect, t, 1, 0, 0, pose)[1] === EYE) v += 0.0025
+        bottoms.push(v)
+      }
+      // At least 2 cells (6 px of 400) between its highest and lowest point.
+      expect(Math.max(...bottoms) - Math.min(...bottoms)).toBeGreaterThanOrEqual(6 / 400)
+    }
+    // And the line moves: at one point it is not where it was a moment ago.
+    const at = (t: number) => waterlineAt(wx + 0.05, t, whalePose(t))
+    expect(Math.abs(at(6) - at(6.5))).toBeGreaterThan(0.002)
+  })
+
+  it("leaves no straight bar under the head: just under the waterline is water, not the mark's gap", () => {
+    for (let u = 0.5 - 0.9 * R / aspect; u <= 0.5 + 0.9 * R / aspect; u += 0.004) {
+      const x = (u - 0.5) * aspect
+      const v = waterlineAt(x, 6, REST) + 0.01
+      expect(field(u, v, aspect, 6, 1, 0, 0, REST)[1]).not.toBe(EYE)
+    }
+  })
+
+  it("is a lit volume: brighter on the sun's side by day and the moon's side by night", () => {
+    const light = (u: number, phase: number) => field(u, HZ - 0.12, aspect, 6, phase, 0, 0)[0]
+    const left = 0.5 - 0.7 * R / aspect
+    const right = 0.5 + 0.7 * R / aspect
+    expect(light(left, 0)).toBeGreaterThan(light(right, 0))
+    expect(light(right, 1)).toBeGreaterThan(light(left, 1))
+    // Darker just above the water than higher up on the same side (the wet shadow).
+    const lowU = 0.5 - 0.3 * R / aspect
+    const xLow = (lowU - 0.5) * aspect
+    const wet = field(lowU, waterlineAt(xLow, 6, REST) - 0.004, aspect, 6, 0, 0, 0)
+    const dry = field(lowU, waterlineAt(xLow, 6, REST) - 0.06, aspect, 6, 0, 0, 0)
+    expect(wet[1]).toBe(WHALE)
+    expect(wet[0]).toBeLessThan(dry[0])
+  })
+
+  it("blinks for 120 ms every 6 to 12 s, the same way for the same seed", () => {
+    for (const seed of [0, 1, 7]) {
+      const { starts, lengths } = events(BLINK, seed, 600)
+      expect(starts.length).toBeGreaterThan(45)
+      for (let k = 1; k < starts.length; k++) {
+        const gap = starts[k] - starts[k - 1]
+        expect(gap).toBeGreaterThanOrEqual(6 - 0.01)
+        expect(gap).toBeLessThanOrEqual(12 + 0.01)
+      }
+      for (const l of lengths) expect(l).toBeCloseTo(0.12, 1)
+    }
+    expect(events(BLINK, 0, 120).starts).toEqual(events(BLINK, 0, 120).starts)
+    expect(events(BLINK, 0, 120).starts).not.toEqual(events(BLINK, 1, 120).starts)
+    // Shut means the eye is a slit, not gone.
+    const shut = { ...REST, eye: 0 }
+    let open = 0
+    let slit = 0
+    for (let v = HZ - 0.12; v < HZ - 0.03; v += 0.002) {
+      if (field(0.5 + (0.342 * R) / aspect, v, aspect, 6, 1, 0, 0, REST)[1] === EYE) open++
+      if (field(0.5 + (0.342 * R) / aspect, v, aspect, 6, 1, 0, 0, shut)[1] === EYE) slit++
+    }
+    expect(slit).toBeGreaterThan(0)
+    expect(slit).toBeLessThan(open / 3)
+  })
+
+  it("spouts for 1.5 s every 20 to 40 s, a plume above the head that rises and falls", () => {
+    for (const seed of [0, 1, 7]) {
+      const { starts, lengths } = events(SPOUT, seed, 1200)
+      expect(starts.length).toBeGreaterThan(28)
+      for (let k = 1; k < starts.length; k++) {
+        const gap = starts[k] - starts[k - 1]
+        expect(gap).toBeGreaterThanOrEqual(20 - 0.01)
+        expect(gap).toBeLessThanOrEqual(40 + 0.01)
+      }
+      for (const l of lengths) expect(l).toBeCloseTo(1.5, 1)
+    }
+    // How high the spray reaches above the head at each moment: up, then back down.
+    const reach = (p: number) => {
+      let top = 1
+      for (let v = 0; v < HZ; v += 0.0025) {
+        for (let u = 0.44; u < 0.52; u += 0.002) {
+          if (field(u, v, aspect, 6, 1, Math.round(u * 400), Math.round(v * 400), { ...REST, spout: p })[1] === SPRAY) top = Math.min(top, v)
+        }
+      }
+      return top
+    }
+    expect(reach(0.4)).toBeLessThan(reach(0.1))
+    expect(reach(0.95)).toBeGreaterThan(reach(0.4))
+    // It stays well inside the band (14 px below its top at 400 px).
+    expect(reach(0.4)).toBeGreaterThan(0.035)
+  })
+
+  it("does not move at all under reduced motion: no bob, eye open, no spout", () => {
+    for (let t = 0; t < 300; t += 0.05) expect(poseFor(t, true)).toEqual(REST)
+    // And it does move otherwise.
+    const poses = Array.from({ length: 600 }, (_, k) => poseFor(k * 0.1, false))
+    expect(new Set(poses.map((p) => p.bob.toFixed(4))).size).toBeGreaterThan(10)
+    expect(poses.some((p) => p.eye === 0)).toBe(true)
+    expect(poses.some((p) => p.spout >= 0)).toBe(true)
+  })
+
+  it("never moves the whale or its spout behind the greeting", () => {
+    const boxes = [
+      { aspect: 1100 / 400, u0: 0.32, u1: 0.68, v0: 0.425, v1: 0.515 },
+      { aspect: 390 / 300, u0: 0.04, u1: 0.96, v0: 0.42, v1: 0.65 },
+    ]
+    for (const b of boxes) {
+      for (let t = 0; t < 60; t += 0.37) {
+        const pose = { ...whalePose(t), spout: (t / 60) % 1 }
+        for (let u = b.u0; u <= b.u1; u += 0.02) {
+          for (let v = b.v0; v <= b.v1; v += 0.01) {
+            expect([WHALE, SPRAY]).not.toContain(field(u, v, b.aspect, t, 1, 0, 0, pose)[1])
+          }
+        }
+      }
+    }
+  })
+
+  it("the spout adds no colour of its own", () => {
+    for (const p of [0, 1]) {
+      const { inks } = sceneInks(p, "dither")
+      expect(inks.slice(0, SPRAY).map(String)).toContain(String(inks[SPRAY]))
+    }
   })
 })
