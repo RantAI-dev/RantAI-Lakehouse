@@ -163,16 +163,16 @@ function nextPathFromQuery(): string {
 }
 
 /**
- * The official Rantai Lake mark (`public/logo-*.png`), drawn whole in a
- * square box with `object-contain`, so its own 196 x 167 proportion is kept
- * (DESIGN.md §5: never squashed). Decorative: the title beside it already
- * names the product.
+ * The official Rantai Lake mark (`public/logo-*.svg`, viewBox 196 x 167),
+ * drawn whole in a box with the mark's own aspect ratio, so it is never
+ * letterboxed or squashed (DESIGN.md §5). Height is set by the caller; width
+ * follows. Decorative: the title beside it already names the product.
  */
 function Logo({ className }: { className?: string }) {
   return (
-    <span className={cn("relative inline-block size-7 shrink-0", className)}>
-      <Image src="/logo-light.png" alt="" fill sizes="64px" className="object-contain dark:hidden" priority />
-      <Image src="/logo-dark.png" alt="" fill sizes="64px" className="hidden object-contain dark:block" priority />
+    <span className={cn("relative inline-block aspect-[196/167] h-7 shrink-0", className)}>
+      <Image src="/logo-light.svg" alt="" fill unoptimized sizes="64px" className="object-contain dark:hidden" priority />
+      <Image src="/logo-dark.svg" alt="" fill unoptimized sizes="64px" className="hidden object-contain dark:block" priority />
     </span>
   );
 }
@@ -349,7 +349,7 @@ export function LoginPage() {
             <React.Suspense fallback={null}>
               <SsoNotice />
             </React.Suspense>
-            <Logo className="size-9" />
+            <Logo className="h-9" />
             <h1 className={cn(LOGIN_DISPLAY, "mt-5 text-[30px] leading-[1.1] text-foreground")}>
               Sign in to Rantai Lake
             </h1>

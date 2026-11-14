@@ -121,9 +121,9 @@ export function PublicDashboard({ token }: { token: string }) {
     <div className={cn("min-h-screen bg-muted/25", look.className)} style={look.style}>
       {/* Compact header — brand + title + theme toggle */}
       <header className="sticky top-0 z-10 flex items-center gap-3 border-b border-border bg-card/80 px-4 py-3 backdrop-blur-md sm:px-6">
-        <span className="relative block h-6 w-[116px] shrink-0">
-          <Image src="/logo-light.png" alt="Rantai Lake" fill sizes="116px" className="object-contain object-left dark:hidden" priority />
-          <Image src="/logo-dark.png" alt="" fill sizes="116px" className="hidden object-contain object-left dark:block" priority />
+        <span className="relative block aspect-[196/167] h-6 shrink-0">
+          <Image src="/logo-light.svg" alt="Rantai Lake" fill unoptimized sizes="28px" className="object-contain dark:hidden" priority />
+          <Image src="/logo-dark.svg" alt="" fill unoptimized sizes="28px" className="hidden object-contain dark:block" priority />
         </span>
         <span className="hidden h-5 w-px bg-border sm:block" />
         <div className="min-w-0 flex-1">
