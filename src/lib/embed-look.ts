@@ -10,7 +10,7 @@ export type EmbedTheme = "light" | "dark" | "dashboard"
 export type EmbedLook = {
   /** `dashboard` keeps the dashboard's own theme. */
   theme: EmbedTheme
-  /** Whether the "Rantai Lake" name shows (feature decision 4: anyone may hide it). */
+  /** Whether the "RantAI Lakehouse" name shows (feature decision 4: anyone may hide it). */
   showName: boolean
   /** Let the host page's background show through. */
   transparent: boolean

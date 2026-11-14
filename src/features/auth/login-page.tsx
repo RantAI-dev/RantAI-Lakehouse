@@ -218,7 +218,7 @@ function nextPathFromQuery(): string {
 }
 
 /**
- * The official Rantai Lake mark (`public/logo-*.svg`, viewBox 196 x 167),
+ * The official RantAI Lakehouse mark (`public/logo-*.svg`, viewBox 196 x 167),
  * drawn whole in a box with the mark's own aspect ratio, so it is never
  * letterboxed or squashed (DESIGN.md §5). Height is set by the caller; width
  * follows. Decorative: the title beside it already names the product.
@@ -608,7 +608,7 @@ export function LoginPage() {
         </div>
 
         <footer className="login-reveal login-reveal-5 flex items-center justify-between gap-4 text-xs text-muted-foreground">
-          <span>© {new Date().getFullYear()} Rantai Lake</span>
+          <span>© {new Date().getFullYear()} RantAI Lakehouse</span>
           {/* Placeholder destination — point this at the docs site (or
               wherever support lives) once that URL exists. */}
           <Link href="#" className={cn("rounded-sm outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50", EASE)}>

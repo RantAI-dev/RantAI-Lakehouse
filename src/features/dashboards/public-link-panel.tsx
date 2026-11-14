@@ -112,7 +112,7 @@ export function PublicLinkPanel({ board }: { readonly board: string }) {
   const shareUrl = live ? `${origin}/public/dashboard/${link.token}` : "";
   const embedUrl = live ? `${origin}/embed/dashboard/${link.token}` : "";
   const iframe = live
-    ? `<iframe src="${embedUrl}" width="100%" height="600" frameborder="0" style="border:1px solid #e5e7eb;border-radius:12px" title="Rantai Lake dashboard"></iframe>`
+    ? `<iframe src="${embedUrl}" width="100%" height="600" frameborder="0" style="border:1px solid #e5e7eb;border-radius:12px" title="RantAI Lakehouse dashboard"></iframe>`
     : "";
 
   async function run(work: () => Promise<PublicLink | null>) {

@@ -34,9 +34,9 @@ function EmbedName({ look, linkBase }: { look: EmbedLook; linkBase: string }) {
   if (!look.showName) return null;
   return linkBase ? (
     <a href={linkBase} target="_blank" rel="noopener noreferrer"
-       className="text-[10px] font-medium text-muted-foreground hover:text-foreground">Rantai Lake ↗</a>
+       className="text-[10px] font-medium text-muted-foreground hover:text-foreground">RantAI Lakehouse ↗</a>
   ) : (
-    <span className="text-[10px] font-medium text-muted-foreground">Rantai Lake</span>
+    <span className="text-[10px] font-medium text-muted-foreground">RantAI Lakehouse</span>
   );
 }
 
