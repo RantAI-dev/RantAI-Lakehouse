@@ -391,7 +391,9 @@ export function LoginPage() {
             <React.Suspense fallback={null}>
               <SsoNotice />
             </React.Suspense>
-            <h1 className={cn(LOGIN_DISPLAY, "text-[30px] leading-[1.1] text-foreground")}>
+            {/* Centred over the form column (T8, owner 2026-11-14); the
+                labels, fields and notices stay left-aligned for reading. */}
+            <h1 className={cn(LOGIN_DISPLAY, "text-center text-[30px] leading-[1.1] text-foreground")}>
               Sign in to Rantai Lake
             </h1>
 
