@@ -209,3 +209,50 @@ Measured: frame bottom / composer top 720/738 px at 1190x800, 820/838 at 1366x90
 
 - No round-1 screenshots. Port 28622 was held by another developer, then 28620 ran a Next dev server, and the owner's rule is one Next dev server at a time. The coordinator screenshots from 28605 after deploy.
 - The fade, the footer menu (collapsed and in the phone sheet), the centred search and the 32 px header were checked by tests only, not in a browser.
+
+## Micro-interaction audit (emil), 2026-11-14
+
+Owner request (2026-11-14): audit the revamped pages' micro-animations with the
+`emil-design-eng` checklist. DESIGN.md wins over the skill: 150–250 ms, eased,
+never linear; motion with a reason; everything stops under reduced motion.
+Opus developer agent (console design exception). Motion only: no layout,
+colour or copy changes; roles and accessible names unchanged.
+
+Shared part (commit `feat(console): motion foundation`, cherry-picked to BI-59 and WEB-17 so the three branches carry the same lines):
+
+| Element | Now | Skill / DESIGN.md | Change |
+| --- | --- | --- | --- |
+| Easing tokens | Tailwind `ease-out` (0,0,0.2,1) and three hand-written curves | Strong custom ease-out; ease-in-out for movement | `ease-ui`, `ease-move`, `ease-drawer` theme tokens |
+| Reduced motion | One `motion-reduce:` on the sidebar, nothing elsewhere | §3: every movement stops | One global rule in `globals.css` |
+| Tooltips | Keyframes (`animate-in`), open at once (provider delay 0), same speed in and out | Delay the first, then instant (`data-instant`); transitions, origin-aware, exit faster | Transition 150 ms in / 100 ms out from `--transform-origin`, `data-instant` → 0 ms, root delay 350 ms |
+| `Button` press | `active:translate-y-px`, `transition-all` | `scale(0.97)` on `:active`; never `transition: all` | `active:scale-[0.97]`, named properties, `ease-ui` |
+| Menus / popovers | 150 ms `ease-out`, scale 0.95 both ways; popover 100 ms default ease | Strong ease-out, exit faster than enter | 150 ms in / 100 ms out, `ease-ui`, scale 0.97 |
+| Dialog / sheet | 200 ms `ease-out`; sheet 300 ms `ease-in-out` both ways | Modal stays centred; drawer curve; exit faster | Dialog 200/150 ms `ease-ui`; sheet 300/200 ms `ease-drawer` |
+| Transition lists naming `transform` | `active:scale-*`, `rotate-*` did not animate (Tailwind v4 sets `scale`/`rotate`/`translate`) | Name the property that changes | Lists name `scale`, `rotate`, `translate` |
+
+Dashboard page and shell (this branch):
+
+| Element | Now | Skill / DESIGN.md | Change |
+| --- | --- | --- | --- |
+| `EASE` (header, chips, tiles, Details) | Lists `transform`: press scale and chevron turn jumped | Name the property | `scale,rotate,translate`, `ease-ui` |
+| Edit / settings / Share press | `active:scale-95` / `0.98`, not animated | 0.95–0.98, animated | Base 0.97, animated |
+| Star (favourite) | Changes only after the server and the shortcut reload answer | Feedback at once (§3 "no button sits still") | Optimistic, reverts on failure, `animate-pop` when it turns on |
+| Dashboard tabs | One underline per tab, fading out/in | Motion that shows where the choice went | One underline that slides (`useSlidingIndicator`, 240 ms `ease-move`), press 0.97 |
+| Filter chips, + Filter, Reset, Parameters | No press | Press 0.97 | `active:scale-[0.97]`; the whole chip gives under its value or × |
+| Chip choice tick | Blinks on | Grow from 0.75, never from 0 | Scale 0.75 → 1 with opacity |
+| Edit banner | Pops in | Enter eased, exit fast | `@starting-style` fade down 200 ms; leaving edit mode drops it at once |
+| Edit mode grid lines, resize corners | Pop in; corner hover not eased | Prevent jarring changes | Fade in; corner grows from 0.9, eases hover, 1.1 on press |
+| Dragged tile | Ring only | Drag should feel held | Lifts (scale 1.01, soft wide shadow), settles on drop |
+| Tiles pushed by a drag | Tailwind default 150 ms curve | Strong ease-out | 200 ms `ease-ui` |
+| Tile data landing | Placeholder replaced in one frame | Fill in place, no blink | Body content fades in over the same box (placeholder excluded, so skeleton → grid does not blink) |
+| Title loading → name | Bar replaced in one frame | Same | Name fades in on its line |
+| Side panel (Copilot, Comments, Details) | Appears in one frame | Drawer from its edge, exit fast | Slide 16 px + fade, 260 ms `ease-drawer`; closing instant |
+| Side panel tabs | Fill jumps between tabs; content swaps in one frame | Sliding indicator; crossfade | Sliding pill (`box`), press 0.97, content fades in |
+| Panel / dock icon buttons | Colour only | Press feedback | Press 0.95, 150 ms |
+| Bottom dock chat | Appears in one frame; `transition-all` | Origin-aware, named properties | Rises from the bar (origin bottom), `transition-[width]` |
+| AI Copilot navbar button | `transform` listed: press jumped | Name the property | `scale`, `ease-ui` |
+| Navbar search | No hover | Hover response | Background eases on hover |
+| ⌘K palette | No open animation | Keyboard, many times a day: none | Kept as is (deliberate) |
+| Sidebar section chevron | `rotate-90` snapped (`transform` listed) | Name the property | Turns 200 ms with the fold |
+| Sidebar icon-mode flyout | Appears in one frame | Grows from its trigger | Grows from the rail (origin left), 150 ms |
+| Sidebar rows | Colour 150 ms | Rows used tens of times a day: keep small | Kept; `ease-ui` on the sub-rows |
