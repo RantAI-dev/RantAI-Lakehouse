@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
 
 import * as realAuth from "@/features/auth/auth-provider"
@@ -13,7 +13,7 @@ afterAll(() => {
   mock.module("@/features/auth/auth-provider", () => real)
 })
 
-import { ChartBuilder, type ChartDef } from "./chart-builder"
+import { ChartBuilder, KIND_GROUPS, type ChartDef } from "./chart-builder"
 
 const originalFetch = global.fetch
 let bodies: Record<string, unknown>[] = []
@@ -214,13 +214,11 @@ describe("ChartBuilder kind switch (phase 2 QA R6)", () => {
   it("keeps the dimension as the first grouping of a data table and back as the dimension of a chart", async () => {
     renderBuilder({ ...barDef, breakdown: "category" })
     await screen.findByLabelText("Aggregation of visitors")
-    // The type list is folded for a chart being edited; the menu in the header changes the type.
-    fireEvent.click(screen.getByRole("button", { name: /Change chart type/ }))
+    // `BI-58` T3: both types are icons in the canvas toolbar.
     fireEvent.click(screen.getByRole("button", { name: "Data table" }))
     // The dimension and the breakdown are the first groupings, so the steps editor has something to keep.
     expect(await screen.findByLabelText("Move provinsi down")).toBeTruthy()
     expect(screen.getByLabelText("Remove category")).toBeTruthy()
-    fireEvent.click(screen.getByRole("button", { name: /Change chart type/ }))
     fireEvent.click(screen.getByRole("button", { name: "Bar" }))
     await waitFor(() => expect(screen.queryByLabelText("Remove category")).toBeNull())
     expect(screen.getAllByText("provinsi").length).toBeGreaterThan(0)
@@ -229,33 +227,45 @@ describe("ChartBuilder kind switch (phase 2 QA R6)", () => {
 
 const expanded = (name: RegExp | string) => screen.getByRole("button", { name }).getAttribute("aria-expanded")
 
-describe("ChartBuilder type list (phase 2 QA R9)", () => {
-  // `BI-58` T1: the long chart-type column is gone; the type is changed from the canvas, for a new chart and an edited one.
-  it("has no chart-type column, and a new chart changes its type from the canvas", async () => {
+/** The pressed type in the canvas toolbar (`BI-58` T3). */
+const pressedKind = () => within(screen.getByRole("group", { name: "Chart type" })).getAllByRole("button").find((b) => b.getAttribute("aria-pressed") === "true")?.getAttribute("aria-label")
+const gallery = () => screen.getByRole("dialog", { name: "Chart types" })
+
+describe("ChartBuilder type list (phase 2 QA R9, BI-58 T3)", () => {
+  // `BI-58` T1, T3: the long chart-type column is gone; the type is an icon above the canvas, for a new chart and an edited one.
+  it("has no chart-type column, and a new chart changes its type from the canvas toolbar", async () => {
     renderBuilder()
     expect(screen.queryByRole("navigation", { name: "Chart type" })).toBeNull()
-    fireEvent.click(screen.getByRole("button", { name: /Change chart type, now Horizontal bar/ }))
-    fireEvent.click(await screen.findByRole("button", { name: "Line" }))
-    await waitFor(() => expect(screen.getByRole("button", { name: /Change chart type, now Line/ })).toBeTruthy())
+    expect(pressedKind()).toBe("Horizontal bar (ranking)")
+    fireEvent.click(screen.getByRole("button", { name: "Line" }))
+    await waitFor(() => expect(pressedKind()).toBe("Line"))
     expect(window.localStorage.length).toBe(0)
   })
 
-  it("starts folded for an edited chart, and the folded control still searches the types", async () => {
+  it("searches every type in the gallery behind More, and Enter picks the first match", async () => {
     renderBuilder(barDef)
-    expect(screen.queryByRole("navigation", { name: "Chart type" })).toBeNull()
-    fireEvent.click(screen.getByRole("button", { name: /Change chart type, now Bar/ }))
-    const search = screen.getByLabelText("Search chart types")
+    fireEvent.click(screen.getByRole("button", { name: "More chart types" }))
+    const search = await screen.findByLabelText("Search chart types")
     fireEvent.change(search, { target: { value: "sankey" } })
-    expect(screen.queryByRole("button", { name: "Line" })).toBeNull()
+    expect(within(gallery()).queryByRole("button", { name: "Line" })).toBeNull()
     fireEvent.keyDown(search, { key: "Enter" })
-    // The first match was picked and the menu closed.
+    // The first match was picked and the gallery closed.
     await waitFor(() => expect(screen.queryByLabelText("Search chart types") === null).toBe(true))
-    expect(screen.getByRole("button", { name: /Change chart type, now Sankey/ })).toBeTruthy()
+    expect(screen.getByRole("button", { name: /More chart types, now Sankey/ })).toBeTruthy()
   })
 
-  it("closes the folded type menu on Escape and on an outside press, and focus returns to its trigger (phase 2 QA R17)", async () => {
+  it("reaches every kind of KIND_GROUPS from the toolbar or the gallery", async () => {
     renderBuilder(barDef)
-    const trigger = () => screen.getByRole("button", { name: /Change chart type, now Bar/ })
+    fireEvent.click(screen.getByRole("button", { name: "More chart types" }))
+    await screen.findByLabelText("Search chart types")
+    for (const g of KIND_GROUPS) for (const item of g.items) {
+      expect(within(gallery()).getByRole("button", { name: item.label }), item.value).toBeTruthy()
+    }
+  })
+
+  it("closes the gallery on Escape and on an outside press, and focus returns to its trigger (phase 2 QA R17)", async () => {
+    renderBuilder(barDef)
+    const trigger = () => screen.getByRole("button", { name: "More chart types" })
     fireEvent.click(trigger())
     const search = await screen.findByLabelText("Search chart types")
     fireEvent.keyDown(search, { key: "Escape" })
@@ -426,12 +436,12 @@ describe("ChartBuilder labels (phase 2 QA R20)", () => {
     expect(heading.textContent).toBe("New chart")
     expect(heading.querySelector("svg")).toBeNull()
     expect(heading.parentElement?.textContent).toBe("Main/New chart")
-    expect(screen.getByRole("button", { name: /Change chart type, now Horizontal bar/ }).textContent).toContain("Horizontal bar")
+    expect(pressedKind()).toBe("Horizontal bar (ranking)")
     unmount()
     cleanup()
     renderBuilder(barDef)
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Edit chart")
-    expect(screen.getByRole("button", { name: /Change chart type, now Bar/ })).toBeTruthy()
+    expect(pressedKind()).toBe("Bar")
   })
 })
 
@@ -534,8 +544,8 @@ describe("ChartBuilder freshness (BI-4 part B)", () => {
 describe("ChartBuilder scatter (BI-17 B QA fix F2)", () => {
   it("asks for an X metric and a Y metric, and a size for a bubble chart", async () => {
     renderBuilder(barDef)
-    const trigger = await screen.findByRole("button", { name: /Change chart type, now Bar/ })
-    fireEvent.click(trigger)
+    await screen.findByLabelText("Aggregation of visitors")
+    fireEvent.click(screen.getByRole("button", { name: "More chart types" }))
     fireEvent.click(await screen.findByRole("button", { name: "Scatter (X vs Y)" }))
     await waitFor(() => expect(screen.getByText("X metric")).toBeTruthy())
     expect(screen.getByText("Y metric")).toBeTruthy()
@@ -544,7 +554,7 @@ describe("ChartBuilder scatter (BI-17 B QA fix F2)", () => {
 
   it("does the same when the chart is new and the data source is picked after the kind", async () => {
     renderBuilder()
-    fireEvent.click(screen.getByRole("button", { name: /Change chart type/ }))
+    fireEvent.click(screen.getByRole("button", { name: "More chart types" }))
     const scatter = await screen.findByRole("button", { name: "Scatter (X vs Y)" })
     fireEvent.click(scatter)
     await waitFor(() => expect(screen.getByText("X metric")).toBeTruthy())
@@ -553,7 +563,7 @@ describe("ChartBuilder scatter (BI-17 B QA fix F2)", () => {
 
   it("keeps the Y metric when the data source is picked after the kind (it used to reset to one row)", async () => {
     renderBuilder()
-    fireEvent.click(screen.getByRole("button", { name: /Change chart type/ }))
+    fireEvent.click(screen.getByRole("button", { name: "More chart types" }))
     fireEvent.click(await screen.findByRole("button", { name: "Bubble (X, Y, size)" }))
     fireEvent.click(await screen.findByRole("combobox", { name: /pick a mart/i }).catch(() => screen.getByText(/pick a mart/)))
     fireEvent.click(await screen.findByRole("option", { name: /mart_visits/ }))

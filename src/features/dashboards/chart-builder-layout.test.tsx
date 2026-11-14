@@ -9,15 +9,20 @@ const real = { ...realAuth }
 mock.module("@/features/auth/auth-provider", () => ({ ...real, useAuth: () => ({ hasPermission: () => false }) }))
 // ECharts draws on a canvas, which the test DOM does not have; each chart is a marker with its kind.
 const realEchart = { ...realEchartModule }
+type DrawnOption = { series?: { type?: string; data?: unknown[] }[] }
+let drawn: DrawnOption[] = []
 mock.module("./echart", () => ({
-  EChart: (props: { option: { series?: { type?: string }[] } }) => <div data-testid="chart" data-type={props.option.series?.[0]?.type ?? ""} />,
+  EChart: (props: { option: DrawnOption }) => {
+    drawn.push(props.option)
+    return <div data-testid="chart" data-type={props.option.series?.[0]?.type ?? ""} />
+  },
 }))
 afterAll(() => {
   mock.module("@/features/auth/auth-provider", () => real)
   mock.module("./echart", () => realEchart)
 })
 
-import { dashboardService } from "@/services"
+import { dashboardService, metricService, paramService } from "@/services"
 import { ChartBuilder, type ChartDef } from "./chart-builder"
 import { ReportingProvider } from "./reporting-context"
 
@@ -38,6 +43,8 @@ const FIELDS = {
   ],
 }
 
+/** The fields the stub answers; a test may take columns away. */
+let fieldsAnswer: typeof FIELDS = FIELDS
 let fetches: string[] = []
 let previews: Record<string, unknown>[] = []
 /** The preview route's answer: an error unless a test draws a chart. */
@@ -46,7 +53,9 @@ let previewAnswer: ((body: Record<string, unknown>) => { status: number; body: u
 beforeEach(() => {
   fetches = []
   previews = []
+  drawn = []
   previewAnswer = null
+  fieldsAnswer = FIELDS
   window.localStorage.clear()
   global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
@@ -61,7 +70,7 @@ beforeEach(() => {
       }
       return json({ error: "not in this test" }, 400)
     }
-    if (url.includes("/api/dashboard/fields") && url.includes("mart=")) return json(FIELDS)
+    if (url.includes("/api/dashboard/fields") && url.includes("mart=")) return json(fieldsAnswer)
     if (url.includes("/api/dashboard/fields")) return json({ marts: [{ name: "mart_visits", rows: 1571564 }] })
     if (url.includes("/api/dashboard/sources")) return json({ sources: [] })
     if (url.includes("/api/dashboard/metrics") && !url.includes("usage")) return json({ metrics: [] })
@@ -197,5 +206,72 @@ describe("the data panel (BI-58 T2, spec T4)", () => {
     expect([...menu.querySelectorAll("[role=menuitem]")].map((i) => i.textContent)).toEqual(["Use as X axis", "Use as split", "Use as filter"])
     fireEvent.click(within(menu).getByRole("menuitem", { name: "Use as split" }))
     await waitFor(() => expect(within(panel).getByRole("button", { name: "category, Split" })).toBeTruthy())
+  })
+})
+
+describe("the chart-type gallery (BI-58 T3, spec T3)", () => {
+  /** A preview of `n` provinces, as the preview route answers a bar chart. */
+  function provinces(n: number) {
+    return (body: Record<string, unknown>) => ({
+      status: 200,
+      body: {
+        spec: { id: "preview", title: "Preview", kind: body.kind, mart: "mart_visits", sql: "", x: "provinsi", y: "visitors", source: "ui" },
+        result: { columns: ["provinsi", "visitors"], rows: Array.from({ length: n }, (_, i) => ({ provinsi: `P${i}`, visitors: 1000 + i })) },
+      },
+    })
+  }
+
+  it("draws each type it can from the preview's rows, with no request of its own and at most 200 rows", async () => {
+    previewAnswer = provinces(250)
+    renderBuilder(SAVED.bar)
+    const preview = screen.getByRole("region", { name: "Preview" })
+    await waitFor(() => expect(within(preview).getByTestId("chart")).toBeTruthy())
+    // Every way the builder reaches the server, watched from here on.
+    const services = [dashboardService, metricService, paramService].flatMap((svc) =>
+      Object.keys(svc).filter((k) => typeof (svc as Record<string, unknown>)[k] === "function").map((k) => spyOn(svc as unknown as Record<string, () => unknown>, k)))
+    const before = fetches.length
+    drawn = []
+    try {
+      fireEvent.click(screen.getByRole("button", { name: "More chart types" }))
+      const gallery = await screen.findByRole("dialog", { name: "Chart types" })
+      const card = (name: string) => within(gallery).getByRole("button", { name })
+      // Drawn from the rows: a pie and a line; a KPI needs its own query, so it shows its icon until it is picked.
+      await waitFor(() => expect(within(card("Donut / pie")).getByTestId("chart")).toBeTruthy())
+      expect(within(card("Line")).getByTestId("chart")).toBeTruthy()
+      expect(within(card("KPI — big number")).queryByTestId("chart")).toBeNull()
+      // At most 200 of the 250 rows reach a picture.
+      const pie = drawn.find((o) => o.series?.[0]?.type === "pie")
+      expect(pie?.series?.[0]?.data?.length).toBe(200)
+      // The gallery asked for nothing.
+      expect(fetches.length).toBe(before)
+      for (const spy of services) expect(spy).not.toHaveBeenCalled()
+    } finally {
+      for (const spy of services) spy.mockRestore()
+    }
+  })
+
+  it("greys out a type the source cannot make, with one line saying why, and picking another updates the preview", async () => {
+    previewAnswer = provinces(5)
+    // A source without date columns: no calendar and no Gantt chart.
+    fieldsAnswer = {
+      ...FIELDS,
+      dimensions: ["provinsi", "category"],
+      columns: FIELDS.columns.filter((c) => c.type !== "Date" && c.type !== "DateTime"),
+    }
+    renderBuilder(SAVED.bar)
+    await waitFor(() => expect(previews.length).toBeGreaterThan(0))
+    fireEvent.click(screen.getByRole("button", { name: "More chart types" }))
+    const gallery = await screen.findByRole("dialog", { name: "Chart types" })
+    for (const name of ["Calendar heatmap (daily)", "Gantt (tasks over time)"]) {
+      const card = within(gallery).getByRole("button", { name }) as HTMLButtonElement
+      expect(card.disabled, name).toBe(true)
+      expect(document.getElementById(card.getAttribute("aria-describedby") ?? "")?.textContent, name).toBe("Needs a date column")
+    }
+    // The stub source has three number columns: a bubble chart (three values) can be made, so it is not greyed.
+    expect((within(gallery).getByRole("button", { name: "Bubble (X, Y, size)" }) as HTMLButtonElement).disabled).toBe(false)
+    const asked = previews.length
+    fireEvent.click(within(gallery).getByRole("button", { name: "Area" }))
+    await waitFor(() => expect(previews.length).toBeGreaterThan(asked))
+    expect(previews[previews.length - 1]!.kind).toBe("area")
   })
 })

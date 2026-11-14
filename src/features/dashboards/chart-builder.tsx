@@ -6,18 +6,14 @@ import { Pill } from "@/components/patterns/status-badge"
 import * as React from "react";
 import Link from "next/link";
 import { useTheme } from "next-themes";
-import {
-  ArrowLeft, CalendarDays, ChartBar, ChartCandlestick, ChartColumn, ChartLine, ChartPie, ChevronDown, Code, Flame, Gauge, Workflow,
-  Map, MapPin, Pencil, ScatterChart, Search, SlidersHorizontal, Table2, Type, type LucideIcon,
-  ChartNoAxesColumn, ChartNoAxesGantt, Globe, Image as ImageIcon, Target,
-} from "lucide-react";
+import { ArrowLeft, ChartColumn, CircleAlert, Code, Pencil, RefreshCw, SlidersHorizontal, Table2 } from "lucide-react";
 import { EmptyState } from "@/components/patterns/page-states";
 import { Button } from "@/components/ui/button";
+import { Spinner } from "@/components/ui/spinner";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
-import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
 import {
   Select, SelectContent, SelectGroup, SelectLabel, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
@@ -51,7 +47,6 @@ import { draftFromDef, draftPayload, draftProblems, emptyTableDraft, type TableD
 import type { TableDefFields } from "@/lib/table-types";
 import type { SqlSource, SqlSourceColumn } from "@/services/contracts/dashboards";
 import { apiFetch } from "@/services/http";
-import { filterKindGroups } from "@/lib/chart-kind-search";
 import { previewKey } from "@/lib/preview-key";
 import {
   effectiveOrder, emptyShapeDraft, entriesFromRows, columnRef, isMetricColumn, metricColumn, metricNameOf, measureLabel, measureLimits, parseSortChoice, resultName,
@@ -81,6 +76,10 @@ import { layerDraftsFromDef, layerProblems, layersPayload, takesLayers, type Lay
 import { displayColumnFull, joinedAlias, joinsPayload, pairsFromSuggestions, type JoinDraft, type JoinPairDef } from "@/lib/chart-joins";
 import { columnGroup, type ColumnUse } from "@/lib/column-click";
 import { ColumnList, type PanelColumn } from "./data-panel";
+import { KindPicker, type GalleryPreview } from "./kind-picker";
+import type { SourceFacts } from "@/lib/kind-gallery";
+
+export { KIND_GROUPS } from "./chart-kinds";
 import type { OwnSource } from "./filters/use-filter-values";
 import { AccordionSection, ColumnLabel, FoldSection, Segmented, columnItems, focusFirstEmpty } from "./builder-sections";
 import { missingSection, sectionSummaries, type SectionNumber } from "@/lib/section-summary";
@@ -145,73 +144,11 @@ type Preview = {
 };
 
 /**
- * Chart types grouped by the question they answer (Metabase/Tableau-style
- * visualization picker). Exported so a caller can offer the type choice
- * earlier (e.g. a "New chart" dropdown in a header) without duplicating
- * the list.
- */
-export const KIND_GROUPS: { group: string; items: { value: ChartKind; label: string }[] }[] = [
-  { group: "Comparison", items: [
-    { value: "bar", label: "Bar" },
-    { value: "hbar", label: "Horizontal bar (ranking)" },
-    { value: "stacked", label: "Stacked bar (≥2 measures)" },
-    { value: "combo", label: "Combo (bar + line)" },
-  ] },
-  { group: "Trend", items: [
-    { value: "line", label: "Line" },
-    { value: "area", label: "Area" },
-    { value: "waterfall", label: "Waterfall (cumulative)" },
-    { value: "calendar", label: "Calendar heatmap (daily)" },
-  ] },
-  { group: "Composition", items: [
-    { value: "pie", label: "Donut / pie" },
-    { value: "rose", label: "Rose (nightingale)" },
-    { value: "funnel", label: "Funnel" },
-    { value: "treemap", label: "Treemap" },
-    { value: "sunburst", label: "Sunburst (2 levels)" },
-  ] },
-  { group: "Relationship / distribution", items: [
-    { value: "scatter", label: "Scatter (X vs Y)" },
-    { value: "bubble", label: "Bubble (X, Y, size)" },
-    { value: "heatmap", label: "Heatmap (2 dimensions)" },
-    { value: "radar", label: "Radar" },
-    { value: "boxplot", label: "Box plot (distribution)" },
-    { value: "histogram", label: "Histogram (spread of a number)" },
-  ] },
-  { group: "Schedule", items: [
-    { value: "gantt", label: "Gantt (tasks over time)" },
-  ] },
-  { group: "Flow", items: [
-    { value: "sankey", label: "Sankey (flow between 2 dimensions)" },
-  ] },
-  { group: "Geographic", items: [
-    { value: "geomap", label: "Map — regions (choropleth)" },
-    { value: "pointmap", label: "Map — points / bubbles" },
-    { value: "geoheat", label: "Map — density heatmap" },
-  ] },
-  { group: "Single value", items: [
-    { value: "kpi", label: "KPI — big number" },
-    { value: "gauge", label: "Gauge" },
-    { value: "progress", label: "Progress bar (value vs goal)" },
-    { value: "bullet", label: "Bullet graph (value, target, bands)" },
-  ] },
-  { group: "Other", items: [
-    { value: "table", label: "Data table" },
-    { value: "pivot", label: "Pivot table" },
-    { value: "text", label: "Text / note" },
-    { value: "image", label: "Image" },
-    { value: "web", label: "Web page" },
-  ] },
-];
-/**
  * Value → label maps for the base-ui selects below. Without `items`, a
  * base-ui `Select.Value` renders the raw value (`hbar`, `b_54e05896`,
  * `desc`, `__none__`) in the closed trigger even though the open list shows
  * labels.
  */
-const KIND_LABELS: Record<string, string> = Object.fromEntries(
-  KIND_GROUPS.flatMap((g) => g.items.map((i) => [i.value, i.label]))
-);
 const NO_BREAKDOWN = "__none__";
 const FIXED_LIMIT = "__fixed_limit__";
 const NO_GRAIN = "__no_grain__";
@@ -240,72 +177,17 @@ function withCalculated(base: Fields, columns: string[], calculated: CalcField[]
 const NO_LABEL_ITEMS: Record<string, string> = { [NO_BREAKDOWN]: "— no label —" };
 const SPAN_LABELS: Record<string, string> = { "1": "Half width", "2": "Full width" };
 
+/** One focus ring and easing for the title and description edited in place (owner taste: 150–250 ms, eased). */
+const INLINE_EDIT = "outline-none transition-[background-color,color,box-shadow] duration-200 ease-[cubic-bezier(0.2,0,0,1)] focus-visible:ring-3 focus-visible:ring-ring/50";
+
+/** The canvas's empty, loading and error states, centred where the chart will be. */
+function StateBox({ children }: { children: React.ReactNode }) {
+  return <div className="grid h-full place-content-center justify-items-center gap-3 p-6 text-center">{children}</div>;
+}
+
 /** Marks a field the chart cannot be drawn without. */
 function Req() {
   return <span aria-hidden className="text-destructive">*</span>;
-}
-const KIND_DESCRIPTIONS: Record<ChartKind, string> = {
-  bar: "Compare values across categories", hbar: "Rank categories clearly",
-  stacked: "Compare totals and their parts", combo: "Compare two metrics on different scales",
-  line: "Show change over time", area: "Show trend and magnitude",
-  waterfall: "Explain contributions to a total", pie: "Show parts of a whole",
-  rose: "Compare composition with radial bars", funnel: "Show drop-off through stages",
-  treemap: "Compare hierarchical proportions", scatter: "Reveal correlation between two metrics",
-  bubble: "Compare relationships with a third metric", heatmap: "Find patterns across two dimensions",
-  radar: "Compare profiles across metrics", geomap: "Colour the regions of a map by value",
-  pointmap: "Plot locations as points sized and coloured by a value",
-  geoheat: "Show where locations are concentrated",
-  kpi: "Highlight one important number", gauge: "Track a value against a target",
-  table: "Inspect detailed rows and values", pivot: "Cross-tabulate with totals and subtotals", text: "Add context, notes, or instructions",
-  sankey: "Show how a total flows from one dimension to another",
-  sunburst: "Break each category into its parts, as rings",
-  boxplot: "Compare the spread of a measure across categories",
-  calendar: "Spot daily patterns on a calendar",
-  progress: "Show a value against its goal, with the percentage reached",
-  histogram: "Count how many rows fall in each range of a number",
-  gantt: "Lay tasks on a time axis, one bar from start to end, with a line at today",
-  bullet: "Compare a value with a target and ranges such as poor, fair and good",
-  image: "Show a picture from an allowed site", web: "Show a web page from an allowed site",
-  // BI-18 part C: added from the dashboard's "Add" menu, never picked here; present only to satisfy the record.
-  heading: "A heading between tiles", divider: "A rule between tiles", section: "A heading that folds the tiles below it",
-};
-/**
- * Extra words the type search matches, beyond label and description: the
- * Indonesian ones (peta = map, titik = point, lokasi = location, kepadatan =
- * density) a user of this console is as likely to type.
- */
-const KIND_KEYWORDS: Partial<Record<ChartKind, string>> = {
-  geomap: "map peta region wilayah choropleth spatial geo",
-  pointmap: "map peta points titik lokasi bubble spatial geo",
-  geoheat: "map peta heatmap density kepadatan spatial geo",
-  pivot: "pivot cross tab crosstab matrix totals subtotals",
-  table: "table rows raw columns grid",
-  histogram: "distribution spread frequency bins ranges buckets",
-  gantt: "timeline schedule project plan tasks milestones jadwal",
-  progress: "goal target percent percentage bar completion",
-  bullet: "target bands goal poor fair good performance",
-  image: "picture logo photo png jpg gambar",
-  web: "iframe page embed website url status halaman",
-};
-function kindIcon(kind: ChartKind): LucideIcon {
-  if (["bar", "hbar", "stacked", "combo"].includes(kind)) return kind === "bar" ? ChartColumn : ChartBar;
-  if (["line", "area", "waterfall"].includes(kind)) return ChartLine;
-  if (["pie", "rose", "funnel", "treemap"].includes(kind)) return ChartPie;
-  if (["scatter", "bubble", "heatmap", "radar"].includes(kind)) return ScatterChart;
-  if (kind === "geomap") return Map;
-  if (kind === "pointmap") return MapPin;
-  if (kind === "geoheat") return Flame;
-  if (kind === "sankey") return Workflow;
-  if (kind === "sunburst") return ChartPie;
-  if (kind === "boxplot") return ChartCandlestick;
-  if (kind === "calendar") return CalendarDays;
-  if (kind === "kpi" || kind === "gauge" || kind === "progress") return Gauge;
-  if (kind === "histogram") return ChartNoAxesColumn;
-  if (kind === "gantt") return ChartNoAxesGantt;
-  if (kind === "bullet") return Target;
-  if (kind === "image") return ImageIcon;
-  if (kind === "web") return Globe;
-  return kind === "table" || kind === "pivot" ? Table2 : Type;
 }
 /** Measure labels that vary by kind (X/Y/size, bar/line, etc.). */
 const MEASURE_LABELS: Partial<Record<ChartKind, string[]>> = {
@@ -389,16 +271,22 @@ export function ChartBuilder({
   const [preview, setPreview] = React.useState<Preview | null>(null);
   const [previewBusy, setPreviewBusy] = React.useState(false);
   const [previewError, setPreviewError] = React.useState<string | null>(null);
+  // `BI-58` T3: "Try again" on a failed preview asks once more with the same inputs.
+  const [retry, setRetry] = React.useState(0);
+  // The rows under the chart: null follows the chart (open with steps), a boolean is the person's choice.
+  const [showData, setShowData] = React.useState<boolean | null>(null);
   const { resolvedTheme } = useTheme();
 
   const [title, setTitle] = React.useState("");
+  // `BI-58` T3: the chart's description, edited under its title; saved as `subtitle`, which the
+  // dashboard shows under a tile's title (and the assistant already writes).
+  const [subtitle, setSubtitle] = React.useState("");
+  const [describing, setDescribing] = React.useState(false);
   // Encoded data-source choice (`mart:<name>` / `sql:<id>`, lib/chart-source).
   const [source, setSource] = React.useState("");
   const choice = decodeSourceChoice(source);
   const chosenMart = selectedMart(marts, choice);
   const [kind, setKind] = React.useState<ChartKind>("hbar");
-  const [kindQuery, setKindQuery] = React.useState("");
-  const kindGroups = React.useMemo(() => filterKindGroups(KIND_GROUPS, KIND_DESCRIPTIONS, kindQuery, KIND_KEYWORDS), [kindQuery]);
   const [dimension, setDimension] = React.useState("");
   // The measures, each with an aggregate of its own or the chart's (BI-6). The
   // first three are also read as `measure`, `measure2` and `measure3`.
@@ -446,7 +334,6 @@ export function ChartBuilder({
   const [active, setActive] = React.useState<2 | 3 | null>(2);
   const panelRefs = React.useRef<Partial<Record<SectionNumber | 5, HTMLElement | null>>>({});
   const [focusAsk, setFocusAsk] = React.useState<{ section: SectionNumber; n: number } | null>(null);
-  const [kindMenu, setKindMenu] = React.useState(false);
   const numberParamDefs = React.useMemo(() => numberParams(paramDefs), [paramDefs]);
   const [targetBoard, setTargetBoard] = React.useState(board);
   // What a click does instead of the drill menu (BI-18·B); undefined = the menu.
@@ -828,10 +715,10 @@ export function ChartBuilder({
     void apiFetch("/api/dashboard/fields").then((r) => r.json()).then((j) => setMarts(j.marts ?? [])).catch(() => setMarts([]));
     // A viewer without the list (or with the API down) still gets marts.
     void dashboardService.listSqlSources().then(setSqlSources).catch(() => setSqlSources([]));
-    setKindMenu(false);
     setActive(editId ? null : 2);
     if (initial) {
       setTitle(initial.title ?? "");
+      setSubtitle(initial.subtitle ?? "");
       setKind((initial.kind as ChartKind) ?? "hbar");
       // Phase 2 QA R4: a measure that stores no aggregate shows this one; saving it back sends the same `aggregate`.
       setAggregate(initial.aggregate ?? "sum");
@@ -1040,12 +927,6 @@ export function ChartBuilder({
     focusFirstEmpty(panelRefs.current[focusAsk.section] ?? null);
     setFocusAsk(null);
   }, [focusAsk]);
-  /** A type was chosen from the menu, which closes. */
-  function chooseKind(next: ChartKind) {
-    pickKind(next);
-    setKindMenu(false);
-  }
-
   /** The shape fields to send; a pivot's bin only while it still has a number field to bin (BI-10). */
   function shapeOut(): Record<string, unknown> {
     const out = shapePayload(shape, shapeContext);
@@ -1146,6 +1027,8 @@ export function ChartBuilder({
     if (freshProblem && !forPreview && !isStaticTile) throw new Error(freshProblem);
     if (clickable && click && !problem) payload.click = click;
     if (isEdit) payload.id = editId;
+    // Sent only when there is one, so a chart without a description is saved as it always was.
+    if (!isStaticTile && subtitle.trim()) payload.subtitle = subtitle;
     // BI-11: the preview is drawn with the values the dashboard shows; they are not part of the chart.
     if (forPreview && paramValues && Object.keys(paramValues).length) payload.params = paramValues;
     return payload;
@@ -1222,7 +1105,7 @@ export function ChartBuilder({
     // BI-9 review fix (BLOCKER) R3: `previewInputsKey` holds every field that affects the
     // generated SQL or render spec, `grain` included (lib/preview-key.ts).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [previewInputsKey, heldPreview, previewSql]);
+  }, [previewInputsKey, heldPreview, previewSql, retry]);
 
   async function save() {
     setError(null);
@@ -1723,58 +1606,33 @@ export function ChartBuilder({
       )}
     </div>
   );
-  /** The type search and the grouped type buttons, shared by the open list and the menu of the folded one (phase 2 QA R9). */
-  const kindSearch = (
-    <>
-      <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden />
-      <Input
-        value={kindQuery}
-        onChange={(e) => setKindQuery(e.target.value)}
-        onKeyDown={(e) => {
-          // Enter picks the first match, so "sank⏎" is enough.
-          const first = kindGroups[0]?.items[0];
-          if (e.key === "Enter" && first) { e.preventDefault(); chooseKind(first.value); }
-        }}
-        placeholder="Search chart types"
-        aria-label="Search chart types"
-        className="h-8 bg-background pl-8"
-      />
-    </>
-  );
-  const kindList = (direction: string) => (
-    <>
-      {kindGroups.length === 0 ? (
-        <p className="px-2 py-1.5 text-xs text-muted-foreground">No chart type matches “{kindQuery.trim()}”.</p>
-      ) : null}
-      {kindGroups.map((group) => (
-        <div key={group.group} className={cn("flex shrink-0 gap-1", direction)}>
-          <p className={cn("px-2 pb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground", direction === "md:flex-col" && "hidden md:block")}>
-            {group.group}
-          </p>
-          {group.items.map((item) => {
-            const Icon = kindIcon(item.value);
-            const active = item.value === kind;
-            return (
-              <button
-                key={item.value}
-                type="button"
-                aria-pressed={active}
-                title={KIND_DESCRIPTIONS[item.value]}
-                onClick={() => chooseKind(item.value)}
-                className={cn(
-                  "flex shrink-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm whitespace-nowrap transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                  active ? "bg-primary/10 font-medium text-foreground" : "text-muted-foreground hover:bg-muted hover:text-foreground",
-                )}
-              >
-                <Icon className={cn("size-4 shrink-0", active ? "text-primary" : "opacity-70")} />
-                <span className="md:truncate">{item.label}</span>
-              </button>
-            );
-          })}
-        </div>
-      ))}
-    </>
-  );
+  // `BI-58` T3: the preview's rows, for the "Data" view under the chart and for the type gallery.
+  const resultRows = preview && "rows" in preview.result ? preview.result : null;
+  const rowsView: PreviewRows | null = preview?.previewRows?.rows.length ? preview.previewRows
+    : resultRows ? { columns: resultRows.columns, rows: resultRows.rows, truncated: false, limit: resultRows.rows.length } : null;
+  const galleryPreview: GalleryPreview | null = preview && resultRows?.rows.length
+    ? { spec: preview.spec, columns: resultRows.columns, rows: resultRows.rows } : null;
+  const sourceFacts: SourceFacts | null = fields ? {
+    dates: Object.values(fields.kinds ?? {}).filter((k) => k === "date" || k === "datetime").length,
+    groups: fields.dimensions.filter((d) => !slotParam(d)).length,
+    numbers: fields.measures.filter((m) => !slotParam(m)).length + (fields.metrics?.length ?? 0),
+  } : null;
+  // A chart with steps opens its rows, as the rows under its preview always did (BI-6 part 2); the person's toggle wins.
+  const hasSteps = !!(preview?.spec as { def?: ShapeDefFields } | undefined)?.def?.steps?.length;
+  const dataOpen = (showData ?? hasSteps) && !!rowsView && !showRows;
+  /** What the preview holds, in plain words, under the chart. */
+  const resultNote = showRows ? "Rows from your SQL"
+    : !resultRows ? (previewBusy ? "Running the query…" : "No result yet")
+    : isSingle ? "One value"
+    : (() => {
+        const n = resultRows.rows.length;
+        const noun = rowsMode ? (n === 1 ? "row" : "rows") : isGantt ? (n === 1 ? "task" : "tasks") : n === 1 ? "group" : "groups";
+        const before = preview?.previewRows;
+        return before && before.rows.length > n
+          ? `Showing ${n.toLocaleString()} of ${before.truncated ? "more than " : ""}${before.rows.length.toLocaleString()} ${noun}`
+          : `${n.toLocaleString()} ${noun}`;
+      })();
+
   const previewBody = showRows ? (
     <div className="flex h-full flex-col gap-3 overflow-auto">
       {chartHold ? <p className="text-sm text-muted-foreground">{chartHold}</p> : null}
@@ -1785,20 +1643,40 @@ export function ChartBuilder({
       )}
     </div>
   ) : preview ? (
-    <div className="flex h-full flex-col gap-2">
-      <div className="min-h-0 flex-1">
+    <div className={cn("grid h-full min-h-0 gap-3", dataOpen ? "grid-rows-[minmax(0,3fr)_minmax(0,2fr)]" : "grid-rows-1")}>
+      <div className="min-h-0">
         <TileBody spec={preview.spec} cell={preview.result} dark={resolvedTheme === "dark"} loading={previewBusy} />
       </div>
-      {preview.previewRows && preview.previewRows.rows.length ? <PreviewRowsTable data={preview.previewRows} labels={finalResult.labels} open={(preview.spec as { def?: ShapeDefFields }).def?.steps?.length ? true : false} /> : null}
+      {dataOpen && rowsView ? (
+        <div className="min-h-0 overflow-auto" data-slot="preview-rows">
+          <PreviewRowsTable data={rowsView} labels={finalResult.labels} open />
+        </div>
+      ) : null}
     </div>
-  ) : previewBusy ? (
-    <div className="h-full animate-pulse rounded-md bg-muted/50" />
+  ) : previewBusy || (!previewError && !missing.length) ? (
+    <StateBox>
+      <Spinner className="size-5 text-muted-foreground" />
+      <p className="text-sm text-muted-foreground">Running the query…</p>
+    </StateBox>
+  ) : previewError ? (
+    <StateBox>
+      <span className="grid size-10 place-items-center rounded-xl bg-destructive/10 text-destructive"><CircleAlert className="size-5" aria-hidden /></span>
+      <div className="grid max-w-sm gap-1">
+        <p className="text-sm font-medium text-foreground">Preview unavailable</p>
+        <p className="text-sm text-muted-foreground">{previewError}</p>
+      </div>
+      <Button type="button" variant="outline" size="sm" onClick={() => setRetry((n) => n + 1)}>
+        <RefreshCw aria-hidden /> Try again
+      </Button>
+    </StateBox>
   ) : (
-    <EmptyState
-      className="h-full py-6"
-      title={previewError ? "Preview unavailable" : missing.length ? "Nothing to preview yet" : "Loading preview…"}
-      description={previewError ?? (missing.length ? `Fill in ${missing.join(", ")} to see real data here.` : undefined)}
-    />
+    <StateBox>
+      <span className="grid size-10 place-items-center rounded-xl bg-muted text-muted-foreground"><ChartColumn className="size-5" aria-hidden /></span>
+      <div className="grid max-w-xs gap-1">
+        <p className="text-sm font-medium text-foreground">Your chart appears here</p>
+        <p className="text-sm text-muted-foreground">{`Fill in ${missing.join(", ")} to see real data here.`}</p>
+      </div>
+    </StateBox>
   );
 
   const boardName = boardLabels[board] ?? board;
@@ -1870,29 +1748,7 @@ export function ChartBuilder({
 
           <section aria-label="Chart" className="flex min-h-[26rem] min-w-0 flex-col rounded-xl bg-card ring-1 ring-foreground/6">
             <div className="flex min-h-12 items-center gap-2 border-b border-border/60 px-3 py-2">
-              {/*
-                Phase 2 QA R17: a popover of the base-ui family, so an outside press and Escape
-                close only the popover, and focus returns to the trigger.
-              */}
-              <PopoverPrimitive.Root open={kindMenu} onOpenChange={setKindMenu}>
-                <PopoverPrimitive.Trigger
-                  render={<Button type="button" size="sm" variant="outline" aria-label={`Change chart type, now ${KIND_LABELS[kind]}`} />}
-                >
-                  {React.createElement(kindIcon(kind), { className: "size-4", "aria-hidden": true })}
-                  {KIND_LABELS[kind]} <ChevronDown className="size-3.5" aria-hidden />
-                </PopoverPrimitive.Trigger>
-                <PopoverPrimitive.Portal>
-                  <PopoverPrimitive.Positioner side="bottom" align="start" sideOffset={4} className="z-[60]">
-                    <PopoverPrimitive.Popup
-                      role="group" aria-label="Chart type"
-                      className="flex max-h-80 w-72 flex-col gap-2 rounded-lg border border-border bg-popover p-2 text-popover-foreground shadow-md outline-hidden"
-                    >
-                      <div className="relative">{kindSearch}</div>
-                      <div className="flex min-h-0 flex-col gap-2 overflow-y-auto">{kindList("flex-col")}</div>
-                    </PopoverPrimitive.Popup>
-                  </PopoverPrimitive.Positioner>
-                </PopoverPrimitive.Portal>
-              </PopoverPrimitive.Root>
+              <KindPicker kind={kind} onPick={pickKind} facts={sourceFacts} preview={galleryPreview} dark={resolvedTheme === "dark"} />
             </div>
             <div className="flex min-h-0 flex-1 flex-col gap-3 px-5 pt-4 pb-4">
               <div className="grid gap-0.5">
@@ -1900,15 +1756,46 @@ export function ChartBuilder({
                 <input
                   id="ch-title" value={title} onChange={(e) => setTitle(e.target.value)}
                   placeholder={suggestedTitle || "e.g. Visitors by Region"}
-                  className="-mx-1.5 min-w-0 rounded-md bg-transparent px-1.5 py-0.5 text-xl font-semibold tracking-tight outline-none transition-colors duration-200 placeholder:text-muted-foreground/70 hover:bg-muted/70 focus-visible:bg-muted/70 focus-visible:ring-3 focus-visible:ring-ring/50"
+                  className={cn("-mx-1.5 min-w-0 rounded-md bg-transparent px-1.5 py-0.5 text-xl font-semibold tracking-tight placeholder:text-muted-foreground/70 hover:bg-muted/70 focus-visible:bg-muted/70", INLINE_EDIT)}
                 />
+                {isStaticTile ? null : describing || subtitle ? (
+                  <div className="mt-1 grid gap-0.5">
+                    <Label htmlFor="ch-description" className="text-xs font-normal text-muted-foreground">Description</Label>
+                    <input
+                      id="ch-description" value={subtitle} autoFocus={describing} onChange={(e) => setSubtitle(e.target.value)}
+                      onBlur={() => setDescribing(false)} placeholder="One line under the title"
+                      className={cn("-mx-1.5 min-w-0 rounded-md bg-transparent px-1.5 py-0.5 text-sm text-muted-foreground placeholder:text-muted-foreground/60 hover:bg-muted/70 focus-visible:bg-muted/70", INLINE_EDIT)}
+                    />
+                  </div>
+                ) : (
+                  <button
+                    type="button" onClick={() => setDescribing(true)}
+                    className={cn("justify-self-start rounded text-xs text-muted-foreground hover:text-foreground", INLINE_EDIT)}
+                  >
+                    + Add a description
+                  </button>
+                )}
               </div>
               <section aria-label="Preview" className="relative min-h-56 flex-1">
                 <div className="absolute inset-0">{previewBody}</div>
+                <span
+                  aria-live="polite"
+                  className={cn(
+                    "pointer-events-none absolute top-0 right-0 inline-flex items-center gap-1.5 rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground transition-opacity duration-200",
+                    previewBusy && preview ? "opacity-100" : "opacity-0",
+                  )}
+                >
+                  {previewBusy && preview ? <><Spinner className="size-3" /> Updating</> : null}
+                </span>
               </section>
             </div>
             <footer className="flex min-h-11 flex-wrap items-center justify-between gap-x-4 gap-y-2 border-t border-border/60 px-3 py-2">
-              <p className="text-xs text-muted-foreground">{showRows ? "Rows from your SQL" : "Live data, updates as you edit"}</p>
+              <p className="text-xs text-muted-foreground tabular-nums" data-slot="result-note">{resultNote}</p>
+              {rowsView && !heldPreview ? (
+                <Button type="button" size="sm" variant={dataOpen ? "secondary" : "ghost"} aria-pressed={dataOpen} onClick={() => setShowData(!dataOpen)}>
+                  <Table2 aria-hidden /> Data
+                </Button>
+              ) : null}
               {heldPreview && chartHold === null && draft.result ? (
                 <div role="group" aria-label="Preview content" className="flex gap-1">
                   {(["chart", "rows"] as const).map((tab) => (
