@@ -58,8 +58,11 @@ export const renderFailure = {
   },
 };
 
-/** Set on `window` when every tile has drawn or shown its error; Gotenberg waits for it. */
-function markReady() {
+/**
+ * Set on `window` when every tile has drawn or shown its error; Gotenberg waits for it.
+ * Shared with the report's print view (`BI-18` part D, T2).
+ */
+export function markReady() {
   (window as unknown as { __lakehouseRenderReady?: boolean }).__lakehouseRenderReady = true;
   document.documentElement.dataset.renderReady = "true";
 }

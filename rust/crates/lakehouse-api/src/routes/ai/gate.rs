@@ -175,6 +175,15 @@ fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
         "delete_report_subscription" => {
             format!("Menghapus laporan terjadwal {} secara permanen.", s("id"))
         }
+        // BI-18 part D (T4): a deleted report goes to the trash, a template away.
+        "delete_report" => format!(
+            "Memindahkan laporan {} ke tempat sampah; bisa dipulihkan selama 30 hari.",
+            s("id")
+        ),
+        "delete_template" => format!(
+            "Menghapus template dashboard {} secara permanen; dashboard yang sudah dibuat darinya tetap ada.",
+            s("id")
+        ),
         "delete_tab" => format!(
             "Menghapus tab {} dari dashboard {}; chart di dalamnya pindah ke tab pertama.",
             s("tab"),
@@ -247,11 +256,11 @@ fn embed_write_high_reason(name: &str, args: &Map<String, Value>) -> String {
 /// tells the reader the action cannot be undone once executed.
 ///
 /// Today it is the sentence [`risk_for_write_high`] gives every `WriteHigh`
-/// tool except `delete_chart` and `delete_board` — a deleted chart and a
-/// deleted board go to the trash and can be restored, so they get
-/// [`WRITE_HIGH_RISK_TRASHED_CHART`] and [`WRITE_HIGH_RISK_TRASHED_BOARD`]
-/// instead; [`risk_for_write_high`] picks between the three sentences
-/// (`AI-1`).
+/// tool except `delete_chart`, `delete_board` and `delete_report` — a deleted
+/// chart, board or report goes to the trash and can be restored, so they get
+/// [`WRITE_HIGH_RISK_TRASHED_CHART`], [`WRITE_HIGH_RISK_TRASHED_BOARD`] and
+/// [`WRITE_HIGH_RISK_TRASHED_REPORT`] instead; [`risk_for_write_high`] picks
+/// between the four sentences (`AI-1`, `BI-18` part D).
 const WRITE_HIGH_RISK: &str =
     "Tindakan berisiko tinggi (WriteHigh): tidak dapat dibatalkan setelah dijalankan.";
 
@@ -277,10 +286,19 @@ const WRITE_HIGH_RISK_TRASHED_CHART: &str = "Tindakan berisiko tinggi (WriteHigh
 /// The constant is named here so the two are changed together.
 const WRITE_HIGH_RISK_TRASHED_BOARD: &str = "Tindakan berisiko tinggi (WriteHigh): board dan chart-nya masuk tempat sampah dan bisa dipulihkan selama 30 hari.";
 
+/// The risk statement for `delete_report` (`BI-18` part D): the report is not
+/// gone, it is in the trash and can be restored, so the generic sentence would
+/// contradict the reason on the very same approval card (as for `AI-1`).
+///
+/// The `30` is the trash's retention, `lakehouse_bi::trash::RETENTION_DAYS`
+/// (30 days), a literal for the reason given at
+/// [`WRITE_HIGH_RISK_TRASHED_CHART`].
+const WRITE_HIGH_RISK_TRASHED_REPORT: &str = "Tindakan berisiko tinggi (WriteHigh): laporan masuk tempat sampah dan bisa dipulihkan selama 30 hari.";
+
 /// The risk sentence stored on a `WriteHigh` approval, chosen per tool.
 ///
-/// One sentence for every tool hid the mismatch: `delete_chart` and
-/// `delete_board` go to the trash and stay restorable, so the generic
+/// One sentence for every tool hid the mismatch: `delete_chart`,
+/// `delete_board` and `delete_report` go to the trash and stay restorable, so the generic
 /// "tidak dapat dibatalkan" sentence contradicted the reason line on the
 /// same card (`AI-1`). Every other `WriteHigh` tool keeps [`WRITE_HIGH_RISK`]
 /// word for word.
@@ -288,6 +306,9 @@ fn risk_for_write_high(spec: &ToolSpec) -> &'static str {
     match spec.name {
         "delete_chart" => WRITE_HIGH_RISK_TRASHED_CHART,
         "delete_board" => WRITE_HIGH_RISK_TRASHED_BOARD,
+        // BI-18 part D (OPS-32 merge, aligned with #525): a deleted report goes
+        // to the trash too, so its card says so, as its reason line does.
+        "delete_report" => WRITE_HIGH_RISK_TRASHED_REPORT,
         _ => WRITE_HIGH_RISK,
     }
 }
@@ -544,6 +565,46 @@ fn alert_summary(name: &str, args: &Map<String, Value>) -> String {
     )
 }
 
+/// The Confirm card's sentence for the report and template writes (`BI-18`
+/// part D, T4): what is made or changed, and how many charts it places.
+fn written_summary(name: &str, args: &Map<String, Value>) -> String {
+    let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
+    let charts = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_array)
+            .map_or(0, |b| b.iter().filter(|b| b["type"] == "chart").count())
+    };
+    match name {
+        "create_report" => format!(
+            "Membuat laporan \"{}\" dengan {} chart langsung dari dashboard.",
+            s("title"),
+            charts("blocks")
+        ),
+        "update_report" => {
+            let added = charts("append") + usize::from(!s("chart").trim().is_empty());
+            if args.contains_key("blocks") {
+                format!(
+                    "Mengganti seluruh isi laporan {} ({} chart).",
+                    s("id"),
+                    charts("blocks")
+                )
+            } else if added > 0 || args.contains_key("append") {
+                format!(
+                    "Menambah isi di akhir laporan {} ({added} chart baru).",
+                    s("id")
+                )
+            } else {
+                format!("Mengubah laporan {}.", s("id"))
+            }
+        }
+        _ => format!(
+            "Membuat dashboard baru \"{}\" dari template {}; salinan ini tidak mengubah templatenya.",
+            s("name"),
+            s("template")
+        ),
+    }
+}
+
 fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
     let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
     match spec.name {
@@ -607,6 +668,10 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             report_summary(spec.name, args)
         }
         "create_alert_rule" | "update_alert_rule" => alert_summary(spec.name, args),
+        // BI-18 part D (T4): the Confirm card's text for the report and template writes.
+        "create_report" | "update_report" | "create_dashboard_from_template" => {
+            written_summary(spec.name, args)
+        }
         "create_calculated_field" => format!(
             "Membuat kolom hitung \"{}\" = {} (pada {}).",
             s("name"),
@@ -1338,6 +1403,19 @@ mod tests {
         assert!(risk.contains("30 hari"), "{risk}");
     }
 
+    /// `BI-18` part D (OPS-32 merge, aligned with #525): a deleted report is in
+    /// the trash for 30 days, so its card says so and never that the action
+    /// cannot be undone.
+    #[test]
+    fn a_deleted_report_says_it_can_be_restored_for_thirty_days() {
+        let risk = risk_for_write_high(spec("delete_report"));
+        assert_eq!(
+            risk,
+            "Tindakan berisiko tinggi (WriteHigh): laporan masuk tempat sampah dan bisa dipulihkan selama 30 hari."
+        );
+        assert!(!risk.contains("tidak dapat dibatalkan"), "{risk}");
+    }
+
     /// The card a person reads before approving a board deletion must not
     /// contradict its own reason sentence: a deleted board and its charts go
     /// to the trash and can be restored, so the risk line says so instead of
@@ -1376,7 +1454,12 @@ mod tests {
     /// tombstone their row (`is_deleted = 1`), and nothing brings it back.
     #[test]
     fn the_other_write_high_tools_keep_the_generic_risk_sentence() {
-        for name in ["delete_calculated_field", "delete_metric"] {
+        // `delete_template` removes the template for good (`BI-18` part D).
+        for name in [
+            "delete_calculated_field",
+            "delete_metric",
+            "delete_template",
+        ] {
             assert_eq!(
                 risk_for_write_high(spec(name)),
                 "Tindakan berisiko tinggi (WriteHigh): tidak dapat dibatalkan setelah dijalankan.",

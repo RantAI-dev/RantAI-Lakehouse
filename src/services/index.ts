@@ -11,6 +11,8 @@ import { clickhouseGovernanceService } from "./clients/governance"
 import { postgresIdentityService } from "./clients/identity"
 import { postgresConnectorService } from "./clients/connectors"
 import { clickhouseDashboardService } from "./clients/dashboards"
+import { dashboardReportService as dashboardReportClientService } from "./clients/dashboard-reports"
+import { dashboardTemplateService as dashboardTemplateClientService } from "./clients/dashboard-templates"
 import { calcFieldService as calcFieldClientService } from "./clients/calc-fields"
 import { metricService as metricClientService } from "./clients/metrics"
 import { hierarchyService as hierarchyClientService } from "./clients/hierarchies"
@@ -115,6 +117,16 @@ export type {
   AccessKind, AccessLevel, Board, BoardChart, BoardTab, CommentInput, CommentList, CommentPerson, DashboardComment, EmbedInfo, FilterMode, GranteeMatches, InheritedGrantee, ItemAccess,
   ItemAccessInput, LayoutMap, MoveEffect, PhoneTile, PublicLink, PublicLinkState, TileBox,
 } from "./contracts/dashboards"
+// Reports (BI-18 part D): written pages with live charts, in Postgres over
+// `/api/dashboard/reports`. Real from the start: no mock ever existed.
+export const dashboardReportService = dashboardReportClientService
+export type {
+  Report, ReportBlock, ReportBlockType, ReportChartEntry, ReportList, ReportSummary, ReportView,
+} from "./contracts/dashboard-reports"
+// Dashboard templates (BI-18 part D): saved dashboard definitions in Postgres
+// over `/api/dashboard/templates`. Real from the start: no mock ever existed.
+export const dashboardTemplateService = dashboardTemplateClientService
+export type { DashboardTemplate, LeftOutChart, StartedBoard, TemplateList } from "./contracts/dashboard-templates"
 /** Calculated fields of a mart or SQL source (BI-8). */
 export const calcFieldService = calcFieldClientService
 /** Reusable metrics and segments (BI-2). */

@@ -108,6 +108,14 @@ export const TOOL_LABEL: Record<string, string> = {
   set_embed_filter_modes: "Set embed filter modes",
   withdraw_embed_tokens: "Withdraw embed tokens",
   get_embed_snippet: "Describe embedding",
+  // BI-18 part D: written reports and dashboard templates.
+  list_reports: "List reports",
+  create_report: "Write report",
+  update_report: "Change report",
+  delete_report: "Delete report",
+  list_templates: "List templates",
+  create_dashboard_from_template: "Start dashboard from template",
+  delete_template: "Delete template",
 };
 
 /**

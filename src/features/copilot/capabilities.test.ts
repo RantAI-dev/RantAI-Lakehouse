@@ -180,3 +180,35 @@ describe("the scheduled-report tools", () => {
     }
   })
 })
+
+// BI-18 part D (T4): the report and template tools, named here or they never
+// reach the model. All six need `dashboard:write`, so they belong to the
+// Dashboard Builder's build mode only.
+describe("the report and template tools", () => {
+  const fixture = JSON.parse(
+    readFileSync(`${process.cwd()}/rust/crates/lakehouse-api/tests/fixtures/tool_schemas.json`, "utf8")
+  ) as { function: { name: string } }[]
+  const serverTools = fixture.map((t) => t.function.name)
+  const tools = [
+    "create_report", "update_report", "delete_report",
+    "list_templates", "create_dashboard_from_template", "delete_template",
+  ]
+
+  it("are on the server and offered with the Dashboard Builder in build mode only", () => {
+    for (const tool of tools) {
+      expect(serverTools).toContain(tool)
+      expect(toolsFromCaps(new Set(["dashboard"]), "build")).toContain(tool)
+      expect(toolsFromCaps(new Set(["dashboard"]), "ask")).not.toContain(tool)
+      expect(toolsFromCaps(new Set(["data"]), "build")).not.toContain(tool)
+    }
+  })
+
+  // Review round 1, SHOULD-FIX 2: listing the reports is a read, in both modes.
+  it("offers list_reports in both modes", () => {
+    expect(serverTools).toContain("list_reports")
+    for (const mode of ["ask", "build"] as const) {
+      expect(toolsFromCaps(new Set(["data"]), mode)).toContain("list_reports")
+    }
+    expect(toolsFromCaps(new Set(["dashboard"]), "build")).toContain("list_reports")
+  })
+})

@@ -16,6 +16,7 @@
 //!   download link, made when the person opens it.
 //! - [`reports`] — the scheduled-report tools (`AI-10`, with `RPT-1`).
 //! - [`tabs`] — the dashboard tab tools (`BI-18` part C, with `AI-9`).
+//! - [`written`] — the report and template tools (`BI-18` part D, with `AI-9`).
 //! - [`calc_fields`] — the calculated-field tools (`BI-8`, with `AI-4`).
 //! - [`embed`] — the signed-embed tools (`BI-26` slice 2, with `AI-11-AC3`):
 //!   enable, filter modes, withdraw, and the snippet.//! - [`pipelines`] — `trigger_lakehouse_build`, `get_build_status`, plus
@@ -60,6 +61,7 @@ mod queries;
 mod reports;
 pub(in crate::routes) use reports::{approval_args, report_audience};
 mod tabs;
+mod written;
 
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
@@ -229,6 +231,8 @@ pub(in crate::routes) async fn run_tool(
             comments::list_dashboard_comments(state, principal, args).await
         }
         n if embed::handles(n) => embed::run(state, principal, name, args).await,
+        // BI-18 part D (T4): reports and templates.
+        n if written::handles(n) => written::run(state, principal, name, args).await,
         "list_connectors" => connectors::list_connectors(state, principal).await,
         "create_connector" => connectors::create_connector(state, principal, args).await,
         "test_connector" => connectors::test_connector(state, principal, args).await,

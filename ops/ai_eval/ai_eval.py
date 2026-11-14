@@ -593,11 +593,19 @@ DELETE_ROUTES = {
     # BI-37: an alert or digest rule, deleted by id like the others
     # (`DELETE /api/alerts?id=`).
     "alert": "/api/alerts",
+    # BI-18 part D: a written report and a dashboard template, deleted by id
+    # in the path (`DELETE /api/dashboard/reports/{id}`), see `PATH_ID_KINDS`.
+    "report": "/api/dashboard/reports",
+    "template": "/api/dashboard/templates",
 }
+# The kinds whose delete names the id in the path, not in `?id=`.
+PATH_ID_KINDS = frozenset({"report", "template"})
 # Newest first: a chart may use a field, a field a source, and a board holds
 # charts, so the dependants go before what they depend on. An alert watches a
 # chart, so it goes before the charts.
-CLEANUP_ORDER = ("alert", "chart", "metric", "field", "source", "board")
+# A report places charts by reference, so it goes first too; a template copies
+# a board's definition and depends on nothing, so it goes last.
+CLEANUP_ORDER = ("alert", "report", "chart", "metric", "field", "source", "board", "template")
 
 
 def kind_of_path(path: str) -> str | None:
@@ -884,6 +892,15 @@ def collect_created(
             elif tool == "create_calculated_field" and result.get("ok") is True:
                 found.append({"kind": "field", "id": str(result["id"])})
             return
+        # BI-18 part D: `create_report` answers `{ok: true, report: {id, ...}}`
+        # and `create_dashboard_from_template` `{ok: true, board: {id, ...}}`.
+        nested = {"create_report": ("report", "report"), "create_dashboard_from_template": ("board", "board")}
+        if tool in nested and result.get("ok") is True:
+            key, kind = nested[tool]
+            obj = result.get(key)
+            if isinstance(obj, dict) and obj.get("id"):
+                found.append({"kind": kind, "id": str(obj["id"])})
+            return
         # BI-37: `create_alert_rule` answers `{ok: true, rule: {id, ...}}` — the
         # object to clean up is the rule, not the reply.
         rule = result.get("rule")
@@ -912,8 +929,13 @@ def run_cleanup(cfg: Config, session: requests.Session, created: list[dict[str, 
     problems: list[str] = []
     for obj in cleanup_plan(created):
         route = DELETE_ROUTES[obj["kind"]]
+        url = (
+            f"{cfg.api_url}{route}/{obj['id']}"
+            if obj["kind"] in PATH_ID_KINDS
+            else f"{cfg.api_url}{route}?id={obj['id']}"
+        )
         try:
-            resp = session.delete(f"{cfg.api_url}{route}?id={obj['id']}", timeout=60)
+            resp = session.delete(url, timeout=60)
         except requests.RequestException as err:
             problems.append(f"cleanup {obj['kind']} {obj['id']}: {type(err).__name__}")
             continue

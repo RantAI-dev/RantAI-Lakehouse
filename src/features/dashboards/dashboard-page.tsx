@@ -46,6 +46,7 @@ import type { ChartDef } from "./chart-builder";
 import { chartEditHref, chartNewHref } from "./chart-page";
 import { fmtInt } from "./chart-option";
 import { DashboardActionsMenu, EditLayoutButton, NewChartButton, RenameDashboardDialog } from "./dashboard-actions";
+import { SaveTemplateDialog } from "./template-dialogs";
 import { chartWriteItems } from "./tile-write-items";
 import { ThemeFontDialog } from "./theme-font-dialog";
 import { FreshnessDialog } from "./freshness-dialog";
@@ -237,6 +238,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const [removeBusy, setRemoveBusy] = React.useState(false);
   const [renameOpen, setRenameOpen] = React.useState(false);
   const [themeOpen, setThemeOpen] = React.useState(false);
+  // BI-18 part D (T6): "Save as template" from the ⋯ menu.
+  const [templateOpen, setTemplateOpen] = React.useState(false);
   // BI-4 part B: the dashboard's own freshness rule, saved through the board write path.
   const [freshOpen, setFreshOpen] = React.useState(false);
   const [savingFresh, setSavingFresh] = React.useState(false);
@@ -1343,6 +1346,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
               onExportPdf={exportPdf}
               onDownloadPdf={() => setPdfOpen(true)}
               onExportFile={() => void downloadFile()}
+              onSaveTemplate={hasPermission("dashboard:write") ? () => setTemplateOpen(true) : undefined}
               onSubscriptions={() => setSubsOpen(true)}
               pdfSupported={data?.pdfSupported === true}
               canDownload={canDownload}
@@ -1582,6 +1586,9 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       {freshOpen ? (
         <FreshnessDialog open={freshOpen} onOpenChange={setFreshOpen} rule={data?.boardCacheRule} effective={data?.cacheRule}
           saving={savingFresh} error={freshError} onSave={(r) => void saveFreshness(r)} />
+      ) : null}
+      {!isDefault && hasPermission("dashboard:write") ? (
+        <SaveTemplateDialog open={templateOpen} onOpenChange={setTemplateOpen} board={board} boardName={dashName} />
       ) : null}
       {renameOpen ? (
         <RenameDashboardDialog open={renameOpen} onOpenChange={setRenameOpen} currentName={dashName} onSave={(n) => void renameDashboard(n)} />
