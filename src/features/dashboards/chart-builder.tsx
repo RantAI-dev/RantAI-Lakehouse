@@ -6,7 +6,8 @@ import { Pill } from "@/components/patterns/status-badge"
 import * as React from "react";
 import Link from "next/link";
 import { useTheme } from "next-themes";
-import { ArrowLeft, ChartColumn, CircleAlert, Code, Pencil, RefreshCw, SlidersHorizontal, Table2 } from "lucide-react";
+import { ArrowLeft, ChartColumn, CircleAlert, Code, Database, Pencil, RefreshCw, SlidersHorizontal, Table2 } from "lucide-react";
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { EmptyState } from "@/components/patterns/page-states";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
@@ -335,6 +336,9 @@ export function ChartBuilder({
   // Where a missing field is: 1 the data panel, 2 the Data tab, 3 the Sort & filter tab.
   const panelRefs = React.useRef<Partial<Record<1 | 2 | 3, HTMLElement | null>>>({});
   const [focusAsk, setFocusAsk] = React.useState<{ section: 1 | 2 | 3; n: number } | null>(null);
+  // `BI-58` T5: below 1280 px of builder width the data panel folds into "Pick data", which opens it as a sheet.
+  const [dataSheet, setDataSheet] = React.useState(false);
+  const sheetPanel = React.useRef<HTMLDivElement | null>(null);
   const numberParamDefs = React.useMemo(() => numberParams(paramDefs), [paramDefs]);
   const [targetBoard, setTargetBoard] = React.useState(board);
   // What a click does instead of the drill menu (BI-18·B); undefined = the menu.
@@ -910,12 +914,17 @@ export function ChartBuilder({
   /** Shows the place that holds a missing field (the data panel or a tab) and moves focus to that field. */
   function revealMissing(place: MissingPlace) {
     if (place !== "source") setTab(place);
+    // The data panel is folded away below 1280 px of builder width; then its sheet opens instead.
+    else if (panelRefs.current[1]?.checkVisibility?.() === false) setDataSheet(true);
     setFocusAsk({ section: place === "source" ? 1 : place === "data" ? 2 : 3, n: Date.now() });
   }
   React.useEffect(() => {
     if (!focusAsk) return;
-    focusFirstEmpty(panelRefs.current[focusAsk.section] ?? null);
-    setFocusAsk(null);
+    if (!(focusAsk.section === 1 && dataSheet)) { focusFirstEmpty(panelRefs.current[focusAsk.section] ?? null); return; }
+    // The sheet's content mounts in a portal on its first frame; the field is looked for after it.
+    const timer = window.setTimeout(() => focusFirstEmpty(sheetPanel.current), 80);
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `dataSheet` is read as it was when the focus was asked for
   }, [focusAsk]);
   /** The shape fields to send; a pivot's bin only while it still has a number field to bin (BI-10). */
   function shapeOut(): Record<string, unknown> {
@@ -1323,6 +1332,17 @@ export function ChartBuilder({
   // track, whose minimum is the widest unbreakable content in it (a trigger's `nowrap` value), so
   // one long column name widened the whole form. Every grid of the form without columns of its own
   // gets a `minmax(0, 1fr)` track, which the container, not the content, sizes.
+  // The data panel's content: inline at the left from 1280 px of builder width, else in the "Pick data" sheet.
+  const dataPanel = (
+    <>
+      {sourcePanel}
+      <ColumnList
+        columns={panelColumns} fieldLabel={fieldLabel} textOf={titleText}
+        xEmpty={!dimension} valueEmpty={!measureRows[0]?.column} onUse={applyColumnUse}
+      />
+      {chosenMart ? <p className="px-2 text-xs text-muted-foreground tabular-nums">{chosenMart.rows.toLocaleString()} rows in {chosenMart.name}</p> : null}
+    </>
+  );
   const FORM_GRID = "grid min-w-0 grid-cols-[minmax(0,1fr)] content-start gap-5 p-4 [&_.grid:not([class*=grid-cols])]:grid-cols-[minmax(0,1fr)]";
   /** A group of settings under the main ones of a tab, set apart by a rule. */
   const group = (children: React.ReactNode) => <div className="grid grid-cols-[minmax(0,1fr)] gap-4 border-t border-border/60 pt-5">{children}</div>;
@@ -1678,6 +1698,11 @@ export function ChartBuilder({
         <p className="text-sm font-medium text-foreground">Your chart appears here</p>
         <p className="text-sm text-muted-foreground">{`Fill in ${missing.join(", ")} to see real data here.`}</p>
       </div>
+      {!choice && !isNewSql ? (
+        <Button type="button" variant="outline" size="sm" className="@7xl:hidden" onClick={() => setDataSheet(true)}>
+          <Database aria-hidden /> Pick data
+        </Button>
+      ) : null}
     </StateBox>
   );
 
@@ -1689,7 +1714,10 @@ export function ChartBuilder({
     // comes from and goes, and the two actions), then three zones: the data panel, the canvas and
     // the inspector. The zones follow the builder's own width (a container query), not the
     // window's, because the app's sidebar takes a different share of each window.
-    <div className="@container" data-slot="chart-builder">
+    // `BI-58` T5: from two columns up the builder fits the window instead of scrolling it. The
+    // assistant dock keeps a 5rem spacer under `main` for pages that scroll; this one cancels it, so
+    // the zones end just above the dock (`main`'s own bottom padding still keeps the dock clear).
+    <div className="@container @3xl:-mb-20" data-slot="chart-builder">
       <div className="flex flex-col gap-4 @3xl:h-[calc(100dvh-12.5rem)] @3xl:min-h-[34rem]">
         <header className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
           <div className="flex min-w-0 items-center gap-2">
@@ -1699,7 +1727,7 @@ export function ChartBuilder({
             <div className="flex min-w-0 items-baseline gap-1.5 text-sm">
               <Link href={backHref} className="truncate text-muted-foreground transition-colors duration-200 hover:text-foreground">{boardName}</Link>
               <span aria-hidden className="text-muted-foreground">/</span>
-              <h1 className="truncate font-medium text-foreground">{isEdit ? "Edit chart" : "New chart"}</h1>
+              <h1 className="truncate text-sm font-medium text-foreground">{isEdit ? "Edit chart" : "New chart"}</h1>
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -1732,24 +1760,27 @@ export function ChartBuilder({
 
         <div className={cn(
           "grid min-h-0 flex-1 gap-4",
-          isStaticTile ? "@3xl:grid-cols-[minmax(0,1fr)_20rem]" : "@3xl:grid-cols-[14rem_minmax(0,1fr)_18rem] @7xl:grid-cols-[16rem_minmax(0,1fr)_20rem]",
+          isStaticTile ? "@3xl:grid-cols-[minmax(0,1fr)_20rem]" : "@3xl:grid-cols-[minmax(0,1fr)_20rem] @7xl:grid-cols-[16rem_minmax(0,1fr)_20rem]",
         )}>
           {isStaticTile ? null : (
             <aside
               aria-label="Data" ref={(n) => { panelRefs.current[1] = n; }}
-              className="flex min-h-0 min-w-0 flex-col gap-4 overflow-y-auto rounded-xl bg-card p-3 ring-1 ring-foreground/6"
+              className="hidden min-h-0 min-w-0 flex-col gap-4 overflow-y-auto rounded-xl bg-card p-3 ring-1 ring-foreground/6 @7xl:flex"
             >
-              {sourcePanel}
-              <ColumnList
-                columns={panelColumns} fieldLabel={fieldLabel} textOf={titleText}
-                xEmpty={!dimension} valueEmpty={!measureRows[0]?.column} onUse={applyColumnUse}
-              />
-              {chosenMart ? <p className="px-2 text-xs text-muted-foreground tabular-nums">{chosenMart.rows.toLocaleString()} rows in {chosenMart.name}</p> : null}
+              {dataPanel}
             </aside>
           )}
 
           <section aria-label="Chart" className="flex min-h-[26rem] min-w-0 flex-col rounded-xl bg-card ring-1 ring-foreground/6">
             <div className="flex min-h-12 items-center gap-2 border-b border-border/60 px-3 py-2">
+              {isStaticTile ? null : (
+                <Button
+                  type="button" variant="outline" size="sm" className="max-w-44 shrink-0 @7xl:hidden"
+                  aria-haspopup="dialog" aria-label={choice || isNewSql ? `Data: ${sourceLabels[source] ?? source}` : "Pick data"} onClick={() => setDataSheet(true)}
+                >
+                  <Database aria-hidden /> <span className="truncate">{choice || isNewSql ? sourceLabels[source] ?? source : "Pick data"}</span>
+                </Button>
+              )}
               <KindPicker kind={kind} onPick={pickKind} facts={sourceFacts} preview={galleryPreview} dark={resolvedTheme === "dark"} />
             </div>
             <div className="flex min-h-0 flex-1 flex-col gap-3 px-5 pt-4 pb-4">
@@ -1818,6 +1849,17 @@ export function ChartBuilder({
           </aside>
         </div>
       </div>
+      {isStaticTile ? null : (
+        <Sheet open={dataSheet} onOpenChange={setDataSheet}>
+          <SheetContent side="left" className="w-[min(22rem,calc(100vw-2rem))] gap-0 p-0 sm:max-w-none">
+            <SheetHeader className="p-4 pb-2">
+              <SheetTitle className="text-base">Data</SheetTitle>
+              <SheetDescription>Pick the source, then click a column to use it.</SheetDescription>
+            </SheetHeader>
+            <div ref={sheetPanel} className="grid min-h-0 flex-1 content-start gap-4 overflow-y-auto p-3 pb-6">{dataPanel}</div>
+          </SheetContent>
+        </Sheet>
+      )}
       {fields?.columns && choice ? (
         <FormulaEditorDialog
           open={formulaOpen}

@@ -275,3 +275,24 @@ describe("the chart-type gallery (BI-58 T3, spec T3)", () => {
     expect(previews[previews.length - 1]!.kind).toBe("area")
   })
 })
+
+describe("the folded data panel (BI-58 T5)", () => {
+  it("opens the data panel as a sheet from Pick data, where the source and its columns work as in the panel", async () => {
+    previewAnswer = drawRows
+    renderBuilder()
+    // The toolbar's button; the empty canvas offers the same one.
+    const buttons = screen.getAllByRole("button", { name: "Pick data" })
+    expect(buttons).toHaveLength(2)
+    fireEvent.click(buttons[0]!)
+    const sheet = await screen.findByRole("dialog", { name: "Data" })
+    fireEvent.click(within(sheet).getByRole("combobox"))
+    fireEvent.click(await screen.findByRole("option", { name: /mart_visits/ }))
+    fireEvent.click(await within(sheet).findByRole("button", { name: "begins" }))
+    fireEvent.click(within(sheet).getByRole("button", { name: "visitors" }))
+    // Closed, the toolbar's button names the source, and the chart was drawn behind the sheet.
+    fireEvent.keyDown(sheet, { key: "Escape" })
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Data" }) === null).toBe(true))
+    expect(screen.getByRole("button", { name: "Data: mart_visits" })).toBeTruthy()
+    await waitFor(() => expect(within(screen.getByRole("region", { name: "Preview" })).getByTestId("chart")).toBeTruthy())
+  })
+})

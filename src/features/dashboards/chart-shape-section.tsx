@@ -92,7 +92,7 @@ export function MeasureRows({
                 }}
                 disabled={disabled}
               >
-                <SelectTrigger className="w-28 shrink-0" aria-label={`Aggregation of ${row.column || labels(i)}`}><SelectValue /></SelectTrigger>
+                <SelectTrigger className="w-24 shrink-0" aria-label={`Aggregation of ${row.column || labels(i)}`}><SelectValue /></SelectTrigger>
                 <SelectContent>
                   {MEASURE_AGGREGATES.map((a) => <SelectItem key={a} value={a}>{a}</SelectItem>)}
                 </SelectContent>
@@ -100,8 +100,13 @@ export function MeasureRows({
             ) : null}
             {flexible ? (
               <>
-                <Button type="button" size="icon-xs" variant="ghost" aria-label={`Move measure ${i + 1} up`} disabled={i === 0} onClick={() => onChange(moveItem(rows, i, -1))}><ArrowUp /></Button>
-                <Button type="button" size="icon-xs" variant="ghost" aria-label={`Move measure ${i + 1} down`} disabled={i === rows.length - 1} onClick={() => onChange(moveItem(rows, i, 1))}><ArrowDown /></Button>
+                {/* `BI-58` T5: with one value there is nothing to move it past, and the narrow inspector needs the room for the column. */}
+                {rows.length > 1 ? (
+                  <>
+                    <Button type="button" size="icon-xs" variant="ghost" aria-label={`Move measure ${i + 1} up`} disabled={i === 0} onClick={() => onChange(moveItem(rows, i, -1))}><ArrowUp /></Button>
+                    <Button type="button" size="icon-xs" variant="ghost" aria-label={`Move measure ${i + 1} down`} disabled={i === rows.length - 1} onClick={() => onChange(moveItem(rows, i, 1))}><ArrowDown /></Button>
+                  </>
+                ) : null}
                 <Button type="button" size="icon-xs" variant="ghost" aria-label={`Remove measure ${i + 1}`} disabled={rows.length <= min} onClick={() => onChange(rows.filter((_, j) => j !== i))}><X /></Button>
               </>
             ) : null}

@@ -318,7 +318,8 @@ describe("ChartBuilder inspector placement (phase 2 QA R10, BI-58 T4)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save changes" }))
     await waitFor(() => expect(selectedTab()).toBe("Data"))
     expect(screen.getByRole("alert").textContent).toContain("Dimension (X)")
-    await waitFor(() => expect((document.activeElement as HTMLElement).closest("[data-slot=dimension-field]")).not.toBeNull())
+    // A boolean, not the element: a failing match would print the whole form on every retry.
+    await waitFor(() => expect((document.activeElement as HTMLElement).closest("[data-slot=dimension-field]") !== null).toBe(true))
     expect(document.activeElement?.hasAttribute("data-placeholder")).toBe(true)
   })
 
