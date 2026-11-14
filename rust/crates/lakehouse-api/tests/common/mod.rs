@@ -423,6 +423,16 @@ pub async fn mount_existing_iceberg_table(server: &wiremock::MockServer, table: 
         .await;
 }
 
+/// The fixed sentence `ClickHouse`'s code 47 (`UNKNOWN_IDENTIFIER`) gets, and
+/// so the browser's copy of a statement failure (owner 2026-11-12,
+/// LH-QS-2-08): the person reads this sentence and a reference, never the
+/// engine's own text.
+pub const COLUMN_DOES_NOT_EXIST: &str = "This query names a column that does not exist.";
+
+/// The engine's own answer for a statement that names a column that does not
+/// exist: code 47, `DB::Exception`, the identifier and the server version.
+pub const CLICKHOUSE_UNKNOWN_IDENTIFIER: &str = "Code: 47. DB::Exception: Unknown expression identifier 'pengunjungg' in scope. (UNKNOWN_IDENTIFIER) (version 26.8.1)";
+
 /// `ClickHouse` for a `run_sql` whose statement the engine answers with
 /// `answer`: the dry run (`EXPLAIN AST`) confirms a `SELECT`, a statement
 /// that contains `failing` gets the engine's own answer, and any other

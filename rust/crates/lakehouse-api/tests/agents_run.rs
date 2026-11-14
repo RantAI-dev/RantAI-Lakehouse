@@ -25,7 +25,8 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{
-    TestApp, create_principal_with_permissions, mock_clickhouse_refusing, model_tool_result,
+    CLICKHOUSE_UNKNOWN_IDENTIFIER, COLUMN_DOES_NOT_EXIST, TestApp,
+    create_principal_with_permissions, mock_clickhouse_refusing, model_tool_result,
     session_cookie_for_seeded_user, session_cookie_for_user, spin_up_with_env,
 };
 
@@ -714,13 +715,6 @@ async fn a_scheduled_runs_approval_has_no_requester_and_any_approver_may_decide_
 // (owner rule LH-QS-2-08, 2026-11-12). A run's step and an outcome executed
 // after approval are read by a browser on the run page, so they carry that
 // copy. The model that drives a run still reads the engine's diagnosis.
-
-/// The fixed sentence `ClickHouse`'s code 47 (`UNKNOWN_IDENTIFIER`) gets.
-const COLUMN_DOES_NOT_EXIST: &str = "This query names a column that does not exist.";
-
-/// The engine's own answer for a statement that names a column that does not
-/// exist.
-const CLICKHOUSE_UNKNOWN_IDENTIFIER: &str = "Code: 47. DB::Exception: Unknown expression identifier 'pengunjungg' in scope. (UNKNOWN_IDENTIFIER) (version 26.8.1)";
 
 /// The statement the mock engine refuses.
 const FAILING_SQL: &str = "SELECT pengunjungg FROM silver.orders";

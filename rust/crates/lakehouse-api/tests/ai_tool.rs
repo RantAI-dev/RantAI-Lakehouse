@@ -19,7 +19,8 @@ use tower::ServiceExt;
 use wiremock::ResponseTemplate;
 
 use common::{
-    TestApp, mock_clickhouse_refusing, session_cookie_for_seeded_user, spin_up, spin_up_with_env,
+    CLICKHOUSE_UNKNOWN_IDENTIFIER, COLUMN_DOES_NOT_EXIST, TestApp, mock_clickhouse_refusing,
+    session_cookie_for_seeded_user, spin_up, spin_up_with_env,
 };
 
 async fn post_tool(
@@ -982,15 +983,9 @@ async fn set_cache_rule_is_refused_without_dashboard_write() {
 // ── LH-QS-2-08: the tool route answers the person's copy ─────────────────
 //
 // An engine failure reaches a person as a fixed sentence and a reference
-// (owner rule LH-QS-2-08, 2026-11-12). Only the chat loop's model reads the
-// engine's diagnosis, so a direct call to this route does not.
-
-/// The fixed sentence `ClickHouse`'s code 47 (`UNKNOWN_IDENTIFIER`) gets.
-const COLUMN_DOES_NOT_EXIST: &str = "This query names a column that does not exist.";
-
-/// The engine's own answer for a statement that names a column that does not
-/// exist.
-const CLICKHOUSE_UNKNOWN_IDENTIFIER: &str = "Code: 47. DB::Exception: Unknown expression identifier 'pengunjungg' in scope. (UNKNOWN_IDENTIFIER) (version 26.8.1)";
+// (owner rule LH-QS-2-08, 2026-11-12). Only a model reads the engine's
+// diagnosis (the chat loop's or an agent run's), and it does not come
+// through this route.
 
 /// Calls `run_sql` with `sql` on a `ClickHouse` that refuses any statement
 /// naming `pengunjungg` with `answer`, and returns the answer's body.

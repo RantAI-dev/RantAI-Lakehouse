@@ -121,12 +121,13 @@ const MAX_ITER: u32 = 8;
 /// sentence in this key (the browser's copy).
 ///
 /// Every caller that hands a tool's result to a model or to a browser takes
-/// this key out first, through [`split_tool_result`]: the model gets the
-/// result without it, and the browser gets the same result with `error`
-/// replaced by the key's text. So the key reaches neither of them, and the
-/// name is not part of the wire contract: no client reads it. The callers
-/// are the chat loop's trace, `POST /api/ai/tool`'s answer, and an agent
-/// run's step and outcome detail.
+/// this key out first: the model gets the result without it, and the browser
+/// gets the same result with `error` replaced by the key's text. So the key
+/// reaches neither of them, and the name is not part of the wire contract:
+/// no client reads it. The chat loop splits the two copies itself, with
+/// [`take_browser_error`] and [`browser_copy`], for its trace. The other
+/// three callers go through [`split_tool_result`]: `POST /api/ai/tool`'s
+/// answer, an agent run's step, and an agent run's approval outcome.
 pub(in crate::routes) const BROWSER_ERROR_KEY: &str = "_browserError";
 
 /// Puts a tool's browser copy of an engine failure next to its error, in
@@ -166,8 +167,10 @@ fn take_browser_error(result: Value) -> (Value, Option<String>) {
 /// result as the tool returned it.
 ///
 /// A caller that shows a tool's result to a person uses the browser's copy,
-/// and a caller that feeds it to the model uses the model's. No caller
-/// rebuilds either copy itself.
+/// and a caller that feeds it to the model uses the model's. No caller keeps
+/// the server-only key in what it hands out. The chat loop does not call
+/// this function: it splits the copies with [`take_browser_error`] and
+/// [`browser_copy`].
 pub(in crate::routes) fn split_tool_result(result: Value) -> (Value, Value) {
     let (model, browser) = take_browser_error(result);
     let shown = match browser {
@@ -1750,8 +1753,9 @@ pub async fn tool_call(
     };
     // LH-QS-2-08 (owner 2026-11-12): this route answers a browser caller, so
     // the answer carries the browser's copy of an engine failure (a fixed
-    // sentence and a reference), never the engine's own text. Only the chat
-    // loop's model reads the diagnosis, and it does not come through here.
+    // sentence and a reference), never the engine's own text. Only a model
+    // reads the diagnosis (the chat loop's or an agent run's), and it does
+    // not come through here.
     let (result, shown) = split_tool_result(result);
     let (resource_kind, resource_id) = audit::resource_for(&parsed.tool, &parsed.args, &result);
     audit::record(
