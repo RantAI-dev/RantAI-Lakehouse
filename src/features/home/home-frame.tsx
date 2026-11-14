@@ -115,8 +115,11 @@ export function HomeFrame({
  * painted, so the first frame never flashes the plain page.
  */
 type ArtLayer = { readonly art: Exclude<HomeBackground, "off">; readonly id: number; readonly later: boolean }
-/** How long a new band takes to fade in (`ART_FADE`), plus a frame, before the old one goes. */
-const CROSSFADE_MS = 340
+/**
+ * The old band goes when the new one's fade ends (`transitionend`); this is the fallback for a fade that
+ * never runs (reduced motion), well past `ART_FADE`'s 300 ms.
+ */
+const CROSSFADE_FALLBACK_MS = 1200
 
 function SceneBand({ background }: { background: HomeBackground }) {
   const off = !drawsScene(background)
@@ -128,14 +131,22 @@ function SceneBand({ background }: { background: HomeBackground }) {
     // Derived during render (not in an effect), so the new band is in the same commit as the choice.
     setLayers([...(top ? [top] : []), { art: background, id: (top?.id ?? -1) + 1, later: true }])
   }
+  const dropOld = React.useCallback(() => setLayers((l) => (l.length > 1 ? l.slice(-1) : l)), [])
   React.useEffect(() => {
     if (layers.length < 2) return
-    const t = window.setTimeout(() => setLayers((l) => l.slice(-1)), CROSSFADE_MS)
+    const t = window.setTimeout(dropOld, CROSSFADE_FALLBACK_MS)
     return () => window.clearTimeout(t)
-  }, [layers])
+  }, [layers, dropOld])
   if (!top) return null
   return (
-    <>
+    // `contents`: no box of its own (the bands stay placed by the frame); it only hears the newest
+    // band's opacity transition end, which is when the band under it can go.
+    <div
+      className="contents"
+      onTransitionEnd={(e) => {
+        if (e.propertyName === "opacity" && e.target === e.currentTarget.lastElementChild) dropOld()
+      }}
+    >
       {layers.map((layer) => {
         const isTop = layer.id === top.id
         return (
@@ -154,7 +165,7 @@ function SceneBand({ background }: { background: HomeBackground }) {
           />
         )
       })}
-    </>
+    </div>
   )
 }
 
