@@ -21,6 +21,7 @@ import { formatRelativeTime } from "@/lib/format"
 import { withNotify } from "@/lib/notify"
 import { dashboardReportService } from "@/services"
 import type { ReportSummary } from "@/services"
+import { forgetRow } from "./dashboards-row"
 
 /**
  * The Reports tab of the Dashboards page (`BI-18` part D, T5, decisions R1 to
@@ -151,7 +152,8 @@ export function ReportList({
           const target = deleting
           if (!target) return
           void (async () => {
-            await deleteAction.run(target.id)
+            const done = await deleteAction.run(target.id)
+            if (done !== null) forgetRow({ kind: "report", id: target.id })
             setDeleting(null)
             reload()
           })()

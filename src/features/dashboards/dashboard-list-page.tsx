@@ -72,6 +72,7 @@ import { ImportDashboardDialog } from "./import-dashboard-dialog"
 import { ManageFoldersDialog, MoveBoardDialog } from "./folder-dialogs"
 import { ReportList } from "./report-list"
 import { TemplateList } from "./template-list"
+import { forgetRow } from "./dashboards-row"
 import { forgetLastBoard } from "./last-board"
 import { TrashDialog } from "./trash-dialog"
 
@@ -321,8 +322,9 @@ function BoardCard({
  * diubah" sejak awal. Menyebutnya "Created" adalah klaim yang salah.
  */
 export function DashboardListPage() {
-  // BI-61 T10: opening Browse resets the sidebar's Dashboards row to "Dashboards".
-  React.useEffect(() => { forgetLastBoard() }, [])
+  // BI-61 T11: opening Browse resets the sidebar's Dashboards row to "Dashboards".
+  // The last board (resolver, Home) is not touched.
+  React.useEffect(() => { forgetRow() }, [])
   const router = useRouter()
   const state = useService((s) => dashboardService.listBoards(s), [])
   // Folders are listed to everyone who can see dashboards; filing needs
@@ -829,6 +831,7 @@ export function DashboardListPage() {
             // Kalau board ini yang terakhir dibuka, `/dashboards` tidak boleh
             // menuntun balik ke sesuatu yang sudah tidak ada.
             forgetLastBoard(target.id)
+            forgetRow({ kind: "dashboard", id: target.id })
             notifyDashboardsChanged()
             reload()
           })()
