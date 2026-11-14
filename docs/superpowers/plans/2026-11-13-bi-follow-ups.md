@@ -154,3 +154,49 @@ written unchanged (a plain number is data under `csv_safe` and `src/lib/csv.ts`)
 - A full `lakehouse-api` test compile is OOM-killed on this 11 GB VM: `rustc` reached 6.4 GB (no debuginfo) to 8.3 GB (debuginfo) of anon-rss, five kills in all. It only fits with `CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_INCREMENTAL=0`, one job and nothing else running. Use CI.
 - Query Studio's download keeps its own 5 GB cap and sends no `max_memory_usage` (`max_memory_usage: None` in `routes/query.rs`); `query_with_options` (buffered) does not send it either. Left for a follow-up.
 - Already present at `6247400f`: rows stream to an unlinked temp file (no row clone), `EXPORT_TIMEOUT` is 300 s, a raw table over a SQL source carries `max_execution_time = 280`.
+
+## Review
+
+### Review, PR A (planner, Opus, 2026-11-14)
+
+No open `BLOCKER`, no `SHOULD-FIX`. Read against this plan and AGENTS.md:
+
+- **`BI-27`:**
+  - The byte cap and the engine time limit are set on the dashboard download path.
+  - A cut file says which limit cut it, in the file name, the `x-export-cut-by` header and
+    the audit row.
+- **`BI-34`:**
+  - `max_memory_usage` is on the row and byte streams.
+  - The two export slots are try-acquire with a fixed 429 sentence (`EXPORT_BUSY`), and
+    scheduled reports take no slot.
+  - XLSX rows are written on the blocking pool in batches.
+- **`BI-28`:**
+  - The shown and sort columns go into `relation_query`.
+  - A plain-number string in a numeric column is written as a number.
+  - The "filters not applied" note is a constant, outside the CSV or TSV body.
+- **`BI-30`:**
+  - `csv_safe` owns the rule, the quoting and the BOM.
+  - The plain-number exemption matches decisions D7/D8 and `src/lib/csv.ts`. `-1+1` still
+    gets the apostrophe; `-5` stays a number.
+  - `upload_workbook` shares only quoting and the BOM. That is right: it is data being
+    loaded, not a file leaving.
+- **Security:** no route line puts error text in a response, and the new header and note
+  texts are fixed constants.
+
+**Verification.** Owner decision 2026-11-14: no Rust compiles on the shared VM, so the
+review's re-run is CI on PR #527.
+- CI run on `febc03f6`: three of the developer's new tests failed. The fixes are in
+  `c709e869`:
+  - one test read the wrong part of the XLSX;
+  - one byte count left out the header's 10 bytes;
+  - one mock typed a numeric column as `String`.
+- CI on `c709e869`: 45 checks pass, 2 are skipped (Dagster, unchanged).
+  - Partition 2/3 first failed on `upload_routes::two_simultaneous_ingests_of_one_upload_launch_once`
+    (`left: 1, right: 2`). It is a timing test outside this PR's paths. It passed on the
+    re-run with no change, and is recorded under `REL-27`.
+- Run locally by the planner: `cargo fmt --check`, `scripts/ci/check_test_modules.sh`,
+  `bun run typecheck`, `bun run lint` (0 errors), `bun test src/lib/csv.test.ts` (24 pass).
+
+**Open points carried to the backlog, not this PR:**
+- the Query Studio download has no `max_memory_usage`;
+- the buffered `query_with_options` does not send it either.
