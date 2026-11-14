@@ -112,6 +112,32 @@
    - Check: unit tests that `loading.tsx` draws the dashboard placeholder on `/dashboards/<id>`,
      the list placeholder on `/dashboards/browse`, nothing on `/login`, and the generic one on
      another page; the shell skeleton tests still pass.
+10. **T10, the Dashboards row is named after the dashboard it opens (owner QA 2026-11-15).**
+   Owner: "kalo emang pas di klik bukan ke halaman browse nama menunya diubah jadi nama dashboard
+   yang dibuka dong". The row's label part goes to `/dashboards`, which opens the board last
+   opened (`dashboard-resolver.tsx`), so its label says which board that is:
+   - `last-board.ts` remembers the board's name with its id (`rememberLastBoard(id, name)`), and
+     the dashboard page passes the name when it opens a board and again when the board is
+     renamed. Reading an old id-only value still works (no name: the label stays "Dashboards").
+     `forgetLastBoard` clears both. Changes are announced in this tab (a custom event) and in
+     other tabs (`storage`), so the sidebar updates at once.
+   - The sidebar's Dashboards row shows that name (truncated with an ellipsis, full name in the
+     collapsed-rail tooltip) with the same chart icon; "Dashboards" when nothing is remembered.
+     The right part (Browse) is unchanged. The row's `aria-label` keeps the word: "Dashboard:
+     <name>" so screen readers know what the row is. The navbar title and the breadcrumb are
+     not changed.
+   - Server-render and first paint use "Dashboards" (localStorage is not readable there); the
+     name swaps in after mount without moving the row (same height, same icon slot).
+   - Check: unit tests for the label with and without a remembered board, an old id-only value,
+     forget, and the update when another board is opened.
+   - **Browse resets it** (owner, 2026-11-15: "kalo misalnya user pencet browse dashboard. berarti
+     menu Dashboardnya kembali lagi dan kalo user klik halaman dashboard dia ke browse"). Opening
+     `/dashboards/browse` (by the right part or any other way) forgets the last board, so the
+     row reads "Dashboards" again. With nothing remembered, the row's label part links straight
+     to `/dashboards/browse`; with a board remembered it links to that board
+     (`/dashboards/<id>`), so the row never depends on the resolver's guess. Opening a board
+     remembers it again. Check: a test that visiting Browse clears the name and the row's href
+     becomes `/dashboards/browse`; opening a board sets both back.
 
 ## 4. Machine rules (owner, 2026-11-14)
 
@@ -239,6 +265,20 @@ Measured: frame bottom / composer top 720/738 px at 1190x800, 820/838 at 1366x90
 **Checks** (each under `systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0 nice -n 15`, one at a time, after `free -m` showed over 3 GB available): `bun run typecheck` clean; `bun test src/components/app-shell src/app/loading.test.tsx` 58 pass, 0 fail (10 files); `bun x eslint` on the 4 changed files clean.
 
 **Not verified:** a real browser on a slow network (no dev server run); the full test and lint runs. The skeleton's wrapper has no `pb-24` as `<main>` has when the Copilot dock shows, as before this change.
+
+### T10 handoff, 2026-11-15 (Sonnet developer agent)
+
+**Commit** `9b47f01b` (`feat(console): BI-61 T10, the Dashboards row is named after the dashboard it opens`; not pushed). Includes the "Browse resets it" bullet.
+
+- `last-board.ts`: the name is stored in a separate key `dashboards:last-board-name` as `{ id, name }`, so the id key, `readLastBoard` and its readers (resolver, Home) are unchanged and an old id-only value still works. The name is read only when its id matches the remembered id. `rememberLastBoard(id, name?)`, `forgetLastBoard` (clears both) announce through a window event (this tab) and `storage` (other tabs). New hooks `useLastBoardName` and `useLastBoardId` (`useSyncExternalStore`, server snapshot `null`).
+- `dashboard-page.tsx`: a new effect after `knownName` remembers `(board, knownName)`, so it also runs after a rename.
+- `dashboard-list-page.tsx`: mount calls `forgetLastBoard()`.
+- `app-sidebar.tsx`: only the `/dashboards` row changes: label = name, `aria-label` "Dashboard: <name>", tooltip = name, href = `/dashboards/<id>` when an id is remembered, else `/dashboards/browse`. Same icon and slot; the name truncates.
+- Tests (`app-sidebar.test.tsx`, 5 new): no board, remembered name, old id-only, forget (what Browse does), another board / rename / name of another id.
+
+**Checks:** `bun run typecheck` clean; `bun test src/components/app-shell src/features/dashboards` 789 pass, 0 fail; eslint on the changed files clean.
+
+**Not verified:** no browser check; the Browse-mount effect in `DashboardListPage` has no test of its own (the sidebar test covers the forget).
 
 ## Micro-interaction audit (emil), 2026-11-14
 

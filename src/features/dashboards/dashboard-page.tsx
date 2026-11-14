@@ -881,6 +881,9 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // not "Dashboards" switching to the name. Once both reads have answered, the old
   // stand-in is kept, so a placeholder never stays on a page that is not loading.
   const knownName = boards.find((b) => b.id === board)?.name ?? listed?.name;
+  // BI-61 T10: the sidebar's Dashboards row is named after the remembered board, so the
+  // name is remembered with the id and refreshed when the board is renamed.
+  React.useEffect(() => { if (knownName) rememberLastBoard(board, knownName); }, [board, knownName]);
   const headerTitle = knownName ?? (data === null && (loading || boardList.status === "loading") ? null : dashName);
   const folderId = boards.find((b) => b.id === board)?.folderId;
   const folderChain = React.useMemo(() => {
