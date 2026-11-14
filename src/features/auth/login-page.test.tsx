@@ -38,6 +38,11 @@ mock.module("next/font/local", () => ({
   default: () => ({ className: "", variable: "", style: { fontFamily: "" } }),
 }))
 
+// WEB-15 T2: the sample dashboard is a `next/dynamic` import that loads after
+// the form. Here it never loads at all, which is what proves the form needs
+// nothing from it: every test in this file signs in without the showcase.
+mock.module("next/dynamic", () => ({ default: () => () => null }))
+
 import { AuthProvider } from "@/features/auth/auth-provider"
 
 // WEB-15: imported after the mocks, not statically. The empty
@@ -276,5 +281,23 @@ describe("LoginPage form (WEB-15 T1)", () => {
     expect(password.type).toBe("text")
     fireEvent.click(screen.getByRole("button", { name: "Hide password" }))
     expect(password.type).toBe("password")
+  })
+})
+
+describe("LoginPage without the sample dashboard (WEB-15 T2)", () => {
+  it("renders a usable form while the sample dashboard has not loaded", async () => {
+    stubLoginApi(401, { error: "invalid_or_expired" })
+    render(
+      <AuthProvider>
+        <LoginPage />
+      </AuthProvider>,
+    )
+    await submitCredentials("rina@meridian.example", "wrong-password")
+    expect((await screen.findByRole("alert")).textContent).toBe("Invalid username/email or password.")
+
+    // The panel and its caption are there; the dashboard inside is not.
+    const panel = screen.getByRole("region", { name: "A preview of the console (sample data)" })
+    expect(panel.textContent).toContain("Sample data")
+    expect(panel.querySelector("[data-motion]")).toBeNull()
   })
 })

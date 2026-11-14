@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import dynamic from "next/dynamic";
 import Image from "next/image";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -22,7 +23,6 @@ import * as authClient from "@/services/clients/auth";
 import { toServiceError } from "@/services/errors";
 import { useAuth } from "./auth-provider";
 import { ChangePasswordStep } from "./change-password-step";
-import { LoginHero } from "./login-hero";
 import { LOGIN_DISPLAY, loginDisplay } from "./login-fonts";
 import { SsoNotice } from "./sso-notice";
 import "./login.css";
@@ -35,6 +35,52 @@ import "./login.css";
  * loading button. The requests, redirects, `next` handling, SSO flag and
  * notices are the ones this page had before; only the markup changed.
  */
+
+/**
+ * The sample dashboard beside the form (`login-showcase.tsx`): client-only
+ * and code-split, so ECharts is neither in the page's first bundle nor on the
+ * server. No `loading` placeholder: until it arrives its area shows the panel
+ * behind it only, never a skeleton imitating content (DESIGN.md §3).
+ */
+const LoginShowcase = dynamic(() => import("./login-showcase").then((m) => m.LoginShowcase), {
+  ssr: false,
+  loading: () => null,
+});
+
+/**
+ * True once the browser is idle after the page came up, so the sample
+ * dashboard (and its chart code) is fetched after the form is on screen and
+ * ready, never competing with the first keystrokes (`WEB-15` spec: "never
+ * blocking typing"). Safari has no `requestIdleCallback`; a short timeout
+ * stands in for it there.
+ */
+function useAfterIdle(): boolean {
+  const [ready, setReady] = React.useState(false);
+  React.useEffect(() => {
+    if (typeof window.requestIdleCallback === "function") {
+      const id = window.requestIdleCallback(() => setReady(true), { timeout: 1500 });
+      return () => window.cancelIdleCallback(id);
+    }
+    const id = window.setTimeout(() => setReady(true), 300);
+    return () => window.clearTimeout(id);
+  }, []);
+  return ready;
+}
+
+const DESKTOP_QUERY = "(min-width: 1024px)";
+function subscribeDesktop(onChange: () => void): () => void {
+  const mq = window.matchMedia(DESKTOP_QUERY);
+  mq.addEventListener("change", onChange);
+  return () => mq.removeEventListener("change", onChange);
+}
+/**
+ * Whether the page is in its two-column layout (Tailwind's `lg`). Only one
+ * preview is mounted, the one the layout shows, so a phone never runs the
+ * hidden desktop dashboard and a laptop never runs the phone's tile.
+ */
+function useDesktop(): boolean {
+  return React.useSyncExternalStore(subscribeDesktop, () => window.matchMedia(DESKTOP_QUERY).matches, () => false);
+}
 
 /** The console's interaction easing: the properties that change, never `all`. */
 const EASE =
@@ -149,6 +195,8 @@ export function LoginPage() {
   // input mistake, and the field is masked so the user cannot see why.
   const [capsLock, setCapsLock] = React.useState(false);
   const passwordRef = React.useRef<HTMLInputElement>(null);
+  const showcaseReady = useAfterIdle();
+  const desktop = useDesktop();
 
   if (error !== null && error !== shownError) setShownError(error);
 
@@ -260,8 +308,22 @@ export function LoginPage() {
   const invalid = !!error;
 
   return (
-    <div className={cn(loginDisplay.variable, "flex min-h-svh flex-col bg-background text-foreground lg:flex-row")}>
-      <LoginHero />
+    <div className={cn(loginDisplay.variable, "flex min-h-svh flex-col bg-background text-foreground lg:flex-row lg:gap-3 lg:p-3")}>
+      {/* Left: the product, bleeding off the panel's lower right like a
+          product shot (mockup A). The panel and its caption render with the
+          page; the dashboard inside arrives after the form. */}
+      <section
+        aria-label="A preview of the console (sample data)"
+        className="relative hidden flex-[1.15] overflow-hidden rounded-3xl bg-muted/55 lg:block dark:bg-card/45"
+      >
+        <div aria-hidden className="absolute top-[11%] left-[8%] h-[74%] w-[104%] min-w-[640px]">
+          {showcaseReady && desktop ? <LoginShowcase /> : null}
+        </div>
+        <div className="absolute bottom-8 left-[8%] flex items-center gap-3">
+          <p className="text-sm font-medium text-foreground/80">Every dataset, pipeline and dashboard in one place.</p>
+          <span className="rounded-full bg-foreground/6 px-2 py-0.5 text-[11px] text-muted-foreground">Sample data</span>
+        </div>
+      </section>
 
       {/* The form, centred, with the logo right above the title (mockup A). */}
       <main className="relative flex min-h-svh flex-1 flex-col px-5 pt-5 pb-6 sm:px-10 lg:min-h-0 lg:px-14">
@@ -271,6 +333,11 @@ export function LoginPage() {
 
         <div className="flex flex-1 items-start justify-center py-4 lg:items-center lg:py-6">
           <div className="w-full max-w-[360px]">
+            {/* On a phone the product still shows: one live tile above the
+                form, its height held so the form never moves when it loads. */}
+            <div aria-hidden className="mb-8 h-[168px] lg:hidden">
+              {showcaseReady && !desktop ? <LoginShowcase compact /> : null}
+            </div>
             {/* `SEC-65` D2: a callback refused because the provider did
                 not confirm the email redirects here with
                 `ssoNotice=email_not_verified`, so the sentence the person
