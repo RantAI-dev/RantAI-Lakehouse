@@ -88,6 +88,36 @@
       states, ink-to-base also at the in-between phases with only the upper bound) and to the
       new day base; existing scene tests pass.
 
+11. **T11, a whale that lives in the water (owner QA 2026-11-15).** Owner: "yang aku masih kurang
+    suka logo paus kita… entah kurang detail atau kek statis dan ga gerak jadi bikin aneh aja".
+    Diagnosis (planner, from the owner's four screenshots at `e1397131`): in `field()` the head is
+    a flat disc with near-uniform ink, a hard round eye, and the logo's white gap and band drawn
+    as a straight solid bar under it (`y < HZ + 0.03`), so it reads as a sticker on a plinth, not
+    a whale in water. It sits in the static sky layer, so it never moves while the water does.
+    In ASCII dark the body interior is nearly empty, so it reads as an outline. Keep the logo's
+    silhouette (dome, eye on the side; DESIGN.md §5: plain eye, no glow, no pupil, no shine).
+    - **Form:** shade the dome as a lit volume: brighter rim on the side facing the sun (day,
+      left) or the moon (night, right), darker towards the water, a soft core shadow; the dither
+      and the glyph ramp carry the shading. The eye stays plain and flat.
+    - **In the water, not on a bar:** remove the straight gap and band. The head's lower edge
+      meets the water with a waterline that follows the ripples (no straight edge, DESIGN.md §2),
+      a short dark band of wet shadow just above it, and the reflection below broken by the
+      ripples as now.
+    - **Alive:** a slow bob (the head and its waterline rise and fall a few px, period ~4–5 s, in
+      step with the swell); a blink now and then (the eye closes for ~120 ms, every 6–12 s at
+      random); a small spout now and then (every ~20–40 s, a short dithered/glyph plume that
+      rises and falls in ~1.5 s; DESIGN.md §5 "sesekali menyemburkan air"). These move the
+      whale's rows only, within the scene's existing budget: at most 10 fps, paused off-screen
+      and in a hidden tab, none under reduced motion (then: no bob, eye open, no spout).
+    - **ASCII:** the body is filled with the glyph ramp (not only its edges), so it reads as a
+      solid head in both themes.
+    - Keep T10's colours and limits: the most contrasting ink against its base stays within
+      2.5–3.0:1 (the whale may sit at the top), greeting text ≥4.5:1, tests updated.
+    - Check: tests for the waterline not being straight, the blink and spout schedules (seeded,
+      no motion under reduced motion), and the contrast limits; screenshots of `/` at 1366×800
+      light and dark, Dither and ASCII, plus a frame strip of one spout, into
+      `docs/plans/web-17-screens/after-whale-*`. Look at them yourself.
+
 ## 4. Machine rules (owner)
 
 - No Rust. Never the full `bun run test` or `bun run lint`. Run `bun run typecheck`, `bun test src/features/home src/lib/home-*.test.ts` (and any test you touch), `bun x eslint <changed files>`.
