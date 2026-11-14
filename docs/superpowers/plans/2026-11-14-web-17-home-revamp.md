@@ -223,6 +223,105 @@ Processes: dev server on 28699 (`bun x next dev` 373591, node 373608, next-serve
 
 **Not verified:** no browser, no screenshots.
 
+### T11 handoff, 2026-11-15 (Opus developer agent)
+
+**Commit** `777dfe4b` (`feat(home): WEB-17 T11, a whale that lives in the water`; not pushed).
+Only `lake-scene.tsx`, its test, and `docs/plans/web-17-screens/after-whale-*` changed.
+
+- **Form.** The dome is shaded as a sphere. By day it is lit from the sun's side (upper left), by night
+  from the moon's (upper right), and during a theme change the light swings over the top. The shading
+  is diffuse light with a soft core shadow on the far side, a brighter rim on the near side, and a wet
+  shadow over the last ~14 px above the water (`headLight`). The dither and the glyph ramp carry it.
+  The old hard rim ring and sheen are gone. The eye stays plain and flat and is now solid
+  (light 0.99, above the highest Bayer threshold): at 0.92 the dither punched two dark dots into it
+  that read as a pupil.
+- **Waterline.** The straight gap and band (`y < HZ + 0.03`) are removed. The head ends at
+  `waterlineAt(x, t, pose)`, which takes 0.6 of the bob and adds two ripple waves driven like the
+  water's swell (±5.6 px on the 400 px band). In a trough, the head continues below `HZ`; a crest
+  covers it above `HZ`. Just under the line is a broken glint (the mark's white gap, now wet). The
+  reflection is taken about the line it rides, wavers wider with depth and thins out instead of ending
+  on a straight edge.
+- **Motion (`whalePose`, `eventAt`).**
+  - Bob: ±0.009 of the height (±3.6 px), period 4.6 s, sine.
+  - Blink: the eye shuts to a slit at its lower lid for 120 ms. Slots of 9 s ± 1.5 s, so blinks
+    come 6 to 12 s apart.
+  - Spout: 1.5 s. A stem shoots up (ease-out, 0.34 R), then a crown opens wider as it falls back
+    and fades. Slots of 30 s ± 5 s, so spouts come 20 to 40 s apart.
+  - The schedule is seeded and constant-time (it looks only at the nearby slots). Seed 0 is used,
+    so the first spout comes at scene time 10 to 20 s, about 3 to 13 s after load.
+  - Under reduced motion and in the Background previews, `poseFor(t, true)` is `REST`: no bob, eye
+    open, no spout.
+  - Only the whale's box is recomputed per frame (`whaleBox`, about 56 × 48 cells at 1110 × 400),
+    inside the same ≤10 fps loop with the same gating. ASCII leaves that box out of the cached sky
+    layer and draws it each frame.
+- **Spray ink** is region 8. It uses the water's blue by day and the moonlight's cream by night,
+  both already in the palette, so it adds no colour. By day its density is 1.3×, so it reads as a
+  plume against the sky's dots.
+- **ASCII** fills the head from the ramp's lightest step (`0.18 + 0.82 × ink`). The dark side is now
+  `.`/`,`/`:` instead of empty.
+- **Contrast** (WCAG; `DIM` and the inks are unchanged from T10). Ink against base at rest, as the
+  maximum, with the whale's own value in brackets:
+  - Dither: day 2.53 (whale 2.53), night 2.55 (whale 2.08).
+  - ASCII: day 2.93 (whale 2.93), night 2.89 (whale 2.32).
+  - In between, at phases 0.25, 0.5 and 0.75: at most 2.06.
+  - The spray matches the existing inks (at most 2.89).
+  - Greeting text against every ink and the base, at its worst: 7.60 (Dither day), 6.96 (Dither
+    night), 6.58 (ASCII day), 6.14 (ASCII night).
+- **Cost.** Measured in headless Chrome 148 on this VM, `next dev`, 1366×800, Dark Dither, using
+  `Performance.getMetrics` over 10 s, against HEAD swapped in on the same server:
+  - Main thread busy: 12.8–13.1 % (HEAD 10.9–11.0 %). Script: 9.8–10.1 % (HEAD 8.0–8.1 %).
+  - ASCII: 13.1 % busy.
+  - The first build cost +3 points more, because V8 stopped inlining `inkAt` into the dither loop.
+    The ASCII fill moved to `glyphRows`, and the eye now returns a float pair (an all-integer
+    `[1, 3]` made the destructuring polymorphic). The CPU profile confirmed both fixes.
+  - Measured on the canvas: reduced motion gives 1 distinct whale-box frame in 4.2 s; with motion,
+    6 of 6 frames differ.
+
+**Checks** (each under `systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0 nice -n 15`,
+one at a time, after `free -m` showed ≥ 3 GB available):
+- `bun run typecheck`: exit 0.
+- `bun test src/features/home src/lib/home-*.test.ts`: 73 pass, 0 fail (9 files). That is 65 + 8
+  new T11 tests:
+  - the waterline is not straight (≥ 2 cells) and moves;
+  - no bar under the head;
+  - the lit side follows the phase, and the wet shadow is darker;
+  - blink and spout gaps and lengths for 3 seeds, and the seed is deterministic;
+  - the spout rises, then falls, and stays ≥ 14 px inside the band;
+  - no motion under reduced motion;
+  - the whale and the spout never sit behind the greeting at any pose;
+  - the spray adds no colour.
+- `bun x eslint src/features/home/lake-scene.tsx src/features/home/lake-scene.test.ts`: exit 0.
+
+**Screenshots** are in `docs/plans/web-17-screens/`. Each was taken on the QA API, logged in as the
+owner account:
+- `after-whale-1366x800-{light,dark}-{dither,ascii}.png`;
+- a 2× crop of the whale for each (`*-whale.png`);
+- `after-whale-1366x800-dark-dither-spout-strip.png`, 8 frames from before the spout to 1.0 s.
+
+The developer's own judgement of them:
+- Day: the head reads as a lit volume. The left side is lighter, the right side and the bottom are
+  denser, and the line where it meets the water is visibly wavy, with white glints under it. The
+  reflection no longer forms a block. The whale is still the pale periwinkle that T10 noted (not
+  navy), because of T10's colour window.
+- Night: the moon side is lit and the far side falls into shadow against the sky. The eye is solid.
+  The whole picture stays dim and calm, and the composer stays the focus.
+- ASCII: the head is solid in both themes. Where a trough dips below the mean waterline, a lone
+  `@@` cell can appear in the first water row; it reads as a drip.
+- The strip shows the stem, the crown opening, its fall, and the head's bob between frames.
+
+**Not verified:**
+- Full `bun run lint` and `bun run test`: not run (machine rule).
+- Phone width: no screenshot at 390 px. The test covers the greeting box on a phone.
+- iPhone Safari: not checked.
+- Light-theme spout in the browser: only rendered offline with the same `field()`.
+- The hidden-tab pause: not measured; the gating is unchanged from slice 1.
+- CPU numbers come from software rendering under `next dev`, not a production build.
+- The blink is 120 ms against a ≥100 ms frame step, so a late frame can skip one blink.
+
+Processes: the dev server on 28699 (bash 2211856, bun 2211860, node 2211862, next-server 2211933)
+and headless Chrome on 28690 (2212326, 2212329) were stopped by PID, and both ports are free. Before
+the commit, `next dev`'s rewrite of `AGENTS.md` was reverted.
+
 ## Micro-interaction audit (emil), 2026-11-14
 
 Owner request (2026-11-14): audit the revamped pages' micro-animations with the
