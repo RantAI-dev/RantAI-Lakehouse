@@ -21,6 +21,8 @@ import {
   SidebarMenuSub,
   SidebarMenuSubItem,
   SidebarRail,
+  SIDEBAR_FADE,
+  SIDEBAR_MOTION,
   useSidebar,
 } from "@/components/ui/sidebar"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
@@ -35,13 +37,25 @@ import { UserMenu } from "./user-menu"
  * one set of classes, so the skeleton cannot drift from the real sidebar.
  */
 export const SIDEBAR_CLASS = "border-r border-sidebar-border bg-sidebar shadow-sm"
-export const SIDEBAR_CONTENT_CLASS = "group-data-[collapsible=icon]:flex group-data-[collapsible=icon]:flex-col group-data-[collapsible=icon]:items-center group-data-[collapsible=icon]:gap-0"
-export const SIDEBAR_GROUP_CLASS = "gap-0 px-2 py-2 group-data-[collapsible=icon]:w-full group-data-[collapsible=icon]:items-center group-data-[collapsible=icon]:px-2"
-export const SIDEBAR_MENU_CLASS = "mt-0 flex flex-col gap-0.5 group-data-[collapsible=icon]:w-full group-data-[collapsible=icon]:items-center group-data-[collapsible=icon]:gap-1.5"
+//
+// Collapsing is one move (owner 2026-11-14, `SIDEBAR_MOTION` in `ui/sidebar.tsx`): the rows keep the
+// expanded layout in both states, left-aligned on one icon column (16 px from the edge, the centre
+// of the 48 px rail), with the same vertical rhythm, so collapsing only narrows the row's box and
+// fades the label; no icon moves and no row jumps.
+export const SIDEBAR_CONTENT_CLASS = "min-w-0"
+export const SIDEBAR_GROUP_CLASS = "gap-0 px-2 py-2"
+export const SIDEBAR_MENU_CLASS = "mt-0 flex flex-col gap-0.5"
 export const SIDEBAR_FOOTER_CLASS = "border-t border-sidebar-border p-2"
-export const ACCOUNT_CARD_CLASS = "h-14 rounded-lg px-2 group-data-[collapsible=icon]:size-10! group-data-[collapsible=icon]:h-10!"
-export const NAV_ROW_CLASS = "h-8 rounded-md px-2.5 py-1.5 text-sm tracking-normal"
-export const SIDEBAR_SUB_CLASS = "mr-0 gap-0.5 border-sidebar-border pr-0"
+// Collapsed, the card is the avatar alone, 32 px on the icon column; the box narrows, its padding
+// eases to none and the avatar with it, in the sidebar's time.
+export const ACCOUNT_CARD_CLASS = "h-14 rounded-lg px-2 group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:p-0!"
+export const ACCOUNT_AVATAR_CLASS = cn(
+  "flex size-9 shrink-0 items-center justify-center rounded-full bg-primary/12 text-primary ring-1 ring-primary/20 transition-[width,height]",
+  SIDEBAR_MOTION,
+  "group-data-[collapsible=icon]:size-8",
+)
+export const NAV_ROW_CLASS = "h-8 rounded-md px-2 py-1.5 text-sm tracking-normal"
+export const SIDEBAR_SUB_CLASS = "mr-0 gap-0.5 border-sidebar-border pr-0 group-data-[collapsible=icon]:flex"
 
 function BrandLogo() {
   // Logo follows the theme: navy for a light sidebar, white for a dark one.
@@ -66,10 +80,11 @@ export function SidebarBrand() {
   // baris logo) dan jatuh di 69px — 5px lebih rendah dari navbar, dan
   // patahannya terlihat tepat di pertemuan sidebar dengan konten.
   return (
-    <SidebarHeader className="flex h-12 shrink-0 flex-col justify-center border-b border-sidebar-border px-3 py-0 group-data-[collapsible=icon]:px-2">
-      <div className="flex min-w-0 items-center justify-start gap-2 group-data-[collapsible=icon]:justify-center">
+    // The logo sits 8 px in, centred on the 48 px rail, in both states; the name fades.
+    <SidebarHeader className="flex h-12 shrink-0 flex-col justify-center border-b border-sidebar-border px-2 py-0">
+      <div className="flex min-w-0 items-center justify-start gap-2">
         <BrandLogo />
-        <div className="grid min-w-0 flex-1 gap-0.5 leading-none group-data-[collapsible=icon]:hidden">
+        <div className={cn("grid min-w-0 flex-1 gap-0.5 whitespace-nowrap leading-none", SIDEBAR_FADE)}>
           <span className="text-sm font-semibold tracking-[-0.084px] text-sidebar-foreground">Rantai Lake</span>
           <span className="text-[11px] font-normal tracking-[-0.04px] text-sidebar-foreground/60">Enterprise Lakehouse Console</span>
         </div>
@@ -158,7 +173,7 @@ export function AppSidebar() {
 
   const menuBtnClass = (active: boolean) =>
     cn(
-      NAV_ROW_CLASS, "transition-colors duration-150",
+      NAV_ROW_CLASS,
       active
         ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
         : "font-normal text-sidebar-foreground/70 hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
@@ -180,7 +195,7 @@ export function AppSidebar() {
         href={item.href}
         onClick={(e) => handleNavClick(e, item.href)}
         className={cn(
-          "flex items-center gap-2 rounded-md px-2.5 py-1.5 text-sm transition-colors duration-150",
+          "flex items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors duration-150",
           active
             ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
             : "text-sidebar-foreground/70 hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
@@ -204,7 +219,7 @@ export function AppSidebar() {
     // One page, or icon mode with one page: nothing to expand.
     if (single) {
       return (
-        <SidebarMenuItem key={group.label} className="group-data-[collapsible=icon]:flex group-data-[collapsible=icon]:justify-center">
+        <SidebarMenuItem key={group.label}>
           <SidebarMenuButton
             isActive={active}
             tooltip={label}
@@ -212,7 +227,7 @@ export function AppSidebar() {
             render={
               <Link href={first.href} onClick={(e) => handleNavClick(e, first.href)}>
                 <Icon className="size-4 shrink-0" />
-                <span className="truncate leading-5">{label}</span>
+                <span className={cn("truncate leading-5", SIDEBAR_FADE)}>{label}</span>
               </Link>
             }
           />
@@ -233,7 +248,8 @@ export function AppSidebar() {
                     // Sits where a section's chevron sits: same size
                     // (3.5) and the same 18px from the row's right edge
                     // to its centre, measured against the Data chevron.
-                    className="right-2 text-sidebar-foreground/50 [&>svg]:size-3.5"
+                    // Fades with the label instead of vanishing as the collapse starts.
+                    className={cn("right-2 text-sidebar-foreground/50 [&>svg]:size-3.5 group-data-[collapsible=icon]:flex", SIDEBAR_FADE)}
                     render={
                       <Link
                         href={first.action.href}
@@ -253,38 +269,50 @@ export function AppSidebar() {
       )
     }
 
-    // Expanded mode, several pages → the header expands the section in
-    // place instead of navigating. Previously it was a link to the first
-    // page, so simply looking at what a section contained cost a page
-    // load, and only the active section could ever be seen.
-    if (!iconMode) {
-      const expanded = isGroupOpen(group.label)
-      return (
-        <SidebarMenuItem key={group.label}>
-          <SidebarMenuButton
-            isActive={active && !expanded}
-            className={menuBtnClass(active && !expanded)}
-            render={
-              <button
-                type="button"
-                aria-expanded={expanded}
-                onClick={() => toggleGroup(group.label)}
-              >
-                <Icon className="size-4 shrink-0" />
-                <span className="flex-1 truncate text-left leading-5">
-                  {label}
-                </span>
-                <ChevronRight
-                  className={cn(
-                    "size-3.5 shrink-0 text-sidebar-foreground/50 transition-transform duration-150",
-                    expanded && "rotate-90"
-                  )}
-                  aria-hidden
-                />
-              </button>
-            }
-          />
-          {expanded ? (
+    // Several pages. Expanded, the header opens and closes the section in
+    // place instead of navigating (it used to link to the first page, so
+    // looking at what a section held cost a page load). Collapsed, the same
+    // row opens a FLYOUT of its pages, as there is no room to show them. One
+    // element in both states, so the row does not swap as the sidebar moves:
+    // its box narrows, its label fades and its pages fold away with it.
+    const expanded = !iconMode && isGroupOpen(group.label)
+    const flyoutOpen = iconMode && flyout?.label === group.label
+    const lit = iconMode ? active || flyoutOpen : active && !expanded
+    return (
+      <SidebarMenuItem key={group.label}>
+        <SidebarMenuButton
+          isActive={lit}
+          className={menuBtnClass(lit)}
+          render={
+            <button
+              type="button"
+              data-section-trigger
+              title={iconMode ? label : undefined}
+              aria-expanded={iconMode ? flyoutOpen : expanded}
+              onClick={(e) => (iconMode ? openFlyout(group.label, e.currentTarget) : toggleGroup(group.label))}
+            >
+              <Icon className="size-4 shrink-0" />
+              <span className={cn("flex-1 truncate text-left leading-5", SIDEBAR_FADE)}>
+                {label}
+              </span>
+              <ChevronRight
+                className={cn(
+                  "size-3.5 shrink-0 text-sidebar-foreground/50 transition-[transform,opacity] duration-150",
+                  expanded && "rotate-90",
+                  "group-data-[collapsible=icon]:opacity-0",
+                )}
+                aria-hidden
+              />
+            </button>
+          }
+        />
+        {/* The pages fold (0fr) and unfold (1fr) in the sidebar's time; folded they are inert,
+            so they take no focus. */}
+        <div
+          className={cn("grid transition-[grid-template-rows]", SIDEBAR_MOTION, expanded ? "grid-rows-[1fr]" : "grid-rows-[0fr]")}
+          inert={!expanded}
+        >
+          <div className="min-h-0 overflow-hidden">
             <SidebarMenuSub className={SIDEBAR_SUB_CLASS}>
               {group.items.map((item) => (
                 <SidebarMenuSubItem key={item.href}>
@@ -292,30 +320,8 @@ export function AppSidebar() {
                 </SidebarMenuSubItem>
               ))}
             </SidebarMenuSub>
-          ) : null}
-        </SidebarMenuItem>
-      )
-    }
-
-    // Icon mode + multi-item → a flyout button.
-    const isOpen = flyout?.label === group.label
-    return (
-      <SidebarMenuItem key={group.label} className="flex justify-center">
-        <button
-          type="button"
-          data-section-trigger
-          title={label}
-          aria-expanded={isOpen}
-          onClick={(e) => openFlyout(group.label, e.currentTarget)}
-          className={cn(
-            "grid size-8 place-items-center rounded-md transition-colors duration-150",
-            (active || isOpen)
-              ? "bg-sidebar-accent text-sidebar-accent-foreground font-medium"
-              : "text-sidebar-foreground/70 hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
-          )}
-        >
-          <Icon className="size-4" />
-        </button>
+          </div>
+        </div>
       </SidebarMenuItem>
     )
   }
@@ -382,14 +388,14 @@ export function AppSidebar() {
                 />
               }
             >
-              <div className="flex size-9 shrink-0 items-center justify-center rounded-full bg-primary/12 text-primary ring-1 ring-primary/20">
+              <div className={ACCOUNT_AVATAR_CLASS}>
                 <CircleUserRound className="size-5" aria-hidden />
               </div>
-              <div className="grid min-w-0 flex-1 text-left leading-tight group-data-[collapsible=icon]:hidden">
+              <div className={cn("grid min-w-0 flex-1 whitespace-nowrap text-left leading-tight", SIDEBAR_FADE)}>
                 <span className="truncate text-sm font-semibold text-sidebar-foreground">{user?.name ?? "Signed in"}</span>
                 <span className="truncate text-xs text-sidebar-foreground/60">{user?.email ?? ""}</span>
               </div>
-              <ChevronsUpDown className="ml-auto size-4 shrink-0 text-sidebar-foreground/60 group-data-[collapsible=icon]:hidden" aria-hidden />
+              <ChevronsUpDown className={cn("ml-auto size-4 shrink-0 text-sidebar-foreground/60", SIDEBAR_FADE)} aria-hidden />
             </UserMenu>
           </SidebarMenuItem>
         </SidebarMenu>

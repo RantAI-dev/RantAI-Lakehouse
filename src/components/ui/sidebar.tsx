@@ -32,6 +32,25 @@ const SIDEBAR_WIDTH_MOBILE = "18rem"
 const SIDEBAR_WIDTH_ICON = "3rem"
 const SIDEBAR_KEYBOARD_SHORTCUT = "b"
 
+/*
+ * The collapse / expand motion (owner 2026-11-14, "aku kurang suka animasi saat collapse sidebar"):
+ * one 220 ms move on a strong ease-out, the same curve for every part, so they move as one.
+ * - The sidebar's width animates on its own fixed container; its content keeps the expanded width
+ *   inside and is clipped, so labels never re-wrap or truncate mid-move and the icons, laid out on
+ *   one column in both states, do not move at all. Labels fade (`SIDEBAR_FADE`).
+ * - The main area is laid out once, at the new width (the gap beside it changes in one step), and
+ *   slides from its old place with a transform (`useSlideMainArea`), so the dashboard grid and the
+ *   charts resize once instead of on every frame of the move.
+ * - Reduced motion: no move, no fade; the new state is drawn at once.
+ */
+export const SIDEBAR_MOTION_MS = 220
+export const SIDEBAR_EASE = "cubic-bezier(0.23, 1, 0.32, 1)"
+/** The timing classes for anything that moves with the sidebar (the same duration and curve). */
+export const SIDEBAR_MOTION = "duration-[220ms] ease-[cubic-bezier(0.23,1,0.32,1)] motion-reduce:transition-none"
+/** A label or other text that fades out as the sidebar collapses, and back in as it opens. */
+export const SIDEBAR_FADE =
+  "transition-opacity duration-150 ease-out motion-reduce:transition-none group-data-[collapsible=icon]:pointer-events-none group-data-[collapsible=icon]:opacity-0"
+
 type SidebarContextProps = {
   state: "expanded" | "collapsed"
   open: boolean
@@ -73,6 +92,10 @@ function SidebarProvider({
   // We use openProp and setOpenProp for control from outside the component.
   const [_open, _setOpen] = React.useState(defaultOpen)
   const open = openProp ?? _open
+  const wrapperRef = React.useRef<HTMLDivElement>(null)
+  // Only a change the person makes slides the main area; restoring the saved state on load does not.
+  const slideNextRef = React.useRef(false)
+  useSlideMainArea(wrapperRef, open, slideNextRef, isMobile)
 
   // Restore sidebar state from cookie on mount so it persists across navigations and refresh.
   React.useEffect(() => {
@@ -92,6 +115,7 @@ function SidebarProvider({
   const setOpen = React.useCallback(
     (value: boolean | ((value: boolean) => boolean)) => {
       const openState = typeof value === "function" ? value(open) : value
+      slideNextRef.current = openState !== open
       if (setOpenProp) {
         setOpenProp(openState)
       } else {
@@ -145,6 +169,7 @@ function SidebarProvider({
   return (
     <SidebarContext.Provider value={contextValue}>
       <div
+        ref={wrapperRef}
         data-slot="sidebar-wrapper"
         style={
           {
@@ -154,7 +179,9 @@ function SidebarProvider({
           } as React.CSSProperties
         }
         className={cn(
-          "group/sidebar-wrapper flex min-h-svh w-full has-data-[variant=inset]:bg-sidebar",
+          // `overflow-x-clip`: while the main area slides, its far edge passes the window's; clip, not
+          // hidden, so the page does not become a scroll container and the sticky navbar still sticks.
+          "group/sidebar-wrapper flex min-h-svh w-full overflow-x-clip has-data-[variant=inset]:bg-sidebar",
           className
         )}
         {...props}
@@ -163,6 +190,42 @@ function SidebarProvider({
       </div>
     </SidebarContext.Provider>
   )
+}
+
+/**
+ * Slides the main area with the sidebar (a FLIP): the gap beside the sidebar has already changed
+ * width in one step, so the main area is laid out once at its new place; this starts it from the
+ * old place (a transform) and lets it ease into the new one in the sidebar's time and curve, so
+ * its left edge stays on the sidebar's moving edge. Fixed children (the Copilot bar) are centred
+ * on the window, not the main area, and are left alone.
+ */
+function useSlideMainArea(
+  wrapperRef: React.RefObject<HTMLDivElement | null>,
+  open: boolean,
+  slideNextRef: React.RefObject<boolean>,
+  isMobile: boolean,
+) {
+  const lastGap = React.useRef<number | null>(null)
+  React.useLayoutEffect(() => {
+    const wrapper = wrapperRef.current
+    const gap = wrapper?.querySelector<HTMLElement>("[data-slot=sidebar-gap]")
+    const now = gap ? gap.getBoundingClientRect().width : null
+    const before = lastGap.current
+    lastGap.current = now
+    const slide = slideNextRef.current
+    slideNextRef.current = false
+    if (!slide || !wrapper || isMobile || now === null || before === null || before === now) return
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return
+    const inset = wrapper.querySelector<HTMLElement>("[data-slot=sidebar-inset]")
+    if (!inset) return
+    for (const child of Array.from(inset.children)) {
+      if (!(child instanceof HTMLElement) || getComputedStyle(child).position === "fixed") continue
+      child.animate([{ transform: `translateX(${before - now}px)` }, { transform: "translateX(0)" }], {
+        duration: SIDEBAR_MOTION_MS,
+        easing: SIDEBAR_EASE,
+      })
+    }
+  }, [open, isMobile, wrapperRef, slideNextRef])
 }
 
 function Sidebar({
@@ -234,7 +297,9 @@ function Sidebar({
       <div
         data-slot="sidebar-gap"
         className={cn(
-          "relative w-(--sidebar-width) bg-transparent transition-[width] duration-200 ease-linear",
+          // No transition: the main area is laid out once at its new place and slides there
+          // (`useSlideMainArea`) instead of being re-laid out on every frame.
+          "relative w-(--sidebar-width) bg-transparent",
           "group-data-[collapsible=offcanvas]:w-0",
           "group-data-[side=right]:rotate-180",
           variant === "floating" || variant === "inset"
@@ -246,7 +311,8 @@ function Sidebar({
         data-slot="sidebar-container"
         data-side={side}
         className={cn(
-          "fixed inset-y-0 z-10 hidden h-svh w-(--sidebar-width) transition-[left,right,width] duration-200 ease-linear data-[side=left]:left-0 data-[side=left]:group-data-[collapsible=offcanvas]:left-[calc(var(--sidebar-width)*-1)] data-[side=right]:right-0 data-[side=right]:group-data-[collapsible=offcanvas]:right-[calc(var(--sidebar-width)*-1)] md:flex",
+          // z-30: above the sticky navbar (z-20), which slides under the sidebar's edge as it moves.
+          "fixed inset-y-0 z-30 hidden h-svh w-(--sidebar-width) transition-[left,right,width] duration-[220ms] ease-[cubic-bezier(0.23,1,0.32,1)] motion-reduce:transition-none data-[side=left]:left-0 data-[side=left]:group-data-[collapsible=offcanvas]:left-[calc(var(--sidebar-width)*-1)] data-[side=right]:right-0 data-[side=right]:group-data-[collapsible=offcanvas]:right-[calc(var(--sidebar-width)*-1)] md:flex",
           // Adjust the padding for floating and inset variants.
           variant === "floating" || variant === "inset"
             ? "p-2 group-data-[collapsible=icon]:w-[calc(var(--sidebar-width-icon)+(--spacing(4))+2px)]"
@@ -258,9 +324,14 @@ function Sidebar({
         <div
           data-sidebar="sidebar"
           data-slot="sidebar-inner"
-          className="flex size-full flex-col bg-sidebar group-data-[variant=floating]:rounded-lg group-data-[variant=floating]:shadow-sm group-data-[variant=floating]:ring-1 group-data-[variant=floating]:ring-sidebar-border"
+          className="flex size-full flex-col overflow-hidden bg-sidebar group-data-[variant=floating]:rounded-lg group-data-[variant=floating]:shadow-sm group-data-[variant=floating]:ring-1 group-data-[variant=floating]:ring-sidebar-border"
         >
-          {children}
+          {/* The content keeps the expanded width while the container narrows around it, so
+              nothing inside re-lays out during the move; the container clips it. The rail is
+              placed against the container, so this clipping does not hide it. */}
+          <div data-slot="sidebar-track" className="flex h-full w-(--sidebar-width) shrink-0 flex-col">
+            {children}
+          </div>
         </div>
       </div>
     </div>
@@ -495,7 +566,7 @@ function SidebarMenuItem({ className, ...props }: React.ComponentProps<"li">) {
 }
 
 const sidebarMenuButtonVariants = cva(
-  "peer/menu-button group/menu-button flex w-full items-center gap-2 overflow-hidden rounded-md p-2 text-left text-sm ring-sidebar-ring outline-hidden transition-[width,height,padding] group-has-data-[sidebar=menu-action]/menu-item:pr-8 group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:p-2! hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 active:bg-sidebar-accent active:text-sidebar-accent-foreground disabled:pointer-events-none disabled:opacity-50 aria-disabled:pointer-events-none aria-disabled:opacity-50 data-open:hover:bg-sidebar-accent data-open:hover:text-sidebar-accent-foreground data-active:bg-sidebar-accent data-active:font-medium data-active:text-sidebar-accent-foreground [&_svg]:size-4 [&_svg]:shrink-0 [&>span:last-child]:truncate",
+  "peer/menu-button group/menu-button flex w-full items-center gap-2 overflow-hidden rounded-md p-2 text-left text-sm ring-sidebar-ring outline-hidden transition-[width,height,padding,background-color,color] duration-[220ms] ease-[cubic-bezier(0.23,1,0.32,1)] motion-reduce:transition-none group-has-data-[sidebar=menu-action]/menu-item:pr-8 group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:p-2! hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 active:bg-sidebar-accent active:text-sidebar-accent-foreground disabled:pointer-events-none disabled:opacity-50 aria-disabled:pointer-events-none aria-disabled:opacity-50 data-open:hover:bg-sidebar-accent data-open:hover:text-sidebar-accent-foreground data-active:bg-sidebar-accent data-active:font-medium data-active:text-sidebar-accent-foreground [&_svg]:size-4 [&_svg]:shrink-0 [&>span:last-child]:truncate",
   {
     variants: {
       variant: {

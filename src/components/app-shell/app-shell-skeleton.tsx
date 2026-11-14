@@ -13,6 +13,8 @@ import {
   SidebarMenuSub,
   SidebarMenuSubItem,
   SidebarTrigger,
+  SIDEBAR_FADE,
+  useSidebar,
 } from "@/components/ui/sidebar";
 import { Skeleton } from "@/components/ui/skeleton";
 import { LoadingSkeleton } from "@/components/patterns/page-states";
@@ -21,6 +23,7 @@ import { DashboardListPageSkeleton } from "@/features/dashboards/dashboard-list-
 import { useSidebarGroups } from "@/hooks/use-sidebar-groups";
 import { cn } from "@/lib/utils";
 import {
+  ACCOUNT_AVATAR_CLASS,
   ACCOUNT_CARD_CLASS,
   NAV_ROW_CLASS,
   SIDEBAR_CLASS,
@@ -73,14 +76,14 @@ export function AppShellSkeleton({ pathname }: { pathname: string }) {
             <SidebarMenuItem>
               {/* The account card's box; the avatar glyph is the same for everyone. */}
               <SidebarMenuButton size="lg" render={<div />} className={cn(ACCOUNT_CARD_CLASS, "hover:bg-transparent active:bg-transparent")}>
-                <div className="flex size-9 shrink-0 items-center justify-center rounded-full bg-primary/12 text-primary ring-1 ring-primary/20">
+                <div className={ACCOUNT_AVATAR_CLASS}>
                   <CircleUserRound className="size-5" aria-hidden />
                 </div>
-                <div className="grid min-w-0 flex-1 gap-1.5 group-data-[collapsible=icon]:hidden">
+                <div className={cn("grid min-w-0 flex-1 gap-1.5", SIDEBAR_FADE)}>
                   <Skeleton className="h-3.5 w-24" />
                   <Skeleton className="h-3 w-36" />
                 </div>
-                <ChevronsUpDown className="ml-auto size-4 shrink-0 text-sidebar-foreground/60 group-data-[collapsible=icon]:hidden" aria-hidden />
+                <ChevronsUpDown className={cn("ml-auto size-4 shrink-0 text-sidebar-foreground/60", SIDEBAR_FADE)} aria-hidden />
               </SidebarMenuButton>
             </SidebarMenuItem>
           </SidebarMenu>
@@ -137,19 +140,22 @@ function SkeletonNav({ pathname }: { pathname: string }) {
   const activeLabel = NAV_GROUPS.find((g) => g.items.some((it) => it.href === activeHref))?.label;
   const defaultOpenLabels = NAV_GROUPS.filter((g) => g.defaultOpen).map((g) => g.label);
   const { isOpen } = useSidebarGroups({ activeLabel, defaultOpenLabels });
-  const row = "flex items-center gap-2 group-data-[collapsible=icon]:size-8 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:p-0";
+  // Collapsed, a section's pages are folded away, as in the real sidebar.
+  const collapsed = useSidebar().state === "collapsed";
+  // The real rows' box: left-aligned on the icon column in both states, 32 px wide when collapsed.
+  const row = "flex items-center gap-2 group-data-[collapsible=icon]:w-8";
   return (
     <SidebarMenu className={SIDEBAR_MENU_CLASS} aria-hidden>
       {NAV_GROUPS.map((group) => {
         const single = group.items.length === 1;
         const label = single ? group.items[0].title : group.label;
         return (
-          <SidebarMenuItem key={group.label} className="group-data-[collapsible=icon]:flex group-data-[collapsible=icon]:justify-center">
+          <SidebarMenuItem key={group.label}>
             <div className={cn(NAV_ROW_CLASS, row)}>
               <Skeleton className="size-4 shrink-0 rounded" />
-              <Skeleton className="h-3 group-data-[collapsible=icon]:hidden" style={{ width: barWidth(label) }} />
+              <Skeleton className={cn("h-3", SIDEBAR_FADE)} style={{ width: barWidth(label) }} />
             </div>
-            {!single && isOpen(group.label) ? (
+            {!single && !collapsed && isOpen(group.label) ? (
               <SidebarMenuSub className={SIDEBAR_SUB_CLASS}>
                 {group.items.map((item) => (
                   <SidebarMenuSubItem key={item.href}>
