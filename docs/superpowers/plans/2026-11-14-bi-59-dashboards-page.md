@@ -262,3 +262,13 @@
 - **Screenshots.** Retaken at 1366: `{table,gallery}-{light,dark}-1366x900.png`.
   - The 1190 and 390 shots, and the `state-*` shots, show the earlier headers.
   - A brief dev server on 28622 and one headless Chrome were stopped by PID afterwards. 28620 was not touched.
+
+### Handoff, BI-59 review round 3 (developer, 2026-11-14)
+
+SHOULD-FIX 4 (owner QA; DESIGN.md §3, a search of normal width):
+- **Layout.** The header row is now the title, then an empty gap that takes the spare width, then a 288 px search (`w-72`), the switch, ⋯ and New, all 36 px. The search widens to 360 px while focused, over 200 ms, with no animation under reduced motion. The phone layout is unchanged.
+- **Measured** in Chrome at 1366x900, dark: the search is 288 px wide at top 88 px, the gap is 434 px, and nothing scrolls sideways. `table-dark-1366x900.png` is retaken.
+- **Checks**, each under `systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0 nice -n 15`:
+  - `bun test` on three files (`dashboard-list-page.test.tsx`, `template-pages.test.tsx`, `library-item-menu.test.tsx`): 37 pass, 0 fail. The structure test now also asserts that the gap is the flexible child and the search is not.
+  - eslint on `src/features/dashboards/`: clean.
+  - `bun run typecheck`: clean.
