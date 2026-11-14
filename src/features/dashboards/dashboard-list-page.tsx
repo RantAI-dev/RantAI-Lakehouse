@@ -470,7 +470,22 @@ export function DashboardListPage() {
       */}
       <header className={cn("flex shrink-0 items-center gap-2", phone && "flex-wrap gap-y-3")}>
         <h1 className={cn("mr-2 shrink-0 text-xl leading-9 font-semibold tracking-tight", phone && "w-full")}>Dashboards</h1>
-        <SearchField value={query} onChange={setQuery} className="min-w-0 flex-1" />
+        {/*
+          BI-59 review round 3, SHOULD-FIX 4 (owner QA; DESIGN.md §3: the search has a normal width,
+          about 280 to 320 px, never the full row): on a laptop an empty gap takes the spare width
+          and the search is 288 px, widening to 360 px while focused (200 ms, off under reduced
+          motion). On a phone the search takes the row beside ⋯ and New, as before.
+        */}
+        {phone ? null : <div aria-hidden data-slot="header-gap" className="flex-1" />}
+        <SearchField
+          value={query}
+          onChange={setQuery}
+          className={
+            phone
+              ? "min-w-0 flex-1"
+              : "w-72 shrink-0 transition-[width] duration-200 ease-out focus-within:w-90 motion-reduce:transition-none"
+          }
+        />
         {phone ? null : <ViewSwitch value={view} onChange={setView} />}
         <PageMenu
           onFolders={canFile ? () => setFoldersOpen(true) : undefined}
