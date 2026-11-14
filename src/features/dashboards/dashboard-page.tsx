@@ -25,7 +25,7 @@ import { formatRelativeTime } from "@/lib/format";
 import { dataFromLabel } from "@/lib/result-cache";
 import { readableErrorMessage } from "@/lib/notify-message";
 import { buildDashboardPageContext, summarizeFilters, summarizeFilterJson, summarizeGrain, summarizeParams, summarizeTabs, summarizeTiles } from "@/lib/page-context-summary";
-import { FILTER_PARAM, decodeFilters, dropInertFilters, enforceRequired, filtersEqual, filtersToParam, isActiveFilter, normalizeFilters, toggleValue } from "@/lib/dashboard-filter-state";
+import { FILTER_PARAM, decodeFilters, dropInertFilters, enforceRequired, filtersEqual, filtersToParam, normalizeFilters, toggleValue } from "@/lib/dashboard-filter-state";
 import { extractViewFiltersFromChat } from "@/lib/dashboard-view-filter-from-chat";
 import { canDrill, drillTarget, offersTileRecords, type ChartClickHandler, type ClickSpec } from "@/lib/chart-click";
 import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
@@ -1296,6 +1296,11 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const drillOffer = drillChart ? tileDrills.offer(drillChart) : null;
   const filterFields = data?.filterFields ?? NO_FIELDS;
   const showFilterBar = filterFields.length > 0 || filters.length > 0;
+  // BI-61 T3: "+ Filter" is an edit-mode control. A reader who cannot edit has no
+  // edit mode, so for them it stays in reading mode: adding a temporary filter
+  // (kept in the address, never saved) was theirs before and stays reachable.
+  const canAddFilter = edit || !canWrite;
+  const hasFilterRow = showFilterBar || grainedCharts.length > 0 || paramControls.length > 0 || Object.keys(paramRefusals).length > 0;
 
   // BI-19 owner QA 2026-10-28, QA-1: a board that never loaded (for the caller, "dashboard not
   // found") shows the error and nothing that acts on the board: no star, menu, comments or
@@ -1399,34 +1404,42 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         }
       />
 
+      {/* BI-61 T3: the tabs and the filter chips share one quiet line under the header. */}
+      {tabs.length > 0 || tabEditing || hasFilterRow ? (
+        <div className="flex min-w-0 shrink-0 flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+          <TabBar tabs={tabs} selected={selTab} onSelect={selectTab} editing={tabEditing} />
+          {hasFilterRow ? (
+            <FilterRow className="sm:flex-1">
+              {grainedCharts.length > 0 ? (
+                <GrainSwitch
+                  choices={grainChoices}
+                  value={shownGrainValue}
+                  changed={grainDirty}
+                  onChange={(next) => writeGrain(next === "" ? "own" : next)}
+                />
+              ) : null}
+              <ParamControls controls={paramControls} onChange={changeParam} refusals={paramRefusals} defaults={data?.defaultParams} />
+              <FilterBar
+                board={board}
+                fields={filterFields}
+                filters={filters}
+                savedFilters={defaultFilters}
+                onChange={applyFilters}
+                dirty={rowDirty}
+                canSaveDefault={!isDefault && canWrite}
+                canAdd={canAddFilter}
+                tabs={tabs}
+                saving={savingDefault}
+                onSaveDefault={() => void saveRowDefault()}
+                onReset={resetRow}
+              />
+            </FilterRow>
+          ) : null}
+        </div>
+      ) : null}
+
       {error ? <div className="rounded-lg border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive">{readableErrorMessage(error)}</div> : null}
       {data?.storeError ? <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 px-4 py-2 text-xs text-amber-600 dark:text-amber-400">Could not load saved charts: {data.storeError}</div> : null}
-
-      {showFilterBar || grainedCharts.length > 0 || paramControls.length > 0 || Object.keys(paramRefusals).length > 0 ? (
-        <FilterRow count={filters.filter(isActiveFilter).length + (pValues ? Object.keys(pValues).length : 0)}>
-          {grainedCharts.length > 0 ? (
-            <GrainSwitch
-              choices={grainChoices}
-              value={shownGrainValue}
-              onChange={(next) => writeGrain(next === "" ? "own" : next)}
-            />
-          ) : null}
-          <ParamControls controls={paramControls} onChange={changeParam} refusals={paramRefusals} />
-          <FilterBar
-            board={board}
-            fields={filterFields}
-            filters={filters}
-            savedFilters={defaultFilters}
-            onChange={applyFilters}
-            dirty={rowDirty}
-            canSaveDefault={!isDefault && canWrite}
-            tabs={tabs}
-            saving={savingDefault}
-            onSaveDefault={() => void saveRowDefault()}
-            onReset={resetRow}
-          />
-        </FilterRow>
-      ) : null}
 
       {/* KPI row (builtin dashboard) */}
       {kpis.length ? (
@@ -1505,7 +1518,6 @@ export function DashboardPage({ boardId }: { boardId: string }) {
               {phoneEdit && phone?.length ? <Button variant="ghost" size="sm" onClick={() => void resetPhone()}>Use the computed order</Button> : null}
             </div>
           ) : null}
-          <TabBar tabs={tabs} selected={selTab} onSelect={selectTab} editing={tabEditing} />
           <DashboardGrid
             items={items} layout={shownLayout} editable={edit && !phoneEdit} onLayoutChange={persistLayout}
             tabs={tabs} tab={selTab} phone={phone} phoneEdit={edit && phoneEdit} onPhoneChange={persistPhone}
