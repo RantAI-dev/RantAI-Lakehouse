@@ -29,21 +29,31 @@
  * ink is moved towards the band's base by one factor per phase (`DIM`), so the
  * art never competes with the greeting and nothing marks the text.
  *
+ * The whale lives in the water (WEB-17 T11, owner QA 2026-11-15: "entah kurang
+ * detail atau kek statis dan ga gerak jadi bikin aneh aja"). Its head is a lit
+ * volume, brighter on the side of the sun (day, left) or the moon (night,
+ * right) and darker towards the water; it meets the water along a waterline
+ * that follows the ripples, with a band of wet shadow above it and a broken
+ * glint below it, instead of the mark's straight gap and band. It bobs with
+ * the swell, blinks now and then and spouts now and then (`whalePose`). Only
+ * the whale's own box is redrawn for that, inside the water's 10 fps loop.
+ * The eye stays plain (DESIGN.md §5: no glow, no pupil, no shine).
+ *
  * What it costs, and the rules that keep it cheap (spec "Scene cost"):
  * - It is sized to the hero band only, never the page.
  * - The first drawing waits for the browser to be idle after first paint,
  *   so it never delays the composer or the largest paint; until then the
  *   band is its solid base colour (the canvas paints the same base), and
  *   the drawing fades in once.
- * - The sky (sun or moon, stars, the whale above water) only moves during
- *   a theme change, so it is computed once per size and phase. At rest only
- *   the water rows are recomputed, at most 10 times a second (`FRAME_MS`),
+ * - The sky (sun or moon, stars) only moves during a theme change, so it is
+ *   computed once per size and phase. At rest only the water rows and the
+ *   whale's box are recomputed, at most 10 times a second (`FRAME_MS`),
  *   and only while the band is on screen and the tab is visible; a theme
  *   change while it is hidden jumps to its end.
  * - The dither is computed one pixel per 3 px block into a small canvas and
  *   scaled up without smoothing; the glyphs are drawn one colour at a time.
- * - Under `prefers-reduced-motion` it is drawn once and nothing moves, and
- *   the fade-in is skipped.
+ * - Under `prefers-reduced-motion` it is drawn once and nothing moves (the
+ *   whale at rest: no bob, eye open, no spout), and the fade-in is skipped.
  */
 import * as React from "react"
 import { useReducedMotion } from "motion/react"
@@ -75,12 +85,13 @@ const STILL_T = 6
 
 /**
  * Inks per phase and region: 0 sky, 1 whale, 2 water, 3 moonlight on the
- * water (and the eye, and the mark's gap), 4 the moon, 5 stars, 6 the sun,
- * 7 sunlight on the water.
+ * water (and the eye), 4 the moon, 5 stars, 6 the sun, 7 sunlight on the
+ * water, 8 the spout's spray (WEB-17 T11: the water's blue by day, the
+ * moonlight's cream by night, so it adds no colour of its own).
  */
 const INKS = {
-  day: ["#4a6fb0", "#050A30", "#2b78cc", "#2b78cc", "#2b78cc", "#4a6fb0", "#e08a1e", "#e08a1e"],
-  night: ["#3f68ad", "#8fcaff", "#44A6FA", "#f4efe3", "#f4efe3", "#9fb4d6", "#f2b04a", "#f2b04a"],
+  day: ["#4a6fb0", "#050A30", "#2b78cc", "#2b78cc", "#2b78cc", "#4a6fb0", "#e08a1e", "#e08a1e", "#2b78cc"],
+  night: ["#3f68ad", "#8fcaff", "#44A6FA", "#f4efe3", "#f4efe3", "#9fb4d6", "#f2b04a", "#f2b04a", "#f4efe3"],
 } as const
 
 /**
@@ -118,6 +129,9 @@ function toInk(L: number, region: number, night: boolean): number {
       return 0.6 + 0.4 * L
     case 7:
       return L > 0.9 ? 0.55 : 0
+    case 8:
+      // Denser than the light sky's dots around it, so the spray reads as a plume by day too.
+      return Math.min(1, L * 1.3)
     default:
       return 0
   }
@@ -138,8 +152,133 @@ function above(y: number): number {
   return Math.max(0, Math.min(1, (HZ - y) / (HZ - UP)))
 }
 
+/**
+ * What the whale is doing at one moment (WEB-17 T11): `bob` moves the head
+ * down (positive) or up, in the scene's height units; `eye` is 1 open and 0
+ * shut; `spout` is the spout's progress, 0 to 1, or −1 when there is none.
+ */
+export type WhalePose = { readonly bob: number; readonly eye: number; readonly spout: number }
+/** The whale at rest: the still picture, reduced motion and the previews. */
+export const REST: WhalePose = { bob: 0, eye: 1, spout: -1 }
+/** A slow bob with the swell: about 3.6 px each way on the 400 px band, every 4.6 s. */
+const BOB = { amp: 0.009, period: 4.6 }
+/**
+ * Occasional events, each at a jittered spot in its own slot (`every` ± `jitter`), so two in a
+ * row are `every` ± 2 × `jitter` apart: a blink (eye shut 120 ms) every 6 to 12 s, a spout
+ * (1.5 s) every 20 to 40 s. Seeded, so a test and a screenshot can know when they come.
+ */
+export const BLINK = { every: 9, jitter: 1.5, dur: 0.12, salt: 17 } as const
+export const SPOUT = { every: 30, jitter: 5, dur: 1.5, salt: 53 } as const
+type Schedule = typeof BLINK | typeof SPOUT
+
+/** The progress (0 to 1) of the schedule's event running at `t`, or −1. Constant time: it looks only at the nearby slots. */
+export function eventAt(t: number, e: Schedule, seed = 0): number {
+  const n = Math.floor(t / e.every)
+  for (let k = n - 1; k <= n + 1; k++) {
+    const start = e.every * (k + 0.5) + e.jitter * (2 * hash(k + seed * 7.31, e.salt) - 1)
+    if (t >= start && t < start + e.dur) return (t - start) / e.dur
+  }
+  return -1
+}
+
+/** The whale's pose at `t` (seconds). Under reduced motion the scene uses `REST` instead (`poseFor`). */
+export function whalePose(t: number, seed = 0): WhalePose {
+  return {
+    bob: BOB.amp * Math.sin((2 * Math.PI * t) / BOB.period),
+    eye: eventAt(t, BLINK, seed) >= 0 ? 0 : 1,
+    spout: eventAt(t, SPOUT, seed),
+  }
+}
+
+/** The pose the scene draws: none of the whale's motion when motion is reduced or the picture is still. */
+export function poseFor(t: number, still: boolean, seed = 0): WhalePose {
+  return still ? REST : whalePose(t, seed)
+}
+
+/**
+ * Where the water meets the head at `x`: it rides the swell with the head (most of the bob, so a
+ * little more of the head shows at the top of a bob) and follows the ripples, so it is never a
+ * straight edge (DESIGN.md §2). About ±5.6 px on the 400 px band.
+ */
+export function waterlineAt(x: number, t: number, pose: WhalePose): number {
+  return (
+    HZ +
+    0.6 * pose.bob +
+    0.01 * Math.sin(x * 30 + Math.sin(x * 4 + t * 0.5) * 0.9 + t * 0.9) +
+    0.004 * Math.sin(x * 67 - t * 1.7)
+  )
+}
+
+/** Hermite step, 0 at `a`, 1 at `b`. */
+const smooth = (a: number, b: number, v: number) => {
+  const k = Math.max(0, Math.min(1, (v - a) / (b - a)))
+  return k * k * (3 - 2 * k)
+}
+
+/**
+ * The head's light at a point inside it (offsets from its centre, and the height above the
+ * waterline): a sphere lit from the sun's side (upper left) by day and the moon's (upper right) by
+ * night, the light swinging over the top during a theme change. Diffuse light with a soft core
+ * shadow on the far side, a brighter rim on the near side, and a wet shadow that darkens the last
+ * few pixels above the water.
+ */
+function headLight(dx: number, dy: number, aboveWater: number, phase: number): number {
+  const R = WHALE.r
+  const nx = dx / R
+  const ny = dy / R
+  const nz = Math.sqrt(Math.max(0, 1 - nx * nx - ny * ny))
+  const lx0 = -0.62 + 1.24 * phase
+  const ly0 = -0.5
+  const lz0 = 0.6
+  const ll = Math.hypot(lx0, ly0, lz0)
+  const diffuse = Math.max(0, (nx * lx0 + ny * ly0 + nz * lz0) / ll)
+  const side = Math.max(0, (nx * lx0 + ny * ly0) / Math.hypot(lx0, ly0))
+  const rim = (1 - nz) ** 2 * side
+  const wet = 0.3 + 0.7 * smooth(0, 0.035, aboveWater)
+  return (0.1 + 0.38 * diffuse + 0.45 * rim) * wet
+}
+
+/**
+ * The spout's spray at `ox` across and `hy` above the blowhole, at progress `p` of its 1.5 s: a
+ * narrow stem that shoots up (ease-out), a crown that opens wider as it falls back and fades. Its
+ * droplets sparkle: the density changes as the spray moves.
+ */
+function spray(ox: number, hy: number, p: number, i: number, j: number): number {
+  if (p < 0 || p > 1 || hy < 0) return 0
+  const R = WHALE.r
+  const H = 0.34 * R
+  const up = 1 - (1 - Math.min(1, p / 0.4)) ** 3
+  const fall = Math.max(0, (p - 0.4) / 0.6)
+  const top = H * up - 0.35 * H * fall * fall
+  let d = 0
+  if (hy < top) {
+    const w = 0.035 * R + 0.12 * R * (hy / H) ** 2
+    d = Math.exp(-((ox / w) ** 2)) * 0.75 * (1 - fall)
+  }
+  const rc = (0.08 + 0.2 * p) * R
+  const cy = hy - top
+  d = Math.max(d, Math.exp(-((ox / (1.7 * rc)) ** 2) - (cy / (0.75 * rc)) ** 2) * 0.85 * up * (1 - fall ** 1.5))
+  return d * (0.5 + 0.5 * hash(i + Math.floor(p * 15) * 31, j))
+}
+
+/** The whale's box as shares of the band, with room for the bob and the spout: only it is redrawn while the whale moves. */
+export function whaleBox(aspect: number): { u0: number; u1: number; v0: number } {
+  const R = WHALE.r
+  const half = (1.05 * R) / aspect
+  return { u0: WHALE.x - half, u1: WHALE.x + half, v0: HZ - 1.265 * R - BOB.amp - 0.42 * R - 0.01 }
+}
+
 /** The scene's light at one point (u, v in 0–1) at a phase, and which ink it belongs to. */
-export function field(u: number, v: number, aspect: number, t: number, phase: number, i: number, j: number): [number, number] {
+export function field(
+  u: number,
+  v: number,
+  aspect: number,
+  t: number,
+  phase: number,
+  i: number,
+  j: number,
+  pose: WhalePose = REST,
+): [number, number] {
   const x = (u - 0.5) * aspect
   const y = v
   const { sunY, moonY } = bodies(phase)
@@ -147,21 +286,35 @@ export function field(u: number, v: number, aspect: number, t: number, phase: nu
   const mx0 = (MOON.x - 0.5) * aspect
   const R = WHALE.r
   const wx = (WHALE.x - 0.5) * aspect
-  const cy = HZ - 0.265 * R
+  // The mark's circle, cut a quarter radius below its centre by the water; it bobs with the swell.
+  const cy = HZ - 0.265 * R + pose.bob
+  const near = Math.abs(x - wx) < R
+  // The waterline stays within ±0.02 of HZ; farther up or down, HZ answers "above or below it" the same.
+  const yw = near && Math.abs(y - HZ) < 0.03 ? waterlineAt(x, t, pose) : HZ
 
-  if (y < HZ) {
+  if (y < yw) {
     const dx = x - wx
     const dy = y - cy
-    const d = Math.sqrt(dx * dx + dy * dy)
-    if (d < R) {
-      const ex = x - (wx + 0.342 * R)
-      const ey = y - (cy - 0.138 * R)
-      if (ex * ex + ey * ey < (0.199 * R) ** 2) return [0.92, 3]
-      if (R - d < 0.022) return [0.5, 1]
-      const shx = x - (wx - 0.38 * R)
-      const shy = y - (cy - 0.5 * R)
-      const sheen = Math.exp(-(shx * shx + shy * shy) / (0.16 * R * R))
-      return [0.04 + 0.2 * sheen, 1]
+    if (dx * dx + dy * dy < R * R) {
+      // The eye: plain and flat. A blink shuts it to a slit at its lower lid.
+      const er = 0.199 * R
+      const ry = er * Math.max(0.2, pose.eye)
+      const ex = (x - (wx + 0.342 * R)) / er
+      const ey = (y - (cy - 0.138 * R + (er - ry) * 0.6)) / ry
+      // Above the highest Bayer threshold (15.5/16), so the dither draws it solid: a dotted eye
+      // would read as a pupil. Not a whole 1: V8 would make this array's elements integers, and
+      // every other return here is a float pair.
+      if (ex * ex + ey * ey < 1) return [0.99, 3]
+      return [headLight(dx, dy, yw - y, phase), 1]
+    }
+  }
+
+  if (y < HZ && (y < yw || !near)) {
+    // The spout, from a blowhole just behind the top of the head.
+    if (pose.spout >= 0) {
+      const bx = wx - 0.14 * R
+      const d = spray(x - bx, cy - 0.99 * R - y, pose.spout, i, j)
+      if (d > 0.06) return [d, 8]
     }
     let L = 0.12 + 0.46 * Math.pow(y / HZ, 1.6)
     // The bodies are drawn only above the waterline: one that sets sinks behind it.
@@ -175,10 +328,8 @@ export function field(u: number, v: number, aspect: number, t: number, phase: nu
     return [Math.min(1, L), 0]
   }
 
-  // The mark's white gap between the dome and its blue band.
-  if (y < HZ + 0.03 && Math.abs(x - wx) < R * 0.96) return [0.92, 3]
-
-  const dy = y - HZ
+  // Water, also where a ripple's crest climbs the head above the mean waterline.
+  const dy = Math.max(0, y - HZ)
   const depth = dy / Math.max(0.0001, 1 - HZ)
   let L = 0.52 - 0.32 * depth
   // Ripples: lines that crowd towards the horizon, broken into dashes along x.
@@ -193,12 +344,24 @@ export function field(u: number, v: number, aspect: number, t: number, phase: nu
   const fy = dy * 2.4
   const c = Math.sqrt(fx * fx + fy * fy) * 9 - t * 0.12
   if (c - Math.floor(c) < 0.07) L += 0.09
-  // Its reflection, broken by the ripples.
-  const rx = x + Math.sin(y * 70 + t * 1.4) * 0.012
-  const ry = HZ - dy * 0.9
+  // Its reflection about the waterline it rides, broken by the ripples, and more so with depth:
+  // it wavers wider and thins out instead of ending on a straight edge.
+  const mean = HZ + 0.6 * pose.bob
+  const deep = Math.max(0, (y - mean) / (1.3 * R))
+  const rx = x + Math.sin(y * 70 + t * 1.4) * (0.008 + 0.03 * deep)
+  const ry = mean - (y - mean) * 0.9
   const ddx = rx - wx
   const ddy = ry - cy
-  if (ddx * ddx + ddy * ddy < R * R && dy < 1.1 * R && ripple < 0.55) L *= 0.38
+  if (ddx * ddx + ddy * ddy < R * R && ripple < 0.55 - 1.2 * deep) L *= 0.38 + 0.4 * deep
+  // Where the water meets the head: a thin glint under the waterline, broken along it, fading at
+  // the head's sides (the mark's white gap, now wet and moving).
+  if (near) {
+    const m = (y - yw) / 0.014
+    const across = Math.abs(x - wx) / (0.96 * R)
+    if (m >= 0 && m < 1 && across < 1) {
+      L += 0.3 * (1 - m) * (1 - across ** 4) * (0.55 + 0.45 * Math.sin(x * 90 - t * 2.2))
+    }
+  }
 
   // A path of light under each body, fading as it sets.
   const width = 0.02 + dy * 0.3
@@ -280,6 +443,7 @@ export function LakeScene({
     const ctx = canvas?.getContext("2d")
     if (!canvas || !ctx || !mounted) return
     const dither = variant === "dither"
+    const still = reduce
     const cw = dither ? 3 : 6
     const ch = dither ? 3 : 10
     let w = 0
@@ -288,6 +452,12 @@ export function LakeScene({
     let rows = 0
     /** The first row at or below the waterline: everything above it is still at rest. */
     let water = 0
+    /** The whale's box above the water (rows `wr0` to `water`, columns `wc0` to `wc1`): redrawn while it moves. */
+    let wr0 = 0
+    let wc0 = 0
+    let wc1 = 0
+    /** The whale's pose for the rows being computed. */
+    let pose = REST
     // Dither: one pixel per block. ASCII: the sky, drawn once per phase.
     const small = document.createElement("canvas")
     const smallCtx = small.getContext("2d")
@@ -309,7 +479,7 @@ export function LakeScene({
     const inkAt = (i: number, j: number, t: number): [number, number] => {
       const u = (i + 0.5) / cols
       const v = (j + 0.5) / rows
-      const [L, region] = field(u, v, w / Math.max(1, h), t, phase, i, j)
+      const [L, region] = field(u, v, w / Math.max(1, h), t, phase, i, j, pose)
       const raw = phase <= 0 ? toInk(L, region, false) : phase >= 1 ? toInk(L, region, true) : toInk(L, region, false) * (1 - phase) + toInk(L, region, true) * phase
       let ink = raw
       // Thin out towards the bottom edge, where the page takes over.
@@ -318,11 +488,11 @@ export function LakeScene({
     }
 
     /** Dither rows into the small image: a dot in its ink, otherwise the base (the canvas is opaque). */
-    const ditherRows = (from: number, to: number, t: number) => {
+    const ditherRows = (from: number, to: number, t: number, c0: number, c1: number) => {
       if (!image) return
       const px = image.data
       for (let j = from; j < to; j++) {
-        for (let i = 0; i < cols; i++) {
+        for (let i = c0; i < c1; i++) {
           const [ink, region] = inkAt(i, j, t)
           const o = (j * cols + i) * 4
           const c = ink > BAYER[(j % 4) * 4 + (i % 4)] ? inks[region] : base
@@ -334,12 +504,18 @@ export function LakeScene({
       }
     }
 
-    const glyphRows = (target2d: CanvasRenderingContext2D, from: number, to: number, t: number) => {
+    /** Glyph rows; `c0`–`c1` limits the columns, and `skipWhale` leaves the whale's box to `draw`. */
+    const glyphRows = (target2d: CanvasRenderingContext2D, from: number, to: number, t: number, c0 = 0, c1 = cols, skipWhale = false) => {
       // One bucket per ink, so each is drawn in one colour.
       const buckets: number[][] = Array.from({ length: DAY.length }, () => [])
       for (let j = from; j < to; j++) {
-        for (let i = 0; i < cols; i++) {
-          const [ink, region] = inkAt(i, j, t)
+        for (let i = c0; i < c1; i++) {
+          if (skipWhale && j >= wr0 && i >= wc0 && i < wc1) continue
+          const [raw, region] = inkAt(i, j, t)
+          // The head is filled with the ramp from its lightest step, so its dark side reads as a
+          // solid body, not an outline (WEB-17 T11). Here, not in `inkAt`, which must stay small
+          // enough for the dither loop to inline it (measured: +3 points of main thread otherwise).
+          const ink = region === 1 ? 0.18 + 0.82 * raw : raw
           const level = Math.min(ASCII_RAMP.length - 1, Math.floor(ink * ASCII_RAMP.length))
           if (level > 0) buckets[region].push(i, j, level)
         }
@@ -360,14 +536,15 @@ export function LakeScene({
     /** The sky for the current phase: rows above the waterline (dither) or the cached layer (ASCII). */
     const drawSky = () => {
       paint()
+      pose = REST
       if (dither) {
-        ditherRows(0, water, STILL_T)
+        ditherRows(0, water, STILL_T, 0, cols)
       } else if (skyCtx) {
         skyCtx.setTransform(1, 0, 0, 1, 0, 0)
         skyCtx.fillStyle = hexOf(base)
         skyCtx.fillRect(0, 0, sky.width, sky.height)
         skyCtx.setTransform(dpr, 0, 0, dpr, 0, 0)
-        glyphRows(skyCtx, 0, water, STILL_T)
+        glyphRows(skyCtx, 0, water, STILL_T, 0, cols, true)
       }
     }
 
@@ -383,6 +560,10 @@ export function LakeScene({
       cols = Math.max(1, Math.ceil(w / cw))
       rows = Math.max(1, Math.ceil(h / ch))
       water = Math.min(rows, Math.max(0, Math.floor(HZ * rows - 0.5)))
+      const box = whaleBox(w / Math.max(1, h))
+      wr0 = Math.min(water, Math.max(0, Math.floor(box.v0 * rows)))
+      wc0 = Math.max(0, Math.floor(box.u0 * cols))
+      wc1 = Math.min(cols, Math.ceil(box.u1 * cols))
       if (dither && smallCtx) {
         small.width = cols
         small.height = rows
@@ -394,11 +575,13 @@ export function LakeScene({
       drawSky()
     }
 
-    /** Recompute the water at moment `t` (seconds) and show the whole picture. */
+    /** Recompute the whale and the water at moment `t` (seconds) and show the whole picture. */
     const draw = (t: number) => {
+      pose = poseFor(t, still)
       ctx.setTransform(1, 0, 0, 1, 0, 0)
       if (dither && image && smallCtx) {
-        ditherRows(water, rows, t)
+        ditherRows(wr0, water, t, wc0, wc1)
+        ditherRows(water, rows, t, 0, cols)
         smallCtx.putImageData(image, 0, 0)
         ctx.imageSmoothingEnabled = false
         ctx.drawImage(small, 0, 0, cols * cw * dpr, rows * ch * dpr)
@@ -406,6 +589,7 @@ export function LakeScene({
       }
       ctx.drawImage(sky, 0, 0)
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+      glyphRows(ctx, wr0, water, t, wc0, wc1)
       glyphRows(ctx, water, rows, t)
     }
 
@@ -413,7 +597,6 @@ export function LakeScene({
     let last = 0
     let visible = true
     let started = false
-    const still = reduce
     const now = () => (still ? STILL_T : STILL_T + performance.now() / 1000)
     /** A theme change in progress: from which phase to which, since when. */
     let turn: { from: number; to: number; t0: number } | null = null
