@@ -18,6 +18,8 @@ import { PRIVATE_TIP } from "./private-badge"
 
 /** One easing and duration for every hover, press and change (owner taste: 150–250 ms, eased, never linear). */
 export const EASE = "transition-[background-color,border-color,color,box-shadow,opacity,transform] duration-200 ease-[cubic-bezier(0.2,0,0,1)]"
+/** Soft, diffuse hover lift for cards (BI-59 owner QA 2026-11-14: hover shadow softer). Dark mode: no black shadow, the ring brightens instead. */
+export const SOFT_LIFT = "hover:shadow-[0_6px_20px_-8px_rgb(0_0_0/0.10)] dark:hover:shadow-none dark:hover:ring-foreground/15"
 /** The keyboard focus ring every custom control here uses. */
 export const FOCUS = "outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
 
@@ -89,68 +91,108 @@ export function ScrollRegion({ children, className }: { readonly children: React
 }
 
 /**
- * The page's search: large, with a clear button. "/" focuses it from
- * anywhere on the page (unless the person is typing somewhere else), and
- * Escape clears it.
+ * The page's search (BI-59 owner QA 2026-11-14: it read as a second global search next to the
+ * navbar's search, so it is an icon-only button that expands in place). Collapsed it is a 32 px
+ * square like the view switch; a click or "/" (unless the person is typing somewhere else) opens
+ * it into an input, focused. Escape clears and collapses it, blur collapses it when empty, and
+ * it stays open while it holds a query (and starts open when one is already set). The width
+ * changes in 200 ms, and not at all under reduced motion.
  */
 export function SearchField({
-  value, onChange, placeholder = "Search everything", className,
+  value, onChange, placeholder = "Search dashboards", className, expandedClassName = "w-72 shrink-0",
 }: {
   readonly value: string
   readonly onChange: (value: string) => void
   readonly placeholder?: string
+  /** Applied in both states. */
   readonly className?: string
+  /** The width while open; collapsed is always the 32 px square. */
+  readonly expandedClassName?: string
 }) {
   const ref = React.useRef<HTMLInputElement>(null)
+  const buttonRef = React.useRef<HTMLButtonElement>(null)
+  const [open, setOpen] = React.useState(() => value !== "")
+  const expanded = open || value !== ""
+  const restoreFocus = React.useRef(false)
+  React.useEffect(() => {
+    if (expanded) ref.current?.focus()
+    else if (restoreFocus.current) {
+      restoreFocus.current = false
+      buttonRef.current?.focus()
+    }
+  }, [expanded])
   React.useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "/" || e.metaKey || e.ctrlKey || e.altKey) return
       const target = e.target
       if (target instanceof Element && target.closest("input,textarea,select,[contenteditable=true],[role=dialog],[role=menu]")) return
       e.preventDefault()
+      setOpen(true)
       ref.current?.focus()
     }
     window.addEventListener("keydown", onKey)
     return () => window.removeEventListener("keydown", onKey)
   }, [])
   return (
-    <div className={cn("relative", className)}>
-      <Search aria-hidden className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
-      <input
-        ref={ref}
-        type="search"
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Escape" && value) {
-            e.preventDefault()
-            onChange("")
-          }
-        }}
-        placeholder={placeholder}
-        aria-label="Search dashboards, reports and templates"
-        className={cn(
-          "h-9 w-full min-w-0 rounded-lg bg-muted/70 pr-12 pl-9 text-sm placeholder:text-muted-foreground hover:bg-muted focus:bg-background focus:ring-1 focus:ring-ring/60 dark:bg-input/30 dark:focus:bg-input/40 [&::-webkit-search-cancel-button]:hidden",
-          EASE,
-          "outline-none focus-visible:ring-3 focus-visible:ring-ring/40",
-        )}
-      />
-      {value ? (
-        <button
-          type="button"
-          aria-label="Clear search"
-          onClick={() => {
-            onChange("")
-            ref.current?.focus()
-          }}
-          className={cn("absolute top-1/2 right-1.5 grid size-6 -translate-y-1/2 place-items-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground", EASE, FOCUS)}
-        >
-          <X className="size-3.5" aria-hidden />
-        </button>
+    <div className={cn("relative h-8 transition-[width] duration-200 ease-out motion-reduce:transition-none", expanded ? expandedClassName : "w-8 shrink-0", className)}>
+      {expanded ? (
+        <>
+          <Search aria-hidden className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+          <input
+            ref={ref}
+            type="search"
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+            onBlur={() => {
+              if (!value) setOpen(false)
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                e.preventDefault()
+                restoreFocus.current = true
+                onChange("")
+                setOpen(false)
+              }
+            }}
+            placeholder={placeholder}
+            aria-label="Search dashboards, reports and templates"
+            className={cn(
+              "h-8 w-full min-w-0 rounded-lg bg-muted/70 pr-8 pl-9 text-sm placeholder:text-muted-foreground hover:bg-muted focus:bg-background focus:ring-1 focus:ring-ring/60 dark:bg-input/30 dark:focus:bg-input/40 [&::-webkit-search-cancel-button]:hidden",
+              EASE,
+              "outline-none focus-visible:ring-3 focus-visible:ring-ring/40",
+            )}
+          />
+          {value ? (
+            <button
+              type="button"
+              aria-label="Clear search"
+              onClick={() => {
+                onChange("")
+                ref.current?.focus()
+              }}
+              className={cn("absolute top-1/2 right-1.5 grid size-6 -translate-y-1/2 place-items-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground", EASE, FOCUS)}
+            >
+              <X className="size-3.5" aria-hidden />
+            </button>
+          ) : null}
+        </>
       ) : (
-        <kbd aria-hidden className="pointer-events-none absolute top-1/2 right-3 hidden h-5 -translate-y-1/2 items-center rounded bg-background px-1.5 text-[11px] text-muted-foreground shadow-xs sm:inline-flex dark:bg-input/40">
-          /
-        </kbd>
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <button
+                ref={buttonRef}
+                type="button"
+                aria-label="Search dashboards"
+                onClick={() => setOpen(true)}
+                className={cn("grid size-8 place-items-center rounded-lg bg-muted/70 text-muted-foreground hover:bg-muted hover:text-foreground dark:bg-input/30", EASE, FOCUS)}
+              />
+            }
+          >
+            <Search className="size-4" aria-hidden />
+          </TooltipTrigger>
+          <TooltipContent>Search dashboards (/)</TooltipContent>
+        </Tooltip>
       )}
     </div>
   )

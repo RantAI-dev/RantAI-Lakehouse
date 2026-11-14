@@ -107,7 +107,7 @@ function useViewMode(): readonly [ViewMode, (next: ViewMode) => void] {
 /** The Table / Gallery switch: two icon buttons with `aria-pressed`, in one soft group like the type filter. */
 /**
  * The Table / Gallery switch: two icon buttons with `aria-pressed` in one soft
- * group, 36 px tall like the search and the buttons beside it (BI-59 review
+ * group, 32 px tall like the search and the buttons beside it (BI-59 review
  * round 2, SHOULD-FIX 3): a filled group, no border, the console's `rounded-lg`.
  */
 function ViewSwitch({ value, onChange }: {
@@ -119,7 +119,7 @@ function ViewSwitch({ value, onChange }: {
     { value: "gallery" as const, label: "Gallery view", icon: LayoutGrid },
   ]
   return (
-    <div role="group" aria-label="View" className="inline-flex h-9 shrink-0 rounded-lg bg-muted/70 p-0.5 dark:bg-input/30">
+    <div role="group" aria-label="View" className="inline-flex h-8 shrink-0 rounded-lg bg-muted/70 p-0.5 dark:bg-input/30">
       {options.map((o) => {
         const on = o.value === value
         return (
@@ -131,7 +131,7 @@ function ViewSwitch({ value, onChange }: {
             title={o.label}
             onClick={() => onChange(o.value)}
             className={cn(
-              "grid size-8 place-items-center rounded-md",
+              "grid size-7 place-items-center rounded-md",
               EASE, FOCUS,
               on ? "bg-background text-foreground shadow-sm dark:bg-input/40" : "text-muted-foreground hover:text-foreground",
             )}
@@ -462,29 +462,25 @@ export function DashboardListPage() {
     <PageFrame>
       {/*
         BI-59 review round 2, SHOULD-FIX 3 (owner QA, "tingginya gede banget"; DESIGN.md §3 "Judul,
-        pencarian, dan aksi halaman satu baris yang ringkas"): one compact row, every control 36 px
-        (the console's h-9) with the title centred on them: the title, the search taking the
+        pencarian, dan aksi halaman satu baris yang ringkas"): one compact row, every control 32 px
+        (the console's h-8) with the title centred on them: the title, the search taking the
         remaining width, the Table / Gallery switch, the page ⋯ and New. On a phone the title has
         its own row, then the search, the ⋯ and an icon-only New; the switch stays in the filters
         row there so the search keeps its room.
       */}
       <header className={cn("flex shrink-0 items-center gap-2", phone && "flex-wrap gap-y-3")}>
-        <h1 className={cn("mr-2 shrink-0 text-xl leading-9 font-semibold tracking-tight", phone && "w-full")}>Dashboards</h1>
+        <h1 className={cn("mr-2 shrink-0 text-xl leading-8 font-semibold tracking-tight", phone && "w-full")}>Dashboards</h1>
         {/*
           BI-59 review round 3, SHOULD-FIX 4 (owner QA; DESIGN.md §3: the search has a normal width,
           about 280 to 320 px, never the full row): on a laptop an empty gap takes the spare width
-          and the search is 288 px, widening to 360 px while focused (200 ms, off under reduced
-          motion). On a phone the search takes the row beside ⋯ and New, as before.
+          and the search is a 32 px icon that opens to 288 px (owner QA 2026-11-14; 200 ms, off
+          under reduced motion). On a phone the opened search takes the row beside ⋯ and New.
         */}
         {phone ? null : <div aria-hidden data-slot="header-gap" className="flex-1" />}
         <SearchField
           value={query}
           onChange={setQuery}
-          className={
-            phone
-              ? "min-w-0 flex-1"
-              : "w-72 shrink-0 transition-[width] duration-200 ease-out focus-within:w-90 motion-reduce:transition-none"
-          }
+          expandedClassName={phone ? "min-w-0 flex-1" : undefined}
         />
         {phone ? null : <ViewSwitch value={view} onChange={setView} />}
         <PageMenu

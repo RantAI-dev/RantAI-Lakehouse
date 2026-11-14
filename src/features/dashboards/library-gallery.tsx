@@ -15,7 +15,7 @@ import { groupBoardsByFolder, type FolderLike } from "@/lib/folder-tree"
 import { cn } from "@/lib/utils"
 import { countLabel, factOf, type LibraryItem } from "./library-items"
 import { ItemMenu, type ItemActions } from "./library-menus"
-import { Avatar, EASE, FOCUS, ItemBadges, StarButton, ownerLabel } from "./library-parts"
+import { Avatar, EASE, FOCUS, SOFT_LIFT, ItemBadges, StarButton, ownerLabel } from "./library-parts"
 import { ItemPicture, chartsOf, type PictureSource } from "./library-picture"
 import { ItemName } from "./library-table"
 
@@ -112,8 +112,8 @@ function Card({ item, actions, myName, pictures, onOpenTemplate }: {
   return (
     <li
       className={cn(
-        "group relative flex flex-col rounded-2xl bg-card p-2 shadow-[0_1px_2px_rgba(0,0,0,0.04)] ring-1 ring-foreground/5 hover:-translate-y-0.5 hover:shadow-lg hover:ring-foreground/10",
-        EASE,
+        "group relative flex flex-col rounded-2xl bg-card p-2 shadow-[0_1px_2px_rgba(0,0,0,0.04)] ring-1 ring-foreground/5 hover:-translate-y-0.5 hover:ring-foreground/10",
+        SOFT_LIFT, EASE,
       )}
     >
       <div className="relative">

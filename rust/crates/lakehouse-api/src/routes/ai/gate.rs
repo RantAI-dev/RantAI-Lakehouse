@@ -134,8 +134,10 @@ fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             s("id")
         ),
         "delete_calculated_field" => format!("Menghapus kolom hitung {} secara permanen.", s("id")),
+        // BI-18 part C, part 2: a deleted board and its charts go to the
+        // trash, not away.
         "delete_board" => format!(
-            "Menghapus board {} berikut seluruh chart di dalamnya secara permanen.",
+            "Memindahkan board {} berikut seluruh chart di dalamnya ke tempat sampah; bisa dipulihkan selama 30 hari.",
             s("id")
         ),
         "delete_metric" => format!("Menghapus metrik {} secara permanen.", s("id")),
@@ -254,9 +256,11 @@ fn embed_write_high_reason(name: &str, args: &Map<String, Value>) -> String {
 /// tells the reader the action cannot be undone once executed.
 ///
 /// Today it is the sentence [`risk_for_write_high`] gives every `WriteHigh`
-/// tool except `delete_chart` — a deleted chart goes to the trash and can be
-/// restored, so it gets [`WRITE_HIGH_RISK_TRASHED_CHART`] instead;
-/// [`risk_for_write_high`] picks between the two sentences (`AI-1`).
+/// tool except `delete_chart`, `delete_board` and `delete_report` — a deleted
+/// chart, board or report goes to the trash and can be restored, so they get
+/// [`WRITE_HIGH_RISK_TRASHED_CHART`], [`WRITE_HIGH_RISK_TRASHED_BOARD`] and
+/// [`WRITE_HIGH_RISK_TRASHED_REPORT`] instead; [`risk_for_write_high`] picks
+/// between the four sentences (`AI-1`, `BI-18` part D).
 const WRITE_HIGH_RISK: &str =
     "Tindakan berisiko tinggi (WriteHigh): tidak dapat dibatalkan setelah dijalankan.";
 
@@ -271,27 +275,43 @@ const WRITE_HIGH_RISK: &str =
 /// The constant is named here so the two are changed together.
 const WRITE_HIGH_RISK_TRASHED_CHART: &str = "Tindakan berisiko tinggi (WriteHigh): chart masuk tempat sampah dan bisa dipulihkan selama 30 hari.";
 
+/// The risk statement for `delete_board`: the board and its charts are not
+/// gone, they are in the trash and can be restored, so the generic sentence
+/// would contradict the reason on the very same approval card (`AI-1`).
+///
+/// The `30` is the trash's retention, `lakehouse_bi::trash::RETENTION_DAYS`
+/// (30 days). It is a literal because [`risk_for_write_high`] returns a
+/// `&'static str` and a `u32` cannot be interpolated into one; the approval
+/// stores the sentence as it stands (`NewApprovalRequest.risk` is a `&str`).
+/// The constant is named here so the two are changed together.
+const WRITE_HIGH_RISK_TRASHED_BOARD: &str = "Tindakan berisiko tinggi (WriteHigh): board dan chart-nya masuk tempat sampah dan bisa dipulihkan selama 30 hari.";
+
+/// The risk statement for `delete_report` (`BI-18` part D): the report is not
+/// gone, it is in the trash and can be restored, so the generic sentence would
+/// contradict the reason on the very same approval card (as for `AI-1`).
+///
+/// The `30` is the trash's retention, `lakehouse_bi::trash::RETENTION_DAYS`
+/// (30 days), a literal for the reason given at
+/// [`WRITE_HIGH_RISK_TRASHED_CHART`].
+const WRITE_HIGH_RISK_TRASHED_REPORT: &str = "Tindakan berisiko tinggi (WriteHigh): laporan masuk tempat sampah dan bisa dipulihkan selama 30 hari.";
+
 /// The risk sentence stored on a `WriteHigh` approval, chosen per tool.
 ///
-/// One sentence for every tool hid the mismatch: `delete_chart` goes to the
-/// trash and stays restorable, so the generic "tidak dapat dibatalkan"
-/// sentence contradicted the reason line on the same card (`AI-1`). Every
-/// other `WriteHigh` tool keeps [`WRITE_HIGH_RISK`] word for word.
+/// One sentence for every tool hid the mismatch: `delete_chart`,
+/// `delete_board` and `delete_report` go to the trash and stay restorable, so the generic
+/// "tidak dapat dibatalkan" sentence contradicted the reason line on the
+/// same card (`AI-1`). Every other `WriteHigh` tool keeps [`WRITE_HIGH_RISK`]
+/// word for word.
 fn risk_for_write_high(spec: &ToolSpec) -> &'static str {
     match spec.name {
         "delete_chart" => WRITE_HIGH_RISK_TRASHED_CHART,
+        "delete_board" => WRITE_HIGH_RISK_TRASHED_BOARD,
         // BI-18 part D (OPS-32 merge, aligned with #525): a deleted report goes
         // to the trash too, so its card says so, as its reason line does.
         "delete_report" => WRITE_HIGH_RISK_TRASHED_REPORT,
         _ => WRITE_HIGH_RISK,
     }
 }
-
-/// The risk statement for `delete_report` (`BI-18` part D): like a chart, the
-/// report goes to the trash and can be restored for 30 days
-/// (`lakehouse_bi::trash::RETENTION_DAYS`, a literal for the reason given at
-/// [`WRITE_HIGH_RISK_TRASHED_CHART`]).
-const WRITE_HIGH_RISK_TRASHED_REPORT: &str = "Tindakan berisiko tinggi (WriteHigh): laporan masuk tempat sampah dan bisa dipulihkan selama 30 hari.";
 
 /// T0.5: the real approvals-inbox flow for a [`Risk::WriteHigh`] call that
 /// [`decide`] has already flagged with [`write_high_pending_marker`] (mode
@@ -1396,15 +1416,50 @@ mod tests {
         assert!(!risk.contains("tidak dapat dibatalkan"), "{risk}");
     }
 
+    /// The card a person reads before approving a board deletion must not
+    /// contradict its own reason sentence: a deleted board and its charts go
+    /// to the trash and can be restored, so the risk line says so instead of
+    /// claiming the action cannot be undone (`AI-1`).
+    #[test]
+    fn a_deleted_board_says_it_can_be_restored_for_thirty_days() {
+        let mut args = Map::new();
+        args.insert("id".to_owned(), json!("b1"));
+        let risk = risk_for_write_high(spec("delete_board"));
+        assert_eq!(
+            risk,
+            "Tindakan berisiko tinggi (WriteHigh): board dan chart-nya masuk tempat sampah dan bisa dipulihkan selama 30 hari."
+        );
+        let reason = reason_for_write_high(spec("delete_board"), &args);
+        assert!(
+            reason.contains("b1"),
+            "the reason must name the board: {reason}"
+        );
+        assert!(reason.contains("30 hari"), "{reason}");
+        for sentence in [risk, reason.as_str()] {
+            assert!(
+                !sentence.contains("permanen"),
+                "the card must not say the board is permanent: {sentence}"
+            );
+            assert!(
+                !sentence.contains("tidak dapat dibatalkan"),
+                "the card must not say the action cannot be undone: {sentence}"
+            );
+        }
+    }
+
     /// Every other `WriteHigh` tool keeps today's sentence, word for word
     /// (`AI-1`).
     ///
-    /// **Planned**: giving `delete_board` the trash sentence makes this test
-    /// fail.
+    /// `delete_calculated_field` and `delete_metric` are permanent: they
+    /// tombstone their row (`is_deleted = 1`), and nothing brings it back.
     #[test]
     fn the_other_write_high_tools_keep_the_generic_risk_sentence() {
         // `delete_template` removes the template for good (`BI-18` part D).
-        for name in ["delete_board", "delete_metric", "delete_template"] {
+        for name in [
+            "delete_calculated_field",
+            "delete_metric",
+            "delete_template",
+        ] {
             assert_eq!(
                 risk_for_write_high(spec(name)),
                 "Tindakan berisiko tinggi (WriteHigh): tidak dapat dibatalkan setelah dijalankan.",

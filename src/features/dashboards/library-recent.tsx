@@ -6,7 +6,7 @@ import { itemHref } from "@/lib/dashboard-organise"
 import { cn } from "@/lib/utils"
 import type { ShortcutItem } from "@/services"
 import { countLabel, type LibraryItem } from "./library-items"
-import { EASE } from "./library-parts"
+import { EASE, SOFT_LIFT } from "./library-parts"
 import { ChartPicture, ItemPicture, chartsOf, type PictureSource } from "./library-picture"
 
 /** At most this many recent items: one row of small cards on a laptop. */
@@ -40,7 +40,7 @@ export function RecentRow({ recent, boards, source }: {
           return (
             <li
               key={`${r.kind}:${r.id}`}
-              className={cn("group relative grid min-w-0 gap-2 rounded-2xl bg-card p-2 ring-1 ring-foreground/5 hover:-translate-y-0.5 hover:shadow-md hover:ring-foreground/10", EASE)}
+              className={cn("group relative grid min-w-0 gap-2 rounded-2xl bg-card p-2 ring-1 ring-foreground/5 hover:-translate-y-0.5 hover:ring-foreground/10", SOFT_LIFT, EASE)}
             >
               {board ? (
                 <ItemPicture item={board} charts={chartsOf(source, board.id)} size="md" className="h-24" />

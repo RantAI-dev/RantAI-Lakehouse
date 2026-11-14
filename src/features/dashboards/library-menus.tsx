@@ -51,9 +51,9 @@ export function NewMenu({
 }) {
   return (
     <DropdownMenu>
-      {/* BI-59 review round 2, SHOULD-FIX 3: 36 px like the search beside it (the console's h-9); on
+      {/* BI-59 review round 2, SHOULD-FIX 3: 32 px like the search beside it (the console's h-8, the default Button); on
           a phone the word is for screen readers only and the button is the plus alone. */}
-      <DropdownMenuTrigger render={<Button size="lg" className="text-white max-sm:w-9 max-sm:px-0! sm:px-3" />}>
+      <DropdownMenuTrigger render={<Button className="text-white max-sm:w-8 max-sm:px-0! sm:px-3" />}>
         <Plus data-icon="inline-start" className="max-sm:mx-auto" /> <span className="max-sm:sr-only">New</span>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-72">
@@ -125,13 +125,13 @@ export function PageMenu({
 }) {
   return (
     <DropdownMenu>
-      {/* BI-59 review round 2, SHOULD-FIX 3: 36 px and filled like the search and the view switch
+      {/* BI-59 review round 2, SHOULD-FIX 3: 32 px and filled like the search and the view switch
           beside it, no border, so the row reads as one set rather than a default outline button. */}
       <DropdownMenuTrigger
         render={
           <Button
             variant="ghost"
-            size="icon-lg"
+            size="icon"
             aria-label="More actions"
             className="bg-muted/70 text-muted-foreground hover:bg-muted hover:text-foreground aria-expanded:bg-muted dark:bg-input/30 dark:hover:bg-input/50"
           />

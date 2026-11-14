@@ -95,8 +95,9 @@ describe("the Dashboards page header (BI-59 T1)", () => {
     await waitFor(() => expect(within(head).getByRole("button", { name: "New" })).toBeTruthy())
     const buttons = within(head).getAllByRole("button").map((b) => b.getAttribute("aria-label") ?? b.textContent?.trim())
     // BI-59 review round 1, SHOULD-FIX 1: the Table / Gallery switch joined the search row.
-    expect(buttons.sort()).toEqual(["Gallery view", "More actions", "New", "Table view"])
-    expect(within(head).getByRole("searchbox")).toBeTruthy()
+    expect(buttons.sort()).toEqual(["Gallery view", "More actions", "New", "Search dashboards", "Table view"])
+    // Owner QA 2026-11-14: the search is an icon that expands, so there is no input until it opens.
+    expect(within(head).queryByRole("searchbox")).toBeNull()
     // The old toolbar's controls are gone from the page.
     for (const gone of ["Metrics", "Folders", "Trash", "Import…", "New dashboard", "Refresh"]) {
       expect(screen.queryByRole("button", { name: gone })).toBeNull()
@@ -139,12 +140,28 @@ describe("the Dashboards page header (BI-59 T1)", () => {
   it('"/" focuses the search and Escape clears it', async () => {
     serve(["dashboard:read"])
     renderPage()
-    const search = within(await header()).getByRole("searchbox") as HTMLInputElement
-    fireEvent.keyDown(window, { key: "/" })
+    const head = await header()
+    fireEvent.click(within(head).getByRole("button", { name: "Search dashboards" }))
+    const search = within(head).getByRole("searchbox") as HTMLInputElement
     expect(document.activeElement).toBe(search)
     fireEvent.change(search, { target: { value: "qa" } })
     fireEvent.keyDown(search, { key: "Escape" })
-    expect(search.value).toBe("")
+    expect(within(head).queryByRole("searchbox")).toBeNull()
+  })
+
+  it("is a collapsed icon by default, \"/\" opens and focuses it, Escape collapses it", async () => {
+    serve(["dashboard:read"])
+    renderPage()
+    const head = await header()
+    expect(within(head).queryByRole("searchbox")).toBeNull()
+    expect(within(head).getByRole("button", { name: "Search dashboards" })).toBeTruthy()
+    fireEvent.keyDown(window, { key: "/" })
+    const search = within(head).getByRole("searchbox") as HTMLInputElement
+    expect(search.placeholder).toBe("Search dashboards")
+    expect(document.activeElement).toBe(search)
+    fireEvent.keyDown(search, { key: "Escape" })
+    expect(within(head).queryByRole("searchbox")).toBeNull()
+    expect(within(head).getByRole("button", { name: "Search dashboards" })).toBeTruthy()
   })
 })
 
@@ -315,9 +332,10 @@ describe("the header and toolbar controls (BI-59 AC1)", () => {
       .filter((b) => !list?.contains(b) && !recent?.contains(b))
       .map((b) => b.getAttribute("aria-label") ?? b.textContent?.trim())
     expect(controls.sort()).toEqual(
-      ["All", "Dashboards", "Folder: All folders", "Gallery view", "More actions", "New", "Reports", "Table view", "Templates"].sort(),
+      ["All", "Dashboards", "Folder: All folders", "Gallery view", "More actions", "New", "Reports", "Search dashboards", "Table view", "Templates"].sort(),
     )
-    expect(screen.getAllByRole("searchbox")).toHaveLength(1)
+    // Collapsed: the one search is an icon button (listed above), not an input.
+    expect(screen.queryAllByRole("searchbox")).toHaveLength(0)
   })
 })
 
@@ -432,6 +450,7 @@ describe("bulk actions, facts and empty states (BI-59 T5)", () => {
     serve(["dashboard:read", "dashboard:write"], { "GET /api/dashboard/folders": () => json({ folders: FOLDERS }) })
     renderPage()
     await screen.findByText("QA BI")
+    fireEvent.click(screen.getByRole("button", { name: "Search dashboards" }))
     const search = screen.getByRole("searchbox")
     fireEvent.change(search, { target: { value: "zzz" } })
     expect(await screen.findByText("Nothing matches “zzz”")).toBeTruthy()
@@ -490,6 +509,7 @@ describe("the header row (BI-59 review rounds 1 and 2, SHOULD-FIX 1 and 3)", () 
     renderPage()
     const head = await header()
     const title = within(head).getByRole("heading", { name: "Dashboards" })
+    fireEvent.click(within(head).getByRole("button", { name: "Search dashboards" }))
     const search = within(head).getByRole("searchbox")
     await waitFor(() => expect(within(head).getByRole("button", { name: "New" })).toBeTruthy())
     // One flex row: each control's own box is a direct child of the header.
