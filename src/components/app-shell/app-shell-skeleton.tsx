@@ -98,13 +98,12 @@ export function AppShellSkeleton({ pathname }: { pathname: string }) {
             </div>
             <NavbarSearch />
             <div className="flex min-w-0 items-center justify-end gap-1" aria-hidden>
-              {/* The Copilot's button is there only for a holder of the assistant permission. */}
-              <span className="grid size-8 place-items-center">
-                <Skeleton className="size-5 rounded-md" />
-              </span>
               <span className="grid size-8 place-items-center rounded-lg text-muted-foreground">
                 <Bell className="size-4" />
               </span>
+              {/* The AI Copilot's button, last, is there only for a holder of the assistant
+                  permission: its box, labelled from `lg` as the real one is. */}
+              <Skeleton className="h-8 w-8 rounded-lg lg:w-[6.75rem]" />
             </div>
           </div>
         </header>

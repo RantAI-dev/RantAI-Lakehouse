@@ -2,11 +2,12 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { Search, Bell, Sparkles } from "lucide-react"
+import { Search, Bell, Bot } from "lucide-react"
 import { usePathname, useRouter } from "next/navigation"
 import { SidebarTrigger } from "@/components/ui/sidebar"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -78,9 +79,47 @@ export function NavbarSearch() {
 }
 
 /**
+ * The AI Copilot's entry, the navbar's last item (owner 2026-11-14, "AI ini bisa ditempatkan di
+ * paling kanan dan kasih label dong, biar ke-notice ada fitur AI-nya"): a 32 px button with its
+ * name, in a soft primary fill so it reads as the bar's main action, and filled solid while the
+ * panel is open (`aria-pressed`). The mark is the assistant's `Bot`, as elsewhere in the console,
+ * never sparkles (DESIGN.md). Below `lg` it is the mark alone, the name in its tooltip and label.
+ * There is no keyboard shortcut for the panel, so the tooltip names none.
+ */
+export const COPILOT_BUTTON_CLASS = "h-8 gap-1.5 rounded-lg px-2 lg:px-2.5"
+export function CopilotButton({ open, onToggle }: { readonly open: boolean; readonly onToggle: () => void }) {
+  const label = open ? "Collapse AI Copilot" : "Open AI Copilot"
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button
+            variant="ghost"
+            aria-pressed={open}
+            aria-label={label}
+            onClick={onToggle}
+            className={cn(
+              COPILOT_BUTTON_CLASS,
+              "font-medium transition-[background-color,color,transform] duration-200 ease-out active:scale-[0.97]",
+              open
+                ? "bg-primary text-primary-foreground hover:bg-primary/90 hover:text-primary-foreground"
+                : "bg-primary/10 text-primary hover:bg-primary/15 hover:text-primary dark:bg-primary/20 dark:text-sky-200 dark:hover:bg-primary/30",
+            )}
+          />
+        }
+      >
+        <Bot className="size-4" aria-hidden />
+        <span className="hidden lg:inline">AI Copilot</span>
+      </TooltipTrigger>
+      <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
+  )
+}
+
+/**
  * Sticky top navbar rendered on every page.
  * Left: sidebar toggle + current page title (derived from nav config) + search.
- * Right: the Copilot, notifications. The account menu is the sidebar's footer
+ * Right: notifications, then the AI Copilot, last. The account menu is the sidebar's footer
  * card (BI-61 review round 1, SHOULD-FIX 7).
  */
 export function AppNavbar() {
@@ -162,23 +201,6 @@ export function AppNavbar() {
               router.refresh()
             }}
           />
-          {!isCopilotPage && hasAssistant && (
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={() => copilot.setExpanded((prev) => !prev)}
-              className={cn(
-                "relative size-8 rounded-lg transition-colors",
-                copilot.expanded
-                  ? "bg-primary/10 text-primary hover:bg-primary/20 hover:text-primary"
-                  : "text-muted-foreground hover:bg-muted hover:text-foreground"
-              )}
-              aria-label={copilot.expanded ? "Collapse AI Copilot" : "Open AI Copilot"}
-              title={copilot.expanded ? "Collapse AI Copilot" : "Open AI Copilot"}
-            >
-              <Sparkles className="size-4" />
-            </Button>
-          )}
           {mentions.length > 0 || mentionsNote ? (
             <DropdownMenu>
               <DropdownMenuTrigger
@@ -253,6 +275,9 @@ export function AppNavbar() {
               }
             />
           )}
+          {!isCopilotPage && hasAssistant ? (
+            <CopilotButton open={copilot.expanded} onToggle={() => copilot.setExpanded((prev) => !prev)} />
+          ) : null}
         </div>
       </div>
     </header>

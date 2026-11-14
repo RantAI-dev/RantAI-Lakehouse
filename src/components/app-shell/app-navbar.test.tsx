@@ -128,3 +128,38 @@ describe("the account menu", () => {
     expect(screen.getByText(`Version ${CONSOLE_VERSION}`)).toBeTruthy()
   })
 })
+
+// Owner 2026-11-14 ("AI ini bisa ditempatkan di paling kanan dan kasih label dong"): the AI Copilot
+// is the navbar's last item, named, with the assistant's mark, and pressed while its panel is open.
+describe("AppNavbar AI Copilot entry", () => {
+  it("is the last button, labelled, and toggles its pressed state", async () => {
+    spyOn(globalThis, "fetch").mockImplementation(((input: RequestInfo | URL) => {
+      if (String(input).includes("/api/auth/me")) {
+        return Promise.resolve(json({ id: "u1", name: "Analyst", email: null, roles: [], permissions: ["assistant:use"], tenants: [] }))
+      }
+      return Promise.resolve(json({}))
+    }) as unknown as typeof fetch)
+    spyOn(notificationsService, "list").mockResolvedValue({
+      supported: true, openAlerts: [], pendingApprovals: [], unreadMentions: [], unreadMentionsUnavailable: null,
+    } as never)
+
+    render(
+      <AuthProvider>
+        <CopilotProvider>
+          <SidebarProvider>
+            <AppNavbar />
+          </SidebarProvider>
+        </CopilotProvider>
+      </AuthProvider>,
+    )
+
+    const copilot = await screen.findByRole("button", { name: "Open AI Copilot" })
+    expect(copilot.textContent).toContain("AI Copilot")
+    expect(copilot.getAttribute("aria-pressed")).toBe("false")
+    const header = copilot.closest("header") as HTMLElement
+    const controls = header.querySelectorAll("button, a[href]")
+    expect(controls[controls.length - 1]).toBe(copilot)
+    fireEvent.click(copilot)
+    await waitFor(() => expect(screen.getByRole("button", { name: "Collapse AI Copilot" }).getAttribute("aria-pressed")).toBe("true"))
+  })
+})
