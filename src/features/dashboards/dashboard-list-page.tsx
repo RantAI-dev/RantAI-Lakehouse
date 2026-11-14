@@ -2,6 +2,7 @@
 
 import * as React from "react"
 import { useRouter } from "next/navigation"
+import { LayoutGrid, Rows3 } from "lucide-react"
 
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
@@ -11,6 +12,7 @@ import { useAuth } from "@/features/auth/auth-provider"
 import { folderChoices, labelledFolders, manageableFolders } from "@/lib/dashboard-organise"
 import { buildFolderTree, flattenFolders, folderPath } from "@/lib/folder-tree"
 import { notifyError, notifyInfo, withNotify } from "@/lib/notify"
+import { cn } from "@/lib/utils"
 import { dashboardReportService, dashboardService, dashboardTemplateService } from "@/services"
 import type { Board, DashboardTemplate } from "@/services"
 import { BoardFormDialog } from "./board-form-dialog"
@@ -22,7 +24,8 @@ import {
   type KindFilter, type FolderFilter, type LibraryItem, type SortColumn, type SortState,
 } from "./library-items"
 import { FolderPicker, NewMenu, PageMenu, type FolderChoice, type ItemActions } from "./library-menus"
-import { PageFrame, ScrollRegion, SearchField, Segmented } from "./library-parts"
+import { LibraryGallery } from "./library-gallery"
+import { EASE, FOCUS, PageFrame, ScrollRegion, SearchField, Segmented } from "./library-parts"
 import { LibraryTable, type FolderLookup } from "./library-table"
 import { ItemPicture, pictureSource } from "./library-picture"
 import { RecentRow } from "./library-recent"
@@ -66,6 +69,70 @@ const TAB_KIND: Record<TabValue, KindFilter> = { all: "all", dashboards: "dashbo
  * `ReplacingMergeTree(created_at)`, so `created_at` is the version column
  * rewritten on every save and has always meant "last changed".
  */
+/**
+ * Table or Gallery (decision P2): Table is the default, and the choice is
+ * kept per browser. A new key rather than the old page's `dashboards:list-view`,
+ * whose default was the gallery, so everyone starts on the table the owner
+ * chose. Read after mount so the server's and the browser's first render
+ * agree, and wrapped in `try` because `localStorage` throws in a private
+ * window or with storage blocked: the page then works and only forgets.
+ */
+type ViewMode = "table" | "gallery"
+const VIEW_STORAGE_KEY = "dashboards:browse-view"
+
+function useViewMode(): readonly [ViewMode, (next: ViewMode) => void] {
+  const [view, setView] = React.useState<ViewMode>("table")
+  React.useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem(VIEW_STORAGE_KEY)
+      if (saved === "gallery" || saved === "table") setView(saved)
+    } catch {
+      /* the default stays */
+    }
+  }, [])
+  const change = React.useCallback((next: ViewMode) => {
+    setView(next)
+    try {
+      window.localStorage.setItem(VIEW_STORAGE_KEY, next)
+    } catch {
+      /* the choice holds for this visit, it is only not remembered */
+    }
+  }, [])
+  return [view, change] as const
+}
+
+/** The Table / Gallery switch: two icon buttons with `aria-pressed`, in one soft group like the type filter. */
+function ViewSwitch({ value, onChange }: { readonly value: ViewMode; readonly onChange: (next: ViewMode) => void }) {
+  const options = [
+    { value: "table" as const, label: "Table view", icon: Rows3 },
+    { value: "gallery" as const, label: "Gallery view", icon: LayoutGrid },
+  ]
+  return (
+    <div role="group" aria-label="View" className="inline-flex rounded-lg bg-muted p-0.5">
+      {options.map((o) => {
+        const on = o.value === value
+        return (
+          <button
+            key={o.value}
+            type="button"
+            aria-pressed={on}
+            aria-label={o.label}
+            title={o.label}
+            onClick={() => onChange(o.value)}
+            className={cn(
+              "grid size-8 place-items-center rounded-md",
+              EASE, FOCUS,
+              on ? "bg-background text-foreground shadow-sm dark:bg-input/40" : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            <o.icon aria-hidden className="size-4" />
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
 /** What the list says when it has no row: why, in words that fit the filter. */
 function ListEmpty({ kind, query, folderFilter, canWrite, anyOfKind }: {
   readonly kind: KindFilter
@@ -169,6 +236,7 @@ export function DashboardListPage() {
   const [query, setQuery] = React.useState("")
   const [folderFilter, setFolderFilter] = React.useState<FolderFilter>(null)
   const [sort, setSort] = React.useState<SortState>({ column: "updated", dir: "desc" })
+  const [view, setView] = useViewMode()
   const [trashOpen, setTrashOpen] = React.useState(false)
   const [foldersOpen, setFoldersOpen] = React.useState(false)
   const [importOpen, setImportOpen] = React.useState(false)
@@ -360,12 +428,15 @@ export function DashboardListPage() {
           <section aria-label="Dashboards, reports and templates" className="grid grid-cols-[minmax(0,1fr)] gap-3">
             <div className="flex min-h-9 flex-wrap items-center justify-between gap-2">
               <Segmented<TabValue> label="Type" value={tab} onChange={setTab} options={tabs} />
-              <FolderPicker
-                value={folderFilter}
-                onChange={setFolderFilter}
-                choices={folderChoicesList}
-                noFolderCount={items.filter((i) => i.kind !== "template" && !i.folderId).length}
-              />
+              <div className="flex items-center gap-2">
+                <FolderPicker
+                  value={folderFilter}
+                  onChange={setFolderFilter}
+                  choices={folderChoicesList}
+                  noFolderCount={items.filter((i) => i.kind !== "template" && !i.folderId).length}
+                />
+                <ViewSwitch value={view} onChange={setView} />
+              </div>
             </div>
 
             {state.status === "error" ? <ErrorState error={state.error} onRetry={reload} /> : null}
@@ -378,6 +449,17 @@ export function DashboardListPage() {
                   folderFilter={folderFilter}
                   canWrite={canFile}
                   anyOfKind={items.some((i) => kind === "all" || i.kind === kind)}
+                />
+              ) : view === "gallery" ? (
+                <LibraryGallery
+                  items={rows}
+                  folders={folders}
+                  showEmpty={!query.trim() && folderFilter === null && (kind === "all" || kind === "dashboard")}
+                  actions={actions}
+                  myName={myName}
+                  pictures={pictures}
+                  onOpenTemplate={(item) => item.template && setUsing(item.template)}
+                  emptyFolder={() => <p className="px-1 text-xs text-muted-foreground">Nothing in this folder yet.</p>}
                 />
               ) : (
                 <LibraryTable

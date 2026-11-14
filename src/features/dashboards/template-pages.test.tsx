@@ -61,6 +61,8 @@ afterEach(() => {
   cleanup()
   mock.restore()
   pushed.length = 0
+  // BI-59 T4: the page remembers Table or Gallery; each test starts on the table.
+  localStorage.clear()
 })
 
 const template = {
@@ -82,6 +84,12 @@ describe("the templates on the Dashboards page", () => {
     if (!row) throw new Error("no row")
     expect(within(row).getByText("Template")).toBeTruthy()
     expect(within(row).getByText("Rina")).toBeTruthy()
+    // BI-59 T4: the gallery card says where it came from, who saved it and its charts.
+    fireEvent.click(screen.getByRole("button", { name: "Gallery view" }))
+    const card = screen.getByRole("button", { name: "Sales overview" }).closest("li")
+    if (!card) throw new Error("no card")
+    expect(within(card).getByText("Saved from Quarterly sales")).toBeTruthy()
+    expect(within(card).getByText(/Rina · 3 charts/)).toBeTruthy()
     // The New menu shows each template with its charts and its source.
     fireEvent.click(screen.getByRole("button", { name: "New" }))
     expect(await screen.findByText("3 charts · from Quarterly sales")).toBeTruthy()

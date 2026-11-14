@@ -61,6 +61,8 @@ afterEach(() => {
   cleanup()
   mock.restore()
   pushed.length = 0
+  // The page remembers Table or Gallery; each test starts on the table.
+  localStorage.clear()
 })
 
 const BOARDS = [
@@ -94,7 +96,7 @@ describe("the Dashboards page header (BI-59 T1)", () => {
     expect(buttons.sort()).toEqual(["More actions", "New"])
     expect(within(head).getByRole("searchbox")).toBeTruthy()
     // The old toolbar's controls are gone from the page.
-    for (const gone of ["Metrics", "Folders", "Trash", "Import…", "New dashboard", "Gallery view"]) {
+    for (const gone of ["Metrics", "Folders", "Trash", "Import…", "New dashboard", "Refresh"]) {
       expect(screen.queryByRole("button", { name: gone })).toBeNull()
     }
   })
@@ -239,5 +241,80 @@ describe("the pictures and Recent (BI-59 T3)", () => {
       ["Main", "/dashboards/default"],
     ])
     expect(within(recent).getByText("Chart on QA BI")).toBeTruthy()
+  })
+})
+
+describe("the Gallery view (BI-59 T4)", () => {
+  const specs = { "GET /api/dashboard/specs": () => json({ charts: [{ id: "u1", board: "b1", kind: "bar" }] }) }
+
+  it("opens on the table, and the gallery chosen survives a reload", async () => {
+    serve(["dashboard:read", "dashboard:write"], specs)
+    const first = renderPage()
+    await screen.findByText("QA BI")
+    expect(document.querySelector("table")).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Gallery view" }))
+    expect(document.querySelector("table")).toBeNull()
+    expect(screen.getByRole("button", { name: "Gallery view" }).getAttribute("aria-pressed")).toBe("true")
+    first.unmount()
+    renderPage()
+    await screen.findByText("QA BI")
+    await waitFor(() => expect(screen.getByRole("button", { name: "Gallery view" }).getAttribute("aria-pressed")).toBe("true"))
+    expect(document.querySelector("table")).toBeNull()
+  })
+
+  it("shows each dashboard as a picture card, grouped by folder", async () => {
+    serve(["dashboard:read", "dashboard:write"], specs)
+    renderPage()
+    await screen.findByText("QA BI")
+    fireEvent.click(screen.getByRole("button", { name: "Gallery view" }))
+    const noFolder = screen.getByRole("region", { name: "No folder" })
+    const card = within(noFolder).getByText("QA BI").closest("li")
+    expect(card?.querySelector('svg[role="presentation"]')).toBeTruthy()
+    expect(within(noFolder).getByText("Built-in dashboard")).toBeTruthy()
+    expect(screen.getByRole("region", { name: "Templates" })).toBeTruthy()
+    expect(screen.queryByText("No description.")).toBeNull()
+  })
+
+  it("still renders, on the table, when localStorage throws", async () => {
+    serve(["dashboard:read"], specs)
+    // Storage blocked (a private window, site data off): reading the
+    // property itself throws, as browsers do.
+    const own = Object.getOwnPropertyDescriptor(window, "localStorage")
+    let reads = 0
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      get() {
+        reads += 1
+        throw new Error("blocked")
+      },
+    })
+    try {
+      renderPage()
+      await screen.findByText("QA BI")
+      expect(document.querySelector("table")).toBeTruthy()
+      fireEvent.click(screen.getByRole("button", { name: "Gallery view" }))
+      expect(document.querySelector("table")).toBeNull()
+      expect(reads).toBeGreaterThan(0)
+    } finally {
+      if (own) Object.defineProperty(window, "localStorage", own)
+      else delete (window as { localStorage?: Storage }).localStorage
+    }
+  })
+})
+
+describe("the header and toolbar controls (BI-59 AC1)", () => {
+  it("are New, the ⋯, the search, the type filter, the folder picker and the view switch, and nothing else", async () => {
+    serve(["dashboard:read", "dashboard:write"])
+    renderPage()
+    await screen.findByText("QA BI")
+    const list = document.querySelector("table")
+    const recent = screen.queryByRole("heading", { name: "Recent" })?.closest("section")
+    const controls = [...document.querySelectorAll("button")]
+      .filter((b) => !list?.contains(b) && !recent?.contains(b))
+      .map((b) => b.getAttribute("aria-label") ?? b.textContent?.trim())
+    expect(controls.sort()).toEqual(
+      ["All", "Dashboards", "Folder: All folders", "Gallery view", "More actions", "New", "Reports", "Table view", "Templates"].sort(),
+    )
+    expect(screen.getAllByRole("searchbox")).toHaveLength(1)
   })
 })
