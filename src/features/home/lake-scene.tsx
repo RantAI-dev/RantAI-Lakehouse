@@ -25,8 +25,9 @@
  * (`design/chart-builder-mockups`, `home-history/lake-art.tsx`). No
  * third-party code and no traced picture (public AGPL repo).
  *
- * Text that sits on the art is marked `data-scene-veil` and stays readable
- * without a hole in the picture (`veilAt`).
+ * The whole picture is a dim background (WEB-17 T9, owner 2026-11-15): every
+ * ink is moved towards the band's base by one factor per phase (`DIM`), so the
+ * art never competes with the greeting and nothing marks the text.
  *
  * What it costs, and the rules that keep it cheap (spec "Scene cost"):
  * - It is sized to the hero band only, never the page.
@@ -210,40 +211,13 @@ export function field(u: number, v: number, aspect: number, t: number, phase: nu
 }
 
 /**
- * Owner QA 2026-11-14: the greeting must stay readable without cutting a
- * hole in the art ("biar tetap full backgroundnya muncul tapi tulisan itu
- * tetap keliatan"). The page marks the text with `data-scene-veil`; over
- * each marked box, and fading out smoothly around it (no edge), the dots
- * thin a little and their colour moves towards the band's base, so every
- * dot under the words keeps at least 4.5:1 against the text while the
- * picture stays whole. The text also carries a soft halo in the base
- * colour (`home-frame.tsx`).
+ * WEB-17 T9, owner 2026-11-15 ("dibuat lebih redup aja, sewajarnya background aja"):
+ * every ink moves towards the band's base by one factor per phase, so the whole
+ * scene is quiet. Calculated from the colours (WCAG relative luminance, see the
+ * test): at these factors no ink is more than 2.0:1 against its base, and the
+ * greeting's text keeps at least 4.5:1 against every ink and the base.
  */
-type Box = { cx: number; cy: number; hw: number; hh: number; fx: number; fy: number }
-/** Falloff around a box, in px: wide sideways, shorter up and down. */
-const VEIL_FALL_X = 72
-const VEIL_FALL_Y = 40
-/** Extra room around the text's own box, in px. */
-const VEIL_PAD = 6
-/** How far a dot's colour moves towards the base at full veil, and how much ink it loses. */
-const VEIL_MIX = 0.64
-const VEIL_THIN = 0.3
-/** The veil is drawn in this many steps (the glyph buckets are per step). */
-const VEIL_STEPS = 4
-
-function veilAt(u: number, v: number, boxes: readonly Box[]): number {
-  let best = 0
-  for (const b of boxes) {
-    const dx = Math.max(0, Math.abs(u - b.cx) - b.hw) / b.fx
-    const dy = Math.max(0, Math.abs(v - b.cy) - b.hh) / b.fy
-    const d = Math.sqrt(dx * dx + dy * dy)
-    if (d >= 1) continue
-    const k = 1 - d * d * (3 - 2 * d)
-    if (k > best) best = k
-  }
-  return best
-}
-
+export const DIM = { day: 0.75, night: 0.8 } as const
 
 const subscribeNothing = () => () => {}
 /** False on the server and the hydration pass, true after: the theme is unknown before. */
@@ -258,6 +232,13 @@ const DAY = INKS.day.map(rgbOf)
 const NIGHT = INKS.night.map(rgbOf)
 const BASE_DAY = rgbOf(BASE.day)
 const BASE_NIGHT = rgbOf(BASE.night)
+
+/** The scene's inks (dimmed) and its base at a phase, 0 day to 1 night. Every phase between blends the two ends. */
+export function sceneInks(phase: number): { inks: number[][]; base: number[] } {
+  const base = mix(BASE_DAY, BASE_NIGHT, phase)
+  const k = DIM.day + (DIM.night - DIM.day) * phase
+  return { inks: DAY.map((d, r) => mix(mix(d, NIGHT[r], phase), base, k)), base }
+}
 /** Ease in and out (cubic): a setting sun starts and ends slowly. */
 const easeInOut = (k: number) => (k < 0.5 ? 4 * k * k * k : 1 - (-2 * k + 2) ** 3 / 2)
 
@@ -305,52 +286,26 @@ export function LakeScene({
     const sky = document.createElement("canvas")
     const skyCtx = sky.getContext("2d")
     let dpr = 1
-    let boxes: Box[] = []
     /** 0 day, 1 night: where the sun and the moon are, and how every ink is blended. */
     let phase = target.current
-    /** Each ink at each veil step for the current phase, and the base colour. */
-    let veiled: number[][][] = []
+    /** Each ink for the current phase, dimmed, and the base colour. */
+    let inks: number[][] = []
     let base = BASE_DAY
     const paint = () => {
-      base = mix(BASE_DAY, BASE_NIGHT, phase)
-      veiled = DAY.map((d, r) => {
-        const c = mix(d, NIGHT[r], phase)
-        return Array.from({ length: VEIL_STEPS + 1 }, (_, st) => mix(c, base, (VEIL_MIX * st) / VEIL_STEPS))
-      })
+      ;({ inks, base } = sceneInks(phase))
     }
     paint()
 
-    /** Ink, region and veil step at one cell. */
-    const inkAt = (i: number, j: number, t: number): [number, number, number] => {
+    /** Ink and region at one cell. */
+    const inkAt = (i: number, j: number, t: number): [number, number] => {
       const u = (i + 0.5) / cols
       const v = (j + 0.5) / rows
       const [L, region] = field(u, v, w / Math.max(1, h), t, phase, i, j)
-      const veil = boxes.length ? veilAt(u, v, boxes) : 0
       const raw = phase <= 0 ? toInk(L, region, false) : phase >= 1 ? toInk(L, region, true) : toInk(L, region, false) * (1 - phase) + toInk(L, region, true) * phase
-      let ink = raw * (1 - VEIL_THIN * veil)
+      let ink = raw
       // Thin out towards the bottom edge, where the page takes over.
       if (v > 0.8) ink *= Math.max(0, 1 - (v - 0.8) / 0.2)
-      return [ink, region, Math.round(veil * VEIL_STEPS)]
-    }
-
-    /** The marked text's boxes, in the canvas's own 0–1 units. */
-    const measureVeil = () => {
-      const frame = canvas.closest("[data-home-frame]")
-      const marked = frame ? [...frame.querySelectorAll<HTMLElement>("[data-scene-veil]")] : []
-      const c = canvas.getBoundingClientRect()
-      if (!c.width || !c.height) return marked
-      boxes = marked
-        .map((el) => el.getBoundingClientRect())
-        .filter((r) => r.width > 0 && r.height > 0)
-        .map((r) => ({
-          cx: (r.left + r.width / 2 - c.left) / c.width,
-          cy: (r.top + r.height / 2 - c.top) / c.height,
-          hw: (r.width / 2 + VEIL_PAD) / c.width,
-          hh: (r.height / 2 + VEIL_PAD) / c.height,
-          fx: VEIL_FALL_X / c.width,
-          fy: VEIL_FALL_Y / c.height,
-        }))
-      return marked
+      return [ink, region]
     }
 
     /** Dither rows into the small image: a dot in its ink, otherwise the base (the canvas is opaque). */
@@ -359,9 +314,9 @@ export function LakeScene({
       const px = image.data
       for (let j = from; j < to; j++) {
         for (let i = 0; i < cols; i++) {
-          const [ink, region, step] = inkAt(i, j, t)
+          const [ink, region] = inkAt(i, j, t)
           const o = (j * cols + i) * 4
-          const c = ink > BAYER[(j % 4) * 4 + (i % 4)] ? veiled[region][step] : base
+          const c = ink > BAYER[(j % 4) * 4 + (i % 4)] ? inks[region] : base
           px[o] = c[0]
           px[o + 1] = c[1]
           px[o + 2] = c[2]
@@ -371,14 +326,13 @@ export function LakeScene({
     }
 
     const glyphRows = (target2d: CanvasRenderingContext2D, from: number, to: number, t: number) => {
-      // One bucket per ink and veil step, so each is drawn in one colour.
-      const per = VEIL_STEPS + 1
-      const buckets: number[][] = Array.from({ length: DAY.length * per }, () => [])
+      // One bucket per ink, so each is drawn in one colour.
+      const buckets: number[][] = Array.from({ length: DAY.length }, () => [])
       for (let j = from; j < to; j++) {
         for (let i = 0; i < cols; i++) {
-          const [ink, region, step] = inkAt(i, j, t)
+          const [ink, region] = inkAt(i, j, t)
           const level = Math.min(ASCII_RAMP.length - 1, Math.floor(ink * ASCII_RAMP.length))
-          if (level > 0) buckets[region * per + step].push(i, j, level)
+          if (level > 0) buckets[region].push(i, j, level)
         }
       }
       // A system monospace face: these are glyphs drawn as a picture, not text to read.
@@ -387,7 +341,7 @@ export function LakeScene({
       target2d.textBaseline = "middle"
       buckets.forEach((cells, b) => {
         if (cells.length === 0) return
-        target2d.fillStyle = hexOf(veiled[Math.floor(b / per)][b % per])
+        target2d.fillStyle = hexOf(inks[b])
         for (let k = 0; k < cells.length; k += 3) {
           target2d.fillText(ASCII_RAMP[cells[k + 2]], cells[k] * cw + cw / 2, cells[k + 1] * ch + ch / 2)
         }
@@ -420,7 +374,6 @@ export function LakeScene({
       cols = Math.max(1, Math.ceil(w / cw))
       rows = Math.max(1, Math.ceil(h / ch))
       water = Math.min(rows, Math.max(0, Math.floor(HZ * rows - 0.5)))
-      measureVeil()
       if (dither && smallCtx) {
         small.width = cols
         small.height = rows
@@ -489,7 +442,6 @@ export function LakeScene({
       started = true
       phase = target.current
       resize()
-      veilKey = keyOf()
       draw(STILL_T)
       setShown(true)
       if (!still) frame = requestAnimationFrame(loop)
@@ -501,24 +453,14 @@ export function LakeScene({
       ? window.requestIdleCallback(start, { timeout: 600 })
       : window.setTimeout(start, 120)
 
-    let veilKey = ""
-    const keyOf = () => boxes.map((b) => `${b.cx.toFixed(4)},${b.cy.toFixed(4)},${b.hw.toFixed(4)},${b.hh.toFixed(4)}`).join(";")
     const ro = new ResizeObserver(() => {
-      if (!started) return
-      // Only a real change redraws: the canvas's box, or the marked text's
-      // (the greeting grows when the name arrives). Setting the canvas's
-      // pixel size in `resize` must not feed back into another resize.
-      const sized = canvas.clientWidth !== w || canvas.clientHeight !== h
-      if (!sized) {
-        measureVeil()
-        if (keyOf() === veilKey) return
-      }
+      // Only a real change of the canvas's box redraws: setting its pixel size
+      // in `resize` must not feed back into another resize.
+      if (!started || (canvas.clientWidth === w && canvas.clientHeight === h)) return
       resize()
-      veilKey = keyOf()
       draw(now())
     })
     ro.observe(canvas)
-    for (const el of measureVeil()) ro.observe(el)
     const io = new IntersectionObserver(([e]) => {
       visible = e?.isIntersecting ?? true
     })
