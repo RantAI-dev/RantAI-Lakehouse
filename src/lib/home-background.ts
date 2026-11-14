@@ -60,3 +60,15 @@ export function writeHomeBackground(storage: Writable | undefined, value: HomeBa
 export function drawsScene(value: HomeBackground): value is Exclude<HomeBackground, "off"> {
   return value !== "off"
 }
+
+/** The mark on `<html>` that says Off before React runs: `data-home-bg="off"`. */
+export const HOME_BACKGROUND_ATTR = "data-home-bg"
+
+/**
+ * Run by the root layout before the first paint (with the request's CSP
+ * nonce, like `next-themes`' own script): marks `<html>` when this browser
+ * chose Off, so the server-rendered loading look of Home draws no band and
+ * the page does not close up once JavaScript runs. A constant: it reads
+ * one known key and sets one known attribute, nothing from the request.
+ */
+export const HOME_BACKGROUND_SCRIPT = `try{if(localStorage.getItem(${JSON.stringify(HOME_BACKGROUND_KEY)})==="off")document.documentElement.setAttribute(${JSON.stringify(HOME_BACKGROUND_ATTR)},"off")}catch(e){}`

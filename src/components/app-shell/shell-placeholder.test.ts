@@ -25,8 +25,14 @@ describe("shellPlaceholderFor", () => {
     expect(shellPlaceholderFor("/dashboards/b1/charts/c1/edit")).toBe("page")
   })
 
+  it("gives Home its own placeholder (WEB-17 T5)", () => {
+    expect(shellPlaceholderFor("/")).toBe("home")
+    expect(shellPlaceholderFor("")).toBe("home")
+    expect(shellPlaceholderFor("/?from=login")).toBe("home")
+    expect(shellPlaceholderFor("/#top")).toBe("home")
+  })
+
   it("gives every other route the generic placeholder", () => {
-    expect(shellPlaceholderFor("/")).toBe("page")
     expect(shellPlaceholderFor("/catalog")).toBe("page")
     expect(shellPlaceholderFor("/dashboardsx")).toBe("page")
   })

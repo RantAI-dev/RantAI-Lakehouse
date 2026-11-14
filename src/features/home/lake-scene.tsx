@@ -383,11 +383,29 @@ export function LakeScene({
 }
 
 /**
- * The scene as Home's hero band: its solid base colour, the drawing on top,
- * and a soft fade at the bottom into the page, so the band has no edge.
+ * The hero band without the drawing: its solid base colour and the soft fade
+ * at the bottom into the page, so the band has no edge. Home's loading look
+ * draws this alone (`home-skeleton.tsx`); `LakeBand` draws the scene in it.
  * Positioned by the caller (absolute, behind the greeting and composer);
  * its height sets the scene's size.
  */
+export function LakeBandBase({ className, children }: { className?: string; children?: React.ReactNode }) {
+  return (
+    <div
+      aria-hidden
+      data-slot="lake-band"
+      className={cn(
+        "pointer-events-none [mask-image:linear-gradient(to_bottom,black_58%,transparent)]",
+        SCENE_BASE,
+        className,
+      )}
+    >
+      {children}
+    </div>
+  )
+}
+
+/** The scene as Home's hero band: `LakeBandBase` with the drawing on top. */
 export function LakeBand({
   variant,
   still,
@@ -398,15 +416,8 @@ export function LakeBand({
   className?: string
 }) {
   return (
-    <div
-      aria-hidden
-      className={cn(
-        "pointer-events-none [mask-image:linear-gradient(to_bottom,black_58%,transparent)]",
-        SCENE_BASE,
-        className,
-      )}
-    >
+    <LakeBandBase className={className}>
       <LakeScene variant={variant} still={still} />
-    </div>
+    </LakeBandBase>
   )
 }

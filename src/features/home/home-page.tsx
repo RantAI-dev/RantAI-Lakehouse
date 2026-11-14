@@ -3,7 +3,6 @@
 import * as React from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
-import { Database } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { canOpen } from "@/components/app-shell/nav-config"
@@ -12,12 +11,10 @@ import { ChatComposer, type ChatComposerHandle } from "@/features/copilot/chat-c
 import { useCopilot, type Mode } from "@/features/copilot/use-copilot"
 import { readLastBoard } from "@/features/dashboards/last-board"
 import { useService } from "@/hooks/use-service"
-import { drawsScene } from "@/lib/home-background"
 import { cardRead } from "@/lib/home-cards"
 import { focalBoard } from "@/lib/home-focal"
 import {
   CARD_IDS,
-  DEFAULT_SHORTCUTS,
   hiddenIds,
   SHORTCUT_IDS,
   WIDE_CARD,
@@ -54,10 +51,21 @@ import {
   type AttentionItem,
   type FocalState,
 } from "./home-widgets"
-import { LakeBand } from "./lake-scene"
 import { OpenAlertsCard } from "./open-alerts-card"
 import { SavedQueriesCard } from "./saved-queries-card"
 import { SourcesCard } from "./sources-card"
+import {
+  ATTENTION_SPAN,
+  BENTO_BOX,
+  BentoFrame,
+  BentoSkeleton,
+  ContextStrip,
+  GREETING,
+  HERO,
+  HomeFrame,
+  TOOLBAR_ROW,
+  ToolbarSkeleton,
+} from "./home-frame"
 import { useHomeBackground } from "./use-home-background"
 import { useHomeLayout } from "./use-home-layout"
 
@@ -329,6 +337,12 @@ export function HomePage() {
   const starts = shown.shortcuts.filter((id) => canOpen(SHORTCUTS[id].href, hasPermission))
 
   const pipelineList = pipelines.data?.pipelines ?? []
+  // The list route answers 200 with `error` set and no pipelines when it
+  // could not read them; that is a failed read, not "no pipelines yet".
+  const pipelinesRead: CheckState =
+    pipelines.status === "success" && pipelines.data.error && pipelineList.length === 0
+      ? "error"
+      : checkState(pipelines.status)
 
   const cardAllowed = React.useCallback(
     (id: CardId): boolean => {
@@ -373,7 +387,7 @@ export function HomePage() {
     ),
     "pipeline-runs": (
       <PipelinesWidget
-        state={checkState(pipelines.status)}
+        state={pipelinesRead}
         rows={pipelineRows(pipelineList, 4)}
         hasPipelines={pipelineList.length > 0}
         canConnect={canOpen("/connectors/create", hasPermission)}
@@ -409,32 +423,16 @@ export function HomePage() {
       items={attention}
       checkedAt={checkedAt}
       onAsk={(p) => fill(p, "ask")}
-      className={focalShown ? "@[560px]/bento:col-span-2 @[1000px]/bento:col-span-1" : "col-span-full"}
+      className={focalShown ? ATTENTION_SPAN : "col-span-full"}
     />
   ) : null
 
-  const scene = drawsScene(background)
   const martCount = marts.status === "success" && Array.isArray(marts.data) ? marts.data.length : null
 
-  // The page is its own scroller, exactly the viewport under the navbar
-  // (`--app-navbar-h`): the negative margins undo `AppFrame`'s padding so
-  // the lake reaches the edges, and the content puts the padding back.
-  // `relative`: without a positioned scroller, absolutely positioned
-  // descendants (the band, `sr-only` labels) escape its clipping and
-  // stretch the document, which then scrolls as well.
   return (
-    <div className="relative -m-4 h-[calc(100svh-var(--app-navbar-h))] overflow-y-auto sm:-m-5 lg:-m-6">
-      {drawsScene(background) ? (
-        <LakeBand variant={background} className="absolute inset-x-0 top-0 h-[300px] sm:h-[400px]" />
-      ) : null}
-      <div
-        className={cn(
-          "relative mx-auto flex max-w-[1180px] flex-col px-4 pb-6 sm:px-6",
-          scene ? "pt-[128px] sm:pt-[172px]" : "pt-8",
-        )}
-      >
-        <section aria-label="AI Copilot" className="mx-auto w-full max-w-[680px]">
-          <h1 className="text-center text-2xl leading-8 font-semibold tracking-[-0.02em] text-balance text-foreground">
+    <HomeFrame background={background}>
+        <section aria-label="AI Copilot" className={HERO}>
+          <h1 className={GREETING}>
             {greeting()}
             {displayName ? `, ${displayName}` : ""}
           </h1>
@@ -475,16 +473,13 @@ export function HomePage() {
         </section>
 
         {/* The quiet row between the hero and the bento: the create
-            shortcuts the person keeps, and Customize. Reserved while the
-            layout loads, so the bento does not move when it lands. */}
-        <div className="mt-6 flex min-h-8 flex-wrap items-center gap-1">
-          {layout.phase === "loading" ? (
-            <div aria-hidden inert className="invisible flex gap-1">
-              {DEFAULT_SHORTCUTS.map((id) => (
-                <ShortcutLink key={id} id={id} />
-              ))}
-            </div>
-          ) : layout.editing ? (
+            shortcuts the person keeps, and Customize. While the layout
+            loads it is the same row as bars (one loading look, T5). */}
+        {layout.phase === "loading" ? (
+          <ToolbarSkeleton />
+        ) : (
+        <div className={TOOLBAR_ROW}>
+          {layout.editing ? (
             <div className="w-full">
               <EditableShortcuts
                 ids={starts}
@@ -510,13 +505,13 @@ export function HomePage() {
             </>
           )}
         </div>
+        )}
 
-        <div className="mt-3 @container/bento">
-          {layout.phase === "loading" ? (
-            <BentoFrame focal={<FocalDashboard state={{ kind: "loading" }} className="h-full min-h-[420px]" />}>
-              {attentionNode}
-            </BentoFrame>
-          ) : layout.editing ? (
+        {layout.phase === "loading" ? (
+          <BentoSkeleton />
+        ) : (
+        <div className={BENTO_BOX}>
+          {layout.editing ? (
             <>
               <EditableCards
                 cards={shown.cards.filter(cardAllowed)}
@@ -552,33 +547,8 @@ export function HomePage() {
             </BentoFrame>
           )}
         </div>
-      </div>
-    </div>
-  )
-}
-
-/**
- * The bento's two shapes. With the focal dashboard: it on the left (7 of
- * 12 columns) as tall as the column beside it, the other widgets stacked on
- * the right. Without it: the widgets share the width, up to three across.
- * Below 1000 px of room the focal dashboard takes the full width and the
- * rest go two across; below 560 px everything is one column.
- */
-function BentoFrame({ focal, children }: { focal: React.ReactNode; children: React.ReactNode }) {
-  if (focal) {
-    return (
-      <div className="grid grid-cols-1 gap-3 @[1000px]/bento:grid-cols-12">
-        <div className="min-w-0 @[1000px]/bento:col-span-7">{focal}</div>
-        <div className="grid min-w-0 content-start gap-3 @[560px]/bento:grid-cols-2 @[1000px]/bento:col-span-5 @[1000px]/bento:grid-cols-1">
-          {children}
-        </div>
-      </div>
-    )
-  }
-  return (
-    <div className="grid grid-cols-1 content-start gap-3 @[560px]/bento:grid-cols-2 @[1000px]/bento:grid-cols-3">
-      {children}
-    </div>
+        )}
+    </HomeFrame>
   )
 }
 
@@ -596,26 +566,6 @@ function ShortcutLink({ id }: { id: keyof typeof SHORTCUTS }) {
       <Icon data-icon="inline-start" />
       {s.title}
     </Button>
-  )
-}
-
-/**
- * The composer's foot: what Ask reads and that it changes nothing, or that
- * Build can change things and asks first. One line, no wrap.
- */
-function ContextStrip({ mode, marts }: { mode: Mode; marts: number | null }) {
-  const reads =
-    marts === null ? "Reads the tables you can see" : `Reads the ${marts.toLocaleString()} ${marts === 1 ? "table" : "tables"} you can see`
-  return (
-    <div className="flex h-8 min-w-0 items-center gap-2 bg-muted/50 px-3.5 text-xs text-muted-foreground dark:bg-white/[0.03]">
-      <Database aria-hidden className="size-3.5 shrink-0" />
-      <span className="min-w-0 truncate">
-        {mode === "build" ? "Can build dashboards, pipelines and more" : reads}
-        <span aria-hidden> · </span>
-        {mode === "build" ? "Asks before each change" : "Answers only, changes nothing"}
-      </span>
-      <span className="ml-auto hidden shrink-0 text-[11px] text-muted-foreground/80 sm:inline">Enter to send</span>
-    </div>
   )
 }
 

@@ -4,6 +4,7 @@ import * as React from "react"
 
 import {
   DEFAULT_HOME_BACKGROUND,
+  HOME_BACKGROUND_ATTR,
   HOME_BACKGROUND_KEY,
   readHomeBackground,
   writeHomeBackground,
@@ -38,6 +39,7 @@ function subscribe(onChange: () => void): () => void {
   const onStorage = (e: StorageEvent) => {
     if (e.key === null || e.key === HOME_BACKGROUND_KEY) {
       memory = null
+      mark(snapshot())
       onChange()
     }
   }
@@ -48,12 +50,19 @@ function subscribe(onChange: () => void): () => void {
   }
 }
 
+/** Keep `<html data-home-bg>` (set before paint by the root layout's script) in step with the choice. */
+function mark(value: HomeBackground): void {
+  if (value === "off") document.documentElement.setAttribute(HOME_BACKGROUND_ATTR, "off")
+  else document.documentElement.removeAttribute(HOME_BACKGROUND_ATTR)
+}
+
 function snapshot(): HomeBackground {
   return memory ?? readHomeBackground(storage())
 }
 
 export function setHomeBackground(value: HomeBackground): void {
   memory = writeHomeBackground(storage(), value) ? null : value
+  mark(value)
   for (const l of listeners) l()
 }
 

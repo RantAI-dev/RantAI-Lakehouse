@@ -9,6 +9,7 @@ import { TableProviders } from "@/components/app-shell/table-providers";
 import { AuthProvider } from "@/features/auth/auth-provider";
 import { ReactGrabDev } from "@/components/app-shell/react-grab-dev";
 import { NONCE_HEADER } from "@/lib/csp";
+import { HOME_BACKGROUND_SCRIPT } from "@/lib/home-background";
 import { dashboardFontVariables } from "./fonts";
 import "./globals.css";
 
@@ -74,6 +75,10 @@ export default async function RootLayout({
         <link rel="icon" type="image/png" href="/icon-light-32.png" media="(prefers-color-scheme: light)" />
         <link rel="icon" type="image/png" href="/icon-dark-32.png" media="(prefers-color-scheme: dark)" />
         <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+        {/* WEB-17 T5: Home's Background choice is known before the first
+            paint, so its loading look draws a band only when there will be
+            one (`HOME_BACKGROUND_SCRIPT`, a constant). */}
+        <script nonce={nonce} dangerouslySetInnerHTML={{ __html: HOME_BACKGROUND_SCRIPT }} />
       </head>
       {/* Browser extensions (Grammarly, ColorZilla, password managers) put
           their own attributes on <body> before React hydrates; in dev that

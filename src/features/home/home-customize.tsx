@@ -157,7 +157,7 @@ export function EmptyHome({
   message?: string
 }) {
   return (
-    <div className="flex flex-col items-center gap-3 rounded-xl border border-dashed border-border px-4 py-10 text-center">
+    <div className="flex flex-col items-center gap-3 rounded-2xl bg-muted/45 px-4 py-10 text-center dark:bg-card">
       <p className="text-sm text-muted-foreground">{message}</p>
       {onCustomize ? (
         <Button variant="outline" size="sm" onClick={onCustomize}>
