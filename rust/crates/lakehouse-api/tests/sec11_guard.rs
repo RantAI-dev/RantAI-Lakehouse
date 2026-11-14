@@ -334,6 +334,13 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         ".map_err(|err| json!({ \"error\": err.to_string() }))",
         "an ApiError from routes::dashboard_access (viewer_for, scope_for_write, require_board_level): fixed texts written in this repository, a store failure is already \"database error\" through From<StoreError>",
     ),
+    // BI-18 D review round 2, BLOCKER 3: the report and template tools' one
+    // error helper.
+    (
+        "ai/tools/written.rs",
+        "json!({ \"error\": err.to_string() })",
+        "an ApiError from routes::dashboard_reports, dashboard_templates and dashboard_access (the routes' own functions): fixed texts written in this repository, a store failure is already \"database error\" or upstream_error::internal_error, a ClickHouse failure goes through classify_ch_error / classify_dashboard_ch_error / board_write_error / calc_fields::classify_ch (upstream_error), and BiError::Validation is lakehouse_bi's own text",
+    ),
     (
         "ai/tools/alerts.rs",
         "json!({ \"error\": err.to_string() })",

@@ -50,6 +50,16 @@ pub(super) fn handles(name: &str) -> bool {
     TOOLS.contains(&name)
 }
 
+/// The tool's answer for a refusal. BI-18 D review round 2, BLOCKER 3 (SEC-11):
+/// every `ApiError` that reaches here is text written in this repository. The
+/// route functions it comes from (`dashboard_reports`, `dashboard_templates`,
+/// `dashboard_access`) send a store failure through `store_failure` /
+/// `upstream_error::internal_error` or `From<StoreError>` ("database error"),
+/// and a `ClickHouse` failure through `classify_ch_error`,
+/// `classify_dashboard_ch_error`, `board_write_error` or
+/// `calc_fields::classify_ch`, all `upstream_error`; a `BiError::Validation` is
+/// `lakehouse_bi`'s own sentence; the rest are the routes' fixed sentences.
+/// Listed in `tests/sec11_guard.rs`.
 fn error(err: &lakehouse_core::ApiError) -> Value {
     json!({ "error": err.to_string() })
 }
