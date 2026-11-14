@@ -1,313 +1,184 @@
 "use client"
 
 import * as React from "react"
-import Link from "next/link"
 import { useRouter } from "next/navigation"
-import { ChevronDown, Folder, FolderCog, LayoutGrid, Lock, PlusIcon, Rows3, Sigma, Trash2, Upload } from "lucide-react"
+import { LayoutGrid, Rows3 } from "lucide-react"
 
-import { DataTable } from "@/components/data-table/data-table"
-import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
-import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
-import { PageHeader } from "@/components/patterns/page-header"
-import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
-import { Button } from "@/components/ui/button"
-import {
-  Dialog,
-  DialogClose,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
-import {
-  Select,
-  SelectContent,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { useDataTable } from "@/hooks/use-data-table"
+import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
+import { useIsMobile } from "@/hooks/use-mobile"
 import { useService, useServiceAction } from "@/hooks/use-service"
-import { useTableUrlState } from "@/hooks/use-table-url-state"
+import { useUrlTab } from "@/hooks/use-url-tab"
 import { useAuth } from "@/features/auth/auth-provider"
-import { filterDataClientSide } from "@/lib/data-table"
-import {
-  folderChoices,
-  folderOptionText,
-  isPersonalFolder,
-  itemHref,
-  labelledFolders,
-  manageableFolders,
-} from "@/lib/dashboard-organise"
-import {
-  buildFolderTree,
-  flattenFolders,
-  folderPath,
-  groupBoardsByFolder,
-  type FolderLike,
-} from "@/lib/folder-tree"
-import { formatRelativeTime } from "@/lib/format"
-import { notifyError, withNotify } from "@/lib/notify"
+import { folderChoices, labelledFolders, manageableFolders } from "@/lib/dashboard-organise"
+import { buildFolderTree, flattenFolders, folderPath } from "@/lib/folder-tree"
+import { notifyError, notifyFailure, notifyInfo, notifySuccess, withNotify } from "@/lib/notify"
 import { cn } from "@/lib/utils"
-import { dashboardService } from "@/services"
-import type { Board } from "@/services"
+import { dashboardReportService, dashboardService, dashboardTemplateService } from "@/services"
+import type { Board, DashboardTemplate } from "@/services"
+import { BoardFormDialog } from "./board-form-dialog"
 import { notifyDashboardsChanged } from "./dashboard-events"
-import {
-  BoardActionsMenu,
-  getDashboardColumns,
-  ShareBadges,
-  type BoardRowActions,
-} from "./dashboard-list-columns"
-import { FavouriteButton } from "./favourite-button"
-import { PRIVATE_HINT } from "./private-badge"
-import { FolderOptions } from "./folder-options"
 import { ImportDashboardDialog } from "./import-dashboard-dialog"
 import { ManageFoldersDialog, MoveBoardDialog } from "./folder-dialogs"
+import {
+  boardItem, filterItems, firstDirection, reportItem, sortItems, templateItem,
+  type KindFilter, type FolderFilter, type LibraryItem, type SortColumn, type SortState,
+} from "./library-items"
+import { FolderPicker, NewMenu, PageMenu, type FolderChoice, type ItemActions } from "./library-menus"
+import { BulkBar, favouriteItems, pickable, trashItems } from "./library-bulk"
+import { EmptyFolder, EmptyWorkspace, NoMatch, NoneOfKind } from "./library-empty"
+import { LibraryGallery } from "./library-gallery"
+import { EASE, FOCUS, PageFrame, ScrollRegion, SearchField, Segmented } from "./library-parts"
+import { LibraryTable, type FolderLookup } from "./library-table"
+import { ItemPicture, pictureSource } from "./library-picture"
+import { RecentRow } from "./library-recent"
+import { MoveItemsDialog } from "./move-items-dialog"
+import { UseTemplateDialog } from "./template-dialogs"
 import { forgetLastBoard } from "./last-board"
 import { TrashDialog } from "./trash-dialog"
 
-/** Select value for "no folder" (base-ui needs a non-empty value). */
-const NO_FOLDER = "__none__"
+/**
+ * The type filter, kept in `?tab=` so a link can open one kind (the report
+ * page's "Reports" link is `?tab=reports`). It replaces the three tabs of
+ * `BI-18` part D. Templates are for a holder of `dashboard:write` (BI-18 part
+ * D, T4), so a reader's filter has no Templates.
+ */
+type TabValue = "all" | "dashboards" | "reports" | "templates"
+const READER_TABS: readonly TabValue[] = ["all", "dashboards", "reports"]
+const WRITER_TABS: readonly TabValue[] = ["all", "dashboards", "reports", "templates"]
+const TAB_LABEL: Record<TabValue, string> = { all: "All", dashboards: "Dashboards", reports: "Reports", templates: "Templates" }
+const TAB_KIND: Record<TabValue, KindFilter> = { all: "all", dashboards: "dashboard", reports: "report", templates: "template" }
 
-type ViewMode = "gallery" | "table"
-const VIEW_STORAGE_KEY = "dashboards:list-view"
+/**
+ * The Dashboards page (`/dashboards/browse`, `BI-59`): find, make and organise
+ * the dashboards, reports and templates of the workspace.
+ *
+ * Reached on purpose, not as the way in: `/dashboards` forwards to the last
+ * board opened. This page is for managing the list.
+ *
+ * The header holds the one primary action (New), the page's ⋯ menu and a
+ * large search; nothing else (spec `BI-59` T1). The page is a frame that ends
+ * above the assistant bar, so the bar never covers a row (T5).
+ *
+ * Folders belong here, because folders organise dashboards and this is where
+ * dashboards are managed: the list shows each item's folder, the page menu
+ * opens the folder manager, "Move to folder…" is in each item's ⋯ menu, and a
+ * new dashboard can be filed on creation.
+ *
+ * The page reads every board at once: `/api/dashboard/boards` is not paged
+ * and a workspace holds few dashboards, so search and filters run here.
+ *
+ * The time column is **Updated**, never Created: `console.bi_board` is a
+ * `ReplacingMergeTree(created_at)`, so `created_at` is the version column
+ * rewritten on every save and has always meant "last changed".
+ */
+/**
+ * Table or Gallery (decision P2): Table is the default, and the choice is
+ * kept per browser. A new key rather than the old page's `dashboards:list-view`,
+ * whose default was the gallery, so everyone starts on the table the owner
+ * chose. Read after mount so the server's and the browser's first render
+ * agree, and wrapped in `try` because `localStorage` throws in a private
+ * window or with storage blocked: the page then works and only forgets.
+ */
+type ViewMode = "table" | "gallery"
+const VIEW_STORAGE_KEY = "dashboards:browse-view"
 
-/** Dialog buat/ubah nama + deskripsi sebuah dashboard. */
-function BoardFormDialog({
-  open,
-  onOpenChange,
-  title,
-  description,
-  submitLabel,
-  initialName,
-  initialDescription,
-  folders,
-  busy,
-  onSubmit,
-}: {
-  readonly open: boolean
-  readonly onOpenChange: (open: boolean) => void
-  readonly title: string
-  readonly description: string
-  readonly submitLabel: string
-  readonly initialName: string
-  readonly initialDescription: string
-  /** Given when creating: offers a folder to file the new dashboard in. */
-  readonly folders?: FolderLike[]
-  readonly busy: boolean
-  readonly onSubmit: (values: { name: string; description: string; folderId: string }) => void
-}) {
-  const [name, setName] = React.useState(initialName)
-  const [desc, setDesc] = React.useState(initialDescription)
-  const [folderId, setFolderId] = React.useState(NO_FOLDER)
-  const folderOptions = flattenFolders(buildFolderTree(folders ?? [], []).folders)
-
-  // Reset tiap kali dibuka: dialog ini dipakai ulang untuk baris yang
-  // berbeda, jadi state lama tidak boleh bocor ke board berikutnya.
+function useViewMode(): readonly [ViewMode, (next: ViewMode) => void] {
+  const [view, setView] = React.useState<ViewMode>("table")
   React.useEffect(() => {
-    if (open) {
-      setName(initialName)
-      setDesc(initialDescription)
-      setFolderId(NO_FOLDER)
+    try {
+      const saved = window.localStorage.getItem(VIEW_STORAGE_KEY)
+      if (saved === "gallery" || saved === "table") setView(saved)
+    } catch {
+      /* the default stays */
     }
-  }, [open, initialName, initialDescription])
+  }, [])
+  const change = React.useCallback((next: ViewMode) => {
+    setView(next)
+    try {
+      window.localStorage.setItem(VIEW_STORAGE_KEY, next)
+    } catch {
+      /* the choice holds for this visit, it is only not remembered */
+    }
+  }, [])
+  return [view, change] as const
+}
 
-  const clean = name.trim()
-  const canSubmit = clean.length > 0
-
+/** The Table / Gallery switch: two icon buttons with `aria-pressed`, in one soft group like the type filter. */
+/**
+ * The Table / Gallery switch: two icon buttons with `aria-pressed` in one soft
+ * group, 36 px tall like the search and the buttons beside it (BI-59 review
+ * round 2, SHOULD-FIX 3): a filled group, no border, the console's `rounded-lg`.
+ */
+function ViewSwitch({ value, onChange }: {
+  readonly value: ViewMode
+  readonly onChange: (next: ViewMode) => void
+}) {
+  const options = [
+    { value: "table" as const, label: "Table view", icon: Rows3 },
+    { value: "gallery" as const, label: "Gallery view", icon: LayoutGrid },
+  ]
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>{title}</DialogTitle>
-          <DialogDescription>{description}</DialogDescription>
-        </DialogHeader>
-        <div className="flex flex-col gap-3">
-          <div className="flex flex-col gap-1.5">
-            <Label htmlFor="board-name">Name</Label>
-            <Input
-              id="board-name"
-              autoFocus
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="Quarterly visitors"
-            />
-          </div>
-          <div className="flex flex-col gap-1.5">
-            <Label htmlFor="board-description">Description</Label>
-            <Input
-              id="board-description"
-              value={desc}
-              onChange={(e) => setDesc(e.target.value)}
-              placeholder="What this dashboard answers"
-            />
-            <p className="text-xs text-muted-foreground">
-              Optional. Shown in the dashboard list so others know what it is for.
-            </p>
-          </div>
-          {folderOptions.length > 0 ? (
-            <div className="flex flex-col gap-1.5">
-              <Label>Folder</Label>
-              <Select value={folderId} onValueChange={(v) => setFolderId(v ?? NO_FOLDER)}>
-                <SelectTrigger className="w-full">
-                  <SelectValue>
-                    {folderOptionText(folders ?? [], folderId === NO_FOLDER ? "" : folderId, "No folder")}
-                  </SelectValue>
-                </SelectTrigger>
-                <SelectContent>
-                  <FolderOptions folders={folders ?? []} noneValue={NO_FOLDER} noneLabel="No folder" />
-                </SelectContent>
-              </Select>
-              {isPersonalFolder(folders ?? [], folderId) ? (
-                <p className="text-xs text-muted-foreground">{PRIVATE_HINT}</p>
-              ) : null}
-            </div>
-          ) : null}
-        </div>
-        <DialogFooter>
-          <DialogClose render={<Button variant="outline" size="sm" />}>Cancel</DialogClose>
-          <Button
-            size="sm"
-            disabled={!canSubmit || busy}
-            onClick={() =>
-              onSubmit({
-                name: clean,
-                description: desc.trim(),
-                folderId: folderId === NO_FOLDER ? "" : folderId,
-              })
-            }
+    <div role="group" aria-label="View" className="inline-flex h-9 shrink-0 rounded-lg bg-muted/70 p-0.5 dark:bg-input/30">
+      {options.map((o) => {
+        const on = o.value === value
+        return (
+          <button
+            key={o.value}
+            type="button"
+            aria-pressed={on}
+            aria-label={o.label}
+            title={o.label}
+            onClick={() => onChange(o.value)}
+            className={cn(
+              "grid size-8 place-items-center rounded-md",
+              EASE, FOCUS,
+              on ? "bg-background text-foreground shadow-sm dark:bg-input/40" : "text-muted-foreground hover:text-foreground",
+            )}
           >
-            {busy ? "Working…" : submitLabel}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-/** One line of links: the caller's favourites or recent items (BI-18 part C, part 2). */
-function ShortcutStrip({
-  label,
-  items,
-}: {
-  readonly label: string
-  readonly items: { kind: "board" | "chart"; id: string; name: string; board?: string }[]
-}) {
-  if (items.length === 0) return null
-  return (
-    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm">
-      <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{label}</span>
-      {items.map((item) => (
-        <Link
-          key={`${item.kind}:${item.id}`}
-          href={itemHref(item)}
-          className="max-w-48 truncate rounded-md border bg-card px-2 py-0.5 hover:border-primary/40"
-        >
-          {item.name}
-        </Link>
-      ))}
+            <o.icon aria-hidden className="size-4" />
+          </button>
+        )
+      })}
     </div>
   )
 }
 
-/**
- * Kartu satu dashboard untuk tampilan galeri.
- *
- * The whole card opens the dashboard (a stretched link on the name), and
- * the ⋯ menu sits above that link so the card offers the same actions as a
- * table row. A menu button cannot be nested inside a link, hence the
- * overlay instead of wrapping the card in one.
- */
-function BoardCard({
-  board,
-  actions,
-}: {
-  readonly board: Board
-  readonly actions: BoardRowActions
+/** What the list says when it has no row: why, in words that fit the filter (T5's designed states). */
+function ListEmpty({ kind, query, folderFilter, folderPathOf, isPersonal, canWrite, anyOfKind, onShowAll }: {
+  readonly kind: KindFilter
+  readonly query: string
+  readonly folderFilter: FolderFilter
+  readonly folderPathOf: (id: string) => string
+  readonly isPersonal: (id: string) => boolean
+  readonly canWrite: boolean
+  /** Whether anything of this kind exists at all, before the search and folder. */
+  readonly anyOfKind: boolean
+  readonly onShowAll: () => void
 }) {
-  return (
-    <div
-      className={cn(
-        "group relative flex flex-col gap-3 rounded-xl border bg-card p-4 text-left",
-        "shadow-[0px_1px_2px_0px_rgba(0,0,0,0.05)] transition-colors hover:border-primary/40",
-      )}
-    >
-      <div className="flex items-start justify-between gap-2">
-        <Link
-          href={`/dashboards/${board.id}`}
-          className="min-w-0 font-medium outline-none after:absolute after:inset-0 after:rounded-xl group-hover:underline focus-visible:after:ring-2 focus-visible:after:ring-ring/50"
-        >
-          {board.name}
-        </Link>
-        <div className="relative z-10 -mt-1.5 -mr-2 flex shrink-0 items-center gap-1">
-          <ShareBadges board={board} />
-          <FavouriteButton
-            on={actions.isFavourite?.(board) ?? false}
-            name={board.name}
-            onToggle={() => actions.onToggleFavourite?.(board)}
-          />
-          <BoardActionsMenu board={board} actions={actions} />
-        </div>
-      </div>
-      <p className="line-clamp-2 min-h-8 text-sm text-muted-foreground">
-        {board.description || "No description."}
-      </p>
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
-        <span className="tabular-nums">
-          {board.chartCount ?? 0} {board.chartCount === 1 ? "tile" : "tiles"}
-        </span>
-        {board.builtin ? (
-          <span>Built-in</span>
-        ) : (
-          <>
-            {board.createdBy ? <span>{board.createdBy}</span> : null}
-            {board.updatedAt ? (
-              <span>Updated {formatRelativeTime(board.updatedAt)}</span>
-            ) : null}
-          </>
-        )}
-      </div>
-    </div>
-  )
+  if (query.trim()) return <NoMatch query={query.trim()} />
+  if (folderFilter !== null && anyOfKind) {
+    return (
+      <EmptyFolder
+        path={folderFilter ? folderPathOf(folderFilter) : "No folder"}
+        personal={Boolean(folderFilter) && isPersonal(folderFilter)}
+        onShowAll={onShowAll}
+      />
+    )
+  }
+  return <NoneOfKind kind={kind} canWrite={canWrite} />
 }
 
-/**
- * Halaman DAFTAR dashboard (`/dashboards/browse`) — galeri kartu atau tabel.
- *
- * Dituju dengan sengaja, bukan pintu masuk: `/dashboards` adalah penerus
- * yang membawa ke board terakhir. Halaman ini untuk MENGELOLA daftarnya.
- *
- * Folders belong here, because folders organise dashboards and this is
- * where dashboards are managed: the gallery is sectioned by folder, the
- * table has a Folder column, "Folders" opens the folder manager, "Move to
- * folder…" is in each dashboard's ⋯ menu, and a new dashboard can be filed
- * on creation. They used to live on a dashboard's canvas, the page for
- * charts, where they read as part of managing charts and were invisible
- * here (QA feedback). The canvas keeps only the title switcher, grouped by
- * folder, for moving between dashboards.
- *
- * Kanvas satu dashboard ada di `/dashboards/[id]`. Halaman ini sengaja
- * memuat seluruh board sekaligus: endpoint `/api/dashboard/boards` memang
- * tidak berhalaman, dan jumlah dashboard di satu workspace kecil. Karena
- * itu pencarian/filter dikerjakan di sisi klien.
- *
- * Kolom waktunya dilabeli **Updated**, bukan Created. `console.bi_board`
- * adalah `ReplacingMergeTree(created_at)` sehingga `created_at` adalah
- * kolom versi yang ditulis ulang setiap board disimpan — isinya "terakhir
- * diubah" sejak awal. Menyebutnya "Created" adalah klaim yang salah.
- */
 export function DashboardListPage() {
   const router = useRouter()
   const state = useService((s) => dashboardService.listBoards(s), [])
   // Folders are listed to everyone who can see dashboards; filing needs
   // `dashboard:write`, which the API enforces (policy.rs).
   const foldersState = useService((s) => dashboardService.listFolders(s), [])
+  const reportsState = useService((s) => dashboardReportService.listReports(s), [])
   const auth = useAuth()
   const me = auth.user?.id
+  const myName = auth.user?.name
   // The caller's own personal space is called "Personal space"; the folder
   // manager never offers one, and a dashboard is filed only in an ordinary
   // folder or the caller's own space (BI-18 part C, part 2).
@@ -318,6 +189,8 @@ export function DashboardListPage() {
   const fileable = React.useMemo(() => folderChoices(folders, me), [folders, me])
   const reloadFolders = foldersState.reload
   const canFile = auth.hasPermission("dashboard:write")
+  const tabValues = canFile ? WRITER_TABS : READER_TABS
+  const [tab, setTabRaw] = useUrlTab<TabValue>("tab", tabValues)
   // The personal space is created on first use: a writer with none yet opens it
   // once, then the folder list is read again.
   const spaceAsked = React.useRef(false)
@@ -330,52 +203,76 @@ export function DashboardListPage() {
       .then(() => reloadFolders())
       .catch(() => undefined)
   }, [canFile, me, foldersState.status, foldersState.data, reloadFolders])
+  // Templates are for a holder of `dashboard:write` (BI-18 part D, T4). A
+  // reader asks for nothing.
+  // The answer names the permission it was read for: `useService` shows the
+  // previous answer for one render after `canFile` changes, and a reader's
+  // empty stand-in must not pass for a writer's list.
+  const templatesState = useService(
+    async (s) => ({
+      forWriter: canFile,
+      list: canFile ? await dashboardTemplateService.listTemplates(s) : { templates: [], truncated: false },
+    }),
+    [canFile],
+  )
+  const templatesReady = templatesState.status === "error" || (templatesState.status === "success" && templatesState.data.forWriter === canFile)
+  const templates = React.useMemo(
+    () => (templatesState.status === "success" ? templatesState.data.list.templates : templatesState.status === "error" ? null : []),
+    [templatesState.status, templatesState.data],
+  )
+  // The pictures (decision P3): every stored chart's board, kind and width,
+  // read once for the whole page; no dashboard is read and no query runs.
+  // When it fails the pictures fall back to glyphs and the list still works.
+  const outlinesState = useService((s) => dashboardService.listChartOutlines(s), [])
+  const pictures = React.useMemo(
+    () => pictureSource(outlinesState.status === "success" ? outlinesState.data : outlinesState.status === "error" ? null : []),
+    [outlinesState.status, outlinesState.data],
+  )
   // Favourites and recent items (best effort: the list works without them).
   const shortcuts = useService((s) => dashboardService.shortcuts(s), [])
-  const favourites = React.useMemo(
-    () => (shortcuts.status === "success" ? shortcuts.data.favourites : []),
+  const favouriteIds = React.useMemo(
+    () => new Set((shortcuts.status === "success" ? shortcuts.data.favourites : []).filter((f) => f.kind === "board").map((f) => f.id)),
     [shortcuts],
   )
-  const recent = shortcuts.status === "success" ? shortcuts.data.recent : []
-  const favouriteIds = React.useMemo(
-    () => new Set(favourites.filter((f) => f.kind === "board").map((f) => f.id)),
-    [favourites],
-  )
   const reloadShortcuts = shortcuts.reload
+  const [query, setQueryRaw] = React.useState("")
+  const [folderFilter, setFolderFilterRaw] = React.useState<FolderFilter>(null)
+  // BI-59 T5: the ticked rows, by key. A change of search, type, folder or
+  // view clears them, so a bulk action never reaches a row that is not shown.
+  const [selected, setSelected] = React.useState<ReadonlySet<string>>(new Set())
+  const [bulkTrash, setBulkTrash] = React.useState<readonly LibraryItem[] | null>(null)
+  const [bulkBusy, setBulkBusy] = React.useState(false)
+  const clearSelection = React.useCallback(() => setSelected(new Set()), [])
+  const setQuery = (next: string) => {
+    setQueryRaw(next)
+    clearSelection()
+  }
+  const setFolderFilter = (next: FolderFilter) => {
+    setFolderFilterRaw(next)
+    clearSelection()
+  }
+  const [sort, setSort] = React.useState<SortState>({ column: "updated", dir: "desc" })
+  const [view, setViewRaw] = useViewMode()
+  const phone = useIsMobile()
+  const setView = (next: ViewMode) => {
+    setViewRaw(next)
+    clearSelection()
+  }
   const [trashOpen, setTrashOpen] = React.useState(false)
-  const [view, setView] = React.useState<ViewMode>("gallery")
-  const [collapsed, setCollapsed] = React.useState<Set<string>>(new Set())
   const [foldersOpen, setFoldersOpen] = React.useState(false)
   const [importOpen, setImportOpen] = React.useState(false)
   const [moving, setMoving] = React.useState<Board | null>(null)
-
-  // Preferensi tampilan dibaca setelah mount supaya markup server dan
-  // klien identik pada render pertama. Dibungkus `try` dengan alasan yang
-  // sama seperti `last-board.ts`: di mode privat atau saat kuota penuh,
-  // localStorage melempar, dan preferensi tata letak tidak layak
-  // menjatuhkan halamannya.
-  React.useEffect(() => {
-    try {
-      const saved = window.localStorage.getItem(VIEW_STORAGE_KEY)
-      if (saved === "gallery" || saved === "table") setView(saved)
-    } catch {
-      /* biarkan galeri sebagai bawaan */
-    }
-  }, [])
-  function changeView(next: ViewMode) {
-    setView(next)
-    try {
-      window.localStorage.setItem(VIEW_STORAGE_KEY, next)
-    } catch {
-      /* pilihan tetap berlaku untuk sesi ini, hanya tidak diingat */
-    }
-  }
-
+  const [movingItems, setMovingItems] = React.useState<readonly LibraryItem[] | null>(null)
+  const [using, setUsing] = React.useState<DashboardTemplate | null>(null)
   const [createOpen, setCreateOpen] = React.useState(false)
   const [renaming, setRenaming] = React.useState<Board | null>(null)
   const [deleting, setDeleting] = React.useState<Board | null>(null)
+  const [deletingReport, setDeletingReport] = React.useState<LibraryItem | null>(null)
+  const [deletingTemplate, setDeletingTemplate] = React.useState<LibraryItem | null>(null)
 
   const reload = state.reload
+  const reloadReports = reportsState.reload
+  const reloadTemplates = templatesState.reload
   const createAction = useServiceAction(
     withNotify(
       { success: "Dashboard created", error: "Could not create dashboard" },
@@ -413,269 +310,300 @@ export function DashboardListPage() {
       (signal, id: string) => dashboardService.deleteBoard(id, signal),
     ),
   )
+  const deleteReportAction = useServiceAction(
+    withNotify(
+      { success: "Moved to the trash", error: "Could not delete the report" },
+      (signal, id: string) => dashboardReportService.deleteReport(id, signal),
+    ),
+  )
+  const deleteTemplateAction = useServiceAction(
+    withNotify(
+      { success: "Template deleted", error: "Could not delete the template" },
+      (signal, id: string) => dashboardTemplateService.deleteTemplate(id, signal),
+    ),
+  )
 
-  const actions = React.useMemo<BoardRowActions>(
+  const toggleFavourite = React.useCallback(
+    (item: LibraryItem) => {
+      void (async () => {
+        try {
+          await dashboardService.setFavourite("board", item.id, !favouriteIds.has(item.id))
+        } catch (err) {
+          notifyError("Could not save the favourite", err)
+        }
+        reloadShortcuts()
+      })()
+    },
+    [favouriteIds, reloadShortcuts],
+  )
+  const actions = React.useMemo<ItemActions>(
     () => ({
-      onRename: canFile ? setRenaming : undefined,
-      onDelete: canFile ? setDeleting : undefined,
-      onMove: canFile ? setMoving : undefined,
-      isFavourite: (b) => favouriteIds.has(b.id),
-      onToggleFavourite: (b) => {
-        void (async () => {
-          try {
-            await dashboardService.setFavourite("board", b.id, !favouriteIds.has(b.id))
-          } catch (err) {
-            notifyError("Could not save the favourite", err)
-          }
-          reloadShortcuts()
-        })()
-      },
+      isFavourite: (item) => item.kind === "dashboard" && favouriteIds.has(item.id),
+      onToggleFavourite: toggleFavourite,
+      onRename: canFile ? (item) => item.board && setRenaming(item.board) : undefined,
+      onMove: canFile
+        ? (item) => (item.kind === "dashboard" && item.board ? setMoving(item.board) : setMovingItems([item]))
+        : undefined,
+      onTrash: canFile
+        ? (item) => (item.kind === "dashboard" && item.board ? setDeleting(item.board) : setDeletingReport(item))
+        : undefined,
       onDuplicate: canFile
-        ? (b) => {
+        ? (item) => {
             void (async () => {
-              const created = await duplicateAction.run(b.id)
+              const created = await duplicateAction.run(item.id)
               notifyDashboardsChanged()
               reload()
               if (created?.id) router.push(`/dashboards/${created.id}`)
             })()
           }
         : undefined,
+      onUseTemplate: canFile ? (item) => item.template && setUsing(item.template) : undefined,
+      onDeleteTemplate: canFile ? setDeletingTemplate : undefined,
     }),
-    [canFile, duplicateAction, favouriteIds, reload, reloadShortcuts, router],
-  )
-  const folderPathOf = React.useCallback(
-    (b: Board) => (b.folderId ? folderPath(folders, b.folderId) : ""),
-    [folders],
-  )
-  const columns = React.useMemo(
-    () => getDashboardColumns(actions, folderPathOf),
-    [actions, folderPathOf],
+    [canFile, duplicateAction, favouriteIds, reload, router, toggleFavourite],
   )
 
-  const tableUrlState = useTableUrlState()
-  const boards = React.useMemo(() => state.data ?? [], [state.data])
-  const filtered = React.useMemo(
+  const pathOf = React.useCallback((folderId: string) => (folderId ? folderPath(folders, folderId) : ""), [folders])
+  const folderLookup = React.useMemo<FolderLookup>(
+    () => ({ pathOf, isPersonal: (id) => Boolean(folders.find((f) => f.id === id)?.ownerId) }),
+    [folders, pathOf],
+  )
+
+  const items = React.useMemo<LibraryItem[]>(
+    () => [
+      ...(state.data ?? []).map(boardItem),
+      ...(reportsState.data?.reports ?? []).map(reportItem),
+      ...(templates ?? []).map(templateItem),
+    ],
+    [state.data, reportsState.data, templates],
+  )
+  const kind = TAB_KIND[tab]
+  const rows = React.useMemo(
+    () => sortItems(filterItems(items, { kind, folder: folderFilter, query }, pathOf), sort, pathOf),
+    [items, kind, folderFilter, query, sort, pathOf],
+  )
+  const folderChoicesList = React.useMemo<FolderChoice[]>(
     () =>
-      filterDataClientSide(boards, {
-        search: tableUrlState.search,
-        // The folder path is searchable, so typing a folder's name
-        // narrows the list to what is filed in it.
-        searchFields: [
-          (b) => b.name,
-          (b) => b.description ?? "",
-          (b) => b.createdBy ?? "",
-          folderPathOf,
-        ],
-        filters: tableUrlState.filters,
-        joinOperator: tableUrlState.joinOperator,
-      }),
-    [boards, folderPathOf, tableUrlState.search, tableUrlState.filters, tableUrlState.joinOperator],
+      flattenFolders(buildFolderTree(folders, []).folders).map(({ folder }) => ({
+        id: folder.id,
+        path: folderPath(folders, folder.id),
+        personal: Boolean(folder.ownerId),
+        count: items.filter((i) => i.kind !== "template" && i.folderId === folder.id).length,
+      })),
+    [folders, items],
   )
+  // A folder filter that names a folder no longer listed (it was deleted
+  // from the folder manager) falls back to every folder.
+  React.useEffect(() => {
+    if (folderFilter && foldersState.status === "success" && !folders.some((f) => f.id === folderFilter)) setFolderFilterRaw(null)
+  }, [folderFilter, folders, foldersState.status])
 
-  const { table } = useDataTable({
-    data: filtered,
-    columns,
-    enableAdvancedFilter: true,
-    paginationMode: "infinite",
-    manualPagination: false,
-    manualSorting: false,
-    manualFiltering: true,
-    persistKey: "/dashboards/browse",
-    initialState: { columnPinning: { right: ["actions"] } },
-    getRowId: (row) => row.id,
-  })
+  const sortBy = (column: SortColumn) =>
+    setSort((s) => (s.column === column ? { column, dir: s.dir === "asc" ? "desc" : "asc" } : { column, dir: firstDirection(column) }))
 
-  // Galeri membaca baris dari tabel, bukan dari `filtered` langsung. Toolbar
-  // di atasnya memegang satu kontrol urutan; kalau galeri memakai array
-  // mentahnya, kontrol itu berubah jadi tombol mati begitu tampilan diganti.
-  //
-  // Tanpa `useMemo`: `getRowModel()` sudah di-cache TanStack terhadap state
-  // tabel, sehingga membungkusnya lagi hanya menambah daftar dependensi yang
-  // tidak bisa dipercaya.
-  const visible = table.getRowModel().rows.map((r) => r.original)
-  // Empty folders are shown only when nothing narrows the list: under a
-  // search or filter an empty section is noise.
-  const narrowed = Boolean(tableUrlState.search) || tableUrlState.filters.length > 0
-  const sections = groupBoardsByFolder(folders, visible, !narrowed)
-  const toggleSection = (id: string) =>
-    setCollapsed((prev) => {
-      const next = new Set(prev)
-      if (!next.delete(id)) next.add(id)
-      return next
-    })
-
-  // BI-18 part C review fix (SHOULD-FIX) R27: without `dashboard:write` there is no button.
-  const newButton = canFile ? (
-    <Button size="sm" onClick={() => setCreateOpen(true)}>
-      <PlusIcon data-icon="inline-start" />
-      New dashboard
-    </Button>
-  ) : null
-
-  // Tidak ada primitive ToggleGroup di repo ini, jadi dua tombol ikon dengan
-  // `aria-pressed` — sama jelasnya bagi screen reader tanpa menambah primitive
-  // baru hanya untuk satu halaman.
-  const viewToggle = (
-    <div role="group" aria-label="Layout" className="flex items-center gap-1">
-      <Tooltip>
-        <TooltipTrigger
-          render={
-            <Button
-              variant={view === "gallery" ? "secondary" : "ghost"}
-              size="icon-sm"
-              aria-label="Gallery view"
-              aria-pressed={view === "gallery"}
-              onClick={() => changeView("gallery")}
-            />
-          }
-        >
-          <LayoutGrid />
-        </TooltipTrigger>
-        <TooltipContent>Gallery view</TooltipContent>
-      </Tooltip>
-      <Tooltip>
-        <TooltipTrigger
-          render={
-            <Button
-              variant={view === "table" ? "secondary" : "ghost"}
-              size="icon-sm"
-              aria-label="Table view"
-              aria-pressed={view === "table"}
-              onClick={() => changeView("table")}
-            />
-          }
-        >
-          <Rows3 />
-        </TooltipTrigger>
-        <TooltipContent>Table view</TooltipContent>
-      </Tooltip>
-    </div>
+  // The list waits for the three reads, so rows do not jump in as each one
+  // lands; a failed read of reports or templates is said under the list and
+  // leaves the dashboards usable.
+  // Until the session is known the templates read is a stand-in (`canFile` is
+  // still false), so the list also waits for it.
+  const loading = auth.status === "loading" || state.status === "loading" || reportsState.status === "loading" || !templatesReady || outlinesState.status === "loading"
+  const tabs = tabValues.map((v) => ({ value: v, label: TAB_LABEL[v] }))
+  const setTab = (next: TabValue) => {
+    setTabRaw(next)
+    clearSelection()
+  }
+  const ticked = rows.filter((r) => selected.has(r.key) && pickable(r))
+  const selection = canFile
+    ? {
+        selected,
+        onToggle: (item: LibraryItem) =>
+          setSelected((prev) => {
+            const next = new Set(prev)
+            if (!next.delete(item.key)) next.add(item.key)
+            return next
+          }),
+        onToggleAll: (list: readonly LibraryItem[], on: boolean) => setSelected(on ? new Set(list.map((i) => i.key)) : new Set()),
+      }
+    : undefined
+  const isFavourite = actions.isFavourite
+  async function favouriteTicked() {
+    setBulkBusy(true)
+    const out = await favouriteItems(ticked, isFavourite)
+    setBulkBusy(false)
+    reloadShortcuts()
+    clearSelection()
+    const skipped = out.skipped > 0 ? `${out.skipped.toLocaleString("en-US")} ${out.skipped === 1 ? "report was" : "reports were"} skipped: reports cannot be favourites.` : undefined
+    if (out.refused.length > 0) notifyFailure(`${out.refused.length.toLocaleString("en-US")} could not be added to favourites`, out.refused.map((r) => `${r.name}: ${r.reason}`).join(" "))
+    else notifySuccess(out.done === 1 ? "1 dashboard added to favourites" : `${out.done.toLocaleString("en-US")} dashboards added to favourites`, skipped)
+  }
+  async function trashTicked(list: readonly LibraryItem[]) {
+    setBulkBusy(true)
+    const out = await trashItems(list)
+    setBulkBusy(false)
+    setBulkTrash(null)
+    clearSelection()
+    if (out.done > 0) {
+      notifyDashboardsChanged()
+      reload()
+      reloadReports()
+      notifySuccess(`${out.done.toLocaleString("en-US")} moved to the trash`, "Restore them from the trash for 30 days.")
+    }
+    if (out.refused.length > 0) notifyFailure(`${out.refused.length.toLocaleString("en-US")} could not be moved to the trash`, out.refused.map((r) => `${r.name}: ${r.reason}`).join(" "))
+  }
+  // The workspace holds nothing but the built-in Main: the list says how to start.
+  const emptyWorkspace = !loading && state.status === "success" && items.every((i) => i.builtin)
+  const boardsById = React.useMemo(
+    () => new Map(items.filter((i) => i.kind === "dashboard").map((i) => [i.id, i])),
+    [items],
   )
+  const recent = shortcuts.status === "success" ? shortcuts.data.recent : []
 
   return (
-    <div className="flex flex-col gap-4">
-      <PageHeader
-        title="Dashboards"
-        description="Every dashboard in this workspace. Open one to edit its tiles, or create a new one."
-      />
-
-      {state.status === "loading" ? <LoadingSkeleton /> : null}
-      {state.status === "error" ? <ErrorState error={state.error} onRetry={reload} /> : null}
-
-      {state.status === "success" && boards.length === 0 ? (
-        <EmptyState
-          title="No dashboards yet"
-          description="Create a dashboard to collect charts, KPIs and tables on one canvas."
-          action={newButton}
+    <PageFrame>
+      {/*
+        BI-59 review round 2, SHOULD-FIX 3 (owner QA, "tingginya gede banget"; DESIGN.md §3 "Judul,
+        pencarian, dan aksi halaman satu baris yang ringkas"): one compact row, every control 36 px
+        (the console's h-9) with the title centred on them: the title, the search taking the
+        remaining width, the Table / Gallery switch, the page ⋯ and New. On a phone the title has
+        its own row, then the search, the ⋯ and an icon-only New; the switch stays in the filters
+        row there so the search keeps its room.
+      */}
+      <header className={cn("flex shrink-0 items-center gap-2", phone && "flex-wrap gap-y-3")}>
+        <h1 className={cn("mr-2 shrink-0 text-xl leading-9 font-semibold tracking-tight", phone && "w-full")}>Dashboards</h1>
+        {/*
+          BI-59 review round 3, SHOULD-FIX 4 (owner QA; DESIGN.md §3: the search has a normal width,
+          about 280 to 320 px, never the full row): on a laptop an empty gap takes the spare width
+          and the search is 288 px, widening to 360 px while focused (200 ms, off under reduced
+          motion). On a phone the search takes the row beside ⋯ and New, as before.
+        */}
+        {phone ? null : <div aria-hidden data-slot="header-gap" className="flex-1" />}
+        <SearchField
+          value={query}
+          onChange={setQuery}
+          className={
+            phone
+              ? "min-w-0 flex-1"
+              : "w-72 shrink-0 transition-[width] duration-200 ease-out focus-within:w-90 motion-reduce:transition-none"
+          }
         />
-      ) : null}
+        {phone ? null : <ViewSwitch value={view} onChange={setView} />}
+        <PageMenu
+          onFolders={canFile ? () => setFoldersOpen(true) : undefined}
+          onTrash={canFile ? () => setTrashOpen(true) : undefined}
+        />
+        {/* BI-18 part C review fix (SHOULD-FIX) R27: without `dashboard:write` there is no New. */}
+        {canFile ? (
+          <NewMenu
+            templates={templates}
+            renderPicture={(t) => (
+              <ItemPicture item={templateItem(t)} charts={null} size="sm" className="h-10 w-16 shrink-0" />
+            )}
+            onDashboard={() => setCreateOpen(true)}
+            onTemplate={setUsing}
+            onImport={() => setImportOpen(true)}
+          />
+        ) : null}
+      </header>
 
-      {state.status === "success" && boards.length > 0 ? (
-        <div className="space-y-4">
-          <ShortcutStrip label="Favourites" items={favourites} />
-          <ShortcutStrip label="Recent" items={recent.filter((r) => !favouriteIds.has(r.id))} />
-          <DataTableAdvancedToolbar
-            table={table}
-            onRefresh={reload}
-            trailing={
-              <div className="flex items-center gap-2">
-                {viewToggle}
-                <Button variant="outline" size="sm" render={<Link href="/dashboards/metrics" />}>
-                  <Sigma data-icon="inline-start" />
-                  Metrics
-                </Button>
-                {canFile ? (
-                  <Button variant="outline" size="sm" onClick={() => setFoldersOpen(true)}>
-                    <FolderCog data-icon="inline-start" />
-                    Folders
-                  </Button>
-                ) : null}
-                {/* BI-18 part C review fix (SHOULD-FIX) R18: the trash is for those who can restore. */}
-                {canFile ? (
-                  <Button variant="outline" size="sm" onClick={() => setTrashOpen(true)}>
-                    <Trash2 data-icon="inline-start" />
-                    Trash
-                  </Button>
-                ) : null}
-                {/* BI-19 part D (plan D14): a dashboard file in; the server asks for edit on the folder. */}
-                {canFile ? (
-                  <Button variant="outline" size="sm" onClick={() => setImportOpen(true)}>
-                    <Upload data-icon="inline-start" />
-                    Import…
-                  </Button>
-                ) : null}
-                {newButton}
-              </div>
-            }
-          >
-            <DataTableSearch placeholder="Search dashboards..." />
-          </DataTableAdvancedToolbar>
-
-          {visible.length === 0 ? (
-            <EmptyState
-              title="No matching dashboards"
-              description="No dashboard matches the current search or filters."
-            />
-          ) : view === "gallery" ? (
-            folders.length === 0 ? (
-              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                {visible.map((b) => (
-                  <BoardCard key={b.id} board={b} actions={actions} />
-                ))}
-              </div>
-            ) : (
-              <div className="flex flex-col gap-5">
-                {sections.map((section) => {
-                  const open = !collapsed.has(section.folderId)
-                  return (
-                    <section key={section.folderId || "none"} className="flex flex-col gap-2.5">
-                      <button
-                        type="button"
-                        aria-expanded={open}
-                        onClick={() => toggleSection(section.folderId)}
-                        className="flex w-fit items-center gap-2 rounded-md px-1 py-0.5 text-sm font-medium text-foreground transition-colors hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-                      >
-                        <ChevronDown
-                          className={cn("size-4 text-muted-foreground transition-transform", !open && "-rotate-90")}
-                          aria-hidden
-                        />
-                        {section.folderId ? (
-                          folders.find((f) => f.id === section.folderId)?.ownerId ? (
-                            <Lock className="size-4 text-muted-foreground" aria-hidden />
-                          ) : (
-                            <Folder className="size-4 text-muted-foreground" aria-hidden />
-                          )
-                        ) : null}
-                        {section.path || "No folder"}
-                        <span className="text-xs font-normal text-muted-foreground tabular-nums">
-                          {section.boards.length}
-                        </span>
-                      </button>
-                      {open ? (
-                        section.boards.length === 0 ? (
-                          <p className="px-1 text-xs text-muted-foreground">
-                            No dashboards in this folder.
-                          </p>
-                        ) : (
-                          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                            {section.boards.map((b) => (
-                              <BoardCard key={b.id} board={b} actions={actions} />
-                            ))}
-                          </div>
-                        )
-                      ) : null}
-                    </section>
-                  )
-                })}
-              </div>
-            )
-          ) : (
-            <div className="rounded-md border">
-              <DataTable table={table} />
+      <ScrollRegion className="-mx-2 mt-4 px-2 pb-6">
+        <div className="grid grid-cols-[minmax(0,1fr)] gap-7">
+          {!query.trim() && state.status === "success" && !loading ? (
+            <RecentRow recent={recent} boards={boardsById} source={pictures} />
+          ) : null}
+          <section aria-label="Dashboards, reports and templates" className="grid grid-cols-[minmax(0,1fr)] gap-3">
+            {/* The controls row; while rows are ticked it becomes the bulk bar, in the same place. */}
+            <div className="flex min-h-9 flex-wrap items-center justify-between gap-2">
+              {ticked.length > 0 ? (
+                <BulkBar
+                  count={ticked.length}
+                  canFavourite={ticked.some((i) => i.kind === "dashboard")}
+                  busy={bulkBusy}
+                  onClear={clearSelection}
+                  onMove={() => setMovingItems(ticked)}
+                  onFavourite={() => void favouriteTicked()}
+                  onTrash={() => setBulkTrash(ticked)}
+                />
+              ) : (
+                <>
+                  {/* Smaller and full width on a phone, so the four choices fit one line. */}
+                  <Segmented<TabValue> label="Type" size={phone ? "sm" : "default"} value={tab} onChange={setTab} options={tabs} className={cn(phone && "w-full")} />
+                  <div className={cn("flex items-center gap-2", phone && "w-full justify-between")}>
+                    <FolderPicker
+                      value={folderFilter}
+                      onChange={setFolderFilter}
+                      choices={folderChoicesList}
+                      noFolderCount={items.filter((i) => i.kind !== "template" && !i.folderId).length}
+                    />
+                    {phone ? <ViewSwitch value={view} onChange={setView} /> : null}
+                  </div>
+                </>
+              )}
             </div>
-          )}
+            {emptyWorkspace && !query.trim() && folderFilter === null && kind !== "report" && kind !== "template" ? (
+              <EmptyWorkspace canWrite={canFile} onNewDashboard={() => setCreateOpen(true)} />
+            ) : null}
+
+            {state.status === "error" ? <ErrorState error={state.error} onRetry={reload} /> : null}
+            {state.status !== "error" && loading ? <LoadingSkeleton /> : null}
+            {state.status === "success" && !loading ? (
+              rows.length === 0 ? (
+                <ListEmpty
+                  kind={kind}
+                  query={query}
+                  folderFilter={folderFilter}
+                  folderPathOf={pathOf}
+                  isPersonal={folderLookup.isPersonal}
+                  canWrite={canFile}
+                  anyOfKind={items.some((i) => kind === "all" || i.kind === kind)}
+                  onShowAll={() => setFolderFilter(null)}
+                />
+              ) : view === "gallery" ? (
+                <LibraryGallery
+                  items={rows}
+                  folders={folders}
+                  showEmpty={!query.trim() && folderFilter === null && (kind === "all" || kind === "dashboard")}
+                  actions={actions}
+                  myName={myName}
+                  pictures={pictures}
+                  onOpenTemplate={(item) => item.template && setUsing(item.template)}
+                  emptyFolder={(id) => <EmptyFolder compact path={pathOf(id)} personal={folderLookup.isPersonal(id)} />}
+                />
+              ) : (
+                <LibraryTable
+                  items={rows}
+                  sort={sort}
+                  onSort={sortBy}
+                  actions={actions}
+                  folders={folderLookup}
+                  myName={myName}
+                  onOpenTemplate={(item) => item.template && setUsing(item.template)}
+                  pictures={pictures}
+                  selection={selection}
+                  phone={phone}
+                />
+              )
+            ) : null}
+            {reportsState.status === "error" ? (
+              <p className="text-xs text-destructive">
+                Reports could not be listed: {reportsState.error.message}{" "}
+                <button type="button" className="underline underline-offset-4" onClick={reloadReports}>Try again</button>
+              </p>
+            ) : null}
+            {templatesState.status === "error" ? (
+              <p className="text-xs text-destructive">
+                Templates could not be listed: {templatesState.error.message}{" "}
+                <button type="button" className="underline underline-offset-4" onClick={reloadTemplates}>Try again</button>
+              </p>
+            ) : null}
+            {reportsState.data?.truncated ? (
+              <p className="text-xs text-muted-foreground">Showing the 1,000 most recently changed reports. Search to find an older one.</p>
+            ) : null}
+            {templatesState.data?.list.truncated ? (
+              <p className="text-xs text-muted-foreground">Showing the 500 newest templates.</p>
+            ) : null}
+          </section>
         </div>
-      ) : null}
+      </ScrollRegion>
 
       <BoardFormDialog
         open={createOpen}
@@ -755,6 +683,41 @@ export function DashboardListPage() {
           }}
         />
       ) : null}
+      {canFile ? (
+        <UseTemplateDialog
+          template={using}
+          folders={fileable}
+          onOpenChange={(open) => !open && setUsing(null)}
+          onStarted={(started) => {
+            setUsing(null)
+            notifyDashboardsChanged()
+            if (started.leftOut.length > 0) {
+              notifyInfo(
+                `${started.leftOut.length} chart(s) could not be copied`,
+                started.leftOut.map((c) => `${c.title}: ${c.reason}`).join(" "),
+              )
+            }
+            router.push(`/dashboards/${encodeURIComponent(started.board.id)}`)
+          }}
+        />
+      ) : null}
+
+      {canFile && movingItems ? (
+        <MoveItemsDialog
+          items={movingItems}
+          folders={fileable}
+          onOpenChange={(open) => !open && setMovingItems(null)}
+          onDone={(outcome) => {
+            clearSelection()
+            if (outcome.moved > 0) {
+              notifyDashboardsChanged()
+              reload()
+              reloadReports()
+              notifySuccess(outcome.moved === 1 ? "Moved" : `${outcome.moved.toLocaleString("en-US")} moved`)
+            }
+          }}
+        />
+      ) : null}
 
       {trashOpen ? (
         <TrashDialog
@@ -763,6 +726,7 @@ export function DashboardListPage() {
           onRestored={() => {
             notifyDashboardsChanged()
             reload()
+            reloadReports()
             reloadShortcuts()
           }}
         />
@@ -787,14 +751,70 @@ export function DashboardListPage() {
           void (async () => {
             await deleteAction.run(target.id)
             setDeleting(null)
-            // Kalau board ini yang terakhir dibuka, `/dashboards` tidak boleh
-            // menuntun balik ke sesuatu yang sudah tidak ada.
+            // If this board was the last one opened, `/dashboards` must not
+            // lead back to something that is gone.
             forgetLastBoard(target.id)
             notifyDashboardsChanged()
             reload()
           })()
         }}
       />
-    </div>
+      <ConfirmActionDialog
+        open={bulkTrash !== null}
+        onOpenChange={(open) => !open && setBulkTrash(null)}
+        title={`Move ${(bulkTrash?.length ?? 0).toLocaleString("en-US")} ${bulkTrash?.length === 1 ? "item" : "items"} to the trash?`}
+        description="Dashboards go with their tiles, and reports keep their charts on their dashboards. You can restore them for 30 days."
+        impact={(() => {
+          const linked = (bulkTrash ?? []).filter((i) => i.publicLink).map((i) => i.name)
+          if (linked.length === 0) return undefined
+          return `${linked.join(", ")} ${linked.length === 1 ? "has a public link" : "have public links"}. Anyone using ${linked.length === 1 ? "that link" : "those links"} will lose access.`
+        })()}
+        confirmLabel="Move to trash"
+        destructive
+        confirming={bulkBusy}
+        onConfirm={() => {
+          const list = bulkTrash
+          if (list) void trashTicked(list)
+        }}
+      />
+
+      <ConfirmActionDialog
+        open={deletingReport !== null}
+        onOpenChange={(open) => !open && setDeletingReport(null)}
+        title={`Delete ${deletingReport?.name ?? "report"}?`}
+        description="The report goes to the trash. You can restore it for 30 days. Its charts stay on their dashboards."
+        confirmLabel="Delete"
+        destructive
+        confirming={deleteReportAction.status === "pending"}
+        onConfirm={() => {
+          const target = deletingReport
+          if (!target) return
+          void (async () => {
+            await deleteReportAction.run(target.id)
+            setDeletingReport(null)
+            reloadReports()
+          })()
+        }}
+      />
+
+      <ConfirmActionDialog
+        open={deletingTemplate !== null}
+        onOpenChange={(open) => !open && setDeletingTemplate(null)}
+        title={`Delete the template ${deletingTemplate?.name ?? ""}?`}
+        description="The template is deleted for good. Dashboards already made from it are not changed."
+        confirmLabel="Delete"
+        destructive
+        confirming={deleteTemplateAction.status === "pending"}
+        onConfirm={() => {
+          const target = deletingTemplate
+          if (!target) return
+          void (async () => {
+            await deleteTemplateAction.run(target.id)
+            setDeletingTemplate(null)
+            reloadTemplates()
+          })()
+        }}
+      />
+    </PageFrame>
   )
 }

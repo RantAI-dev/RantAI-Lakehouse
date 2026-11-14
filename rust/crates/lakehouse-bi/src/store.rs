@@ -669,7 +669,11 @@ fn new_board_id() -> String {
     format!("b_{}", random_hex(4))
 }
 
-fn new_chart_id() -> String {
+/// A fresh chart id (`u_` and 8 hex characters). Public for the copy a
+/// dashboard template makes (`BI-18` part D, T3), which gives every chart of
+/// the new dashboard its own id, as [`duplicate_board`] does.
+#[must_use]
+pub fn new_chart_id() -> String {
     format!("u_{}", random_hex(4))
 }
 
@@ -3193,6 +3197,22 @@ pub fn stored_from_document(doc: &Value, board: &str, created_by: &str) -> Optio
         created_by: Some(created_by.to_owned()),
         created_at: None,
     })
+}
+
+/// A stored chart's document (`{ spec, def, hasYear }`), the exact shape
+/// `spec_json` holds and [`stored_from_document`] reads back: what a dashboard
+/// template keeps of each chart (`BI-18` part D, T3), so a dashboard started
+/// from it is a copy of the charts as they were, like [`duplicate_board`]'s,
+/// and not a rebuild against today's schema (a chart whose table is gone then
+/// keeps its tile and says so, decision T2). No row of data is in it.
+#[must_use]
+pub fn stored_document(chart: &StoredChartSpec) -> Value {
+    serde_json::to_value(StoredPayload {
+        spec: &chart.spec,
+        def: &chart.def,
+        has_year: chart.has_year,
+    })
+    .unwrap_or(Value::Null)
 }
 
 fn empty_chart_input() -> ChartInput {

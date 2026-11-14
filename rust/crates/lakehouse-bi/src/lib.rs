@@ -27,6 +27,7 @@ pub mod layers;
 pub mod layout;
 pub mod metrics;
 pub mod params;
+pub mod reports;
 pub mod search;
 pub mod shape;
 pub mod sources;

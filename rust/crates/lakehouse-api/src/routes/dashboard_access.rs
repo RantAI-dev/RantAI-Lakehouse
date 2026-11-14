@@ -296,6 +296,17 @@ impl Scope {
         self.map.level_at_root()
     }
 
+    /// The caller's level on folder `id` (`""` = the root), `None` for one
+    /// they have no level on. A report has no rules of its own: it takes its
+    /// folder's (`BI-18` part D, R2).
+    pub(crate) fn folder_level(&self, id: &str) -> Option<Level> {
+        if id.is_empty() {
+            self.root_level()
+        } else {
+            self.map.level_for_folder(id)
+        }
+    }
+
     /// Require `needed` at the root.
     ///
     /// # Errors

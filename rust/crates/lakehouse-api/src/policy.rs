@@ -765,6 +765,26 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // BI-1 (D5): a dashboard as a PDF. `dashboard:read`, narrowed by the roles
     // switched off from downloading (D7), audited before the file is sent.
     ("GET",    "/api/dashboard/export/pdf",   Policy::RequiresAuth),
+    // BI-18 part D (T1, feature R2): reports live in dashboard folders. Reading
+    // is "signed in" at the router and `dashboard:read` or a rule in the handler
+    // (`viewer_for`), like a dashboard; writing needs `dashboard:write` here
+    // (`BI-18D-AC8`) and `edit` on the folder in the handler (`manage` to move
+    // one out or delete it).
+    ("GET",    "/api/dashboard/reports",      Policy::RequiresAuth),
+    ("POST",   "/api/dashboard/reports",      Policy::RequiresPermission("dashboard:write")),
+    ("GET",    "/api/dashboard/reports/{id}", Policy::RequiresAuth),
+    ("PUT",    "/api/dashboard/reports/{id}", Policy::RequiresPermission("dashboard:write")),
+    ("DELETE", "/api/dashboard/reports/{id}", Policy::RequiresPermission("dashboard:write")),
+    // BI-18 part D (T2, R3): a report as a PDF, like `GET /api/dashboard/export/pdf`:
+    // read access and the download switch, checked in the handler, audited.
+    ("GET",    "/api/dashboard/reports/{id}/pdf", Policy::RequiresAuth),
+    // BI-18 part D (T3, feature T4): saving a template, listing them, starting a
+    // dashboard from one and deleting one all need `dashboard:write`; starting
+    // also needs `edit` on the folder, in the handler.
+    ("GET",    "/api/dashboard/templates",          Policy::RequiresPermission("dashboard:write")),
+    ("POST",   "/api/dashboard/templates",          Policy::RequiresPermission("dashboard:write")),
+    ("DELETE", "/api/dashboard/templates/{id}",     Policy::RequiresPermission("dashboard:write")),
+    ("POST",   "/api/dashboard/templates/{id}/use", Policy::RequiresPermission("dashboard:write")),
     // BI-19 B2: the Share dialog's embed state and sample token: `manage` on the
     // dashboard, in the handler.
     ("GET",    "/api/dashboard/embed-info",   Policy::RequiresAuth),
