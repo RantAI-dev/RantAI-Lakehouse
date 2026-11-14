@@ -31,8 +31,26 @@ mock.module("next/navigation", () => ({
 // them as plain nothing at the module boundary.
 mock.module("next/image", () => ({ default: () => null }))
 
+// WEB-15: the title's face comes through `next/font/local`, which only the
+// Next compiler can evaluate (it has no runtime default export). The face
+// carries no behaviour under test, so the loader returns an empty class.
+mock.module("next/font/local", () => ({
+  default: () => ({ className: "", variable: "", style: { fontFamily: "" } }),
+}))
+
+// WEB-15 T2: the sample dashboard is a `next/dynamic` import that loads after
+// the form. Here it never loads at all, which is what proves the form needs
+// nothing from it: every test in this file signs in without the showcase.
+mock.module("next/dynamic", () => ({ default: () => () => null }))
+
 import { AuthProvider } from "@/features/auth/auth-provider"
-import { LoginPage } from "./login-page"
+
+// WEB-15: imported after the mocks, not statically. The empty
+// `next/font/local` entry has no default export, and a static import links
+// the page's whole module graph before `mock.module` above can stand in for
+// it ("Missing 'default' export"); `next/image` never hit this because its
+// real module does have one.
+const { LoginPage } = await import("./login-page")
 
 const originalFetch = global.fetch
 
@@ -167,7 +185,119 @@ describe("LoginPage lockout surface (plan T5)", () => {
     const alert = await screen.findByRole("alert")
     // One generic message regardless of cause — the page must not leak
     // the server's non-enumeration constant ("invalid_or_expired").
-    expect(alert.textContent).toBe("Invalid username/email or password.")
+    expect(alert.textContent).toBe("Wrong username or password.")
     expect(alert.textContent).not.toContain("invalid_or_expired")
+  })
+})
+
+/**
+ * A `keydown` whose `getModifierState("CapsLock")` answers `on`. happy-dom's
+ * `KeyboardEvent` reports no lock keys at all, and React's synthetic event
+ * asks the native one, so the answer is set on the instance.
+ */
+function keyWithCapsLock(type: "keydown" | "keyup", on: boolean): KeyboardEvent {
+  const event = new KeyboardEvent(type, { key: "A", bubbles: true })
+  Object.defineProperty(event, "getModifierState", {
+    value: (key: string) => (key === "CapsLock" ? on : false),
+  })
+  return event
+}
+
+describe("LoginPage form (WEB-15 T1)", () => {
+  it("opens the refusal in place, shakes the form once and selects the password for retyping", async () => {
+    stubLoginApi(401, { error: "invalid_or_expired" })
+    render(
+      <AuthProvider>
+        <LoginPage />
+      </AuthProvider>,
+    )
+    await submitCredentials("rina@meridian.example", "wrong-password")
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toBe("Wrong username or password.")
+    expect(alert.id).toBe("login-error")
+
+    // WEB-15 spec: "the password is selected for retyping".
+    const password = screen.getByLabelText("Password") as HTMLInputElement
+    expect(password.getAttribute("aria-describedby")).toBe("login-error")
+    expect(document.activeElement).toBe(password)
+    expect(password.selectionStart).toBe(0)
+    expect(password.selectionEnd).toBe("wrong-password".length)
+
+    // The 240 ms shake is a class on the form (the motion itself is CSS, and
+    // sits inside `prefers-reduced-motion: no-preference`).
+    expect(password.closest("form")?.className).toContain("login-shake")
+  })
+
+  it("folds the refusal away once the person types again", async () => {
+    stubLoginApi(401, { error: "invalid_or_expired" })
+    render(
+      <AuthProvider>
+        <LoginPage />
+      </AuthProvider>,
+    )
+    await submitCredentials("rina@meridian.example", "wrong-password")
+    await screen.findByRole("alert")
+
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "right-password" } })
+    expect(screen.queryByRole("alert")).toBeNull()
+    expect(screen.getByLabelText("Password").getAttribute("aria-invalid")).toBe("false")
+  })
+
+  it("warns while Caps Lock is on in the password field, and stops on blur", async () => {
+    stubLoginApi(401, { error: "invalid_or_expired" })
+    render(
+      <AuthProvider>
+        <LoginPage />
+      </AuthProvider>,
+    )
+    await screen.findByLabelText("Username or email")
+    const password = screen.getByLabelText("Password")
+
+    fireEvent(password, keyWithCapsLock("keydown", true))
+    expect((await screen.findByRole("alert")).textContent).toBe("Caps Lock is on")
+
+    fireEvent(password, keyWithCapsLock("keyup", false))
+    expect(screen.queryByRole("alert")).toBeNull()
+
+    fireEvent(password, keyWithCapsLock("keydown", true))
+    expect(screen.getByRole("alert").textContent).toBe("Caps Lock is on")
+    fireEvent.blur(password)
+    expect(screen.queryByRole("alert")).toBeNull()
+  })
+
+  it("names the eye after what it does and switches the field's type", async () => {
+    stubLoginApi(401, { error: "invalid_or_expired" })
+    render(
+      <AuthProvider>
+        <LoginPage />
+      </AuthProvider>,
+    )
+    await screen.findByLabelText("Username or email")
+    const password = screen.getByLabelText("Password") as HTMLInputElement
+    expect(password.type).toBe("password")
+
+    fireEvent.click(screen.getByRole("button", { name: "Show password" }))
+    expect(password.type).toBe("text")
+    fireEvent.click(screen.getByRole("button", { name: "Hide password" }))
+    expect(password.type).toBe("password")
+  })
+})
+
+describe("LoginPage without the sample dashboard (WEB-15 T2)", () => {
+  it("renders a usable form while the sample dashboard has not loaded", async () => {
+    stubLoginApi(401, { error: "invalid_or_expired" })
+    render(
+      <AuthProvider>
+        <LoginPage />
+      </AuthProvider>,
+    )
+    await submitCredentials("rina@meridian.example", "wrong-password")
+    expect((await screen.findByRole("alert")).textContent).toBe("Wrong username or password.")
+
+    // The panel and its caption are there; the dashboard inside is not.
+    const panel = screen.getByRole("region", { name: "A preview of the console (sample data)" })
+    expect(panel.textContent).toContain("Sample data")
+    expect(panel.querySelector("[data-motion]")).toBeNull()
   })
 })
