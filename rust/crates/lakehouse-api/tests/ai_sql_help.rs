@@ -176,6 +176,71 @@ const FIX_MESSAGE: &str = "Why does this query fail? Fix it.\n\nEngine: clickhou
 const WRONG_PROPOSAL: &str = r#"{"sql":"SELECT no_such_col FROM silver.orders","reason":"Used the wrong column.","engine":"clickhouse"}"#;
 const RIGHT_PROPOSAL: &str = r#"{"sql":"SELECT order_id FROM silver.orders","reason":"The column is order_id, not no_such_col.","engine":"clickhouse"}"#;
 
+/// The fixed sentence `ClickHouse`'s code 47 (`UNKNOWN_IDENTIFIER`) gets, and
+/// so the browser's copy of a statement failure (owner 2026-11-12,
+/// LH-QS-2-08): the person reads this sentence and a reference, never the
+/// engine's own text.
+const COLUMN_DOES_NOT_EXIST: &str = "This query names a column that does not exist.";
+
+/// The engine's own answer for a statement that names a column that does not
+/// exist: code 47, `DB::Exception`, the identifier and the server version.
+const CLICKHOUSE_UNKNOWN_IDENTIFIER: &str = "Code: 47. DB::Exception: Unknown expression identifier 'pengunjungg' in scope. (UNKNOWN_IDENTIFIER) (version 26.8.1)";
+
+/// A `run_sql` call whose statement the engine refuses.
+const RUN_SQL_FAILING: &str = r#"{"sql":"SELECT pengunjungg FROM silver.orders"}"#;
+
+/// `ClickHouse` for a `run_sql` whose statement the engine answers with
+/// `answer`: the dry run (`EXPLAIN AST`) confirms a `SELECT`, the statement
+/// itself gets the engine's own answer.
+///
+/// The mocks are mounted in that order because `wiremock` answers with the
+/// FIRST matching mock in mount order: the dry run's body carries the
+/// statement too, so its mock has to come first to keep the statement's own
+/// answer out of the dry run.
+async fn mock_clickhouse_refusing(failing: &str, answer: ResponseTemplate) -> MockServer {
+    let ch = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("EXPLAIN AST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("SelectWithUnionQuery (children 1)\n ExpressionList ...\n"),
+        )
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(failing))
+        .respond_with(answer)
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [{"name": "n", "type": "UInt64"}],
+            "data": [{"n": 5}],
+            "rows": 1,
+        })))
+        .mount(&ch)
+        .await;
+    ch
+}
+
+/// The tool result the model read in the round at `index` (`0` is the first
+/// round), as the model received it: the tool's own result, with the
+/// model's copy of the failure in `error`.
+async fn model_tool_result(llm: &MockServer, index: usize) -> Value {
+    let requests = llm.received_requests().await.expect("recording is on");
+    let request: Value =
+        serde_json::from_slice(&requests[index].body).expect("a JSON model request");
+    let message = request["messages"]
+        .as_array()
+        .expect("messages are a list")
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "tool")
+        .unwrap_or_else(|| panic!("the model read a tool result: {request}"));
+    serde_json::from_str(message["content"].as_str().unwrap_or_default())
+        .expect("the tool result is a JSON object")
+}
+
 #[tokio::test]
 async fn an_allowlist_naming_propose_sql_offers_it_with_the_rules() {
     let llm = mock_model(vec![model_round(Some("Explained."), &[])]).await;
@@ -226,15 +291,22 @@ async fn a_proposal_clickhouse_rejects_returns_to_the_model_and_a_second_one_end
     );
     assert_eq!(trace[0]["tool"], "propose_sql");
     assert_eq!(trace[0]["ok"], false);
+    // LH-QS-2-08 (owner 2026-11-12): the person reads a fixed sentence and
+    // a reference, never the engine's text. The engine's diagnosis is the
+    // MODEL's copy, and it is in the model's next request.
     let error = trace[0]["result"]["error"].as_str().unwrap_or_default();
-    assert!(
-        error.contains("no_such_col"),
-        "the engine's text, cleaned: {error}"
-    );
-    assert!(
-        !error.contains("DB::Exception"),
-        "the prefix is cleaned: {error}"
-    );
+    let reference = error
+        .strip_prefix(&format!("{COLUMN_DOES_NOT_EXIST} Reference: "))
+        .unwrap_or_else(|| panic!("the fixed sentence and a reference: {error}"));
+    assert!(!reference.is_empty(), "{error}");
+    for engine_text in [
+        "no_such_col",
+        "DB::Exception",
+        "Code:",
+        "UNKNOWN_IDENTIFIER",
+    ] {
+        assert!(!error.contains(engine_text), "{engine_text} in {error}");
+    }
     assert_eq!(trace[1]["ok"], true);
     assert_eq!(trace[1]["result"]["proposed"], json!(true));
     assert_eq!(
@@ -243,6 +315,199 @@ async fn a_proposal_clickhouse_rejects_returns_to_the_model_and_a_second_one_end
     );
     let model_calls = llm.received_requests().await.expect("recording").len();
     assert_eq!(model_calls, 2, "no round runs after the accepted proposal");
+}
+
+/// Plan 86, step 2 (b): the same check for `propose_sql` — the model's copy
+/// keeps the engine's diagnosis and the SAME reference the person reads.
+#[tokio::test]
+async fn a_rejected_proposal_keeps_the_diagnosis_for_the_model_and_the_fixed_sentence_for_the_person()
+ {
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "propose_sql", WRONG_PROPOSAL)]),
+        model_round(Some("Explained."), &[]),
+    ])
+    .await;
+    let ch = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("no_such_col"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            "Code: 47. DB::Exception: Unknown identifier: no_such_col (UNKNOWN_IDENTIFIER) (version 26.8.1)",
+        ))
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(""))
+        .mount(&ch)
+        .await;
+
+    let (status, body) = chat(&llm, &ch, "true", Some(json!(["propose_sql"])), FIX_MESSAGE).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let trace = body["toolTrace"].as_array().expect("trace is a list");
+    assert_eq!(trace.len(), 1, "one step, the rejected proposal: {trace:?}");
+    let error = trace[0]["result"]["error"].as_str().unwrap_or_default();
+    let reference = error
+        .strip_prefix(&format!("{COLUMN_DOES_NOT_EXIST} Reference: "))
+        .unwrap_or_else(|| panic!("the fixed sentence and a reference: {error}"));
+    // The model reads the engine's diagnosis, with the SAME reference.
+    let model = model_tool_result(&llm, 1).await;
+    let model_error = model["error"].as_str().unwrap_or_default();
+    assert!(
+        model_error.contains("UNKNOWN_IDENTIFIER"),
+        "the model reads the diagnosis: {model}"
+    );
+    assert!(
+        model_error.contains(&format!(" Reference: {reference}")),
+        "the model's copy carries the same reference: {model}"
+    );
+}
+
+/// Plan 86, step 2 (a): `run_sql` whose statement the engine refuses. The
+/// person reads the fixed sentence and the reference; the model keeps the
+/// engine's diagnosis, byte for byte (SEC-11, the query-author exception).
+#[tokio::test]
+async fn a_failed_run_sql_shows_the_person_a_fixed_sentence_and_the_model_the_diagnosis() {
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "run_sql", RUN_SQL_FAILING)]),
+        model_round(Some("The column is order_id."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse_refusing(
+        "pengunjungg",
+        ResponseTemplate::new(400).set_body_string(CLICKHOUSE_UNKNOWN_IDENTIFIER),
+    )
+    .await;
+
+    let (status, body) = chat(
+        &llm,
+        &ch,
+        "true",
+        Some(json!(["run_sql"])),
+        "berapa tamu bulan ini?",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let trace = body["toolTrace"].as_array().expect("trace is a list");
+    assert_eq!(trace.len(), 1, "one step, the failed run: {trace:?}");
+    assert_eq!(trace[0]["tool"], "run_sql");
+    assert_eq!(trace[0]["ok"], false);
+
+    // The person's copy: the fixed sentence and the reference, and nothing of
+    // the engine's own text.
+    let error = trace[0]["result"]["error"].as_str().unwrap_or_default();
+    let reference = error
+        .strip_prefix(&format!("{COLUMN_DOES_NOT_EXIST} Reference: "))
+        .unwrap_or_else(|| panic!("the fixed sentence and a reference: {error}"));
+    assert!(!reference.is_empty(), "{error}");
+    for engine_text in [
+        "DB::Exception",
+        "Code:",
+        "pengunjungg",
+        "UNKNOWN_IDENTIFIER",
+    ] {
+        assert!(!error.contains(engine_text), "{engine_text} in {error}");
+    }
+
+    // The model's copy: the engine's diagnosis and the SAME reference.
+    let model = model_tool_result(&llm, 1).await;
+    let model_error = model["error"].as_str().unwrap_or_default();
+    assert!(
+        model_error.contains("Unknown expression identifier 'pengunjungg' in scope."),
+        "the model reads the engine's diagnosis: {model}"
+    );
+    assert!(
+        model_error.contains(&format!(" Reference: {reference}")),
+        "the model's copy carries the same reference: {model}"
+    );
+}
+
+/// Plan 86, step 2 (d): an engine failure that is not the statement's own
+/// (a proxy answering instead of the engine) keeps the same fixed message in
+/// both copies, as today.
+#[tokio::test]
+async fn a_run_sql_that_fails_for_another_reason_gives_both_copies_the_same_text() {
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "run_sql", RUN_SQL_FAILING)]),
+        model_round(Some("The engine is not answering."), &[]),
+    ])
+    .await;
+    // A proxy's page, not the engine answering that the STATEMENT is wrong:
+    // the text is this repository's own, so there is nothing to keep from the
+    // engine and both copies are the same.
+    let ch = mock_clickhouse_refusing(
+        "pengunjungg",
+        ResponseTemplate::new(502).set_body_string("<html><body>502 Bad Gateway</body></html>"),
+    )
+    .await;
+
+    let (status, body) = chat(
+        &llm,
+        &ch,
+        "true",
+        Some(json!(["run_sql"])),
+        "berapa tamu bulan ini?",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let trace = body["toolTrace"].as_array().expect("trace is a list");
+    assert_eq!(trace.len(), 1, "one step, the failed run: {trace:?}");
+    let error = trace[0]["result"]["error"].as_str().unwrap_or_default();
+    assert!(
+        error.starts_with("The database request failed. Reference: "),
+        "the fixed message and a reference: {error}"
+    );
+    let model = model_tool_result(&llm, 1).await;
+    let model_error = model["error"].as_str().unwrap_or_default();
+    assert_eq!(
+        error, model_error,
+        "both copies are the same fixed message: {model}"
+    );
+}
+
+/// Plan 86, step 2 (e): the key the browser's copy travels under is the
+/// server's alone. It reaches neither the browser nor the model.
+#[tokio::test]
+async fn the_server_only_key_reaches_neither_the_browser_nor_the_model() {
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "propose_sql", WRONG_PROPOSAL)]),
+        model_round(Some("Explained."), &[]),
+    ])
+    .await;
+    let ch = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("no_such_col"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            "Code: 47. DB::Exception: Unknown identifier: no_such_col (UNKNOWN_IDENTIFIER) (version 26.8.1)",
+        ))
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(""))
+        .mount(&ch)
+        .await;
+
+    let (status, body) = chat(&llm, &ch, "true", Some(json!(["propose_sql"])), FIX_MESSAGE).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !body.to_string().contains("_browserError"),
+        "the key never reaches the browser: {body}"
+    );
+    for (index, request) in llm
+        .received_requests()
+        .await
+        .expect("recording")
+        .iter()
+        .enumerate()
+    {
+        let text = String::from_utf8_lossy(&request.body);
+        assert!(
+            !text.contains("_browserError"),
+            "the key never reaches the model, round {index}: {text}"
+        );
+    }
 }
 
 #[tokio::test]

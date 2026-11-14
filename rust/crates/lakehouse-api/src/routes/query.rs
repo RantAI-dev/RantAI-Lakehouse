@@ -1501,6 +1501,83 @@ impl EngineFailure {
     }
 }
 
+/// A failure of the assistant's statement paths, in the two copies the
+/// owner's rule LH-QS-2-08 asks for.
+///
+/// The rule (owner 2026-11-12): an engine failure reaches a person as a
+/// fixed sentence and a reference, never as the engine's own text. The
+/// assistant's model still reads the engine's trimmed diagnosis (SEC-11, the
+/// query-author exception, product owner 2026-10-10), so the two copies
+/// differ — and they carry the SAME reference, which the log line holds.
+///
+/// The assistant's tools hand both copies back: the model's copy in the
+/// tool's `error`, the browser's copy next to it, in the one key only the
+/// server reads (`routes::ai::BROWSER_ERROR_KEY`).
+#[derive(Debug)]
+pub(crate) struct AssistantFailure {
+    /// The error the response carries: the model's copy for a statement the
+    /// engine refused, the fixed text for every other failure.
+    pub response: ApiError,
+    /// The browser's copy: the fixed sentence and the reference for a
+    /// statement the engine refused, the same text as `response` for every
+    /// other failure, because that text is this repository's own.
+    pub browser: String,
+}
+
+impl AssistantFailure {
+    /// A failure whose text is already fixed (a refusal, an unreachable
+    /// engine, a limit): the browser's copy is the text the response
+    /// carries.
+    fn fixed(response: ApiError) -> Self {
+        let browser = response.to_string();
+        Self { response, browser }
+    }
+
+    /// A statement the engine refused: the model's copy is the engine's
+    /// trimmed diagnosis and the reference, the browser's copy the fixed
+    /// sentence for the error code and the same reference.
+    fn statement(failure: upstream_error::StatementFailure) -> Self {
+        let browser = failure.recorded;
+        Self {
+            response: failure.response,
+            browser,
+        }
+    }
+
+    /// The two copies of an engine failure the run already classified: the
+    /// model's copy in `response`, the browser's copy in `message` (the
+    /// fixed sentence and the same reference).
+    fn from_engine(failure: EngineFailure) -> Self {
+        Self {
+            response: failure.response,
+            browser: failure.message,
+        }
+    }
+
+    /// The model's copy, as text.
+    pub fn model(&self) -> String {
+        self.response.to_string()
+    }
+}
+
+impl From<ApiError> for AssistantFailure {
+    /// A failure that was already an [`ApiError`]: a fixed text of this
+    /// repository's own, so both copies are the same.
+    fn from(failure: ApiError) -> Self {
+        Self::fixed(failure)
+    }
+}
+
+impl From<String> for AssistantFailure {
+    /// A refusal written as text (the policy's own message, the settings
+    /// rule's sentence): this repository's own text, so both copies are the
+    /// same. The status is the tool's business, never the caller's: the
+    /// tool's failure is text.
+    fn from(message: String) -> Self {
+        Self::fixed(ApiError::Unprocessable(message))
+    }
+}
+
 /// Runs the already-rewritten `sql` against whichever engine `engine`
 /// names, returning `(columns, rows, duration_ms, scanned_bytes)`. Split
 /// out of [`run`] purely to keep that function under
@@ -1614,17 +1691,20 @@ async fn execute_query_against_engine(
 ///
 /// # Errors
 ///
-/// Returns the message for the statement's author, as text. It is never an
-/// [`ApiError`] and reaches no HTTP response body from here; the caller
-/// hands it to a tool, which cleans it.
+/// Returns the failure as an [`AssistantFailure`]: the two copies the
+/// assistant's tools need. It is never an [`ApiError`] in a response body
+/// from here; the caller hands it to a tool, which cleans the model's copy
+/// and keeps the browser's copy for the server alone.
 /// - A statement that is not read-only: a fixed sentence naming that only
 ///   read statements can be proposed.
 /// - A statement the policy refuses: the policy's own non-leaking message,
 ///   from [`rewrite_sql_for_principal`].
 /// - A statement that names a setting other than `iceberg_snapshot_id`: the
 ///   settings rule's fixed sentence (`SEC-21`).
-/// - A statement `ClickHouse` cannot plan: its own SQL error text, which is
-///   the author's to see, the same text `run_sql` already treats as such.
+/// - A statement `ClickHouse` cannot plan: the model's copy is the engine's
+///   trimmed diagnosis and the reference (the author is the model, SEC-11),
+///   the browser's copy the fixed sentence for the error code and the same
+///   reference (owner 2026-11-12, LH-QS-2-08).
 /// - `engine` `"trino"`: a fixed "not supported yet" sentence. Plan 16
 ///   replaces this arm.
 pub(crate) async fn check_statement_would_run(
@@ -1632,19 +1712,21 @@ pub(crate) async fn check_statement_would_run(
     principal: &Principal,
     sql: &str,
     engine: &str,
-) -> Result<(), String> {
+) -> Result<(), AssistantFailure> {
     // The statement is read with the rules of the engine the request
     // names (`SEC-62`), as `run` reads it.
     if !is_read_only(sql, crate::sql_rewrite::Engine::from_name(engine)) {
-        return Err(
+        return Err(AssistantFailure::fixed(ApiError::Unprocessable(
             "Only read statements (SELECT/SHOW/DESCRIBE/EXPLAIN) can be proposed.".to_owned(),
-        );
+        )));
     }
     let rewritten = rewrite_sql_for_principal(state, sql, engine, principal)
         .await
         .map_err(|err| err.to_string())?;
     if is_trino_engine(engine) {
-        return Err("Checking a Trino statement is not supported yet.".to_owned());
+        return Err(AssistantFailure::fixed(ApiError::Unprocessable(
+            "Checking a Trino statement is not supported yet.".to_owned(),
+        )));
     }
     // SEC-21: the check sends the statement to the engine, so the proposal
     // must meet the settings rule a run applies, or the user would be shown a
@@ -1662,7 +1744,18 @@ pub(crate) async fn check_statement_would_run(
         // does (trimmed statement diagnosis so the model can correct its SQL;
         // an outage stays the fixed message with a reference id). The
         // console no longer gets it (owner 2026-11-12, LH-QS-2-08).
-        .map_err(|err| upstream_error::ch_message_for_author(&upstream_error::DATABASE, &err))
+        //
+        // LH-QS-2-08: the browser's copy of that failure is the fixed
+        // sentence and the reference, never the engine's text. Both copies
+        // come from ONE log line and ONE reference
+        // (`upstream_error::ch_failure_for_author`), so the sentence is not
+        // rebuilt here and the raw text is not logged twice.
+        .map_err(|err| {
+            AssistantFailure::statement(upstream_error::ch_failure_for_author(
+                &upstream_error::DATABASE,
+                &err,
+            ))
+        })
 }
 
 // The most rows one run hands back to the browser is the administrator's
@@ -1797,6 +1890,10 @@ pub async fn run(
         FailureText::Console,
     )
     .await
+    // The console reads the response's copy only: its browser copy is the
+    // same text (owner 2026-11-12, LH-QS-2-08), so dropping it changes
+    // nothing the console sees.
+    .map_err(|failure| failure.response.into())
 }
 
 /// The run of a statement that is already final: every `{{name}}` in it is
@@ -1825,17 +1922,24 @@ pub async fn run(
 /// `run` answers a fixed sentence instead (owner 2026-11-12, LH-QS-2-08), see
 /// [`run_statement_with`].
 ///
+/// The failure comes in two copies (owner 2026-11-12, LH-QS-2-08): the
+/// model's copy in `response`, the browser's copy in `browser` — a fixed
+/// sentence and the same reference. The assistant's tools hand both to the
+/// chat loop, which shows the browser's copy to the person and the model's
+/// copy to the model.
+///
 /// # Errors
 ///
 /// The same as [`run`], less the 400s for the request body and the
-/// parameters.
+/// parameters. The failure is an [`AssistantFailure`], not an
+/// [`ApiRejection`]: the tools read both copies of it.
 pub(crate) async fn run_statement(
     state: &AppState,
     principal: Option<&Principal>,
     headers: &HeaderMap,
     statement: &str,
     engine: &str,
-) -> ApiResult<ApiJson<Value>> {
+) -> Result<ApiJson<Value>, AssistantFailure> {
     run_statement_with(
         state,
         principal,
@@ -1872,7 +1976,7 @@ async fn run_statement_with(
     statement: &str,
     engine: &str,
     text: FailureText,
-) -> ApiResult<ApiJson<Value>> {
+) -> Result<ApiJson<Value>, AssistantFailure> {
     // The statement's tables are parsed with the dialect of the engine it
     // names (the same parser the policy step uses), and the history row
     // records them whether the run completes, fails or is refused (`QS-4`,
@@ -1893,7 +1997,7 @@ async fn run_statement_with(
         if let Some(p) = principal {
             record_blocked(state, p, statement, engine, &tables_read, &refusal).await;
         }
-        return Err(refusal.into());
+        return Err(AssistantFailure::fixed(refusal));
     }
 
     // See this function's doc comment: there is no honest value left to
@@ -1901,7 +2005,7 @@ async fn run_statement_with(
     // unauthenticated caller, so every engine requires a principal now —
     // `"anonymous"` is never written to `query_history` again.
     let Some(p) = principal else {
-        return Err(ApiError::unauthorized().into());
+        return Err(AssistantFailure::fixed(ApiError::unauthorized()));
     };
     let user_id = p.id.uuid().to_string();
     // BI-5: this caller's limits and the run (`X-Run-Id`) the statement
@@ -1917,7 +2021,7 @@ async fn run_statement_with(
                 .to_owned(),
         );
         record_blocked(state, p, statement, engine, &tables_read, &refusal).await;
-        return Err(refusal.into());
+        return Err(AssistantFailure::fixed(refusal));
     }
 
     // WS7 item C2: every ad hoc SQL surface is rewritten through the same
@@ -1956,7 +2060,7 @@ async fn run_statement_with(
                     0,
                 )
                 .await;
-                return Err(err.into());
+                return Err(AssistantFailure::fixed(err));
             }
         };
     // SEC-21: a statement's own `SETTINGS` would override the cap the run
@@ -1965,7 +2069,7 @@ async fn run_statement_with(
         && let Err(refusal) = refuse_unlisted_settings(&rewritten)
     {
         record_blocked(state, p, statement, engine, &tables_read, &refusal).await;
-        return Err(refusal.into());
+        return Err(AssistantFailure::fixed(refusal));
     }
 
     let started = Instant::now();
@@ -2002,7 +2106,13 @@ async fn run_statement_with(
                 started.elapsed().as_millis(),
             )
             .await;
-            return Err(failure.response.into());
+            // LH-QS-2-08 (owner 2026-11-12): the failure comes in two
+            // copies — the model's copy (`failure.response`, the engine's
+            // trimmed diagnosis so the model can correct its SQL) and the
+            // browser's copy (`failure.message`, the fixed sentence and the
+            // same reference). The console's copy is the response's text
+            // already; the assistant's tools need both.
+            return Err(AssistantFailure::from_engine(failure));
         }
     };
 
@@ -4050,14 +4160,19 @@ mod settings_rule_tests {
         env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT_ID.to_owned());
         let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
 
+        // Both copies are the settings rule's own sentence: the model's copy
+        // and the browser's copy are the same text, because that text is
+        // this repository's own (owner 2026-11-12, LH-QS-2-08).
         let refused = check_statement_would_run(
             &state,
             &analyst(),
             "SELECT n FROM serving.t SETTINGS max_result_rows = 0",
             "clickhouse",
         )
-        .await;
-        assert_eq!(refused, Err(SETTINGS_REFUSAL_MESSAGE.to_owned()));
+        .await
+        .expect_err("the settings rule must refuse the statement");
+        assert_eq!(refused.model(), SETTINGS_REFUSAL_MESSAGE);
+        assert_eq!(refused.browser, SETTINGS_REFUSAL_MESSAGE);
 
         let leaked: Vec<String> = server
             .received_requests()
@@ -4079,7 +4194,10 @@ mod settings_rule_tests {
             "clickhouse",
         )
         .await;
-        assert_eq!(allowed, Ok(()));
+        assert!(
+            allowed.is_ok(),
+            "the listed setting may be proposed: {allowed:?}"
+        );
         Ok(())
     }
 }
@@ -5403,7 +5521,7 @@ mod tests {
             .await
             .expect_err("a Trino query error is a failed run");
 
-            let text = err.0.to_string();
+            let text = err.model();
             assert!(text.contains("line 1:1: mismatched input"), "{text}");
             assert!(text.contains(" Reference: "), "{text}");
             assert!(!text.contains("trino-1.internal"), "{text}");
@@ -5458,6 +5576,67 @@ mod tests {
                 failure.message
             );
             assert!(!failure.message.contains("mismatched input"));
+        }
+
+        /// The two copies of a `Trino` statement failure (owner 2026-11-12,
+        /// LH-QS-2-08): the browser's copy is the fixed sentence and the
+        /// reference, the model's copy keeps the engine's trimmed diagnosis
+        /// so the model can correct its SQL (SEC-11, the query-author
+        /// exception).
+        ///
+        /// `Trino` is the narrowest seam here: both assistant tools hardcode
+        /// `engine: "clickhouse"`, so no route test can reach this arm.
+        #[test]
+        fn a_trino_statement_failure_gives_the_browser_the_fixed_sentence_and_the_model_the_diagnosis()
+         {
+            let failure = AssistantFailure::from_engine(map_trino_error(
+                TrinoError::Query(
+                    "line 1:1: mismatched input 'x' at trino-1.internal:8080".to_owned(),
+                ),
+                FailureText::Assistant,
+            ));
+
+            // The browser's copy: the fixed sentence and a reference, never
+            // the engine's own text.
+            let browser = failure.browser.clone();
+            let reference = browser
+                .strip_prefix(&format!(
+                    "{} Reference: ",
+                    upstream_error::STATEMENT_FAILED_SENTENCE
+                ))
+                .unwrap_or_else(|| panic!("the fixed sentence and a reference: {browser}"));
+            assert_eq!(reference.len(), 10, "{browser}");
+            for engine_text in ["mismatched input", "trino-1.internal", "SYNTAX_ERROR"] {
+                assert!(!browser.contains(engine_text), "{engine_text} in {browser}");
+            }
+
+            // The model's copy: the trimmed diagnosis, with the SAME
+            // reference, so the two copies name one failure.
+            let model = failure.model();
+            assert!(model.contains("line 1:1: mismatched input"), "{model}");
+            assert!(
+                model.contains(&format!(" Reference: {reference}")),
+                "{model}"
+            );
+            assert!(!model.contains("trino-1.internal"), "{model}");
+        }
+
+        /// A failure that is not the statement's own (an unreachable engine,
+        /// a timeout): the text is this repository's own, so the browser's
+        /// copy and the model's copy are the same text.
+        #[test]
+        fn a_trino_failure_that_is_not_the_statements_own_gives_both_copies_the_same_text() {
+            let failure = AssistantFailure::from_engine(map_trino_error(
+                TrinoError::Timeout,
+                FailureText::Assistant,
+            ));
+
+            assert_eq!(failure.browser, failure.model());
+            assert!(
+                failure.browser.contains("trino query timed out"),
+                "{}",
+                failure.browser
+            );
         }
 
         #[test]
@@ -6302,7 +6481,9 @@ mod tests {
             let result =
                 check_statement_would_run(&state, &analyst_principal().0, "SELECT 1", "trino")
                     .await;
-            let message = result.expect_err("the Trino arm must not pass the check yet");
+            let message = result
+                .expect_err("the Trino arm must not pass the check yet")
+                .model();
             assert!(
                 message.contains("not supported yet"),
                 "the Trino arm must say it is not supported yet: {message}"

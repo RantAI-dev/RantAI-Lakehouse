@@ -110,6 +110,68 @@ pub async fn build_status(
 
 const MAX_ITER: u32 = 8;
 
+/// The key a tool's result carries the browser's copy of an engine failure
+/// under.
+///
+/// Owner rule LH-QS-2-08 (owner 2026-11-12): an engine failure reaches a
+/// person as a fixed sentence and a reference, never as the engine's own
+/// text. The model still reads the engine's trimmed diagnosis (SEC-11, the
+/// query-author exception, product owner 2026-10-10), so a tool hands back
+/// BOTH copies: the diagnosis in `error` (the model's copy) and the fixed
+/// sentence in this key (the browser's copy).
+///
+/// The chat loop takes this key out before it builds either copy
+/// ([`take_browser_error`]), so it reaches neither the model nor the
+/// browser. The name is not part of the wire contract: no client reads
+/// it, and it is gone from every payload a browser reads — the chat
+/// loop's trace, `POST /api/ai/tool`'s answer, and an agent run's step
+/// and outcome detail ([`without_browser_error`]).
+pub(in crate::routes) const BROWSER_ERROR_KEY: &str = "_browserError";
+
+/// Puts a tool's browser copy of an engine failure next to its error, in
+/// the one key only the server reads ([`BROWSER_ERROR_KEY`]).
+pub(in crate::routes) fn with_browser_error(mut result: Value, browser: &str) -> Value {
+    if let Value::Object(map) = &mut result {
+        map.insert(
+            BROWSER_ERROR_KEY.to_owned(),
+            Value::String(browser.to_owned()),
+        );
+    }
+    result
+}
+
+/// Takes the browser's copy of a tool's failure out of the tool's result:
+/// the key is removed and the text returned, so the chat loop can show it
+/// to the person while the model's copy stays with the model.
+fn take_browser_error(result: Value) -> (Value, Option<String>) {
+    let mut map = match result {
+        Value::Object(map) => map,
+        other => return (other, None),
+    };
+    let browser = map
+        .remove(BROWSER_ERROR_KEY)
+        .and_then(|value| value.as_str().map(str::to_owned));
+    (Value::Object(map), browser)
+}
+
+/// A tool's result with the browser's copy of an engine failure taken out:
+/// for a caller that hands the result to a browser and has no use for the
+/// copy (a run's step detail, a run's outcome detail). The key is the
+/// server's own ([`BROWSER_ERROR_KEY`]), so it never reaches a browser.
+pub(in crate::routes) fn without_browser_error(result: Value) -> Value {
+    take_browser_error(result).0
+}
+
+/// The browser's copy of a tool's failure: the tool's result with its
+/// `error` replaced by the fixed sentence and the reference.
+fn browser_copy(result: &Value, browser: &str) -> Value {
+    let mut result = result.clone();
+    if let Value::Object(map) = &mut result {
+        map.insert("error".to_owned(), Value::String(browser.to_owned()));
+    }
+    result
+}
+
 /// What a late `ask_user` gets back (plan 14). The model reads it on its
 /// next round, so it asks the model to answer with the reading it used.
 /// The wording forbids the three defects staging QA saw in the model's
@@ -1234,6 +1296,15 @@ async fn run_chat(
                 let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
                 (result, if ok { "executed" } else { "failed" }, None, None)
             };
+            // LH-QS-2-08 (owner 2026-11-12): a tool that failed on an
+            // engine statement hands back two copies — the model's copy
+            // (the engine's trimmed diagnosis, so the model can correct its
+            // SQL) and the browser's copy (a fixed sentence and the same
+            // reference). The browser's copy is taken out HERE, before
+            // either copy is built, so the key reaches neither the model nor
+            // the browser; the trace carries the browser's copy and the
+            // model carries its own.
+            let (result, browser_error) = take_browser_error(result);
             let (resource_kind, resource_id) =
                 audit::resource_for(&call.function.name, &args, &result);
             audit::record(
@@ -1251,8 +1322,11 @@ async fn run_chat(
             )
             .await;
             let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
+            let trace_result = browser_error
+                .as_deref()
+                .map_or_else(|| result.clone(), |text| browser_copy(&result, text));
             tool_trace.push(json!({
-                "tool": call.function.name, "args": args, "ok": ok, "result": result,
+                "tool": call.function.name, "args": args, "ok": ok, "result": trace_result,
             }));
             // plan 14: an accepted ask ends the turn. The question is the
             // reply, so the reader sees it above the option buttons; calls
@@ -1659,6 +1733,11 @@ pub async fn tool_call(
         let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
         (result, if ok { "executed" } else { "failed" }, None, None)
     };
+    // LH-QS-2-08: the tool's browser copy of an engine failure lives in the
+    // one key only the server reads, so it is taken out here as well: this
+    // route answers a browser caller, and the key is not part of the wire
+    // contract. What the caller sees is the tool's own result, unchanged.
+    let (result, _) = take_browser_error(result);
     let (resource_kind, resource_id) = audit::resource_for(&parsed.tool, &parsed.args, &result);
     audit::record(
         state.pg.as_deref(),
