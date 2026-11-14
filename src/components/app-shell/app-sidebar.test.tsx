@@ -9,12 +9,15 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import { SidebarProvider } from "@/components/ui/sidebar"
+import { act } from "@testing-library/react"
+import { forgetLastBoard, rememberLastBoard } from "@/features/dashboards/last-board"
 import { AppSidebar } from "./app-sidebar"
 
 const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } })
 
 afterEach(() => {
   cleanup()
+  window.localStorage.clear()
   mock.restore()
 })
 
@@ -70,5 +73,52 @@ describe("AppSidebar, the Dashboards split row", () => {
     expect(browse.className).toContain("size-8")
     expect(dashboards.closest("li")).toBe(browse.closest("li"))
     expect(browse.previousElementSibling?.className).toContain("w-px")
+  })
+})
+
+// BI-61 T10 (owner QA 2026-11-15): the row is named after the dashboard it opens.
+describe("AppSidebar, the Dashboards row names the board it opens", () => {
+  const row = () => document.querySelector("a[href^='/dashboards']:not([aria-label='Browse all dashboards'])") as HTMLAnchorElement
+
+  it("says Dashboards and goes to Browse when no board is remembered", async () => {
+    renderSidebar(true)
+    await screen.findByRole("link", { name: "Dashboards" })
+    expect(row().getAttribute("href")).toBe("/dashboards/browse")
+  })
+
+  it("is named after the remembered board and goes to it", async () => {
+    rememberLastBoard("b1", "Revenue")
+    renderSidebar(true)
+    const link = await screen.findByRole("link", { name: "Dashboard: Revenue" })
+    expect(link.textContent).toBe("Revenue")
+    expect(link.getAttribute("href")).toBe("/dashboards/b1")
+  })
+
+  it("keeps Dashboards for an old id-only value, but still goes to the board", async () => {
+    window.localStorage.setItem("dashboards:last-board", "b1")
+    renderSidebar(true)
+    const link = await screen.findByRole("link", { name: "Dashboards" })
+    expect(link.getAttribute("href")).toBe("/dashboards/b1")
+  })
+
+  it("forgetting, which is what opening Browse does, brings Dashboards and the Browse href back", async () => {
+    rememberLastBoard("b1", "Revenue")
+    renderSidebar(true)
+    await screen.findByRole("link", { name: "Dashboard: Revenue" })
+    act(() => forgetLastBoard())
+    expect((await screen.findByRole("link", { name: "Dashboards" })).getAttribute("href")).toBe("/dashboards/browse")
+  })
+
+  it("opening another board, or renaming it, updates the label at once", async () => {
+    rememberLastBoard("b1", "Revenue")
+    renderSidebar(true)
+    await screen.findByRole("link", { name: "Dashboard: Revenue" })
+    act(() => rememberLastBoard("b2", "Ops"))
+    expect((await screen.findByRole("link", { name: "Dashboard: Ops" })).getAttribute("href")).toBe("/dashboards/b2")
+    act(() => rememberLastBoard("b2", "Operations"))
+    await screen.findByRole("link", { name: "Dashboard: Operations" })
+    // a name belonging to another board is never shown
+    act(() => rememberLastBoard("b3"))
+    expect((await screen.findByRole("link", { name: "Dashboards" })).getAttribute("href")).toBe("/dashboards/b3")
   })
 })
