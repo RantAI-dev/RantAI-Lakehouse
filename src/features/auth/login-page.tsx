@@ -23,6 +23,7 @@ import * as authClient from "@/services/clients/auth";
 import { toServiceError } from "@/services/errors";
 import { useAuth } from "./auth-provider";
 import { ChangePasswordStep } from "./change-password-step";
+import { LoginContours } from "./login-contours";
 import { LOGIN_DISPLAY, loginDisplay } from "./login-fonts";
 import { SsoNotice } from "./sso-notice";
 import "./login.css";
@@ -82,9 +83,44 @@ function useDesktop(): boolean {
   return React.useSyncExternalStore(subscribeDesktop, () => window.matchMedia(DESKTOP_QUERY).matches, () => false);
 }
 
-/** The console's interaction easing: the properties that change, never `all`. */
+/**
+ * The console's interaction easing: the properties that change, never `all`.
+ * 160 ms (`WEB-15` T5, emil-design-eng: press feedback 100 to 160 ms, inside
+ * DESIGN.md's 150 to 250), on a strong ease-out so the response starts at once.
+ * `scale` and `translate` by name: Tailwind 4's `scale-*` and `translate-*`
+ * set those properties, not `transform`, so a list naming only `transform`
+ * would let them jump.
+ */
 const EASE =
-  "transition-[background-color,border-color,color,box-shadow,opacity,transform] duration-200 ease-[cubic-bezier(0.2,0,0,1)]";
+  "transition-[background-color,border-color,color,box-shadow,opacity,scale,translate] duration-[160ms] ease-[cubic-bezier(0.2,0,0,1)]";
+
+/**
+ * Press feedback (`WEB-15` T5, emil-design-eng): a button gives a little
+ * under the pointer, scaling to 0.97, in place of the console's 1 px drop.
+ * Not on a disabled button, and not with reduced motion.
+ */
+const PRESS = "active:translate-y-0 motion-safe:active:not-disabled:scale-[0.97]";
+
+/**
+ * The fields' focus ring eases in rather than snapping on (`WEB-15` T5):
+ * the input group already eases its border colour; this adds the ring.
+ */
+const FIELD_EASE =
+  "transition-[color,background-color,border-color,box-shadow] duration-150 ease-[cubic-bezier(0.2,0,0,1)] motion-reduce:transition-none";
+
+/**
+ * The Sign in button in the logo's navy (`WEB-15` T4, owner 2026-11-14):
+ * `#050A2F` with white text on the light page (about 19:1), a shade lighter
+ * on hover. On the dark page a navy button would sink into the background,
+ * so it turns over like the logo's dark variant: near-white with navy text,
+ * pure white on hover. The focus ring stands off the button by the page's
+ * own colour so it reads against the navy as well as the white page. While
+ * signing in the button is disabled but keeps its colours (the console's
+ * button would fade to half), since the spinner already says it is busy.
+ * This page only: the console's primary colour and tokens are unchanged.
+ */
+const SIGN_IN_COLOURS =
+  "bg-[#050A2F] text-white hover:bg-[#161D4A] focus-visible:border-transparent focus-visible:ring-2 focus-visible:ring-[#050A2F]/45 focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:opacity-100 dark:bg-[#F1F4F9] dark:text-[#050A2F] dark:hover:bg-white dark:focus-visible:ring-white/55";
 
 /**
  * Whether an SSO button should render at all.
@@ -131,7 +167,7 @@ function SsoButton({ disabled }: { disabled?: boolean }) {
         variant="outline"
         size="lg"
         disabled={disabled || redirecting}
-        className={cn("h-11 w-full rounded-lg text-sm", EASE)}
+        className={cn("h-11 w-full rounded-lg text-sm", EASE, PRESS)}
         onClick={() => {
           setRedirecting(true);
           // The authorization-code redirect itself is deliberately not
@@ -319,6 +355,8 @@ export function LoginPage() {
         aria-label="A preview of the console (sample data)"
         className="relative hidden flex-[1.15] overflow-hidden rounded-3xl bg-muted/55 lg:block dark:bg-card/45"
       >
+        {/* The lake under the product: depth lines, server-rendered, behind the card. */}
+        <LoginContours />
         <div aria-hidden className="absolute top-[11%] left-[8%] h-[74%] w-[104%] min-w-[640px]">
           {showcaseReady && desktop ? <LoginShowcase /> : null}
         </div>
@@ -331,7 +369,7 @@ export function LoginPage() {
       <main className="relative flex min-h-svh flex-1 flex-col px-5 pt-5 pb-6 sm:px-10 lg:min-h-0 lg:px-14">
         <div className="flex items-center justify-between">
           <Logo className="h-7" />
-          <ThemeToggle />
+          <ThemeToggle className={cn(EASE, PRESS)} />
         </div>
 
         <div className="flex flex-1 items-start justify-center py-4 lg:items-center lg:py-6">
@@ -375,7 +413,7 @@ export function LoginPage() {
                     <FieldLabel htmlFor="login-email" className="text-sm">
                       Username or email
                     </FieldLabel>
-                    <InputGroup className="h-11 bg-background dark:bg-input/30">
+                    <InputGroup className={cn("h-11 bg-background dark:bg-input/30", FIELD_EASE)}>
                       <InputGroupAddon className="pl-3">
                         <User />
                       </InputGroupAddon>
@@ -407,7 +445,7 @@ export function LoginPage() {
                     <FieldLabel htmlFor="login-password" className="text-sm">
                       Password
                     </FieldLabel>
-                    <InputGroup className="h-11 bg-background dark:bg-input/30">
+                    <InputGroup className={cn("h-11 bg-background dark:bg-input/30", FIELD_EASE)}>
                       <InputGroupAddon className="pl-3">
                         <Lock />
                       </InputGroupAddon>
@@ -437,10 +475,14 @@ export function LoginPage() {
                       <InputGroupAddon align="inline-end" className="pr-2">
                         <Tooltip>
                           <TooltipTrigger
+                            // A short wait before the label shows (emil-design-eng:
+                            // tooltips delay so a pointer passing over does not
+                            // flash one); the console's provider shows them at once.
+                            delay={400}
                             render={
                               <InputGroupButton
                                 size="icon-sm"
-                                className="size-8"
+                                className={cn("size-8", EASE, PRESS)}
                                 // Skipped in the tab order: between password and
                                 // submit, a reveal toggle is a detour for keyboard
                                 // users, who can still reach it via shift-tab.
@@ -451,7 +493,13 @@ export function LoginPage() {
                               />
                             }
                           >
-                            {showPassword ? <EyeOff /> : <Eye />}
+                            {/* The icons swap with a short fade and settle from 90 %,
+                                so the change reads as one control turning over. */}
+                            {showPassword ? (
+                              <EyeOff key="hide" className="animate-in fade-in-0 zoom-in-90 duration-150 ease-out motion-reduce:animate-none" />
+                            ) : (
+                              <Eye key="show" className="animate-in fade-in-0 zoom-in-90 duration-150 ease-out motion-reduce:animate-none" />
+                            )}
                           </TooltipTrigger>
                           <TooltipContent>{showPassword ? "Hide password" : "Show password"}</TooltipContent>
                         </Tooltip>
@@ -460,7 +508,9 @@ export function LoginPage() {
                     {capsLock ? (
                       <p
                         role="alert"
-                        className="flex items-center gap-1.5 text-sm text-amber-600 dark:text-amber-500"
+                        // Arrives with a 150 ms fade and a 4 px settle, not a jump
+                        // (WEB-15 T5); still with reduced motion.
+                        className="flex items-center gap-1.5 text-sm text-amber-600 transition-[opacity,translate] duration-150 ease-[cubic-bezier(0.2,0,0,1)] starting:-translate-y-1 starting:opacity-0 motion-reduce:transition-none dark:text-amber-500"
                       >
                         <TriangleAlert className="size-3.5 shrink-0" aria-hidden />
                         Caps Lock is on
@@ -483,8 +533,10 @@ export function LoginPage() {
                       there is an error, so the closing text is not announced. */}
                   <div
                     className={cn(
-                      "grid transition-[grid-template-rows,opacity,margin] duration-200 ease-[cubic-bezier(0.2,0,0,1)] motion-reduce:transition-none",
-                      error ? "mt-0 grid-rows-[1fr] opacity-100" : "-mt-5 grid-rows-[0fr] opacity-0",
+                      "grid transition-[grid-template-rows,opacity,margin] ease-[cubic-bezier(0.2,0,0,1)] motion-reduce:transition-none",
+                      // Opens in 200 ms, folds away faster, 150 ms (WEB-15 T5,
+                      // emil-design-eng: the exit is quicker than the entrance).
+                      error ? "mt-0 grid-rows-[1fr] opacity-100 duration-200" : "-mt-5 grid-rows-[0fr] opacity-0 duration-150",
                     )}
                   >
                     <div className="min-h-0 overflow-hidden">
@@ -503,11 +555,18 @@ export function LoginPage() {
                   <Button
                     type="submit"
                     size="lg"
-                    className={cn("h-11 w-full rounded-lg text-sm", EASE)}
+                    className={cn("h-11 w-full rounded-lg text-sm", SIGN_IN_COLOURS, EASE, PRESS)}
                     disabled={submitting}
                   >
-                    {submitting ? <Spinner /> : null}
-                    {submitting ? "Signing in…" : "Sign in"}
+                    {/* Idle and busy labels fade into each other (150 ms)
+                        instead of swapping in one frame (WEB-15 T5). */}
+                    <span
+                      key={submitting ? "busy" : "idle"}
+                      className="inline-flex items-center gap-1.5 animate-in fade-in-0 duration-150 ease-out motion-reduce:animate-none"
+                    >
+                      {submitting ? <Spinner /> : null}
+                      {submitting ? "Signing in…" : "Sign in"}
+                    </span>
                   </Button>
                 </form>
 

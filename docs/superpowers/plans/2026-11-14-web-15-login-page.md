@@ -159,3 +159,32 @@ with selection `[0, 16]` of 16 characters.
 - The 9 s redraw in a browser was not timed; the loop's gating is proven by the unit test. The phone
   refusal shot shows the KPI mid-count (1,572,507 of 1,572,524), consistent with a redraw in
   progress when it was taken.
+
+### Slice 2 (owner follow-ups T1 to T5, 2026-11-14), Opus developer
+
+Branch `feat/web-15-login-page`, base `36e679ea`, not pushed.
+
+| Task | Commit | What |
+| --- | --- | --- |
+| T1 | `def7768d` | Lake depth contours behind the preview: `scripts/login-contours.mjs` draws `public/login-contours-{0,1,2}.svg` (seeded field, marching squares; ~37 KiB each, ~8.5 KiB gzipped); `login-contours.tsx` shows them as CSS masks over a theme colour (`login.css`), 36 s opacity drift gated by `use-in-view.ts` (now shared with the showcase loop), static under reduced motion and without JS |
+| T2 | `bc54a08d` | KPI tile: no repeated "2024", change on one line ("+19.3% vs 2023", amount in the tooltip), trend from the monthly bars; x-axis labels level (`axes.x.rotate: 0`) |
+| T3 | `40de7ee6` | Favicons redrawn from the official SVGs at 196:167: `icon-light-32`, `icon-dark-32`, `apple-touch-icon` (white), plus `android-chrome-192/512` and `src/app/favicon.ico`, which had the same stretch |
+| T4 | `11099478` | Sign in button `#050A2F`/white (light), `#F1F4F9`/navy (dark), offset focus ring, keeps colours while busy; login page only |
+| T5 | `1f4eee44` | emil-design-eng motion pass (press scale, field focus ease, eye tooltip delay and icon swap, asymmetric error box, Caps Lock entrance, label crossfade, showcase entrance) |
+
+**Commands run** (each under `systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0 nice -n 15`,
+with at least 4.4 GB available), last on the tree of `1f4eee44`:
+
+- `bun run typecheck`: no errors.
+- `bun test src/features/auth/login-page.test.tsx src/features/auth/login-showcase.test.tsx src/features/auth/login-contours.test.tsx`: 16 pass, 0 fail, 48 expect() calls.
+- `bun x eslint` on every changed TS/TSX file and `scripts/login-contours.mjs`: 0 errors, 1 warning
+  (the existing `no-location-assign-relative-destination` on the SSO button).
+- Dev server (port 28699) + headless Chrome: screenshots at 1366x900 and 1920x1080, light and dark,
+  reduced motion, a refused sign-in; a CDP probe confirmed the eye tooltip is absent at 150 ms and
+  shown at 650 ms, the pressed eye button computes `scale: 0.97`, and the three contour layers run
+  with opacities summing to 1.
+
+**Not verified:** the full `bun run test`/`bun run lint` and `next build` (machine rules);
+iPhone Safari; the contour drift and the motion pass judged by eye over a full cycle (only sampled by
+the probe); Safari's support of the mask stack (`mask-composite: intersect` is supported since
+Safari 15.4; not checked on a device).
