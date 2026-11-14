@@ -5,13 +5,13 @@ import { useRouter } from "next/navigation"
 import { LayoutGrid, Rows3 } from "lucide-react"
 
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
-import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
+import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { useUrlTab } from "@/hooks/use-url-tab"
 import { useAuth } from "@/features/auth/auth-provider"
 import { folderChoices, labelledFolders, manageableFolders } from "@/lib/dashboard-organise"
 import { buildFolderTree, flattenFolders, folderPath } from "@/lib/folder-tree"
-import { notifyError, notifyInfo, withNotify } from "@/lib/notify"
+import { notifyError, notifyFailure, notifyInfo, notifySuccess, withNotify } from "@/lib/notify"
 import { cn } from "@/lib/utils"
 import { dashboardReportService, dashboardService, dashboardTemplateService } from "@/services"
 import type { Board, DashboardTemplate } from "@/services"
@@ -24,6 +24,8 @@ import {
   type KindFilter, type FolderFilter, type LibraryItem, type SortColumn, type SortState,
 } from "./library-items"
 import { FolderPicker, NewMenu, PageMenu, type FolderChoice, type ItemActions } from "./library-menus"
+import { BulkBar, favouriteItems, pickable, trashItems } from "./library-bulk"
+import { EmptyFolder, EmptyWorkspace, NoMatch, NoneOfKind } from "./library-empty"
 import { LibraryGallery } from "./library-gallery"
 import { EASE, FOCUS, PageFrame, ScrollRegion, SearchField, Segmented } from "./library-parts"
 import { LibraryTable, type FolderLookup } from "./library-table"
@@ -133,38 +135,30 @@ function ViewSwitch({ value, onChange }: { readonly value: ViewMode; readonly on
   )
 }
 
-/** What the list says when it has no row: why, in words that fit the filter. */
-function ListEmpty({ kind, query, folderFilter, canWrite, anyOfKind }: {
+/** What the list says when it has no row: why, in words that fit the filter (T5's designed states). */
+function ListEmpty({ kind, query, folderFilter, folderPathOf, isPersonal, canWrite, anyOfKind, onClearQuery, onShowAll }: {
   readonly kind: KindFilter
   readonly query: string
   readonly folderFilter: FolderFilter
+  readonly folderPathOf: (id: string) => string
+  readonly isPersonal: (id: string) => boolean
   readonly canWrite: boolean
   /** Whether anything of this kind exists at all, before the search and folder. */
   readonly anyOfKind: boolean
+  readonly onClearQuery: () => void
+  readonly onShowAll: () => void
 }) {
-  if (query.trim()) return <EmptyState title={`Nothing matches “${query.trim()}”`} description="Search looks at names, owners, folders and types." />
-  if (folderFilter !== null && anyOfKind) return <EmptyState title="Nothing in this folder" description="Move a dashboard or a report here from its ⋯ menu." />
-  if (kind === "template") {
+  if (query.trim()) return <NoMatch query={query.trim()} onClear={onClearQuery} />
+  if (folderFilter !== null && anyOfKind) {
     return (
-      <EmptyState
-        title="No templates yet"
-        description="Open a dashboard and choose Save as template in its ⋯ menu. Its layout, charts and filters are saved, without data."
+      <EmptyFolder
+        path={folderFilter ? folderPathOf(folderFilter) : "No folder"}
+        personal={Boolean(folderFilter) && isPersonal(folderFilter)}
+        onShowAll={onShowAll}
       />
     )
   }
-  if (kind === "report") {
-    return (
-      <EmptyState
-        title="No reports yet"
-        description={
-          canWrite
-            ? "A report is a written page with live charts between the paragraphs. Pick the charts from your dashboards."
-            : "Nobody has shared a report with you yet."
-        }
-      />
-    )
-  }
-  return <EmptyState title="No dashboards yet" description="A dashboard collects charts, KPIs and tables on one canvas." />
+  return <NoneOfKind kind={kind} canWrite={canWrite} />
 }
 
 export function DashboardListPage() {
@@ -188,7 +182,7 @@ export function DashboardListPage() {
   const reloadFolders = foldersState.reload
   const canFile = auth.hasPermission("dashboard:write")
   const tabValues = canFile ? WRITER_TABS : READER_TABS
-  const [tab, setTab] = useUrlTab<TabValue>("tab", tabValues)
+  const [tab, setTabRaw] = useUrlTab<TabValue>("tab", tabValues)
   // The personal space is created on first use: a writer with none yet opens it
   // once, then the folder list is read again.
   const spaceAsked = React.useRef(false)
@@ -233,10 +227,28 @@ export function DashboardListPage() {
     [shortcuts],
   )
   const reloadShortcuts = shortcuts.reload
-  const [query, setQuery] = React.useState("")
-  const [folderFilter, setFolderFilter] = React.useState<FolderFilter>(null)
+  const [query, setQueryRaw] = React.useState("")
+  const [folderFilter, setFolderFilterRaw] = React.useState<FolderFilter>(null)
+  // BI-59 T5: the ticked rows, by key. A change of search, type, folder or
+  // view clears them, so a bulk action never reaches a row that is not shown.
+  const [selected, setSelected] = React.useState<ReadonlySet<string>>(new Set())
+  const [bulkTrash, setBulkTrash] = React.useState<readonly LibraryItem[] | null>(null)
+  const [bulkBusy, setBulkBusy] = React.useState(false)
+  const clearSelection = React.useCallback(() => setSelected(new Set()), [])
+  const setQuery = (next: string) => {
+    setQueryRaw(next)
+    clearSelection()
+  }
+  const setFolderFilter = (next: FolderFilter) => {
+    setFolderFilterRaw(next)
+    clearSelection()
+  }
   const [sort, setSort] = React.useState<SortState>({ column: "updated", dir: "desc" })
-  const [view, setView] = useViewMode()
+  const [view, setViewRaw] = useViewMode()
+  const setView = (next: ViewMode) => {
+    setViewRaw(next)
+    clearSelection()
+  }
   const [trashOpen, setTrashOpen] = React.useState(false)
   const [foldersOpen, setFoldersOpen] = React.useState(false)
   const [importOpen, setImportOpen] = React.useState(false)
@@ -374,7 +386,7 @@ export function DashboardListPage() {
   // A folder filter that names a folder no longer listed (it was deleted
   // from the folder manager) falls back to every folder.
   React.useEffect(() => {
-    if (folderFilter && foldersState.status === "success" && !folders.some((f) => f.id === folderFilter)) setFolderFilter(null)
+    if (folderFilter && foldersState.status === "success" && !folders.some((f) => f.id === folderFilter)) setFolderFilterRaw(null)
   }, [folderFilter, folders, foldersState.status])
 
   const sortBy = (column: SortColumn) =>
@@ -387,6 +399,50 @@ export function DashboardListPage() {
   // still false), so the list also waits for it.
   const loading = auth.status === "loading" || state.status === "loading" || reportsState.status === "loading" || !templatesReady || outlinesState.status === "loading"
   const tabs = tabValues.map((v) => ({ value: v, label: TAB_LABEL[v] }))
+  const setTab = (next: TabValue) => {
+    setTabRaw(next)
+    clearSelection()
+  }
+  const ticked = rows.filter((r) => selected.has(r.key) && pickable(r))
+  const selection = canFile
+    ? {
+        selected,
+        onToggle: (item: LibraryItem) =>
+          setSelected((prev) => {
+            const next = new Set(prev)
+            if (!next.delete(item.key)) next.add(item.key)
+            return next
+          }),
+        onToggleAll: (list: readonly LibraryItem[], on: boolean) => setSelected(on ? new Set(list.map((i) => i.key)) : new Set()),
+      }
+    : undefined
+  const isFavourite = actions.isFavourite
+  async function favouriteTicked() {
+    setBulkBusy(true)
+    const out = await favouriteItems(ticked, isFavourite)
+    setBulkBusy(false)
+    reloadShortcuts()
+    clearSelection()
+    const skipped = out.skipped > 0 ? `${out.skipped.toLocaleString("en-US")} ${out.skipped === 1 ? "report was" : "reports were"} skipped: reports cannot be favourites.` : undefined
+    if (out.refused.length > 0) notifyFailure(`${out.refused.length.toLocaleString("en-US")} could not be added to favourites`, out.refused.map((r) => `${r.name}: ${r.reason}`).join(" "))
+    else notifySuccess(out.done === 1 ? "1 dashboard added to favourites" : `${out.done.toLocaleString("en-US")} dashboards added to favourites`, skipped)
+  }
+  async function trashTicked(list: readonly LibraryItem[]) {
+    setBulkBusy(true)
+    const out = await trashItems(list)
+    setBulkBusy(false)
+    setBulkTrash(null)
+    clearSelection()
+    if (out.done > 0) {
+      notifyDashboardsChanged()
+      reload()
+      reloadReports()
+      notifySuccess(`${out.done.toLocaleString("en-US")} moved to the trash`, "Restore them from the trash for 30 days.")
+    }
+    if (out.refused.length > 0) notifyFailure(`${out.refused.length.toLocaleString("en-US")} could not be moved to the trash`, out.refused.map((r) => `${r.name}: ${r.reason}`).join(" "))
+  }
+  // The workspace holds nothing but the built-in Main: the list says how to start.
+  const emptyWorkspace = !loading && state.status === "success" && items.every((i) => i.builtin)
   const boardsById = React.useMemo(
     () => new Map(items.filter((i) => i.kind === "dashboard").map((i) => [i.id, i])),
     [items],
@@ -426,18 +482,36 @@ export function DashboardListPage() {
             <RecentRow recent={recent} boards={boardsById} source={pictures} />
           ) : null}
           <section aria-label="Dashboards, reports and templates" className="grid grid-cols-[minmax(0,1fr)] gap-3">
+            {/* The controls row; while rows are ticked it becomes the bulk bar, in the same place. */}
             <div className="flex min-h-9 flex-wrap items-center justify-between gap-2">
-              <Segmented<TabValue> label="Type" value={tab} onChange={setTab} options={tabs} />
-              <div className="flex items-center gap-2">
-                <FolderPicker
-                  value={folderFilter}
-                  onChange={setFolderFilter}
-                  choices={folderChoicesList}
-                  noFolderCount={items.filter((i) => i.kind !== "template" && !i.folderId).length}
+              {ticked.length > 0 ? (
+                <BulkBar
+                  count={ticked.length}
+                  canFavourite={ticked.some((i) => i.kind === "dashboard")}
+                  busy={bulkBusy}
+                  onClear={clearSelection}
+                  onMove={() => setMovingItems(ticked)}
+                  onFavourite={() => void favouriteTicked()}
+                  onTrash={() => setBulkTrash(ticked)}
                 />
-                <ViewSwitch value={view} onChange={setView} />
-              </div>
+              ) : (
+                <>
+                  <Segmented<TabValue> label="Type" value={tab} onChange={setTab} options={tabs} />
+                  <div className="flex items-center gap-2">
+                    <FolderPicker
+                      value={folderFilter}
+                      onChange={setFolderFilter}
+                      choices={folderChoicesList}
+                      noFolderCount={items.filter((i) => i.kind !== "template" && !i.folderId).length}
+                    />
+                    <ViewSwitch value={view} onChange={setView} />
+                  </div>
+                </>
+              )}
             </div>
+            {emptyWorkspace && !query.trim() && folderFilter === null && kind !== "report" && kind !== "template" ? (
+              <EmptyWorkspace canWrite={canFile} onNewDashboard={() => setCreateOpen(true)} />
+            ) : null}
 
             {state.status === "error" ? <ErrorState error={state.error} onRetry={reload} /> : null}
             {state.status !== "error" && loading ? <LoadingSkeleton /> : null}
@@ -447,8 +521,12 @@ export function DashboardListPage() {
                   kind={kind}
                   query={query}
                   folderFilter={folderFilter}
+                  folderPathOf={pathOf}
+                  isPersonal={folderLookup.isPersonal}
                   canWrite={canFile}
                   anyOfKind={items.some((i) => kind === "all" || i.kind === kind)}
+                  onClearQuery={() => setQuery("")}
+                  onShowAll={() => setFolderFilter(null)}
                 />
               ) : view === "gallery" ? (
                 <LibraryGallery
@@ -459,7 +537,7 @@ export function DashboardListPage() {
                   myName={myName}
                   pictures={pictures}
                   onOpenTemplate={(item) => item.template && setUsing(item.template)}
-                  emptyFolder={() => <p className="px-1 text-xs text-muted-foreground">Nothing in this folder yet.</p>}
+                  emptyFolder={(id) => <EmptyFolder compact path={pathOf(id)} personal={folderLookup.isPersonal(id)} />}
                 />
               ) : (
                 <LibraryTable
@@ -471,6 +549,7 @@ export function DashboardListPage() {
                   myName={myName}
                   onOpenTemplate={(item) => item.template && setUsing(item.template)}
                   pictures={pictures}
+                  selection={selection}
                 />
               )
             ) : null}
@@ -599,10 +678,12 @@ export function DashboardListPage() {
           folders={fileable}
           onOpenChange={(open) => !open && setMovingItems(null)}
           onDone={(outcome) => {
+            clearSelection()
             if (outcome.moved > 0) {
               notifyDashboardsChanged()
               reload()
               reloadReports()
+              notifySuccess(outcome.moved === 1 ? "Moved" : `${outcome.moved.toLocaleString("en-US")} moved`)
             }
           }}
         />
@@ -648,6 +729,25 @@ export function DashboardListPage() {
           })()
         }}
       />
+      <ConfirmActionDialog
+        open={bulkTrash !== null}
+        onOpenChange={(open) => !open && setBulkTrash(null)}
+        title={`Move ${(bulkTrash?.length ?? 0).toLocaleString("en-US")} ${bulkTrash?.length === 1 ? "item" : "items"} to the trash?`}
+        description="Dashboards go with their tiles, and reports keep their charts on their dashboards. You can restore them for 30 days."
+        impact={(() => {
+          const linked = (bulkTrash ?? []).filter((i) => i.publicLink).map((i) => i.name)
+          if (linked.length === 0) return undefined
+          return `${linked.join(", ")} ${linked.length === 1 ? "has a public link" : "have public links"}. Anyone using ${linked.length === 1 ? "that link" : "those links"} will lose access.`
+        })()}
+        confirmLabel="Move to trash"
+        destructive
+        confirming={bulkBusy}
+        onConfirm={() => {
+          const list = bulkTrash
+          if (list) void trashTicked(list)
+        }}
+      />
+
       <ConfirmActionDialog
         open={deletingReport !== null}
         onOpenChange={(open) => !open && setDeletingReport(null)}

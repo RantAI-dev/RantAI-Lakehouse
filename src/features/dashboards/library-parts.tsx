@@ -27,7 +27,7 @@ export const FOCUS = "outline-none focus-visible:ring-3 focus-visible:ring-ring/
  * `assistant:use` or `assistant:ask`, and `/dashboards/browse` is not one of
  * the paths that hide it.
  */
-function useHasDock(): boolean {
+export function useHasDock(): boolean {
   const { hasPermission } = useAuth()
   return hasPermission("assistant:use") || hasPermission("assistant:ask")
 }

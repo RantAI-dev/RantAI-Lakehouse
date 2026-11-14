@@ -10,9 +10,11 @@ import * as React from "react"
 import Link from "next/link"
 import { ArrowDown, ArrowUp, Folder as FolderIcon, Lock } from "lucide-react"
 
+import { Checkbox } from "@/components/ui/checkbox"
 import { formatRelativeTime } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import { KIND_LABEL, libraryHref, type LibraryItem, type SortColumn, type SortState } from "./library-items"
+import { pickable } from "./library-bulk"
 import { ItemMenu, type ItemActions } from "./library-menus"
 import { Avatar, EASE, FOCUS, ItemBadges, KindIcon, StarButton, ownerLabel } from "./library-parts"
 import { ItemPicture, chartsOf, type PictureSource } from "./library-picture"
@@ -31,10 +33,20 @@ type RowProps = {
   /** Opening a template asks for a name first; the page owns that dialog. */
   readonly onOpenTemplate: (item: LibraryItem) => void
   readonly pictures: PictureSource
+  /** Ticking rows for the bulk actions; absent without `dashboard:write`. */
+  readonly selection?: Selection
+}
+
+/** The ticked rows, by key, and how to change them. */
+export type Selection = {
+  readonly selected: ReadonlySet<string>
+  readonly onToggle: (item: LibraryItem) => void
+  /** Tick every pickable row shown, or untick them all. */
+  readonly onToggleAll: (items: readonly LibraryItem[], on: boolean) => void
 }
 
 export function LibraryTable({
-  items, sort, onSort, actions, folders, myName, onOpenTemplate, pictures,
+  items, sort, onSort, actions, folders, myName, onOpenTemplate, pictures, selection,
 }: {
   readonly items: readonly LibraryItem[]
   readonly sort: SortState
@@ -44,13 +56,28 @@ export function LibraryTable({
   readonly myName: string | undefined
   readonly onOpenTemplate: (item: LibraryItem) => void
   readonly pictures: PictureSource
+  readonly selection?: Selection
 }) {
+  const choosable = items.filter(pickable)
+  const allOn = choosable.length > 0 && choosable.every((i) => selection?.selected.has(i.key))
+  const someOn = !allOn && choosable.some((i) => selection?.selected.has(i.key))
   return (
     <div className="rounded-2xl bg-card ring-1 ring-foreground/5">
       <table className="w-full table-fixed text-sm">
         <thead>
           <tr className="text-left text-xs text-muted-foreground">
-            <Th column="name" sort={sort} onSort={onSort} className="w-[30%] pl-4">Name</Th>
+            {selection ? (
+              <th className="w-11 py-2.5 pl-4 font-normal">
+                {choosable.length > 0 ? (
+                  <Checkbox
+                    aria-label="Select all"
+                    checked={allOn ? true : someOn ? "indeterminate" : false}
+                    onCheckedChange={() => selection.onToggleAll(choosable, !allOn)}
+                  />
+                ) : null}
+              </th>
+            ) : null}
+            <Th column="name" sort={sort} onSort={onSort} className={cn("w-[30%]", !selection && "pl-4")}>Name</Th>
             <Th column="kind" sort={sort} onSort={onSort} className="w-28">Type</Th>
             <Th column="folder" sort={sort} onSort={onSort} className="hidden w-40 xl:table-cell">Folder</Th>
             <Th column="owner" sort={sort} onSort={onSort} className="w-36">Owner</Th>
@@ -61,7 +88,7 @@ export function LibraryTable({
         </thead>
         <tbody>
           {items.map((item) => (
-            <TableRow key={item.key} item={item} actions={actions} folders={folders} myName={myName} onOpenTemplate={onOpenTemplate} pictures={pictures} />
+            <TableRow key={item.key} item={item} actions={actions} folders={folders} myName={myName} onOpenTemplate={onOpenTemplate} pictures={pictures} selection={selection} />
           ))}
         </tbody>
       </table>
@@ -129,11 +156,19 @@ export function FolderCell({ item, folders }: { readonly item: LibraryItem; read
   )
 }
 
-function TableRow({ item, actions, folders, myName, onOpenTemplate, pictures }: RowProps) {
+function TableRow({ item, actions, folders, myName, onOpenTemplate, pictures, selection }: RowProps) {
   const fav = item.kind === "dashboard" && actions.isFavourite(item)
+  const ticked = selection?.selected.has(item.key) ?? false
   return (
-    <tr className={cn("group relative border-t border-border/60 hover:bg-muted/40", EASE)}>
-      <td className="py-2 pr-3 pl-4">
+    <tr className={cn("group relative border-t border-border/60", ticked ? "bg-primary/6 dark:bg-primary/10" : "hover:bg-muted/40", EASE)}>
+      {selection ? (
+        <td className="py-2 pl-4">
+          {pickable(item) ? (
+            <Checkbox aria-label={`Select ${item.name}`} checked={ticked} onCheckedChange={() => selection.onToggle(item)} className="relative z-10" />
+          ) : null}
+        </td>
+      ) : null}
+      <td className={cn("py-2 pr-3", !selection && "pl-4")}>
         <div className="flex min-w-0 items-center gap-3">
           <ItemPicture item={item} charts={chartsOf(pictures, item.id)} size="sm" className="h-8 w-11 shrink-0 rounded-md" />
           <ItemName item={item} onOpenTemplate={onOpenTemplate} />

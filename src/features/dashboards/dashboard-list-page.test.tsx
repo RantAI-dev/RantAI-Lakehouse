@@ -15,6 +15,7 @@ mock.module("next/navigation", () => ({
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { TableProviders } from "@/components/app-shell/table-providers"
+import { chooseOption } from "@/components/patterns/select-field.testing"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import { DashboardListPage } from "./dashboard-list-page"
 
@@ -154,7 +155,7 @@ const FOLDERS = [{ id: "f1", name: "Tourism", parentId: "", createdBy: "u1" }]
 
 /** The names in the table, top to bottom. */
 function rowNames(): string[] {
-  return [...document.querySelectorAll("tbody tr")].map((tr) => tr.querySelector("td a, td button")?.textContent?.trim() ?? "")
+  return [...document.querySelectorAll("tbody tr")].map((tr) => tr.querySelector("td a, td button:not([role=checkbox])")?.textContent?.trim() ?? "")
 }
 
 describe("the one list (BI-59 T2)", () => {
@@ -316,5 +317,140 @@ describe("the header and toolbar controls (BI-59 AC1)", () => {
       ["All", "Dashboards", "Folder: All folders", "Gallery view", "More actions", "New", "Reports", "Table view", "Templates"].sort(),
     )
     expect(screen.getAllByRole("searchbox")).toHaveLength(1)
+  })
+})
+
+describe("bulk actions, facts and empty states (BI-59 T5)", () => {
+  const listRoutes = {
+    "GET /api/dashboard/reports": () => json({ reports: [REPORT], truncated: false, maxCharts: 30 }),
+    "GET /api/dashboard/folders": () => json({ folders: FOLDERS }),
+  }
+
+  async function tick(...names: string[]) {
+    await screen.findByText("Wisman 2020-2024")
+    for (const name of names) fireEvent.click(screen.getByRole("checkbox", { name: `Select ${name}` }))
+    return await screen.findByRole("toolbar", { name: "Selected items" })
+  }
+
+  it("offers no box to tick on Main or a template, and none at all to a reader", async () => {
+    serve(["dashboard:read", "dashboard:write"], listRoutes)
+    renderPage()
+    await screen.findByText("Wisman 2020-2024")
+    expect(screen.queryByRole("checkbox", { name: "Select Main" })).toBeNull()
+    expect(screen.queryByRole("checkbox", { name: "Select Sales overview" })).toBeNull()
+    expect(screen.getByRole("checkbox", { name: "Select QA BI" })).toBeTruthy()
+    cleanup()
+    serve(["dashboard:read"], listRoutes)
+    renderPage()
+    await screen.findByText("Wisman 2020-2024")
+    expect(screen.queryAllByRole("checkbox")).toHaveLength(0)
+  })
+
+  it("moves the ticked dashboard and report to a folder through the existing services", async () => {
+    const calls = serve(["dashboard:read", "dashboard:write"], {
+      ...listRoutes,
+      "PUT /api/dashboard/boards": () => json({ ok: true }),
+      "PUT /api/dashboard/reports": () => json({ report: { ...REPORT, folderId: "" } }),
+      "GET /api/dashboard/access-preview": () => json({ gains: [], loses: [], startingPointGains: false, startingPointLoses: false }),
+    })
+    renderPage()
+    const bar = await tick("QA BI", "Wisman 2020-2024")
+    expect(within(bar).getByText("2 selected")).toBeTruthy()
+    fireEvent.click(within(bar).getByRole("button", { name: /Move to folder/ }))
+    const dialog = await screen.findByRole("dialog")
+    expect(within(dialog).getByText("2 items")).toBeTruthy()
+    // The report sits in Tourism and the dashboard at the top level: Tourism is the target.
+    chooseOption(within(dialog).getByRole("combobox", { name: "Folder" }), "Tourism")
+    fireEvent.click(within(dialog).getByRole("button", { name: "Move" }))
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT" && c.url === "/api/dashboard/boards")).toBe(true))
+    expect(calls.find((c) => c.method === "PUT" && c.url === "/api/dashboard/boards")?.body).toEqual({ id: "b1", folderId: "f1" })
+    // The report is already in Tourism, so it is not written again.
+    expect(calls.some((c) => c.method === "PUT" && c.url.startsWith("/api/dashboard/reports"))).toBe(false)
+  })
+
+  it("favourites the ticked dashboards and skips a report, which cannot be one", async () => {
+    const calls = serve(["dashboard:read", "dashboard:write"], {
+      ...listRoutes,
+      "PUT /api/dashboard/favourites": () => json({ ok: true }),
+    })
+    renderPage()
+    const bar = await tick("QA BI", "Wisman 2020-2024")
+    fireEvent.click(within(bar).getByRole("button", { name: /Favourite/ }))
+    await waitFor(() => expect(calls.filter((c) => c.method === "PUT" && c.url === "/api/dashboard/favourites")).toHaveLength(1))
+    expect(calls.find((c) => c.url === "/api/dashboard/favourites")?.body).toEqual({ kind: "board", id: "b1", on: true })
+    await waitFor(() => expect(screen.queryByRole("toolbar", { name: "Selected items" })).toBeNull())
+  })
+
+  it("moves the ticked rows to the trash only after a confirmation, and the trash can still restore", async () => {
+    const calls = serve(["dashboard:read", "dashboard:write"], {
+      ...listRoutes,
+      "DELETE /api/dashboard/boards": () => json({ ok: true }),
+      "DELETE /api/dashboard/reports": () => json({ ok: true }),
+      "GET /api/dashboard/trash": () => json({
+        items: [{ kind: "board", id: "b1", name: "QA BI", board: "", boardName: "", boardState: "", deletedBy: "Rina", deletedAt: "2026-11-14T00:00:00Z", expiresAt: "2026-12-14T00:00:00Z", personal: false }],
+        retentionDays: 30,
+      }),
+      "POST /api/dashboard/trash/restore": () => json({ restored: { kind: "board", id: "b1", charts: 0, boardState: "" } }),
+    })
+    renderPage()
+    const bar = await tick("QA BI", "Wisman 2020-2024")
+    fireEvent.click(within(bar).getByRole("button", { name: /Move to trash/ }))
+    expect(calls.some((c) => c.method === "DELETE")).toBe(false)
+    const confirm = await screen.findByRole("alertdialog").catch(() => screen.findByRole("dialog"))
+    expect(within(confirm).getByText("Move 2 items to the trash?")).toBeTruthy()
+    fireEvent.click(within(confirm).getByRole("button", { name: "Move to trash" }))
+    await waitFor(() => expect(calls.filter((c) => c.method === "DELETE")).toHaveLength(2))
+    // In the list's order (newest first): the report, then the dashboard.
+    expect(calls.filter((c) => c.method === "DELETE").map((c) => c.url)).toEqual([
+      "/api/dashboard/reports/r1",
+      "/api/dashboard/boards?id=b1",
+    ])
+    // Restore from the trash still works and reloads the list.
+    const boardReads = () => calls.filter((c) => c.method === "GET" && c.url === "/api/dashboard/boards").length
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull())
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }))
+    fireEvent.click(await screen.findByText("Trash"))
+    const before = boardReads()
+    fireEvent.click(await screen.findByRole("button", { name: "Restore" }))
+    await waitFor(() => expect(calls.some((c) => c.method === "POST" && c.url === "/api/dashboard/trash/restore")).toBe(true))
+    await waitFor(() => expect(boardReads()).toBeGreaterThan(before))
+  })
+
+  it("never says No description.: a description is the card's fact", async () => {
+    serve(["dashboard:read"], {
+      "GET /api/dashboard/boards": () => json({ boards: [...BOARDS, { id: "b2", name: "Arrivals", description: "Weekly arrivals by port", chartCount: 0 }] }),
+    })
+    renderPage()
+    await screen.findByText("Arrivals")
+    fireEvent.click(screen.getByRole("button", { name: "Gallery view" }))
+    expect(screen.getByText("Weekly arrivals by port")).toBeTruthy()
+    expect(screen.queryByText("No description.")).toBeNull()
+  })
+
+  it("says what to do when the search matches nothing, a folder is empty, or there is nothing but Main", async () => {
+    serve(["dashboard:read", "dashboard:write"], { "GET /api/dashboard/folders": () => json({ folders: FOLDERS }) })
+    renderPage()
+    await screen.findByText("QA BI")
+    const search = screen.getByRole("searchbox")
+    fireEvent.change(search, { target: { value: "zzz" } })
+    expect(await screen.findByText("Nothing matches “zzz”")).toBeTruthy()
+    // The empty state's own button (the search field has an ✕ of the same name).
+    const clear = screen.getAllByRole("button", { name: "Clear search" })
+    expect(clear).toHaveLength(2)
+    fireEvent.click(clear[1])
+    expect((search as HTMLInputElement).value).toBe("")
+    fireEvent.click(screen.getByRole("button", { name: "Folder: All folders" }))
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Tourism/ }))
+    expect(await screen.findByText("Nothing in Tourism yet")).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Show all folders" }))
+    await screen.findByText("QA BI")
+    cleanup()
+    serve(["dashboard:read", "dashboard:write"], {
+      "GET /api/dashboard/boards": () => json({ boards: [BOARDS[0]] }),
+      "GET /api/dashboard/templates": () => json({ templates: [], truncated: false }),
+    })
+    renderPage()
+    expect(await screen.findByText("Nothing made here yet")).toBeTruthy()
+    expect(screen.getByText("Main")).toBeTruthy()
   })
 })
