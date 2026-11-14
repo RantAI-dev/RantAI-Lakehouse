@@ -120,6 +120,7 @@ export function CopilotDock() {
       ) : null}
 
       {/* Bar input — glass; compact pill when collapsed, full when expanded */}
+      <ComposerReserve>
       <ChatComposer onStop={c.stop}
         glass
         compact={!showPanel}
@@ -136,8 +137,46 @@ export function CopilotDock() {
         toggleCap={c.toggleCap}
         onFocus={() => c.setExpanded(true)}
       />
+      </ComposerReserve>
     </div>
     </div>
     </>
   );
+}
+
+/** The bar's distance from the window's bottom edge (`bottom-4`) and the gap kept above it. */
+export const DOCK_OFFSET_PX = 16;
+export const DOCK_GAP_PX = 14;
+
+/**
+ * Owner QA 2026-11-14, composer reserve: the room a page keeps under its content while the floating
+ * composer shows, in px: the composer's own height, its offset from the bottom, and a 14 px gap.
+ */
+export function dockReserve(composerHeight: number): number {
+  return Math.round(composerHeight + DOCK_OFFSET_PX + DOCK_GAP_PX);
+}
+
+/**
+ * Owner QA 2026-11-14, composer reserve: while the composer is on screen, `--dock-reserve` on the
+ * document is the room it takes (`dockReserve` of its measured height, kept current as it grows); it
+ * is removed when the dock hides itself (the Copilot side panel, a page without the dock), so
+ * AppFrame's `--content-bottom` falls back to the page's normal padding. The composer's height,
+ * not the open chat panel above it, is what is reserved.
+ */
+function ComposerReserve({ children }: { readonly children: React.ReactNode }) {
+  const ref = React.useRef<HTMLDivElement>(null);
+  React.useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const root = document.documentElement;
+    const measure = () => root.style.setProperty("--dock-reserve", `${dockReserve(el.getBoundingClientRect().height)}px`);
+    measure();
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
+    observer?.observe(el);
+    return () => {
+      observer?.disconnect();
+      root.style.removeProperty("--dock-reserve");
+    };
+  }, []);
+  return <div ref={ref} data-slot="dock-composer">{children}</div>;
 }

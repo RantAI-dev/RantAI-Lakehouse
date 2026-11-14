@@ -1822,7 +1822,7 @@ export function ChartBuilder({
     // Owner QA 2026-11-14, composer: that bottom room is now just the composer and a small gap, the
     // same token `main` pads with, so the zones end about 14 px above the composer.
     <div className="@container" data-slot="chart-builder" onPointerDownCapture={markTouched} onKeyDownCapture={markTouched} onInputCapture={markTouched}>
-      <div className="flex flex-col gap-4 @3xl:h-[calc(100dvh-5.5rem-var(--content-bottom,1.5rem))] @3xl:min-h-[30rem]">
+      <div className="flex flex-col gap-4 @3xl:h-[calc(100dvh-5.5rem-var(--content-bottom,1.5rem))] @3xl:min-h-[30rem] @3xl:transition-[height] @3xl:duration-200 @3xl:ease-out motion-reduce:transition-none">
         {/*
           BI-58 review round 1, SHOULD-FIX 4 and 5 (owner): one action, one button. The back arrow
           leaves (asking first when something changed), the dashboard name in the breadcrumb is
