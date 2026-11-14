@@ -51,8 +51,10 @@ export function NewMenu({
 }) {
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger render={<Button className="text-white" />}>
-        <Plus data-icon="inline-start" /> New
+      {/* BI-59 review round 1, SHOULD-FIX 1: as tall as the search beside it (h-11); on a phone the
+          word is for screen readers only and the button is the plus alone, so the row still fits. */}
+      <DropdownMenuTrigger render={<Button className="h-11 text-white max-sm:w-11 max-sm:px-0 sm:px-4" />}>
+        <Plus data-icon="inline-start" className="max-sm:mx-auto" /> <span className="max-sm:sr-only">New</span>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-72">
         <DropdownMenuItem className="items-start py-2" onClick={onDashboard}>
@@ -123,7 +125,8 @@ export function PageMenu({
 }) {
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger render={<Button variant="outline" size="icon" aria-label="More actions" />}>
+      {/* BI-59 review round 1, SHOULD-FIX 1: the height of the search beside it. */}
+      <DropdownMenuTrigger render={<Button variant="outline" size="icon" aria-label="More actions" className="size-11" />}>
         <MoreHorizontal />
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-56">

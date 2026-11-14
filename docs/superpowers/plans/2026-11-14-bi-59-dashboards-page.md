@@ -189,3 +189,45 @@
    - Its height does hard-code the app frame's current bottom reserve: `pb-24` / `lg:pb-28`, 5rem for the bar.
    - When BI-58 merges, `PageFrame` (`library-parts.tsx`) should read the shared reserve token instead.
 
+
+### Handoff, BI-59 review round 1 (developer, 2026-11-14)
+
+**SHOULD-FIX 1: search and page actions on one row** (owner QA; DESIGN.md §3 "Pencarian dan aksi halaman satu baris").
+
+- **Layout.**
+  - The "Dashboards" title sits alone on its row.
+  - Under it, one row: the search takes the remaining width, then the Table / Gallery switch, the page ⋯ and **+ New**, all 44 px tall and vertically centred.
+  - The view switch moved there from the filters row, because the rule names it among the page actions.
+- **Phone: one row, the cleaner of the two options.**
+  - The row holds the search, the ⋯ and an icon-only New. "New" stays as screen-reader text.
+  - The view switch stays in the filters row, so the search keeps its room.
+- **Measured in Chrome over CDP, light theme, Table view:**
+
+  | Viewport | Title (top) | Search, ⋯ and New (top / height) | View switch (top / height) |
+  | --- | --- | --- | --- |
+  | 1366x900 | 88 | 132 / 44 | 132 / 44 |
+  | 390x844 | 80 | 124 / 44 | not on this row |
+
+- **Tests.** happy-dom has no layout, so the unit test checks the DOM: the search, New, ⋯ and the view switch share one row element, and the title is above it, alone. The 1-px `top` check comes from the browser measurements above.
+
+**SHOULD-FIX 2: the frame follows the shell's reserve.**
+
+- `PageFrame` (`library-parts.tsx`) now reads `--content-bottom`, the token BI-58 adds (`c4d87211`, `50295df6`).
+- Its fallbacks are today's values:
+  - **With the dock:** a 5rem reserve, plus the negative margin that gives back `pb-24` / `lg:pb-28`.
+  - **Without the dock:** the shell's own bottom padding.
+- Heights are unchanged on this branch. Once BI-58 merges, the frame ends where `--content-bottom` says.
+- With the token present, the margin works out at `--content-bottom - 6rem`. That only shortens `main` below the frame and moves nothing on screen. It can go once this branch has the token.
+- No BI-58 code was copied.
+
+**Checks** (each under `systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0 nice -n 15`, one at a time):
+
+- `bun test` on three files (`dashboard-list-page.test.tsx`, `template-pages.test.tsx`, `library-item-menu.test.tsx`): 37 pass, 0 fail.
+- `bun --bun eslint src/features/dashboards/`: clean.
+- `bun run typecheck`: clean.
+- **Not verified:** the full `bun run lint` and `bun run test`. Both are left to CI.
+
+**Screenshots.** The 12 Table and Gallery shots in `docs/plans/bi-59-screens/` were retaken with this header. A brief dev server on 28622 and one headless Chrome were stopped by PID afterwards. 28620 was not touched.
+
+- No horizontal scroll at any size.
+- The five `state-*.png` shots predate this round and still show the old header.

@@ -105,13 +105,18 @@ function useViewMode(): readonly [ViewMode, (next: ViewMode) => void] {
 }
 
 /** The Table / Gallery switch: two icon buttons with `aria-pressed`, in one soft group like the type filter. */
-function ViewSwitch({ value, onChange }: { readonly value: ViewMode; readonly onChange: (next: ViewMode) => void }) {
+function ViewSwitch({ value, onChange, tall }: {
+  readonly value: ViewMode
+  readonly onChange: (next: ViewMode) => void
+  /** In the search row: as tall as the search (BI-59 review round 1, SHOULD-FIX 1). */
+  readonly tall?: boolean
+}) {
   const options = [
     { value: "table" as const, label: "Table view", icon: Rows3 },
     { value: "gallery" as const, label: "Gallery view", icon: LayoutGrid },
   ]
   return (
-    <div role="group" aria-label="View" className="inline-flex rounded-lg bg-muted p-0.5">
+    <div role="group" aria-label="View" className={cn("inline-flex shrink-0 rounded-lg bg-muted p-0.5", tall && "h-11")}>
       {options.map((o) => {
         const on = o.value === value
         return (
@@ -123,7 +128,8 @@ function ViewSwitch({ value, onChange }: { readonly value: ViewMode; readonly on
             title={o.label}
             onClick={() => onChange(o.value)}
             className={cn(
-              "grid size-8 place-items-center rounded-md",
+              "grid place-items-center rounded-md",
+              tall ? "size-10" : "size-8",
               EASE, FOCUS,
               on ? "bg-background text-foreground shadow-sm dark:bg-input/40" : "text-muted-foreground hover:text-foreground",
             )}
@@ -452,29 +458,35 @@ export function DashboardListPage() {
 
   return (
     <PageFrame>
+      {/*
+        BI-59 review round 1, SHOULD-FIX 1 (owner QA; DESIGN.md §3 "Pencarian dan aksi halaman
+        satu baris"): the title alone, then one row with the search taking the width on the left
+        and the page's actions on the right, all 44 px tall and centred. From sm the Table /
+        Gallery switch joins them; on a phone it stays in the filters row so the search keeps
+        its room, and New is the plus alone.
+      */}
       <header className="grid shrink-0 gap-4">
-        <div className="flex items-center justify-between gap-3">
-          <h1 className="text-xl font-semibold tracking-tight">Dashboards</h1>
-          <div className="flex items-center gap-2">
-            <PageMenu
-              onFolders={canFile ? () => setFoldersOpen(true) : undefined}
-              onTrash={canFile ? () => setTrashOpen(true) : undefined}
+        <h1 className="text-xl font-semibold tracking-tight">Dashboards</h1>
+        <div className="flex items-center gap-2">
+          <SearchField value={query} onChange={setQuery} className="min-w-0 flex-1" />
+          {phone ? null : <ViewSwitch value={view} onChange={setView} tall />}
+          <PageMenu
+            onFolders={canFile ? () => setFoldersOpen(true) : undefined}
+            onTrash={canFile ? () => setTrashOpen(true) : undefined}
+          />
+          {/* BI-18 part C review fix (SHOULD-FIX) R27: without `dashboard:write` there is no New. */}
+          {canFile ? (
+            <NewMenu
+              templates={templates}
+              renderPicture={(t) => (
+                <ItemPicture item={templateItem(t)} charts={null} size="sm" className="h-10 w-16 shrink-0" />
+              )}
+              onDashboard={() => setCreateOpen(true)}
+              onTemplate={setUsing}
+              onImport={() => setImportOpen(true)}
             />
-            {/* BI-18 part C review fix (SHOULD-FIX) R27: without `dashboard:write` there is no New. */}
-            {canFile ? (
-              <NewMenu
-                templates={templates}
-                renderPicture={(t) => (
-                  <ItemPicture item={templateItem(t)} charts={null} size="sm" className="h-10 w-16 shrink-0" />
-                )}
-                onDashboard={() => setCreateOpen(true)}
-                onTemplate={setUsing}
-                onImport={() => setImportOpen(true)}
-              />
-            ) : null}
-          </div>
+          ) : null}
         </div>
-        <SearchField value={query} onChange={setQuery} className="max-w-2xl" />
       </header>
 
       <ScrollRegion className="-mx-2 mt-5 px-2 pb-6">
@@ -506,7 +518,7 @@ export function DashboardListPage() {
                       choices={folderChoicesList}
                       noFolderCount={items.filter((i) => i.kind !== "template" && !i.folderId).length}
                     />
-                    <ViewSwitch value={view} onChange={setView} />
+                    {phone ? <ViewSwitch value={view} onChange={setView} /> : null}
                   </div>
                 </>
               )}
