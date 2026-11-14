@@ -2423,13 +2423,30 @@ mod route_policy_tests {
 
     /// The state [`test_router`] builds, for a test that assembles a router
     /// of its own through [`super::gated`].
+    ///
+    /// PR #528 CI: the pool gets a short acquire timeout. A limit-bearing path
+    /// (`limit_bearing`: the board routes, `/api/query/run`, the chart saves)
+    /// makes [`super::timeout_middleware`] read the query limits before the
+    /// auth gate answers 401, and that read dials this address. Nothing listens
+    /// there, and sqlx retries a refused connection until the pool's acquire
+    /// timeout, 30 seconds by default, so each such entry of the table cost
+    /// 30 seconds: on `main` the sweep took 554 of its 600 seconds under
+    /// nextest, and the three report entries of `BI-18` part D
+    /// (`GET`/`PUT`/`DELETE /api/dashboard/reports/{id}`) pushed it past the
+    /// limit. With 200 ms the same read fails just as it did, only at once;
+    /// what the test asserts (the route is mounted and gated) is unchanged.
     fn test_state() -> AppState {
-        let env = std::collections::HashMap::from([(
-            "DATABASE_URL".to_owned(),
-            "postgres://test:test@127.0.0.1:5432/test".to_owned(),
-        )]);
+        const URL: &str = "postgres://test:test@127.0.0.1:5432/test";
+        let env = std::collections::HashMap::from([("DATABASE_URL".to_owned(), URL.to_owned())]);
         let cfg = Config::from_map(&env).unwrap();
-        AppState::new(cfg)
+        let mut state = AppState::new(cfg);
+        state.pg = Some(std::sync::Arc::new(
+            sqlx::postgres::PgPoolOptions::new()
+                .acquire_timeout(std::time::Duration::from_millis(200))
+                .connect_lazy(URL)
+                .unwrap(),
+        ));
+        state
     }
 
     /// `{id}`/`{token}`/`{kind}`/`{runId}` — any `{...}` capture segment —
