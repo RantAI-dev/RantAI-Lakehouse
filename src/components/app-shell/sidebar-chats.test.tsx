@@ -24,11 +24,11 @@ mock.module("next/navigation", () => ({
 mock.module("next/image", () => ({ default: () => null }))
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import { CopilotProvider } from "@/features/copilot/use-copilot"
-import { SidebarProvider } from "@/components/ui/sidebar"
+import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { AppSidebar } from "./app-sidebar"
 
@@ -74,14 +74,15 @@ afterEach(() => {
   globalThis.fetch = originalFetch
 })
 
-function renderSidebar() {
+function renderSidebar({ open = true }: { open?: boolean } = {}) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return render(
     <QueryClientProvider client={client}>
       <TooltipProvider>
         <AuthProvider>
           <CopilotProvider>
-            <SidebarProvider open onOpenChange={() => {}}>
+            <SidebarProvider open={open} onOpenChange={() => {}}>
+              <SidebarTrigger />
               <AppSidebar />
             </SidebarProvider>
           </CopilotProvider>
@@ -209,5 +210,69 @@ describe("the sidebar's chat list on a conversation (WEB-18)", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "New chat" }))
     expect(router.push).toHaveBeenCalledWith("/")
+  })
+})
+
+// T3: the two views slide sideways inside the sidebar, both at once; collapsed, the actions stay as
+// icons; on a phone the sheet holds the same list.
+describe("the slide between the sidebar's two views (WEB-18 T3)", () => {
+  const view = (name: "menu" | "chats") => document.querySelector(`[data-sidebar-view="${name}"]`) as HTMLElement
+
+  it("moves the menu out to the left and the chats in from the right, and back, at the sidebar's width", async () => {
+    currentPathname = "/copilot"
+    stubApi(["assistant:ask", "catalog:read"])
+    renderSidebar()
+
+    await screen.findByRole("button", { name: "Back to menu" })
+    expect(view("menu").className).toContain("-translate-x-full")
+    expect(view("menu").hasAttribute("inert")).toBe(true)
+    expect(view("chats").className).not.toContain("translate-x-full")
+    // One move: the same duration and curve for both, and none under reduced motion.
+    for (const pane of [view("menu"), view("chats")]) {
+      expect(pane.className).toContain("transition-transform")
+      expect(pane.className).toContain("duration-[240ms]")
+      expect(pane.className).toContain("ease-[cubic-bezier(0.23,1,0.32,1)]")
+      expect(pane.className).toContain("motion-reduce:transition-none")
+    }
+
+    fireEvent.click(screen.getByRole("button", { name: "Back to menu" }))
+    await waitFor(() => expect(view("chats").className).toContain("translate-x-full"))
+    expect(view("chats").hasAttribute("inert")).toBe(true)
+    expect(view("menu").className).not.toContain("-translate-x-full")
+    expect(view("menu").hasAttribute("inert")).toBe(false)
+    // The focus follows to the control that leads back.
+    await waitFor(() => expect(document.activeElement?.textContent).toContain("AI chats"))
+  })
+
+  it("collapsed: the four actions stay as icons with tooltips and the chats fold away", async () => {
+    currentPathname = "/copilot"
+    stubApi(["assistant:ask", "settings:write"])
+    renderSidebar({ open: false })
+
+    const back = await screen.findByRole("button", { name: "Back to menu" })
+    expect(back.closest("[data-collapsible='icon']")).toBeTruthy()
+    // Collapsed, Search is a button that opens the sidebar on the field.
+    expect(screen.getByRole("button", { name: "Search chats" })).toBeTruthy()
+    expect(screen.getByRole("searchbox", { name: "Search chats" }).getAttribute("tabindex")).toBe("-1")
+    await waitFor(() => expect(chatTitles()).toHaveLength(3))
+    const list = screen.getByRole("navigation", { name: "Chats" })
+    expect(list.hasAttribute("inert")).toBe(true)
+  })
+
+  it("on a phone the sidebar's sheet shows the chat list, with Back to menu", async () => {
+    const width = window.innerWidth
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 390 })
+    try {
+      currentPathname = "/copilot"
+      stubApi(["assistant:ask", "catalog:read"])
+      renderSidebar()
+      fireEvent.click(await screen.findByRole("button", { name: "Toggle Sidebar" }))
+      const sheet = await screen.findByRole("dialog")
+      expect(sheet.getAttribute("data-mobile")).toBe("true")
+      expect(within(sheet).getByRole("button", { name: "Back to menu" })).toBeTruthy()
+      await waitFor(() => expect(chatTitles()).toHaveLength(3))
+    } finally {
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: width })
+    }
   })
 })

@@ -38,6 +38,7 @@ import {
   SIDEBAR_GROUP_CLASS,
   SIDEBAR_MENU_CLASS,
   SIDEBAR_SUB_CLASS,
+  SIDEBAR_VIEW_PANE_CLASS,
   navRowClass,
 } from "./sidebar-classes"
 import { SidebarChats } from "./sidebar-chats"
@@ -125,6 +126,40 @@ export function AppSidebar() {
   const [menuOnConversation, setMenuOnConversation] = React.useState(false)
   React.useEffect(() => setMenuOnConversation(false), [pathname])
   const showChats = onConversation && !menuOnConversation
+
+  // The slide between the two views. The chat view mounts the first time it is wanted, off to the
+  // right, and only then moves in, so the browser has a place to move it from; after that it stays
+  // mounted, out of view and inert, and the two views just trade places.
+  const [chatsMounted, setChatsMounted] = React.useState(showChats)
+  const [chatsIn, setChatsIn] = React.useState(showChats)
+  const chatsPaneRef = React.useRef<HTMLDivElement>(null)
+  const contentRef = React.useRef<HTMLDivElement>(null)
+  // The view that gets the focus once it is in: the control that leads back to the other one.
+  const focusOnArrival = React.useRef<"chats" | "menu" | null>(null)
+  React.useEffect(() => {
+    if (showChats && !chatsMounted) {
+      setChatsMounted(true)
+      return
+    }
+    if (showChats === chatsIn) return
+    // Lay the pane out at its starting place before it moves (a fresh pane has no "from" yet).
+    void chatsPaneRef.current?.offsetWidth
+    setChatsIn(showChats)
+  }, [showChats, chatsMounted, chatsIn])
+  React.useEffect(() => {
+    const target = focusOnArrival.current
+    if (!target) return
+    focusOnArrival.current = null
+    contentRef.current?.querySelector<HTMLElement>(`[data-view-focus="${target}"]`)?.focus({ preventScroll: true })
+  }, [chatsIn])
+  const backToMenu = () => {
+    focusOnArrival.current = "menu"
+    setMenuOnConversation(true)
+  }
+  const backToChats = () => {
+    focusOnArrival.current = "chats"
+    setMenuOnConversation(false)
+  }
   const [flyout, setFlyout] = React.useState<FlyoutState>(null)
   const flyoutRef = React.useRef<HTMLDivElement>(null)
   const [mounted, setMounted] = React.useState(false)
@@ -330,7 +365,7 @@ export function AppSidebar() {
         tooltip="AI chats"
         data-view-focus="menu"
         className={menuBtnClass(true)}
-        onClick={() => setMenuOnConversation(false)}
+        onClick={backToChats}
       >
         <Bot className="size-4 shrink-0" />
         <span className={cn("flex-1 truncate text-left leading-5", SIDEBAR_FADE)}>AI chats</span>
@@ -349,19 +384,38 @@ export function AppSidebar() {
     <Sidebar data-print-hide collapsible="icon" side="left" className={SIDEBAR_CLASS}>
       <SidebarBrand />
 
-      <SidebarContent className={SIDEBAR_CONTENT_CLASS}>
+      <SidebarContent ref={contentRef} className={cn(SIDEBAR_CONTENT_CLASS, "relative overflow-hidden")}>
         {/* WEB-18 (owner 2026-11-14): on a conversation the chat list takes the menu's place,
             as in a chat app, so the history is beside the chat it belongs to instead of on a
             page of its own. The account card and the logo row stay. */}
-        {showChats ? (
-          <SidebarChats shown onBack={() => setMenuOnConversation(true)} />
-        ) : (
+        {/* The two views sit side by side and slide together (`SIDEBAR_VIEW_PANE_CLASS`): the
+            menu leaves to the left as the chats come in from the right, so the sidebar is never
+            empty mid-move, and its width does not change. The one out of view is inert. */}
+        <div
+          className={cn(
+            SIDEBAR_VIEW_PANE_CLASS,
+            "no-scrollbar overflow-y-auto group-data-[collapsible=icon]:overflow-hidden",
+            chatsIn && "-translate-x-full",
+          )}
+          inert={chatsIn}
+          data-sidebar-view="menu"
+        >
           <SidebarGroup className={SIDEBAR_GROUP_CLASS}>
             <SidebarMenu className={SIDEBAR_MENU_CLASS}>
               {menuEntries}
             </SidebarMenu>
           </SidebarGroup>
-        )}
+        </div>
+        {chatsMounted ? (
+          <div
+            ref={chatsPaneRef}
+            className={cn(SIDEBAR_VIEW_PANE_CLASS, !chatsIn && "translate-x-full")}
+            inert={!chatsIn}
+            data-sidebar-view="chats"
+          >
+            <SidebarChats shown={chatsIn} onBack={backToMenu} />
+          </div>
+        ) : null}
       </SidebarContent>
 
       {/* Flyout (icon mode only) */}
