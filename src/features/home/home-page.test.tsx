@@ -283,3 +283,44 @@ describe("Home's states (WEB-17 T5)", () => {
     expect(screen.queryByText(/No pipelines yet/)).toBeNull()
   })
 })
+
+describe("Ask why on a failed pipeline (WEB-17 T6)", () => {
+  it("fills the composer with a question naming the pipeline, in Ask mode, focused, and sends nothing", async () => {
+    resetHomeBackgroundMemory()
+    const requested: string[] = []
+    spyOn(globalThis, "fetch").mockImplementation(((input: RequestInfo | URL) => {
+      const path = String(input)
+      requested.push(path)
+      if (path.includes("/api/auth/me")) return Promise.resolve(me(["assistant:ask", "pipeline:read"]))
+      if (path.includes("/api/home/layout")) return Promise.resolve(layout())
+      if (path.includes("/api/dashboard/fields")) return Promise.resolve(json({ marts: [] }))
+      if (path.includes("/api/ai/sessions")) return Promise.resolve(json({ sessions: [] }))
+      if (path.includes("/api/pipelines")) {
+        return Promise.resolve(
+          json({
+            pipelines: [
+              { id: "p1", name: "orders_daily", status: "failed", lastRunAt: "2026-11-14T01:00:00Z" },
+              { id: "p2", name: "visits_hourly", status: "completed", lastRunAt: "2026-11-14T02:00:00Z" },
+            ],
+          }),
+        )
+      }
+      return Promise.resolve(json({}))
+    }) as unknown as typeof fetch)
+    renderHome()
+
+    // Only the failed pipeline offers it.
+    const askWhy = await screen.findByRole("button", { name: "Ask AI Copilot why orders_daily failed" })
+    expect(screen.queryByRole("button", { name: "Ask AI Copilot why visits_hourly failed" })).toBeNull()
+
+    // Start from Build, to see Ask why switch the mode back to Ask.
+    fireEvent.click(screen.getByRole("button", { name: "Build" }))
+    fireEvent.click(askWhy)
+
+    const box = screen.getByLabelText("Message AI Copilot", { selector: "textarea" }) as HTMLTextAreaElement
+    await waitFor(() => expect(box.value).toBe("Why did orders_daily fail?"))
+    expect(document.activeElement).toBe(box)
+    expect(screen.getByRole("button", { name: "Ask", pressed: true })).toBeTruthy()
+    expect(requested.some((p) => p.includes("/api/ai/chat"))).toBe(false)
+  })
+})
