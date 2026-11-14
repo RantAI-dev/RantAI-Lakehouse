@@ -5,7 +5,7 @@ import { createPortal } from "react-dom"
 import Image from "next/image"
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
-import { ChevronDown, ChevronRight } from "lucide-react"
+import { ChevronDown, ChevronRight, FileText } from "lucide-react"
 import { useAuth } from "@/features/auth/auth-provider"
 import { rememberTableHref } from "@/hooks/use-table-memory"
 import {
@@ -25,7 +25,7 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
-import { useLastBoardId, useLastBoardName } from "@/features/dashboards/last-board"
+import { useDashboardsRow } from "@/features/dashboards/dashboards-row"
 import { useSidebarGroups } from "@/hooks/use-sidebar-groups"
 import { cn } from "@/lib/utils"
 import { NAV_GROUPS, activeNavHref, canOpen, type NavGroup, type NavItem } from "./nav-config"
@@ -107,8 +107,7 @@ export function AppSidebar() {
   const activeHref = activeNavHref(pathname)
   const { state } = useSidebar()
   const iconMode = state === "collapsed"
-  const lastBoardName = useLastBoardName()
-  const lastBoardId = useLastBoardId()
+  const dashboardsRow = useDashboardsRow()
   const { user, hasPermission, logout } = useAuth()
   const groups = React.useMemo(() => {
     return NAV_GROUPS.map((g) => ({
@@ -248,13 +247,20 @@ export function AppSidebar() {
     const Icon = group.icon ?? first.icon
     // A group declared with one page shows that page's title, which is the
     // more descriptive of the two.
-    // Only the Dashboards row is named after what it opens: `/dashboards` goes to the board
-    // last opened, so the row says which one. Nothing remembered keeps "Dashboards".
-    const boardName = first.href === "/dashboards" ? lastBoardName : null
-    const label = boardName ?? (single ? first.title : group.label)
-    // The row goes straight to the board it names; with nothing remembered (or after Browse)
-    // it goes to the list, so it never depends on the `/dashboards` resolver's guess.
-    const labelHref = first.href === "/dashboards" ? (lastBoardId ? `/dashboards/${encodeURIComponent(lastBoardId)}` : first.action?.href ?? first.href) : first.href
+    // Only the Dashboards row is named after what it opens: the last dashboard or report
+    // opened (its own memory, cleared by Browse). Nothing remembered keeps "Dashboards".
+    const remembered = first.href === "/dashboards" ? dashboardsRow : null
+    const label = remembered?.name ?? (single ? first.title : group.label)
+    const labelHref = remembered
+      ? remembered.kind === "report"
+        ? `/dashboards/reports/${encodeURIComponent(remembered.id)}`
+        : `/dashboards/${encodeURIComponent(remembered.id)}`
+      : first.href === "/dashboards"
+        ? (first.action?.href ?? first.href)
+        : first.href
+    // The icon follows the kind. BI-61 T11 review: a dashboard keeps the row's own chart icon
+    // (the Browse part beside it already uses the grid); a report gets the document icon.
+    const RowIcon = remembered?.kind === "report" ? FileText : Icon
     const active = group.items.some((it) => it.href === activeHref)
 
     // One page, or icon mode with one page: nothing to expand.
@@ -280,14 +286,14 @@ export function AppSidebar() {
                 <SidebarMenuButton
                   isActive={labelActive}
                   tooltip={label}
-                  aria-label={boardName ? `Dashboard: ${boardName}` : undefined}
+                  aria-label={remembered ? `${remembered.kind === "report" ? "Report" : "Dashboard"}: ${remembered.name}` : undefined}
                   className={cn(
                     menuBtnClass(labelActive),
                     action && "min-w-0 flex-1 rounded-r-none group-data-[collapsible=icon]:flex-none group-data-[collapsible=icon]:rounded-md",
                   )}
                   render={
                     <Link href={labelHref} onClick={(e) => handleNavClick(e, labelHref)}>
-                      <Icon className="size-4 shrink-0" />
+                      <RowIcon className="size-4 shrink-0" />
                       <span className={cn("truncate leading-5", SIDEBAR_FADE)}>{label}</span>
                     </Link>
                   }

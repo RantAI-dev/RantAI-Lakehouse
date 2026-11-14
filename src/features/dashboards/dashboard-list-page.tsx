@@ -39,6 +39,7 @@ import { ItemPicture, pictureSource } from "./library-picture"
 import { RecentRow } from "./library-recent"
 import { MoveItemsDialog } from "./move-items-dialog"
 import { UseTemplateDialog } from "./template-dialogs"
+import { forgetRow } from "./dashboards-row"
 import { forgetLastBoard } from "./last-board"
 import { TrashDialog } from "./trash-dialog"
 
@@ -177,8 +178,9 @@ function ListEmpty({ kind, query, folderFilter, folderPathOf, isPersonal, canWri
 }
 
 export function DashboardListPage() {
-  // BI-61 T10: opening Browse resets the sidebar's Dashboards row to "Dashboards".
-  React.useEffect(() => { forgetLastBoard() }, [])
+  // BI-61 T11: opening Browse resets the sidebar's Dashboards row to "Dashboards".
+  // The last board (resolver, Home) is not touched.
+  React.useEffect(() => { forgetRow() }, [])
   const router = useRouter()
   const state = useService((s) => dashboardService.listBoards(s), [])
   // Folders are listed to everyone who can see dashboards; filing needs
@@ -786,6 +788,7 @@ export function DashboardListPage() {
             // If this board was the last one opened, `/dashboards` must not
             // lead back to something that is gone.
             forgetLastBoard(target.id)
+            forgetRow({ kind: "dashboard", id: target.id })
             notifyDashboardsChanged()
             reload()
           })()

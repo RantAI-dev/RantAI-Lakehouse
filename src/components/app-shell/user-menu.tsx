@@ -122,10 +122,10 @@ export function UserMenu({
       </DropdownMenuTrigger>
       {/* From the sidebar's footer it opens upward, left edges aligned; from the collapsed rail, to its right. */}
       <DropdownMenuContent side={side} align={align} className="w-(--anchor-width) min-w-56">
-        {/* The email, then the role: muted and not clickable; the name is already on the trigger. */}
+        {/* The role first, then the email (owner QA 2026-11-15): muted and not clickable; the name is already on the trigger. */}
         <DropdownMenuLabel className="grid gap-0.5 text-xs font-normal text-muted-foreground">
-          <span className="truncate">{userEmail ?? userName ?? "Signed in"}</span>
           {roleLine(roles) ? <span className="truncate">{roleLine(roles)}</span> : null}
+          <span className="truncate">{userEmail ?? userName ?? "Signed in"}</span>
         </DropdownMenuLabel>
         <DropdownMenuSeparator />
         <DropdownMenuItem render={<Link href="/account/change-password" />}>

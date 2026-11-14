@@ -138,6 +138,28 @@
      (`/dashboards/<id>`), so the row never depends on the resolver's guess. Opening a board
      remembers it again. Check: a test that visiting Browse clears the name and the row's href
      becomes `/dashboards/browse`; opening a board sets both back.
+11. **T11, the row remembers dashboards and reports, in its own memory (owner QA 2026-11-15).**
+   Owner: "berlaku buat halaman dashboard dan reports ini juga. pokoknya halaman yang ada di
+   dashboards nih yang namanya kesimpan di menu". T10 stored the row's name in the last-board
+   memory, which also drives the `/dashboards` resolver and Home's focal dashboard, so Browse's
+   reset made Home lose its last board. Split the two:
+   - **Last board** (`last-board.ts`, id plus name): back to its pre-T10 meaning for the resolver
+     and Home. Opening Browse no longer forgets it. Deleting a board still does.
+   - **The row's memory** (new, e.g. `dashboards-row.ts`): `{kind: "dashboard" | "report", id,
+     name}`, the last dashboard or report opened. Set when a dashboard page or a report page
+     (view or edit, `/dashboards/reports/<id>…`) opens, and again on rename. Cleared when Browse
+     opens and when that item is deleted (the page's delete, Browse's bulk delete and trash).
+     Same tab and cross-tab updates and the same `useSyncExternalStore` hook pattern as T10.
+   - The row shows that item's name, and its icon is the item kind's icon, the same one Browse
+     uses for a dashboard or a report. Its label part links to `/dashboards/<id>` or
+     `/dashboards/reports/<id>`. With nothing remembered: "Dashboards", the row's own icon, and
+     a link to `/dashboards/browse`. `aria-label` "Dashboard: <name>" or "Report: <name>".
+   - Metrics (`/dashboards/metrics`) and templates are not remembered: they are not items one
+     reopens.
+   - Check: tests for a report setting the row (name, icon, href), a dashboard after a report
+     replacing it, Browse clearing the row but **not** the last board, deleting the remembered
+     item clearing it, and Home's focal board still following the last board after a Browse
+     visit.
 
 ## 4. Machine rules (owner, 2026-11-14)
 
@@ -279,6 +301,20 @@ Measured: frame bottom / composer top 720/738 px at 1190x800, 820/838 at 1366x90
 **Checks:** `bun run typecheck` clean; `bun test src/components/app-shell src/features/dashboards` 789 pass, 0 fail; eslint on the changed files clean.
 
 **Not verified:** no browser check; the Browse-mount effect in `DashboardListPage` has no test of its own (the sidebar test covers the forget).
+
+### T11 handoff, 2026-11-15 (Sonnet developer agent)
+
+**Commit** `45aa4e1e` (`feat(console): BI-61 T11, the Dashboards row remembers dashboards and reports`; not pushed).
+
+- `last-board.ts` is restored to its pre-T10 content (id only). T10's name key and hooks are gone.
+- New `dashboards-row.ts`: key `dashboards:menu-row` = `{kind, id, name}`; `rememberRow`, `forgetRow` (no argument clears; with an item clears only if it is the remembered one), `useDashboardsRow` (`useSyncExternalStore`, server snapshot `null`, event plus `storage`).
+- Set by the dashboard page (also on rename), the report reader and the report editor (existing report). Cleared by Browse mount, the page's delete, Browse's dashboard delete, the report list's delete and the reader's delete. Trash only restores, so it needs nothing. Metrics and templates never call it.
+- Sidebar: name, `aria-label` "Dashboard: <n>" or "Report: <n>", `LayoutGrid` or `FileText` icon (the Browse tab icons), href `/dashboards/<id>` or `/dashboards/reports/<id>`; nothing remembered gives "Dashboards", the row's icon, `/dashboards/browse`.
+- Tests (`app-sidebar.test.tsx`, 7 for the row): none, dashboard, report then dashboard (icons, hrefs), Browse clears the row but not the last board, delete of remembered vs other item, rename, malformed value.
+
+**Checks:** typecheck clean; `bun test src/components/app-shell src/features/dashboards` 791 pass, 0 fail; eslint on the 9 changed files clean.
+
+**Not verified:** no browser; the page-level calls (reader, editor, list, delete) have no tests of their own, only the store and the sidebar are tested.
 
 ## Micro-interaction audit (emil), 2026-11-14
 
