@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test"
-import { bodies, DIM, field, HZ, sceneInks } from "./lake-scene"
+import { readFileSync } from "node:fs"
+import { BASE, bodies, field, HZ, sceneInks } from "./lake-scene"
 
 // Regions of `field`: 1 whale, 4 moon, 6 sun.
 const WHALE = 1
@@ -56,29 +57,54 @@ const ratio = (a: readonly number[], b: readonly number[]) => {
 const rgb = (hex: string) => [1, 3, 5].map((k) => parseInt(hex.slice(k, k + 2), 16))
 const TEXT = { day: rgb("#0b0f11"), night: rgb("#f8fbfc") }
 
-describe("the lake is a dim background (WEB-17 T9, owner 2026-11-15)", () => {
-  // Both phases, and the moments of a theme change between them.
-  const phases = [0, 0.1, 0.25, 0.5, 0.75, 0.9, 1]
+describe("the lake is a middle-dim background (WEB-17 T9 and T10, owner 2026-11-15)", () => {
+  const styles = ["dither", "ascii"] as const
+  const between = [0.1, 0.25, 0.5, 0.75, 0.9]
+  const strongest = (p: number, style: (typeof styles)[number]) => {
+    const { inks, base } = sceneInks(p, style)
+    return inks.map((ink) => ratio(ink, base))
+  }
 
-  it("every ink is at most 2.0:1 against its base, in both phases and between", () => {
-    for (const p of phases) {
-      const { inks, base } = sceneInks(p)
-      for (const ink of inks) expect(ratio(ink, base)).toBeLessThanOrEqual(2.0)
+  it("the day base is the light page background, pinned to the --background token", () => {
+    const css = readFileSync(new URL("../../../design-system/tokens/colors.css", import.meta.url), "utf8")
+    // The first `--background` is the light theme's: oklch(1 0 0) is white.
+    expect(css.match(/--background:\s*([^;]+);/)?.[1].trim()).toBe("oklch(1 0 0)")
+    expect(BASE.day).toBe("#ffffff")
+  })
+
+  it("at rest the most contrasting ink is between 2.5:1 and 3.0:1 against its base, per style", () => {
+    for (const style of styles) {
+      for (const p of [0, 1]) {
+        const top = Math.max(...strongest(p, style))
+        expect(top).toBeGreaterThanOrEqual(2.5)
+        expect(top).toBeLessThanOrEqual(3.0)
+      }
+    }
+    // ASCII sits near the top of the window, Dither nearer the bottom.
+    for (const p of [0, 1]) {
+      expect(Math.max(...strongest(p, "ascii"))).toBeGreaterThan(Math.max(...strongest(p, "dither")))
     }
   })
 
-  it("the greeting's text is at least 4.5:1 against every ink and the base, day and night", () => {
+  it("between day and night no ink goes past 3.0:1", () => {
+    for (const style of styles) {
+      for (const p of between) expect(Math.max(...strongest(p, style))).toBeLessThanOrEqual(3.0)
+    }
+  })
+
+  it("the greeting's text is at least 4.5:1 against every ink and the base, day and night, both styles", () => {
     // At rest. During the 1.5 s theme change the text already has the new theme's colour while
     // the scene is still blending, so the midpoints are not a state anyone reads in.
-    for (const [p, text] of [[0, TEXT.day], [1, TEXT.night]] as const) {
-      const { inks, base } = sceneInks(p)
-      for (const c of [...inks, base]) expect(ratio(text, c)).toBeGreaterThanOrEqual(4.5)
+    for (const style of styles) {
+      for (const [p, text] of [[0, TEXT.day], [1, TEXT.night]] as const) {
+        const { inks, base } = sceneInks(p, style)
+        for (const c of [...inks, base]) expect(ratio(text, c)).toBeGreaterThanOrEqual(4.5)
+      }
     }
   })
 
-  it("dims by one factor per phase, and the day's and night's factors are in range", () => {
-    expect(DIM.day).toBeGreaterThan(0)
-    expect(DIM.night).toBeLessThan(1)
-    expect(sceneInks(0).inks[1]).not.toEqual(rgb("#050A30"))
+  it("keeps each ink's hue: the day whale is still blue, not grey", () => {
+    const [r, , b] = sceneInks(0, "dither").inks[1]
+    expect(b - r).toBeGreaterThan(10)
   })
 })
