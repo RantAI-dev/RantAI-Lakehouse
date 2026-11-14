@@ -188,6 +188,15 @@ function StateBox({ children }: { children: React.ReactNode }) {
   return <div className="grid h-full place-content-center justify-items-center gap-3 p-6 text-center">{children}</div>;
 }
 
+/**
+ * BI-58 review round 2, SHOULD-FIX 7 (owner; DESIGN.md §3, "Panel yang bersebelahan sejajar"): the
+ * header rows of zones that sit side by side (the canvas's toolbar, the inspector's tabs) share one
+ * height, 44 px, so their dividers are one line. Below the two-column width the toolbar may wrap,
+ * since nothing sits beside it there. (The tab row repeats `h-11` under the tabs' group variant,
+ * which the base TabsList sets its own height with.)
+ */
+const ZONE_HEADER = "min-h-11 shrink-0 @3xl:h-11";
+
 /** The inspector's tabs (`BI-58` T4). */
 type InspectorTab = "data" | "sort" | "style";
 
@@ -1376,7 +1385,7 @@ export function ChartBuilder({
           with centred labels, a 44 px row with its divider across the panel, and one underline the
           width of the active tab that slides to it (no slide under reduced motion). An inactive tab
           is muted but readable; hover and focus show. Round 1's padded row still looked cramped. */}
-      <TabsList variant="line" className="relative h-11 w-full shrink-0 gap-0 rounded-none border-b border-border/60 p-0 group-data-horizontal/tabs:h-11">
+      <TabsList variant="line" className={cn("relative w-full gap-0 rounded-none border-b border-border/60 p-0", ZONE_HEADER, "group-data-horizontal/tabs:h-11")}>
         {([["data", "Data", summaries.show], ["sort", "Sort & filter", summaries.sortAndFilter], ["style", "Style", undefined]] as const).map(([value, label, title]) => (
           <TabsTrigger
             key={value} value={value} title={title} data-slot="inspector-tab"
@@ -1866,7 +1875,7 @@ export function ChartBuilder({
           )}
 
           <section aria-label="Chart" className="flex min-h-[26rem] min-w-0 flex-col rounded-xl bg-card ring-1 ring-foreground/6">
-            <div className="flex min-h-12 items-center gap-2 border-b border-border/60 px-3 py-2">
+            <div data-slot="canvas-toolbar" className={cn("flex items-center gap-2 border-b border-border/60 px-3", ZONE_HEADER)}>
               {isStaticTile ? null : (
                 <Button
                   type="button" variant="outline" size="sm" className="max-w-44 shrink-0 @7xl:hidden"
