@@ -177,6 +177,8 @@ function ListEmpty({ kind, query, folderFilter, folderPathOf, isPersonal, canWri
 }
 
 export function DashboardListPage() {
+  // BI-61 T10: opening Browse resets the sidebar's Dashboards row to "Dashboards".
+  React.useEffect(() => { forgetLastBoard() }, [])
   const router = useRouter()
   const state = useService((s) => dashboardService.listBoards(s), [])
   // Folders are listed to everyone who can see dashboards; filing needs
