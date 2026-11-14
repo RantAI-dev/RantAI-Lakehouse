@@ -81,12 +81,13 @@ import type { SourceFacts } from "@/lib/kind-gallery";
 
 export { KIND_GROUPS } from "./chart-kinds";
 import type { OwnSource } from "./filters/use-filter-values";
-import { AccordionSection, ColumnLabel, FoldSection, Segmented, columnItems, focusFirstEmpty } from "./builder-sections";
-import { missingSection, sectionSummaries, type SectionNumber } from "@/lib/section-summary";
+import { ColumnLabel, Segmented, columnItems, focusFirstEmpty } from "./builder-sections";
+import { missingPlace, missingSection, sectionSummaries, type MissingPlace } from "@/lib/section-summary";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { CustomFieldsMenu } from "./custom-fields-menu";
-import { builderRules, carryOverOnKindSwitch, moreOptionsUsed } from "@/lib/builder-rules";
+import { builderRules, carryOverOnKindSwitch } from "@/lib/builder-rules";
 import type { StyleFields } from "@/lib/chart-style";
-import { effectivePalette, formatRules, formatUsed, styleFromDef, stylePayload, withCompanyPalette } from "@/lib/style-draft";
+import { effectivePalette, formatRules, styleFromDef, stylePayload, withCompanyPalette } from "@/lib/style-draft";
 import { FormatSection } from "./format-section";
 import { FormulaEditorDialog } from "./formula-editor";
 import { isValueGroup, type CalcField } from "@/services/contracts/calc-fields";
@@ -184,6 +185,9 @@ const INLINE_EDIT = "outline-none transition-[background-color,color,box-shadow]
 function StateBox({ children }: { children: React.ReactNode }) {
   return <div className="grid h-full place-content-center justify-items-center gap-3 p-6 text-center">{children}</div>;
 }
+
+/** The inspector's tabs (`BI-58` T4). */
+type InspectorTab = "data" | "sort" | "style";
 
 /** Marks a field the chart cannot be drawn without. */
 function Req() {
@@ -321,19 +325,16 @@ export function ChartBuilder({
   const [cacheDraft, setCacheDraft] = React.useState<RuleDraft>(draftOf(null));
   // BI-17 part A: the chart's formats, colours, axes, labels, notes, tooltip and conditional colours (section 5).
   const [style, setStyle] = React.useState<StyleFields>({});
-  const [formatOpen, setFormatOpen] = React.useState(false);
   // BI-13: the chart's other questions, and how its own series is drawn when it has them ("" = the kind's default).
   const [layers, setLayers] = React.useState<LayerDraft[]>([]);
   const [ownDraw, setOwnDraw] = React.useState("");
   const [ownAxis, setOwnAxis] = React.useState("");
   const [paramsOpen, setParamsOpen] = React.useState(false);
-  // Phase 2 QA R3: "More options" is folded unless the chart being edited uses something in it.
-  const [moreOpen, setMoreOpen] = React.useState(false);
-  // Phase 2 QA R10: sections 1 to 3 are an accordion (one open, or none); a new chart starts on 1, an edited one folded.
-  // `BI-58` T1: section 1 (the source) moved to the data panel, so a new chart starts on 2.
-  const [active, setActive] = React.useState<2 | 3 | null>(2);
-  const panelRefs = React.useRef<Partial<Record<SectionNumber | 5, HTMLElement | null>>>({});
-  const [focusAsk, setFocusAsk] = React.useState<{ section: SectionNumber; n: number } | null>(null);
+  // `BI-58` T4: the inspector's tab; every chart opens on Data.
+  const [tab, setTab] = React.useState<InspectorTab>("data");
+  // Where a missing field is: 1 the data panel, 2 the Data tab, 3 the Sort & filter tab.
+  const panelRefs = React.useRef<Partial<Record<1 | 2 | 3, HTMLElement | null>>>({});
+  const [focusAsk, setFocusAsk] = React.useState<{ section: 1 | 2 | 3; n: number } | null>(null);
   const numberParamDefs = React.useMemo(() => numberParams(paramDefs), [paramDefs]);
   const [targetBoard, setTargetBoard] = React.useState(board);
   // What a click does instead of the drill menu (BI-18·B); undefined = the menu.
@@ -715,7 +716,6 @@ export function ChartBuilder({
     void apiFetch("/api/dashboard/fields").then((r) => r.json()).then((j) => setMarts(j.marts ?? [])).catch(() => setMarts([]));
     // A viewer without the list (or with the API down) still gets marts.
     void dashboardService.listSqlSources().then(setSqlSources).catch(() => setSqlSources([]));
-    setActive(editId ? null : 2);
     if (initial) {
       setTitle(initial.title ?? "");
       setSubtitle(initial.subtitle ?? "");
@@ -744,18 +744,10 @@ export function ChartBuilder({
       setCacheDraft(draftOf(initial.cache));
       setTypeDraft(typeDraftFromDef(initial));
       setStyle(styleFromDef(initial));
-      setFormatOpen(formatUsed(styleFromDef(initial), initial.referenceLines?.length ?? 0));
       setLayers(layerDraftsFromDef(initial.layers));
       setOwnDraw(initial.draw ?? "");
       setOwnAxis(initial.axis ?? "");
       setLimitTouched(true);
-      setMoreOpen(moreOptionsUsed({
-        steps: savedShape.steps.length, layers: initial.layers?.length ?? 0,
-        click: !!initial.click,
-        columnSettings: initial.kind === "table" && initial.tableMode !== "rows" ? Object.keys(initial.columnSettings ?? {}).length : 0,
-        compare: initial.kind === "kpi" && !!initial.compare,
-        freshness: !!initial.cache && initial.cache.mode !== "default",
-      }));
       setTargetBoard(initial.board ?? board);
       setClick(initial.click);
       setGrain(isGrain(initial.grain) ? initial.grain : "");
@@ -771,7 +763,6 @@ export function ChartBuilder({
       }
     } else {
       setTargetBoard(board);
-      setMoreOpen(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -871,7 +862,7 @@ export function ChartBuilder({
     } else if (use === "split") {
       pickBreakdown(name);
     } else {
-      setActive(3);
+      setTab("sort");
       setFilterAsk({ column: name, n: Date.now() });
     }
   }
@@ -916,11 +907,10 @@ export function ChartBuilder({
     limit: rules.limit ? (limitParamName ? "param" : Math.min(limit, maxLimit)) : null,
     filters: rules.filters ? shape.filters.length : 0, other: shape.other && rules.other.shown,
   });
-  /** Opens the section that holds a missing field and moves focus to that field. */
-  function revealSection(n: SectionNumber) {
-    // Section 1 is the data panel, which is always open.
-    if (n === 4) setMoreOpen(true); else if (n !== 1) setActive(n);
-    setFocusAsk({ section: n, n: Date.now() });
+  /** Shows the place that holds a missing field (the data panel or a tab) and moves focus to that field. */
+  function revealMissing(place: MissingPlace) {
+    if (place !== "source") setTab(place);
+    setFocusAsk({ section: place === "source" ? 1 : place === "data" ? 2 : 3, n: Date.now() });
   }
   React.useEffect(() => {
     if (!focusAsk) return;
@@ -1112,7 +1102,9 @@ export function ChartBuilder({
     if (sqlActive && draft.blocker) { draft.markSaveAttempted(); setError(draft.blocker); return; }
     // Phase 2 QA R10: a required field that is missing opens its section and takes focus.
     if (missing.length) {
-      revealSection(missing.map(missingSection).reduce((a, b) => (b < a ? b : a)));
+      // The first missing field in the order of the old sections.
+      const first = missing.reduce((a, b) => (missingSection(b) < missingSection(a) ? b : a));
+      revealMissing(missingPlace(first));
       setError(`Still needed: ${missing.join(", ")}.`);
       return;
     }
@@ -1327,23 +1319,38 @@ export function ChartBuilder({
             </div>
   );
 
-  const formFields = (
-    // Phase 2 QA R14, the cause of the sideways scroll: a grid with no column template has one `auto`
-    // track, whose minimum is the widest unbreakable content in it (a trigger's `nowrap` value), so
-    // one long column name widened the whole form. Every grid of the form without columns of its own
-    // gets a `minmax(0, 1fr)` track, which the container, not the content, sizes.
-    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] content-start gap-5 p-4 [&_.grid:not([class*=grid-cols])]:grid-cols-[minmax(0,1fr)]">
+  // Phase 2 QA R14, the cause of the sideways scroll: a grid with no column template has one `auto`
+  // track, whose minimum is the widest unbreakable content in it (a trigger's `nowrap` value), so
+  // one long column name widened the whole form. Every grid of the form without columns of its own
+  // gets a `minmax(0, 1fr)` track, which the container, not the content, sizes.
+  const FORM_GRID = "grid min-w-0 grid-cols-[minmax(0,1fr)] content-start gap-5 p-4 [&_.grid:not([class*=grid-cols])]:grid-cols-[minmax(0,1fr)]";
+  /** A group of settings under the main ones of a tab, set apart by a rule. */
+  const group = (children: React.ReactNode) => <div className="grid grid-cols-[minmax(0,1fr)] gap-4 border-t border-border/60 pt-5">{children}</div>;
+
+  // `BI-58` T4: every control of the old five sections, in three tabs. Data: what the chart shows
+  // and where from (old sections 2 and 4 but steps); Sort & filter: old section 3 and the steps;
+  // Style: the Format section as it is. A kind's own panels show only for it, as before.
+  const inspector = isStaticTile ? (
+    <div className={FORM_GRID}>
       {isText ? (
         <div className="grid gap-1.5">
           <Label>Content (markdown) <Req /></Label>
           <Textarea rows={8} value={text} onChange={(e) => setText(e.target.value)} placeholder="Title **bold**, - bullets, or | table | GFM |." />
         </div>
-      ) : isCard ? (
-        <CardFields kind={kind === "web" ? "web" : "image"} draft={typeDraft} onChange={changeType} sites={sites} />
       ) : (
-        <>
-          {/* Phase 2 QA R3: four ordered sections; the last is folded. */}
-          <AccordionSection number={2} title="What to show" summary={summaries.show} open={active === 2} onOpenChange={(o) => setActive(o ? 2 : null)} panelRef={(n) => { panelRefs.current[2] = n; }}>
+        <CardFields kind={kind === "web" ? "web" : "image"} draft={typeDraft} onChange={changeType} sites={sites} />
+      )}
+    </div>
+  ) : (
+    <Tabs value={tab} onValueChange={(v) => setTab(v as InspectorTab)} className="flex min-h-0 flex-1 flex-col gap-0">
+      <TabsList variant="line" className="h-11 w-full shrink-0 justify-start gap-0 rounded-none border-b border-border/60 px-2">
+        <TabsTrigger value="data" title={summaries.show}>Data</TabsTrigger>
+        <TabsTrigger value="sort" title={summaries.sortAndFilter}>Sort &amp; filter</TabsTrigger>
+        <TabsTrigger value="style">Style</TabsTrigger>
+      </TabsList>
+      <div className="@container min-h-0 flex-1 overflow-y-auto">
+        <TabsContent value="data">
+          <div className={FORM_GRID} ref={(n) => { panelRefs.current[2] = n; }}>
           {isMap ? (
             <div className="grid gap-1.5">
               <Label>Map</Label>
@@ -1358,7 +1365,7 @@ export function ChartBuilder({
 
           {kind === "table" ? <TableSection part="shape" draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} groupedColumns={shownColumns} /> : null}
           {!isSingle && !ownColumns ? (
-            <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2">
+            <div className="grid grid-cols-1 items-start gap-3 @md:grid-cols-2">
               {isGroupedTable ? (
                 <GroupingsEditor
                   value={shape.groupings}
@@ -1410,7 +1417,7 @@ export function ChartBuilder({
                 cannot stretch them.
               */}
               {dimensionExtras || breakdownExtras ? (
-                <div className="grid grid-cols-1 gap-3 sm:col-span-2 sm:grid-cols-2" data-slot="conditional-row">
+                <div className="grid grid-cols-1 gap-3 @md:col-span-2 @md:grid-cols-2" data-slot="conditional-row">
                   {dimensionExtras ? (
                     <div className="grid content-start gap-3">
                       {grainPicker}
@@ -1421,7 +1428,7 @@ export function ChartBuilder({
                     </div>
                   ) : null}
                   {breakdownExtras ? (
-                    <div className="grid content-start gap-3 sm:col-start-2">
+                    <div className="grid content-start gap-3 @md:col-start-2">
                       {breakdownGrainPicker}
                       {breakdownBinPicker ? (
                         <BinPicker label="Group the breakdown in" value={shape.breakdownBin} sqlSource={onSqlSource} aria="Group the breakdown in bins"
@@ -1434,7 +1441,7 @@ export function ChartBuilder({
             </div>
           ) : null}
           {isPoints ? (
-            <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2">
+            <div className="grid grid-cols-1 items-start gap-3 @md:grid-cols-2">
               <div className="grid gap-1.5">
                 <Label>Latitude <Req /></Label>
                 <Select value={lat} items={columnItems(coordinateColumns, fieldLabel, lat)} onValueChange={(v) => setLat(v ?? "")} disabled={!fields}>
@@ -1451,11 +1458,6 @@ export function ChartBuilder({
               </div>
             </div>
           ) : null}
-          {isPoints ? <GridPicker value={shape.grid} onChange={(grid) => setShape((d) => ({ ...d, grid }))} disabled={!fields} /> : null}
-          {isCalendar ? (
-            <p className="-mt-2 text-xs text-muted-foreground">Pick a date column as the dimension; one cell per day, up to the last year of data.</p>
-          ) : null}
-
           {isPoints ? <GridPicker value={shape.grid} onChange={(grid) => setShape((d) => ({ ...d, grid }))} disabled={!fields} /> : null}
           {isCalendar ? (
             <p className="text-xs text-muted-foreground">Pick a date column as the dimension; one cell per day, up to the last year of data.</p>
@@ -1510,11 +1512,38 @@ export function ChartBuilder({
               ) : null}
             </>
           ) : null}
-          </AccordionSection>
-
-          <AccordionSection number={3} title="Sort and filter" summary={summaries.sortAndFilter} open={active === 3} onOpenChange={(o) => setActive(o ? 3 : null)} panelRef={(n) => { panelRefs.current[3] = n; }}>
+            {rules.layers ? group(
+              <LayersSection
+                layers={layers} onChange={setLayers}
+                baseKind={dimension ? fields?.kinds?.[dimension] : undefined} grained={!!(grain && grainOptions.includes(grain))}
+                marts={marts.map((m) => m.name)} sqlSources={sqlSources.map((s) => ({ id: s.id, title: s.title }))}
+                ownDraw={ownDraw} ownAxis={ownAxis} onOwnChange={(patch) => { if (patch.draw !== undefined) setOwnDraw(patch.draw); if (patch.axis !== undefined) setOwnAxis(patch.axis); }}
+                blocked={layersBlocked.length ? `Remove ${layersBlocked.join(", ")} to combine questions.` : isNewSql ? "Save the SQL as a source first to combine it with other questions." : undefined}
+                disabled={!fields}
+              />,
+            ) : null}
+            {isKpi ? group(<KpiCompareSection draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} metric={pickedMetric ? { label: pickedMetric.label, timeColumn: pickedMetric.timeColumn, grain: pickedMetric.grain } : undefined} />) : null}
+            {isGroupedTable ? group(<TableSection part="format" draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} groupedColumns={shownColumns} />) : null}
+            {group(
+              <>
+                {rules.parameters ? (
+                  <div>
+                    <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => setParamsOpen(true)}>
+                      <SlidersHorizontal className="size-3" aria-hidden /> Parameters
+                    </Button>
+                  </div>
+                ) : null}
+                {rules.click ? <ClickSetting value={click} onChange={setClick} boards={boardOptions} /> : null}
+                <FreshnessField id="chart-freshness" draft={cacheDraft} onChange={setCacheDraft}
+                  help="How long this chart's result is remembered. Follow the default uses the dashboard's setting." />
+              </>,
+            )}
+          </div>
+        </TabsContent>
+        <TabsContent value="sort">
+          <div className={FORM_GRID} ref={(n) => { panelRefs.current[3] = n; }}>
             {rules.sort !== "none" ? (
-              <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2">
+              <div className="grid grid-cols-1 items-start gap-3 @md:grid-cols-2">
                 {rules.sort === "by-date" || rules.sort === "by-category" ? (
                   <div className="grid gap-1.5">
                     <Label>Sort</Label>
@@ -1563,49 +1592,22 @@ export function ChartBuilder({
             ) : null}
 
             {rules.filters ? <ChartFilters value={shape.filters} onChange={(filters) => setShape((d) => ({ ...d, filters }))} columns={columnChoices} disabled={!fields} segments={fields?.segments ?? []} source={filterSource} startWith={filterAsk} /> : null}
-          </AccordionSection>
-
-          <FoldSection number={4} title="More options" open={moreOpen} onOpenChange={setMoreOpen} panelRef={(n) => { panelRefs.current[4] = n; }}>
-            {rules.steps ? <StepsEditor value={shape.steps} onChange={(steps) => setShape((d) => ({ ...d, steps }))} base={baseResult} disabled={!fields} /> : null}
-
-            {rules.layers ? (
-              <LayersSection
-                layers={layers} onChange={setLayers}
-                baseKind={dimension ? fields?.kinds?.[dimension] : undefined} grained={!!(grain && grainOptions.includes(grain))}
-                marts={marts.map((m) => m.name)} sqlSources={sqlSources.map((s) => ({ id: s.id, title: s.title }))}
-                ownDraw={ownDraw} ownAxis={ownAxis} onOwnChange={(patch) => { if (patch.draw !== undefined) setOwnDraw(patch.draw); if (patch.axis !== undefined) setOwnAxis(patch.axis); }}
-                blocked={layersBlocked.length ? `Remove ${layersBlocked.join(", ")} to combine questions.` : isNewSql ? "Save the SQL as a source first to combine it with other questions." : undefined}
-                disabled={!fields}
-              />
-            ) : null}
-
-            {isKpi ? <KpiCompareSection draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} metric={pickedMetric ? { label: pickedMetric.label, timeColumn: pickedMetric.timeColumn, grain: pickedMetric.grain } : undefined} /> : null}
-            {isGroupedTable ? <TableSection part="format" draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} groupedColumns={shownColumns} /> : null}
-            {rules.click ? <ClickSetting value={click} onChange={setClick} boards={boardOptions} /> : null}
-            {!isStaticTile ? (
-              <FreshnessField id="chart-freshness" draft={cacheDraft} onChange={setCacheDraft}
-                help="How long this chart's result is remembered. Follow the default uses the dashboard's setting." />
-            ) : null}
-            {rules.parameters ? (
-              <div>
-                <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => setParamsOpen(true)}>
-                  <SlidersHorizontal className="size-3" aria-hidden /> Parameters
-                </Button>
-              </div>
-            ) : null}
-            {paramsOpen ? <ParamDialog open onOpenChange={setParamsOpen} canWrite onChanged={() => { if (source) void loadFields(source); }} /> : null}
-          </FoldSection>
-
+            {rules.steps ? group(<StepsEditor value={shape.steps} onChange={(steps) => setShape((d) => ({ ...d, steps }))} base={baseResult} disabled={!fields} />) : null}
+          </div>
+        </TabsContent>
+        <TabsContent value="style">
           {/* BI-17 part A: formats, colours, axes, labels, reference lines, notes, tooltip; conditional colours for tables and KPIs. */}
-          <FoldSection number={5} title="Format" open={formatOpen} onOpenChange={setFormatOpen} panelRef={(n) => { panelRefs.current[5] = n; }}>
+          <div className={FORM_GRID}>
             <FormatSection rules={fmtRules} style={style} onChange={setStyle} valueNames={formatValueNames} seriesNames={formatValueNames} paletteValue={effectivePalette(style, palette, isEdit)}>
               {rules.referenceLines ? <ReferenceLinesEditor value={refLines} onChange={setRefLines} numberParams={numberParamDefs} valueNames={resultNames} takesForecast={kind !== "hbar"} /> : null}
             </FormatSection>
-          </FoldSection>
-        </>
-      )}
-    </div>
+          </div>
+        </TabsContent>
+      </div>
+      {paramsOpen ? <ParamDialog open onOpenChange={setParamsOpen} canWrite onChanged={() => { if (source) void loadFields(source); }} /> : null}
+    </Tabs>
   );
+
   // `BI-58` T3: the preview's rows, for the "Data" view under the chart and for the type gallery.
   const resultRows = preview && "rows" in preview.result ? preview.result : null;
   const rowsView: PreviewRows | null = preview?.previewRows?.rows.length ? preview.previewRows
@@ -1811,8 +1813,8 @@ export function ChartBuilder({
             </footer>
           </section>
 
-          <aside aria-label="Settings" className="flex min-h-0 min-w-0 flex-col overflow-y-auto rounded-xl bg-card ring-1 ring-foreground/6">
-            {formFields}
+          <aside aria-label="Settings" className="flex min-h-0 min-w-0 flex-col overflow-hidden rounded-xl bg-card ring-1 ring-foreground/6">
+            {inspector}
           </aside>
         </div>
       </div>

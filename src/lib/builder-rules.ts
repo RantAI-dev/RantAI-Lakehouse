@@ -99,24 +99,6 @@ export function builderRules(s: BuilderState): BuilderRules {
   }
 }
 
-/** What a chart being edited uses that sits inside "More options", so the fold opens by itself. */
-export type MoreOptionsUse = {
-  steps: number
-  layers: number
-  /** A click that replaces the drill menu. */
-  click: boolean
-  /** Column formats of a grouped table. */
-  columnSettings: number
-  /** A KPI compared with an earlier period or a goal. */
-  compare: boolean
-  /** A freshness rule of the chart's own (`BI-4` part B). */
-  freshness?: boolean
-}
-
-export function moreOptionsUsed(u: MoreOptionsUse): boolean {
-  return u.steps > 0 || u.layers > 0 || u.click || u.columnSettings > 0 || u.compare || u.freshness === true
-}
-
 /**
  * The picks of a chart kind that carry over to another (phase 2 QA R6). A chart
  * becoming a grouped table: its dimension (and breakdown) are the first

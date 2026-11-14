@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 
-import { builderRules, carryOverOnKindSwitch, moreOptionsUsed, type BuilderState } from "./builder-rules"
+import { builderRules, carryOverOnKindSwitch, type BuilderState } from "./builder-rules"
 
 const plain: BuilderState = {
   kind: "bar", rowsMode: false, grained: false, breakdown: false, other: false, steps: 0, layers: 0,
@@ -114,15 +114,6 @@ test("questions lock the breakdown and the bins", () => {
   assert.equal(rules({ layers: 1 }).breakdownLocked, "Not available with more questions.")
   assert.equal(rules({ layers: 1 }).bins, false)
   assert.equal(rules({}).breakdownLocked, undefined)
-})
-
-test("the fold opens for anything the edited chart uses inside it", () => {
-  // BI-17: reference lines moved to the Format section, which opens on `formatUsed` (style-draft.test.ts).
-  const none = { steps: 0, layers: 0, click: false, columnSettings: 0, compare: false }
-  assert.equal(moreOptionsUsed(none), false)
-  for (const key of ["steps", "layers", "columnSettings"] as const) assert.equal(moreOptionsUsed({ ...none, [key]: 1 }), true, key)
-  assert.equal(moreOptionsUsed({ ...none, click: true }), true)
-  assert.equal(moreOptionsUsed({ ...none, compare: true }), true)
 })
 
 const sw = { rowsMode: false, dimension: "", breakdown: "", grain: "", dimensionBin: undefined, breakdownBin: undefined, groupings: [] }
