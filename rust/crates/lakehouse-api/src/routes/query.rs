@@ -3307,6 +3307,7 @@ async fn write_download_rows<S: crate::export::RowSource>(
         locale,
         labels: &labels,
         formats: &formats,
+        note: None,
     };
     crate::export::write_export_with_byte_cap(source, &options, Some(byte_cap)).await
 }

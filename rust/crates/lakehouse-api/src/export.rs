@@ -231,7 +231,16 @@ pub(crate) struct ExportOptions<'a> {
     pub(crate) labels: &'a HashMap<String, String>,
     /// The value format of a column, by name (used with [`Values::Formatted`]).
     pub(crate) formats: &'a HashMap<String, ValueFormat>,
+    /// A sentence the file carries beside its data (`BI-28`): a `Note` sheet in
+    /// a workbook. A CSV or TSV body is never changed; the route says it in the
+    /// file's name and a header instead.
+    pub(crate) note: Option<&'a str>,
 }
+
+/// The sentence a download carries when an active dashboard filter did not
+/// apply to the tile's data and was left out of the file (`BI-28`).
+pub(crate) const FILTERS_NOT_APPLIED: &str =
+    "Some dashboard filters do not apply to this table, so they were not used for this file.";
 
 /// A finished file, open for reading from its start.
 pub(crate) struct Written {
@@ -309,9 +318,29 @@ fn csv_cell(
     // BI-1 review fix (SHOULD-FIX) R5: a number the engine sent as text (a 64-bit
     // integer) is a number, not a formula: `"-5"` is written as `-5`, with no
     // apostrophe, as a JSON number is.
+    text_cell(value, numeric_column)
+}
+
+/// A text that is a plain decimal number: an optional minus sign, digits, and
+/// an optional fraction. No exponent, no sign other than a minus, no spaces.
+fn is_plain_number(s: &str) -> bool {
+    let body = s.strip_prefix('-').unwrap_or(s);
+    let (whole, fraction) = body
+        .split_once('.')
+        .map_or((body, None), |(w, f)| (w, Some(f)));
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    digits(whole) && fraction.is_none_or(digits)
+}
+
+/// The text of a cell that is not written as a number. `BI-28`: a number the
+/// engine sent as a quoted string (a 64-bit integer, 16 digits or more, which
+/// does not survive being a float) in a numeric column is written as it came,
+/// never prefixed with an apostrophe like a formula. Any other text is
+/// neutralised.
+fn text_cell(value: &Value, numeric_column: bool) -> String {
     if numeric_column
         && let Value::String(text) = value
-        && numeric_string(text).is_some()
+        && (numeric_string(text).is_some() || is_plain_number(text))
     {
         return text.clone();
     }
@@ -615,7 +644,7 @@ impl XlsxSink {
                     },
                     (Value::Bool(b), None) => sheet.write_boolean(r, col, *b),
                     (other, None) => {
-                        let text = csv_export::cell_text(Some(other));
+                        let text = text_cell(other, numeric);
                         if text.chars().count() > XLSX_CELL_CHARS {
                             return Err(ExportError::Xlsx(
                                 "a cell is longer than Excel allows".to_owned(),
@@ -738,7 +767,16 @@ async fn write_xlsx_file<S: RowSource>(
     flush_batch(&mut sink, &mut batch, rows).await?;
     let path = TempPath::new("xlsx");
     let target = path.0.clone();
+    let note = options.note.map(str::to_owned);
     on_blocking_pool(&mut sink, move |sink| {
+        if let Some(note) = &note {
+            // BI-28: a small second sheet after the data, so the data sheet's
+            // cells are exactly the tile's rows.
+            let sheet = sink.workbook.add_worksheet();
+            sheet.set_name("Note").map_err(|e| xlsx_err(&e))?;
+            sheet.write_string(0, 0, note).map_err(|e| xlsx_err(&e))?;
+            sheet.set_column_width(0, 90).map_err(|e| xlsx_err(&e))?;
+        }
         // `Workbook::save` takes `&mut self`.
         sink.workbook.save(&target).map_err(|e| xlsx_err(&e))
     })
@@ -837,6 +875,7 @@ mod tests {
             locale: "id-ID",
             labels,
             formats,
+            note: None,
         }
     }
 
@@ -1227,7 +1266,7 @@ mod tests {
     #[tokio::test]
     async fn a_negative_quoted_integer_is_written_unchanged_and_text_is_still_neutralised() {
         let (labels, formats) = (HashMap::new(), HashMap::new());
-        let make = |_| vec![json!("-5"), json!("-5")];
+        let make = |_| vec![json!("-5x"), json!("-5")];
         let mut src = Generated {
             names: vec!["code".to_owned(), "amount".to_owned()],
             types: vec!["String".to_owned(), "Int64".to_owned()],
@@ -1242,7 +1281,92 @@ mod tests {
         .await
         .unwrap();
         let text = String::from_utf8(read_all(w).await).unwrap();
-        assert!(text.ends_with("code,amount\r\n'-5,-5\r\n"), "{text:?}");
+        assert!(text.ends_with("code,amount\r\n'-5x,-5\r\n"), "{text:?}");
+    }
+
+    /// BI-28: a negative 64-bit integer of 16 digits or more, sent as a quoted
+    /// string in a numeric column, is written as it came, in a CSV and in a
+    /// workbook; a text column's `-...` is still neutralised.
+    #[tokio::test]
+    async fn a_long_negative_integer_in_a_numeric_column_has_no_apostrophe() {
+        let (labels, formats) = (HashMap::new(), HashMap::new());
+        let long = "-9223372036854775807";
+        assert!(is_plain_number(long) && is_plain_number("12.5") && !is_plain_number("-x"));
+        assert!(!is_plain_number("=1") && !is_plain_number("1e5") && !is_plain_number("-"));
+        let make = |_| vec![json!("-9223372036854775807"), json!("-9223372036854775807")];
+        let mk = || Generated {
+            names: vec!["code".to_owned(), "amount".to_owned()],
+            types: vec!["String".to_owned(), "Int64".to_owned()],
+            total: 1,
+            next: 0,
+            make,
+        };
+        let w = write_export(
+            &mut mk(),
+            &options(FileFormat::Csv, Values::Raw, 10, &labels, &formats),
+        )
+        .await
+        .unwrap();
+        let text = String::from_utf8(read_all(w).await).unwrap();
+        assert!(
+            text.ends_with(&format!("code,amount\r\n{long},{long}\r\n")),
+            "{text:?}"
+        );
+        assert!(!text.contains('\''), "{text:?}");
+        let w = write_export(
+            &mut mk(),
+            &options(FileFormat::Xlsx, Values::Raw, 10, &labels, &formats),
+        )
+        .await
+        .unwrap();
+        let bytes = read_all(w).await;
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut strings = String::new();
+        zip.by_name("xl/sharedStrings.xml")
+            .unwrap()
+            .read_to_string(&mut strings)
+            .unwrap();
+        assert!(strings.contains(&format!(">{long}<")), "{strings}");
+        assert!(!strings.contains('\''), "{strings}");
+    }
+
+    /// BI-28: a note rides in a `Note` sheet of a workbook after the data; the
+    /// body of a CSV is the same with or without it.
+    #[tokio::test]
+    async fn a_note_is_a_second_sheet_and_never_changes_a_csv_body() {
+        let (labels, formats) = (HashMap::new(), HashMap::new());
+        let make = |_| vec![json!("a"), json!(1)];
+        let mut with = options(FileFormat::Xlsx, Values::Raw, 10, &labels, &formats);
+        with.note = Some(FILTERS_NOT_APPLIED);
+        let w = write_export(&mut source(1, make), &with).await.unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(read_all(w).await)).unwrap();
+        let mut workbook = String::new();
+        zip.by_name("xl/workbook.xml")
+            .unwrap()
+            .read_to_string(&mut workbook)
+            .unwrap();
+        assert!(workbook.contains("name=\"Data\"") && workbook.contains("name=\"Note\""));
+        let mut note = String::new();
+        zip.by_name("xl/sharedStrings.xml")
+            .unwrap()
+            .read_to_string(&mut note)
+            .unwrap();
+        assert!(note.contains(FILTERS_NOT_APPLIED), "{note}");
+        let plain = options(FileFormat::Xlsx, Values::Raw, 10, &labels, &formats);
+        let w = write_export(&mut source(1, make), &plain).await.unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(read_all(w).await)).unwrap();
+        assert!(zip.by_name("xl/worksheets/sheet2.xml").is_err());
+
+        let mut csv_with = options(FileFormat::Csv, Values::Raw, 10, &labels, &formats);
+        csv_with.note = Some(FILTERS_NOT_APPLIED);
+        let a = write_export(&mut source(1, make), &csv_with).await.unwrap();
+        let b = write_export(
+            &mut source(1, make),
+            &options(FileFormat::Csv, Values::Raw, 10, &labels, &formats),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_all(a).await, read_all(b).await);
     }
 
     #[test]

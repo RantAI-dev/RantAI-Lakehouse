@@ -1034,7 +1034,11 @@ impl Collected<'_> {
         let cut = file.written.cut;
         let name = unique_name(
             &self.files.attachments,
-            &export_file_name(&title, file.format.extension(), cut.then_some(cap)),
+            &export_file_name(
+                &title,
+                file.format.extension(),
+                (cut.then_some(cap), file.filters_skipped),
+            ),
         );
         let len = usize::try_from(file.written.len).unwrap_or(usize::MAX);
         if !self.budget.take(len) {
