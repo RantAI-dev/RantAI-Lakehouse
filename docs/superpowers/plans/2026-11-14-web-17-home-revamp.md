@@ -178,6 +178,21 @@ Processes: dev server on 28699 (`bun x next dev` 373591, node 373608, next-serve
 
 **Not verified:** no screenshots (`after-dim-*` not taken) and no browser; how dim it looks is for the owner to judge.
 
+### T10 handoff, 2026-11-15 (Sonnet developer agent)
+
+**Commit** `e1397131` (`feat(home): WEB-17 T10, a neutral light band and a middle dim`; not pushed).
+
+- Day base is `#ffffff`, the light `--background` (`oklch(1 0 0)`); the test reads `design-system/tokens/colors.css` and pins both. Night base `#061230` unchanged. `BASE` is exported.
+- `DIM` is per style: Dither day 0.62, night 0.69; ASCII day 0.57, night 0.65 (interpolated on the phase). `sceneInks(phase, style)`; the scene passes its variant.
+- Measured ink against base at rest, best to worst (min to max): Dither day 1.43 to 2.53, night 1.36 to 2.55; ASCII day 1.50 to 2.93, night 1.43 to 2.89. In between (0.25, 0.5, 0.75): at most 1.78, 1.19, 1.89 (Dither) and 1.95, 1.22, 2.06 (ASCII).
+- Greeting text against every ink and the base at rest: worst 6.14:1 (ASCII night); day 6.58 to 7.60.
+- Tests: both bounds (2.5 to 3.0) at rest for both styles, ASCII above Dither, upper bound 3.0 at in-between phases, text 4.5, the pin, and the day whale still blue.
+- Note: the navy whale at day is a pale periwinkle, not navy, because the window caps its contrast with white at about 2.5 to 2.9. It is blue-tinted (not neutral grey), but it is light.
+
+**Checks:** typecheck clean; `bun test src/features/home src/lib/home-*.test.ts` 65 pass, 0 fail; eslint on the 2 changed files clean.
+
+**Not verified:** no browser, no screenshots.
+
 ## Micro-interaction audit (emil), 2026-11-14
 
 Owner request (2026-11-14): audit the revamped pages' micro-animations with the
