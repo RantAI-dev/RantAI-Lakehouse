@@ -39,15 +39,15 @@ import { SHORTCUTS } from "./home-shortcuts"
  * not act, so a click aimed at a handle or at "hide" cannot also navigate.
  */
 export const CARD_LABEL: Record<CardId, string> = {
-  "dashboard-preview": "Dashboard preview",
-  recent: "Recent",
-  "pipeline-runs": "Pipeline runs",
+  "dashboard-preview": "Dashboard",
+  recent: "Recent AI chats",
+  "pipeline-runs": "Pipelines",
   sources: "Sources",
   "open-alerts": "Open alerts",
   "saved-queries": "Saved queries",
 }
 
-/** The quiet entry point at the top right of the second screen. */
+/** The quiet entry point at the right of the row above the bento. */
 export function CustomizeButton({ onClick }: { onClick: () => void }) {
   return (
     <Button variant="ghost" size="sm" onClick={onClick} className="text-muted-foreground">

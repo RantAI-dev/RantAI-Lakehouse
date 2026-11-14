@@ -100,15 +100,22 @@ export function ModeToggle({ mode, setMode }: { mode: Mode; setMode: (m: Mode) =
   );
 }
 
+/** What a page can do to the composer from outside: put text in it (`WEB-17` "Ask why"). */
+export type ChatComposerHandle = {
+  /** Replace the text, focus the box with the caret at the end; nothing is sent. */
+  fill: (text: string) => void;
+};
+
 /**
  * The chat composer — input + Ask/Build toggle + Tools menu + send. A "bar"
  * style like Google Cloud Assist / RantAI-Agents. Used by the global chat
  * dock and /copilot.
  */
 export function ChatComposer({
-  mode, setMode, onSend, onStop, busy, placeholder, autoFocus, rows = 2,
-  enabledCaps, toggleCap, onFocus, glass, compact, solid, examples,
+  ref, mode, setMode, onSend, onStop, busy, placeholder, autoFocus, rows = 2,
+  enabledCaps, toggleCap, onFocus, glass, compact, solid, examples, footer,
 }: {
+  ref?: React.Ref<ChatComposerHandle>;
   mode: Mode;
   setMode: (m: Mode) => void;
   onSend: (text: string) => void;
@@ -138,8 +145,24 @@ export function ChatComposer({
    * the first one stays put.
    */
   examples?: string[];
+  /**
+   * One line under the toolbar, inside the box, edge to edge: Home's
+   * context strip (what Ask can read, what Build may change). Full style only.
+   */
+  footer?: React.ReactNode;
 }) {
   const [input, setInput] = React.useState("");
+  const area = React.useRef<HTMLTextAreaElement>(null);
+  React.useImperativeHandle(ref, () => ({
+    fill: (text: string) => {
+      setInput(text);
+      const el = area.current;
+      if (!el) return;
+      el.focus();
+      // After React has put the text in, so the caret lands after it.
+      requestAnimationFrame(() => el.setSelectionRange(text.length, text.length));
+    },
+  }), []);
   const reduce = useReducedMotion() ?? false;
   const [exampleIndex, setExampleIndex] = React.useState(0);
   const cycling = Boolean(examples?.length) && !input;
@@ -197,6 +220,7 @@ export function ChatComposer({
     <>
       <div className="relative">
         <Textarea
+          ref={area}
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onFocus={onFocus}
@@ -267,6 +291,7 @@ export function ChatComposer({
           </button>
         )}
       </div>
+      {footer ? <div className="-mx-1.5 -mb-1.5 mt-1.5 overflow-hidden rounded-b-[15px]">{footer}</div> : null}
     </>
   );
 
