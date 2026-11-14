@@ -86,6 +86,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { asSentence, formatLocaleNumber } from "@/lib/format";
 import { missingPlace, missingSection, sectionSummaries, type MissingPlace } from "@/lib/section-summary";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Tabs as TabsPrimitive } from "@base-ui/react/tabs";
 import { CustomFieldsMenu } from "./custom-fields-menu";
 import { builderRules, carryOverOnKindSwitch, limitTakesParam } from "@/lib/builder-rules";
 import type { StyleFields } from "@/lib/chart-style";
@@ -1371,17 +1372,30 @@ export function ChartBuilder({
     </div>
   ) : (
     <Tabs value={tab} onValueChange={(v) => setTab(v as InspectorTab)} className="flex min-h-0 flex-1 flex-col gap-0">
-      {/* BI-58 review round 1 (SHOULD-FIX 1): the tabs keep room from the panel's edge and from each
-          other, and an inactive tab reads as muted text, not as a disabled control. */}
-      <TabsList variant="line" className="h-12 w-full shrink-0 justify-start gap-2 rounded-none border-b border-border/60 px-4">
+      {/* BI-58 review round 2, SHOULD-FIX 6 (owner): the tab row spans the inspector. Three equal tabs
+          with centred labels, a 44 px row with its divider across the panel, and one underline the
+          width of the active tab that slides to it (no slide under reduced motion). An inactive tab
+          is muted but readable; hover and focus show. Round 1's padded row still looked cramped. */}
+      <TabsList variant="line" className="relative h-11 w-full shrink-0 gap-0 rounded-none border-b border-border/60 p-0 group-data-horizontal/tabs:h-11">
         {([["data", "Data", summaries.show], ["sort", "Sort & filter", summaries.sortAndFilter], ["style", "Style", undefined]] as const).map(([value, label, title]) => (
           <TabsTrigger
-            key={value} value={value} title={title}
-            className="h-9 flex-none px-3 text-muted-foreground hover:text-foreground data-active:text-foreground dark:text-muted-foreground dark:data-active:text-foreground"
+            key={value} value={value} title={title} data-slot="inspector-tab"
+            className={cn(
+              "h-full min-w-0 flex-1 justify-center rounded-none border-0 px-1 text-[13px] whitespace-nowrap @[18rem]:text-sm",
+              "text-muted-foreground transition-[color,background-color] duration-200 ease-[cubic-bezier(0.2,0,0,1)] hover:text-foreground group-data-[variant=line]/tabs-list:hover:bg-muted/50",
+              "focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:ring-inset focus-visible:outline-none",
+              "data-active:text-foreground dark:text-muted-foreground dark:data-active:text-foreground",
+              // The sliding indicator below draws the underline; the tab's own one stays hidden.
+              "after:hidden",
+            )}
           >
             {label}
           </TabsTrigger>
         ))}
+        <TabsPrimitive.Indicator
+          aria-hidden
+          className="absolute bottom-[-1px] left-0 h-0.5 w-(--active-tab-width) translate-x-(--active-tab-left) bg-foreground transition-[translate,width] duration-200 ease-[cubic-bezier(0.2,0,0,1)] motion-reduce:transition-none"
+        />
       </TabsList>
       <div className="@container min-h-0 flex-1 overflow-y-auto">
         <TabsContent value="data">
@@ -1924,7 +1938,7 @@ export function ChartBuilder({
             </footer>
           </section>
 
-          <aside aria-label="Settings" className="flex min-h-0 min-w-0 flex-col overflow-hidden rounded-xl bg-card ring-1 ring-foreground/6">
+          <aside aria-label="Settings" className="@container flex min-h-0 min-w-0 flex-col overflow-hidden rounded-xl bg-card ring-1 ring-foreground/6">
             {inspector}
           </aside>
         </div>

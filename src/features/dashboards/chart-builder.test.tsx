@@ -65,6 +65,9 @@ describe("ChartBuilder inspector tabs (phase 2 QA R3, BI-58 T4)", () => {
     renderBuilder(barDef)
     await screen.findByLabelText("Aggregation of visitors")
     expect(screen.getAllByRole("tab").map((t) => t.textContent)).toEqual(["Data", "Sort & filter", "Style"])
+    // BI-58 review round 2, SHOULD-FIX 6 (owner): the row spans the inspector, the three tabs in equal thirds.
+    expect(screen.getByRole("tablist").className).toContain("w-full")
+    for (const tab of screen.getAllByRole("tab")) expect(tab.className).toContain("flex-1")
     expect(selectedTab()).toBe("Data")
     expect(screen.queryAllByRole("heading", { level: 3 })).toHaveLength(0)
     expect(screen.getByRole("complementary", { name: "Data" }).textContent).toContain("Data source")
