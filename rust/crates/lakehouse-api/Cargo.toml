@@ -96,7 +96,7 @@ lakehouse-iceberg = { path = "../lakehouse-iceberg" }
 # comment on why `=0.10.1`, not `0.10`) — needed directly here for
 # `iceberg::spec` types and `iceberg::arrow::schema_to_arrow_schema`,
 # which `lakehouse-iceberg` does not re-export.
-iceberg = "=0.10.1"
+iceberg = "=0.11.0"
 rand = { workspace = true }
 aes-gcm = { workspace = true }
 axum = { workspace = true }

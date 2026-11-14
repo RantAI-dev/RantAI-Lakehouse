@@ -2352,6 +2352,66 @@ dependencies = [
 ]
 
 [[package]]
+name = "iceberg"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25dd5d1aa2fa92d2c9bc426f72bc16717a27eb73255805beb8845afcca31e58d"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "apache-avro",
+ "array-init",
+ "arrow-arith",
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-cast",
+ "arrow-ord",
+ "arrow-schema",
+ "arrow-select",
+ "arrow-string",
+ "as-any",
+ "async-trait",
+ "backon",
+ "base64 0.22.1",
+ "bimap",
+ "bytes",
+ "chrono",
+ "crc32fast",
+ "derive_builder",
+ "expect-test",
+ "fastnum",
+ "flate2",
+ "fnv",
+ "form_urlencoded",
+ "futures",
+ "iceberg-property-macro",
+ "itertools 0.13.0",
+ "moka",
+ "murmur3",
+ "once_cell",
+ "ordered-float 4.6.0",
+ "parquet",
+ "rand 0.9.5",
+ "reqwest 0.12.28",
+ "roaring",
+ "serde",
+ "serde_bytes",
+ "serde_derive",
+ "serde_json",
+ "serde_repr",
+ "serde_with",
+ "strum",
+ "tokio",
+ "tracing",
+ "typed-builder",
+ "typetag",
+ "url",
+ "uuid",
+ "zeroize",
+ "zstd",
+]
+
+[[package]]
 name = "iceberg-catalog-rest"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2360,7 +2420,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "http",
- "iceberg",
+ "iceberg 0.10.1",
  "itertools 0.13.0",
  "reqwest 0.12.28",
  "serde",
@@ -2369,6 +2429,17 @@ dependencies = [
  "tokio",
  "typed-builder",
  "uuid",
+]
+
+[[package]]
+name = "iceberg-property-macro"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6de7eea6577fed2290867f7604483e3649297514b873cdac108e0cc7f783c9e1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2752,7 +2823,7 @@ dependencies = [
  "flate2",
  "futures",
  "hmac",
- "iceberg",
+ "iceberg 0.11.0",
  "ipnet",
  "jiff",
  "jsonwebtoken",
@@ -2910,7 +2981,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
- "iceberg",
+ "iceberg 0.11.0",
  "iceberg-catalog-rest",
  "lakehouse-core",
  "object_store",
