@@ -19,8 +19,13 @@ import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 
-/** One easing and duration for every hover, press and change here (owner taste: 150–250 ms, eased, never linear). */
-export const EASE = "transition-[background-color,border-color,color,box-shadow,opacity,transform] duration-200 ease-[cubic-bezier(0.2,0,0,1)]";
+/**
+ * One easing and duration for every hover, press and change here (owner taste: 150–250 ms, eased, never linear).
+ * Micro-interaction audit 2026-11-14 (emil): Tailwind v4's `scale-*`, `rotate-*` and `translate-*` set the
+ * `scale`, `rotate` and `translate` properties, not `transform`, so the list names those; with `transform`
+ * the press scale and the chip's chevron turn jumped. `ease-ui` is the console's strong ease-out.
+ */
+export const EASE = "transition-[background-color,border-color,color,box-shadow,opacity,scale,rotate,translate] duration-200 ease-ui";
 /** The keyboard focus ring the custom controls of the page use. */
 export const FOCUS = "outline-none focus-visible:ring-3 focus-visible:ring-ring/50";
 
@@ -43,7 +48,7 @@ export function HeaderIconButton({
       <TooltipTrigger
         render={
           <Button variant="ghost" size="icon" aria-label={label} onClick={onClick} disabled={disabled}
-            className={cn("text-muted-foreground hover:text-foreground active:scale-95", EASE, className)} />
+            className={cn("text-muted-foreground hover:text-foreground", EASE, className)} />
         }
       >
         {children}
@@ -96,7 +101,7 @@ export function ShareButton({
   }
   if (!canManage) return null;
   return (
-    <Button onClick={onShare} className={cn("active:scale-[0.98]", EASE)}>
+    <Button onClick={onShare} className={EASE}>
       <Share2 data-icon="inline-start" aria-hidden /> Share
     </Button>
   );
@@ -187,7 +192,10 @@ export function DashboardHeader({
         <div className="grid w-full min-w-0 gap-1 sm:w-auto sm:flex-1">
           <div className="flex min-w-0 items-start gap-1.5 sm:items-center">
             <h1 className="line-clamp-2 min-w-0 text-xl font-semibold tracking-tight text-foreground sm:truncate sm:text-2xl">
-              {title ?? (
+              {title !== null ? (
+                // Micro-interaction audit 2026-11-14: the name fades in over its placeholder's line, not in one frame.
+                <span className="transition-opacity duration-200 ease-ui starting:opacity-0">{title}</span>
+              ) : (
                 // Owner QA 2026-11-14: the name is not known yet, so a bar where it will be, at the
                 // title's own line height, rather than "Dashboards" switching to the real name.
                 <>

@@ -202,7 +202,7 @@ export function AppSidebar() {
         href={item.href}
         onClick={(e) => handleNavClick(e, item.href)}
         className={cn(
-          "flex items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors duration-150",
+          "flex items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors duration-150 ease-ui",
           active
             ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
             : "text-sidebar-foreground/70 hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
@@ -316,7 +316,9 @@ export function AppSidebar() {
               </span>
               <ChevronRight
                 className={cn(
-                  "size-3.5 shrink-0 text-sidebar-foreground/50 transition-[transform,opacity] duration-150",
+                  // Micro-interaction audit 2026-11-14: `rotate-90` sets `rotate`, not `transform`, in
+                  // Tailwind v4, so the chevron used to snap; it now turns with the section's fold.
+                  "size-3.5 shrink-0 text-sidebar-foreground/50 transition-[rotate,opacity] duration-200 ease-ui",
                   expanded && "rotate-90",
                   "group-data-[collapsible=icon]:opacity-0",
                 )}
@@ -377,7 +379,8 @@ export function AppSidebar() {
             <div
               ref={flyoutRef}
               style={{ position: "fixed", top: Math.min(flyout.top, window.innerHeight - 40 - openGroup.items.length * 34), left: flyout.left }}
-              className="z-[60] w-56 rounded-xl border border-sidebar-border bg-sidebar p-1.5 shadow-2xl"
+              // Micro-interaction audit 2026-11-14: the flyout grows out of the rail it belongs to, like the menus.
+              className="z-[60] w-56 origin-left rounded-xl border border-sidebar-border bg-sidebar p-1.5 shadow-2xl transition-[opacity,scale] duration-150 ease-ui starting:scale-[0.97] starting:opacity-0"
             >
               <p className="px-2 py-1 text-[11px] font-medium uppercase tracking-wide text-sidebar-foreground/60">{openGroup.label}</p>
               {openGroup.items.map((item) => (
@@ -397,6 +400,7 @@ export function AppSidebar() {
             <UserMenu
               userName={user?.name}
               userEmail={user?.email}
+              roles={user?.roles}
               onLogout={logout}
               side={state === "collapsed" ? "right" : "top"}
               align={state === "collapsed" ? "end" : "start"}
@@ -409,10 +413,9 @@ export function AppSidebar() {
               }
             >
               <div className={ACCOUNT_AVATAR_CLASS} aria-hidden>{initialsOf(user?.name)}</div>
-              {/* The name, then the person's first role (from the session; nothing is shown without one). */}
+              {/* Avatar, name, chevron; the email and role are in the menu's header. */}
               <span className={cn("min-w-0 flex-1 truncate whitespace-nowrap text-left text-sm font-medium text-sidebar-foreground", SIDEBAR_FADE)}>
                 {user?.name ?? "Signed in"}
-                {user?.roles?.[0] ? <span className="font-normal text-sidebar-foreground/60"> · {user.roles[0]}</span> : null}
               </span>
               <ChevronDown className={cn("ml-auto size-4 shrink-0 text-sidebar-foreground/60", SIDEBAR_FADE)} aria-hidden />
             </UserMenu>

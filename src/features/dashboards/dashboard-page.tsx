@@ -1429,9 +1429,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
               <FavouriteButton
                 on={isFavourite}
                 name={dashName}
-                onToggle={() => {
-                  void dashboardService.setFavourite("board", board, !isFavourite).then(reloadShortcuts).catch(() => undefined);
-                }}
+                // Micro-interaction audit 2026-11-14: the promise lets the star show the change at once and undo it on failure.
+                onToggle={() => dashboardService.setFavourite("board", board, !isFavourite).then(reloadShortcuts)}
               />
             ) : null}
             {ownerId ? <PrivateBadge /> : null}
@@ -1448,7 +1447,9 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         onStop={stopLoading}
         notice={edit ? (
           // BI-61 T5: what edit mode does, in one line, with the layout's own extras beside it.
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl bg-primary/8 px-3 py-2 text-sm" data-print-hide>
+          // Micro-interaction audit 2026-11-14: the line arrives with edit mode (a short fade down from the
+          // title row) instead of popping in; leaving edit mode drops it at once, as the reader asked for.
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl bg-primary/8 px-3 py-2 text-sm transition-[opacity,translate] duration-200 ease-ui starting:-translate-y-1 starting:opacity-0" data-print-hide>
             <Move className="size-4 shrink-0 text-primary dark:text-sky-300" aria-hidden />
             {/* BI-18 part C review fix (SHOULD-FIX) R2: the hint's colour is its own; the buttons beside it keep theirs. */}
             <span className="min-w-0 flex-1 basis-[calc(100%-2rem)] text-primary sm:basis-0 dark:text-sky-200">
@@ -1566,7 +1567,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
               {/* BI-61 T5: which parameters the row shows is an edit-mode choice, beside "+ Filter". */}
               {edit && hasPermission("dashboard:write") ? (
                 <button type="button" onClick={() => setParamsOpen(true)}
-                  className={cn("inline-flex h-8 shrink-0 items-center gap-1 rounded-full px-3 text-sm font-medium text-primary hover:bg-primary/10 dark:text-sky-300", EASE, FOCUS)}>
+                  className={cn("inline-flex h-8 shrink-0 items-center gap-1 rounded-full px-3 text-sm font-medium text-primary hover:bg-primary/10 active:scale-[0.97] dark:text-sky-300", EASE, FOCUS)}>
                   <SlidersHorizontal className="size-3.5" aria-hidden /> Parameters
                 </button>
               ) : null}

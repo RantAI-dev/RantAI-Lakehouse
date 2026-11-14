@@ -129,9 +129,10 @@ describe("the account menu", () => {
   })
 
   it("heads the menu with the email, muted, and ends with Sign out", () => {
-    render(<UserMenu userName="Ada Lovelace" userEmail="ada@example.com" onLogout={() => {}} />)
+    render(<UserMenu userName="Ada Lovelace" userEmail="ada@example.com" roles={["platform_admin", "viewer", "editor"]} onLogout={() => {}} />)
     fireEvent.click(screen.getByRole("button", { name: /Account menu/ }))
     expect(screen.getByText("ada@example.com")).toBeTruthy()
+    expect(screen.getByText("Platform admin, Viewer +1")).toBeTruthy()
     const items = screen.getAllByRole("menuitem")
     expect(items[items.length - 1].textContent).toBe("Sign out")
   })

@@ -227,6 +227,18 @@
   .scroll-fade { mask-image: none; }
 }
 
+/* Micro-interaction audit 2026-11-14 (BI-61, "tiles filling in place"): when a
+   tile's data lands, its chart, table or number fades in over the tile's own
+   box instead of replacing the grey placeholder in one frame. The placeholder
+   itself is left out, so the loading skeleton handing over to the grid (the
+   same placeholder in the same box) does not blink. A tab switch mounts new
+   bodies and fades them the same way; a refresh updates a body in place and
+   does not. */
+.tile-body-fill > :not([data-slot="tile-body-placeholder"]) {
+  transition: opacity 220ms var(--ease-ui);
+  @starting-style { opacity: 0; }
+}
+
 /* ── Print / Export PDF ──────────────────────────────────────────────────────
    Sembunyikan chrome konsol; ubah kanvas dashboard (tile absolut) jadi tumpukan
    vertikal yang rapi agar "Save as PDF" dari dialog print menghasilkan snapshot
