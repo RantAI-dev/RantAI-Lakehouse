@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation"
 import { LayoutGrid, Rows3 } from "lucide-react"
 
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
-import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
+import { ErrorState } from "@/components/patterns/page-states"
 import { useIsMobile } from "@/hooks/use-mobile"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { useUrlTab } from "@/hooks/use-url-tab"
@@ -18,6 +18,10 @@ import { dashboardReportService, dashboardService, dashboardTemplateService } fr
 import type { Board, DashboardTemplate } from "@/services"
 import { BoardFormDialog } from "./board-form-dialog"
 import { notifyDashboardsChanged } from "./dashboard-events"
+import {
+  DASHBOARDS_VIEW_STORAGE_KEY, DashboardListRecentSkeleton, DashboardListRowsSkeleton, useStoredListView,
+  type DashboardListView,
+} from "./dashboard-list-skeleton"
 import { ImportDashboardDialog } from "./import-dashboard-dialog"
 import { ManageFoldersDialog, MoveBoardDialog } from "./folder-dialogs"
 import {
@@ -76,32 +80,29 @@ const TAB_KIND: Record<TabValue, KindFilter> = { all: "all", dashboards: "dashbo
  * Table or Gallery (decision P2): Table is the default, and the choice is
  * kept per browser. A new key rather than the old page's `dashboards:list-view`,
  * whose default was the gallery, so everyone starts on the table the owner
- * chose. Read after mount so the server's and the browser's first render
- * agree, and wrapped in `try` because `localStorage` throws in a private
- * window or with storage blocked: the page then works and only forgets.
+ * chose. Wrapped in `try` because `localStorage` throws in a private window or
+ * with storage blocked: the page then works and only forgets.
+ *
+ * The stored choice is read during the first render (`useStoredListView`,
+ * which the loading shell reads too), not after mount: the page's loading
+ * placeholder is the table's or the gallery's, the same one the shell drew a
+ * moment before, so it must not start on the table and then switch (owner QA
+ * 2026-11-14, one loading state from refresh to data).
  */
-type ViewMode = "table" | "gallery"
-const VIEW_STORAGE_KEY = "dashboards:browse-view"
+type ViewMode = DashboardListView
 
 function useViewMode(): readonly [ViewMode, (next: ViewMode) => void] {
-  const [view, setView] = React.useState<ViewMode>("table")
-  React.useEffect(() => {
-    try {
-      const saved = window.localStorage.getItem(VIEW_STORAGE_KEY)
-      if (saved === "gallery" || saved === "table") setView(saved)
-    } catch {
-      /* the default stays */
-    }
-  }, [])
+  const stored = useStoredListView()
+  const [chosen, setChosen] = React.useState<ViewMode | null>(null)
   const change = React.useCallback((next: ViewMode) => {
-    setView(next)
+    setChosen(next)
     try {
-      window.localStorage.setItem(VIEW_STORAGE_KEY, next)
+      window.localStorage.setItem(DASHBOARDS_VIEW_STORAGE_KEY, next)
     } catch {
       /* the choice holds for this visit, it is only not remembered */
     }
   }, [])
-  return [view, change] as const
+  return [chosen ?? stored, change] as const
 }
 
 /** The Table / Gallery switch: two icon buttons with `aria-pressed`, in one soft group like the type filter. */
@@ -229,7 +230,9 @@ export function DashboardListPage() {
     [outlinesState.status, outlinesState.data],
   )
   // Favourites and recent items (best effort: the list works without them).
-  const shortcuts = useService((s) => dashboardService.shortcuts(s), [])
+  // A reload (after a star is toggled) keeps the cards on screen: only the first
+  // read shows the Recent placeholder (owner QA 2026-11-14, one loading state).
+  const shortcuts = useService((s) => dashboardService.shortcuts(s), [], { keepDataOnReload: true })
   const favouriteIds = React.useMemo(
     () => new Set((shortcuts.status === "success" ? shortcuts.data.favourites : []).filter((f) => f.kind === "board").map((f) => f.id)),
     [shortcuts],
@@ -503,9 +506,14 @@ export function DashboardListPage() {
 
       <ScrollRegion className="-mx-2 mt-3 px-2 pt-1 pb-6">
         <div className="grid grid-cols-[minmax(0,1fr)] gap-7">
-          {!query.trim() && state.status === "success" && !loading ? (
+          {/* Owner QA 2026-11-14 (one loading state from refresh to data): while the reads are on
+              their way the Recent cards are placeholders in their own place, the ones the loading
+              shell drew, so the type filter and the list below do not move when they land. */}
+          {query.trim() || state.status === "error" ? null : loading || shortcuts.status === "loading" ? (
+            <DashboardListRecentSkeleton />
+          ) : (
             <RecentRow recent={recent} boards={boardsById} source={pictures} />
-          ) : null}
+          )}
           <section aria-label="Dashboards, reports and templates" className="grid grid-cols-[minmax(0,1fr)] gap-3">
             {/* The controls row; while rows are ticked it becomes the bulk bar, in the same place. */}
             <div className="flex min-h-9 flex-wrap items-center justify-between gap-2">
@@ -540,7 +548,9 @@ export function DashboardListPage() {
             ) : null}
 
             {state.status === "error" ? <ErrorState error={state.error} onRetry={reload} /> : null}
-            {state.status !== "error" && loading ? <LoadingSkeleton /> : null}
+            {/* The rows or cards of the view shown, the same placeholder the loading shell drew
+                for this page (`dashboard-list-skeleton.tsx`), not a generic one. */}
+            {state.status !== "error" && loading ? <DashboardListRowsSkeleton view={view} /> : null}
             {state.status === "success" && !loading ? (
               rows.length === 0 ? (
                 <ListEmpty

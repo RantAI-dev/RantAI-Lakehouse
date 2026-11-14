@@ -37,9 +37,13 @@ export function useHasDock(): boolean {
 /**
  * The page as a frame that ends above the assistant bar, so the bar never
  * covers a row or a card (spec `BI-59` T5): the list scrolls inside the frame
- * instead of under the bar. Its height is the viewport less the navbar (4rem),
- * the shell's top padding (1, 1.25 or 1.5rem) and the room kept under the
- * content.
+ * instead of under the bar. Its height is the viewport less the navbar, the
+ * shell's top padding (1, 1.25 or 1.5rem; 4 px less for the focus-ring room
+ * below) and the room kept under the content.
+ *
+ * The navbar's height is read from the shell's `--app-navbar-h`, the one
+ * source BI-61 adds (48 px there); until this branch has it the fallback is
+ * today's 64 px navbar (4rem), so the frame is right on both.
  *
  * BI-59 review round 1, SHOULD-FIX 2: that room is read from the app shell's
  * `--content-bottom`, the token BI-58 adds (`c4d87211`, `50295df6`: the
@@ -67,10 +71,10 @@ export function PageFrame({ children, className }: { readonly children: React.Re
         "-mx-1 -mt-1 flex min-h-0 flex-col overflow-y-auto px-1 pt-1 lg:overflow-hidden",
         dock
           ? cn(
-              "h-[calc(100dvh-4.75rem-var(--content-bottom,5rem))] sm:h-[calc(100dvh-5rem-var(--content-bottom,5rem))] lg:h-[calc(100dvh-5.25rem-var(--content-bottom,5rem))]",
+              "h-[calc(100dvh-var(--app-navbar-h,4rem)-0.75rem-var(--content-bottom,5rem))] sm:h-[calc(100dvh-var(--app-navbar-h,4rem)-1rem-var(--content-bottom,5rem))] lg:h-[calc(100dvh-var(--app-navbar-h,4rem)-1.25rem-var(--content-bottom,5rem))]",
               "mb-[calc(var(--content-bottom,0px)-6rem)] lg:mb-[calc(var(--content-bottom,0px)-7rem)]",
             )
-          : "h-[calc(100dvh-4.75rem-var(--content-bottom,1rem))] sm:h-[calc(100dvh-5rem-var(--content-bottom,1.25rem))] lg:h-[calc(100dvh-5.25rem-var(--content-bottom,1.5rem))]",
+          : "h-[calc(100dvh-var(--app-navbar-h,4rem)-0.75rem-var(--content-bottom,1rem))] sm:h-[calc(100dvh-var(--app-navbar-h,4rem)-1rem-var(--content-bottom,1.25rem))] lg:h-[calc(100dvh-var(--app-navbar-h,4rem)-1.25rem-var(--content-bottom,1.5rem))]",
         className,
       )}
     >
