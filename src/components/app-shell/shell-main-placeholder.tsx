@@ -1,6 +1,7 @@
 "use client";
 
 import { LoadingSkeleton } from "@/components/patterns/page-states";
+import { HomePlaceholder } from "@/features/home/home-frame";
 import { DashboardPageSkeleton } from "@/features/dashboards/dashboard-skeleton";
 import { DashboardListPageSkeleton } from "@/features/dashboards/dashboard-list-skeleton";
 import { shellPlaceholderFor } from "./shell-placeholder";
@@ -13,6 +14,7 @@ import { shellPlaceholderFor } from "./shell-placeholder";
  */
 export function ShellMainPlaceholder({ pathname }: { pathname: string }) {
   const placeholder = shellPlaceholderFor(pathname);
+  if (placeholder === "home") return <HomePlaceholder />;
   if (placeholder === "dashboard-list") return <DashboardListPageSkeleton />;
   if (placeholder === "dashboard") return <DashboardPageSkeleton />;
   return <LoadingSkeleton rows={8} />;
