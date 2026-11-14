@@ -112,3 +112,45 @@ The VM is shared and busy, so build with `nice` and `CARGO_BUILD_JOBS=2`.
 
 (The developer appends one entry per PR: commits, the commands run with counts, the values
 chosen for D3 and D5, and anything not verified.)
+
+### Handoff, PR A (developer, 2026-11-14)
+
+Branch `fix/bi-export-safety`, base `13e5675e` (plan commit), merged with `origin/main`
+(a merge, no conflicts, includes OPS-32). Not pushed; no PR opened. All commits as
+`mtharreqq <72479829+mtharreqq@users.noreply.github.com>`.
+
+| Commit | Item |
+| --- | --- |
+| `cff1b996` | `BI-27`: 1 GiB byte cap, 280 s engine time limit, a cut file says which limit cut it |
+| `1b93dc4f` | `BI-34`: `max_memory_usage` on the row and byte streams (2 GiB), two downloads at a time (third is 429, fixed sentence, scheduled reports never take a slot), XLSX writes and save on the blocking pool in 1,000-row batches |
+| `db7b5bb1` | `BI-28`: shown and sort columns go into the relation query (calculated column exports), plain-number strings in numeric columns have no apostrophe, skipped filters are said by file name suffix `-filters-not-applied`, `x-export-note` header, the audit row and a `Note` sheet (CSV/TSV body unchanged) |
+| `2bc12368` | `BI-30`: `csv_safe` owns `neutralise`, `quote_field`, `BOM`; `csv_export` and `upload_workbook` call them; shared vectors in `tests/fixtures/csv_neutralise_vectors.json` |
+| merge | `origin/main` |
+
+**Values chosen.** D3: byte cap 1 GiB, engine time 280 s, memory 2 GiB (`EXPORT_MEMORY_BYTES`).
+D5: 2 download slots (`EXPORT_AT_ONCE`), try-acquire, 429 with `Retry-After` 10 s.
+
+**Decision to confirm (BI-28).** The plan's D4 asked for a first-row note in CSV. The planner's
+amendment kept the CSV/TSV body untouched, so the note is outside the body (name, header,
+audit, `Note` sheet). Also, `upload_workbook` shares only the quoting and the mark with
+`csv_safe`; it does not neutralise, because it keeps the workbook's cell text as data.
+
+**Behaviour change (BI-30).** A text cell like `+1` or `-1` in a dashboard download is now
+written unchanged (a plain number is data under `csv_safe` and `src/lib/csv.ts`). The
+`csv_export` test that expected `'+1` and `'-1` was updated.
+
+**Commands actually run** (no Rust compiles on the VM from 2026-11-14, owner decision):
+- Before the rule, on the BI-27 commit: `cargo clippy -p lakehouse-api --all-targets -- -D warnings` exit 0; `cargo test -p lakehouse-api --lib -- export cut` 163 passed, 0 failed, 1 ignored.
+- BI-34 tree: `cargo clippy -p lakehouse-clickhouse -p lakehouse-api --all-targets -- -D warnings` exit 0; `cargo test -p lakehouse-clickhouse` 43 passed, 0 failed.
+- BI-28 and BI-30: `cargo fmt --check` clean (also after the merge); `bun test src/lib/csv.test.ts` 24 passed; `bash scripts/ci/check_test_modules.sh` passed after the merge.
+
+**Not verified (CI).**
+- Every Rust compile and test of the BI-34 `lakehouse-api` tests (the third download is a 429; a 2,500-row workbook; the byte-cap cut at 1,077 rows), and of all BI-28 and BI-30 code and tests. A clippy run that included BI-28 hit one `too_many_lines` lint in `tests/dashboard_export.rs` (fixed with an `allow`) and was not run again.
+- The new integration test `a_calculated_column_exports_and_a_skipped_filter_is_said_outside_the_body` (it mocks one `bi_field` row, formula `[amount] * 2`; a type or formula check on the mock's `String` columns may need adjusting).
+- The full per-crate test block, `tests/sec11_guard.rs` (BI-28 adds the `x-export-note` header with a fixed sentence; no error text goes into a response), `cargo test --workspace`, and the TS `typecheck`, `lint` and full `bun run test`.
+- Intermediate commits were not compiled one by one. In `db7b5bb1` alone, the new long-integer test expects no apostrophe in a text column, which holds only with `2bc12368`.
+
+**Findings.**
+- A full `lakehouse-api` test compile is OOM-killed on this 11 GB VM: `rustc` reached 6.4 GB (no debuginfo) to 8.3 GB (debuginfo) of anon-rss, five kills in all. It only fits with `CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_INCREMENTAL=0`, one job and nothing else running. Use CI.
+- Query Studio's download keeps its own 5 GB cap and sends no `max_memory_usage` (`max_memory_usage: None` in `routes/query.rs`); `query_with_options` (buffered) does not send it either. Left for a follow-up.
+- Already present at `6247400f`: rows stream to an unlinked temp file (no row clone), `EXPORT_TIMEOUT` is 300 s, a raw table over a SQL source carries `max_execution_time = 280`.
