@@ -69,7 +69,7 @@ export function NavbarSearch() {
         onClick={() => openCommandPalette()}
         onFocus={() => openCommandPalette()}
         placeholder="Search pages, tables, columns"
-        className="h-8 w-full cursor-pointer rounded-lg border-border bg-muted/40 py-2 pl-9 pr-14 text-sm leading-5 shadow-none placeholder:text-muted-foreground focus-visible:bg-background"
+        className="h-8 w-full cursor-pointer rounded-lg border-border bg-muted/40 py-2 pl-9 pr-14 text-sm leading-5 shadow-none transition-[background-color,border-color] duration-150 ease-ui placeholder:text-muted-foreground hover:bg-muted/70 focus-visible:bg-background"
         aria-label="Open command palette"
       />
       <kbd className="pointer-events-none absolute right-2 top-1/2 hidden h-5 -translate-y-1/2 items-center rounded border border-border bg-background px-1.5 font-mono text-[10px] text-muted-foreground lg:flex">
@@ -103,7 +103,9 @@ export function CopilotButton({ open, onToggle }: { readonly open: boolean; read
               COPILOT_BUTTON_CLASS,
               // Closed: outlined, the label and mark in the primary blue. Open: the soft primary
               // tint. The border stays (transparent when open), so the width never changes.
-              "border font-medium transition-[background-color,color,border-color,transform] duration-200 ease-out active:scale-[0.97]",
+              // Micro-interaction audit 2026-11-14: `scale` (not `transform`) is what `active:scale-*` sets in
+              // Tailwind v4, so the press now eases instead of jumping.
+              "border font-medium transition-[background-color,color,border-color,scale] duration-200 ease-ui active:scale-[0.97]",
               open
                 ? "border-transparent bg-primary/10 text-primary hover:bg-primary/15 hover:text-primary dark:bg-primary/20 dark:text-sky-200 dark:hover:bg-primary/30"
                 : "border-border bg-transparent text-primary hover:bg-primary/10 hover:text-primary dark:text-sky-200 dark:hover:bg-primary/20",
