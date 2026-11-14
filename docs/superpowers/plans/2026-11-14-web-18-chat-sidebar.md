@@ -45,6 +45,10 @@ Owner: "halaman menu history itu dihapus aja, dan cukup ditampilkan dari menu Ho
 6. **T6, after screenshots** (same sizes; plus a 0/80/160/240 ms frame sequence of the slide) into `docs/plans/web-18-screens/after-*`.
 7. **T7, handoff** in §6.
 
+### Slice 2 (owner QA, 2026-11-14)
+
+8. **T8, Home becomes a split row; the "AI chats" row goes.** Owner: "di menu Home ini tu, buat button split juga untuk ke history copilot". Home gets the same split as the Dashboards row (`action` in `nav-config.ts`, drawn by the split branch of `renderEntry` in `app-sidebar.tsx`): the label part goes to `/`, the square right part (icon `MessagesSquare`, label and delayed tooltip "AI chats") **slides the sidebar to the chat list in place, on any page, without navigating**. Opening a chat from the list navigates to the conversation as today. Back to menu slides back. The view state is no longer only route-driven: on `/copilot` the list is the default as today; elsewhere the menu is the default; the right part opens the list; any navigation resets to that route's default. The right part is lit (`aria-current`) on `/copilot`, and the Home label part is then not lit. Remove `aiChatsEntry`. Collapsed icon mode hides the right part, as with Dashboards. The skeleton draws the Home row split too. Tests: the right part opens the list on `/` and on another page without a route change; Back to menu returns; no "AI chats" row anywhere; the focus lands on Back to menu after the slide in and on the right part after the slide out.
+
 ## 4. Machine rules (owner)
 
 - No Rust. Never the full `bun run test` or `bun run lint`. Run `bun run typecheck`, the touched test files (`bun test src/components/app-shell src/features/copilot` and others you change), `bun x eslint <changed files>`.
