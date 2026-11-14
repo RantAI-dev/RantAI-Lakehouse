@@ -185,31 +185,30 @@ pub fn engine_error_message(err: &PolicyEngineError) -> &'static str {
 pub fn refusal_message(err: &sql_rewrite::RewriteError) -> &'static str {
     match err {
         sql_rewrite::RewriteError::Unparseable => {
-            "Query tidak dapat diproses oleh mesin kebijakan (sintaks tidak dikenali)."
+            "The query could not be read by the policy engine. Check the SQL syntax."
         }
         sql_rewrite::RewriteError::UnprovableSubstitution { .. } => {
-            "Query menyentuh tabel yang diatur kebijakan melalui konstruksi yang tidak didukung \
-             (mis. table function, ARRAY JOIN)."
+            "The query reads a policy-governed table through a construct the policy engine does \
+             not support, such as a table function or ARRAY JOIN."
         }
         sql_rewrite::RewriteError::InvalidRowFilter { .. } => {
-            "Filter baris yang diautorisasi untuk tabel ini tidak valid; hubungi admin \
-             kebijakan."
+            "The row filter authorized for this table is not valid. Ask a policy administrator."
         }
         sql_rewrite::RewriteError::TableFunctionDenied { .. } => {
-            "Table function tidak diizinkan pada query yang diatur kebijakan."
+            "Table functions are not allowed in a query that policies govern."
         }
         sql_rewrite::RewriteError::SensitiveSystemTable { .. } => {
-            "Tabel sistem ini tidak bisa dibaca dari sini; gunakan halaman Audit."
+            "This system table cannot be read from here. Use the Audit page."
         }
         sql_rewrite::RewriteError::DictOrJoinFunctionDenied { .. } => {
-            "Fungsi dictGet/joinGet tidak diizinkan untuk principal dengan kebijakan aktif — \
-             sumber dictionary/join table tidak dapat diverifikasi."
+            "dictGet and joinGet are not allowed while a policy applies to you, because their \
+             source table cannot be checked."
         }
         sql_rewrite::RewriteError::ViewOverGovernedTable { .. } => {
-            "Query membaca view yang menyingkap tabel yang diatur kebijakan; tidak didukung."
+            "The query reads a view over a policy-governed table, which is not supported."
         }
         sql_rewrite::RewriteError::InvalidPastVersion => {
-            "Versi lampau dipilih dengan id versinya, bukan dengan timestamp."
+            "Pick a past version by its version id, not by a timestamp."
         }
     }
 }
@@ -937,6 +936,73 @@ mod tests {
                 !text.contains("kebijakan") && !text.contains("tidak"),
                 "{text}"
             );
+        }
+    }
+
+    /// QS-14: every rewrite refusal reaches the person in English, one
+    /// distinct sentence per variant, with no em dash or other non-ASCII
+    /// character. The expected texts are the plan's, typed here as
+    /// literals, so the test cannot agree with a wrong edit by construction.
+    #[test]
+    fn refusal_messages_are_distinct_ascii_english_sentences() {
+        use sql_rewrite::RewriteError;
+
+        let cases: [(RewriteError, &str); 8] = [
+            (
+                RewriteError::Unparseable,
+                "The query could not be read by the policy engine. Check the SQL syntax.",
+            ),
+            (
+                RewriteError::UnprovableSubstitution {
+                    table: "serving.t".to_owned(),
+                },
+                "The query reads a policy-governed table through a construct the policy engine does not support, such as a table function or ARRAY JOIN.",
+            ),
+            (
+                RewriteError::InvalidRowFilter {
+                    reason: "r".to_owned(),
+                },
+                "The row filter authorized for this table is not valid. Ask a policy administrator.",
+            ),
+            (
+                RewriteError::TableFunctionDenied {
+                    name: "f".to_owned(),
+                },
+                "Table functions are not allowed in a query that policies govern.",
+            ),
+            (
+                RewriteError::SensitiveSystemTable {
+                    table: "system.processes".to_owned(),
+                },
+                "This system table cannot be read from here. Use the Audit page.",
+            ),
+            (
+                RewriteError::DictOrJoinFunctionDenied {
+                    name: "dictGet".to_owned(),
+                },
+                "dictGet and joinGet are not allowed while a policy applies to you, because their source table cannot be checked.",
+            ),
+            (
+                RewriteError::ViewOverGovernedTable {
+                    view: "serving.v".to_owned(),
+                },
+                "The query reads a view over a policy-governed table, which is not supported.",
+            ),
+            (
+                RewriteError::InvalidPastVersion,
+                "Pick a past version by its version id, not by a timestamp.",
+            ),
+        ];
+        for (err, expected) in &cases {
+            let message = refusal_message(err);
+            assert_eq!(message, *expected, "{err:?}");
+            assert!(message.is_ascii(), "{message}");
+            assert!(!message.contains('\u{2014}'), "{message}");
+        }
+        for (i, (_, a)) in cases.iter().enumerate() {
+            for (_, b) in &cases[i + 1..] {
+                assert_ne!(a, b, "two variants share one sentence");
+            }
         }
     }
 

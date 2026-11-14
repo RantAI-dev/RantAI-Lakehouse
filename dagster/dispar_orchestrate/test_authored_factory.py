@@ -415,7 +415,7 @@ class CompileSqlTest(unittest.TestCase):
         """A 422 is the policy engine refusing a construct it will not
         rewrite -- also a decision, also not retried."""
         self._assert_refused_without_retry(
-            self._post_returning(422, {"error": "Query menyentuh tabel yang diatur kebijakan melalui konstruksi yang tidak didukung"})
+            self._post_returning(422, {"error": "The query reads a policy-governed table through a construct the policy engine does not support, such as a table function or ARRAY JOIN."})
         )
 
     def test_a_transport_failure_is_left_retryable(self) -> None:

@@ -74,6 +74,47 @@ use crate::sql_rewrite::Engine;
 /// from the request.
 #[must_use]
 pub fn is_read_only(sql: &str, engine: Engine) -> bool {
+    read_only_verdict(sql, engine) == ReadOnlyVerdict::Read
+}
+
+/// Why [`read_only_verdict`] refused a statement, or that it did not.
+///
+/// One refusal used to cover three causes (QS-14): a character the
+/// lexer cannot read, a typo in the first word and a real write. The person
+/// with the first two could not tell what to change, so each cause has its
+/// own variant and [`not_read_only_message`] its own sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadOnlyVerdict {
+    /// The statement is a read: it starts with an allowed keyword and holds
+    /// no denied one.
+    Read,
+    /// The statement holds a [`SpanKind::Uncertain`] span, such as a curly
+    /// quote on `ClickHouse` or a `$`-run no measured rule reads.
+    Unreadable,
+    /// A denied keyword (`DROP`, `INSERT`, ...) is in the code.
+    Writes,
+    /// No denied keyword, but the statement does not start with an allowed
+    /// one: a typo in the first word, or a statement Query Studio does not
+    /// run (`OPTIMIZE`).
+    NotARead,
+}
+
+/// The verdict [`is_read_only`] is the boolean form of.
+///
+/// The checks run in this order, and the order is the contract:
+///
+/// 1. An uncertain span is [`ReadOnlyVerdict::Unreadable`], before any word
+///    is read (today's first check, unchanged).
+/// 2. A denied keyword in the stripped code is [`ReadOnlyVerdict::Writes`].
+///    It comes before the first-word check, so `DROP TABLE t` is a write
+///    and not a typo.
+/// 3. No allowed first keyword is [`ReadOnlyVerdict::NotARead`].
+/// 4. Otherwise [`ReadOnlyVerdict::Read`].
+///
+/// A statement is accepted exactly when it starts with an allowed keyword
+/// and holds no denied one, as before: only the name of the refusal moved.
+#[must_use]
+pub fn read_only_verdict(sql: &str, engine: Engine) -> ReadOnlyVerdict {
     // A `$`-run no measured rule reads, or a Unicode quote on `ClickHouse`
     // (`SpanKind::Uncertain`), is a shape the lexer cannot follow. The
     // engine refuses every `$` shape the measurements cover with
@@ -85,10 +126,41 @@ pub fn is_read_only(sql: &str, engine: Engine) -> bool {
         .iter()
         .any(|span| span.kind == SpanKind::Uncertain)
     {
-        return false;
+        return ReadOnlyVerdict::Unreadable;
     }
     let code = strip_sql_noise(sql, engine);
-    starts_with_allowed_keyword(&code) && !contains_denied_keyword(&code)
+    if contains_denied_keyword(&code) {
+        return ReadOnlyVerdict::Writes;
+    }
+    if !starts_with_allowed_keyword(&code) {
+        return ReadOnlyVerdict::NotARead;
+    }
+    ReadOnlyVerdict::Read
+}
+
+/// The sentence a refused statement is told, one per cause.
+///
+/// Fixed text: it names no part of the statement and no engine text, so
+/// nothing a caller typed is echoed (`AGENTS.md` principle 4).
+/// [`ReadOnlyVerdict::Read`] is never refused, so no caller asks for its
+/// sentence; it returns the [`ReadOnlyVerdict::Writes`] text, the
+/// pre-existing one, rather than a fourth sentence nobody can reach.
+#[must_use]
+pub fn not_read_only_message(verdict: ReadOnlyVerdict) -> &'static str {
+    match verdict {
+        ReadOnlyVerdict::Unreadable => {
+            "The query has a character Query Studio cannot read safely, such as a curly quote \
+             (\u{2018} \u{2019} \u{201C} \u{201D}) or a `$$` sequence. Type straight quotes \
+             (' or \") and run it again."
+        }
+        ReadOnlyVerdict::NotARead => {
+            "Query Studio runs only statements that start with SELECT, WITH, SHOW, DESCRIBE or \
+             EXPLAIN. Check the first word for a typo."
+        }
+        ReadOnlyVerdict::Writes | ReadOnlyVerdict::Read => {
+            "Only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) are allowed in Query Studio."
+        }
+    }
 }
 
 /// `sql` with comments and quoted literals blanked out, so the guard reads
@@ -691,6 +763,141 @@ mod engine_aware_rules {
         assert_eq!(
             strip_sql_noise("SELECT 'unterminated", Engine::Trino),
             "SELECT  "
+        );
+    }
+}
+
+/// QS-14: the guard says why it refused, not only that it did.
+#[cfg(test)]
+mod read_only_verdict_rules {
+    use super::{ReadOnlyVerdict, is_read_only, not_read_only_message, read_only_verdict};
+    use crate::sql_rewrite::Engine;
+
+    const BOTH: [Engine; 2] = [Engine::ClickHouse, Engine::Trino];
+
+    #[test]
+    fn a_read_is_a_read_on_both_engines() {
+        for engine in BOTH {
+            for sql in ["SELECT 1", "  -- c\nWITH x AS (SELECT 1) SELECT * FROM x"] {
+                assert_eq!(
+                    read_only_verdict(sql, engine),
+                    ReadOnlyVerdict::Read,
+                    "{engine:?} {sql}"
+                );
+            }
+        }
+    }
+
+    /// A curly quote and a `$` shape no measured rule reads are the two
+    /// things the lexer calls uncertain. Both are `ClickHouse` rules: a
+    /// Unicode quote is plain code on `Trino`.
+    #[test]
+    fn a_character_the_lexer_cannot_read_is_unreadable_on_clickhouse() {
+        for sql in [
+            "\u{2018}SELECT\u{2019} 1",
+            "SELECT \u{201C}a\u{201D}",
+            "SELECT $'$x$'$",
+            "SELECT $$x$$$$y$$",
+        ] {
+            assert_eq!(
+                read_only_verdict(sql, Engine::ClickHouse),
+                ReadOnlyVerdict::Unreadable,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_statement_that_does_not_start_with_a_read_word_is_not_a_read() {
+        for engine in BOTH {
+            for sql in ["SELEC 1", "OPTIMIZE TABLE t", ""] {
+                assert_eq!(
+                    read_only_verdict(sql, engine),
+                    ReadOnlyVerdict::NotARead,
+                    "{engine:?} {sql:?}"
+                );
+            }
+        }
+        // `Trino` has no Unicode quote: the curly-quoted word is an
+        // ordinary first word that is no read keyword.
+        assert_eq!(
+            read_only_verdict("\u{2018}SELECT\u{2019} 1", Engine::Trino),
+            ReadOnlyVerdict::NotARead
+        );
+    }
+
+    /// A denied word wins over a missing read keyword: `DROP TABLE t` is a
+    /// write, not a typo.
+    #[test]
+    fn a_denied_word_is_a_write_even_without_a_read_keyword() {
+        for engine in BOTH {
+            for sql in [
+                "DROP TABLE t",
+                "SELECT 1; DELETE FROM t",
+                "INSERT INTO t VALUES (1)",
+            ] {
+                assert_eq!(
+                    read_only_verdict(sql, engine),
+                    ReadOnlyVerdict::Writes,
+                    "{engine:?} {sql}"
+                );
+            }
+        }
+    }
+
+    /// The `#437`/`#446` shapes the lexer exists for stay writes on
+    /// `ClickHouse`, and the QS-14 route tests name them, so the verdict
+    /// is pinned here, not only the boolean.
+    #[test]
+    fn a_write_behind_a_heredoc_or_a_trino_backslash_is_a_write() {
+        assert_eq!(
+            read_only_verdict("SELECT $$'$$; DROP TABLE t; SELECT '", Engine::ClickHouse),
+            ReadOnlyVerdict::Writes
+        );
+        assert_eq!(
+            read_only_verdict("SELECT 'a\\'; DROP TABLE t; SELECT '", Engine::Trino),
+            ReadOnlyVerdict::Writes
+        );
+    }
+
+    /// The accept set did not move: `is_read_only` is exactly "the verdict
+    /// is `Read`".
+    #[test]
+    fn is_read_only_is_the_read_verdict() {
+        for engine in BOTH {
+            for sql in [
+                "SELECT 1",
+                "SELEC 1",
+                "DROP TABLE t",
+                "\u{2018}SELECT\u{2019} 1",
+                "SHOW TABLES",
+                "EXPLAIN SELECT 1",
+                "SELECT 1; DELETE FROM t",
+            ] {
+                assert_eq!(
+                    is_read_only(sql, engine),
+                    read_only_verdict(sql, engine) == ReadOnlyVerdict::Read,
+                    "{engine:?} {sql}"
+                );
+            }
+        }
+    }
+
+    /// The sentences are the plan's, typed as literals. `Unreadable` holds
+    /// the curly quotes on purpose: they are the characters it names.
+    #[test]
+    fn each_refusal_has_its_own_sentence() {
+        assert_eq!(
+            not_read_only_message(ReadOnlyVerdict::Unreadable),
+            "The query has a character Query Studio cannot read safely, such as a curly quote (\u{2018} \u{2019} \u{201C} \u{201D}) or a `$$` sequence. Type straight quotes (' or \") and run it again."
+        );
+        assert_eq!(
+            not_read_only_message(ReadOnlyVerdict::Writes),
+            "Only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) are allowed in Query Studio."
+        );
+        assert_eq!(
+            not_read_only_message(ReadOnlyVerdict::NotARead),
+            "Query Studio runs only statements that start with SELECT, WITH, SHOW, DESCRIBE or EXPLAIN. Check the first word for a typo."
         );
     }
 }

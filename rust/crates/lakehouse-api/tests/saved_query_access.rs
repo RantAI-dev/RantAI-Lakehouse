@@ -709,6 +709,118 @@ async fn a_statement_that_is_not_read_only_is_refused_everywhere_it_could_be_sto
     assert_eq!(error(&body), NOT_READ_ONLY);
 }
 
+/// The three causes the read-only guard tells apart (QS-14), as the
+/// statement that has each and the sentence a store of it is refused with.
+/// A write keeps the save route's own sentence; a curly quote and a typo
+/// use the sentences Query Studio's run and estimate give.
+const REFUSED_WHEN_STORED: [(&str, &str); 3] = [
+    (
+        "SELEC 1",
+        "Query Studio runs only statements that start with SELECT, WITH, SHOW, DESCRIBE or EXPLAIN. Check the first word for a typo.",
+    ),
+    (
+        "\u{2018}SELECT\u{2019} 1",
+        "The query has a character Query Studio cannot read safely, such as a curly quote (\u{2018} \u{2019} \u{201C} \u{201D}) or a `$$` sequence. Type straight quotes (' or \") and run it again.",
+    ),
+    ("DROP TABLE t", NOT_READ_ONLY),
+];
+
+/// A refused save, edit, copy or revert names its cause: a typo in the
+/// first word and a curly quote get their own sentence, a write keeps the
+/// old one.
+#[tokio::test]
+async fn a_statement_refused_for_storing_says_whether_it_is_a_typo_a_curly_quote_or_a_write() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let owner = user_id(&pool, "rina@meridian.example").await;
+    let id = write_a_query_that_cannot_be_saved(&pool, owner, "Doomed").await;
+
+    for (sql, sentence) in REFUSED_WHEN_STORED {
+        let (status, body) = call(
+            &router,
+            "POST",
+            "/api/query/saved",
+            &cookie,
+            Some(json!({"title": "Refused", "sql": sql})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "save {sql}: {body}"
+        );
+        assert_eq!(error(&body), sentence, "save {sql}");
+
+        let (status, body) = call(
+            &router,
+            "PATCH",
+            &format!("/api/query/saved/{id}"),
+            &cookie,
+            Some(json!({"sql": sql})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "edit {sql}: {body}"
+        );
+        assert_eq!(error(&body), sentence, "edit {sql}");
+
+        // The copy and the revert read a statement that is already stored,
+        // so the row is written with it, the way a row older than the
+        // guard would be.
+        sqlx::query("UPDATE saved_query SET sql = $1 WHERE id = $2")
+            .bind(sql)
+            .bind(Uuid::parse_str(&id).expect("the query id"))
+            .execute(&pool)
+            .await
+            .expect("store the statement");
+        let (status, body) = call(
+            &router,
+            "POST",
+            &format!("/api/query/saved/{id}/duplicate"),
+            &cookie,
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "copy {sql}: {body}"
+        );
+        assert_eq!(error(&body), sentence, "copy {sql}");
+
+        sqlx::query("DELETE FROM saved_query_version WHERE query_id = $1 AND version = 2")
+            .bind(Uuid::parse_str(&id).expect("the query id"))
+            .execute(&pool)
+            .await
+            .expect("clear the version");
+        sqlx::query(
+            "INSERT INTO saved_query_version (query_id, version, title, sql, author_name, label) \
+             VALUES ($1, 2, 'Doomed', $2, 'Rina Wijaya', '')",
+        )
+        .bind(Uuid::parse_str(&id).expect("the query id"))
+        .bind(sql)
+        .execute(&pool)
+        .await
+        .expect("write the version");
+        let (status, body) = call(
+            &router,
+            "POST",
+            &format!("/api/query/saved/{id}/versions/2/revert"),
+            &cookie,
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "revert {sql}: {body}"
+        );
+        assert_eq!(error(&body), sentence, "revert {sql}");
+    }
+}
+
 /// The move rules: a query moves into a folder the mover may edit, back
 /// to the shared space, and nowhere else.
 #[tokio::test]

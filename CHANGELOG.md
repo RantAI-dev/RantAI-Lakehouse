@@ -61,6 +61,8 @@ once a first release is tagged.
 - A run ended with Stop shows as Stopped in History (backlog `QS-2`, `QS-4`). The status `stopped` is a filter value in place of `cancelled`, and migration `0127` moves the rows already stored. The History page pages by number: `GET /api/query/history` takes `page` instead of `before` and answers `runs`, `total`, `page` and `pageSize`, 50 runs per page, and the pills read Completed, Failed, Stopped and Refused.
 - The revert confirmation button reads "Restore version N" (backlog `QS-3`), and the folder access list answers at edit with a sentence that says only someone who can edit the folder can see who it is shared with (backlog `QS-3`).
 - Query Studio shows a fixed sentence and a reference for an engine failure, on a run and on the cost estimate, in place of the engine's own text (backlog `QS-2`, `QS-1`; feature page `docs/core/features/no-raw-upstream-errors.md`). The raw text goes to the log under the same reference. The assistant's tools are unchanged, but **Fix with AI** now sends the model only the sentence and the reference.
+- Refusals of the policy engine are in English everywhere they are shown: Query Studio, the assistant's tools and the layers rewrite. Each refusal has its own sentence, and the same queries are refused as before (backlog `QS-14`). Before, these were in Indonesian.
+- The read-only refusal in Query Studio says which of three causes applies (backlog `QS-14`). A curly quote or a `$$` sequence gets a sentence that asks for straight quotes. A first word that is not SELECT, WITH, SHOW, DESCRIBE or EXPLAIN gets a sentence that asks the person to check it for a typo. A write keeps the sentence it had. The queries refused stay the same.
 
 ### Fixed
 
