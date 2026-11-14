@@ -1,13 +1,20 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
 
 import * as realAuth from "@/features/auth/auth-provider"
+import * as realEchartModule from "./echart"
 
 // As in chart-builder.test.tsx: a plain editor, and the real module put back afterwards.
 const real = { ...realAuth }
 mock.module("@/features/auth/auth-provider", () => ({ ...real, useAuth: () => ({ hasPermission: () => false }) }))
+// ECharts draws on a canvas, which the test DOM does not have; each chart is a marker with its kind.
+const realEchart = { ...realEchartModule }
+mock.module("./echart", () => ({
+  EChart: (props: { option: { series?: { type?: string }[] } }) => <div data-testid="chart" data-type={props.option.series?.[0]?.type ?? ""} />,
+}))
 afterAll(() => {
   mock.module("@/features/auth/auth-provider", () => real)
+  mock.module("./echart", () => realEchart)
 })
 
 import { dashboardService } from "@/services"
@@ -33,17 +40,25 @@ const FIELDS = {
 
 let fetches: string[] = []
 let previews: Record<string, unknown>[] = []
+/** The preview route's answer: an error unless a test draws a chart. */
+let previewAnswer: ((body: Record<string, unknown>) => { status: number; body: unknown }) | null = null
 
 beforeEach(() => {
   fetches = []
   previews = []
+  previewAnswer = null
   window.localStorage.clear()
   global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
     fetches.push(url)
     const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } })
     if (url.includes("/specs/preview")) {
-      if (init?.body) previews.push(JSON.parse(String(init.body)))
+      const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : {}
+      previews.push(body)
+      if (previewAnswer) {
+        const answer = previewAnswer(body)
+        return json(answer.body, answer.status)
+      }
       return json({ error: "not in this test" }, 400)
     }
     if (url.includes("/api/dashboard/fields") && url.includes("mart=")) return json(FIELDS)
@@ -124,4 +139,63 @@ describe("ChartBuilder keeps a saved chart as it was (BI-58, spec T5)", () => {
       }
     })
   }
+})
+
+/** A bar-like preview answer over the stub's rows: the X column and the first value, as the preview route returns them. */
+function drawRows(body: Record<string, unknown>) {
+  const x = String(body.dimension)
+  const y = String((body.measures as unknown[])[0])
+  return {
+    status: 200,
+    body: {
+      spec: { id: "preview", title: "Preview", kind: body.kind, mart: "mart_visits", sql: "", x, y, source: "ui" },
+      result: { columns: [x, y], rows: [{ [x]: "2024-01-01", [y]: 1571564 }, { [x]: "2024-02-01", [y]: 1204311 }] },
+    },
+  }
+}
+
+describe("the data panel (BI-58 T2, spec T4)", () => {
+  async function pickSource() {
+    renderBuilder()
+    const panel = screen.getByRole("complementary", { name: "Data" })
+    fireEvent.click(within(panel).getByRole("combobox"))
+    fireEvent.click(await screen.findByRole("option", { name: /mart_visits/ }))
+    await within(panel).findByRole("group", { name: "Dates" })
+    return panel
+  }
+
+  it("lists the source's columns as Dates, Text and Numbers", async () => {
+    const panel = await pickSource()
+    const names = (group: string) => [...within(panel).getByRole("group", { name: group }).querySelectorAll("button")].map((b) => b.getAttribute("aria-label"))
+    expect(names("Dates")).toEqual(["begins", "ends"])
+    expect(names("Text")).toEqual(["provinsi", "category"])
+    expect(names("Numbers")).toEqual(["visitors", "stay", "target"])
+  })
+
+  it("gives a preview from a source, one click on a date column and one on a number column", async () => {
+    previewAnswer = drawRows
+    const panel = await pickSource()
+    fireEvent.click(within(panel).getByRole("button", { name: "begins" }))
+    fireEvent.click(within(panel).getByRole("button", { name: "visitors" }))
+    // The chips say where each column went, and no menu opened on the way.
+    expect(within(panel).getByRole("button", { name: "begins, X axis" })).toBeTruthy()
+    expect(within(panel).getByRole("button", { name: "visitors, Value" })).toBeTruthy()
+    expect(screen.queryByRole("menu")).toBeNull()
+    await waitFor(() => expect(previews.some((b) => b.dimension === "begins" && JSON.stringify(b.measures) === '["visitors"]')).toBe(true))
+    const preview = screen.getByRole("region", { name: "Preview" })
+    await waitFor(() => expect(within(preview).getByTestId("chart")).toBeTruthy())
+    expect(preview.textContent).not.toContain("Preview unavailable")
+  })
+
+  it("opens a menu of the uses the chart offers for a column once its slot is taken", async () => {
+    const panel = await pickSource()
+    fireEvent.click(within(panel).getByRole("button", { name: "provinsi" }))
+    expect(within(panel).getByRole("button", { name: "provinsi, X axis" })).toBeTruthy()
+    // The X axis is taken: a second text column asks.
+    fireEvent.click(within(panel).getByRole("button", { name: "category" }))
+    const menu = await screen.findByRole("menu")
+    expect([...menu.querySelectorAll("[role=menuitem]")].map((i) => i.textContent)).toEqual(["Use as X axis", "Use as split", "Use as filter"])
+    fireEvent.click(within(menu).getByRole("menuitem", { name: "Use as split" }))
+    await waitFor(() => expect(within(panel).getByRole("button", { name: "category, Split" })).toBeTruthy())
+  })
 })

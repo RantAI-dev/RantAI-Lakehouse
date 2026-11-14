@@ -78,7 +78,9 @@ import { selectedMart, type Mart } from "./mart-marks";
 import { JoinsSection, type JoinTableInfo } from "./joins-section";
 import { LayersSection } from "./layers-section";
 import { layerDraftsFromDef, layerProblems, layersPayload, takesLayers, type LayerDraft } from "@/lib/chart-layers";
-import { displayColumnFull, joinsPayload, pairsFromSuggestions, type JoinDraft, type JoinPairDef } from "@/lib/chart-joins";
+import { displayColumnFull, joinedAlias, joinsPayload, pairsFromSuggestions, type JoinDraft, type JoinPairDef } from "@/lib/chart-joins";
+import { columnGroup, type ColumnUse } from "@/lib/column-click";
+import { ColumnList, type PanelColumn } from "./data-panel";
 import type { OwnSource } from "./filters/use-filter-values";
 import { AccordionSection, ColumnLabel, FoldSection, Segmented, columnItems, focusFirstEmpty } from "./builder-sections";
 import { missingSection, sectionSummaries, type SectionNumber } from "@/lib/section-summary";
@@ -947,6 +949,46 @@ export function ChartBuilder({
     : choice.kind === "sql"
       ? { sqlSource: choice.id }
       : { mart: choice.name, joins: joinsPayload(shape.joins).joins };
+  // `BI-58` T2: the data panel's columns, each with its use now and the uses the chart's own
+  // pickers offer it (a column a picker would not list is not offered there either).
+  const takesX = !isStaticTile && !isSingle && !ownColumns && !isGroupedTable;
+  const xChoices = isPoints || isBullet ? fields?.dimensions ?? [] : dimensionChoices;
+  const panelColumns: PanelColumn[] = fields ? [...new Set([
+    ...fields.dimensions, ...fields.measures,
+    ...(takesMetrics ? (fields.metrics ?? []).map((m) => metricColumn(m.name)) : []),
+  ])].filter((name) => !slotParam(name)).map((name) => ({
+    name,
+    group: isMetricColumn(name) ? "number" : columnGroup(fields.kinds?.[name] ?? (fields.measures.includes(name) ? "number" : "text")),
+    table: joinedAlias(name),
+    role: takesX && name === dimension ? (isGantt ? "Task" : "X axis")
+      : !noMeasures && measureRows.some((r) => r.column === name) ? "Value"
+      : canBreakdown && name === breakdown ? (isGantt ? "Group" : "Split")
+      : null,
+    offers: {
+      x: takesX && xChoices.includes(name),
+      value: !noMeasures && measureColumns.includes(name),
+      split: canBreakdown && !rules.breakdownLocked && breakdownChoices.includes(name),
+      filter: rules.filters && columnChoices.some((c) => c.name === name),
+    },
+  })) : [];
+  // A filter asked for from the panel opens in the filters, which the sort-and-filter section shows.
+  const [filterAsk, setFilterAsk] = React.useState<{ column: string; n: number } | null>(null);
+  function applyColumnUse(name: string, use: ColumnUse) {
+    if (use === "x") {
+      // The X axis and the split are two different columns.
+      if (name === breakdown) pickBreakdown("");
+      if (isPoints || isBullet) setDimension(name); else pickDimension(name);
+    } else if (use === "value") {
+      // The first value, with the chart's default aggregate.
+      setMeasureRows((rows) => [{ column: name, aggregate: "" }, ...rows.slice(1)]);
+    } else if (use === "split") {
+      pickBreakdown(name);
+    } else {
+      setActive(3);
+      setFilterAsk({ column: name, n: Date.now() });
+    }
+  }
+
   // The chart's grouped result, and (BI-6 part 2) what is left after its steps: the sort names the last one's columns.
   const baseResult: ResultColumns = {
     groups: (isGroupedTable ? shape.groupings : [{ column: dimension } as { column: string; grain?: string }]).filter((g) => g.column).map((g) => {
@@ -1637,7 +1679,7 @@ export function ChartBuilder({
               </div>
             ) : null}
 
-            {rules.filters ? <ChartFilters value={shape.filters} onChange={(filters) => setShape((d) => ({ ...d, filters }))} columns={columnChoices} disabled={!fields} segments={fields?.segments ?? []} source={filterSource} /> : null}
+            {rules.filters ? <ChartFilters value={shape.filters} onChange={(filters) => setShape((d) => ({ ...d, filters }))} columns={columnChoices} disabled={!fields} segments={fields?.segments ?? []} source={filterSource} startWith={filterAsk} /> : null}
           </AccordionSection>
 
           <FoldSection number={4} title="More options" open={moreOpen} onOpenChange={setMoreOpen} panelRef={(n) => { panelRefs.current[4] = n; }}>
@@ -1818,6 +1860,11 @@ export function ChartBuilder({
               className="flex min-h-0 min-w-0 flex-col gap-4 overflow-y-auto rounded-xl bg-card p-3 ring-1 ring-foreground/6"
             >
               {sourcePanel}
+              <ColumnList
+                columns={panelColumns} fieldLabel={fieldLabel} textOf={titleText}
+                xEmpty={!dimension} valueEmpty={!measureRows[0]?.column} onUse={applyColumnUse}
+              />
+              {chosenMart ? <p className="px-2 text-xs text-muted-foreground tabular-nums">{chosenMart.rows.toLocaleString()} rows in {chosenMart.name}</p> : null}
             </aside>
           )}
 

@@ -133,7 +133,7 @@ function FilterEditor({ kind, ...props }: EditorProps & { kind: string }) {
  * dashboard filter can only narrow them further.
  */
 export function ChartFilters({
-  value, onChange, columns, disabled, segments = [], source,
+  value, onChange, columns, disabled, segments = [], source, startWith,
 }: {
   readonly value: readonly FilterDef[];
   readonly onChange: (next: FilterDef[]) => void;
@@ -147,9 +147,17 @@ export function ChartFilters({
    * from every mart that happens to have the column.
    */
   readonly source: OwnSource;
+  /**
+   * `BI-58` T2: "Use as filter" in the data panel opens a new filter on that column here; `n`
+   * changes on each request, so asking for the same column twice opens it twice.
+   */
+  readonly startWith?: { column: string; n: number } | null;
 }) {
   // `null`: nothing open; a column: a new filter on it; a number: editing that one.
   const [open, setOpen] = React.useState<{ column: string } | { index: number } | null>(null);
+  React.useEffect(() => {
+    if (startWith?.column) setOpen({ column: startWith.column });
+  }, [startWith?.column, startWith?.n]);
   const kindOf = (column: string) => columns.find((c) => c.name === column)?.kind ?? "text";
   const unused = columns.filter((c) => !value.some((f) => !f.segment && f.column === c.name));
   const others = (column: string) => value.filter((f) => !f.segment && f.column !== column && isActiveFilter(f));
