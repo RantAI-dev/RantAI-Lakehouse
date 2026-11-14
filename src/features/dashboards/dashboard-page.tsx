@@ -18,7 +18,7 @@ import { ParamDialog } from "./param-dialog";
 import { PARAMS_PARAM, acceptedParams, normalizeDef, paramsDiffer, paramsQuery, readParamsParam, savedParamsBody, withParamsParam, withValue, type BoardParam, type ParamControl, type ParamValue, type RefusedParam } from "@/lib/params";
 import { GRAIN_PARAM, differsFromSaved, grainNotAppliedSentence, grainQuery, readGrainParam, savedGrainBody, shownGrain, withGrainParam, type GrainChoice } from "@/lib/grain-switch";
 import { PART_NO_CLICK_REASON, isGrain, isTruncation, switchChoices, type ColumnKind, type Grain, type ReportingContext } from "@/lib/time-grain";
-import { effectiveRefresh, canSaveRefresh as refreshIsSaveable, listedInterval } from "@/lib/dashboard-refresh";
+import { REFRESH_OPTIONS, effectiveRefresh, canSaveRefresh as refreshIsSaveable, listedInterval } from "@/lib/dashboard-refresh";
 import { enterFullscreen, leaveFullscreen, readFullscreenDark, writeFullscreenDark } from "@/lib/dashboard-fullscreen";
 import { notifyFailure, notifyInfo, notifySuccess } from "@/lib/notify";
 import { formatRelativeTime } from "@/lib/format";
@@ -138,10 +138,15 @@ type Payload = {
   charts: ChartCard[]; results: Record<string, Cell>; storeError?: string | null;
 };
 
-const SOURCE_BADGE: Record<ChartSource, { label: string; cls: string } | null> = {
+/**
+ * Who made a tile, said in its ⋯ (`BI-61` T4). It was the "AI" / "Manual"
+ * badge on every tile face, which read as a refresh mode; the words say what
+ * it is.
+ */
+const SOURCE_NOTE: Record<ChartSource, string | null> = {
   builtin: null,
-  ai: { label: "AI", cls: "bg-violet-500/15 text-violet-600 dark:text-violet-400" },
-  ui: { label: "Manual", cls: "bg-sky-500/15 text-sky-600 dark:text-sky-400" },
+  ai: "made with AI",
+  ui: "made by hand",
 };
 const NO_CHARTS: ChartCard[] = [];
 const NO_KPIS: KpiMeta[] = [];
@@ -1172,7 +1177,6 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     // says why. Without a grain on screen the mark would answer nobody.
     const notApplied = hasRows(cell) && data?.appliedGrain && grainedCharts.length > 0
       ? grainNotAppliedSentence(cell.grainNotApplied) : null;
-    const badge = SOURCE_BADGE[spec.source];
     const drilled = tileDrills.drills[spec.id];
     const level = drilled ? tileDrills.currentLevel(spec) : undefined;
     const clickSpec = clickSpecOf(spec, level);
@@ -1187,47 +1191,60 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       onDuplicate: () => void duplicateChart(spec),
       onDelete: () => setRemoving({ id: spec.id, title: spec.title }),
     });
+    // BI-61 T4: one ⋯ per tile, in the mockup's order: edit, refresh, view
+    // data, download ›, alert, lineage, then the rest the old menu held, then
+    // the writes. Nothing the old menu offered is left out.
+    const [editChart, ...otherWrites] = write.edit;
+    const downloads: TileMenuItem[] = downloadKind === "data"
+      ? [
+          // BI-1: a chart of the board downloads its whole result from the server, as
+          // Excel or CSV, formatted or raw (the dialog asks).
+          { label: "Download data…", icon: <Table2 />, onSelect: () => setDataFor({ id: spec.id, title: spec.title }) },
+          // BI-19 part D (plan D13): the chart as a picture, drawn by the same renderer as the PDF, so only where there is one.
+          ...(data?.pdfSupported === true
+            ? [{ label: "Download PNG", icon: <ImageDown />, onSelect: () => void downloadPng(spec.id) }]
+            : []),
+        ]
+      : downloadKind === "csv"
+        // A built-in tile has no stored definition to read and keeps the rows on screen as CSV.
+        ? [{ label: "Download CSV", icon: <Table2 />, onSelect: () => hasRows(cell) && downloadRowsCsv(spec.title, cell) }]
+        : [];
     const menu: TileMenuItem[] = [
-      { label: "Expand", icon: <Maximize2 />, onSelect: () => setTileDialog({ kind: "expand", id: spec.id }) },
-      { label: "View data", icon: <Table2 />, onSelect: () => setTileDialog({ kind: "data", id: spec.id }) },
+      ...(editChart ? [editChart] : []),
       // BI-4 part B (feature decision 6): this tile is computed again and replaces what is remembered; the others stay.
       ...(hasRows(cell) && cell.computedAt ? [{ label: "Refresh this tile", icon: <RefreshCw />, onSelect: () => void load(spec.id) }] : []),
-      // The drill menu stays reachable on a chart that opens somewhere else.
-      ...(spec.def?.click && drillable
-        ? [{ label: menuTiles.has(spec.id) ? "Click opens its destination" : "Click opens the drill menu", icon: <MousePointerClick />, onSelect: () => toggleMenuTile(spec.id) }]
-        : []),
+      { label: "View data", icon: <Table2 />, onSelect: () => setTileDialog({ kind: "data", id: spec.id }) },
+      ...(downloads.length ? [{ label: "Download", icon: <Download />, onSelect: () => {}, sub: downloads }] : []),
+      // BI-19 part C (C3): everyone who can view a stored chart may alert on it
+      // for themselves; the server decides who may send it elsewhere.
+      ...(own && !edit ? [{ label: "Alert me…", icon: <Bell />, onSelect: () => setAlertChart({ id: spec.id, title: spec.title, kind: spec.kind, measures: hasRows(cell) ? cell.columns.filter((c) => c !== spec.def?.dimension) : [], latestPoint: chartHasLatestPoint(spec.def), labels: tileMeasureLabels(spec.def?.measures, spec.y, spec.def?.steps, hasRows(cell) ? cell.metricLabels : undefined, spec.def?.aggregate) }) }] : []),
+      // BI-14 (decision 1, Q6): everyone who sees a stored chart gets the item; the panel says what a person without `lineage:read` may do.
+      ...(own ? [{ label: "Where does this come from", icon: <GitFork />, onSelect: () => setLineageChart({ id: spec.id, title: spec.title }) }] : []),
+      { label: "Expand", icon: <Maximize2 />, onSelect: () => setTileDialog({ kind: "expand", id: spec.id }), separatorBefore: true },
       // A KPI, gauge or table has no mark to click: its rows are one step away here.
       ...((offersTileRecords(spec.kind) || spec.def?.steps?.length) && (spec.mart || spec.sqlSource)
         ? [{ label: "View records", icon: <Table2 />, onSelect: () => openRecords({ title: spec.title, mart: spec.mart, sqlSource: spec.sqlSource, chart: ownFilterChart(spec) }, spec.source === "builtin", NO_FILTERS, spec.id) }]
         : []),
-      // BI-14 (decision 1, Q6): everyone who sees a stored chart gets the item; the panel says what a person without `lineage:read` may do.
-      ...(own ? [{ label: "Where does this come from", icon: <GitFork />, onSelect: () => setLineageChart({ id: spec.id, title: spec.title }) }] : []),
-      // BI-19 part C (C3): everyone who can view a stored chart may alert on it
-      // for themselves; the server decides who may send it elsewhere.
-      ...(own && !edit ? [{ label: "Alert me…", icon: <Bell />, onSelect: () => setAlertChart({ id: spec.id, title: spec.title, kind: spec.kind, measures: hasRows(cell) ? cell.columns.filter((c) => c !== spec.def?.dimension) : [], latestPoint: chartHasLatestPoint(spec.def), labels: tileMeasureLabels(spec.def?.measures, spec.y, spec.def?.steps, hasRows(cell) ? cell.metricLabels : undefined, spec.def?.aggregate) }) }] : []),
+      // The drill menu stays reachable on a chart that opens somewhere else.
+      ...(spec.def?.click && drillable
+        ? [{ label: menuTiles.has(spec.id) ? "Click opens its destination" : "Click opens the drill menu", icon: <MousePointerClick />, onSelect: () => toggleMenuTile(spec.id) }]
+        : []),
       // BI-9: a chart grouped by a part of the date (a weekday) has no rows to
       // list or range to filter; the menu says why instead of leaving the click dead.
       ...(hasRows(cell) && isGrain(cell.grain) && !isTruncation(cell.grain)
         ? [{ label: "Why clicking does nothing", icon: <MousePointerClick />, onSelect: () => notifyInfo("Nothing to open from this value", PART_NO_CLICK_REASON) }]
         : []),
-      // BI-1: a chart of the board downloads its whole result from the server, as
-      // Excel or CSV, formatted or raw. A built-in tile has no stored definition to
-      // read and keeps the rows on screen as CSV.
-      ...(downloadKind === "data"
-        ? [
-            { label: "Download data…", icon: <Download />, onSelect: () => setDataFor({ id: spec.id, title: spec.title }) },
-            // BI-19 part D (plan D13): the chart as a picture, drawn by the same renderer as the PDF, so only where there is one.
-            ...(data?.pdfSupported === true
-              ? [{ label: "Download PNG", icon: <ImageDown />, onSelect: () => void downloadPng(spec.id) }]
-              : []),
-          ]
-        : downloadKind === "csv"
-          ? [{ label: "Download CSV", icon: <Download />, onSelect: () => hasRows(cell) && downloadRowsCsv(spec.title, cell) }]
-          : []),
-      ...write.edit,
-      ...moveItems(spec.id),
+      ...otherWrites.map((w, i) => (i === 0 ? { ...w, separatorBefore: true } : w)),
+      ...moveItems(spec.id).map((m, i) => (i === 0 && otherWrites.length === 0 ? m : { ...m, separatorBefore: false })),
       ...write.remove,
     ];
+    // BI-61 T4: what the tile face used to carry, now in its ⋯: when the data is
+    // from, the refresh mode, what it reads and who made it (the old badge).
+    const tileFrom = hasRows(cell) ? dataFromLabel(cell.computedAt, data?.reporting?.timeZone, cell.remembered) : null;
+    const menuNotes = [
+      [tileFrom, autoSec > 0 ? `refreshes ${(REFRESH_OPTIONS.find((o) => o.seconds === autoSec)?.label ?? "").toLowerCase()}` : "auto-refresh off"].filter(Boolean).join(" · "),
+      [spec.sqlSource ? "Reads a SQL source" : spec.mart ? `Reads ${spec.mart}` : null, SOURCE_NOTE[spec.source]].filter(Boolean).join(" · "),
+    ].filter((line) => line.length > 0);
     return {
       id: spec.id,
       span: spec.span,
@@ -1263,29 +1280,20 @@ export function DashboardPage({ boardId }: { boardId: string }) {
           ) : null}
         </>
       ),
-      badge: (
-        <div className="flex items-center gap-1.5">
-          {badge ? (
-            <span className={cn("inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium", badge.cls)}>
-              {spec.source === "ai" ? <Sparkles className="size-2.5" /> : null}{badge.label}
-            </span>
-          ) : null}
-          {/* The source table is detail for whoever arranges the board. */}
-          {edit ? <span className="hidden rounded-full border px-2 py-0.5 font-mono text-[10px] text-muted-foreground sm:inline">{spec.sqlSource ? "SQL source" : spec.mart}</span> : null}
-        </div>
-      ),
-      menuLabel: spec.sqlSource ? "Source: SQL source" : spec.mart ? `Source: ${spec.mart}` : undefined,
+      // BI-61 T3: no badge on the tile face; its facts are in `menuNotes`.
+      menuNotes,
+      dataFrom: tileFrom?.replace(/ · remembered$/, ""),
       menu,
       body: drilled ? (
         <div className="flex h-full min-h-0 flex-col">
           <DrillTrail steps={drilled.steps} onClimb={(index) => tileDrills.climb(spec, index)} />
           <div className="min-h-0 flex-1">
-            <TileBody spec={{ ...spec, x: level ?? spec.x, def: { ...spec.def, dimension: level } }} cell={drilled.cell} dark={dark} loading={loading || drilled.loading}
+            <TileBody hideDataFrom spec={{ ...spec, x: level ?? spec.x, def: { ...spec.def, dimension: level } }} cell={drilled.cell} dark={dark} loading={loading || drilled.loading}
               onDataClick={drillable ? onChartClick(spec, clickSpec) : undefined} />
           </div>
         </div>
       ) : (
-        <TileBody spec={spec} cell={cell} dark={dark} loading={loading} paging={{ filters: filtersOnTab(filters, tabOf(tabs, layout, spec.id)) }} onTableSort={(sort) => { tableSorts.current[spec.id] = sort; }}
+        <TileBody hideDataFrom spec={spec} cell={cell} dark={dark} loading={loading} paging={{ filters: filtersOnTab(filters, tabOf(tabs, layout, spec.id)) }} onTableSort={(sort) => { tableSorts.current[spec.id] = sort; }}
           onDataClick={drillable ? onChartClick(spec, clickSpec) : undefined} />
       ),
     };
@@ -1522,6 +1530,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
             items={items} layout={shownLayout} editable={edit && !phoneEdit} onLayoutChange={persistLayout}
             tabs={tabs} tab={selTab} phone={phone} phoneEdit={edit && phoneEdit} onPhoneChange={persistPhone}
             foldKey={board}
+            look="soft"
           />
           {tabs.length > 0 && selTab && tilesOnTab(tabs, layout, chartIds, selTab).length === 0 ? (
             // BI-18 part C review fix (SHOULD-FIX) R3: the page's own empty state.

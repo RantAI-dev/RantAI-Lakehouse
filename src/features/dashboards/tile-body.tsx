@@ -71,6 +71,11 @@ type TileBodyProps = {
    * sent to the login page (`PR #246 review BLOCKER 1`).
    */
   loadMap?: MapLoader;
+  /**
+   * Leave out the "Data from" footer: the dashboard page shows it in the
+   * tile's hover line and its ⋯ instead (`BI-61` T4). Absent: shown.
+   */
+  hideDataFrom?: boolean;
 };
 
 /**
@@ -83,7 +88,7 @@ export function TileBody(props: TileBodyProps) {
   const reporting = useReporting();
   const cut = hasRows(props.cell) && props.cell.limitHit?.kind === "rows" ? limitSentence(props.cell.limitHit) : null;
   // BI-4 part B (feature decision 5): "Data from 10:42", and "remembered" when it came from memory.
-  const from = hasRows(props.cell) ? dataFromLabel(props.cell.computedAt, reporting.timeZone, props.cell.remembered) : null;
+  const from = hasRows(props.cell) && !props.hideDataFrom ? dataFromLabel(props.cell.computedAt, reporting.timeZone, props.cell.remembered) : null;
   if (!cut && !from) return <TileBodyOf {...props} />;
   return (
     <div className="flex h-full min-h-0 flex-col">

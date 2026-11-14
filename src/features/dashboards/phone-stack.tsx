@@ -4,7 +4,7 @@ import { ArrowDown, ArrowUp, Minus, Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { movePhoneTile, resizePhoneTile } from "@/lib/dashboard-tabs";
 import type { PhoneTile } from "@/services";
-import type { GridItem } from "./dashboard-grid";
+import type { GridItem, TileLook } from "./dashboard-grid";
 import { SectionTile, TileCard, isSectionKind } from "./tile-card";
 
 const ROW_H = 44;
@@ -19,8 +19,10 @@ const heightOf = (rows: number) => rows * ROW_H + (rows - 1) * MARGIN;
  * full), and they are sent up as the whole new list.
  */
 export function PhoneStack({
-  items, order, editing, folded, onToggleFold, onChange,
+  items, order, editing, folded, onToggleFold, onChange, look = "card",
 }: {
+  /** How the tiles are drawn (`BI-61` T4). */
+  look?: TileLook;
   items: GridItem[];
   /** Visible tiles in order, with their heights in rows. */
   order: PhoneTile[];
@@ -41,7 +43,7 @@ export function PhoneStack({
             {isSectionKind(item.kind) ? (
               <SectionTile item={item} editable={editing} folded={folded.has(item.id)} onToggle={() => onToggleFold(item.id)} />
             ) : (
-              <TileCard item={item} editable={false} />
+              <TileCard item={item} editable={false} look={look} />
             )}
             {editing && onChange ? (
               <div className="absolute right-1 top-1 z-10 flex items-center gap-0.5 rounded-md border border-border bg-card/95 p-0.5 shadow-sm">
