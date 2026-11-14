@@ -377,3 +377,48 @@ shots show the new one.
 **Not verified:** the full `bun run test` (CI); a real iPhone Safari check; the discard confirm on the
 live preview (covered by the tests only). `AGENTS.md` still carries the uncommitted block `next dev`
 writes, and `.preview-dev.log` (the planner's preview log) is untracked; neither is committed.
+
+### Handoff, BI-58 review round 2 (Opus developer agent, 2026-11-14)
+
+**Commits:**
+- `1ab47ac4` SHOULD-FIX 6, the tab row: equal thirds, a full-width divider, the sliding underline, and the test.
+- `712caad2` SHOULD-FIX 7's code: `ZONE_HEADER`, the shared 44 px height.
+- `5bdab0bc` SHOULD-FIX 7's test and its measurement.
+- `8f625135` the app shell's sidebar at 14rem, without the subtitle.
+- `c4d87211` the composer, centred on the content area, with one shared bottom token.
+- The commit of this entry adds the screenshots.
+
+**History note (not rewritten):** `712caad2` holds SHOULD-FIX 7 (`ZONE_HEADER`, the shared 44 px height),
+not 6 as its message says; `1ab47ac4` is SHOULD-FIX 6. A second session committed it while this one
+was working. The final tree has each fix once, and tests cover both: equal tabs in the R3 tab test,
+the shared height in the zones test.
+
+**Checks on `c4d87211`**, each run alone with `nice -n 15` under `systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0`:
+- `bun test` on 23 files (the builder's 20 plus the 3 app-shell tests): **273 pass, 0 fail, 1,370 expect() calls**;
+- `bun run typecheck`: **0 errors**;
+- `bun run lint`: **0 errors, 11 warnings** (the existing 11);
+- `bun run test` in full: **not verified (CI)**.
+
+**Measured on the preview at 28620** over CDP, using `getBoundingClientRect`:
+
+| Check | 1366x900 | 1190x800 |
+| --- | --- | --- |
+| Divider bottoms: canvas toolbar / inspector tabs | 180 / 180 | 180 / 180 |
+| Card tops / bottoms | 136 / 788 | 136 / 688 |
+| Composer centre / content centre | 795 / 795 | 707 / 707 |
+| Gap between the zones and the composer | 14 px | 14 px |
+| Page scroll | none | none |
+
+- Card tops and bottoms were measured before the composer change. After it, the zones end 14 px
+  above the composer, at 824 (1366x900) and 724 (1190x800).
+- With the sidebar collapsed to icons, the composer centre and the content centre are both 707.
+- At 14rem (224 px) no sidebar label is cut off.
+
+**Screenshots:** `docs/plans/bi-58-screens/review-data-`, `review-style-` and `review-style-axes-`
+at `1366x900`, light and dark, and `review-sidebar-1366x900-dark.png`, all re-taken after the
+sidebar and composer changes. They were taken on 28620 with one headless Chrome of my own (its own
+profile folder), stopped by PID afterwards. No dev server was started or stopped.
+
+**Not verified:** the full suite (CI); a real iPhone Safari check; the phone drawer and the composer
+on a phone, beyond the code path (with no `--content-left` the composer is centred on the window as
+before).
