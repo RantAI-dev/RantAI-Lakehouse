@@ -405,13 +405,23 @@ pub fn ch_error_as(ctx: &Context, err: &ChError, failed_as: FailedAs) -> ApiErro
 // the engine's text goes to the log under that reference (the `_for_console`
 // functions below).
 //
-// It still stands for the assistant: the model corrects its SQL from the
-// engine's trimmed diagnosis, so `routes::query::run_statement` (as the
+// It still stands for the assistant's MODEL: the model corrects its SQL from
+// the engine's trimmed diagnosis, so `routes::query::run_statement` (as the
 // assistant's `run_sql` and `run_saved_query` call it) and
 // `check_statement_would_run` (`propose_sql`) use the functions here that end
 // in `_for_author`. `tests/sec11_guard.rs` flags any route line that calls one
 // outside its single allowlist entry for `query.rs`, so the exception cannot
 // spread by copy.
+//
+// It does NOT stand for the assistant's browser copy (owner 2026-11-14,
+// LH-QS-2-08): a tool failure in the chat response's `toolTrace` shows the
+// same fixed sentence and the same reference the console shows, and the
+// engine's text goes to the log under that reference. The tool hands both
+// copies back, the model's in its `error` and the browser's in the one key
+// only the server reads (`routes::ai::BROWSER_ERROR_KEY`), and the chat loop
+// takes that key out before it builds either copy. The sentence is this
+// module's own `StatementFailure::recorded`, so no route line builds a
+// response from an error's own text and the guard has nothing new to flag.
 
 /// The longest diagnosis shown to the author, in characters.
 const MAX_DIAGNOSIS_CHARS: usize = 800;

@@ -85,6 +85,21 @@ fn required(field: &str, value: &str) -> Result<String, ApiError> {
     Ok(trimmed.to_owned())
 }
 
+/// The detail a run's step, or a run's outcome, keeps of a tool's result.
+///
+/// The browser's copy of an engine failure travels in the one key only the
+/// server reads ([`crate::routes::ai::BROWSER_ERROR_KEY`]). A run's detail
+/// is read by a browser, so the key must not be in it: it is not part of
+/// the wire contract and no client reads it. The strip happens here, so a
+/// stored detail never carries the key whatever the caller hands it.
+///
+/// The `error` key beside it stays the model's copy of a failure (the
+/// engine's trimmed diagnosis). That leak predates this change and is
+/// reported to the owner as a separate finding; it is NOT changed here.
+fn stored_tool_detail(result: Value) -> String {
+    serde_json::to_string(&crate::routes::ai::without_browser_error(result)).unwrap_or_default()
+}
+
 const VALID_AUTONOMY: [&str; 4] = ["L1", "L2", "L3", "L4"];
 
 /// `agent_employee.mode`'s `CHECK` constraint values
@@ -769,6 +784,11 @@ pub async fn decide_approval(
         return Err(ApiError::PermissionDenied(detail).into());
     }
     let result = ai_tools::run_tool(&state, Some(&principal), &pending.tool, &args).await;
+    // The browser's copy of an engine failure travels in the one key only
+    // the server reads (LH-QS-2-08, owner 2026-11-12); this run's outcome
+    // is read by a browser, so the key is taken out before the result is
+    // inspected or stored.
+    let result = crate::routes::ai::without_browser_error(result);
     let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
     let status = if ok { "succeeded" } else { "failed" };
     if let Err(err) = agents::record_run_outcome(
@@ -776,7 +796,7 @@ pub async fn decide_approval(
         &run_id,
         status,
         "Executed after approval",
-        &serde_json::to_string(&result).unwrap_or_default(),
+        &stored_tool_detail(result.clone()),
     )
     .await
     {
@@ -1611,6 +1631,12 @@ async fn run_headless_loop_inner(
             // requiring tool (`run_saved_query`) is responsible for
             // refusing `None` with a named reason rather than a bare 401.
             let result = ai_tools::run_tool(state, principal, &call.function.name, &args).await;
+            // The browser's copy of an engine failure travels in the one key
+            // only the server reads (LH-QS-2-08, owner 2026-11-12); this
+            // run's step detail is read by a browser, so the key is taken
+            // out before the result is inspected, stored or fed back to
+            // the model.
+            let result = crate::routes::ai::without_browser_error(result);
             let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
             let (resource_kind, resource_id) =
                 ai_audit::resource_for(&call.function.name, &args, &result);
@@ -1620,7 +1646,7 @@ async fn run_headless_loop_inner(
                 &format!("step-{step_no}"),
                 &call.function.name,
                 if ok { "succeeded" } else { "failed" },
-                &serde_json::to_string(&result).unwrap_or_default(),
+                &stored_tool_detail(result.clone()),
             )
             .await;
             write_headless_audit(
@@ -1946,6 +1972,25 @@ mod tests {
             comment: None,
         };
         assert!(!matches!(body.decision.as_str(), "approved" | "rejected"));
+    }
+
+    /// A run's step detail is read by a browser, so the one key only the
+    /// server reads (`routes::ai::BROWSER_ERROR_KEY`) must not be in it —
+    /// while the `error` key beside it keeps the model's copy, which this
+    /// fix does not touch.
+    #[test]
+    fn a_stored_tool_detail_holds_no_browser_error_and_keeps_the_models_copy() {
+        let diagnosis = "Unknown expression identifier 'pengunjungg' in scope. (UNKNOWN_IDENTIFIER) Reference: dc51a4b585";
+        let result = json!({
+            "error": diagnosis,
+            "_browserError": "This query names a column that does not exist. Reference: dc51a4b585",
+        });
+
+        let detail = stored_tool_detail(result);
+
+        assert!(!detail.contains("_browserError"), "{detail}");
+        let stored: Value = serde_json::from_str(&detail).expect("the detail is JSON");
+        assert_eq!(stored["error"], json!(diagnosis));
     }
 
     /// A logged-in human principal — `PrincipalId::User`. Mirrors
