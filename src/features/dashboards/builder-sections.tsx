@@ -108,3 +108,36 @@ export function ColumnLabel({ reference, title }: { readonly reference: ColumnRe
     </span>
   );
 }
+
+/**
+ * A row of mutually exclusive choices, each a real button reachable by Tab
+ * (`BI-58`, from layout A): the width of a chart, Half or Full.
+ */
+export function Segmented<T extends string>({ value, options, onChange, label, className }: {
+  readonly value: T;
+  readonly options: readonly { value: T; label: string }[];
+  readonly onChange: (next: T) => void;
+  /** Read by screen readers; what the choice is about. */
+  readonly label: string;
+  readonly className?: string;
+}) {
+  return (
+    <div role="group" aria-label={label} className={cn("inline-flex rounded-lg bg-muted p-0.5", className)}>
+      {options.map((o) => {
+        const on = o.value === value;
+        return (
+          <button
+            key={o.value} type="button" aria-pressed={on} onClick={() => onChange(o.value)}
+            className={cn(
+              "inline-flex h-7 items-center justify-center rounded-md px-2.5 text-xs font-medium whitespace-nowrap outline-none",
+              "transition-[background-color,color,box-shadow] duration-200 ease-[cubic-bezier(0.2,0,0,1)] focus-visible:ring-3 focus-visible:ring-ring/50",
+              on ? "bg-background text-foreground shadow-sm dark:bg-input/40" : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {o.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}

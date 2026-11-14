@@ -4,21 +4,20 @@ import { governedPairLabels } from "@/features/catalog/governed-tags"
 import { Pill } from "@/components/patterns/status-badge"
 
 import * as React from "react";
+import Link from "next/link";
 import { useTheme } from "next-themes";
 import {
-  CalendarDays, ChartBar, ChartCandlestick, ChartColumn, ChartLine, ChartPie, ChevronDown, ChevronRight, Code, Flame, Gauge, Workflow,
-  Map, MapPin, PanelLeftClose, PanelLeftOpen, Pencil, ScatterChart, Search, SlidersHorizontal, Table2, Type, type LucideIcon,
+  ArrowLeft, CalendarDays, ChartBar, ChartCandlestick, ChartColumn, ChartLine, ChartPie, ChevronDown, Code, Flame, Gauge, Workflow,
+  Map, MapPin, Pencil, ScatterChart, Search, SlidersHorizontal, Table2, Type, type LucideIcon,
   ChartNoAxesColumn, ChartNoAxesGantt, Globe, Image as ImageIcon, Target,
 } from "lucide-react";
 import { EmptyState } from "@/components/patterns/page-states";
-import { FormPage } from "@/components/patterns/form-page";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
-import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 import {
   Select, SelectContent, SelectGroup, SelectLabel, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
@@ -81,9 +80,8 @@ import { LayersSection } from "./layers-section";
 import { layerDraftsFromDef, layerProblems, layersPayload, takesLayers, type LayerDraft } from "@/lib/chart-layers";
 import { displayColumnFull, joinsPayload, pairsFromSuggestions, type JoinDraft, type JoinPairDef } from "@/lib/chart-joins";
 import type { OwnSource } from "./filters/use-filter-values";
-import { AccordionSection, ColumnLabel, FoldSection, columnItems, focusFirstEmpty } from "./builder-sections";
+import { AccordionSection, ColumnLabel, FoldSection, Segmented, columnItems, focusFirstEmpty } from "./builder-sections";
 import { missingSection, sectionSummaries, type SectionNumber } from "@/lib/section-summary";
-import { readKindListPref, writeKindListPref } from "@/lib/kind-list-pref";
 import { CustomFieldsMenu } from "./custom-fields-menu";
 import { builderRules, carryOverOnKindSwitch, moreOptionsUsed } from "@/lib/builder-rules";
 import type { StyleFields } from "@/lib/chart-style";
@@ -239,19 +237,6 @@ function withCalculated(base: Fields, columns: string[], calculated: CalcField[]
 /** Map id → label for the base-ui select (see KIND_LABELS). */
 const NO_LABEL_ITEMS: Record<string, string> = { [NO_BREAKDOWN]: "— no label —" };
 const SPAN_LABELS: Record<string, string> = { "1": "Half width", "2": "Full width" };
-/** Whether the viewport is at least `px` wide; false on the server. */
-function useMinWidth(px: number): boolean {
-  const query = `(min-width: ${px}px)`;
-  return React.useSyncExternalStore(
-    (onChange) => {
-      const mql = window.matchMedia(query);
-      mql.addEventListener("change", onChange);
-      return () => mql.removeEventListener("change", onChange);
-    },
-    () => window.matchMedia(query).matches,
-    () => false,
-  );
-}
 
 /** Marks a field the chart cannot be drawn without. */
 function Req() {
@@ -403,8 +388,6 @@ export function ChartBuilder({
   const [previewBusy, setPreviewBusy] = React.useState(false);
   const [previewError, setPreviewError] = React.useState<string | null>(null);
   const { resolvedTheme } = useTheme();
-  // Side-by-side, resizable form and preview from the `lg` breakpoint.
-  const wide = useMinWidth(1024);
 
   const [title, setTitle] = React.useState("");
   // Encoded data-source choice (`mart:<name>` / `sql:<id>`, lib/chart-source).
@@ -457,11 +440,10 @@ export function ChartBuilder({
   // Phase 2 QA R3: "More options" is folded unless the chart being edited uses something in it.
   const [moreOpen, setMoreOpen] = React.useState(false);
   // Phase 2 QA R10: sections 1 to 3 are an accordion (one open, or none); a new chart starts on 1, an edited one folded.
-  const [active, setActive] = React.useState<1 | 2 | 3 | null>(1);
+  // `BI-58` T1: section 1 (the source) moved to the data panel, so a new chart starts on 2.
+  const [active, setActive] = React.useState<2 | 3 | null>(2);
   const panelRefs = React.useRef<Partial<Record<SectionNumber | 5, HTMLElement | null>>>({});
   const [focusAsk, setFocusAsk] = React.useState<{ section: SectionNumber; n: number } | null>(null);
-  // Phase 2 QA R9: the type list at the left is open or folded; a remembered choice wins, else open for a new chart until a type is chosen.
-  const [listOpen, setListOpen] = React.useState(true);
   const [kindMenu, setKindMenu] = React.useState(false);
   const numberParamDefs = React.useMemo(() => numberParams(paramDefs), [paramDefs]);
   const [targetBoard, setTargetBoard] = React.useState(board);
@@ -844,10 +826,8 @@ export function ChartBuilder({
     void apiFetch("/api/dashboard/fields").then((r) => r.json()).then((j) => setMarts(j.marts ?? [])).catch(() => setMarts([]));
     // A viewer without the list (or with the API down) still gets marts.
     void dashboardService.listSqlSources().then(setSqlSources).catch(() => setSqlSources([]));
-    const pref = readKindListPref();
-    setListOpen(pref ? pref === "expanded" : !editId);
     setKindMenu(false);
-    setActive(editId ? null : 1);
+    setActive(editId ? null : 2);
     if (initial) {
       setTitle(initial.title ?? "");
       setKind((initial.kind as ChartKind) ?? "hbar");
@@ -1009,7 +989,8 @@ export function ChartBuilder({
   });
   /** Opens the section that holds a missing field and moves focus to that field. */
   function revealSection(n: SectionNumber) {
-    if (n === 4) setMoreOpen(true); else setActive(n);
+    // Section 1 is the data panel, which is always open.
+    if (n === 4) setMoreOpen(true); else if (n !== 1) setActive(n);
     setFocusAsk({ section: n, n: Date.now() });
   }
   React.useEffect(() => {
@@ -1017,17 +998,10 @@ export function ChartBuilder({
     focusFirstEmpty(panelRefs.current[focusAsk.section] ?? null);
     setFocusAsk(null);
   }, [focusAsk]);
-  /** A type was chosen from the list or the menu; with no remembered choice the list folds away. */
+  /** A type was chosen from the menu, which closes. */
   function chooseKind(next: ChartKind) {
     pickKind(next);
     setKindMenu(false);
-    if (!readKindListPref()) setListOpen(false);
-  }
-  function toggleList() {
-    const next = !listOpen;
-    setListOpen(next);
-    setKindMenu(false);
-    writeKindListPref(next ? "expanded" : "collapsed");
   }
 
   /** The shape fields to send; a pivot's bin only while it still has a number field to bin (BI-10). */
@@ -1312,55 +1286,11 @@ export function ChartBuilder({
   const breakdownBinPicker = canBreakdown && !!binKind && !!breakdown && isNumber(breakdown);
   const breakdownExtras = !!breakdownGrainPicker || breakdownBinPicker;
 
-  const formFields = (
-    // Phase 2 QA R14, the cause of the sideways scroll: a grid with no column template has one `auto`
-    // track, whose minimum is the widest unbreakable content in it (a trigger's `nowrap` value), so
-    // one long column name widened the whole form. Every grid of the form without columns of its own
-    // gets a `minmax(0, 1fr)` track, which the container, not the content, sizes.
-    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] content-start gap-5 px-5 pt-1 pb-5 [&_.grid:not([class*=grid-cols])]:grid-cols-[minmax(0,1fr)]">
-      {/* Phase 2 QA R11: title wide, dashboard and width narrow, on one row. */}
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_9rem_8rem]">
-        <div className="grid gap-1.5">
-          <Label htmlFor="ch-title">Title {isStaticTile ? <Req /> : null}</Label>
-          <Input
-            id="ch-title" value={title} onChange={(e) => setTitle(e.target.value)}
-            placeholder={suggestedTitle || "e.g. Visitors by Region"}
-          />
-        </div>
-        <div className="grid gap-1.5">
-          <Label>Dashboard</Label>
-          <Select value={targetBoard} items={boardLabels} onValueChange={(v) => setTargetBoard(v ?? "default")}>
-            <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-            <SelectContent>
-              {boardOptions.map((b) => (
-                <SelectItem key={b.id} value={b.id}>{b.name}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-        <div className="grid gap-1.5">
-          <Label>Width</Label>
-          <Select value={String(span)} items={SPAN_LABELS} onValueChange={(v) => setSpan(v === "2" ? 2 : 1)}>
-            <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="1">{SPAN_LABELS["1"]}</SelectItem>
-              <SelectItem value="2">{SPAN_LABELS["2"]}</SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
-      </div>
-
-      {isText ? (
-        <div className="grid gap-1.5">
-          <Label>Content (markdown) <Req /></Label>
-          <Textarea rows={8} value={text} onChange={(e) => setText(e.target.value)} placeholder="Title **bold**, - bullets, or | table | GFM |." />
-        </div>
-      ) : isCard ? (
-        <CardFields kind={kind === "web" ? "web" : "image"} draft={typeDraft} onChange={changeType} sites={sites} />
-      ) : (
-        <>
-          {/* Phase 2 QA R3: four ordered sections; the last is folded. */}
-          <AccordionSection number={1} title="Data" summary={summaries.data} open={active === 1} onOpenChange={(o) => setActive(o ? 1 : null)} panelRef={(n) => { panelRefs.current[1] = n; }}>
+  /**
+   * `BI-58` T1: the source, its joins, its SQL and its custom fields sit in the data
+   * panel at the left of the page (they were section 1 of the form).
+   */
+  const sourcePanel = (
             <div className="grid gap-1.5">
             <Label>Data source <Req /></Label>
             <Select value={source} items={sourceLabels} onValueChange={(v) => onSourceChange(v ?? "")}>
@@ -1470,8 +1400,24 @@ export function ChartBuilder({
                 />
               ) : null}
             </div>
-          </AccordionSection>
+  );
 
+  const formFields = (
+    // Phase 2 QA R14, the cause of the sideways scroll: a grid with no column template has one `auto`
+    // track, whose minimum is the widest unbreakable content in it (a trigger's `nowrap` value), so
+    // one long column name widened the whole form. Every grid of the form without columns of its own
+    // gets a `minmax(0, 1fr)` track, which the container, not the content, sizes.
+    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] content-start gap-5 p-4 [&_.grid:not([class*=grid-cols])]:grid-cols-[minmax(0,1fr)]">
+      {isText ? (
+        <div className="grid gap-1.5">
+          <Label>Content (markdown) <Req /></Label>
+          <Textarea rows={8} value={text} onChange={(e) => setText(e.target.value)} placeholder="Title **bold**, - bullets, or | table | GFM |." />
+        </div>
+      ) : isCard ? (
+        <CardFields kind={kind === "web" ? "web" : "image"} draft={typeDraft} onChange={changeType} sites={sites} />
+      ) : (
+        <>
+          {/* Phase 2 QA R3: four ordered sections; the last is folded. */}
           <AccordionSection number={2} title="What to show" summary={summaries.show} open={active === 2} onOpenChange={(o) => setActive(o ? 2 : null)} panelRef={(n) => { panelRefs.current[2] = n; }}>
           {isMap ? (
             <div className="grid gap-1.5">
@@ -1787,210 +1733,201 @@ export function ChartBuilder({
       ))}
     </>
   );
-  const previewPane = (
-    <section aria-label="Preview" className={cn("flex flex-col gap-3 px-5 pb-5", wide ? "h-full pt-1" : "min-h-96 border-t border-border pt-4")}>
-      <div className="flex flex-wrap items-center justify-between gap-x-3">
-        <p className="text-sm font-medium">Preview</p>
-        {heldPreview && chartHold === null && draft.result ? (
-          <div role="group" aria-label="Preview content" className="flex gap-1">
-            {(["chart", "rows"] as const).map((tab) => (
-              <Button
-                key={tab} type="button" size="xs" variant={paneTab === tab ? "secondary" : "ghost"}
-                aria-pressed={paneTab === tab} onClick={() => setPaneTab(tab)}
-              >
-                {tab === "chart" ? "Chart" : "Rows"}
-              </Button>
-            ))}
-          </div>
-        ) : (
-          <p className="text-xs text-muted-foreground">{showRows ? "Rows from your SQL" : "Live data, updates as you edit"}</p>
-        )}
+  const previewBody = showRows ? (
+    <div className="flex h-full flex-col gap-3 overflow-auto">
+      {chartHold ? <p className="text-sm text-muted-foreground">{chartHold}</p> : null}
+      {draft.result && draft.phase !== "empty" ? (
+        <SqlRowsTable result={draft.result} stale={draft.phase === "stale"} className="min-h-0 flex-1" />
+      ) : (
+        <EmptyState className="py-6" title="Run the SQL" description="Its first rows appear here." />
+      )}
+    </div>
+  ) : preview ? (
+    <div className="flex h-full flex-col gap-2">
+      <div className="min-h-0 flex-1">
+        <TileBody spec={preview.spec} cell={preview.result} dark={resolvedTheme === "dark"} loading={previewBusy} />
       </div>
-      <div className="relative min-h-72 flex-1">
-        <div className="absolute inset-0">
-          {showRows ? (
-            <div className="flex h-full flex-col gap-3 overflow-auto">
-              {chartHold ? <p className="text-sm text-muted-foreground">{chartHold}</p> : null}
-              {draft.result && draft.phase !== "empty" ? (
-                <SqlRowsTable result={draft.result} stale={draft.phase === "stale"} className="min-h-0 flex-1" />
-              ) : (
-                <EmptyState className="py-6" title="Run the SQL" description="Its first rows appear here." />
-              )}
-            </div>
-          ) : preview ? (
-            <div className="flex h-full flex-col gap-2">
-              <div className="min-h-0 flex-1">
-                <TileBody spec={preview.spec} cell={preview.result} dark={resolvedTheme === "dark"} loading={previewBusy} />
-              </div>
-              {preview.previewRows && preview.previewRows.rows.length ? <PreviewRowsTable data={preview.previewRows} labels={finalResult.labels} open={(preview.spec as { def?: ShapeDefFields }).def?.steps?.length ? true : false} /> : null}
-            </div>
-          ) : previewBusy ? (
-            <div className="h-full animate-pulse rounded-md bg-muted/50" />
-          ) : (
-            <EmptyState
-              className="h-full py-6"
-              title={previewError ? "Preview unavailable" : missing.length ? "Nothing to preview yet" : "Loading preview…"}
-              description={previewError ?? (missing.length ? `Fill in ${missing.join(", ")} to see real data here.` : undefined)}
-            />
-          )}
-        </div>
-      </div>
-    </section>
+      {preview.previewRows && preview.previewRows.rows.length ? <PreviewRowsTable data={preview.previewRows} labels={finalResult.labels} open={(preview.spec as { def?: ShapeDefFields }).def?.steps?.length ? true : false} /> : null}
+    </div>
+  ) : previewBusy ? (
+    <div className="h-full animate-pulse rounded-md bg-muted/50" />
+  ) : (
+    <EmptyState
+      className="h-full py-6"
+      title={previewError ? "Preview unavailable" : missing.length ? "Nothing to preview yet" : "Loading preview…"}
+      description={previewError ?? (missing.length ? `Fill in ${missing.join(", ")} to see real data here.` : undefined)}
+    />
   );
 
+  const boardName = boardLabels[board] ?? board;
+  const canSubmit = !busy && !(sqlActive && !!draft.runBlocker);
+
   return (
-    <FormPage
-      title={isEdit ? "Edit chart" : "New chart"}
-      description={`${KIND_DESCRIPTIONS[kind]} Review live data before adding it to the dashboard.`}
-      backHref={backHref}
-      backLabel="Back to dashboard"
-      submitLabel={isEdit ? "Save changes" : "Create chart"}
-      submittingLabel={isEdit ? "Saving…" : "Creating…"}
-      // The SQL source of a new chart must be run once before the chart can be
-      // saved over it; until then the builder says so (`draft.runBlocker`).
-      canSubmit={!busy && !(sqlActive && !!draft.runBlocker)}
-      submitting={busy}
-      error={error}
-      onSubmit={() => void save()}
-      onCancel={onCancel}
-      className="max-w-6xl"
-    >
-      {/*
-        Chart types live in a sidebar next to the form (like a settings page)
-        instead of a separate gallery step: switching type keeps everything
-        else filled in and the live preview follows at once. The grid has a
-        fixed minimum height so the form and the preview scroll inside their
-        own columns and the page's footer stays under them.
-      */}
-      <div className={cn("grid min-h-[32rem] overflow-hidden rounded-xl border border-border", listOpen ? "grid-rows-[auto_minmax(0,1fr)] md:grid-cols-[14rem_minmax(0,1fr)] md:grid-rows-1" : "grid-rows-[minmax(0,1fr)]")}>
-          {listOpen ? (
-          <nav aria-label="Chart type" className="flex min-h-0 flex-col border-b border-border bg-muted/30 md:border-r md:border-b-0">
-            <div className="flex items-center gap-1 p-2 md:p-3 md:pb-2">
-              <div className="relative min-w-0 flex-1">{kindSearch}</div>
-              <Button type="button" size="icon-sm" variant="ghost" className="shrink-0" aria-label="Fold the chart type list" title="Fold the chart type list" onClick={toggleList}>
-                <PanelLeftClose aria-hidden />
-              </Button>
+    // `BI-58` T1 (layout A of 2026-11-14): the chart is the page. A header row (where the chart
+    // comes from and goes, and the two actions), then three zones: the data panel, the canvas and
+    // the inspector. The zones follow the builder's own width (a container query), not the
+    // window's, because the app's sidebar takes a different share of each window.
+    <div className="@container" data-slot="chart-builder">
+      <div className="flex flex-col gap-4 @3xl:h-[calc(100dvh-12.5rem)] @3xl:min-h-[34rem]">
+        <header className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+          <div className="flex min-w-0 items-center gap-2">
+            <Button variant="ghost" size="icon-sm" aria-label="Back to dashboard" title="Back to dashboard" render={<Link href={backHref} />}>
+              <ArrowLeft aria-hidden />
+            </Button>
+            <div className="flex min-w-0 items-baseline gap-1.5 text-sm">
+              <Link href={backHref} className="truncate text-muted-foreground transition-colors duration-200 hover:text-foreground">{boardName}</Link>
+              <span aria-hidden className="text-muted-foreground">/</span>
+              <h1 className="truncate font-medium text-foreground">{isEdit ? "Edit chart" : "New chart"}</h1>
             </div>
-            <div className="flex min-h-0 gap-1 overflow-x-auto px-2 pb-2 md:flex-col md:gap-3 md:overflow-y-auto md:px-3 md:pb-3">
-              {kindList("md:flex-col")}
-            </div>
-          </nav>
-          ) : null}
-
-          <div className="flex min-h-0 flex-col">
-            <div className="flex min-h-11 items-center border-b border-border px-5 py-2">
-              {/* Phase 2 QA R20: with the list open the kind is named here; folded, it is on the menu button. */}
-              {listOpen ? (
-                <span data-slot="chart-kind" className="flex items-center gap-1.5 text-sm text-muted-foreground">
-                  <ChevronRight className="size-4" aria-hidden />
-                  {KIND_LABELS[kind]}
-                </span>
-              ) : (
-                // Phase 2 QA R9: with the list folded, the type is changed from here, and the search stays.
-                <div className="flex items-center gap-1.5">
-                  {/*
-                    Phase 2 QA R17: a popover of the base-ui family the dialog is made of, so it nests in the
-                    dialog's layer stack: an outside press and Escape close only the popover, and focus
-                    returns to the trigger. (The hand-made inline panel closed on neither.)
-                  */}
-                  <PopoverPrimitive.Root open={kindMenu} onOpenChange={setKindMenu}>
-                    <PopoverPrimitive.Trigger
-                      render={<Button type="button" size="sm" variant="outline" aria-label={`Change chart type, now ${KIND_LABELS[kind]}`} />}
-                    >
-                      {React.createElement(kindIcon(kind), { className: "size-4", "aria-hidden": true })}
-                      {KIND_LABELS[kind]} <ChevronDown className="size-3.5" aria-hidden />
-                    </PopoverPrimitive.Trigger>
-                    <PopoverPrimitive.Portal>
-                      <PopoverPrimitive.Positioner side="bottom" align="start" sideOffset={4} className="z-[60]">
-                        <PopoverPrimitive.Popup
-                          role="group" aria-label="Chart type"
-                          className="flex max-h-80 w-72 flex-col gap-2 rounded-lg border border-border bg-popover p-2 text-popover-foreground shadow-md outline-hidden"
-                        >
-                          <div className="relative">{kindSearch}</div>
-                          <div className="flex min-h-0 flex-col gap-2 overflow-y-auto">{kindList("flex-col")}</div>
-                        </PopoverPrimitive.Popup>
-                      </PopoverPrimitive.Positioner>
-                    </PopoverPrimitive.Portal>
-                  </PopoverPrimitive.Root>
-                  <Button type="button" size="icon-sm" variant="ghost" aria-label="Show the chart type list" title="Show the chart type list" onClick={toggleList}>
-                    <PanelLeftOpen aria-hidden />
-                  </Button>
-                </div>
-              )}
-            </div>
-            {/*
-              Form and preview are split by a divider rather than a card
-              around the preview, so the chart gets the whole column height.
-              On a wide screen the divider is a drag handle (double-click
-              resets it); a narrow one stacks them and scrolls instead.
-            */}
-            {wide ? (
-              <ResizablePanelGroup className="min-h-0 flex-1">
-                <ResizablePanel defaultSize="50" minSize="30">
-                  <div className="h-full min-w-0 overflow-y-auto">{formFields}</div>
-                </ResizablePanel>
-                <ResizableHandle withHandle />
-                <ResizablePanel defaultSize="50" minSize="30">{previewPane}</ResizablePanel>
-              </ResizablePanelGroup>
-            ) : (
-              <div className="min-h-0 flex-1 overflow-y-auto">
-                {formFields}
-                {previewPane}
-              </div>
-            )}
-
-            {/* Why the chart cannot be saved yet; the API's own error is FormPage's. */}
-            {!error && sqlActive && draft.blocker ? (
-              <p className="border-t border-border px-5 py-2 text-sm text-muted-foreground">{draft.blocker}</p>
-            ) : null}
           </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-sm text-muted-foreground" aria-hidden>Add to</span>
+            <Select value={targetBoard} items={boardLabels} onValueChange={(v) => setTargetBoard(v ?? "default")}>
+              <SelectTrigger className="w-40" aria-label="Add to dashboard"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                {boardOptions.map((b) => (
+                  <SelectItem key={b.id} value={b.id}>{b.name}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Segmented
+              label="Width" value={String(span)} onChange={(v) => setSpan(v === "2" ? 2 : 1)}
+              options={[{ value: "1", label: SPAN_LABELS["1"] }, { value: "2", label: SPAN_LABELS["2"] }]}
+            />
+            <span aria-hidden className="mx-1 hidden h-5 w-px bg-border @3xl:block" />
+            <Button type="button" variant="ghost" disabled={busy} onClick={onCancel}>Cancel</Button>
+            {/* The SQL source of a new chart must be run once before the chart can be saved over it;
+                until then the builder says so (`draft.runBlocker`). */}
+            <Button type="button" className="min-w-28" disabled={!canSubmit} onClick={() => void save()}>
+              {busy ? (isEdit ? "Saving…" : "Creating…") : isEdit ? "Save changes" : "Create chart"}
+            </Button>
+          </div>
+        </header>
+
+        {error ? <p role="alert" className="text-sm text-destructive">{error}</p> : null}
+        {/* Why the chart cannot be saved yet; the API's own error is the line above. */}
+        {!error && sqlActive && draft.blocker ? <p className="text-sm text-muted-foreground">{draft.blocker}</p> : null}
+
+        <div className={cn(
+          "grid min-h-0 flex-1 gap-4",
+          isStaticTile ? "@3xl:grid-cols-[minmax(0,1fr)_20rem]" : "@3xl:grid-cols-[14rem_minmax(0,1fr)_18rem] @7xl:grid-cols-[16rem_minmax(0,1fr)_20rem]",
+        )}>
+          {isStaticTile ? null : (
+            <aside
+              aria-label="Data" ref={(n) => { panelRefs.current[1] = n; }}
+              className="flex min-h-0 min-w-0 flex-col gap-4 overflow-y-auto rounded-xl bg-card p-3 ring-1 ring-foreground/6"
+            >
+              {sourcePanel}
+            </aside>
+          )}
+
+          <section aria-label="Chart" className="flex min-h-[26rem] min-w-0 flex-col rounded-xl bg-card ring-1 ring-foreground/6">
+            <div className="flex min-h-12 items-center gap-2 border-b border-border/60 px-3 py-2">
+              {/*
+                Phase 2 QA R17: a popover of the base-ui family, so an outside press and Escape
+                close only the popover, and focus returns to the trigger.
+              */}
+              <PopoverPrimitive.Root open={kindMenu} onOpenChange={setKindMenu}>
+                <PopoverPrimitive.Trigger
+                  render={<Button type="button" size="sm" variant="outline" aria-label={`Change chart type, now ${KIND_LABELS[kind]}`} />}
+                >
+                  {React.createElement(kindIcon(kind), { className: "size-4", "aria-hidden": true })}
+                  {KIND_LABELS[kind]} <ChevronDown className="size-3.5" aria-hidden />
+                </PopoverPrimitive.Trigger>
+                <PopoverPrimitive.Portal>
+                  <PopoverPrimitive.Positioner side="bottom" align="start" sideOffset={4} className="z-[60]">
+                    <PopoverPrimitive.Popup
+                      role="group" aria-label="Chart type"
+                      className="flex max-h-80 w-72 flex-col gap-2 rounded-lg border border-border bg-popover p-2 text-popover-foreground shadow-md outline-hidden"
+                    >
+                      <div className="relative">{kindSearch}</div>
+                      <div className="flex min-h-0 flex-col gap-2 overflow-y-auto">{kindList("flex-col")}</div>
+                    </PopoverPrimitive.Popup>
+                  </PopoverPrimitive.Positioner>
+                </PopoverPrimitive.Portal>
+              </PopoverPrimitive.Root>
+            </div>
+            <div className="flex min-h-0 flex-1 flex-col gap-3 px-5 pt-4 pb-4">
+              <div className="grid gap-0.5">
+                <Label htmlFor="ch-title" className="text-xs font-normal text-muted-foreground">Title {isStaticTile ? <Req /> : null}</Label>
+                <input
+                  id="ch-title" value={title} onChange={(e) => setTitle(e.target.value)}
+                  placeholder={suggestedTitle || "e.g. Visitors by Region"}
+                  className="-mx-1.5 min-w-0 rounded-md bg-transparent px-1.5 py-0.5 text-xl font-semibold tracking-tight outline-none transition-colors duration-200 placeholder:text-muted-foreground/70 hover:bg-muted/70 focus-visible:bg-muted/70 focus-visible:ring-3 focus-visible:ring-ring/50"
+                />
+              </div>
+              <section aria-label="Preview" className="relative min-h-56 flex-1">
+                <div className="absolute inset-0">{previewBody}</div>
+              </section>
+            </div>
+            <footer className="flex min-h-11 flex-wrap items-center justify-between gap-x-4 gap-y-2 border-t border-border/60 px-3 py-2">
+              <p className="text-xs text-muted-foreground">{showRows ? "Rows from your SQL" : "Live data, updates as you edit"}</p>
+              {heldPreview && chartHold === null && draft.result ? (
+                <div role="group" aria-label="Preview content" className="flex gap-1">
+                  {(["chart", "rows"] as const).map((tab) => (
+                    <Button
+                      key={tab} type="button" size="xs" variant={paneTab === tab ? "secondary" : "ghost"}
+                      aria-pressed={paneTab === tab} onClick={() => setPaneTab(tab)}
+                    >
+                      {tab === "chart" ? "Chart" : "Rows"}
+                    </Button>
+                  ))}
+                </div>
+              ) : null}
+            </footer>
+          </section>
+
+          <aside aria-label="Settings" className="flex min-h-0 min-w-0 flex-col overflow-y-auto rounded-xl bg-card ring-1 ring-foreground/6">
+            {formFields}
+          </aside>
         </div>
-        {fields?.columns && choice ? (
-          <FormulaEditorDialog
-            open={formulaOpen}
-            onOpenChange={setFormulaOpen}
+      </div>
+      {fields?.columns && choice ? (
+        <FormulaEditorDialog
+          open={formulaOpen}
+          onOpenChange={setFormulaOpen}
+          source={choice.kind === "mart" ? { mart: choice.name } : { source: choice.id }}
+          columns={fields.columns}
+          params={paramDefs}
+          fields={(fields.calculated ?? []).filter((f) => !isValueGroup(f))}
+          existing={editing}
+          onSaved={() => { void loadFields(source); }}
+          onDeleted={(gone) => {
+            void loadFields(source).then((f) => {
+              setDimension((v) => (v === gone.name ? "" : keepIfOffered(v, f.dimensions)));
+              keepMeasures(f.measures);
+              setBreakdown((v) => keepIfOffered(v, f.dimensions));
+            });
+          }}
+        />
+      ) : null}
+      {fields?.columns && choice ? (
+        <>
+          <ValueGroupDialog
+            open={groupOpen}
+            onOpenChange={setGroupOpen}
             source={choice.kind === "mart" ? { mart: choice.name } : { source: choice.id }}
-            columns={fields.columns}
-            params={paramDefs}
-            fields={(fields.calculated ?? []).filter((f) => !isValueGroup(f))}
-            existing={editing}
+            textColumns={fields.columns.filter((c) => fields.kinds?.[c] === "text")}
+            existing={editingGroup}
             onSaved={() => { void loadFields(source); }}
             onDeleted={(gone) => {
               void loadFields(source).then((f) => {
                 setDimension((v) => (v === gone.name ? "" : keepIfOffered(v, f.dimensions)));
-                keepMeasures(f.measures);
                 setBreakdown((v) => keepIfOffered(v, f.dimensions));
               });
             }}
           />
-        ) : null}
-        {fields?.columns && choice ? (
-          <>
-            <ValueGroupDialog
-              open={groupOpen}
-              onOpenChange={setGroupOpen}
-              source={choice.kind === "mart" ? { mart: choice.name } : { source: choice.id }}
-              textColumns={fields.columns.filter((c) => fields.kinds?.[c] === "text")}
-              existing={editingGroup}
-              onSaved={() => { void loadFields(source); }}
-              onDeleted={(gone) => {
-                void loadFields(source).then((f) => {
-                  setDimension((v) => (v === gone.name ? "" : keepIfOffered(v, f.dimensions)));
-                  setBreakdown((v) => keepIfOffered(v, f.dimensions));
-                });
-              }}
-            />
-            <HierarchyDialog
-              open={hierarchyOpen}
-              onOpenChange={setHierarchyOpen}
-              source={choice.kind === "mart" ? { mart: choice.name } : { source: choice.id }}
-              columns={fields.columns}
-              existing={editingHierarchy}
-              onSaved={() => { void loadFields(source); }}
-              onDeleted={() => { void loadFields(source); }}
-            />
-          </>
-        ) : null}
-    </FormPage>
+          <HierarchyDialog
+            open={hierarchyOpen}
+            onOpenChange={setHierarchyOpen}
+            source={choice.kind === "mart" ? { mart: choice.name } : { source: choice.id }}
+            columns={fields.columns}
+            existing={editingHierarchy}
+            onSaved={() => { void loadFields(source); }}
+            onDeleted={() => { void loadFields(source); }}
+          />
+        </>
+      ) : null}
+    </div>
   );
 }

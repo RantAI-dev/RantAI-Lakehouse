@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
-import { afterAll, afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
 
 import * as realAuth from "@/features/auth/auth-provider"
 
@@ -56,13 +56,15 @@ function renderBuilder(initial?: ChartDef) {
 }
 
 describe("ChartBuilder sections (phase 2 QA R3)", () => {
-  it("shows five ordered sections and folds the last two", async () => {
+  it("shows the four ordered sections of the form and folds the last two, with the source in the data panel", async () => {
     renderBuilder(barDef)
     const headings = await screen.findAllByRole("heading", { level: 3 })
-    // A folded section also shows its summary after the title (phase 2 QA R10). BI-17 added "Format" as the fifth.
-    const titles = ["Data", "What to show", "Sort and filter", "More options", "Format"]
-    expect(headings.map((h) => h.textContent ?? "")).toHaveLength(5)
+    // A folded section also shows its summary after the title (phase 2 QA R10). BI-17 added "Format".
+    // `BI-58` T1: the source (section 1, "Data") is the data panel at the left of the page.
+    const titles = ["What to show", "Sort and filter", "More options", "Format"]
+    expect(headings.map((h) => h.textContent ?? "")).toHaveLength(4)
     headings.forEach((h, i) => expect(h.textContent).toContain(titles[i]))
+    expect(screen.getByRole("complementary", { name: "Data" }).textContent).toContain("Data source")
     expect(screen.getByRole("button", { name: /More options/ }).getAttribute("aria-expanded")).toBe("false")
     expect(screen.getByRole("button", { name: /Format/ }).getAttribute("aria-expanded")).toBe("false")
     // Nothing of the folded options is drawn, and no row of chips or default-aggregate select stands in the form.
@@ -228,27 +230,14 @@ describe("ChartBuilder kind switch (phase 2 QA R6)", () => {
 const expanded = (name: RegExp | string) => screen.getByRole("button", { name }).getAttribute("aria-expanded")
 
 describe("ChartBuilder type list (phase 2 QA R9)", () => {
-  it("shows the list for a new chart, folds it once a type is chosen, and the choice of folding is remembered", async () => {
-    const { unmount } = renderBuilder()
-    expect(screen.getByRole("navigation", { name: "Chart type" })).toBeTruthy()
-    fireEvent.click(screen.getByRole("button", { name: "Line" }))
-    // No remembered choice yet: choosing a type folds the list away, and nothing is stored by that.
-    expect(screen.queryByRole("navigation", { name: "Chart type" })).toBeNull()
-    expect(window.localStorage.getItem("lh.chartBuilder.typeList")).toBeNull()
-    // Opening it by hand is remembered, and a builder opened later starts open.
-    fireEvent.click(screen.getByRole("button", { name: "Show the chart type list" }))
-    expect(screen.getByRole("navigation", { name: "Chart type" })).toBeTruthy()
-    expect(window.localStorage.getItem("lh.chartBuilder.typeList")).toBe("expanded")
-    unmount()
-    cleanup()
-    renderBuilder({ ...barDef })
-    expect(screen.getByRole("navigation", { name: "Chart type" })).toBeTruthy()
-    // Folding by hand is remembered too, and a new chart then opens folded.
-    fireEvent.click(screen.getByRole("button", { name: "Fold the chart type list" }))
-    expect(window.localStorage.getItem("lh.chartBuilder.typeList")).toBe("collapsed")
-    cleanup()
+  // `BI-58` T1: the long chart-type column is gone; the type is changed from the canvas, for a new chart and an edited one.
+  it("has no chart-type column, and a new chart changes its type from the canvas", async () => {
     renderBuilder()
     expect(screen.queryByRole("navigation", { name: "Chart type" })).toBeNull()
+    fireEvent.click(screen.getByRole("button", { name: /Change chart type, now Horizontal bar/ }))
+    fireEvent.click(await screen.findByRole("button", { name: "Line" }))
+    await waitFor(() => expect(screen.getByRole("button", { name: /Change chart type, now Line/ })).toBeTruthy())
+    expect(window.localStorage.length).toBe(0)
   })
 
   it("starts folded for an edited chart, and the folded control still searches the types", async () => {
@@ -284,33 +273,20 @@ describe("ChartBuilder type list (phase 2 QA R9)", () => {
     await waitFor(() => expect(screen.queryByLabelText("Search chart types") === null).toBe(true))
     expect(screen.getByText("Edit chart")).toBeTruthy()
   })
-
-  it("works when the browser refuses storage", async () => {
-    const read = spyOn(Storage.prototype, "getItem").mockImplementation(() => { throw new Error("blocked") })
-    const write = spyOn(Storage.prototype, "setItem").mockImplementation(() => { throw new Error("blocked") })
-    try {
-      renderBuilder()
-      expect(screen.getByRole("navigation", { name: "Chart type" })).toBeTruthy()
-      fireEvent.click(screen.getByRole("button", { name: "Fold the chart type list" }))
-      expect(screen.queryByRole("navigation", { name: "Chart type" })).toBeNull()
-    } finally {
-      read.mockRestore()
-      write.mockRestore()
-    }
-  })
 })
 
 describe("ChartBuilder accordion (phase 2 QA R10)", () => {
-  it("opens only section 1 for a new chart, with no way on until its required field is filled", async () => {
+  // `BI-58` T1: section 1 is the data panel, always shown; the accordion starts on "What to show".
+  it("opens only What to show for a new chart, and the source sits open in the data panel", async () => {
     renderBuilder()
     await screen.findByText("Data source")
-    expect(expanded(/^Data(?! table)/)).toBe("true")
-    expect(expanded(/What to show/)).toBe("false")
+    expect(screen.getByRole("complementary", { name: "Data" }).textContent).toContain("Data source")
+    expect(expanded(/What to show/)).toBe("true")
     expect(expanded(/Sort and filter/)).toBe("false")
     // Opening another section folds the open one.
-    fireEvent.click(screen.getByRole("button", { name: /What to show/ }))
-    expect(expanded(/What to show/)).toBe("true")
-    expect(expanded(/^Data(?! table)/)).toBe("false")
+    fireEvent.click(screen.getByRole("button", { name: /Sort and filter/ }))
+    expect(expanded(/Sort and filter/)).toBe("true")
+    expect(expanded(/What to show/)).toBe("false")
   })
 
   it("has no Next button, even once the source is picked (phase 2 QA R19)", async () => {
@@ -320,15 +296,14 @@ describe("ChartBuilder accordion (phase 2 QA R10)", () => {
     await screen.findByText("Data source")
     expect(screen.queryByRole("button", { name: /^Next/ })).toBeNull()
     // Opening a section by its heading still folds the open one.
-    fireEvent.click(screen.getByRole("button", { name: /What to show/ }))
-    expect(expanded(/What to show/)).toBe("true")
-    expect(expanded(/^Data(?! table)/)).toBe("false")
+    fireEvent.click(screen.getByRole("button", { name: /Sort and filter/ }))
+    expect(expanded(/Sort and filter/)).toBe("true")
+    expect(expanded(/What to show/)).toBe("false")
   })
 
-  it("opens an edited chart with sections 1 to 3 folded to one-line summaries", async () => {
+  it("opens an edited chart with sections 2 and 3 folded to one-line summaries, and its source in the data panel", async () => {
     renderBuilder({ ...barDef, measures: ["visitors", { column: "stay", aggregate: "avg" }] as never, filters: [{ column: "category", op: "eq", value: "a" }] as never, limit: 5 })
-    await waitFor(() => expect(screen.getByRole("button", { name: /^Data(?! table)/ }).textContent).toContain("mart_visits"))
-    expect(expanded(/^Data(?! table)/)).toBe("false")
+    await waitFor(() => expect(screen.getByRole("complementary", { name: "Data" }).textContent).toContain("mart_visits"))
     expect(expanded(/What to show/)).toBe("false")
     expect(expanded(/Sort and filter/)).toBe("false")
     expect(screen.getByRole("button", { name: /What to show/ }).textContent).toContain("provinsi · visitors, avg of stay")
@@ -349,26 +324,37 @@ describe("ChartBuilder accordion (phase 2 QA R10)", () => {
     expect(focused.closest("section")?.querySelector("h3")?.textContent).toContain("What to show")
   })
 
-  it("opens section 1 and focuses the source select when a new chart has no source", async () => {
+  it("focuses the source select in the data panel when a new chart has no source", async () => {
     renderBuilder()
     await screen.findByText("Data source")
-    fireEvent.click(screen.getByRole("button", { name: /What to show/ }))
     fireEvent.click(screen.getByRole("button", { name: "Create chart" }))
-    await waitFor(() => expect(expanded(/^Data(?! table)/)).toBe("true"))
+    await waitFor(() => expect((document.activeElement as HTMLElement).closest("aside")?.getAttribute("aria-label")).toBe("Data"))
     const focused = document.activeElement as HTMLElement
-    expect(focused.closest("section")?.querySelector("h3")?.textContent).toContain("Data")
     expect(focused.hasAttribute("data-placeholder")).toBe(true)
   })
 })
 
-describe("ChartBuilder header (phase 2 QA R11)", () => {
-  it("keeps title, dashboard and width in one row and has no helper line under the title", async () => {
+describe("ChartBuilder header (phase 2 QA R11, BI-58 T1)", () => {
+  it("keeps the dashboard, the width, Cancel and Save in one header row, the title on the canvas, and no helper line under the title", async () => {
     renderBuilder()
-    const title = await screen.findByLabelText(/^Title/)
-    const row = title.closest("div.grid")?.parentElement as HTMLElement
-    expect(row.textContent).toContain("Dashboard")
-    expect(row.textContent).toContain("Width")
+    const header = (await screen.findByRole("heading", { level: 1 })).closest("header") as HTMLElement
+    expect(header.querySelector('[aria-label="Add to dashboard"]')).not.toBeNull()
+    expect(header.querySelector('[role="group"][aria-label="Width"]')?.textContent).toBe("Half widthFull width")
+    expect([...header.querySelectorAll("button")].map((b) => b.textContent)).toEqual(expect.arrayContaining(["Cancel", "Create chart"]))
+    const title = screen.getByLabelText(/^Title/)
+    expect(header.contains(title)).toBe(false)
+    expect(title.closest('section[aria-label="Chart"]')).not.toBeNull()
     expect(screen.queryByText(/Left empty, the chart is saved as/)).toBeNull()
+  })
+
+  it("sets the width from the header's segmented control", async () => {
+    renderBuilder(barDef)
+    await waitFor(() => expect(bodies.length).toBeGreaterThan(0))
+    const full = screen.getByRole("button", { name: "Full width" })
+    expect(full.getAttribute("aria-pressed")).toBe("false")
+    fireEvent.click(full)
+    expect(full.getAttribute("aria-pressed")).toBe("true")
+    await waitFor(() => expect(bodies[bodies.length - 1]!.span).toBe(2))
   })
 })
 
@@ -432,51 +418,33 @@ describe("ChartBuilder labels (phase 2 QA R20)", () => {
     await waitFor(() => expect(field.getAttribute("placeholder")).toBe("Coba metrik by category"))
   })
 
-  // `WEB-7` D6: the breadcrumb was the dialog's; the page title is FormPage's,
-  // and the kind is named beside the type list, or on the control that changes
-  // it when that list is folded.
-  it("names the page in the header and the kind beside the list, and no chevron in the title", async () => {
+  // `WEB-7` D6, `BI-58` T1: the page is named last in the header's breadcrumb, after the
+  // dashboard, and the kind is named on the control that changes it.
+  it("names the page in the header after the dashboard, the kind on its control, and no chevron in the title", async () => {
     const { unmount } = renderBuilder()
     const heading = screen.getByRole("heading", { level: 1 })
     expect(heading.textContent).toBe("New chart")
     expect(heading.querySelector("svg")).toBeNull()
-    // The kind follows a chevron in the builder's own header row.
-    const kind = document.querySelector("[data-slot=chart-kind]") as HTMLElement
-    expect(kind.textContent).toContain("Horizontal bar")
-    expect(kind.querySelector("svg")).not.toBeNull()
+    expect(heading.parentElement?.textContent).toBe("Main/New chart")
+    expect(screen.getByRole("button", { name: /Change chart type, now Horizontal bar/ }).textContent).toContain("Horizontal bar")
     unmount()
     cleanup()
     renderBuilder(barDef)
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Edit chart")
-    // Folded, the same name is on the control that changes it.
     expect(screen.getByRole("button", { name: /Change chart type, now Bar/ })).toBeTruthy()
-    expect(document.querySelector("[data-slot=chart-kind]")).toBeNull()
   })
 })
 
-describe("ChartBuilder resizable split (phase 2 QA R18)", () => {
-  it("draws a focusable separator between the form panel and the preview panel at a wide screen", async () => {
-    const original = window.matchMedia
-    window.matchMedia = ((query: string) => ({
-      matches: true, media: query, onchange: null,
-      addEventListener: () => {}, removeEventListener: () => {}, addListener: () => {}, removeListener: () => {}, dispatchEvent: () => false,
-    })) as unknown as typeof window.matchMedia
-    try {
-      renderBuilder(barDef)
-      await screen.findByLabelText("Aggregation of visitors")
-      const handle = document.querySelector('[data-slot="resizable-handle"]') as HTMLElement
-      expect(handle).not.toBeNull()
-      expect(handle.getAttribute("role")).toBe("separator")
-      expect(handle.getAttribute("aria-orientation")).toBe("vertical")
-      expect(handle.getAttribute("tabindex")).toBe("0")
-      const panels = Array.from(document.querySelectorAll('[data-slot="resizable-panel"]'))
-      expect(panels.length).toBe(2)
-      // The form panel holds the form (its own scroller) and the preview panel the preview.
-      expect(panels[0].querySelector('[aria-label="Aggregation of visitors"]')).not.toBeNull()
-      expect(panels[1].querySelector('section[aria-label="Preview"]')).not.toBeNull()
-    } finally {
-      window.matchMedia = original
-    }
+// `BI-58` T1: the resizable form-and-preview split (phase 2 QA R18) became three zones.
+describe("ChartBuilder zones (BI-58 T1)", () => {
+  it("puts the data panel, the chart with its preview, and the settings side by side", async () => {
+    renderBuilder(barDef)
+    await screen.findByLabelText("Aggregation of visitors")
+    const zones = [...document.querySelectorAll("[data-slot=chart-builder] aside, [data-slot=chart-builder] section[aria-label=Chart]")]
+    expect(zones.map((z) => z.getAttribute("aria-label"))).toEqual(["Data", "Chart", "Settings"])
+    expect(zones[1]!.querySelector('section[aria-label="Preview"]')).not.toBeNull()
+    expect(zones[2]!.querySelector('[aria-label="Aggregation of visitors"]')).not.toBeNull()
+    expect(document.querySelector('[data-slot="resizable-handle"]')).toBeNull()
   })
 })
 
@@ -576,6 +544,7 @@ describe("ChartBuilder scatter (BI-17 B QA fix F2)", () => {
 
   it("does the same when the chart is new and the data source is picked after the kind", async () => {
     renderBuilder()
+    fireEvent.click(screen.getByRole("button", { name: /Change chart type/ }))
     const scatter = await screen.findByRole("button", { name: "Scatter (X vs Y)" })
     fireEvent.click(scatter)
     await waitFor(() => expect(screen.getByText("X metric")).toBeTruthy())
@@ -584,11 +553,13 @@ describe("ChartBuilder scatter (BI-17 B QA fix F2)", () => {
 
   it("keeps the Y metric when the data source is picked after the kind (it used to reset to one row)", async () => {
     renderBuilder()
+    fireEvent.click(screen.getByRole("button", { name: /Change chart type/ }))
     fireEvent.click(await screen.findByRole("button", { name: "Bubble (X, Y, size)" }))
     fireEvent.click(await screen.findByRole("combobox", { name: /pick a mart/i }).catch(() => screen.getByText(/pick a mart/)))
     fireEvent.click(await screen.findByRole("option", { name: /mart_visits/ }))
     await screen.findByText("Data source")
-    fireEvent.click(screen.getByRole("button", { name: /What to show/ }))
+    // `BI-58` T1: "What to show" is the section a new chart opens on.
+    expect(expanded(/What to show/)).toBe("true")
     await waitFor(() => expect(screen.getByText("X metric")).toBeTruthy())
     expect(screen.getByText("Y metric")).toBeTruthy()
     expect(screen.getByText("Size metric")).toBeTruthy()
