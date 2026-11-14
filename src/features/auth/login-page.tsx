@@ -350,10 +350,14 @@ export function LoginPage() {
     <div className={cn(loginDisplay.variable, "flex min-h-svh flex-col bg-background text-foreground lg:flex-row lg:gap-3 lg:p-3")}>
       {/* Left: the product, bleeding off the panel's lower right like a
           product shot (mockup A). The panel and its caption render with the
-          page; the dashboard inside arrives after the form. */}
+          page; the dashboard inside arrives after the form. The panel is the
+          lake: a solid deep navy from the logo's #050A2F, one step lighter
+          so the card's lift still reads on it (T7, owner 2026-11-14: "jangan
+          putih dong, biar kontras"); on the dark page a deeper blue-navy,
+          still distinct from the page's neutral black. */}
       <section
         aria-label="A preview of the console (sample data)"
-        className="relative hidden flex-[1.15] overflow-hidden rounded-3xl bg-muted/55 lg:block dark:bg-card/45"
+        className="relative hidden flex-[1.15] overflow-hidden rounded-3xl bg-[#0B1440] lg:block dark:bg-[#0A1030]"
       >
         {/* The lake under the product: depth lines, server-rendered, behind the card. */}
         <LoginContours />
@@ -361,7 +365,7 @@ export function LoginPage() {
           {showcaseReady && desktop ? <LoginShowcase /> : null}
         </div>
         <div className="absolute bottom-8 left-[8%] flex items-center gap-3">
-          <p className="text-sm font-medium text-foreground/80">Every dataset, pipeline and dashboard in one place.</p>
+          <p className="text-sm font-medium text-white/85">Every dataset, pipeline and dashboard in one place.</p>
         </div>
       </section>
 

@@ -35,16 +35,17 @@
  * (T6: about 40 % less CPU in a software-composited Chrome).
  */
 .login-contours {
-  --login-contour-ink: color-mix(in oklch, var(--primary) 36%, transparent);
+  /* A lighter lake blue, faint, on the navy panel (T7). */
+  --login-contour-ink: oklch(0.8 0.09 245 / 0.26);
   position: absolute;
   inset: 0;
   pointer-events: none;
   container-type: size;
 }
 
-/* A lake blue on the dark panel (T6: the sky-cyan chart colour read green there). */
+/* The dark page's deeper panel: the same blue, a touch fainter (T6: a lake blue, not the sky-cyan chart colour that read green). */
 .dark .login-contours {
-  --login-contour-ink: oklch(0.72 0.12 250 / 0.26);
+  --login-contour-ink: oklch(0.76 0.1 248 / 0.24);
 }
 
 .login-contour {
