@@ -1,6 +1,6 @@
 "use client"
 
-import { Sparkles } from "lucide-react"
+import { Bot } from "lucide-react"
 
 import { SectionCard } from "@/components/patterns/section-card"
 import { Button } from "@/components/ui/button"
@@ -37,7 +37,7 @@ export function NaturalLanguagePanel({
           onClick={() => void agent.ask()}
           disabled={asking || !question.trim()}
         >
-          <Sparkles className="size-4" aria-hidden />
+          <Bot className="size-4" aria-hidden />
           {asking ? "Agent working…" : "Ask (agentic)"}
         </Button>
         <Button

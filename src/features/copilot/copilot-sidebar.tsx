@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { usePathname } from "next/navigation";
-import { Bot, Sparkles, Plus, PanelBottom, PanelRightClose, X } from "lucide-react";
+import { Bot, Plus, PanelBottom, PanelRightClose, X } from "lucide-react";
 import { useSidePanel } from "@/components/app-shell/side-panel";
 import { SuggestionButton } from "@/features/copilot/suggestion-button";
 import { useCopilot } from "./use-copilot";
@@ -80,7 +80,7 @@ export function CopilotSidebar({ hasAssistant = true }: { readonly hasAssistant?
         ? ({ "--side-panel-w": `${c.sidebarWidth}px` } as React.CSSProperties)
         : { width: `${c.sidebarWidth}px`, minWidth: `${c.sidebarWidth}px`, maxWidth: "850px" }}
       className={cn(
-        "sticky top-16 flex h-[calc(100vh-4rem)] shrink-0 flex-col border-l border-border bg-card/95 backdrop-blur-md",
+        "sticky top-(--app-navbar-h) flex h-[calc(100vh-var(--app-navbar-h))] shrink-0 flex-col border-l border-border bg-card/95 backdrop-blur-md",
         tabbed && "max-md:fixed max-md:inset-x-0 max-md:bottom-0 max-md:z-40 max-md:h-auto max-md:border-l-0 max-md:bg-card md:w-(--side-panel-w) md:max-w-[850px] md:min-w-(--side-panel-w)",
         isDragging && "select-none",
       )}
@@ -145,8 +145,9 @@ export function CopilotSidebar({ hasAssistant = true }: { readonly hasAssistant?
       {/* Header */}
       {!tabbed ? (
       <div className="flex h-14 shrink-0 items-center gap-2 border-b border-border px-3.5">
+        {/* The assistant's mark, as on the navbar's AI Copilot button; never sparkles (DESIGN.md). */}
         <span className="grid size-6 place-items-center rounded-md bg-primary/10 text-primary">
-          <Sparkles className="size-3.5" />
+          <Bot className="size-3.5" aria-hidden />
         </span>
         <div className="flex items-center gap-1.5 min-w-0">
           <span className="text-sm font-semibold truncate text-foreground">AI Copilot</span>

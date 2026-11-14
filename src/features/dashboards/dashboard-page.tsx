@@ -156,7 +156,7 @@ const NO_PANEL_TABS: readonly SidePanelTab[] = [];
  * BI-61 T7: the page is a frame that ends above the assistant's bar, so the
  * bar never covers a tile (spec T5); the tiles scroll inside it from `lg` up,
  * and below `lg` the whole frame scrolls, header included, so a phone keeps
- * its room for the tiles. Its height is the viewport less the navbar (4rem),
+ * its room for the tiles. Its height is the viewport less the navbar (`--app-navbar-h`),
  * the shell's top padding (1, 1.25 or 1.5rem) and the room kept under it.
  *
  * That room is read from the app shell's `--content-bottom`, the token BI-58
@@ -179,9 +179,9 @@ function frameClass(frame: Frame): string {
   // Below lg the frame itself scrolls, header included, so its cut edges fade too (review round 1, SHOULD-FIX 1).
   const scroll = "scroll-fade overflow-y-auto lg:overflow-hidden print:h-auto print:overflow-visible print:m-0";
   if (frame === "bar") {
-    return cn(scroll, giveBack, "h-[calc(100dvh-5rem-var(--content-bottom,5rem))] sm:h-[calc(100dvh-5.25rem-var(--content-bottom,5rem))] lg:h-[calc(100dvh-5.5rem-var(--content-bottom,5rem))]");
+    return cn(scroll, giveBack, "h-[calc(100dvh-var(--app-navbar-h)-1rem-var(--content-bottom,5rem))] sm:h-[calc(100dvh-var(--app-navbar-h)-1.25rem-var(--content-bottom,5rem))] lg:h-[calc(100dvh-var(--app-navbar-h)-1.5rem-var(--content-bottom,5rem))]");
   }
-  const own = "h-[calc(100dvh-5rem-var(--content-bottom,1rem))] sm:h-[calc(100dvh-5.25rem-var(--content-bottom,1.25rem))] lg:h-[calc(100dvh-5.5rem-var(--content-bottom,1.5rem))]";
+  const own = "h-[calc(100dvh-var(--app-navbar-h)-1rem-var(--content-bottom,1rem))] sm:h-[calc(100dvh-var(--app-navbar-h)-1.25rem-var(--content-bottom,1.25rem))] lg:h-[calc(100dvh-var(--app-navbar-h)-1.5rem-var(--content-bottom,1.5rem))]";
   return cn(scroll, own, frame === "padded" && giveBack);
 }
 /** The part of the frame that scrolls on a laptop; an edge that cuts a tile fades instead (review round 1, SHOULD-FIX 1). */
@@ -876,6 +876,12 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // the dashboard list (the page's own read carries neither); a failed read
   // leaves them out rather than guessing.
   const listed = boardList.status === "success" ? boardList.data.find((b) => b.id === board) : undefined;
+  // Owner QA 2026-11-14: until the board's name is known (from this page's read or the
+  // dashboard list, whichever lands first) the header holds a title-sized placeholder,
+  // not "Dashboards" switching to the name. Once both reads have answered, the old
+  // stand-in is kept, so a placeholder never stays on a page that is not loading.
+  const knownName = boards.find((b) => b.id === board)?.name ?? listed?.name;
+  const headerTitle = knownName ?? (data === null && (loading || boardList.status === "loading") ? null : dashName);
   const folderId = boards.find((b) => b.id === board)?.folderId;
   const folderChain = React.useMemo(() => {
     const names: string[] = [];
@@ -1416,7 +1422,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     >
       <DashboardHeader
         folderPath={folderChain}
-        title={dashName}
+        title={headerTitle}
         titleAccessory={
           <>
             {!isDefault ? (

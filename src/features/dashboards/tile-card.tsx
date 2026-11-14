@@ -94,6 +94,17 @@ function TileMenu({ item, triggerClassName }: { item: GridItem; triggerClassName
   );
 }
 
+/*
+ * The soft tile's three boxes (`BI-61` T4): a soft fill with no border, the
+ * 40 px header the title sits in, and the body under it. Exported for the
+ * dashboard's loading placeholder (`dashboard-skeleton.tsx`), which draws the
+ * same boxes with grey shapes inside, so a tile fills in place instead of a
+ * differently drawn card being swapped for it (owner QA 2026-11-14).
+ */
+export const SOFT_TILE_FRAME = "group/tile flex h-full flex-col overflow-hidden rounded-2xl bg-muted/45 dark:bg-card";
+export const SOFT_TILE_HEADER = "flex h-10 shrink-0 items-center gap-1.5 pl-4 pr-2 pt-1";
+export const SOFT_TILE_BODY = "min-h-0 flex-1 px-2 pb-2";
+
 /**
  * A tile: header (drag handle in edit mode, title, badge, ⋯ menu) over its body.
  *
@@ -117,14 +128,14 @@ export function TileCard({
       <div
         data-slot="tile"
         className={cn(
-          "group/tile flex h-full flex-col overflow-hidden rounded-2xl bg-muted/45 dark:bg-card",
+          SOFT_TILE_FRAME,
           EASE,
           handle && "ring-1 ring-primary/25 ring-inset",
           dragging && "ring-2 ring-primary/60",
         )}
       >
         <div
-          className={cn("flex h-10 shrink-0 items-center gap-1.5 pl-4 pr-2 pt-1", handle && "cursor-move select-none pl-2")}
+          className={cn(SOFT_TILE_HEADER, handle && "cursor-move select-none pl-2")}
           style={handle ? { touchAction: "none" } : undefined}
           onPointerDown={handle ? onHeaderPointerDown : undefined}
         >
@@ -158,7 +169,7 @@ export function TileCard({
             />
           </span>
         </div>
-        <div className="min-h-0 flex-1 px-2 pb-2">{item.body}</div>
+        <div className={SOFT_TILE_BODY}>{item.body}</div>
       </div>
     );
   }

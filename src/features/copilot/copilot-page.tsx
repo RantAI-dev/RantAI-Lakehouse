@@ -120,10 +120,10 @@ export function CopilotPage() {
   // had every message deleted is just empty, not loading.
   const loading = c.messages.length === 0 && !c.busy && !c.error && !c.sessionId;
 
-  // Viewport minus the 4rem navbar and `AppFrame`'s vertical padding, so the
+  // Viewport minus the navbar (`--app-navbar-h`) and `AppFrame`'s vertical padding, so the
   // message list scrolls on its own and the composer stays on the bottom edge.
   return (
-    <div className="flex h-[calc(100svh-6rem)] sm:h-[calc(100svh-6.5rem)] lg:h-[calc(100svh-7rem)]">
+    <div className="flex h-[calc(100svh-var(--app-navbar-h)-2rem)] sm:h-[calc(100svh-var(--app-navbar-h)-2.5rem)] lg:h-[calc(100svh-var(--app-navbar-h)-3rem)]">
       <React.Suspense fallback={null}>
         <SessionUrlSync />
       </React.Suspense>

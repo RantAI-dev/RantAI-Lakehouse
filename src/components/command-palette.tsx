@@ -6,7 +6,7 @@ import { useRouter } from "next/navigation";
 import { usePathname } from "next/navigation";
 import { useTheme } from "next-themes";
 import {
-  Search, Sparkles, BarChart3, LayoutGrid, Plus, Download, Moon, Sun, Clock, Database, Star,
+  Search, Bot, BarChart3, LayoutGrid, Plus, Download, Moon, Sun, Clock, Database, Star,
 } from "lucide-react";
 import { NAV_GROUPS, pageTitleFor, canOpen } from "@/components/app-shell/nav-config";
 import { useAuth } from "@/features/auth/auth-provider";
@@ -338,7 +338,7 @@ export function CommandPalette() {
         {/* Quick actions */}
         <Command.Group heading="Quick actions" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
           {(hasPermission("assistant:use") || hasPermission("assistant:ask")) && (
-            <PaletteItem icon={Sparkles} label="Ask / build via AI Copilot" value="ai copilot chat ask build" onSelect={() => go("/")} />
+            <PaletteItem icon={Bot} label="Ask / build via AI Copilot" value="ai copilot chat ask build" onSelect={() => go("/")} />
           )}
           {hasPermission("dashboard:read") && (
             <PaletteItem icon={BarChart3} label="Open Dashboards" value="dashboards visualization chart" onSelect={() => go("/dashboards")} />
