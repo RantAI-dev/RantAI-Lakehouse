@@ -13,7 +13,7 @@ What the person sees before signing in (`/login`). Backlog `WEB-15`; spec [`web-
 | # | Decision | Who | When |
 | --- | --- | --- | --- |
 | 1 | Layout A of four mockups: a live sample dashboard left, the form right | Owner | 2026-11-14 |
-| 2 | The sample is labelled sample data and uses no customer data and no API call | Planner | 2026-11-14 |
+| 2 | The sample uses no customer data and no API call; no visible "Sample data" badge (owner removed it 2026-11-14), the panel's accessible name says sample data | Planner, owner | 2026-11-14 |
 | 3 | The sample dashboard loads after the form and never delays it | Planner | 2026-11-14 |
 
 ## Limits

@@ -76,7 +76,12 @@
 
 ## 5. Review
 
-(planner)
+Planner, 2026-11-14.
+
+- **Round 1** (on `e859ef99`): SHOULD-FIX 1, the refusal sentence was long; fixed in `526aa5e1` ("Wrong username or password.", ADM-11-AC11 updated in `bd16b898`). BLOCKER 1, the console Docker image failed to build: `login-showcase.tsx` imported a hook from `src/features/landing/`, which `.dockerignore` keeps out of the console image; fixed in `66d98a8b` (hook in `src/hooks/use-reduced-motion.ts`, guard test `src/app/landing-boundary.test.ts`).
+- **Owner QA rounds** (28605, 2026-11-14), each built by a developer agent and re-checked here by screenshot or probe: official SVG logo at 196:167 everywhere it was squashed, favicons redrawn (`16267467`, `40de7ee6`); logo top-left, no description, placeholders, `User` icon, footer split, no "Sample data" badge (`36e679ea`); lake contours on a navy panel, ripple motion, centred title, first-load reveal, navy Sign in button, emil pass (`def7768d`…`3f8a384f`); product name "RantAI Lakehouse" in the console (`78eae925`); title "Sign in to Lakehouse", medium (`d4163bc5`); the card never disappears, data morphs in place through an opt-in `live` prop on `EChart`/`TileBody` (`c191d1c9`, `b6670c3a`). Planner probe after `b6670c3a`: across a loop tick the card stayed visible, every bar drawn, KPI 1,572,524 → 1,580,673.
+- **Owner verdict:** "login page udah bagus menurutku" (2026-11-14). No open BLOCKER.
+- **Not verified:** iPhone Safari (`WEB-15` AC on the phone), CPU in a GPU browser (contours ~45 % of one core in the VM's software-rendered Chrome).
 
 ## 6. Handoff
 
