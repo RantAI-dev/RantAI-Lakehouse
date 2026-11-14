@@ -15,11 +15,49 @@
 //! quotes. The test is on the cell's text alone: `-1+1` is not a number and
 //! gets the apostrophe.
 //!
+//! This module owns the whole rule and the two bits of syntax every delimited
+//! file shares with it: [`neutralise`] (one text), [`quote_field`] and
+//! [`BOM`]. The dashboard download (`csv_export`) and the workbook-to-text
+//! conversion (`upload_workbook`) call them, so the rule cannot drift between
+//! writers. The conversion only shares the quoting and the mark: it keeps the
+//! cell's text as the workbook has it (it is data being loaded, not a file
+//! leaving). The same vectors are checked here and in `src/lib/csv.ts`
+//! (`tests/fixtures/csv_neutralise_vectors.json`).
+//!
 //! [`neutralize_csv`] applies the rule to bytes `ClickHouse` wrote with
 //! `FORMAT CSV`, field by field, with a small state machine instead of a CSV
 //! library (this crate has none, and none is added). The price is that the
 //! file no longer reads back as the same bytes; Parquet is the format for
 //! exact data and is returned untouched.
+
+/// The UTF-8 byte-order mark, as text.
+pub const BOM: &str = "\u{feff}";
+
+/// The UTF-8 byte-order mark, as bytes.
+pub const BOM_BYTES: &[u8] = &[0xEF, 0xBB, 0xBF];
+
+/// `text` with a leading apostrophe when a spreadsheet could run it as a
+/// formula, by the rule above: a plain number (`-5`, `+3.2e4`) is left as it
+/// is. The one owner of the rule for a text in a delimited file or a workbook.
+#[must_use]
+pub fn neutralise(text: &str) -> String {
+    if needs_apostrophe(text.as_bytes()) {
+        format!("'{text}")
+    } else {
+        text.to_owned()
+    }
+}
+
+/// `field` quoted for RFC 4180 when it holds the `separator`, a double quote,
+/// CR or LF (the quotes inside it are doubled); as it is otherwise.
+#[must_use]
+pub fn quote_field(field: &str, separator: char) -> std::borrow::Cow<'_, str> {
+    if field.contains(['"', '\r', '\n', separator]) {
+        std::borrow::Cow::Owned(format!("\"{}\"", field.replace('"', "\"\"")))
+    } else {
+        std::borrow::Cow::Borrowed(field)
+    }
+}
 
 /// Whether `cell` (the text between a field's quotes, or an unquoted
 /// field) must get a leading apostrophe.
@@ -154,6 +192,35 @@ mod tests {
 
     fn neutralized(text: &str) -> String {
         String::from_utf8(neutralize_csv(text.as_bytes())).unwrap()
+    }
+
+    /// The vectors `src/lib/csv.ts` is tested against too (`BI-30`): one file,
+    /// so the Rust and the TypeScript rule cannot drift.
+    #[test]
+    fn the_shared_vectors_hold() {
+        #[derive(serde::Deserialize)]
+        struct Vector {
+            text: String,
+            neutralised: String,
+        }
+        let vectors: Vec<Vector> = serde_json::from_str(include_str!(
+            "../tests/fixtures/csv_neutralise_vectors.json"
+        ))
+        .unwrap();
+        assert!(vectors.len() > 10);
+        for v in vectors {
+            assert_eq!(neutralise(&v.text), v.neutralised, "{:?}", v.text);
+        }
+    }
+
+    #[test]
+    fn a_field_is_quoted_for_its_separator_a_quote_or_a_line_break() {
+        assert_eq!(quote_field("a,b", ','), "\"a,b\"");
+        assert_eq!(quote_field("a,b", '\t'), "a,b");
+        assert_eq!(quote_field("a\tb", '\t'), "\"a\tb\"");
+        assert_eq!(quote_field("say \"hi\"", ','), "\"say \"\"hi\"\"\"");
+        assert_eq!(quote_field("two\nlines", ','), "\"two\nlines\"");
+        assert_eq!(quote_field("plain", ','), "plain");
     }
 
     #[test]

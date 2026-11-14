@@ -685,18 +685,12 @@ pub fn write_record<W: std::io::Write>(out: &mut W, fields: &[&str]) -> std::io:
 }
 
 fn write_field<W: std::io::Write>(out: &mut W, field: &str) -> std::io::Result<()> {
-    if field.contains([',', '"', '\n', '\r']) {
-        out.write_all(b"\"")?;
-        out.write_all(field.replace('"', "\"\"").as_bytes())?;
-        out.write_all(b"\"")?;
-    } else {
-        out.write_all(field.as_bytes())?;
-    }
-    Ok(())
+    // The quoting is `csv_safe`'s; the text stays as the workbook has it.
+    out.write_all(crate::csv_safe::quote_field(field, ',').as_bytes())
 }
 
 /// The byte order mark of UTF-8.
-const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+const BOM: &[u8] = crate::csv_safe::BOM_BYTES;
 
 /// Whether the record's text starts with a byte order mark: the first field
 /// holds one and is written as it is (a field with a comma, a quote or a line
