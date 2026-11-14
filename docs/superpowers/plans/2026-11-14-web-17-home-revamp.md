@@ -48,6 +48,28 @@
 7. **T7, after screenshots** (same sizes, light/dark, Background Off, empty state) into `docs/plans/web-17-screens/after-*`; check each yourself.
 8. **T8, handoff** in §6.
 
+### Slice 2 (owner QA, 2026-11-15)
+
+9. **T9, the scene is a dim background; no veil, no halo.** Owner: "background ini tu dibuat lebih
+   redup aja, sewajarnya background aja. ga sampe ganggu fokus user… shadow lebih gelap di
+   tulisan Good morningnya itu jadi kek malah aneh". DESIGN.md §2 now says so as a general rule.
+   - Remove the greeting veil (`veilAt`, `data-scene-veil`, the `VEIL_*` constants and the veil
+     buckets in `lake-scene.tsx`) and the greeting halo (`GREETING_TEXT` text-shadow and
+     `--home-scene-base` in `home-frame.tsx`/`home-page.tsx`). The art is drawn the same
+     everywhere; nothing marks the text.
+   - Dim the whole scene in both styles (Dither, ASCII) and both phases (day, night, and the
+     sun/moon transition between them): move every ink towards the band's base colour by one
+     global factor per phase, including the moon, the sun, the whale's eye and the glints. Targets,
+     calculated from the colours (WCAG relative luminance) and written in a test:
+     - every ink against its phase's base: **at most 2.0:1** (a background, not a picture);
+     - the greeting's text colour against every ink and the base: **at least 4.5:1**;
+     - the composer, chips and context strip are unchanged.
+     The scene keeps its shapes and its motion; only the colours change. The fade into the page
+     stays.
+   - Check: the contrast test above; the existing scene and Off tests still pass (update any that
+     asserted the veil); screenshots `/` at 1366×800 light and dark into
+     `docs/plans/web-17-screens/after-dim-*` if a browser is free (else write *not verified*).
+
 ## 4. Machine rules (owner)
 
 - No Rust. Never the full `bun run test` or `bun run lint`. Run `bun run typecheck`, `bun test src/features/home src/lib/home-*.test.ts` (and any test you touch), `bun x eslint <changed files>`.
