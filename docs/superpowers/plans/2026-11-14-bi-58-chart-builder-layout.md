@@ -296,3 +296,74 @@ assistant bar); at 1366x900 the canvas is 726 px wide, more than half of the win
   the screenshots; their tests pass.
 - `AGENTS.md` carries the block `next dev` writes on start (uncommitted). Restoring it with
   `git checkout` was refused by this session's permission check, so it is left for the planner.
+
+### Handoff, BI-58 review round 1 (Opus developer agent, 2026-11-14)
+
+**Commits:** `5bde2ebe` (SHOULD-FIX 1–5, tests, screenshots), and this entry's commit, which also
+adds the round's citation at the two-column rows of `type-b-fields.tsx`.
+
+**Checks on the final commit**, each run alone with `nice -n 15` under
+`systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0`:
+- `bun test` on the 20 builder files (round 0's 18 plus `reference-lines-editor` and
+  `click-setting`): **256 pass, 0 fail, 1,294 expect() calls**.
+- `bun run typecheck`: **0 errors**.
+- `bun run lint`: **0 errors, 11 warnings** (the existing 11).
+- `bun run test` in full: **not verified (CI)**.
+
+**Fixes:**
+- **SHOULD-FIX 1:** the tab row has 1rem of padding from the panel's edge and gaps between its tabs.
+  An inactive tab is muted text that brightens on hover; the active one is foreground with its
+  underline.
+- **SHOULD-FIX 2 (owner: every control full width):** the two-column rows of On click, the goal and
+  Gantt fields follow the inspector's own width (`@md`), so in the inspector each control spans the
+  panel. The value and its aggregate are equal halves. A step's condition is its column across the
+  row, then comparison and value as a pair. A step's value box keeps its `min-w-28` floor (phase 2
+  QA R12, test unchanged).
+- **SHOULD-FIX 3:**
+  - The Style tab is groups under small headings, separated by space, with no bordered fieldsets.
+  - Every field has a visible label, and no placeholder is cut off.
+  - The toggles read as sentences: "Thousands separator", "Short month and day names (Oct, Mon)",
+    "Shade each mark by its value", "Logarithmic scale", "Show this axis".
+  - "Automatic" replaces "As it is now" and "Time as is".
+  - Axes, notes, conditional rules and reference lines are short stacks of labelled fields under a
+    sub-heading.
+  - Steps, second-source questions and the open filter editor use a soft fill instead of a border.
+  - Accessible names are unchanged, so the existing tests find the same controls.
+- **SHOULD-FIX 4:**
+  - Cancel is gone. The back arrow and Esc leave; Esc counts only when no popover, list, menu or
+    dialog is open.
+  - After a change, "Discard changes?" asks first (Keep editing / Discard).
+  - In-app links (the sidebar) are held back the same way, and a reload or tab close asks through
+    `beforeunload`.
+  - "A change" means a field the chart is saved with changed after the person first touched the
+    builder. Before that first touch, the baseline follows the builder's own loading and settling.
+- **SHOULD-FIX 5:**
+  - The header is "← [dashboard ⌄] / New chart" and Save. The breadcrumb's dashboard is the target
+    picker ("Add to" before).
+  - The width is "Size on dashboard" at the top of Style: two drawings of a dashboard row, "Half
+    row" and "Full row". It is a radio group with arrow keys and keeps the same `span` values.
+  - A note, an image or a web page shows the same group in its inspector.
+
+**Tests added:**
+- back with no change leaves at once;
+- back after a change asks, Keep editing stays, Discard leaves;
+- Esc after a change asks;
+- picking another dashboard in the breadcrumb saves to it;
+- the header holds only back, the picker and Save;
+- the width pictures set the span, with radio semantics and arrow keys.
+
+**Screenshots:** `docs/plans/bi-58-screens/review-data-`, `review-style-` and `review-style-axes-`
+at `1366x900`, `light` and `dark`. They were taken on the planner's preview at port 28620 with a
+headless Chrome started and stopped by PID. No server was started or stopped. The round-0
+`new-*` and `edit-*` shots still show the old header (Add to, Width, Cancel); the `review-data-*`
+shots show the new one.
+
+**Choices:**
+1. The picker keeps the accessible name "Add to dashboard"; its hover title says what it is.
+2. The browser's own back button cannot be held back while Next's router owns the history; only
+   links, the back arrow, Esc, reload and tab close ask.
+3. Leaving with the confirm open: Esc or a click outside closes the confirm (keep editing).
+
+**Not verified:** the full `bun run test` (CI); a real iPhone Safari check; the discard confirm on the
+live preview (covered by the tests only). `AGENTS.md` still carries the uncommitted block `next dev`
+writes, and `.preview-dev.log` (the planner's preview log) is untracked; neither is committed.
