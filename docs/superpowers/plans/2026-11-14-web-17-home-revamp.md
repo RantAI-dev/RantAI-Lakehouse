@@ -70,6 +70,24 @@
      asserted the veil); screenshots `/` at 1366×800 light and dark into
      `docs/plans/web-17-screens/after-dim-*` if a browser is free (else write *not verified*).
 
+10. **T10, light band without the cream; dim to a middle (owner QA 2026-11-15).** Owner, on
+    T9's result: "ini tu emang gradient ke kuning kah? dan redup sih tapi jadi ga keliatan".
+    - **Light base = the page background.** The day base `#f3eee2` (cream) fading into the
+      page reads as a yellow gradient. Use the light theme's page background colour (resolve
+      the `--background` token to sRGB; keep a test that pins it) as the day base, so the band
+      has no tint of its own and nothing fades. The sun and its glints keep their warm ink. The
+      night base (`#061230`) stays. The phase blend between them stays continuous.
+    - **Dim less.** T9's factors (0.75 day, 0.8 night) left the ASCII scene invisible and turned
+      the navy whale grey in daylight. New window, per style and per phase, at the rest states:
+      the most contrasting ink against its base is **between 2.5:1 and 3.0:1**. ASCII glyphs are
+      thin, so ASCII may use its own factor and sit at the top of the window; Dither sits nearer
+      2.5. With the neutral day base, mixing keeps each ink's hue (no greying).
+    - Keep: greeting text **at least 4.5:1** against every ink and the base at the rest states;
+      no veil, no halo.
+    - Check: update the contrast tests to the window above (both bounds, both styles, both rest
+      states, ink-to-base also at the in-between phases with only the upper bound) and to the
+      new day base; existing scene tests pass.
+
 ## 4. Machine rules (owner)
 
 - No Rust. Never the full `bun run test` or `bun run lint`. Run `bun run typecheck`, `bun test src/features/home src/lib/home-*.test.ts` (and any test you touch), `bun x eslint <changed files>`.
@@ -159,6 +177,21 @@ Processes: dev server on 28699 (`bun x next dev` 373591, node 373608, next-serve
 **Checks:** typecheck clean; `bun test src/features/home src/lib/home-*.test.ts` 63 pass, 0 fail; eslint on the 4 changed files clean.
 
 **Not verified:** no screenshots (`after-dim-*` not taken) and no browser; how dim it looks is for the owner to judge.
+
+### T10 handoff, 2026-11-15 (Sonnet developer agent)
+
+**Commit** `e1397131` (`feat(home): WEB-17 T10, a neutral light band and a middle dim`; not pushed).
+
+- Day base is `#ffffff`, the light `--background` (`oklch(1 0 0)`); the test reads `design-system/tokens/colors.css` and pins both. Night base `#061230` unchanged. `BASE` is exported.
+- `DIM` is per style: Dither day 0.62, night 0.69; ASCII day 0.57, night 0.65 (interpolated on the phase). `sceneInks(phase, style)`; the scene passes its variant.
+- Measured ink against base at rest, best to worst (min to max): Dither day 1.43 to 2.53, night 1.36 to 2.55; ASCII day 1.50 to 2.93, night 1.43 to 2.89. In between (0.25, 0.5, 0.75): at most 1.78, 1.19, 1.89 (Dither) and 1.95, 1.22, 2.06 (ASCII).
+- Greeting text against every ink and the base at rest: worst 6.14:1 (ASCII night); day 6.58 to 7.60.
+- Tests: both bounds (2.5 to 3.0) at rest for both styles, ASCII above Dither, upper bound 3.0 at in-between phases, text 4.5, the pin, and the day whale still blue.
+- Note: the navy whale at day is a pale periwinkle, not navy, because the window caps its contrast with white at about 2.5 to 2.9. It is blue-tinted (not neutral grey), but it is light.
+
+**Checks:** typecheck clean; `bun test src/features/home src/lib/home-*.test.ts` 65 pass, 0 fail; eslint on the 2 changed files clean.
+
+**Not verified:** no browser, no screenshots.
 
 ## Micro-interaction audit (emil), 2026-11-14
 

@@ -10,7 +10,7 @@
  * Day and night follow the theme (owner, 2026-11-14: "kalo buat light mode
  * berarti kondisinya dibuat siang juga, matahari muncul di sebelah kiri;
  * kalo dark berarti matahari turun dan bulan naik di sebelah kanan"). The
- * light theme is a day lake printed on cream: the sun high on the left, its
+ * light theme is a day lake printed on the page white: the sun high on the left, its
  * light sparkling on the water, the whale in dense navy. The dark theme is
  * night on deep water: the moon high on the right, stars, the whale in lake
  * blue. One number, the phase (0 day, 1 night), places the sun and the
@@ -85,16 +85,21 @@ const INKS = {
 
 /**
  * The band's solid base, the colour shown before (and under) the drawing:
- * the cream of the day print and the deep navy of the night, not theme
+ * the page white of the day print and the deep navy of the night, not theme
  * tokens, since the scene is a picture in the brand's inks. The canvas
  * paints exactly these at rest, so the first paint never flashes.
  */
-const SCENE_BASE = "bg-[#f3eee2] dark:bg-[#061230]"
-const BASE = { day: "#f3eee2", night: "#061230" } as const
+const SCENE_BASE = "bg-[#ffffff] dark:bg-[#061230]"
+/**
+ * WEB-17 T10 (owner QA 2026-11-15): the day base is the light page background
+ * (`--background`, oklch(1 0 0), pinned in the test), so the band has no tint
+ * of its own and nothing fades into a yellow. The night base is the deep navy.
+ */
+export const BASE = { day: "#ffffff", night: "#061230" } as const
 
 /**
  * From the scene's light to ink. At night light is drawn as dots; by day the
- * same light is printed on cream: a pale sky, the whale in dense navy, the
+ * same light is printed on the page white: a pale sky, the whale in dense navy, the
  * water in lake blue, the sun in warm ink, its light on the water as gaps
  * and a few warm glints.
  */
@@ -211,13 +216,17 @@ export function field(u: number, v: number, aspect: number, t: number, phase: nu
 }
 
 /**
- * WEB-17 T9, owner 2026-11-15 ("dibuat lebih redup aja, sewajarnya background aja"):
- * every ink moves towards the band's base by one factor per phase, so the whole
- * scene is quiet. Calculated from the colours (WCAG relative luminance, see the
- * test): at these factors no ink is more than 2.0:1 against its base, and the
+ * WEB-17 T9/T10, owner 2026-11-15 ("dibuat lebih redup aja, sewajarnya background aja",
+ * then "jadi ga keliatan"): every ink moves towards the band's base by one factor
+ * per style and phase. Calculated from the colours (WCAG relative luminance, see
+ * the test): the most contrasting ink is between 2.5:1 and 3.0:1 against its
+ * base at rest, ASCII (thin glyphs) near 3.0 and Dither near 2.5, and the
  * greeting's text keeps at least 4.5:1 against every ink and the base.
  */
-export const DIM = { day: 0.75, night: 0.8 } as const
+export const DIM = {
+  dither: { day: 0.62, night: 0.69 },
+  ascii: { day: 0.57, night: 0.65 },
+} as const
 
 const subscribeNothing = () => () => {}
 /** False on the server and the hydration pass, true after: the theme is unknown before. */
@@ -234,9 +243,9 @@ const BASE_DAY = rgbOf(BASE.day)
 const BASE_NIGHT = rgbOf(BASE.night)
 
 /** The scene's inks (dimmed) and its base at a phase, 0 day to 1 night. Every phase between blends the two ends. */
-export function sceneInks(phase: number): { inks: number[][]; base: number[] } {
+export function sceneInks(phase: number, style: SceneVariant = "dither"): { inks: number[][]; base: number[] } {
   const base = mix(BASE_DAY, BASE_NIGHT, phase)
-  const k = DIM.day + (DIM.night - DIM.day) * phase
+  const k = DIM[style].day + (DIM[style].night - DIM[style].day) * phase
   return { inks: DAY.map((d, r) => mix(mix(d, NIGHT[r], phase), base, k)), base }
 }
 /** Ease in and out (cubic): a setting sun starts and ends slowly. */
@@ -292,7 +301,7 @@ export function LakeScene({
     let inks: number[][] = []
     let base = BASE_DAY
     const paint = () => {
-      ;({ inks, base } = sceneInks(phase))
+      ;({ inks, base } = sceneInks(phase, variant))
     }
     paint()
 
