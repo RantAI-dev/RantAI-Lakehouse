@@ -4,9 +4,9 @@
  * T1, owner 2026-11-14: the grey panel was "kosong banget"). Writes
  * `public/login-contours-0.svg`, `-1.svg` and `-2.svg`: the same lake, its
  * depth lines drawn at three water levels a third of a step apart. The page
- * shows them as CSS masks (so the colour comes from the theme's tokens) and,
- * with motion allowed, lets the three take turns very slowly, which reads as
- * the rings of the lake creeping outward.
+ * shows them as CSS masks (so the colour comes from the theme) and, with
+ * motion allowed, lets each one spread out from the deep point and fade in
+ * turn, which reads as ripples rolling outward (T6, `login.css`).
  *
  * Deterministic: a fixed seed, no dependencies. Run it again only to change
  * the drawing: `node scripts/login-contours.mjs`.
@@ -15,15 +15,16 @@
  * dashboard card, plus a low, seeded swell so no line is a clean ellipse) is
  * sampled on an 8 px grid; marching squares finds each depth level, the
  * segments are joined into lines, and each line is smoothed into cubic
- * curves. The drawing is 1600 x 1400 at 1:1 px, so the lines stay 1 px at
+ * curves. The drawing is 2000 x 1704 at 1:1 px, so the lines stay 1 px at
  * every panel size; the card's top-left corner sits at (ANCHOR_X, ANCHOR_Y).
  */
 import { writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const W = 1600;
-const H = 1400;
+const W = 2000;
+/** Both sizes are whole grid steps (`STEP`). */
+const H = 1704;
 /** Where the card's top-left corner lands in the drawing (the page positions the masks to match). */
 const ANCHOR_X = 400;
 const ANCHOR_Y = 320;

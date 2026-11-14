@@ -9,11 +9,12 @@
  * third of a step apart (`public/login-contours-*.svg`, drawn by
  * `scripts/login-contours.mjs`), used as CSS masks over the theme's line
  * colour, so they are server-rendered markup, cost no JavaScript to draw, and
- * stay 1 px at every panel size. With motion allowed the three take turns
- * over 36 s and the rings creep slowly outward, like water; the drift runs
- * only while the panel is on screen and the tab is in front, and with
- * `prefers-reduced-motion` (or before the page's script runs) the first
- * drawing stands still. Styles: `login.css`.
+ * stay 1 px at every panel size. With motion allowed each drawing in turn
+ * spreads out from the lake's deep point and fades, so the rings roll
+ * outward like ripples (T6, owner: "aku pengen background wavenya gerak").
+ * The water moves only while the panel is on screen and the tab is in
+ * front; before the page's script runs it is a still picture, and with
+ * `prefers-reduced-motion` the first drawing stands alone. Styles: `login.css`.
  */
 import * as React from "react";
 import { useOnScreen, usePageVisible } from "./use-in-view";
