@@ -14,11 +14,21 @@ import { useFolded } from "./use-folded";
 export type TileMenuItem = {
   label: string;
   icon: React.ReactNode;
+  /** Ignored when `sub` is given: the item opens its submenu instead. */
   onSelect: () => void;
   destructive?: boolean;
   /** Start a new group: a separator is drawn above this item. */
   separatorBefore?: boolean;
+  /** The item is a submenu of these (`BI-61` T4: "Download ›"). */
+  sub?: TileMenuItem[];
 };
+
+/**
+ * How a tile is drawn: `card`, the bordered card of the embed and the public
+ * link; `soft`, the dashboard page's own (`BI-61` T4, layout A): a soft fill
+ * with no border and no badge, whose ⋯ and "Data from" line show on hover.
+ */
+export type TileLook = "card" | "soft";
 
 export type GridItem = {
   id: string;
@@ -34,6 +44,10 @@ export type GridItem = {
   body: React.ReactNode;
   /** Heading of the ⋯ menu (e.g. where the data comes from). */
   menuLabel?: string;
+  /** Quiet lines at the top of the ⋯ menu (`soft` look): the data's time, the refresh mode, what the tile reads. */
+  menuNotes?: string[];
+  /** "Data from 12:47", shown on hover in the `soft` look's header. */
+  dataFrom?: string | null;
   menu?: TileMenuItem[];
 };
 
@@ -67,8 +81,10 @@ type Drag = { id: string; mode: "move" | "resize"; px: number; py: number; box: 
  * (`PhoneStack`) in the order of the phone layout, else the reading order.
  */
 export function DashboardGrid({
-  items, layout, editable, onLayoutChange, tabs, tab, phone, phoneEdit, onPhoneChange, foldKey,
+  items, layout, editable, onLayoutChange, tabs, tab, phone, phoneEdit, onPhoneChange, foldKey, look = "card",
 }: {
+  /** How the tiles are drawn; the dashboard page passes `soft` (`BI-61` T4). */
+  look?: TileLook;
   items: GridItem[];
   layout: LayoutMap;
   editable: boolean;
@@ -147,6 +163,7 @@ export function DashboardGrid({
           items={shown}
           order={ordered.filter((p) => !hidden.has(p.id))}
           editing={Boolean(phoneEdit)}
+          look={look}
           folded={folded}
           onToggleFold={toggleFold}
           onChange={onPhoneChange}
@@ -219,13 +236,16 @@ export function DashboardGrid({
             {isSectionKind(it.kind) ? (
               <SectionTile item={it} editable={editable} folded={folded.has(it.id)} onToggle={() => toggleFold(it.id)} onHeaderPointerDown={onMove} />
             ) : (
-              <TileCard item={it} editable={editable} dragging={dragging} onHeaderPointerDown={onMove} />
+              <TileCard item={it} editable={editable} dragging={dragging} onHeaderPointerDown={onMove} look={look} />
             )}
             {/* Resize handle (bottom-right corner, visible) */}
             {editable ? (
               <div
                 onPointerDown={(e) => startDrag(e, it.id, "resize")}
-                className="absolute -bottom-1 -right-1 z-10 grid size-6 cursor-se-resize place-items-center rounded-md border border-border bg-card text-muted-foreground shadow-sm hover:bg-muted hover:text-foreground"
+                className={cn(
+                  "absolute -bottom-1 -right-1 z-10 grid size-6 cursor-se-resize place-items-center rounded-md text-muted-foreground shadow-sm hover:bg-muted hover:text-foreground",
+                  look === "soft" ? "bg-background ring-1 ring-foreground/10" : "border border-border bg-card",
+                )}
                 style={{ touchAction: "none" }}
                 title="Drag to resize"
               >

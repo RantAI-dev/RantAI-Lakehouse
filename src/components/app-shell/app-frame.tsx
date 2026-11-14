@@ -9,6 +9,7 @@ import { CopilotDock } from "@/features/copilot/copilot-dock";
 import { cn } from "@/lib/utils";
 import { CopilotSidebar } from "@/features/copilot/copilot-sidebar";
 import { CopilotProvider } from "@/features/copilot/use-copilot";
+import { SidePanelProvider } from "@/components/app-shell/side-panel";
 import { CommandPalette } from "@/components/command-palette";
 import { isPublicPath, useAuth } from "@/features/auth/auth-provider";
 import { SsoNotice } from "@/features/auth/sso-notice";
@@ -74,7 +75,8 @@ function AuthenticatedFrame({
   hasAssistant,
 }: Readonly<{ children: React.ReactNode; hasAssistant: boolean }>) {
   return (
-    <>
+    // BI-61 T6: the one right side panel the Copilot and a page's own panels share.
+    <SidePanelProvider>
       <AppSidebar />
       {/*
         Owner QA 2026-11-14, composer (DESIGN.md §3, "Elemen melayang diletakkan di tengah area
@@ -121,11 +123,12 @@ function AuthenticatedFrame({
             <VersionBanner />
             <RouteGuard>{children}</RouteGuard>
           </main>
-          {hasAssistant && <CopilotSidebar />}
+          {/* Mounted for everyone: without the assistant it opens only for a page's tabs (BI-61 T6). */}
+          <CopilotSidebar hasAssistant={hasAssistant} />
         </div>
         {hasAssistant && <CopilotDock />}
       </SidebarInset>
       <CommandPalette />
-    </>
+    </SidePanelProvider>
   );
 }

@@ -8,6 +8,7 @@ import { useCopilot } from "./use-copilot";
 import { ChatMessages } from "./chat-messages";
 import { ChatComposer } from "./chat-composer";
 import { CopilotHistoryButton } from "./history-menu";
+import { useSidePanel } from "@/components/app-shell/side-panel";
 
 /**
  * Pages that never show the floating dock: Home's own prompt is the entry
@@ -32,8 +33,12 @@ export function dockHiddenOn(pathname: string | null): boolean {
 export function CopilotDock() {
   const pathname = usePathname();
   const c = useCopilot();
+  const panel = useSidePanel();
 
-  if (dockHiddenOn(pathname) || c.dockPosition === "right") {
+  // BI-61 T6: while a page tab of the shared side panel is open, the Copilot is
+  // that panel's first tab, so the bottom bar steps aside rather than float as
+  // a second way in over the panel.
+  if (dockHiddenOn(pathname) || c.dockPosition === "right" || panel.active !== null) {
     return null;
   }
 
