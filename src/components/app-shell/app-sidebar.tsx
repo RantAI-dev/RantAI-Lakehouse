@@ -237,7 +237,7 @@ export function AppSidebar() {
     const first = group.items[0]
     const Icon = group.icon ?? first.icon
     // A group declared with one page shows that page's title, which is the
-    // more descriptive of the two ("History" over "History").
+    // more descriptive of the two.
     const label = single ? first.title : group.label
     const active = group.items.some((it) => it.href === activeHref)
 
