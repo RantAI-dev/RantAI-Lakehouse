@@ -152,7 +152,7 @@ describe("Save as template in the dashboard's menu", () => {
     isDefault: false, canWrite: true, loading: false, fullscreen: false, autoSec: "0", savedSec: "300",
     canSaveRefresh: false, savingRefresh: false,
     onRefresh: () => {}, onToggleFullscreen: () => {}, onAutoSec: () => {}, onSaveRefresh: () => {},
-    onRename: () => {}, onShare: () => {}, onExportPdf: () => {}, onDuplicate: () => {}, onDelete: () => {},
+    onRename: () => {}, onExportPdf: () => {}, onDuplicate: () => {}, onDelete: () => {},
   }
 
   it("is offered to a writer on a saved dashboard", async () => {

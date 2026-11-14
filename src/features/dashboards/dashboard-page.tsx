@@ -1368,7 +1368,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
                   isDefault={isDefault}
                   canWrite={canWrite}
                   canManage={canManage}
-                  isPrivate={Boolean(ownerId)}
+                  dataFrom={pageDataFrom?.replace(/^Data from /, "")}
                   onHistory={() => setHistoryOpen(true)}
                   onTheme={canWrite ? () => { setThemeError(null); setThemeOpen(true); } : undefined}
                   onFreshness={canWrite ? () => { setFreshError(null); setFreshOpen(true); } : undefined}
@@ -1383,7 +1383,6 @@ export function DashboardPage({ boardId }: { boardId: string }) {
                   onAutoSec={(v) => setSessionSec(Number(v))}
                   onSaveRefresh={() => void saveRefreshDefault()}
                   onRename={() => setRenameOpen(true)}
-                  onShare={() => setShareOpen(true)}
                   onExportPdf={exportPdf}
                   onDownloadPdf={() => setPdfOpen(true)}
                   onExportFile={() => void downloadFile()}

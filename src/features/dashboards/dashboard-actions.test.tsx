@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
 import { DashboardActionsMenu, NewChartButton } from "./dashboard-actions"
-import { EditPencil } from "./dashboard-header"
+import { EditPencil, ShareButton } from "./dashboard-header"
 import { chartWriteItems } from "./tile-write-items"
 
 afterEach(cleanup)
@@ -11,16 +11,57 @@ function renderMenu(over: Partial<React.ComponentProps<typeof DashboardActionsMe
     isDefault: false, canWrite: true, loading: false, fullscreen: false, autoSec: "0", savedSec: "300",
     canSaveRefresh: false, savingRefresh: false,
     onRefresh: () => {}, onToggleFullscreen: () => {}, onAutoSec: () => {}, onSaveRefresh: () => {},
-    onRename: () => {}, onShare: () => {}, onExportPdf: () => {}, onDuplicate: () => {}, onDelete: () => {},
+    onRename: () => {}, onExportPdf: () => {}, onDuplicate: () => {}, onDelete: () => {},
     ...over,
   }
   render(<DashboardActionsMenu {...props} />)
   fireEvent.click(screen.getByRole("button", { name: "More actions" }))
 }
 
+/** BI-61 T2: the intervals and the exports are submenus; their entries show once the submenu opens. */
+async function openSub(name: "Auto-refresh" | "Export") {
+  fireEvent.click(await screen.findByText(name))
+}
+
+// BI-61 T2 (spec T2, AC2): grouped, at most 14 entries at the top level, and every old entry still reachable.
+describe("DashboardActionsMenu groups (BI-61 T2)", () => {
+  const all = {
+    onHistory: () => {}, onTheme: () => {}, onFreshness: () => {}, onDownloadPdf: () => {}, onSubscriptions: () => {},
+    onExportFile: () => {}, onSaveTemplate: () => {}, canSaveRefresh: true, canManage: true,
+  }
+
+  it("groups the entries under View, Get a copy and Manage, in that order, with 14 at the top level", async () => {
+    renderMenu(all)
+    await screen.findByText("Refresh now")
+    const labels = screen.getAllByRole("group").map((g) => g.querySelector("[data-slot='dropdown-menu-group-label']")?.textContent)
+    expect(labels).toEqual(["View", "Get a copy", "Manage"])
+    const top = screen.getAllByRole("menuitem").map((i) => i.textContent?.trim())
+    expect(top).toEqual([
+      "Refresh now", "Fullscreen", "Auto-refreshOff", "Freshness…",
+      "Download PDF…", "Print…", "Subscriptions…", "Export",
+      "Rename", "Duplicate", "Theme and font…", "Version history…", "Save as template…", "Delete dashboard",
+    ])
+    expect(top.length).toBeLessThanOrEqual(14)
+  })
+
+  it("keeps every entry of the old flat menu reachable: the intervals and Save as default in Auto-refresh, both exports in Export", async () => {
+    renderMenu(all)
+    await openSub("Auto-refresh")
+    for (const label of ["Manual", "Every 1m", "Every 5m", "Every 10m", "Every 15m", "Every 30m", "Every 60m", "Save as dashboard default"]) {
+      expect(await screen.findByText(label)).toBeTruthy()
+    }
+    cleanup()
+    renderMenu(all)
+    await openSub("Export")
+    expect(await screen.findByText("Dashboard file")).toBeTruthy()
+    expect(screen.getByText("YAML").closest("a")?.getAttribute("href")).toBe("/api/dashboard/export")
+  })
+})
+
 describe("DashboardActionsMenu auto-refresh", () => {
   it("lists the server's intervals and marks the saved default", async () => {
     renderMenu()
+    await openSub("Auto-refresh")
     for (const label of ["Manual", "Every 1m", "Every 5m", "Every 10m", "Every 15m", "Every 30m", "Every 60m"]) {
       expect(await screen.findByText(label)).toBeTruthy()
     }
@@ -31,12 +72,14 @@ describe("DashboardActionsMenu auto-refresh", () => {
 
   it("offers saving the choice as the default only when asked to", async () => {
     renderMenu({ canSaveRefresh: false })
+    await openSub("Auto-refresh")
     await screen.findByText("Manual")
     expect(screen.queryByText("Save as dashboard default")).toBeNull()
     cleanup()
 
     const onSaveRefresh = mock(() => {})
     renderMenu({ canSaveRefresh: true, onSaveRefresh })
+    await openSub("Auto-refresh")
     fireEvent.click(await screen.findByText("Save as dashboard default"))
     expect(onSaveRefresh).toHaveBeenCalledTimes(1)
   })
@@ -44,6 +87,7 @@ describe("DashboardActionsMenu auto-refresh", () => {
   it("reports the interval a viewer picks as seconds", async () => {
     const onAutoSec = mock<(v: string) => void>(() => {})
     renderMenu({ onAutoSec })
+    await openSub("Auto-refresh")
     fireEvent.click(await screen.findByText("Every 10m"))
     expect(onAutoSec).toHaveBeenCalledWith("600")
   })
@@ -57,7 +101,7 @@ describe("DashboardActionsMenu theme and font", () => {
     expect(onTheme).toHaveBeenCalledTimes(1)
     cleanup()
     renderMenu({ isDefault: true, onTheme })
-    await screen.findByText("Manual")
+    await screen.findByText("Refresh now")
     expect(screen.queryByText("Theme and font…")).toBeNull()
   })
 })
@@ -70,23 +114,33 @@ describe("DashboardActionsMenu history and personal space", () => {
     expect(onHistory).toHaveBeenCalledTimes(1)
     cleanup()
     renderMenu({ isDefault: true, onHistory })
-    await screen.findByText("Manual")
+    await screen.findByText("Refresh now")
     expect(screen.queryByText("Version history…")).toBeNull()
   })
 
-  it("disables Share on a private dashboard and says why", async () => {
+})
+
+// BI-61 T1/T2: Share left the menu for the header's primary button, with the same rules.
+describe("ShareButton", () => {
+  it("is disabled on a private dashboard and says why", () => {
     const onShare = mock(() => {})
-    renderMenu({ isPrivate: true, onShare })
-    const share = await screen.findByText("Share…")
+    render(<ShareButton isDefault={false} isPrivate canManage onShare={onShare} />)
+    const share = screen.getByRole("button", { name: "Share" }) as HTMLButtonElement
+    expect(share.disabled).toBe(true)
     fireEvent.click(share)
     expect(onShare).not.toHaveBeenCalled()
   })
 
-  it("keeps Share working on a shared dashboard", async () => {
+  it("keeps Share working on a shared dashboard", () => {
     const onShare = mock(() => {})
-    renderMenu({ isPrivate: false, onShare })
-    fireEvent.click(await screen.findByText("Share…"))
+    render(<ShareButton isDefault={false} isPrivate={false} canManage onShare={onShare} />)
+    fireEvent.click(screen.getByRole("button", { name: "Share" }))
     expect(onShare).toHaveBeenCalledTimes(1)
+  })
+
+  it("is not offered to someone who does not manage the dashboard, nor on the built-in one (BI-19 B2)", () => {
+    render(<><ShareButton isDefault={false} isPrivate={false} canManage={false} onShare={() => {}} /><ShareButton isDefault isPrivate={false} canManage onShare={() => {}} /></>)
+    expect(screen.queryByRole("button", { name: "Share" })).toBeNull()
   })
 })
 
@@ -127,20 +181,23 @@ describe("DashboardActionsMenu Export dashboard file (BI-19 part D)", () => {
   it("offers the file on a saved dashboard and not on the built-in one", async () => {
     const onExportFile = mock(() => {})
     renderMenu({ isDefault: false, onExportFile })
-    fireEvent.click(await screen.findByText("Export dashboard file"))
+    await openSub("Export")
+    fireEvent.click(await screen.findByText("Dashboard file"))
     expect(onExportFile).toHaveBeenCalledTimes(1)
     cleanup()
     renderMenu({ isDefault: true, onExportFile })
-    await screen.findByText("Print…")
-    expect(screen.queryByText("Export dashboard file")).toBeNull()
+    await openSub("Export")
+    await screen.findByText("YAML")
+    expect(screen.queryByText("Dashboard file")).toBeNull()
   })
 
   // BI-19 Q-D1 (owner decision 2026-10-27).
   it("hides both exports when downloads are switched off for the viewer", async () => {
     renderMenu({ isDefault: false, onExportFile: () => {}, canDownload: false })
     await screen.findByText("Print…")
-    expect(screen.queryByText("Export dashboard file")).toBeNull()
-    expect(screen.queryByText("Export YAML")).toBeNull()
+    expect(screen.queryByText("Export")).toBeNull()
+    expect(screen.queryByText("Dashboard file")).toBeNull()
+    expect(screen.queryByText("YAML")).toBeNull()
   })
 })
 
@@ -163,12 +220,14 @@ describe("DashboardActionsMenu Subscriptions… (RPT-1)", () => {
 describe("write controls (R18)", () => {
   it("the dashboard menu leaves out Rename, Duplicate and Delete for a viewer, and keeps the read actions", async () => {
     renderMenu({ canWrite: false })
-    await screen.findByText("Manual")
+    await screen.findByText("Refresh now")
     for (const label of ["Rename", "Duplicate", "Delete dashboard"]) expect(screen.queryByText(label)).toBeNull()
-    for (const label of ["Refresh now", "Fullscreen", "Print…", "Export YAML"]) {
+    for (const label of ["Refresh now", "Fullscreen", "Print…"]) {
       expect(screen.getByText(label)).toBeTruthy()
     }
-    // BI-19 B2: sharing needs manage, so a viewer is not offered it either.
+    await openSub("Export")
+    expect(await screen.findByText("YAML")).toBeTruthy()
+    // BI-61: Share is the header's button now; the menu never offers it.
     expect(screen.queryByText("Share…")).toBeNull()
   })
 
@@ -176,7 +235,7 @@ describe("write controls (R18)", () => {
     renderMenu({ canWrite: true, canManage: false })
     expect(await screen.findByText("Rename")).toBeTruthy()
     expect(screen.getByText("Duplicate")).toBeTruthy()
-    for (const label of ["Share…", "Delete dashboard"]) expect(screen.queryByText(label)).toBeNull()
+    expect(screen.queryByText("Delete dashboard")).toBeNull()
   })
 
   it("the dashboard menu shows Rename, Duplicate and Delete to an editor", async () => {
