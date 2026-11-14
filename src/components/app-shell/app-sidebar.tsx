@@ -5,7 +5,7 @@ import { createPortal } from "react-dom"
 import Image from "next/image"
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
-import { CircleUserRound, ChevronRight, ChevronsUpDown } from "lucide-react"
+import { Bot, CircleUserRound, ChevronRight, ChevronsUpDown } from "lucide-react"
 import { useAuth } from "@/features/auth/auth-provider"
 import { rememberTableHref } from "@/hooks/use-table-memory"
 import {
@@ -29,33 +29,22 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { useSidebarGroups } from "@/hooks/use-sidebar-groups"
 import { cn } from "@/lib/utils"
 import { NAV_GROUPS, activeNavHref, canOpen, type NavGroup, type NavItem } from "./nav-config"
+import {
+  ACCOUNT_AVATAR_CLASS,
+  ACCOUNT_CARD_CLASS,
+  SIDEBAR_CLASS,
+  SIDEBAR_CONTENT_CLASS,
+  SIDEBAR_FOOTER_CLASS,
+  SIDEBAR_GROUP_CLASS,
+  SIDEBAR_MENU_CLASS,
+  SIDEBAR_SUB_CLASS,
+  navRowClass,
+} from "./sidebar-classes"
+import { SidebarChats } from "./sidebar-chats"
 import { UserMenu } from "./user-menu"
 
-/*
- * The sidebar's boxes, shared with the loading shell (`AppShellSkeleton`),
- * which draws the same frame with grey rows while the session is checked:
- * one set of classes, so the skeleton cannot drift from the real sidebar.
- */
-export const SIDEBAR_CLASS = "border-r border-sidebar-border bg-sidebar shadow-sm"
-//
-// Collapsing is one move (owner 2026-11-14, `SIDEBAR_MOTION` in `ui/sidebar.tsx`): the rows keep the
-// expanded layout in both states, left-aligned on one icon column (16 px from the edge, the centre
-// of the 48 px rail), with the same vertical rhythm, so collapsing only narrows the row's box and
-// fades the label; no icon moves and no row jumps.
-export const SIDEBAR_CONTENT_CLASS = "min-w-0"
-export const SIDEBAR_GROUP_CLASS = "gap-0 px-2 py-2"
-export const SIDEBAR_MENU_CLASS = "mt-0 flex flex-col gap-0.5"
-export const SIDEBAR_FOOTER_CLASS = "border-t border-sidebar-border p-2"
-// Collapsed, the card is the avatar alone, 32 px on the icon column; the box narrows, its padding
-// eases to none and the avatar with it, in the sidebar's time.
-export const ACCOUNT_CARD_CLASS = "h-14 rounded-lg px-2 group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:p-0!"
-export const ACCOUNT_AVATAR_CLASS = cn(
-  "flex size-9 shrink-0 items-center justify-center rounded-full bg-primary/12 text-primary ring-1 ring-primary/20 transition-[width,height]",
-  SIDEBAR_MOTION,
-  "group-data-[collapsible=icon]:size-8",
-)
-export const NAV_ROW_CLASS = "h-8 rounded-md px-2 py-1.5 text-sm tracking-normal"
-export const SIDEBAR_SUB_CLASS = "mr-0 gap-0.5 border-sidebar-border pr-0 group-data-[collapsible=icon]:flex"
+/** The conversation page, where the sidebar lists the chats instead of the menu (`WEB-18`). */
+export const CONVERSATION_PATH = "/copilot"
 
 function BrandLogo() {
   // Logo follows the theme: navy for a light sidebar, white for a dark one.
@@ -128,6 +117,14 @@ export function AppSidebar() {
     activeLabel: activeGroup?.label,
     defaultOpenLabels,
   })
+  // WEB-18: on a conversation the sidebar lists the chats instead of the menu. "Back to menu"
+  // brings the menu back for this visit only: any navigation (another page, the browser's Back)
+  // resets it, so the next conversation opens on its chats again.
+  const hasAssistant = hasPermission("assistant:use") || hasPermission("assistant:ask")
+  const onConversation = pathname === CONVERSATION_PATH && hasAssistant
+  const [menuOnConversation, setMenuOnConversation] = React.useState(false)
+  React.useEffect(() => setMenuOnConversation(false), [pathname])
+  const showChats = onConversation && !menuOnConversation
   const [flyout, setFlyout] = React.useState<FlyoutState>(null)
   const flyoutRef = React.useRef<HTMLDivElement>(null)
   const [mounted, setMounted] = React.useState(false)
@@ -170,13 +167,7 @@ export function AppSidebar() {
     setFlyout({ label, top: r.top, left: r.right + 8 })
   }
 
-  const menuBtnClass = (active: boolean) =>
-    cn(
-      NAV_ROW_CLASS,
-      active
-        ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
-        : "font-normal text-sidebar-foreground/70 hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
-    )
+  const menuBtnClass = navRowClass
 
   /**
    * Satu baris halaman.
@@ -327,28 +318,50 @@ export function AppSidebar() {
 
   const openGroup = groups.find((g) => g.label === flyout?.label)
 
+  /**
+   * The menu's way back to the chats, shown only on a conversation, right
+   * under Home where the conversations used to be listed (`WEB-18`).
+   * Elsewhere chats are reached from Home and the navbar's AI Copilot panel.
+   */
+  const aiChatsEntry = (
+    <SidebarMenuItem key="ai-chats">
+      <SidebarMenuButton
+        isActive
+        tooltip="AI chats"
+        data-view-focus="menu"
+        className={menuBtnClass(true)}
+        onClick={() => setMenuOnConversation(false)}
+      >
+        <Bot className="size-4 shrink-0" />
+        <span className={cn("flex-1 truncate text-left leading-5", SIDEBAR_FADE)}>AI chats</span>
+        <ChevronRight
+          className="size-3.5 shrink-0 text-sidebar-foreground/50 transition-opacity duration-150 group-data-[collapsible=icon]:opacity-0"
+          aria-hidden
+        />
+      </SidebarMenuButton>
+    </SidebarMenuItem>
+  )
+  const menuEntries = groups.flatMap((g) =>
+    onConversation && g.label === "Home" ? [renderEntry(g), aiChatsEntry] : [renderEntry(g)],
+  )
+
   return (
     <Sidebar data-print-hide collapsible="icon" side="left" className={SIDEBAR_CLASS}>
       <SidebarBrand />
 
       <SidebarContent className={SIDEBAR_CONTENT_CLASS}>
-        <SidebarGroup className={SIDEBAR_GROUP_CLASS}>
-          <SidebarMenu className={SIDEBAR_MENU_CLASS}>
-            {groups.map(renderEntry)}
-          </SidebarMenu>
-        </SidebarGroup>
-
-        {/* A dashboard list and Copilot history used to live here. Both
-            only ever appeared once you were already on their page, so
-            they could never be used to NAVIGATE there — that was page
-            content occupying navigation space, and it vanished the moment
-            the sidebar collapsed to icons. Both now live in their own
-            page's header instead (`BoardSwitcher`, `CopilotHistoryMenu`),
-            and the sidebar purely reads `nav-config` with no per-route
-            exception. */}
-        {/* The active section's pages used to be repeated down here, in a
-            separate block. They now sit inside their own group above, so
-            the section that is open is the one you are reading. */}
+        {/* WEB-18 (owner 2026-11-14): on a conversation the chat list takes the menu's place,
+            as in a chat app, so the history is beside the chat it belongs to instead of on a
+            page of its own. The account card and the logo row stay. */}
+        {showChats ? (
+          <SidebarChats shown onBack={() => setMenuOnConversation(true)} />
+        ) : (
+          <SidebarGroup className={SIDEBAR_GROUP_CLASS}>
+            <SidebarMenu className={SIDEBAR_MENU_CLASS}>
+              {menuEntries}
+            </SidebarMenu>
+          </SidebarGroup>
+        )}
       </SidebarContent>
 
       {/* Flyout (icon mode only) */}

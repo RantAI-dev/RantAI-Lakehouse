@@ -158,15 +158,23 @@ export function RenameSessionDialog({
   );
 }
 
-/** The ⋯ menu on a conversation row: Rename and Delete (confirmed first). */
+/**
+ * The ⋯ menu on a conversation row: Rename and Delete (confirmed first).
+ *
+ * `trigger` replaces the default ghost icon button, so a row that has its own
+ * action slot (the sidebar's chat list, `SidebarMenuAction`) keeps its look;
+ * it receives the menu's props and the ⋯ icon.
+ */
 export function SessionActionsMenu({
   session,
   onRename,
   onDelete,
+  trigger,
 }: {
   readonly session: SessionMeta;
   readonly onRename: (title: string) => Promise<boolean>;
   readonly onDelete: () => Promise<boolean>;
+  readonly trigger?: React.ReactElement;
 }) {
   const [renaming, setRenaming] = React.useState(false);
   const [deleting, setDeleting] = React.useState(false);
@@ -176,13 +184,15 @@ export function SessionActionsMenu({
     <>
       <DropdownMenu>
         <DropdownMenuTrigger
+          aria-label={`Actions for ${session.title}`}
           render={
-            <Button
-              variant="ghost"
-              size="icon"
-              className="size-8 text-muted-foreground hover:text-foreground"
-              aria-label={`Actions for ${session.title}`}
-            />
+            trigger ?? (
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-8 text-muted-foreground hover:text-foreground"
+              />
+            )
           }
         >
           <MoreHorizontal className="size-4" />

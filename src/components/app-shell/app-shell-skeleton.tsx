@@ -22,6 +22,7 @@ import { DashboardPageSkeleton } from "@/features/dashboards/dashboard-skeleton"
 import { DashboardListPageSkeleton } from "@/features/dashboards/dashboard-list-skeleton";
 import { useSidebarGroups } from "@/hooks/use-sidebar-groups";
 import { cn } from "@/lib/utils";
+import { SidebarBrand } from "./app-sidebar";
 import {
   ACCOUNT_AVATAR_CLASS,
   ACCOUNT_CARD_CLASS,
@@ -32,8 +33,7 @@ import {
   SIDEBAR_GROUP_CLASS,
   SIDEBAR_MENU_CLASS,
   SIDEBAR_SUB_CLASS,
-  SidebarBrand,
-} from "./app-sidebar";
+} from "./sidebar-classes";
 import { NAVBAR_CLASS, NAVBAR_GRID_CLASS, NAVBAR_TRIGGER_CLASS, NavbarSearch, NavbarTitle } from "./app-navbar";
 import { NAV_GROUPS, activeNavHref, pageTitleFor } from "./nav-config";
 import { shellPlaceholderFor } from "./shell-placeholder";
