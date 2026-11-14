@@ -185,7 +185,7 @@ describe("LoginPage lockout surface (plan T5)", () => {
     const alert = await screen.findByRole("alert")
     // One generic message regardless of cause — the page must not leak
     // the server's non-enumeration constant ("invalid_or_expired").
-    expect(alert.textContent).toBe("Invalid username/email or password.")
+    expect(alert.textContent).toBe("Wrong username or password.")
     expect(alert.textContent).not.toContain("invalid_or_expired")
   })
 })
@@ -214,7 +214,7 @@ describe("LoginPage form (WEB-15 T1)", () => {
     await submitCredentials("rina@meridian.example", "wrong-password")
 
     const alert = await screen.findByRole("alert")
-    expect(alert.textContent).toBe("Invalid username/email or password.")
+    expect(alert.textContent).toBe("Wrong username or password.")
     expect(alert.id).toBe("login-error")
 
     // WEB-15 spec: "the password is selected for retyping".
@@ -293,7 +293,7 @@ describe("LoginPage without the sample dashboard (WEB-15 T2)", () => {
       </AuthProvider>,
     )
     await submitCredentials("rina@meridian.example", "wrong-password")
-    expect((await screen.findByRole("alert")).textContent).toBe("Invalid username/email or password.")
+    expect((await screen.findByRole("alert")).textContent).toBe("Wrong username or password.")
 
     // The panel and its caption are there; the dashboard inside is not.
     const panel = screen.getByRole("region", { name: "A preview of the console (sample data)" })

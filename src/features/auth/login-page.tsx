@@ -267,9 +267,12 @@ export function LoginPage() {
           setError(serviceError.message);
         }
       } else {
+        // WEB-15 review SHOULD-FIX 1: the owner's short sentence from mockup
+        // A (DESIGN.md: help and status text is one short line). Still one
+        // sentence for every refusal, so it does not say which part was wrong.
         setError(
           serviceError.code === "permission_denied"
-            ? "Invalid username/email or password."
+            ? "Wrong username or password."
             : serviceError.message || "Could not sign in. Try again."
         );
       }
