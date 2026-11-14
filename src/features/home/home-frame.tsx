@@ -40,7 +40,12 @@ const BAND = "absolute inset-x-0 top-0 h-[300px] sm:h-[400px]"
  */
 const TOP = "pt-[128px] sm:pt-[172px]"
 /** The art fades in and out in place when the Background changes; no movement. */
-const ART_FADE = "motion-safe:transition-opacity motion-safe:duration-300 motion-safe:ease-out"
+const ART_FADE = "motion-safe:transition-opacity motion-safe:duration-300 motion-safe:ease-ui"
+/**
+ * The page's first band: the server painted its base colour already, so only the art inside fades in
+ * (micro-interaction audit 2026-11-14), never the base, which would flash the plain page first.
+ */
+const ART_FIRST_FADE = "*:transition-opacity *:duration-[400ms] *:ease-ui starting:*:opacity-0"
 
 /** The row between the hero and the bento: shortcuts at the left, Customize at the right. */
 export const TOOLBAR_ROW = "mt-6 flex min-h-8 flex-wrap items-center gap-1"
@@ -100,21 +105,56 @@ export function HomeFrame({
  * band's place empty (the plain page shows through); the last art stays
  * mounted, still, so switching back fades it in again without a redraw
  * flash. A page that opens with Off never mounts the scene at all.
+ *
+ * Micro-interaction audit 2026-11-14 (emil; owner: switching the Background
+ * cross-fades, never jumps): Dither to ASCII (or back) mounts the new art as
+ * a second band over the old one and fades it in; the old one, still drawn
+ * underneath, is dropped once the new one is opaque. A band that comes after
+ * the page opened (from Off, or the switch) fades in whole; the band the page
+ * opens with fades only its art in, over the base colour the server already
+ * painted, so the first frame never flashes the plain page.
  */
+type ArtLayer = { readonly art: Exclude<HomeBackground, "off">; readonly id: number; readonly later: boolean }
+/** How long a new band takes to fade in (`ART_FADE`), plus a frame, before the old one goes. */
+const CROSSFADE_MS = 340
+
 function SceneBand({ background }: { background: HomeBackground }) {
   const off = !drawsScene(background)
-  const [art, setArt] = React.useState<Exclude<HomeBackground, "off"> | null>(drawsScene(background) ? background : null)
+  const [layers, setLayers] = React.useState<readonly ArtLayer[]>(() =>
+    drawsScene(background) ? [{ art: background, id: 0, later: false }] : [],
+  )
+  const top = layers.at(-1)
+  if (drawsScene(background) && top?.art !== background) {
+    // Derived during render (not in an effect), so the new band is in the same commit as the choice.
+    setLayers([...(top ? [top] : []), { art: background, id: (top?.id ?? -1) + 1, later: true }])
+  }
   React.useEffect(() => {
-    if (drawsScene(background)) setArt(background)
-  }, [background])
-  if (art === null) return null
+    if (layers.length < 2) return
+    const t = window.setTimeout(() => setLayers((l) => l.slice(-1)), CROSSFADE_MS)
+    return () => window.clearTimeout(t)
+  }, [layers])
+  if (!top) return null
   return (
-    <LakeBand
-      variant={art}
-      still={off}
-      data-state={off ? "off" : "on"}
-      className={cn(BAND, ART_FADE, off && "opacity-0")}
-    />
+    <>
+      {layers.map((layer) => {
+        const isTop = layer.id === top.id
+        return (
+          <LakeBand
+            key={layer.id}
+            variant={layer.art}
+            // The band under a cross-fade keeps moving until it goes; only Off holds the picture still.
+            still={off}
+            data-state={off ? "off" : "on"}
+            className={cn(
+              BAND,
+              ART_FADE,
+              off && "opacity-0",
+              isTop && (layer.later ? "starting:opacity-0" : ART_FIRST_FADE),
+            )}
+          />
+        )
+      })}
+    </>
   )
 }
 
@@ -141,7 +181,8 @@ export function ContextStrip({ mode, marts }: { mode: Mode; marts: number | null
   return (
     <div className="flex h-8 min-w-0 items-center gap-2 bg-muted/50 px-3.5 text-xs text-muted-foreground dark:bg-white/[0.03]">
       <Database aria-hidden className="size-3.5 shrink-0" />
-      <span className="min-w-0 truncate">
+      {/* Micro-interaction audit 2026-11-14: switching Ask and Build swaps the line with a short fade, so the change of what the composer will do is seen. */}
+      <span key={mode} className="min-w-0 truncate transition-opacity duration-200 ease-ui starting:opacity-0">
         {mode === "build" ? "Can build dashboards, pipelines and more" : reads}
         <span aria-hidden> · </span>
         {mode === "build" ? "Asks before each change" : "Answers only, changes nothing"}

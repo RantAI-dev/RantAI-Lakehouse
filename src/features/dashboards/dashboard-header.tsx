@@ -19,8 +19,13 @@ import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 
-/** One easing and duration for every hover, press and change here (owner taste: 150–250 ms, eased, never linear). */
-export const EASE = "transition-[background-color,border-color,color,box-shadow,opacity,transform] duration-200 ease-[cubic-bezier(0.2,0,0,1)]";
+/**
+ * One easing and duration for every hover, press and change here (owner taste: 150–250 ms, eased, never linear).
+ * Micro-interaction audit 2026-11-14 (emil): Tailwind v4's `scale-*`, `rotate-*` and `translate-*` set the
+ * `scale`, `rotate` and `translate` properties, not `transform`, so the list names those; with `transform`
+ * the press scale and the chip's chevron turn jumped. `ease-ui` is the console's strong ease-out.
+ */
+export const EASE = "transition-[background-color,border-color,color,box-shadow,opacity,scale,rotate,translate] duration-200 ease-ui";
 /** The keyboard focus ring the custom controls of the page use. */
 export const FOCUS = "outline-none focus-visible:ring-3 focus-visible:ring-ring/50";
 
