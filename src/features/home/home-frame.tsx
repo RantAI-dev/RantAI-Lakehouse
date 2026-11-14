@@ -74,7 +74,14 @@ export function HomeFrame({
       aria-busy={busy || undefined}
       role={busy ? "status" : undefined}
       aria-label={busy ? "Loading Home" : undefined}
-      className="relative -m-4 h-[calc(100svh-var(--app-navbar-h))] overflow-y-auto sm:-m-5 lg:-m-6"
+      data-home-frame=""
+      className={cn(
+        "relative -m-4 h-[calc(100svh-var(--app-navbar-h))] overflow-y-auto sm:-m-5 lg:-m-6",
+        // The band's base colour, for the greeting's halo; none when there is no art.
+        "[--home-scene-base:#f3eee2] dark:[--home-scene-base:#061230]",
+        background === "off" && "[--home-scene-base:transparent] dark:[--home-scene-base:transparent]",
+        background === null && "in-data-[home-bg=off]:[--home-scene-base:transparent]",
+      )}
     >
       {background === null ? (
         <LakeBandBase className={cn(BAND, "in-data-[home-bg=off]:opacity-0")} />
@@ -114,6 +121,13 @@ function SceneBand({ background }: { background: HomeBackground }) {
 /** The hero's box: the greeting, the composer and the chips, centred. */
 export const HERO = "mx-auto w-full max-w-[680px]"
 export const GREETING = "text-center text-2xl leading-8 font-semibold tracking-[-0.02em] text-balance text-foreground"
+/**
+ * The greeting's words: marked for the scene's veil (`lake-scene.tsx`), with
+ * a soft halo in the band's base colour, so they read over the art without
+ * a hole cut in it (owner QA 2026-11-14).
+ */
+export const GREETING_TEXT =
+  "[text-shadow:0_0_1px_var(--home-scene-base),0_0_3px_var(--home-scene-base),0_0_6px_var(--home-scene-base),0_0_12px_var(--home-scene-base)]"
 
 /**
  * The composer's foot: what Ask reads and that it changes nothing, or that
