@@ -61,4 +61,64 @@
 
 ## 6. Handoff
 
-(developer)
+### Slice 1 (the whole PR), 2026-11-14, Opus developer agent
+
+Branch `feat/web-17-home-revamp`, base `50451d5a`. Not pushed.
+
+| Task | Commit |
+| --- | --- |
+| T1 before screenshots | `5d555fb4` |
+| T2 the scene | `558bfdf8` |
+| T3 layout | `deed7120` |
+| T4 Background choice | `e4380100` |
+| T5 states + Home loading look (planner's mid-task addition) | `dcbc0867` |
+| T6 Ask why | `1ba02d85` (test only; the behaviour landed with the Pipelines widget in T3) |
+| fixes found while checking T7 | `11e9d399` (focal waits for favourites; orchestrator-unreachable wording), `a87361c7` (phone greeting patch) |
+| T7 after screenshots | `bea11bf3` |
+| T8 this entry | the commit that adds it |
+
+**The scene** (`src/features/home/lake-scene.tsx`): one 2D canvas sized to the hero band (300 px phone, 400 px from `sm`), never the page. The first drawing waits for `requestIdleCallback` after first paint (fallback `setTimeout`), then fades in once (500 ms, skipped under reduced motion); until then the band is its solid base colour. The still sky (moon, stars, whale above water) is computed once per size and theme; only the water rows are recomputed, at most 10 fps (`FRAME_MS = 100`), only while an `IntersectionObserver` says it is on screen and `document.hidden` is false. Dither is one pixel per 3 px block scaled up without smoothing; ASCII draws glyphs per colour over a cached sky layer. Under `prefers-reduced-motion` it draws once and stops. A `ResizeObserver` redraws only on a real box change.
+
+**Cost**, headless Chrome 148 on this VM (software rendering, `--disable-gpu`), 1366×800, dark, `Performance.getMetrics` `TaskDuration` over 10 s, canvas hashed before/after:
+
+| Case | Main thread busy | Script | Canvas changed |
+| --- | --- | --- | --- |
+| Dither, visible | 10.4 % | 6.1 % | yes |
+| ASCII, visible | 12.5 % | 5.1 % | yes |
+| Dither, reduced motion | 1.4 % | 0 % | no (still) |
+| Dither, scrolled off screen (1366×450, band bottom at −66 px) | 1.7 % | 0.2 % | no (paused) |
+| Background Off (baseline) | 1.1 % | 0 % | no |
+
+**Data per widget** (all existing APIs, nothing sample):
+- Focal dashboard: `dashboardService.listBoards` + `dashboardService.shortcuts()` favourites + `readLastBoard()`; order in `lib/home-focal` (chosen in Customize → first favourite → last opened → most recently updated; charts only). Tiles from `/api/dashboard?board=` via `DashboardPreview` (now tiles only, no box per tile). Meta line: why it is shown + `updatedAt`.
+- Recent AI chats: `copilot.sessions` (latest 4, `updatedAt`); `use-copilot` now reports `sessionsRead` (loading/ok/error). Rows open `/copilot?id=<id>` (the param Home already used; `/copilot` reads `id` or `session`). "All chats" opens the latest conversation, hidden with no chats (planner's correction).
+- Pipelines: `pipelineService.listPipelines` → `pipelineRows(…, 4)`; status, last run, next run; failed rows offer Ask why. A 503 with `error` and no rows reads "Couldn't reach the orchestrator to list pipelines."
+- Needs attention: `homeStatus()` unchanged over pipelines, `overviewService.listAlerts`, `connectorService.listConnectors`, `overviewService.getSummary().staleAssets`; rows list alerts, sources, datasets (failing pipelines are counted in the line but listed only in Pipelines). Clear = one line "All clear · checked HH:MM".
+- Context strip: `goldService.listMarts().length` ("Reads the N tables you can see"); count dropped if the read fails.
+
+**Commands run** (each under `systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0 nice -n 15`, one at a time, after `free -m` showed ≥ 3 GB available), final run on `bea11bf3` plus this entry:
+- `bun run typecheck`: exit 0.
+- `bun x eslint <the 24 changed .ts/.tsx files under src>`: exit 0, 0 errors, 1 warning (`changedABoard` unused in `use-copilot.ts:9`, present at the base).
+- `bun test src/features/home src/lib/home-*.test.ts`: 56 pass, 0 fail (8 files).
+- `bun test src/components/app-shell/app-shell-skeleton.test.tsx src/components/app-shell/shell-placeholder.test.ts`: 15 pass, 0 fail.
+- `bun test src/features/copilot/use-copilot.test.tsx src/features/copilot/copilot-page.test.tsx src/features/copilot/chat-messages.test.tsx`: 43 pass, 0 fail.
+- No Rust, Python or compose touched; no cargo command run.
+
+**Screenshots**: `docs/plans/web-17-screens/before-*` (6) and `after-*` (18). `*-stubbed` shots use CDP-fulfilled API answers (the QA stack has no chats and no pipelines): `after-1366x800-dark-empty-stubbed`, `after-1366x900-dark-activity-stubbed` (a failed pipeline after Ask why). At 1366×800 the focal dashboard's first tile row ends at 750 px (light and dark), inside the viewport. No horizontal scroll at 390×844 (document and Home's own scroller).
+
+**Decisions taken where the plan was not exact** (please review):
+1. The plan calls Customize a dialog; in the code it was an in-place edit mode. Customize is now a menu: Background as three still previews (DESIGN.md §2, a visual choice is a preview) plus "Edit cards and shortcuts" (the old edit mode, unchanged). It is offered even where layouts cannot be saved.
+2. Needs attention is a fixed widget, not a card in the catalogue: a person's saved layout from before would not list a new id and the status would vanish for them.
+3. "Ask" on attention rows, Ask why, and the empty states now fill the composer (nothing sent); the old status pill's "Ask AI" sent at once. The suggestion chips still send at once, as before.
+4. The planner's T5 addition needs the Background known before first paint for the server-rendered shell placeholder: `src/app/layout.tsx` runs a constant script (`HOME_BACKGROUND_SCRIPT`, with the request's CSP nonce, like next-themes) that sets `<html data-home-bg="off">`; the placeholder's band and padding follow it in CSS.
+5. Removed with their only users: `recent-card.tsx`, `pipeline-runs-card.tsx`, `start-button.tsx`, `lib/home-recent.ts` and its test, the shortcuts' AI prompts. The page's fade-in and scroll snap are gone (one loading look into the page).
+
+**Not verified**:
+- Full `bun run lint` and `bun run test`: not run (owner machine rule; CI runs them).
+- iPhone 13 Safari (AC6): not run; only Chrome's 390×844 mobile emulation.
+- The hidden-tab pause is in code (`document.hidden` check inside a `requestAnimationFrame` loop) but was not measured.
+- CPU numbers are from software rendering on this VM; a real laptop with a GPU will differ.
+- Empty and failed-pipeline states were seen only with stubbed API answers; the error states only in unit tests and the QA stack's real "could not check datasets".
+- Phone: the three shortcuts and Customize wrap to two lines at 390 px; the composer's text box keeps its two-line minimum (`Textarea` `min-h-16`).
+
+Processes: dev server on 28699 (`bun x next dev` 373591, node 373608, next-server 373654) and headless Chrome on 28690 (373590) stopped by PID; both ports free. `AGENTS.md` rewrites by `next dev` reverted before every commit.
