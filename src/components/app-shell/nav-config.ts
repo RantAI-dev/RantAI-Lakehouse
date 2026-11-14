@@ -8,7 +8,6 @@ import {
   FileText,
   GitBranch,
   HeartPulse,
-  History,
   LayoutGrid,
   Home,
   KeyRound,
@@ -61,9 +60,11 @@ export type NavGroup = {
  * - Home: where work starts — the Copilot composer, and what needs you.
  *   It is the one place a conversation is started; there is no separate
  *   "Ask AI" entry, which used to open a second, near-identical composer.
- * - History: the conversations already had — find, reopen, rename, delete.
- *   A conversation itself is `/copilot?id=…`, reached from Home or here.
- * - Dashboards: always top level, right under History — it is where most
+ * - The conversations already had have no entry of their own (`WEB-18`,
+ *   owner 2026-11-14): on a conversation (`/copilot?id=…`) the sidebar itself
+ *   lists them, as in a chat app (`SidebarChats`), and elsewhere they are
+ *   reached from Home and the navbar's AI Copilot panel.
+ * - Dashboards: always top level, right under Home — it is where most
  *   people spend their time, not a sub-page of Data.
  * - Data: where data lives and how it is read (catalog, queries).
  * - Build: author and operate data movement and outbound exports.
@@ -85,18 +86,6 @@ export const NAV_GROUPS: NavGroup[] = [
         title: "Home",
         href: "/",
         icon: Home,
-        requires: ["assistant:use", "assistant:ask"],
-      },
-    ],
-  },
-  {
-    label: "History",
-    icon: History,
-    items: [
-      {
-        title: "History",
-        href: "/copilot/history",
-        icon: History,
         requires: ["assistant:use", "assistant:ask"],
       },
     ],
@@ -212,21 +201,12 @@ const SECONDARY_ROUTES: { title: string; href: string }[] = [
   { title: "Saved Queries", href: "/query-studio/saved" },
   { title: "All Dashboards", href: "/dashboards/browse" },
   // One conversation with Copilot. Not a sidebar entry: it is opened from
-  // Home (a new one) or from History (an old one).
+  // Home (a new one) or from the sidebar's chat list (an old one, `WEB-18`).
   { title: "Conversation", href: "/copilot" },
   // Table detail pages, opened from System status's maintenance runs or
   // an asset's Snapshots tab. Their nav entry was removed, so without this the
   // title would fall back to the product name.
   { title: "Iceberg Table", href: "/lakehouse/tables" },
-]
-
-/**
- * Routes whose sidebar parent is not a prefix of their path. An open
- * conversation (`/copilot`) belongs under History (`/copilot/history`),
- * which the longest-prefix rule alone cannot see.
- */
-const HIGHLIGHT_UNDER: { href: string; item: string }[] = [
-  { href: "/copilot", item: "/copilot/history" },
 ]
 
 function bestMatch<T extends { href: string }>(
@@ -245,12 +225,11 @@ function bestMatch<T extends { href: string }>(
 /**
  * Resolves which sidebar item should be highlighted for a pathname.
  * Longest-match semantics so nested routes highlight their closest parent.
+ * A conversation (`/copilot`) highlights none: its sidebar is the chat
+ * list, and the menu's "AI chats" row stands for it there (`WEB-18`).
  */
 export function activeNavHref(pathname: string): string | undefined {
-  return (
-    bestMatch(pathname, ALL_NAV_ITEMS)?.href ??
-    bestMatch(pathname, HIGHLIGHT_UNDER)?.item
-  )
+  return bestMatch(pathname, ALL_NAV_ITEMS)?.href
 }
 
 /**
@@ -279,7 +258,6 @@ export const ROUTE_ACCESS: readonly RouteAccessEntry[] = [
   // Home and AI
   { pattern: "/", requires: ["assistant:use", "assistant:ask"] },
   { pattern: "/copilot", requires: ["assistant:use", "assistant:ask"] },
-  { pattern: "/copilot/history", requires: ["assistant:use", "assistant:ask"] },
 
   // Dashboards
   { pattern: "/dashboards", requires: ["dashboard:read"] },

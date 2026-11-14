@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test"
 import * as fs from "node:fs"
-import { shellPlaceholderFor } from "./shell-placeholder"
+import { shellPlaceholderFor, sidebarPlaceholderFor } from "./shell-placeholder"
 
 describe("shellPlaceholderFor", () => {
   it("gives the Dashboards page its own list placeholder", () => {
@@ -49,5 +49,16 @@ describe("shellPlaceholderFor", () => {
     for (const name of pages) {
       expect(shellPlaceholderFor(`/dashboards/${name}`)).not.toBe("dashboard")
     }
+  })
+})
+
+describe("sidebarPlaceholderFor (WEB-18 T5)", () => {
+  it("draws the chat list on a conversation, and the menu elsewhere", () => {
+    expect(sidebarPlaceholderFor("/copilot")).toBe("chats")
+    expect(sidebarPlaceholderFor("/copilot?id=c1")).toBe("chats")
+    expect(sidebarPlaceholderFor("/copilot/")).toBe("chats")
+    expect(sidebarPlaceholderFor("/")).toBe("menu")
+    expect(sidebarPlaceholderFor("/catalog")).toBe("menu")
+    expect(sidebarPlaceholderFor("/copilot/history")).toBe("menu")
   })
 })

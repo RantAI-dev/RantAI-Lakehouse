@@ -34,3 +34,15 @@ export function shellPlaceholderFor(pathname: string): ShellPlaceholder {
   if (board !== undefined && !DASHBOARD_PAGES.has(board)) return "dashboard"
   return "page"
 }
+
+/**
+ * Which of the sidebar's two views the loading shell draws (`WEB-18` T5):
+ * the chat list on a conversation (`/copilot`), where the real sidebar lists
+ * the chats instead of the menu, and the menu everywhere else.
+ */
+export type SidebarPlaceholder = "menu" | "chats"
+
+export function sidebarPlaceholderFor(pathname: string): SidebarPlaceholder {
+  const path = pathname.split(/[?#]/)[0].replace(/\/+$/, "") || "/"
+  return path === "/copilot" ? "chats" : "menu"
+}
