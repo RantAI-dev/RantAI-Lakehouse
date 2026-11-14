@@ -539,3 +539,53 @@ describe("the header row (BI-59 review rounds 1 and 2, SHOULD-FIX 1 and 3)", () 
     expect(searchBox?.className).toContain("shrink-0")
   })
 })
+
+// Owner QA 2026-11-14 ("kenapa kita punya dua skeleton page?"): while its reads are on their way
+// the page draws the same placeholders the loading shell drew for this route
+// (`dashboard-list-skeleton.tsx`), under its real header and filter row.
+describe("the page while it loads", () => {
+  /** Serves the session and holds the boards read until `release` is called. */
+  function serveHeld(permissions: string[]) {
+    let release = () => {}
+    const held = new Promise<void>((resolve) => { release = resolve })
+    spyOn(globalThis, "fetch").mockImplementation(((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes("/api/auth/me")) {
+        return Promise.resolve(json({ id: "u1", name: "Rina", email: null, roles: ["R"], permissions, tenants: [] }))
+      }
+      if (url.includes("/api/dashboard/boards")) return held.then(() => json({ boards: BOARDS }))
+      if (url.includes("/api/dashboard/folders")) return Promise.resolve(json({ folders: [] }))
+      if (url.includes("/api/dashboard/shortcuts")) return Promise.resolve(json({ favourites: [], recent: [] }))
+      if (url.includes("/api/dashboard/reports")) return Promise.resolve(json({ reports: [], truncated: false, maxCharts: 30 }))
+      if (url.includes("/api/dashboard/templates")) return Promise.resolve(json({ templates: [], truncated: false }))
+      if (url.includes("/api/dashboard/specs")) return Promise.resolve(json({ charts: [] }))
+      return Promise.resolve(json({}))
+    }) as unknown as typeof fetch)
+    return () => release()
+  }
+
+  it("draws the shared rows and Recent placeholders below the real header and type filter", async () => {
+    const release = serveHeld(["dashboard:read"])
+    renderPage()
+    await header()
+    expect(screen.getByRole("group", { name: "Type" })).toBeTruthy()
+    const status = await screen.findByRole("status", { name: "Loading dashboards" })
+    expect(status.querySelector("table")).toBeTruthy()
+    expect(screen.getByText("Recent").closest("[aria-hidden]")).toBeTruthy()
+    release()
+    await screen.findByText("QA BI")
+    expect(screen.queryByRole("status", { name: "Loading dashboards" })).toBeNull()
+  })
+
+  it("draws the gallery's placeholder when the gallery is the stored view, from the first frame", async () => {
+    localStorage.setItem("dashboards:browse-view", "gallery")
+    const release = serveHeld(["dashboard:read"])
+    renderPage()
+    const status = await screen.findByRole("status", { name: "Loading dashboards" })
+    expect(status.querySelector("table")).toBeNull()
+    expect(status.querySelectorAll("li").length).toBeGreaterThan(0)
+    expect(screen.getByRole("button", { name: "Gallery view" }).getAttribute("aria-pressed")).toBe("true")
+    release()
+    await screen.findByText("QA BI")
+  })
+})
