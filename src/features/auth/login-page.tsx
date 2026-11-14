@@ -83,6 +83,25 @@ function useDesktop(): boolean {
   return React.useSyncExternalStore(subscribeDesktop, () => window.matchMedia(DESKTOP_QUERY).matches, () => false);
 }
 
+/** How long the first look lasts (`login.css`, T9): the whole sequence is under it. */
+const FIRST_LOOK_MS = 900;
+
+/**
+ * True for the page's first 900 ms (`WEB-15` T9). The reveal animations in
+ * `login.css` apply only under `.login-first`, so a part that appears later
+ * (the form after the session check, the page again after the
+ * change-password step) simply appears, and nothing replays. The server
+ * renders `true`, so without JavaScript the reveal runs once and ends visible.
+ */
+function useFirstLook(): boolean {
+  const [first, setFirst] = React.useState(true);
+  React.useEffect(() => {
+    const id = window.setTimeout(() => setFirst(false), FIRST_LOOK_MS);
+    return () => window.clearTimeout(id);
+  }, []);
+  return first;
+}
+
 /**
  * The console's interaction easing: the properties that change, never `all`.
  * 160 ms (`WEB-15` T5, emil-design-eng: press feedback 100 to 160 ms, inside
@@ -233,6 +252,7 @@ export function LoginPage() {
   const passwordRef = React.useRef<HTMLInputElement>(null);
   const showcaseReady = useAfterIdle();
   const desktop = useDesktop();
+  const firstLook = useFirstLook();
 
   if (error !== null && error !== shownError) setShownError(error);
 
@@ -347,27 +367,34 @@ export function LoginPage() {
   const invalid = !!error;
 
   return (
-    <div className={cn(loginDisplay.variable, "flex min-h-svh flex-col bg-background text-foreground lg:flex-row lg:gap-3 lg:p-3")}>
+    <div className={cn(loginDisplay.variable, firstLook && "login-first", "flex min-h-svh flex-col bg-background text-foreground lg:flex-row lg:gap-3 lg:p-3")}>
       {/* Left: the product, bleeding off the panel's lower right like a
           product shot (mockup A). The panel and its caption render with the
-          page; the dashboard inside arrives after the form. */}
+          page; the dashboard inside arrives after the form. The panel is the
+          lake: a solid deep navy from the logo's #050A2F, one step lighter
+          so the card's lift still reads on it (T7, owner 2026-11-14: "jangan
+          putih dong, biar kontras"); on the dark page a deeper blue-navy,
+          still distinct from the page's neutral black. */}
       <section
         aria-label="A preview of the console (sample data)"
-        className="relative hidden flex-[1.15] overflow-hidden rounded-3xl bg-muted/55 lg:block dark:bg-card/45"
+        className="relative hidden flex-[1.15] overflow-hidden rounded-3xl bg-[#0B1440] lg:block dark:bg-[#0A1030]"
       >
         {/* The lake under the product: depth lines, server-rendered, behind the card. */}
         <LoginContours />
         <div aria-hidden className="absolute top-[11%] left-[8%] h-[74%] w-[104%] min-w-[640px]">
           {showcaseReady && desktop ? <LoginShowcase /> : null}
         </div>
-        <div className="absolute bottom-8 left-[8%] flex items-center gap-3">
-          <p className="text-sm font-medium text-foreground/80">Every dataset, pipeline and dashboard in one place.</p>
+        <div className="login-reveal login-reveal-caption absolute bottom-8 left-[8%] flex items-center gap-3">
+          <p className="text-sm font-medium text-white/85">Every dataset, pipeline and dashboard in one place.</p>
         </div>
       </section>
 
       {/* The form, centred; the brand mark sits top-left in the panel's own padding. */}
       <main className="relative flex min-h-svh flex-1 flex-col px-5 pt-5 pb-6 sm:px-10 lg:min-h-0 lg:px-14">
-        <div className="flex items-center justify-between">
+        {/* T9: the form side arrives in one short stagger after the lake
+            (`login.css`, `.login-reveal-*`); first paint only, nothing moves
+            with reduced motion, and the fields take focus and typing at once. */}
+        <div className="login-reveal login-reveal-0 flex items-center justify-between">
           <Logo className="h-7" />
           <ThemeToggle className={cn(EASE, PRESS)} />
         </div>
@@ -387,12 +414,14 @@ export function LoginPage() {
             <React.Suspense fallback={null}>
               <SsoNotice />
             </React.Suspense>
-            <h1 className={cn(LOGIN_DISPLAY, "text-[30px] leading-[1.1] text-foreground")}>
+            {/* Centred over the form column (T8, owner 2026-11-14); the
+                labels, fields and notices stay left-aligned for reading. */}
+            <h1 className={cn(LOGIN_DISPLAY, "login-reveal login-reveal-1 text-center text-[30px] leading-[1.1] text-foreground")}>
               Sign in to Rantai Lake
             </h1>
 
             {checkingSession ? (
-              <div className="mt-7 flex flex-col gap-5" aria-label="Loading" role="status">
+              <div className="login-reveal login-reveal-2 mt-7 flex flex-col gap-5" aria-label="Loading" role="status">
                 <Skeleton className="h-[72px] w-full" />
                 <Skeleton className="h-[72px] w-full" />
                 <Skeleton className="h-11 w-full" />
@@ -409,7 +438,7 @@ export function LoginPage() {
                     if (e.target === e.currentTarget) setShaking(false);
                   }}
                 >
-                  <Field data-invalid={invalid}>
+                  <Field data-invalid={invalid} className="login-reveal login-reveal-2">
                     <FieldLabel htmlFor="login-email" className="text-sm">
                       Username or email
                     </FieldLabel>
@@ -441,7 +470,7 @@ export function LoginPage() {
                     </InputGroup>
                   </Field>
 
-                  <Field data-invalid={invalid}>
+                  <Field data-invalid={invalid} className="login-reveal login-reveal-3">
                     <FieldLabel htmlFor="login-password" className="text-sm">
                       Password
                     </FieldLabel>
@@ -555,7 +584,7 @@ export function LoginPage() {
                   <Button
                     type="submit"
                     size="lg"
-                    className={cn("h-11 w-full rounded-lg text-sm", SIGN_IN_COLOURS, EASE, PRESS)}
+                    className={cn("login-reveal login-reveal-4 h-11 w-full rounded-lg text-sm", SIGN_IN_COLOURS, EASE, PRESS)}
                     disabled={submitting}
                   >
                     {/* Idle and busy labels fade into each other (150 ms)
@@ -576,7 +605,7 @@ export function LoginPage() {
           </div>
         </div>
 
-        <footer className="flex items-center justify-between gap-4 text-xs text-muted-foreground">
+        <footer className="login-reveal login-reveal-5 flex items-center justify-between gap-4 text-xs text-muted-foreground">
           <span>© {new Date().getFullYear()} Rantai Lake</span>
           {/* Placeholder destination — point this at the docs site (or
               wherever support lives) once that URL exists. */}
