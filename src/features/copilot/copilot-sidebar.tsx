@@ -2,13 +2,14 @@
 
 import * as React from "react";
 import { usePathname } from "next/navigation";
-import { Bot, Plus, PanelBottom, PanelRightClose, X } from "lucide-react";
+import { Bot, Plus, PanelBottom, X } from "lucide-react";
 import { useSidePanel } from "@/components/app-shell/side-panel";
 import { SuggestionButton } from "@/features/copilot/suggestion-button";
 import { useCopilot } from "./use-copilot";
 import { ChatMessages } from "./chat-messages";
 import { ChatComposer } from "./chat-composer";
 import { CopilotHistoryButton } from "./history-menu";
+import { useSlidingIndicator } from "@/hooks/use-sliding-indicator";
 import { cn } from "@/lib/utils";
 
 /**
@@ -81,6 +82,10 @@ export function CopilotSidebar({ hasAssistant = true }: { readonly hasAssistant?
         : { width: `${c.sidebarWidth}px`, minWidth: `${c.sidebarWidth}px`, maxWidth: "850px" }}
       className={cn(
         "sticky top-(--app-navbar-h) flex h-[calc(100vh-var(--app-navbar-h))] shrink-0 flex-col border-l border-border bg-card/95 backdrop-blur-md",
+        // Micro-interaction audit 2026-11-14 (emil): the panel arrives from the edge it docks to (a short
+        // slide and fade on the drawer curve) instead of appearing in one frame; closing stays instant, so
+        // the page gets its width back at once. On a phone it rises from the bottom.
+        "transition-[opacity,translate] duration-[260ms] ease-drawer starting:opacity-0 md:starting:translate-x-4 max-md:starting:translate-y-4",
         tabbed && "max-md:fixed max-md:inset-x-0 max-md:bottom-0 max-md:z-40 max-md:h-auto max-md:border-l-0 max-md:bg-card md:w-(--side-panel-w) md:max-w-[850px] md:min-w-(--side-panel-w)",
         isDragging && "select-none",
       )}
@@ -100,7 +105,7 @@ export function CopilotSidebar({ hasAssistant = true }: { readonly hasAssistant?
       >
         <span
           className={cn(
-            "h-12 w-1 rounded-full transition-all pointer-events-none",
+            "h-12 w-1 rounded-full transition-[height,background-color] duration-200 ease-ui pointer-events-none",
             isDragging ? "h-16 w-1 bg-primary" : "bg-border/80 group-hover:h-14 group-hover:bg-primary/70",
           )}
         />
@@ -126,11 +131,11 @@ export function CopilotSidebar({ hasAssistant = true }: { readonly hasAssistant?
             <>
               <CopilotHistoryButton align="end" />
               <button type="button" onClick={() => c.setDockPosition("bottom")} aria-label="Switch to bottom floating dock" title="Switch to bottom floating dock"
-                className="grid size-7 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground">
+                className="grid size-7 place-items-center rounded-md text-muted-foreground transition-[background-color,color,scale] duration-150 ease-ui hover:bg-muted hover:text-foreground active:scale-95">
                 <PanelBottom className="size-4" />
               </button>
               <button type="button" onClick={c.newChat} aria-label="New chat" title="New chat"
-                className="grid size-7 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground">
+                className="grid size-7 place-items-center rounded-md text-muted-foreground transition-[background-color,color,scale] duration-150 ease-ui hover:bg-muted hover:text-foreground active:scale-95">
                 <Plus className="size-4" />
               </button>
             </>
@@ -163,7 +168,7 @@ export function CopilotSidebar({ hasAssistant = true }: { readonly hasAssistant?
             onClick={() => c.setDockPosition("bottom")}
             aria-label="Switch to bottom floating dock"
             title="Switch to bottom floating dock"
-            className="grid size-7 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            className="grid size-7 place-items-center rounded-md text-muted-foreground transition-[background-color,color,scale] duration-150 ease-ui hover:bg-muted hover:text-foreground active:scale-95"
           >
             <PanelBottom className="size-4" />
           </button>
@@ -172,18 +177,9 @@ export function CopilotSidebar({ hasAssistant = true }: { readonly hasAssistant?
             onClick={c.newChat}
             aria-label="New chat"
             title="New chat"
-            className="grid size-7 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            className="grid size-7 place-items-center rounded-md text-muted-foreground transition-[background-color,color,scale] duration-150 ease-ui hover:bg-muted hover:text-foreground active:scale-95"
           >
             <Plus className="size-4" />
-          </button>
-          <button
-            type="button"
-            onClick={() => c.setExpanded(false)}
-            aria-label="Collapse AI Copilot"
-            title="Collapse AI Copilot"
-            className="grid size-7 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-          >
-            <PanelRightClose className="size-4" />
           </button>
         </div>
       </div>
@@ -257,21 +253,28 @@ function PanelTabs({
   readonly onClose: () => void;
   readonly copilotTools: React.ReactNode;
 }) {
+  // Micro-interaction audit 2026-11-14 (emil): the chosen tab's fill is one pill that slides to the tab
+  // chosen, so the eye follows the switch; the tabs themselves only change colour and give under a press.
+  const { listRef, indicatorRef } = useSlidingIndicator(`${active ?? "copilot"}|${tabs.map((t) => t.id).join(",")}`, { box: true });
   const tab = (on: boolean) => cn(
-    "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-sm font-medium outline-none transition-colors duration-200 ease-[cubic-bezier(0.2,0,0,1)] focus-visible:ring-3 focus-visible:ring-ring/50",
-    on ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+    "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-sm font-medium outline-none transition-[background-color,color,scale] duration-200 ease-ui focus-visible:ring-3 focus-visible:ring-ring/50 active:scale-[0.97]",
+    on ? "text-foreground" : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
   );
   return (
     <div className="flex h-14 shrink-0 items-center gap-1 border-b border-border px-2.5">
-      <div role="tablist" aria-label="Side panel" className="flex min-w-0 items-center gap-0.5 overflow-x-auto [scrollbar-width:none]">
+      <div ref={listRef} role="tablist" aria-label="Side panel" className="relative isolate flex min-w-0 items-center gap-0.5 overflow-x-auto [scrollbar-width:none]">
+        <span ref={indicatorRef} aria-hidden data-slot="panel-tab-indicator"
+          className="pointer-events-none absolute top-0 left-0 -z-10 rounded-lg bg-muted data-ready:transition-[transform,width] data-ready:duration-[240ms] data-ready:ease-move" />
         {withCopilot ? (
-          <button type="button" role="tab" aria-selected={active === null} onClick={onCopilot} className={tab(active === null)}>
+          <button type="button" role="tab" aria-selected={active === null} onClick={onCopilot} className={tab(active === null)}
+            data-indicator-item data-indicator-active={active === null || undefined}>
             {/* BI-61 review round 1, SHOULD-FIX 2: no sparkles icon on what this branch adds (DESIGN.md, AI slop). */}
             <Bot className="size-3.5 text-muted-foreground" aria-hidden /> AI Copilot
           </button>
         ) : null}
         {tabs.map((t) => (
-          <button key={t.id} type="button" role="tab" aria-selected={active === t.id} onClick={() => onTab(t.id)} className={tab(active === t.id)}>
+          <button key={t.id} type="button" role="tab" aria-selected={active === t.id} onClick={() => onTab(t.id)} className={tab(active === t.id)}
+            data-indicator-item data-indicator-active={active === t.id || undefined}>
             {t.label}
           </button>
         ))}
@@ -279,7 +282,7 @@ function PanelTabs({
       <div className="ml-auto flex shrink-0 items-center gap-0.5">
         {copilotTools}
         <button type="button" onClick={onClose} aria-label="Close panel" title="Close panel"
-          className="grid size-7 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground">
+          className="grid size-7 place-items-center rounded-md text-muted-foreground transition-[background-color,color,scale] duration-150 ease-ui hover:bg-muted hover:text-foreground active:scale-95">
           <X className="size-4" />
         </button>
       </div>

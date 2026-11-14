@@ -36,6 +36,21 @@ function ThemeIcon({
 }
 
 /**
+ * The menu header's role line: separators become spaces and the first letter is capital
+ * (`platform_admin` is "Platform admin"; a name already written "Platform Admin" stays so).
+ * Several roles: the first two, then "+N". Empty when there are none.
+ */
+export function roleLine(roles: readonly string[] | undefined): string {
+  const names = (roles ?? [])
+    .map((r) => r.replace(/[_-]+/g, " ").trim())
+    .filter(Boolean)
+    .map((r) => r.charAt(0).toUpperCase() + r.slice(1))
+  if (names.length === 0) return ""
+  const rest = names.length - 2
+  return names.slice(0, 2).join(", ") + (rest > 0 ? ` +${rest}` : "")
+}
+
+/**
  * Who's signed in, with a logout affordance and theme selection. Renders once `AuthProvider` has resolved a user (see `AppFrame`).
  *
  * BI-61 review round 1, SHOULD-FIX 7 (owner decision 2026-11-14): the account
@@ -51,15 +66,23 @@ function ThemeIcon({
 export function UserMenu({
   userName,
   userEmail,
+  roles,
   onLogout,
   trigger,
+  side,
+  align = "start",
   children,
 }: Readonly<{
   userName: string | undefined
   userEmail: string | null | undefined
+  /** The session's role names, shown under the email. */
+  roles?: readonly string[]
   onLogout: () => void | Promise<void>
   /** The element that opens the menu (the sidebar's footer card); it receives the menu's props and ref. */
   trigger?: React.ReactElement
+  /** Where the menu opens from its trigger: upward from the footer row, to the right of the collapsed rail. */
+  side?: "top" | "right" | "bottom" | "left"
+  align?: "start" | "center" | "end"
   /** What `trigger` shows. */
   children?: React.ReactNode
 }>) {
@@ -97,11 +120,12 @@ export function UserMenu({
       >
         {trigger ? children : <CircleUserRound className="size-5" />}
       </DropdownMenuTrigger>
-      {/* From the sidebar's footer the menu opens upward (it flips from below), as wide as the card. */}
-      <DropdownMenuContent align="start" className="w-(--anchor-width) min-w-56">
-        <DropdownMenuLabel>
-          <p className="truncate text-sm font-medium text-foreground">{userName ?? "Signed in"}</p>
-          {userEmail ? <p className="truncate text-xs font-normal text-muted-foreground">{userEmail}</p> : null}
+      {/* From the sidebar's footer it opens upward, left edges aligned; from the collapsed rail, to its right. */}
+      <DropdownMenuContent side={side} align={align} className="w-(--anchor-width) min-w-56">
+        {/* The email, then the role: muted and not clickable; the name is already on the trigger. */}
+        <DropdownMenuLabel className="grid gap-0.5 text-xs font-normal text-muted-foreground">
+          <span className="truncate">{userEmail ?? userName ?? "Signed in"}</span>
+          {roleLine(roles) ? <span className="truncate">{roleLine(roles)}</span> : null}
         </DropdownMenuLabel>
         <DropdownMenuSeparator />
         <DropdownMenuItem render={<Link href="/account/change-password" />}>
@@ -130,13 +154,13 @@ export function UserMenu({
             </DropdownMenuRadioGroup>
           </DropdownMenuSubContent>
         </DropdownMenuSub>
-        <DropdownMenuSeparator />
         {/* REL-2 S1-T5: the console's own version, so a person can say
             which build they are looking at. Disabled — it is a fact, not
             an action. */}
         <DropdownMenuItem disabled>
           Version {CONSOLE_VERSION}
         </DropdownMenuItem>
+        <DropdownMenuSeparator />
         <DropdownMenuItem variant="destructive" onClick={() => void onLogout()}>
           <LogOut />
           Sign out

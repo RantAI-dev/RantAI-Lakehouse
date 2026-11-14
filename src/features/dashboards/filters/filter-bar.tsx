@@ -155,7 +155,7 @@ export function FilterBar({
       <Popover open={addOpen} onOpenChange={(o) => { if (o) setAddOpen(true); else closeAdd(); }}>
         <PopoverTrigger asChild>
           <button type="button" aria-label="Add filter" disabled={fields.length === 0}
-            className={cn("inline-flex h-8 shrink-0 items-center gap-1 rounded-full px-3 text-sm font-medium text-primary hover:bg-primary/10 disabled:pointer-events-none disabled:opacity-50 dark:text-sky-300", EASE, FOCUS)}>
+            className={cn("inline-flex h-8 shrink-0 items-center gap-1 rounded-full px-3 text-sm font-medium text-primary hover:bg-primary/10 active:scale-[0.97] disabled:pointer-events-none disabled:opacity-50 dark:text-sky-300", EASE, FOCUS)}>
             <Plus className="size-3.5" aria-hidden /> Filter
           </button>
         </PopoverTrigger>
@@ -208,7 +208,7 @@ export function FilterBar({
       {dirty ? (
         <span className="flex shrink-0 items-center gap-1">
           <button type="button" onClick={onReset}
-            className={cn("inline-flex h-8 shrink-0 items-center gap-1 rounded-full px-2.5 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground", EASE, FOCUS)}>
+            className={cn("inline-flex h-8 shrink-0 items-center gap-1 rounded-full px-2.5 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground active:scale-[0.97]", EASE, FOCUS)}>
             <RotateCcw className="size-3" aria-hidden /> Reset
           </button>
           {canSaveDefault ? (

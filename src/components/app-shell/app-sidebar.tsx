@@ -5,7 +5,7 @@ import { createPortal } from "react-dom"
 import Image from "next/image"
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
-import { CircleUserRound, ChevronRight, ChevronsUpDown } from "lucide-react"
+import { ChevronDown, ChevronRight } from "lucide-react"
 import { useAuth } from "@/features/auth/auth-provider"
 import { rememberTableHref } from "@/hooks/use-table-memory"
 import {
@@ -15,7 +15,6 @@ import {
   SidebarGroup,
   SidebarHeader,
   SidebarMenu,
-  SidebarMenuAction,
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarMenuSub,
@@ -46,23 +45,32 @@ export const SIDEBAR_CONTENT_CLASS = "min-w-0"
 export const SIDEBAR_GROUP_CLASS = "gap-0 px-2 py-2"
 export const SIDEBAR_MENU_CLASS = "mt-0 flex flex-col gap-0.5"
 export const SIDEBAR_FOOTER_CLASS = "border-t border-sidebar-border p-2"
-// Collapsed, the card is the avatar alone, 32 px on the icon column; the box narrows, its padding
-// eases to none and the avatar with it, in the sidebar's time.
-export const ACCOUNT_CARD_CLASS = "h-14 rounded-lg px-2 group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:p-0!"
-export const ACCOUNT_AVATAR_CLASS = cn(
-  "flex size-9 shrink-0 items-center justify-center rounded-full bg-primary/12 text-primary ring-1 ring-primary/20 transition-[width,height]",
-  SIDEBAR_MOTION,
-  "group-data-[collapsible=icon]:size-8",
-)
+// One compact row (Claude's footer): a 24 px avatar, the name and role, a chevron, 32 px tall.
+// Collapsed, it is the avatar alone, centred in the 32 px icon column.
+export const ACCOUNT_CARD_CLASS = "h-8 gap-2 rounded-lg px-1.5 group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:p-0!"
+export const ACCOUNT_AVATAR_CLASS =
+  "flex size-6 shrink-0 items-center justify-center rounded-full bg-primary/12 text-[10px] font-semibold text-primary"
+
+/** Up to two initials of a display name, for the avatar (the app has no pictures for people). */
+export function initialsOf(name: string | undefined): string {
+  const words = (name ?? "").trim().split(/\s+/).filter(Boolean)
+  if (words.length === 0) return "?"
+  const letters = words.length === 1 ? [...words[0]].slice(0, 2) : [[...words[0]][0], [...words[words.length - 1]][0]]
+  return letters.join("").toUpperCase()
+}
 export const NAV_ROW_CLASS = "h-8 rounded-md px-2 py-1.5 text-sm tracking-normal"
 export const SIDEBAR_SUB_CLASS = "mr-0 gap-0.5 border-sidebar-border pr-0 group-data-[collapsible=icon]:flex"
 
 function BrandLogo() {
   // Logo follows the theme: navy for a light sidebar, white for a dark one.
   return (
-    <div className="relative size-8 shrink-0" aria-hidden>
-      <Image src="/logo-light.png" alt="RantAI Lakehouse" fill sizes="32px" className="object-contain dark:hidden" priority />
-      <Image src="/logo-dark.png" alt="" fill sizes="32px" className="hidden object-contain dark:block" priority />
+    // A 32 px slot (the rail's icon column) holds the 24 px mark, centred in it.
+    <div className="grid size-8 shrink-0 place-items-center" aria-hidden>
+      {/* Explicit width too: a grid item centred in its slot would otherwise size to its (absolutely placed) image, i.e. 0, and the mark would not show. */}
+      <span className="relative block h-6 w-[28.17px] shrink-0">
+        <Image src="/logo-light.png" alt="RantAI Lakehouse" fill sizes="28px" className="object-contain dark:hidden" priority />
+        <Image src="/logo-dark.png" alt="" fill sizes="28px" className="hidden object-contain dark:block" priority />
+      </span>
     </div>
   )
 }
@@ -194,7 +202,7 @@ export function AppSidebar() {
         href={item.href}
         onClick={(e) => handleNavClick(e, item.href)}
         className={cn(
-          "flex items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors duration-150",
+          "flex items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors duration-150 ease-ui",
           active
             ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
             : "text-sidebar-foreground/70 hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
@@ -218,52 +226,64 @@ export function AppSidebar() {
     // One page, or icon mode with one page: nothing to expand.
     if (single) {
       return (
-        <SidebarMenuItem key={group.label}>
-          <SidebarMenuButton
-            isActive={active}
-            tooltip={label}
-            className={menuBtnClass(active)}
-            render={
-              <Link href={first.href} onClick={(e) => handleNavClick(e, first.href)}>
-                <Icon className="size-4 shrink-0" />
-                <span className={cn("truncate leading-5", SIDEBAR_FADE)}>{label}</span>
-              </Link>
-            }
-          />
-          {/* A second destination at the row's right end, where a section's
-              chevron sits. `SidebarMenuAction` hides itself in icon mode. */}
-          {first.action ? (
-            // The app's tooltips open at once: the root `TooltipProvider`
-            // has delay 0, and in base-ui a provider's zero wins over a
-            // `delay` set on the trigger. This one sits on a navigation row
-            // the pointer crosses all the time, so it gets its own provider
-            // and waits for the pointer to rest.
-            <TooltipProvider delay={500}>
-            <Tooltip>
-              <TooltipTrigger
-                render={
-                  <SidebarMenuAction
-                    aria-label={first.action.title}
-                    // Sits where a section's chevron sits: same size
-                    // (3.5) and the same 18px from the row's right edge
-                    // to its centre, measured against the Data chevron.
-                    // Fades with the label instead of vanishing as the collapse starts.
-                    className={cn("right-2 text-sidebar-foreground/50 [&>svg]:size-3.5 group-data-[collapsible=icon]:flex", SIDEBAR_FADE)}
-                    render={
-                      <Link
-                        href={first.action.href}
-                        onClick={(e) => handleNavClick(e, first.action?.href ?? first.href)}
-                      />
-                    }
-                  />
-                }
-              >
-                <first.action.icon />
-              </TooltipTrigger>
-              <TooltipContent side="right">{first.action.title}</TooltipContent>
-            </Tooltip>
-            </TooltipProvider>
-          ) : null}
+        <SidebarMenuItem key={group.label} className={first.action ? "flex items-stretch" : undefined}>
+          {(() => {
+            // A split row (shadcn's button group): the label part and, at the right end, a square
+            // part that is the whole touch target for a second destination, one thin separator
+            // between them. Each part lights up on its own; the active route lights only its own part.
+            const action = first.action
+            const actionActive = !!action && (pathname === action.href || pathname.startsWith(`${action.href}/`))
+            const labelActive = active && !actionActive
+            return (
+              <>
+                <SidebarMenuButton
+                  isActive={labelActive}
+                  tooltip={label}
+                  className={cn(
+                    menuBtnClass(labelActive),
+                    action && "min-w-0 flex-1 rounded-r-none group-data-[collapsible=icon]:flex-none group-data-[collapsible=icon]:rounded-md",
+                  )}
+                  render={
+                    <Link href={first.href} onClick={(e) => handleNavClick(e, first.href)}>
+                      <Icon className="size-4 shrink-0" />
+                      <span className={cn("truncate leading-5", SIDEBAR_FADE)}>{label}</span>
+                    </Link>
+                  }
+                />
+                {action ? (
+                  // The app's tooltips open at once: the root `TooltipProvider` has delay 0, and in
+                  // base-ui a provider's zero wins over a `delay` set on the trigger. This sits on
+                  // a navigation row the pointer crosses all the time, so it gets its own provider
+                  // and waits for the pointer to rest. Hidden with the rail's collapse: Browse stays
+                  // reachable from the page itself.
+                  <TooltipProvider delay={500}>
+                    <span aria-hidden className="my-2 w-px shrink-0 bg-sidebar-border group-data-[collapsible=icon]:hidden" />
+                    <Tooltip>
+                      <TooltipTrigger
+                        render={
+                          <Link
+                            href={action.href}
+                            aria-label={action.title}
+                            aria-current={actionActive ? "page" : undefined}
+                            onClick={(e) => handleNavClick(e, action.href)}
+                            className={cn(
+                              "grid size-8 shrink-0 place-items-center rounded-r-md outline-hidden ring-sidebar-ring transition-colors duration-150 focus-visible:ring-2 group-data-[collapsible=icon]:hidden [&>svg]:size-3.5",
+                              actionActive
+                                ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                                : "text-sidebar-foreground/70 hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
+                            )}
+                          />
+                        }
+                      >
+                        <action.icon />
+                      </TooltipTrigger>
+                      <TooltipContent side="right">{action.title}</TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                ) : null}
+              </>
+            )
+          })()}
         </SidebarMenuItem>
       )
     }
@@ -296,7 +316,9 @@ export function AppSidebar() {
               </span>
               <ChevronRight
                 className={cn(
-                  "size-3.5 shrink-0 text-sidebar-foreground/50 transition-[transform,opacity] duration-150",
+                  // Micro-interaction audit 2026-11-14: `rotate-90` sets `rotate`, not `transform`, in
+                  // Tailwind v4, so the chevron used to snap; it now turns with the section's fold.
+                  "size-3.5 shrink-0 text-sidebar-foreground/50 transition-[rotate,opacity] duration-200 ease-ui",
                   expanded && "rotate-90",
                   "group-data-[collapsible=icon]:opacity-0",
                 )}
@@ -357,7 +379,8 @@ export function AppSidebar() {
             <div
               ref={flyoutRef}
               style={{ position: "fixed", top: Math.min(flyout.top, window.innerHeight - 40 - openGroup.items.length * 34), left: flyout.left }}
-              className="z-[60] w-56 rounded-xl border border-sidebar-border bg-sidebar p-1.5 shadow-2xl"
+              // Micro-interaction audit 2026-11-14: the flyout grows out of the rail it belongs to, like the menus.
+              className="z-[60] w-56 origin-left rounded-xl border border-sidebar-border bg-sidebar p-1.5 shadow-2xl transition-[opacity,scale] duration-150 ease-ui starting:scale-[0.97] starting:opacity-0"
             >
               <p className="px-2 py-1 text-[11px] font-medium uppercase tracking-wide text-sidebar-foreground/60">{openGroup.label}</p>
               {openGroup.items.map((item) => (
@@ -377,24 +400,24 @@ export function AppSidebar() {
             <UserMenu
               userName={user?.name}
               userEmail={user?.email}
+              roles={user?.roles}
               onLogout={logout}
+              side={state === "collapsed" ? "right" : "top"}
+              align={state === "collapsed" ? "end" : "start"}
               trigger={
                 <SidebarMenuButton
-                  size="lg"
                   tooltip={user?.name ?? "Signed in"}
                   aria-label={`Account menu, ${user?.name ?? "signed in"}`}
                   className={cn(ACCOUNT_CARD_CLASS, "hover:bg-sidebar-accent data-[popup-open]:bg-sidebar-accent")}
                 />
               }
             >
-              <div className={ACCOUNT_AVATAR_CLASS}>
-                <CircleUserRound className="size-5" aria-hidden />
-              </div>
-              <div className={cn("grid min-w-0 flex-1 whitespace-nowrap text-left leading-tight", SIDEBAR_FADE)}>
-                <span className="truncate text-sm font-semibold text-sidebar-foreground">{user?.name ?? "Signed in"}</span>
-                <span className="truncate text-xs text-sidebar-foreground/60">{user?.email ?? ""}</span>
-              </div>
-              <ChevronsUpDown className={cn("ml-auto size-4 shrink-0 text-sidebar-foreground/60", SIDEBAR_FADE)} aria-hidden />
+              <div className={ACCOUNT_AVATAR_CLASS} aria-hidden>{initialsOf(user?.name)}</div>
+              {/* Avatar, name, chevron; the email and role are in the menu's header. */}
+              <span className={cn("min-w-0 flex-1 truncate whitespace-nowrap text-left text-sm font-medium text-sidebar-foreground", SIDEBAR_FADE)}>
+                {user?.name ?? "Signed in"}
+              </span>
+              <ChevronDown className={cn("ml-auto size-4 shrink-0 text-sidebar-foreground/60", SIDEBAR_FADE)} aria-hidden />
             </UserMenu>
           </SidebarMenuItem>
         </SidebarMenu>

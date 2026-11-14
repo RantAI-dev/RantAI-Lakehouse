@@ -103,7 +103,7 @@ function TileMenu({ item, triggerClassName }: { item: GridItem; triggerClassName
  */
 export const SOFT_TILE_FRAME = "group/tile flex h-full flex-col overflow-hidden rounded-2xl bg-muted/45 dark:bg-card";
 export const SOFT_TILE_HEADER = "flex h-10 shrink-0 items-center gap-1.5 pl-4 pr-2 pt-1";
-export const SOFT_TILE_BODY = "min-h-0 flex-1 px-2 pb-2";
+export const SOFT_TILE_BODY = "tile-body-fill min-h-0 flex-1 px-2 pb-2";
 
 /**
  * A tile: header (drag handle in edit mode, title, badge, ⋯ menu) over its body.
@@ -131,7 +131,9 @@ export function TileCard({
           SOFT_TILE_FRAME,
           EASE,
           handle && "ring-1 ring-primary/25 ring-inset",
-          dragging && "ring-2 ring-primary/60",
+          // Micro-interaction audit 2026-11-14: a picked-up tile lifts (a little larger, a soft wide
+          // shadow) and settles back when dropped, so the drag reads as holding something.
+          dragging && "scale-[1.01] shadow-[0_18px_40px_-16px_rgb(0_0_0/0.35)] ring-2 ring-primary/60",
         )}
       >
         <div

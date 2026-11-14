@@ -23,7 +23,9 @@ const TONE: Record<ChipTone, string> = {
 
 /** The chip's container: the trigger, and a remove button beside it when there is one. */
 export function chipShell(tone: ChipTone): string {
-  return cn("inline-flex h-8 max-w-80 shrink-0 items-center rounded-full", TONE[tone], EASE);
+  // Micro-interaction audit 2026-11-14: `:active` holds on the ancestors of what is pressed, so the
+  // whole chip gives a little under the pointer whether its value or its × is pressed.
+  return cn("inline-flex h-8 max-w-80 shrink-0 items-center rounded-full active:scale-[0.97]", TONE[tone], EASE);
 }
 
 /**
@@ -73,7 +75,8 @@ export function ChoiceRow({
   return (
     <button type="button" role="radio" aria-checked={on} onClick={onClick}
       className={cn("flex h-8 w-full items-center gap-2.5 rounded-md px-2 text-left text-sm hover:bg-muted", on && "font-medium", EASE, FOCUS)}>
-      <Check className={cn("size-4 shrink-0 text-primary", on ? "opacity-100" : "opacity-0")} aria-hidden />
+      {/* Micro-interaction audit 2026-11-14: the tick grows into place rather than blinking on. */}
+      <Check className={cn("size-4 shrink-0 text-primary", on ? "scale-100 opacity-100" : "scale-75 opacity-0", EASE)} aria-hidden />
       <span className="truncate">{label}</span>
     </button>
   );

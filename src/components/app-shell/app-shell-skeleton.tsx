@@ -1,6 +1,6 @@
 "use client";
 
-import { Bell, ChevronsUpDown, CircleUserRound } from "lucide-react";
+import { Bell, ChevronDown } from "lucide-react";
 import {
   Sidebar,
   SidebarContent,
@@ -17,14 +17,9 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar";
 import { Skeleton } from "@/components/ui/skeleton";
-import { LoadingSkeleton } from "@/components/patterns/page-states";
-import { DashboardPageSkeleton } from "@/features/dashboards/dashboard-skeleton";
-import { DashboardListPageSkeleton } from "@/features/dashboards/dashboard-list-skeleton";
-import { HomePlaceholder } from "@/features/home/home-frame";
 import { useSidebarGroups } from "@/hooks/use-sidebar-groups";
 import { cn } from "@/lib/utils";
 import {
-  ACCOUNT_AVATAR_CLASS,
   ACCOUNT_CARD_CLASS,
   NAV_ROW_CLASS,
   SIDEBAR_CLASS,
@@ -37,7 +32,7 @@ import {
 } from "./app-sidebar";
 import { NAVBAR_CLASS, NAVBAR_GRID_CLASS, NAVBAR_TRIGGER_CLASS, NavbarSearch, NavbarTitle } from "./app-navbar";
 import { NAV_GROUPS, activeNavHref, pageTitleFor } from "./nav-config";
-import { shellPlaceholderFor } from "./shell-placeholder";
+import { ShellMainPlaceholder } from "./shell-main-placeholder";
 
 /**
  * What the console shows while `AuthProvider` is still checking the session.
@@ -62,7 +57,6 @@ import { shellPlaceholderFor } from "./shell-placeholder";
  *   placeholder.
  */
 export function AppShellSkeleton({ pathname }: { pathname: string }) {
-  const placeholder = shellPlaceholderFor(pathname);
   return (
     <>
       <Sidebar collapsible="icon" side="left" className={SIDEBAR_CLASS}>
@@ -75,16 +69,13 @@ export function AppShellSkeleton({ pathname }: { pathname: string }) {
         <SidebarFooter className={SIDEBAR_FOOTER_CLASS} aria-hidden>
           <SidebarMenu>
             <SidebarMenuItem>
-              {/* The account card's box; the avatar glyph is the same for everyone. */}
-              <SidebarMenuButton size="lg" render={<div />} className={cn(ACCOUNT_CARD_CLASS, "hover:bg-transparent active:bg-transparent")}>
-                <div className={ACCOUNT_AVATAR_CLASS}>
-                  <CircleUserRound className="size-5" aria-hidden />
-                </div>
-                <div className={cn("grid min-w-0 flex-1 gap-1.5", SIDEBAR_FADE)}>
+              {/* The account row's box: an avatar circle and one name bar, as tall as the real row. */}
+              <SidebarMenuButton render={<div />} className={cn(ACCOUNT_CARD_CLASS, "hover:bg-transparent active:bg-transparent")}>
+                <Skeleton className="size-6 shrink-0 rounded-full" />
+                <div className={cn("min-w-0 flex-1", SIDEBAR_FADE)}>
                   <Skeleton className="h-3.5 w-24" />
-                  <Skeleton className="h-3 w-36" />
                 </div>
-                <ChevronsUpDown className={cn("ml-auto size-4 shrink-0 text-sidebar-foreground/60", SIDEBAR_FADE)} aria-hidden />
+                <ChevronDown className={cn("ml-auto size-4 shrink-0 text-sidebar-foreground/60", SIDEBAR_FADE)} aria-hidden />
               </SidebarMenuButton>
             </SidebarMenuItem>
           </SidebarMenu>
@@ -93,8 +84,8 @@ export function AppShellSkeleton({ pathname }: { pathname: string }) {
       <SidebarInset className="min-w-0 bg-muted/25">
         <header className={NAVBAR_CLASS}>
           <div className={NAVBAR_GRID_CLASS}>
-            <div className="flex min-w-0 items-center gap-3">
-              <SidebarTrigger variant="outline" size="icon" className={NAVBAR_TRIGGER_CLASS} />
+            <div className="flex min-w-0 items-center gap-2">
+              <SidebarTrigger variant="ghost" size="icon" className={NAVBAR_TRIGGER_CLASS} />
               <NavbarTitle title={pageTitleFor(pathname)} />
             </div>
             <NavbarSearch />
@@ -110,15 +101,7 @@ export function AppShellSkeleton({ pathname }: { pathname: string }) {
         </header>
         <div className="flex flex-1 min-h-0 min-w-0">
           <div className="flex-1 min-w-0 p-4 sm:p-5 lg:p-6" aria-busy="true">
-            {placeholder === "home" ? (
-              <HomePlaceholder />
-            ) : placeholder === "dashboard-list" ? (
-              <DashboardListPageSkeleton />
-            ) : placeholder === "dashboard" ? (
-              <DashboardPageSkeleton />
-            ) : (
-              <LoadingSkeleton rows={8} />
-            )}
+            <ShellMainPlaceholder pathname={pathname} />
           </div>
         </div>
       </SidebarInset>
@@ -157,6 +140,15 @@ function SkeletonNav({ pathname }: { pathname: string }) {
               <Skeleton className="size-4 shrink-0 rounded" />
               <Skeleton className={cn("h-3", SIDEBAR_FADE)} style={{ width: barWidth(label) }} />
             </div>
+            {single && group.items[0].action ? (
+              // The split row's right part: a separator and a 32 px square, as the real row draws them.
+              <div className="absolute inset-y-0 right-0 flex group-data-[collapsible=icon]:hidden">
+                <span className="my-2 w-px bg-sidebar-border" />
+                <span className="grid size-8 place-items-center">
+                  <Skeleton className="size-3.5 rounded" />
+                </span>
+              </div>
+            ) : null}
             {!single && !collapsed && isOpen(group.label) ? (
               <SidebarMenuSub className={SIDEBAR_SUB_CLASS}>
                 {group.items.map((item) => (

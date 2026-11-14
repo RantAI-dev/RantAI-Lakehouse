@@ -145,7 +145,8 @@ export function CommentsPanel({ board, onChanged, className }: {
   const truncated = list.status === "success" && list.data.truncated;
 
   return (
-    <div className={cn("flex min-h-0 flex-col gap-3", className)} data-slot="comments-panel">
+    // Micro-interaction audit 2026-11-14: switching the side panel's tab fades the new content in.
+    <div className={cn("flex min-h-0 flex-col gap-3 transition-opacity duration-200 ease-ui starting:opacity-0", className)} data-slot="comments-panel">
       {list.status === "loading" ? <p className="text-xs text-muted-foreground">Loading comments…</p> : null}
       {list.status === "error" ? (
         <p role="alert" className="text-xs text-destructive">{sentence(list.error)}</p>

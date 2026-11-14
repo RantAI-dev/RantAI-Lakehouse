@@ -49,9 +49,11 @@ export function CopilotDock() {
     {/* The bar floats over the page; this keeps the last row of content
         scrollable out from under it. */}
     <div aria-hidden className="h-20 shrink-0 print:hidden" />
-    <div className={`fixed bottom-4 left-1/2 z-50 -translate-x-1/2 print:hidden transition-all duration-200 ${showPanel ? "w-[min(92vw,560px)]" : "w-[min(88vw,460px)]"}`}>
+    <div className={`fixed bottom-4 left-1/2 z-50 -translate-x-1/2 print:hidden transition-[width] duration-200 ease-ui ${showPanel ? "w-[min(92vw,560px)]" : "w-[min(88vw,460px)]"}`}>
       {showPanel ? (
-        <div className="mb-2 flex max-h-[58vh] flex-col overflow-hidden rounded-2xl border border-border/70 bg-card/90 shadow-[0_8px_40px_rgba(0,0,0,0.18)] backdrop-blur-xl supports-backdrop-filter:bg-card/80">
+        // Micro-interaction audit 2026-11-14 (emil): the chat rises out of the bar it opens from (origin at
+        // the bottom, a short lift and fade) instead of appearing in one frame.
+        <div className="mb-2 flex max-h-[58vh] origin-bottom flex-col overflow-hidden rounded-2xl border border-border/70 bg-card/90 shadow-[0_8px_40px_rgba(0,0,0,0.18)] backdrop-blur-xl transition-[opacity,scale,translate] duration-200 ease-ui supports-backdrop-filter:bg-card/80 starting:translate-y-2 starting:scale-[0.98] starting:opacity-0">
           <div className="flex items-center gap-2 border-b border-border px-3 py-2">
             <span className="grid size-6 place-items-center rounded-md bg-primary/10 text-primary">
               <Bot className="size-3.5" aria-hidden />
@@ -70,7 +72,7 @@ export function CopilotDock() {
                 }}
                 aria-label="Dock to right sidebar"
                 title="Dock to right sidebar"
-                className="grid size-7 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                className="grid size-7 place-items-center rounded-md text-muted-foreground transition-[background-color,color,scale] duration-150 ease-ui hover:bg-muted hover:text-foreground active:scale-95"
               >
                 <PanelRight className="size-4" />
               </button>
@@ -79,7 +81,7 @@ export function CopilotDock() {
                 onClick={c.newChat}
                 aria-label="New chat"
                 title="New chat"
-                className="grid size-7 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                className="grid size-7 place-items-center rounded-md text-muted-foreground transition-[background-color,color,scale] duration-150 ease-ui hover:bg-muted hover:text-foreground active:scale-95"
               >
                 <Plus className="size-4" />
               </button>
@@ -88,7 +90,7 @@ export function CopilotDock() {
                 onClick={() => c.setExpanded(false)}
                 aria-label="Collapse panel"
                 title="Collapse panel"
-                className="grid size-7 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                className="grid size-7 place-items-center rounded-md text-muted-foreground transition-[background-color,color,scale] duration-150 ease-ui hover:bg-muted hover:text-foreground active:scale-95"
               >
                 <ChevronDown className="size-4" />
               </button>
