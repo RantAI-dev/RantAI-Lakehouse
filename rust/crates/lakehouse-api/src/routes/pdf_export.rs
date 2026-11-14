@@ -12,6 +12,10 @@
 //! nothing from the query string reaches it, so a caller cannot point the
 //! renderer anywhere else (`crate::pdf`).
 //!
+//! `GET /api/dashboard/reports/{id}/pdf` (`BI-18` part D, T2) is the same path
+//! for a report: the same slots, deadline and render token, with a token that
+//! names the report, and the console's `/render/report/<token>`.
+//!
 //! At most [`crate::state::PDF_AT_ONCE`] PDFs are made at once per process; a
 //! further request waits for a slot. Every failure is a fixed sentence under a
 //! reference (`upstream_error`, SEC-11), never Gotenberg's text.
@@ -218,6 +222,7 @@ pub(crate) async fn make_pdf(state: &AppState, job: &PdfJob<'_>) -> Result<Vec<u
         &RenderPage {
             kind: "dashboard",
             chart: None,
+            report: None,
             board: job.board,
             person: job.person,
             values: job.values,
@@ -271,6 +276,7 @@ pub(crate) async fn make_png(state: &AppState, job: &PngJob<'_>) -> Result<Vec<u
         &RenderPage {
             kind: "chart",
             chart: Some(job.chart),
+            report: None,
             board: job.board,
             person: job.person,
             values: job.values,
@@ -282,6 +288,54 @@ pub(crate) async fn make_png(state: &AppState, job: &PngJob<'_>) -> Result<Vec<u
     crate::pdf::screenshot_url(gotenberg, &page_url, crate::pdf::PDF_DEADLINE)
         .await
         .map_err(PdfFailure::Conversion)
+}
+
+/// Make one report's PDF (`BI-18` part D, T2, decision R3): the same slot,
+/// token secret, configured address and deadline as [`make_pdf`], with a token
+/// that names the report and no dashboard, and the console's report print view
+/// (`/render/report/<token>`).
+///
+/// The caller has already checked that the person may download and may read
+/// the report.
+///
+/// # Errors
+///
+/// [`PdfFailure`] as for [`make_pdf`].
+pub(crate) async fn make_report_pdf(
+    state: &AppState,
+    report: &str,
+    person: uuid::Uuid,
+    (paper, orientation): (Paper, Orientation),
+) -> Result<Vec<u8>, PdfFailure> {
+    let started = std::time::Instant::now();
+    let _slot = take_slot(state).await?;
+    tracing::info!(slot_wait_ms = millis(started), "pdf render started");
+    let rendering = std::time::Instant::now();
+    let (page_url, gotenberg) = render_page(
+        state,
+        &RenderPage {
+            kind: "report",
+            chart: None,
+            report: Some(report),
+            board: "",
+            person,
+            values: DashboardValues::default(),
+            paper: (paper.as_str(), orientation.as_str()),
+        },
+    )?;
+    let converted = convert_url(
+        gotenberg,
+        &page_url,
+        (paper, orientation),
+        crate::pdf::PDF_DEADLINE,
+    )
+    .await;
+    tracing::info!(
+        render_ms = millis(rendering),
+        ok = converted.is_ok(),
+        "pdf render finished"
+    );
+    converted.map_err(PdfFailure::Conversion)
 }
 
 /// The slots are taken for the whole conversion. A further request waits for
@@ -297,9 +351,11 @@ async fn take_slot(state: &AppState) -> Result<tokio::sync::OwnedSemaphorePermit
 
 /// The print view one token opens.
 struct RenderPage<'a> {
-    /// `dashboard` or `chart`: the path under `/render/`.
+    /// `dashboard`, `chart` or `report`: the path under `/render/`.
     kind: &'static str,
     chart: Option<&'a str>,
+    /// `BI-18` part D (T2): the report a `report` page prints.
+    report: Option<&'a str>,
     board: &'a str,
     person: uuid::Uuid,
     values: DashboardValues<'a>,
@@ -326,6 +382,7 @@ fn render_page<'s>(
             aud: lakehouse_embed::RENDER_AUDIENCE.to_owned(),
             board: page.board.to_owned(),
             chart: page.chart.map(str::to_owned),
+            report: page.report.map(str::to_owned),
             principal: page.person.to_string(),
             filters: page.values.filters.map(str::to_owned),
             params: page.values.params.map(str::to_owned),
@@ -377,18 +434,7 @@ pub async fn export_pdf(
     if !pdf_supported(&state.config) {
         return Err(ApiError::Unavailable(PDF_NOT_SET_UP.to_owned()).into());
     }
-    let paper = q
-        .paper
-        .as_deref()
-        .map_or(Some(Paper::A4), Paper::parse)
-        .ok_or_else(|| ApiError::BadRequest("paper must be a4 or letter.".to_owned()))?;
-    let orientation = q
-        .orientation
-        .as_deref()
-        .map_or(Some(Orientation::Portrait), Orientation::parse)
-        .ok_or_else(|| {
-            ApiError::BadRequest("orientation must be portrait or landscape.".to_owned())
-        })?;
+    let (paper, orientation) = paper_of(q.paper.as_deref(), q.orientation.as_deref())?;
     let board_id = q
         .board
         .as_deref()
@@ -449,6 +495,100 @@ pub async fn export_pdf(
 
     let date = crate::routes::settings::report_date(&state).await;
     let file_name = format!("{}-{date}.pdf", file_slug(name, "dashboard"));
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/pdf".to_owned()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{file_name}\""),
+            ),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+        ],
+        pdf,
+    )
+        .into_response())
+}
+
+/// The query of `GET /api/dashboard/reports/{id}/pdf`: the paper only. A
+/// report has no filters of its own; each chart is read with its dashboard's
+/// saved values, as on the report page.
+#[derive(Debug, Default, Deserialize)]
+pub struct ReportPdfQuery {
+    #[serde(default)]
+    paper: Option<String>,
+    #[serde(default)]
+    orientation: Option<String>,
+}
+
+/// The paper and orientation of a PDF request: A4 portrait when absent, a 400
+/// with a fixed sentence for any other word. Shared by the dashboard and the
+/// report PDF.
+fn paper_of(
+    paper: Option<&str>,
+    orientation: Option<&str>,
+) -> Result<(Paper, Orientation), ApiError> {
+    let paper = paper
+        .map_or(Some(Paper::A4), Paper::parse)
+        .ok_or_else(|| ApiError::BadRequest("paper must be a4 or letter.".to_owned()))?;
+    let orientation = orientation
+        .map_or(Some(Orientation::Portrait), Orientation::parse)
+        .ok_or_else(|| {
+            ApiError::BadRequest("orientation must be portrait or landscape.".to_owned())
+        })?;
+    Ok((paper, orientation))
+}
+
+/// `GET /api/dashboard/reports/{id}/pdf?paper=&orientation=` — a report as a
+/// PDF made by the server (`BI-18` part D, T2, decision R3). The checks of the
+/// dashboard PDF in the same order (the entry check, no service token, the
+/// download switch, a renderer set up), then the report must be one the person
+/// may read; the print view reads it as them (`routes::render`). Audited as
+/// `dashboard.report_pdf` before the file is sent.
+///
+/// # Errors
+///
+/// As [`export_pdf`]; 404 `report not found.` for a report the person cannot
+/// read.
+pub async fn export_report_pdf(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(q): Query<ReportPdfQuery>,
+) -> ApiResult<Response> {
+    let viewer = viewer_for(&state, &principal).await?;
+    if matches!(principal.id, lakehouse_auth::PrincipalId::Service(_)) {
+        return Err(ApiError::BadRequest(PDF_FOR_PEOPLE.to_owned()).into());
+    }
+    crate::routes::settings::require_download(&state, &principal).await?;
+    if !pdf_supported(&state.config) {
+        return Err(ApiError::Unavailable(PDF_NOT_SET_UP.to_owned()).into());
+    }
+    let (paper, orientation) = paper_of(q.paper.as_deref(), q.orientation.as_deref())?;
+    let id = crate::routes::dashboard_reports::report_id(&id)?;
+    let report = crate::routes::dashboard_reports::readable_report(&state, &viewer, id).await?;
+    let report_id = report.id.to_string();
+    let pdf = make_report_pdf(
+        &state,
+        &report_id,
+        principal.id.uuid(),
+        (paper, orientation),
+    )
+    .await
+    .map_err(PdfFailure::into_api_error)?;
+    record_download_audit(
+        &state,
+        &principal,
+        ("dashboard.report_pdf", "dashboard_report", &report_id),
+        json!({
+            "report": report_id,
+            "paper": paper.as_str(),
+            "orientation": orientation.as_str(),
+            "bytes": pdf.len(),
+        }),
+    )
+    .await?;
+    let date = crate::routes::settings::report_date(&state).await;
+    let file_name = format!("{}-{date}.pdf", file_slug(&report.title, "report"));
     Ok((
         [
             (header::CONTENT_TYPE, "application/pdf".to_owned()),

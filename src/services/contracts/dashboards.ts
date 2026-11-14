@@ -1,3 +1,4 @@
+import type { ChartKind } from "@/lib/dashboard-specs"
 import type { FilterDef } from "../clients/bi-store"
 import type { TileLimit } from "./settings"
 
@@ -169,6 +170,13 @@ export type DashboardService = {
   setEmbedFilterModes(board: string, modes: Record<string, FilterMode>, signal?: AbortSignal): Promise<void>
   /** `BI-26`: the charts of a dashboard, for the chart picker of the embed section. */
   listBoardCharts(board: string, signal?: AbortSignal): Promise<BoardChart[]>
+  /**
+   * `BI-59` (decision P3): every stored chart the caller can see, reduced to
+   * what a picture of its dashboard needs (which board, which kind, how
+   * wide). One read of `GET /api/dashboard/specs` for the whole Dashboards
+   * page; it runs no query.
+   */
+  listChartOutlines(signal?: AbortSignal): Promise<ChartOutline[]>
   /** `BI-19` part A. Needs `dashboard:write`. */
   getPublicLink(board: string, signal?: AbortSignal): Promise<PublicLinkState>
   /** Make a link or change its expiry or password; refusals carry the server's sentence. */
@@ -234,7 +242,7 @@ export type DashboardService = {
   /** Deleted dashboards and charts the caller may see (`GET /api/dashboard/trash`). */
   listTrash(signal?: AbortSignal): Promise<TrashList>
   /** Bring one back (`POST /api/dashboard/trash/restore`). Needs `dashboard:write`. */
-  restoreFromTrash(kind: ItemKind, id: string, signal?: AbortSignal): Promise<RestoredItem>
+  restoreFromTrash(kind: TrashKind, id: string, signal?: AbortSignal): Promise<RestoredItem>
   /** The caller's personal space, created on first use. Needs `dashboard:write`. */
   ensurePersonalSpace(signal?: AbortSignal): Promise<DashboardFolder>
   /** The caller's favourites and recent dashboards and charts. */
@@ -255,6 +263,8 @@ export type DashboardService = {
 
 /** What a favourite, a recent item, a search hit or a trash entry points at. */
 export type ItemKind = "board" | "chart"
+/** What the trash holds: dashboards, charts and (`BI-18` part D) reports. */
+export type TrashKind = ItemKind | "report"
 
 /** One version of a dashboard (`lakehouse_bi::versions::VersionEntry`). */
 export type VersionEntry = {
@@ -286,7 +296,7 @@ export type RevertResult = {
 
 /** `lakehouse_bi::trash::TrashItem`. */
 export type TrashItem = {
-  kind: ItemKind
+  kind: TrashKind
   id: string
   name: string
   /** For a chart, the dashboard it was on. */
@@ -303,7 +313,7 @@ export type TrashItem = {
 export type TrashList = { items: TrashItem[]; retentionDays: number }
 
 export type RestoredItem = {
-  kind: ItemKind
+  kind: TrashKind
   id: string
   /** For a dashboard, how many charts came back with it. */
   charts: number
@@ -351,7 +361,15 @@ export type EmbedInfo = {
 export type FilterMode = "locked" | "editable" | "hidden"
 
 /** A chart of a dashboard, for the embed chart picker. */
-export type BoardChart = { id: string; title: string }
+/** `kind` lets a picker leave out the tiles that carry no data (`BI-18` part D). */
+export type BoardChart = { id: string; title: string; kind?: string }
+
+/**
+ * A stored chart as the Dashboards page draws it (`BI-59`, P3): its board,
+ * its kind (`| string`: a kind this console does not know is drawn as a
+ * neutral tile, not dropped) and its width (`span: 2` is the full row).
+ */
+export type ChartOutline = { id: string; board: string; kind: ChartKind | string; span?: 1 | 2 }
 
 /**
  * One stored chart, as `GET /api/dashboard/specs` answers it (`WEB-7` D6).

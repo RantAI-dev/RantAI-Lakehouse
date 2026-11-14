@@ -1143,8 +1143,10 @@ fn spawn_upload_session_sweep(state: &AppState) {
 /// in the trash for more than 30 days (`BI-18` part C, part 2). Runs once at
 /// start and then every hour, like [`spawn_auth_cleanup`] (missed ticks
 /// skipped), on the API's own runtime: the dashboards live in `ClickHouse`, so
-/// no Postgres pool is needed and every replica may run it (the removal is
-/// idempotent).
+/// no Postgres pool is needed for them and every replica may run it (the
+/// removal is idempotent). Reports (`BI-18` part D) live in Postgres and are
+/// swept from it, by one `DELETE` of the rows past 30 days, when there is a
+/// pool.
 ///
 /// Fail closed: `lakehouse_bi::trash::purge_expired` reads the expired ids
 /// before it writes anything, so a sweep that cannot read deletes nothing; the
@@ -1158,6 +1160,24 @@ fn spawn_trash_sweep(state: &AppState) {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
+            // BI-18 part D (T1): reports in the trash go after the same 30
+            // days. A failure is logged and the next tick tries again.
+            if let Some(pg) = pg.as_deref() {
+                match lakehouse_store::dashboard_reports::purge_expired(
+                    pg,
+                    lakehouse_bi::trash::RETENTION_DAYS,
+                )
+                .await
+                {
+                    Ok(0) => {}
+                    Ok(reports) => {
+                        tracing::info!(reports, "dashboard trash sweep removed expired reports");
+                    }
+                    Err(err) => {
+                        tracing::warn!(%err, "expired reports were not removed; the next sweep retries");
+                    }
+                }
+            }
             match lakehouse_bi::trash::purge_expired(&ch).await {
                 Ok(purged) if purged.boards + purged.charts > 0 => {
                     // BI-19 B1 review R8: a dashboard removed for good takes its

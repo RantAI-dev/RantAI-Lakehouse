@@ -23,6 +23,14 @@
 //! `Extension<Principal>`: a session cookie sent along is never read. The body
 //! is `{ "token": ... }` and nothing else, so a caller cannot name another
 //! board; the board is in the signed token. Every refusal reads the same.
+//!
+//! # A report (`BI-18` part D, T2)
+//!
+//! A token with `report` set names one report and no dashboard. The answer is
+//! that report with every chart block read as the person, through the reader
+//! route's own function (`dashboard_reports::read_charts`), so the PDF shows
+//! what the report page shows; a report the person can no longer read is the
+//! same one-sentence refusal.
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -117,6 +125,11 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
     // PDF; durations only, never a token or a name.
     tracing::info!("render data requested");
     let read_started = std::time::Instant::now();
+    // BI-18 part D (T2): a report token is good for that report and nothing
+    // else, read as the person now, through the reader route's own function.
+    if let Some(report) = claims.report.as_deref() {
+        return report_data(&state, &principal, report, &claims).await;
+    }
     let query = DashboardQuery::for_render(
         &claims.board,
         claims.filters.as_deref(),
@@ -162,6 +175,51 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
     }
 }
 
+/// The report payload for a report token (`BI-18` part D, T2): the report and
+/// every chart block read as the person, through
+/// `dashboard_reports::read_charts` (the reader page's own function), with the
+/// `render` block for the first page. A report the person can no longer read
+/// is refused with the one sentence, as any refused token is.
+async fn report_data(
+    state: &AppState,
+    principal: &lakehouse_auth::Principal,
+    report: &str,
+    claims: &lakehouse_embed::RenderClaims,
+) -> Response {
+    use crate::routes::dashboard_reports as reports;
+    let started = std::time::Instant::now();
+    let Ok(viewer) = crate::routes::dashboard_access::viewer_for(state, principal).await else {
+        return refused();
+    };
+    let Ok(id) = reports::report_id(report) else {
+        return refused();
+    };
+    let found = match reports::readable_report(state, &viewer, id).await {
+        Ok(found) => found,
+        Err(lakehouse_core::ApiError::NotFound(_)) => return refused(),
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
+    let read = reports::read_charts(state, principal, &viewer, &found, &HeaderMap::new()).await;
+    tracing::info!(
+        payload_ms = crate::routes::pdf_export::millis(started),
+        ok = read.is_ok(),
+        "render data read"
+    );
+    match read {
+        Ok((charts, reporting)) => (
+            StatusCode::OK,
+            ApiJson(json!({
+                "report": reports::report_json(&found),
+                "charts": charts,
+                "reporting": reporting,
+                "render": render_block(&principal.display_name, claims),
+            })),
+        )
+            .into_response(),
+        Err(err) => crate::error::ApiRejection(err).into_response(),
+    }
+}
+
 /// Keep `chart` and nothing else of the board's tiles: its spec, its result and
 /// its place. Returns `false` when the payload has no such chart. The board's
 /// other tiles' data never reaches a chart image's view.
@@ -197,6 +255,7 @@ fn render_block(requested_by: &str, claims: &lakehouse_embed::RenderClaims) -> V
         "paper": claims.paper,
         "orientation": claims.orientation,
         "chart": claims.chart,
+        "report": claims.report,
     })
 }
 

@@ -133,3 +133,19 @@ export function downloadMenuKind(tile: { own: boolean; hasRows: boolean }, canDo
   if (!canDownload || !tile.hasRows) return null;
   return tile.own ? "data" : "csv";
 }
+
+/**
+ * Download a report as a PDF (`BI-18` part D, T2, decision R3): the server
+ * prints the report's print view as the person who asked, through the same
+ * renderer, slots and token as a dashboard PDF. Throws an `Error` carrying the
+ * server's sentence on a refusal.
+ */
+export async function downloadReportPdf(report: string, choice: PdfChoice): Promise<string> {
+  const q = new URLSearchParams({ paper: choice.paper, orientation: choice.orientation });
+  const res = await apiFetch(`/api/dashboard/reports/${encodeURIComponent(report)}/pdf?${q.toString()}`, { cache: "no-store" });
+  if (!res.ok) throw new Error(await refusalOf(res, "The PDF could not be made."));
+  const blob = await res.blob();
+  const fileName = fileNameOf(res.headers.get("content-disposition")).replace(/\.csv$/, ".pdf");
+  saveBlob(blob, fileName);
+  return fileName;
+}

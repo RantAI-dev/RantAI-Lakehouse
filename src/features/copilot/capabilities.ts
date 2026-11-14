@@ -38,6 +38,8 @@ export const CAPABILITIES: Capability[] = [
       // offers it here; enabling, the filter modes and the withdrawal are
       // writes and live in the Dashboard Builder.
       "get_embed_snippet",
+      // BI-18 D review round 1, SHOULD-FIX 2: listing the reports one may read is a question.
+      "list_reports",
       // AI-2 AC1: "show only 2026" narrows the person's own view of the page
       // and saves nothing, so Ask mode offers it here; the board's default
       // filters change what every viewer sees and stay in the Dashboard Builder.
@@ -85,7 +87,13 @@ export const CAPABILITIES: Capability[] = [
       // needs the chat's Confirm, and `get_embed_snippet` is a read (it is on
       // Query Data for Ask mode too). None of them signs or shows a token: the
       // customer's server does, with the embedding secret.
-      "enable_embed", "set_embed_filter_modes", "withdraw_embed_tokens", "get_embed_snippet"],
+      "enable_embed", "set_embed_filter_modes", "withdraw_embed_tokens", "get_embed_snippet",
+      // BI-18 part D (T4): written reports with live charts, and dashboard templates. Writing
+      // a report and starting from a template wait for the Confirm button; deleting either
+      // waits in Approvals. Listing templates is a read, but needs `dashboard:write` like
+      // its route, so it lives here and not in Query Data.
+      "list_reports", "create_report", "update_report", "delete_report",
+      "list_templates", "create_dashboard_from_template", "delete_template"],
   },
   {
     key: "pipeline",

@@ -293,6 +293,13 @@ export const ROUTE_ACCESS: readonly RouteAccessEntry[] = [
   // person and the page says "You don't have access" below edit.
   { pattern: "/dashboards/[id]/charts/new", requires: [] },
   { pattern: "/dashboards/[id]/charts/[chartId]/edit", requires: [] },
+  // BI-18 part D (T5): a report is read with `dashboard:read` (its routes
+  // resolve the folder's access in the handler), and written with
+  // `dashboard:write`, which `POST`/`PUT /api/dashboard/reports` require at
+  // the router.
+  { pattern: "/dashboards/reports/[reportId]", requires: ["dashboard:read"] },
+  { pattern: "/dashboards/reports/[reportId]/edit", requires: ["dashboard:write"] },
+  { pattern: "/dashboards/reports/new", requires: ["dashboard:write"] },
 
   // Data & Catalog
   { pattern: "/catalog", requires: ["catalog:read"] },

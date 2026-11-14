@@ -173,6 +173,15 @@ fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
         "delete_report_subscription" => {
             format!("Menghapus laporan terjadwal {} secara permanen.", s("id"))
         }
+        // BI-18 part D (T4): a deleted report goes to the trash, a template away.
+        "delete_report" => format!(
+            "Memindahkan laporan {} ke tempat sampah; bisa dipulihkan selama 30 hari.",
+            s("id")
+        ),
+        "delete_template" => format!(
+            "Menghapus template dashboard {} secara permanen; dashboard yang sudah dibuat darinya tetap ada.",
+            s("id")
+        ),
         "delete_tab" => format!(
             "Menghapus tab {} dari dashboard {}; chart di dalamnya pindah ke tab pertama.",
             s("tab"),
@@ -271,9 +280,18 @@ const WRITE_HIGH_RISK_TRASHED_CHART: &str = "Tindakan berisiko tinggi (WriteHigh
 fn risk_for_write_high(spec: &ToolSpec) -> &'static str {
     match spec.name {
         "delete_chart" => WRITE_HIGH_RISK_TRASHED_CHART,
+        // BI-18 part D (OPS-32 merge, aligned with #525): a deleted report goes
+        // to the trash too, so its card says so, as its reason line does.
+        "delete_report" => WRITE_HIGH_RISK_TRASHED_REPORT,
         _ => WRITE_HIGH_RISK,
     }
 }
+
+/// The risk statement for `delete_report` (`BI-18` part D): like a chart, the
+/// report goes to the trash and can be restored for 30 days
+/// (`lakehouse_bi::trash::RETENTION_DAYS`, a literal for the reason given at
+/// [`WRITE_HIGH_RISK_TRASHED_CHART`]).
+const WRITE_HIGH_RISK_TRASHED_REPORT: &str = "Tindakan berisiko tinggi (WriteHigh): laporan masuk tempat sampah dan bisa dipulihkan selama 30 hari.";
 
 /// T0.5: the real approvals-inbox flow for a [`Risk::WriteHigh`] call that
 /// [`decide`] has already flagged with [`write_high_pending_marker`] (mode
@@ -527,6 +545,46 @@ fn alert_summary(name: &str, args: &Map<String, Value>) -> String {
     )
 }
 
+/// The Confirm card's sentence for the report and template writes (`BI-18`
+/// part D, T4): what is made or changed, and how many charts it places.
+fn written_summary(name: &str, args: &Map<String, Value>) -> String {
+    let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
+    let charts = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_array)
+            .map_or(0, |b| b.iter().filter(|b| b["type"] == "chart").count())
+    };
+    match name {
+        "create_report" => format!(
+            "Membuat laporan \"{}\" dengan {} chart langsung dari dashboard.",
+            s("title"),
+            charts("blocks")
+        ),
+        "update_report" => {
+            let added = charts("append") + usize::from(!s("chart").trim().is_empty());
+            if args.contains_key("blocks") {
+                format!(
+                    "Mengganti seluruh isi laporan {} ({} chart).",
+                    s("id"),
+                    charts("blocks")
+                )
+            } else if added > 0 || args.contains_key("append") {
+                format!(
+                    "Menambah isi di akhir laporan {} ({added} chart baru).",
+                    s("id")
+                )
+            } else {
+                format!("Mengubah laporan {}.", s("id"))
+            }
+        }
+        _ => format!(
+            "Membuat dashboard baru \"{}\" dari template {}; salinan ini tidak mengubah templatenya.",
+            s("name"),
+            s("template")
+        ),
+    }
+}
+
 fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
     let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
     match spec.name {
@@ -590,6 +648,10 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             report_summary(spec.name, args)
         }
         "create_alert_rule" | "update_alert_rule" => alert_summary(spec.name, args),
+        // BI-18 part D (T4): the Confirm card's text for the report and template writes.
+        "create_report" | "update_report" | "create_dashboard_from_template" => {
+            written_summary(spec.name, args)
+        }
         "create_calculated_field" => format!(
             "Membuat kolom hitung \"{}\" = {} (pada {}).",
             s("name"),
@@ -1321,6 +1383,19 @@ mod tests {
         assert!(risk.contains("30 hari"), "{risk}");
     }
 
+    /// `BI-18` part D (OPS-32 merge, aligned with #525): a deleted report is in
+    /// the trash for 30 days, so its card says so and never that the action
+    /// cannot be undone.
+    #[test]
+    fn a_deleted_report_says_it_can_be_restored_for_thirty_days() {
+        let risk = risk_for_write_high(spec("delete_report"));
+        assert_eq!(
+            risk,
+            "Tindakan berisiko tinggi (WriteHigh): laporan masuk tempat sampah dan bisa dipulihkan selama 30 hari."
+        );
+        assert!(!risk.contains("tidak dapat dibatalkan"), "{risk}");
+    }
+
     /// Every other `WriteHigh` tool keeps today's sentence, word for word
     /// (`AI-1`).
     ///
@@ -1328,7 +1403,8 @@ mod tests {
     /// fail.
     #[test]
     fn the_other_write_high_tools_keep_the_generic_risk_sentence() {
-        for name in ["delete_board", "delete_metric"] {
+        // `delete_template` removes the template for good (`BI-18` part D).
+        for name in ["delete_board", "delete_metric", "delete_template"] {
             assert_eq!(
                 risk_for_write_high(spec(name)),
                 "Tindakan berisiko tinggi (WriteHigh): tidak dapat dibatalkan setelah dijalankan.",

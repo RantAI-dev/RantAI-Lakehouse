@@ -1011,5 +1011,35 @@
       {"path": "/api/dashboard/specs", "list": "charts", "where": {"sqlSource": "{src}", "kind": "radar", "def.measures": "kunjungan"}, "count": 1},
       {"path": "/api/dashboard/specs", "list": "charts", "where": {"sqlSource": "{src}", "kind": "radar", "def.measures": "baris"}, "count": 1}
     ]
+  },
+  {
+    "id": "report_with_one_chart",
+    "mode": "build",
+    "confirm": true,
+    "note": "BI-18 part D (BI-18D-AC9): a short written report with one live chart placed by reference; the chat names what it made.",
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Report Source Board"}, "id_at": "board.id"},
+      {"name": "chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Report Events Total", "kind": "kpi", "mart": "mart_event", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"}
+    ],
+    "turns": ["Write a short report titled \"Eval Events Report\" with one paragraph saying events are tracked here, followed by the chart {chart}."],
+    "expect_tool": {"name": "create_report", "args_contains": {"title": "Eval Events Report"}},
+    "expect_state": [
+      {"path": "/api/dashboard/reports", "list": "reports", "where": {"title": "Eval Events Report", "chartCount": 1}, "count": 1}
+    ]
+  },
+  {
+    "id": "dashboard_from_template",
+    "mode": "build",
+    "confirm": true,
+    "note": "BI-18 part D (BI-18D-AC9, AI-9 templates): start a new, independent dashboard from a saved template.",
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Template Source Board"}, "id_at": "board.id"},
+      {"name": "template", "method": "POST", "path": "/api/dashboard/templates", "body": {"board": "{board}", "name": "Eval Sales Overview"}, "id_at": "template.id"}
+    ],
+    "turns": ["Start a new dashboard called \"Eval From Template\" from the \"Eval Sales Overview\" template."],
+    "expect_tool": {"name": "create_dashboard_from_template", "args_contains": {"template": "{template}", "name": "Eval From Template"}},
+    "expect_state": [
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"name": "Eval From Template"}, "count": 1}
+    ]
   }
 ]
