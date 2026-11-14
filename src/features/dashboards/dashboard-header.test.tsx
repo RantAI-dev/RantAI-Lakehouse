@@ -16,7 +16,7 @@ mock.module("next/navigation", () => ({
   }),
 }))
 
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { TableProviders } from "@/components/app-shell/table-providers"
 import { AuthProvider } from "@/features/auth/auth-provider"
@@ -88,5 +88,26 @@ describe("the dashboard header (BI-61 T1)", () => {
     expect(await screen.findByText("Rina Putri")).toBeTruthy()
     expect(screen.getByText("Updated 2h ago")).toBeTruthy()
     expect(await screen.findByRole("button", { name: "2 comments" })).toBeTruthy()
+  })
+})
+
+// BI-61 T5: the pencil turns the page into edit mode: Add chart (primary) and
+// Done in the header, the edit hint, "+ Filter", Parameters and "+ tab" in the
+// row; Done returns to reading.
+describe("edit mode (BI-61 T5)", () => {
+  it("swaps the reading controls for Add chart and Done, and Done comes back", async () => {
+    mount({ permissions: ["dashboard:read", "dashboard:write"], level: "manage" })
+    await screen.findByText("Quarterly Sales")
+    fireEvent.click(await screen.findByRole("button", { name: "Edit layout" }))
+    await waitFor(() => expect(within(actions()).getAllByRole("button").map((b) => b.textContent?.trim())).toEqual(["Add chart", "Done"]))
+    expect(screen.getByText(/Editing the layout\./)).toBeTruthy()
+    expect(screen.getByRole("button", { name: "Parameters" })).toBeTruthy()
+    expect(screen.getByText("Add tabs")).toBeTruthy()
+    expect(screen.getByRole("button", { name: "Edit phone layout" })).toBeTruthy()
+    fireEvent.click(within(actions()).getByRole("button", { name: "Done" }))
+    await waitFor(() => expect(within(actions()).getAllByRole("button").map((b) => b.getAttribute("aria-label") ?? b.textContent?.trim()))
+      .toEqual(["Edit layout", "Share", "More actions"]))
+    expect(screen.queryByText(/Editing the layout\./)).toBeNull()
+    expect(screen.queryByRole("button", { name: "Parameters" })).toBeNull()
   })
 })

@@ -42,7 +42,7 @@ import { newRunId, RUN_ID_HEADER } from "@/lib/run-id";
 import { STOPPED_SENTENCE } from "@/lib/query-limits";
 import { apiFetch } from "@/services/http";
 import { useAutoRefresh } from "./auto-refresh";
-import { DashboardHeader, EditPencil, ShareButton } from "./dashboard-header";
+import { DashboardHeader, EASE, EditPencil, FOCUS, ShareButton } from "./dashboard-header";
 import type { ChartDef } from "./chart-builder";
 import { chartEditHref, chartNewHref } from "./chart-page";
 import { fmtInt } from "./chart-option";
@@ -1308,7 +1308,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // edit mode, so for them it stays in reading mode: adding a temporary filter
   // (kept in the address, never saved) was theirs before and stays reachable.
   const canAddFilter = edit || !canWrite;
-  const hasFilterRow = showFilterBar || grainedCharts.length > 0 || paramControls.length > 0 || Object.keys(paramRefusals).length > 0;
+  const hasFilterRow = showFilterBar || grainedCharts.length > 0 || paramControls.length > 0 || Object.keys(paramRefusals).length > 0
+    || (edit && hasPermission("dashboard:write"));
 
   // BI-19 owner QA 2026-10-28, QA-1: a board that never loaded (for the caller, "dashboard not
   // found") shows the error and nothing that acts on the board: no star, menu, comments or
@@ -1353,6 +1354,35 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         }}
         loading={loading}
         onStop={stopLoading}
+        notice={edit ? (
+          // BI-61 T5: what edit mode does, in one line, with the layout's own extras beside it.
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl bg-primary/8 px-3 py-2 text-sm" data-print-hide>
+            <Move className="size-4 shrink-0 text-primary dark:text-sky-300" aria-hidden />
+            {/* BI-18 part C review fix (SHOULD-FIX) R2: the hint's colour is its own; the buttons beside it keep theirs. */}
+            <span className="min-w-0 flex-1 text-primary dark:text-sky-200">
+              {phoneEdit
+                ? "Phone layout: move tiles up or down and change their height. Saved automatically."
+                : "Editing the layout. Drag a tile by its header to move it, and by its bottom-right corner to resize it. Saved automatically."}
+            </span>
+            {canWrite && !isDefault && !phoneEdit ? (
+              <DropdownMenu>
+                <DropdownMenuTrigger render={<Button variant="ghost" size="sm" className="text-primary hover:text-primary dark:text-sky-300" />}><Plus className="size-3.5" /> Heading or section</DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-40">
+                  <DropdownMenuItem onClick={() => setLineDialog({ mode: "add", kind: "heading" })}><Heading className="size-4" /> Heading</DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => setLineDialog({ mode: "add", kind: "section" })}><Rows3 className="size-4" /> Section</DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => void addSectionTile("divider", "")}><Minus className="size-4" /> Divider</DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            ) : null}
+            {canWrite ? (
+              <Button variant={phoneEdit ? "default" : "ghost"} size="sm" aria-pressed={phoneEdit} onClick={() => setPhoneEdit((v) => !v)}
+                className={phoneEdit ? undefined : "text-primary hover:text-primary dark:text-sky-300"}>
+                <Smartphone className="size-3.5" /> {phoneEdit ? "Done with phone layout" : "Edit phone layout"}
+              </Button>
+            ) : null}
+            {phoneEdit && phone?.length ? <Button variant="ghost" size="sm" onClick={() => void resetPhone()}>Use the computed order</Button> : null}
+          </div>
+        ) : undefined}
         onComments={isDefault ? undefined : () => setCommentsOpen(true)}
         actions={
           <>
@@ -1362,12 +1392,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
               </Button>
             ) : null}
             {edit ? (
+              // BI-61 T5: edit mode's own two controls; Done is the one way back (one action, one button).
               <>
-                {hasPermission("dashboard:write") ? (
-                  <Button variant="ghost" size="lg" onClick={() => setParamsOpen(true)}>
-                    <SlidersHorizontal data-icon="inline-start" aria-hidden /> Parameters
-                  </Button>
-                ) : null}
                 <NewChartButton canWrite={canWrite} onClick={() => router.push(chartNewHref(board, data?.appliedParams))} />
                 <Button variant="outline" size="lg" className="min-w-20" onClick={() => setEdit(false)}>
                   <Check data-icon="inline-start" aria-hidden /> Done
@@ -1441,6 +1467,13 @@ export function DashboardPage({ boardId }: { boardId: string }) {
                 onSaveDefault={() => void saveRowDefault()}
                 onReset={resetRow}
               />
+              {/* BI-61 T5: which parameters the row shows is an edit-mode choice, beside "+ Filter". */}
+              {edit && hasPermission("dashboard:write") ? (
+                <button type="button" onClick={() => setParamsOpen(true)}
+                  className={cn("inline-flex h-8 shrink-0 items-center gap-1 rounded-full px-3 text-sm font-medium text-primary hover:bg-primary/10 dark:text-sky-300", EASE, FOCUS)}>
+                  <SlidersHorizontal className="size-3.5" aria-hidden /> Parameters
+                </button>
+              ) : null}
             </FilterRow>
           ) : null}
         </div>
@@ -1499,33 +1532,6 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         </Empty>
       ) : (
         <>
-          {edit ? (
-            <div className="flex flex-wrap items-center gap-2 rounded-lg border border-dashed border-primary/30 bg-primary/5 px-3 py-1.5 text-xs">
-              <Move className="size-3.5 text-primary" />
-              {/* BI-18 part C review fix (SHOULD-FIX) R2: the muted colour is the hint's alone; on the bar it was inherited by the buttons and made them look disabled. */}
-              <span className="min-w-0 flex-1 text-muted-foreground">
-                {phoneEdit
-                  ? <>Phone layout: <span className="font-medium text-foreground">move tiles up or down</span> and change their height. Saved automatically.</>
-                  : <>Edit mode: <span className="font-medium text-foreground">drag the header</span> to move, <span className="font-medium text-foreground">drag the bottom-right corner</span> to resize. Saved automatically.</>}
-              </span>
-              {canWrite && !isDefault && !phoneEdit ? (
-                <DropdownMenu>
-                  <DropdownMenuTrigger render={<Button variant="outline" size="sm" />}><Plus className="size-3.5" /> Add</DropdownMenuTrigger>
-                  <DropdownMenuContent align="end" className="w-40">
-                    <DropdownMenuItem onClick={() => setLineDialog({ mode: "add", kind: "heading" })}><Heading className="size-4" /> Heading</DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => setLineDialog({ mode: "add", kind: "section" })}><Rows3 className="size-4" /> Section</DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => void addSectionTile("divider", "")}><Minus className="size-4" /> Divider</DropdownMenuItem>
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              ) : null}
-              {canWrite ? (
-                <Button variant={phoneEdit ? "default" : "outline"} size="sm" aria-pressed={phoneEdit} onClick={() => setPhoneEdit((v) => !v)}>
-                  <Smartphone className="size-3.5" /> {phoneEdit ? "Done with phone layout" : "Edit phone layout"}
-                </Button>
-              ) : null}
-              {phoneEdit && phone?.length ? <Button variant="ghost" size="sm" onClick={() => void resetPhone()}>Use the computed order</Button> : null}
-            </div>
-          ) : null}
           <DashboardGrid
             items={items} layout={shownLayout} editable={edit && !phoneEdit} onLayoutChange={persistLayout}
             tabs={tabs} tab={selTab} phone={phone} phoneEdit={edit && phoneEdit} onPhoneChange={persistPhone}
