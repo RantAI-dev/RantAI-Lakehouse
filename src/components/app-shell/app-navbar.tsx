@@ -114,7 +114,8 @@ export function CopilotButton({ open, onToggle }: { readonly open: boolean; read
         <Bot className="size-4" aria-hidden />
         <span className="hidden lg:inline">AI Copilot</span>
       </TooltipTrigger>
-      <TooltipContent>{label}</TooltipContent>
+      {/* No tooltip while the button shows its own label (lg and up); the icon-only form keeps it. */}
+      <TooltipContent className="lg:hidden">{label}</TooltipContent>
     </Tooltip>
   )
 }
