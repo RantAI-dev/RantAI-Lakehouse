@@ -13,7 +13,7 @@ import { ArrowDown, ArrowUp, Folder as FolderIcon, Lock } from "lucide-react"
 import { Checkbox } from "@/components/ui/checkbox"
 import { formatRelativeTime } from "@/lib/format"
 import { cn } from "@/lib/utils"
-import { KIND_LABEL, libraryHref, type LibraryItem, type SortColumn, type SortState } from "./library-items"
+import { KIND_LABEL, countLabel, libraryHref, type LibraryItem, type SortColumn, type SortState } from "./library-items"
 import { pickable } from "./library-bulk"
 import { ItemMenu, type ItemActions } from "./library-menus"
 import { Avatar, EASE, FOCUS, ItemBadges, KindIcon, StarButton, ownerLabel } from "./library-parts"
@@ -46,7 +46,7 @@ export type Selection = {
 }
 
 export function LibraryTable({
-  items, sort, onSort, actions, folders, myName, onOpenTemplate, pictures, selection,
+  items, sort, onSort, actions, folders, myName, onOpenTemplate, pictures, selection, phone,
 }: {
   readonly items: readonly LibraryItem[]
   readonly sort: SortState
@@ -57,41 +57,55 @@ export function LibraryTable({
   readonly onOpenTemplate: (item: LibraryItem) => void
   readonly pictures: PictureSource
   readonly selection?: Selection
+  /**
+   * Below 768 px the rows are stacked instead of a table (T6). Chosen by the
+   * page from the viewport, not by CSS alone, so the rows are not in the
+   * page twice for a screen reader.
+   */
+  readonly phone?: boolean
 }) {
   const choosable = items.filter(pickable)
   const allOn = choosable.length > 0 && choosable.every((i) => selection?.selected.has(i.key))
   const someOn = !allOn && choosable.some((i) => selection?.selected.has(i.key))
   return (
     <div className="rounded-2xl bg-card ring-1 ring-foreground/5">
-      <table className="w-full table-fixed text-sm">
-        <thead>
-          <tr className="text-left text-xs text-muted-foreground">
-            {selection ? (
-              <th className="w-11 py-2.5 pl-4 font-normal">
-                {choosable.length > 0 ? (
-                  <Checkbox
-                    aria-label="Select all"
-                    checked={allOn ? true : someOn ? "indeterminate" : false}
-                    onCheckedChange={() => selection.onToggleAll(choosable, !allOn)}
-                  />
-                ) : null}
-              </th>
-            ) : null}
-            <Th column="name" sort={sort} onSort={onSort} className={cn("w-[30%]", !selection && "pl-4")}>Name</Th>
-            <Th column="kind" sort={sort} onSort={onSort} className="w-28">Type</Th>
-            <Th column="folder" sort={sort} onSort={onSort} className="hidden w-40 xl:table-cell">Folder</Th>
-            <Th column="owner" sort={sort} onSort={onSort} className="w-36">Owner</Th>
-            <Th column="updated" sort={sort} onSort={onSort} className="w-24">Updated</Th>
-            <Th column="sharing" sort={sort} onSort={onSort}>Sharing</Th>
-            <th className="w-20 py-2.5 pr-2"><span className="sr-only">Actions</span></th>
-          </tr>
-        </thead>
-        <tbody>
+      {phone ? (
+        <ul className="divide-y divide-border/60" aria-label="Dashboards, reports and templates">
           {items.map((item) => (
-            <TableRow key={item.key} item={item} actions={actions} folders={folders} myName={myName} onOpenTemplate={onOpenTemplate} pictures={pictures} selection={selection} />
+            <PhoneRow key={item.key} item={item} actions={actions} folders={folders} myName={myName} onOpenTemplate={onOpenTemplate} pictures={pictures} selection={selection} />
           ))}
-        </tbody>
-      </table>
+        </ul>
+      ) : (
+        <table className="w-full table-fixed text-sm">
+          <thead>
+            <tr className="text-left text-xs text-muted-foreground">
+              {selection ? (
+                <th className="w-11 py-2.5 pl-4 font-normal">
+                  {choosable.length > 0 ? (
+                    <Checkbox
+                      aria-label="Select all"
+                      checked={allOn ? true : someOn ? "indeterminate" : false}
+                      onCheckedChange={() => selection.onToggleAll(choosable, !allOn)}
+                    />
+                  ) : null}
+                </th>
+              ) : null}
+              <Th column="name" sort={sort} onSort={onSort} className={cn("w-[30%]", !selection && "pl-4")}>Name</Th>
+              <Th column="kind" sort={sort} onSort={onSort} className="w-28">Type</Th>
+              <Th column="folder" sort={sort} onSort={onSort} className="hidden w-40 xl:table-cell">Folder</Th>
+              <Th column="owner" sort={sort} onSort={onSort} className="w-36">Owner</Th>
+              <Th column="updated" sort={sort} onSort={onSort} className="w-24">Updated</Th>
+              <Th column="sharing" sort={sort} onSort={onSort}>Sharing</Th>
+              <th className="w-20 py-2.5 pr-2"><span className="sr-only">Actions</span></th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((item) => (
+              <TableRow key={item.key} item={item} actions={actions} folders={folders} myName={myName} onOpenTemplate={onOpenTemplate} pictures={pictures} selection={selection} />
+            ))}
+          </tbody>
+        </table>
+      )}
     </div>
   )
 }
@@ -206,5 +220,43 @@ function TableRow({ item, actions, folders, myName, onOpenTemplate, pictures, se
         </div>
       </td>
     </tr>
+  )
+}
+
+/**
+ * A row on a phone: the tick, the picture, the name over one line of what the
+ * table's columns say (type, size, folder, when), then the star and the ⋯.
+ * Nothing scrolls sideways.
+ */
+function PhoneRow({ item, actions, folders, myName, onOpenTemplate, pictures, selection }: RowProps) {
+  const fav = item.kind === "dashboard" && actions.isFavourite(item)
+  const ticked = selection?.selected.has(item.key) ?? false
+  const folder = item.folderId ? folders.pathOf(item.folderId) : ""
+  const owner = ownerLabel(item, myName)
+  const facts = [
+    KIND_LABEL[item.kind],
+    countLabel(item),
+    folder || null,
+    item.builtin ? null : owner === "—" ? null : owner,
+    item.updatedAt ? formatRelativeTime(item.updatedAt) : null,
+  ].filter(Boolean)
+  return (
+    <li className={cn("relative flex items-center gap-3 px-3 py-2.5", ticked && "bg-primary/6 dark:bg-primary/10", EASE)}>
+      {selection ? (
+        pickable(item) ? (
+          <Checkbox aria-label={`Select ${item.name}`} checked={ticked} onCheckedChange={() => selection.onToggle(item)} className="relative z-10" />
+        ) : (
+          <span aria-hidden className="size-4 shrink-0" />
+        )
+      ) : null}
+      <ItemPicture item={item} charts={chartsOf(pictures, item.id)} size="sm" className="h-9 w-12 shrink-0 rounded-md" />
+      <div className="grid min-w-0 flex-1 gap-0.5">
+        <ItemName item={item} onOpenTemplate={onOpenTemplate} className="block max-w-full text-sm" />
+        <p className="truncate text-xs text-muted-foreground">{facts.join(" · ")}</p>
+        <ItemBadges item={item} max={2} />
+      </div>
+      {item.kind === "dashboard" ? <StarButton on={fav} name={item.name} onToggle={() => actions.onToggleFavourite(item)} /> : null}
+      <ItemMenu item={item} actions={actions} />
+    </li>
   )
 }

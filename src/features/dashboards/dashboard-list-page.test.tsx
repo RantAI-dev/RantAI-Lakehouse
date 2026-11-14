@@ -454,3 +454,31 @@ describe("bulk actions, facts and empty states (BI-59 T5)", () => {
     expect(screen.getByText("Main")).toBeTruthy()
   })
 })
+
+describe("at phone width (BI-59 T6)", () => {
+  it("stacks the rows instead of a table, each with its facts, star and ⋯", async () => {
+    const own = Object.getOwnPropertyDescriptor(window, "innerWidth")
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 390 })
+    try {
+      serve(["dashboard:read", "dashboard:write"], {
+        "GET /api/dashboard/reports": () => json({ reports: [REPORT], truncated: false, maxCharts: 30 }),
+        "GET /api/dashboard/folders": () => json({ folders: FOLDERS }),
+      })
+      renderPage()
+      const list = await screen.findByRole("list", { name: "Dashboards, reports and templates" })
+      expect(document.querySelector("table")).toBeNull()
+      const row = within(list).getByText("Wisman 2020-2024").closest("li")
+      if (!row) throw new Error("no row")
+      // Type, size, folder, owner, then when (a relative time).
+      expect(within(row).getByText(/^Report · 2 charts · Tourism · Bima · .+ ago$/)).toBeTruthy()
+      expect(within(row).getByRole("button", { name: "Actions for Wisman 2020-2024" })).toBeTruthy()
+      const qa = within(list).getByText("QA BI").closest("li")
+      if (!qa) throw new Error("no row")
+      expect(within(qa).getByRole("button", { name: "Add QA BI to favourites" })).toBeTruthy()
+      expect(within(qa).getByRole("checkbox", { name: "Select QA BI" })).toBeTruthy()
+    } finally {
+      if (own) Object.defineProperty(window, "innerWidth", own)
+      else delete (window as { innerWidth?: number }).innerWidth
+    }
+  })
+})

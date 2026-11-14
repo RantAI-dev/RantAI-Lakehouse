@@ -37,8 +37,12 @@ export type PictureSize = "sm" | "md" | "lg"
 const COL = 10
 const ROW = 7
 const WIDTH = 12 * COL
-/** Width over height of each size's box, so the drawing fills it and only its bottom is cut. */
-const ASPECT: Record<Exclude<PictureSize, "sm">, number> = { md: 2.4, lg: 2.25 }
+/**
+ * Width over height of the drawing. Kept below every box it is drawn in
+ * (about 1.9 to 2.6 wide for each high), so `slice` fills the box by its width
+ * and only ever cuts the bottom, never the first tile's left edge.
+ */
+const ASPECT: Record<Exclude<PictureSize, "sm">, number> = { md: 1.6, lg: 1.6 }
 
 /** The charts of each board, by board id. */
 export function outlinesByBoard(outlines: readonly ChartOutline[]): Map<string, ChartOutline[]> {
@@ -417,12 +421,13 @@ export function BoardPicture({ board, charts, size, className }: {
 /** One chart on its own (a recent chart): its silhouette in a card. */
 export function ChartPicture({ chart, size, className }: { chart: ChartOutline | null; size: PictureSize; className?: string }) {
   if (!chart) return <Neutral icon={LayoutDashboard} size={size} className={className} />
-  const h = size === "sm" ? 30 : WIDTH / ASPECT[size]
+  // One card, shown whole: `meet` leaves the box's colour around it rather than cutting it.
+  const h = size === "sm" ? 30 : WIDTH / 2.4
   const w = size === "sm" ? 44 : WIDTH
   const inset = size === "sm" ? 3 : 4
   return (
     <div aria-hidden className={cn(BOX, className)}>
-      <svg viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="xMidYMid slice" className="block size-full" role="presentation">
+      <svg viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="xMidYMid meet" className="block size-full" role="presentation">
         <TileShape tile={chart} x={inset} y={inset} w={w - inset * 2} h={h - inset * 2} small={size === "sm"} />
       </svg>
     </div>

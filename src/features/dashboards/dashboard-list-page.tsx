@@ -6,6 +6,7 @@ import { LayoutGrid, Rows3 } from "lucide-react"
 
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
+import { useIsMobile } from "@/hooks/use-mobile"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { useUrlTab } from "@/hooks/use-url-tab"
 import { useAuth } from "@/features/auth/auth-provider"
@@ -245,6 +246,7 @@ export function DashboardListPage() {
   }
   const [sort, setSort] = React.useState<SortState>({ column: "updated", dir: "desc" })
   const [view, setViewRaw] = useViewMode()
+  const phone = useIsMobile()
   const setView = (next: ViewMode) => {
     setViewRaw(next)
     clearSelection()
@@ -496,8 +498,9 @@ export function DashboardListPage() {
                 />
               ) : (
                 <>
-                  <Segmented<TabValue> label="Type" value={tab} onChange={setTab} options={tabs} />
-                  <div className="flex items-center gap-2">
+                  {/* Smaller and full width on a phone, so the four choices fit one line. */}
+                  <Segmented<TabValue> label="Type" size={phone ? "sm" : "default"} value={tab} onChange={setTab} options={tabs} className={cn(phone && "w-full")} />
+                  <div className={cn("flex items-center gap-2", phone && "w-full justify-between")}>
                     <FolderPicker
                       value={folderFilter}
                       onChange={setFolderFilter}
@@ -550,6 +553,7 @@ export function DashboardListPage() {
                   onOpenTemplate={(item) => item.template && setUsing(item.template)}
                   pictures={pictures}
                   selection={selection}
+                  phone={phone}
                 />
               )
             ) : null}
