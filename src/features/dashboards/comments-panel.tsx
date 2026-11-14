@@ -64,7 +64,11 @@ function when(at: string): string {
  * rendered as a React child (never as HTML or Markdown), with line breaks kept.
  * The @ picker offers only people who can see the dashboard.
  */
-export function CommentsPanel({ board }: { readonly board: string }) {
+export function CommentsPanel({ board, onChanged }: {
+  readonly board: string;
+  /** Called after a comment was posted, edited or deleted, so a count elsewhere can follow (`BI-61` facts line). */
+  readonly onChanged?: () => void;
+}) {
   const list = useService((signal) => dashboardService.listComments(board, signal), [board]);
   const [text, setText] = React.useState("");
   const [picked, setPicked] = React.useState<CommentPerson[]>([]);
@@ -113,6 +117,7 @@ export function CommentsPanel({ board }: { readonly board: string }) {
       await work();
       done?.();
       list.reload();
+      onChanged?.();
     } catch (e) {
       setMessage(sentence(e));
     } finally { setBusy(false); }
@@ -241,9 +246,10 @@ export function CommentsPanel({ board }: { readonly board: string }) {
 
 /** The panel in a dialog, opened from the dashboard's toolbar. */
 export function CommentsDialog({
-  board, dashName, open, onOpenChange,
+  board, dashName, open, onOpenChange, onChanged,
 }: {
   readonly board: string;
+  readonly onChanged?: () => void;
   readonly dashName: string;
   readonly open: boolean;
   readonly onOpenChange: (open: boolean) => void;
@@ -256,7 +262,7 @@ export function CommentsDialog({
             <MessageSquare className="size-4" /> Comments on {dashName}
           </DialogTitle>
         </DialogHeader>
-        {open ? <CommentsPanel board={board} /> : null}
+        {open ? <CommentsPanel board={board} onChanged={onChanged} /> : null}
         <DialogFooter>
           <DialogClose render={<Button variant="outline" size="sm" />}>Close</DialogClose>
         </DialogFooter>

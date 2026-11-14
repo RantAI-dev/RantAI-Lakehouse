@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
-import { DashboardActionsMenu, EditLayoutButton, NewChartButton } from "./dashboard-actions"
+import { DashboardActionsMenu, NewChartButton } from "./dashboard-actions"
+import { EditPencil } from "./dashboard-header"
 import { chartWriteItems } from "./tile-write-items"
 
 afterEach(cleanup)
@@ -183,14 +184,15 @@ describe("write controls (R18)", () => {
     for (const label of ["Rename", "Duplicate", "Delete dashboard"]) expect(await screen.findByText(label)).toBeTruthy()
   })
 
-  it("Edit layout and New chart are shown to an editor and not to a viewer", () => {
-    render(<><EditLayoutButton canWrite edit={false} onToggle={() => {}} /><NewChartButton canWrite onClick={() => {}} /></>)
-    expect(screen.getByText("Edit layout")).toBeTruthy()
-    expect(screen.getByText("New chart")).toBeTruthy()
+  // BI-61 T1/T5: "Edit layout" is the header's pencil (named by its label) and "New chart" became edit mode's "Add chart".
+  it("Edit layout and Add chart are shown to an editor and not to a viewer", () => {
+    render(<><EditPencil canWrite onEdit={() => {}} /><NewChartButton canWrite onClick={() => {}} /></>)
+    expect(screen.getByRole("button", { name: "Edit layout" })).toBeTruthy()
+    expect(screen.getByText("Add chart")).toBeTruthy()
     cleanup()
-    render(<><EditLayoutButton canWrite={false} edit={false} onToggle={() => {}} /><NewChartButton canWrite={false} onClick={() => {}} /></>)
-    expect(screen.queryByText("Edit layout")).toBeNull()
-    expect(screen.queryByText("New chart")).toBeNull()
+    render(<><EditPencil canWrite={false} onEdit={() => {}} /><NewChartButton canWrite={false} onClick={() => {}} /></>)
+    expect(screen.queryByRole("button", { name: "Edit layout" })).toBeNull()
+    expect(screen.queryByText("Add chart")).toBeNull()
   })
 
   it("a chart tile's menu has Edit chart, Duplicate and Delete chart for an editor of its own chart only", () => {

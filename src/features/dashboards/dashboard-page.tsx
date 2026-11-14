@@ -4,9 +4,8 @@ import * as React from "react";
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { ArrowRightLeft, Bell, MessageSquare, ChartColumn, Download, GitFork, ImageDown, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, RefreshCw, Smartphone, SlidersHorizontal, Sparkles, Square, Table2, Trash2, Rows3 } from "lucide-react";
+import { ArrowRightLeft, Bell, Check, ChartColumn, Download, GitFork, ImageDown, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, RefreshCw, Smartphone, SlidersHorizontal, Sparkles, Table2, Trash2, Rows3 } from "lucide-react";
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
-import { PageHeader } from "@/components/patterns/page-header";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@rantai/design-system/ui/empty";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -22,6 +21,8 @@ import { PART_NO_CLICK_REASON, isGrain, isTruncation, switchChoices, type Column
 import { effectiveRefresh, canSaveRefresh as refreshIsSaveable, listedInterval } from "@/lib/dashboard-refresh";
 import { enterFullscreen, leaveFullscreen, readFullscreenDark, writeFullscreenDark } from "@/lib/dashboard-fullscreen";
 import { notifyFailure, notifyInfo, notifySuccess } from "@/lib/notify";
+import { formatRelativeTime } from "@/lib/format";
+import { dataFromLabel } from "@/lib/result-cache";
 import { readableErrorMessage } from "@/lib/notify-message";
 import { buildDashboardPageContext, summarizeFilters, summarizeFilterJson, summarizeGrain, summarizeParams, summarizeTabs, summarizeTiles } from "@/lib/page-context-summary";
 import { FILTER_PARAM, decodeFilters, dropInertFilters, enforceRequired, filtersEqual, filtersToParam, isActiveFilter, normalizeFilters, toggleValue } from "@/lib/dashboard-filter-state";
@@ -41,11 +42,11 @@ import { newRunId, RUN_ID_HEADER } from "@/lib/run-id";
 import { STOPPED_SENTENCE } from "@/lib/query-limits";
 import { apiFetch } from "@/services/http";
 import { useAutoRefresh } from "./auto-refresh";
-import { BoardSwitcher } from "./board-switcher";
+import { DashboardHeader, EditPencil, ShareButton } from "./dashboard-header";
 import type { ChartDef } from "./chart-builder";
 import { chartEditHref, chartNewHref } from "./chart-page";
 import { fmtInt } from "./chart-option";
-import { DashboardActionsMenu, EditLayoutButton, NewChartButton, RenameDashboardDialog } from "./dashboard-actions";
+import { DashboardActionsMenu, NewChartButton, RenameDashboardDialog } from "./dashboard-actions";
 import { SaveTemplateDialog } from "./template-dialogs";
 import { chartWriteItems } from "./tile-write-items";
 import { ThemeFontDialog } from "./theme-font-dialog";
@@ -253,6 +254,13 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // Folders only group the title switcher here. Managing them and filing
   // a dashboard are on the dashboard list (`dashboard-list-page.tsx`).
   const foldersState = useService((signal) => dashboardService.listFolders(signal), []);
+  // BI-61 T1: the facts line's owner and "Updated", and its comment count.
+  const boardList = useService((signal) => dashboardService.listBoards(signal), []);
+  const comments = useService(
+    (signal) => (isDefault ? Promise.resolve(null) : dashboardService.listComments(board, signal)),
+    [board, isDefault],
+  );
+  const commentCount = comments.status === "success" && comments.data ? comments.data.comments.length : null;
   const folders = React.useMemo(() => labelledFolders(foldersState.data ?? [], user?.id), [foldersState.data, user?.id]);
   const [shareOpen, setShareOpen] = React.useState(false);
   const [commentsOpen, setCommentsOpen] = React.useState(false);
@@ -394,7 +402,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // Charts added or removed elsewhere (Copilot, board menus); folders are
   // reloaded too, since the same event covers filing a dashboard.
   const reloadFolders = foldersState.reload;
-  useDashboardsChanged(React.useCallback(() => { void load(); reloadFolders(); }, [load, reloadFolders]));
+  const reloadBoardList = boardList.reload;
+  useDashboardsChanged(React.useCallback(() => { void load(); reloadFolders(); reloadBoardList(); }, [load, reloadFolders, reloadBoardList]));
   // Periodic refresh for presenting; pauses while the tab is hidden.
   const savedSec = listedInterval(data?.refreshSeconds);
   const autoSec = effectiveRefresh(data?.refreshSeconds, sessionSec);
@@ -778,15 +787,6 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       notifyFailure("The dashboard was not duplicated", writeError(e));
     }
   }
-  async function createDashboard() {
-    try {
-      const created = await dashboardService.createBoard({ name: "New dashboard" });
-      notifyDashboardsChanged();
-      if (created.id) router.push(`/dashboards/${created.id}`);
-    } catch (e) {
-      notifyFailure("The dashboard was not created", writeError(e));
-    }
-  }
   async function deleteDashboard() {
     if (isDefault) return;
     try {
@@ -823,6 +823,32 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const boards = data?.boards ?? [{ id: "default", name: "Main" }];
   const dashName = boards.find((b) => b.id === board)?.name ?? "Dashboards";
   const ownerId = boards.find((b) => b.id === board)?.ownerId;
+  // BI-61 T1: the facts line. Who made it and when it was last written come from
+  // the dashboard list (the page's own read carries neither); a failed read
+  // leaves them out rather than guessing.
+  const listed = boardList.status === "success" ? boardList.data.find((b) => b.id === board) : undefined;
+  const folderId = boards.find((b) => b.id === board)?.folderId;
+  const folderChain = React.useMemo(() => {
+    const names: string[] = [];
+    const seen = new Set<string>();
+    let at = folderId ? folders.find((f) => f.id === folderId) : undefined;
+    while (at && !seen.has(at.id)) {
+      seen.add(at.id);
+      names.unshift(at.name);
+      const parent = at.parentId;
+      at = parent ? folders.find((f) => f.id === parent) : undefined;
+    }
+    return names;
+  }, [folders, folderId]);
+  // "Data from" for the page is its oldest tile: everything on screen is at least that fresh.
+  const pageDataFrom = React.useMemo(() => {
+    let oldest: string | undefined;
+    for (const cell of Object.values(data?.results ?? NO_RESULTS)) {
+      if (!hasRows(cell) || !cell.computedAt) continue;
+      if (!oldest || new Date(cell.computedAt).getTime() < new Date(oldest).getTime()) oldest = cell.computedAt;
+    }
+    return dataFromLabel(oldest, data?.reporting?.timeZone, false);
+  }, [data?.results, data?.reporting?.timeZone]);
   // Stable empty fallbacks: a fresh `[]` each render re-ran the Copilot
   // context effect, which re-rendered this page, forever, while loading.
   const kpis = data?.kpis ?? NO_KPIS;
@@ -1289,26 +1315,11 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   return (
     <ReportingProvider reporting={data?.reporting}>
     <div className={cn("flex flex-col gap-4", fullscreen && "fixed inset-0 z-40 overflow-auto bg-background p-4 sm:p-6", look.className || (fullscreen && fsDark && "dark"), look.className && !fullscreen && "rounded-lg p-4")} style={look.style}>
-      <PageHeader
-        title={
-          <BoardSwitcher
-            boards={boards}
-            activeId={board}
-            activeName={dashName}
-            onSelect={(id) => router.push(`/dashboards/${id}`)}
-            onCreate={() => void createDashboard()}
-            folders={folders}
-            badge={ownerId ? <PrivateBadge /> : undefined}
-          />
-        }
-        actions={
-          <span data-print-hide className="contents">
-            {fullscreen ? (
-              <Button variant="outline" size="sm" aria-pressed={fsDark} onClick={toggleFsDark}>
-                <Moon className="size-4" /> Dark
-              </Button>
-            ) : null}
-            <EditLayoutButton canWrite={canWrite} edit={edit} onToggle={() => setEdit((e) => !e)} />
+      <DashboardHeader
+        folderPath={folderChain}
+        title={dashName}
+        titleAccessory={
+          <>
             {!isDefault ? (
               <FavouriteButton
                 on={isFavourite}
@@ -1318,54 +1329,74 @@ export function DashboardPage({ boardId }: { boardId: string }) {
                 }}
               />
             ) : null}
-            {loading ? (
-              <Button size="sm" variant="outline" onClick={stopLoading}>
-                <Square className="size-4" aria-hidden /> Stop
+            {ownerId ? <PrivateBadge /> : null}
+          </>
+        }
+        facts={{
+          owner: listed?.createdBy || undefined,
+          updated: listed?.updatedAt ? formatRelativeTime(listed.updatedAt) : undefined,
+          dataFrom: pageDataFrom,
+          comments: isDefault ? undefined : commentCount,
+        }}
+        loading={loading}
+        onStop={stopLoading}
+        onComments={isDefault ? undefined : () => setCommentsOpen(true)}
+        actions={
+          <>
+            {fullscreen ? (
+              <Button variant="outline" size="lg" aria-pressed={fsDark} onClick={toggleFsDark}>
+                <Moon className="size-4" /> Dark
               </Button>
             ) : null}
-            <DashboardActionsMenu
-              isDefault={isDefault}
-              canWrite={canWrite}
-              canManage={canManage}
-              isPrivate={Boolean(ownerId)}
-              onHistory={() => setHistoryOpen(true)}
-              onTheme={canWrite ? () => { setThemeError(null); setThemeOpen(true); } : undefined}
-              onFreshness={canWrite ? () => { setFreshError(null); setFreshOpen(true); } : undefined}
-              loading={loading}
-              fullscreen={fullscreen}
-              autoSec={String(autoSec)}
-              savedSec={String(savedSec)}
-              canSaveRefresh={refreshIsSaveable({ mayWrite: canWrite, saved: savedSec, effective: autoSec })}
-              savingRefresh={savingRefresh}
-              onRefresh={() => void load("1")}
-              onToggleFullscreen={toggleFullscreen}
-              onAutoSec={(v) => setSessionSec(Number(v))}
-              onSaveRefresh={() => void saveRefreshDefault()}
-              onRename={() => setRenameOpen(true)}
-              onShare={() => setShareOpen(true)}
-              onExportPdf={exportPdf}
-              onDownloadPdf={() => setPdfOpen(true)}
-              onExportFile={() => void downloadFile()}
-              onSaveTemplate={hasPermission("dashboard:write") ? () => setTemplateOpen(true) : undefined}
-              onSubscriptions={() => setSubsOpen(true)}
-              pdfSupported={data?.pdfSupported === true}
-              canDownload={canDownload}
-              onDuplicate={() => void duplicateDashboard()}
-              onDelete={() => void deleteDashboard()}
-            />
-            {/* BI-19 part E: anyone who can see the dashboard can read and write comments; the server checks. */}
-            {!isDefault ? (
-              <Button size="sm" variant="outline" onClick={() => setCommentsOpen(true)}>
-                <MessageSquare className="size-4" /> Comments
-              </Button>
-            ) : null}
-            {hasPermission("dashboard:write") ? (
-              <Button size="sm" variant="outline" onClick={() => setParamsOpen(true)}>
-                <SlidersHorizontal className="size-4" /> Parameters
-              </Button>
-            ) : null}
-            <NewChartButton canWrite={canWrite} onClick={() => router.push(chartNewHref(board, data?.appliedParams))} />
-          </span>
+            {edit ? (
+              <>
+                {hasPermission("dashboard:write") ? (
+                  <Button variant="ghost" size="lg" onClick={() => setParamsOpen(true)}>
+                    <SlidersHorizontal data-icon="inline-start" aria-hidden /> Parameters
+                  </Button>
+                ) : null}
+                <NewChartButton canWrite={canWrite} onClick={() => router.push(chartNewHref(board, data?.appliedParams))} />
+                <Button variant="outline" size="lg" className="min-w-20" onClick={() => setEdit(false)}>
+                  <Check data-icon="inline-start" aria-hidden /> Done
+                </Button>
+              </>
+            ) : (
+              <>
+                <EditPencil canWrite={canWrite} onEdit={() => setEdit(true)} />
+                <ShareButton isDefault={isDefault} isPrivate={Boolean(ownerId)} canManage={canManage} onShare={() => setShareOpen(true)} />
+                <DashboardActionsMenu
+                  isDefault={isDefault}
+                  canWrite={canWrite}
+                  canManage={canManage}
+                  isPrivate={Boolean(ownerId)}
+                  onHistory={() => setHistoryOpen(true)}
+                  onTheme={canWrite ? () => { setThemeError(null); setThemeOpen(true); } : undefined}
+                  onFreshness={canWrite ? () => { setFreshError(null); setFreshOpen(true); } : undefined}
+                  loading={loading}
+                  fullscreen={fullscreen}
+                  autoSec={String(autoSec)}
+                  savedSec={String(savedSec)}
+                  canSaveRefresh={refreshIsSaveable({ mayWrite: canWrite, saved: savedSec, effective: autoSec })}
+                  savingRefresh={savingRefresh}
+                  onRefresh={() => void load("1")}
+                  onToggleFullscreen={toggleFullscreen}
+                  onAutoSec={(v) => setSessionSec(Number(v))}
+                  onSaveRefresh={() => void saveRefreshDefault()}
+                  onRename={() => setRenameOpen(true)}
+                  onShare={() => setShareOpen(true)}
+                  onExportPdf={exportPdf}
+                  onDownloadPdf={() => setPdfOpen(true)}
+                  onExportFile={() => void downloadFile()}
+                  onSaveTemplate={hasPermission("dashboard:write") ? () => setTemplateOpen(true) : undefined}
+                  onSubscriptions={() => setSubsOpen(true)}
+                  pdfSupported={data?.pdfSupported === true}
+                  canDownload={canDownload}
+                  onDuplicate={() => void duplicateDashboard()}
+                  onDelete={() => void deleteDashboard()}
+                />
+              </>
+            )}
+          </>
         }
       />
 
@@ -1433,7 +1464,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
             </EmptyDescription>
           </EmptyHeader>
           <EmptyContent className="flex-row justify-center gap-2">
-            <NewChartButton canWrite={canWrite} onClick={() => router.push(chartNewHref(board, data?.appliedParams))} />
+            <NewChartButton size="sm" canWrite={canWrite} onClick={() => router.push(chartNewHref(board, data?.appliedParams))} />
             <Button
               size="sm"
               variant="outline"
@@ -1577,7 +1608,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
           onReverted={() => { notifyDashboardsChanged(); void load(); }}
         />
       ) : null}
-      {!isDefault ? <CommentsDialog board={board} dashName={dashName} open={commentsOpen} onOpenChange={changeCommentsOpen} /> : null}
+      {!isDefault ? <CommentsDialog board={board} dashName={dashName} open={commentsOpen} onOpenChange={changeCommentsOpen} onChanged={comments.reload} /> : null}
       {!isDefault ? <ShareDialog board={board} dashName={dashName} open={shareOpen && canManage} onOpenChange={setShareOpen} /> : null}
       {themeOpen ? (
         <ThemeFontDialog open={themeOpen} onOpenChange={setThemeOpen} theme={data?.theme} font={data?.font}

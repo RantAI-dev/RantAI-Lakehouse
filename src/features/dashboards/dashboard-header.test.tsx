@@ -1,0 +1,92 @@
+// BI-61 T1 (spec T1, AC1): in reading mode the header of a dashboard shows
+// Edit (a pencil, for writers), Share (for those who manage it) and ⋯, and
+// nothing else; the facts line names the owner, the update and the comments,
+// and the breadcrumb names the folder. Renders the real page, like
+// `dashboard-stop.test.tsx`.
+mock.module("next/navigation", () => ({
+  usePathname: () => "/dashboards/b_1",
+  useSearchParams: () => new URLSearchParams(),
+  useRouter: () => ({
+    push: () => {},
+    replace: () => {},
+    refresh: () => {},
+    back: () => {},
+    forward: () => {},
+    prefetch: () => {},
+  }),
+}))
+
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react"
+import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { TableProviders } from "@/components/app-shell/table-providers"
+import { AuthProvider } from "@/features/auth/auth-provider"
+import { DashboardPage } from "./dashboard-page"
+
+afterEach(() => {
+  cleanup()
+  mock.restore()
+  window.localStorage.clear()
+})
+
+const json = (body: unknown, status = 200) =>
+  new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } })
+
+function mount({ permissions, level }: { permissions: string[]; level: string }) {
+  spyOn(globalThis, "fetch").mockImplementation(((input: RequestInfo | URL) => {
+    const path = String(input)
+    if (path.includes("/api/auth/me")) {
+      return Promise.resolve(json({ id: "u1", name: "Rina", email: null, roles: [], permissions, tenants: [] }))
+    }
+    if (path.startsWith("/api/dashboard?")) {
+      return Promise.resolve(json({
+        board: "b_1", boards: [{ id: "default", name: "Main" }, { id: "b_1", name: "Quarterly Sales", folderId: "f_2" }],
+        charts: [], kpis: [], filterColumns: [], results: {}, layout: {}, canDownload: true, access: { level },
+      }))
+    }
+    if (path.includes("/api/dashboard/boards")) {
+      return Promise.resolve(json({ boards: [{ id: "b_1", name: "Quarterly Sales", createdBy: "Rina Putri", updatedAt: new Date(Date.now() - 2 * 3_600_000).toISOString() }] }))
+    }
+    if (path.includes("/api/dashboard/folders")) {
+      return Promise.resolve(json({ folders: [{ id: "f_1", name: "Finance", parentId: "", createdBy: "u1" }, { id: "f_2", name: "Sales", parentId: "f_1", createdBy: "u1" }] }))
+    }
+    if (path.includes("/api/dashboard/comments")) {
+      return Promise.resolve(json({ comments: [{ id: "c1", body: "hi", createdAt: "2026-11-14T00:00:00Z" }, { id: "c2", body: "yo", createdAt: "2026-11-14T00:00:00Z" }], truncated: false }))
+    }
+    if (path.includes("/api/dashboard/shortcuts")) return Promise.resolve(json({ favourites: [], recent: [] }))
+    return Promise.resolve(json({}))
+  }) as unknown as typeof fetch)
+  render(
+    <AuthProvider>
+      <TableProviders>
+        <DashboardPage boardId="b_1" />
+      </TableProviders>
+    </AuthProvider>,
+  )
+}
+
+const actions = () => document.querySelector("[data-slot='dashboard-header-actions']") as HTMLElement
+
+describe("the dashboard header (BI-61 T1)", () => {
+  it("shows Edit, Share and ⋯ only, to someone who manages the dashboard", async () => {
+    mount({ permissions: ["dashboard:read", "dashboard:write"], level: "manage" })
+    await screen.findByText("Quarterly Sales")
+    await waitFor(() => expect(within(actions()).getAllByRole("button").map((b) => b.getAttribute("aria-label") ?? b.textContent?.trim()))
+      .toEqual(["Edit layout", "Share", "More actions"]))
+  })
+
+  it("shows only ⋯ to a reader who may neither edit nor share", async () => {
+    mount({ permissions: ["dashboard:read"], level: "view" })
+    await screen.findByText("Quarterly Sales")
+    await waitFor(() => expect(within(actions()).getAllByRole("button").map((b) => b.getAttribute("aria-label")))
+      .toEqual(["More actions"]))
+  })
+
+  it("names the folder in the breadcrumb, and the owner, the update and the comments in the facts line", async () => {
+    mount({ permissions: ["dashboard:read"], level: "view" })
+    const crumbs = await screen.findByRole("navigation", { name: "Breadcrumb" })
+    await waitFor(() => expect(crumbs.textContent).toBe("DashboardsFinanceSales"))
+    expect(await screen.findByText("Rina Putri")).toBeTruthy()
+    expect(screen.getByText("Updated 2h ago")).toBeTruthy()
+    expect(await screen.findByRole("button", { name: "2 comments" })).toBeTruthy()
+  })
+})

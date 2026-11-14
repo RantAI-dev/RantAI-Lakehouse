@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import {
-  ChartColumn, Check, Copy, Download, Eye, FileDown, History, LayoutTemplate, Mail, Printer, Maximize2, Minimize2, MoreHorizontal, Palette, Pencil, RefreshCw, Save, Share2, Timer, Trash2,
+  Check, Copy, Download, FileDown, History, LayoutTemplate, Mail, Printer, Maximize2, Minimize2, MoreHorizontal, Palette, Pencil, Plus, RefreshCw, Save, Share2, Timer, Trash2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -79,7 +79,7 @@ export function DashboardActionsMenu({
   return (
     <div className="relative">
       <DropdownMenu>
-        <DropdownMenuTrigger render={<Button variant="outline" size="sm" aria-label="More actions" />}>
+        <DropdownMenuTrigger render={<Button variant="ghost" size="icon-lg" aria-label="More actions" className="text-muted-foreground hover:text-foreground aria-expanded:text-foreground" />}>
           <MoreHorizontal className="size-4" />
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end" className="w-56">
@@ -278,24 +278,14 @@ export function RenameDashboardDialog({
 }
 
 /**
- * "Edit layout"/"Done". Left out for a caller without `dashboard:write`
- * (BI-18 part C review fix (SHOULD-FIX) R18).
+ * "Add chart", the primary button of edit mode and of the empty dashboard
+ * (`BI-61` T5); left out without `dashboard:write` (R18).
  */
-export function EditLayoutButton({ canWrite, edit, onToggle }: { readonly canWrite: boolean; readonly edit: boolean; readonly onToggle: () => void }) {
+export function NewChartButton({ canWrite, onClick, size = "lg" }: { readonly canWrite: boolean; readonly onClick: () => void; readonly size?: "sm" | "lg" }) {
   if (!canWrite) return null;
   return (
-    <Button variant={edit ? "default" : "outline"} size="sm" onClick={onToggle}>
-      {edit ? <Eye className="size-4" /> : <Pencil className="size-4" />}{edit ? "Done" : "Edit layout"}
-    </Button>
-  );
-}
-
-/** "New chart", in the header and in the empty state; left out without `dashboard:write` (R18). */
-export function NewChartButton({ canWrite, onClick }: { readonly canWrite: boolean; readonly onClick: () => void }) {
-  if (!canWrite) return null;
-  return (
-    <Button size="sm" onClick={onClick}>
-      <ChartColumn className="size-4" /> New chart
+    <Button size={size} onClick={onClick}>
+      <Plus data-icon="inline-start" aria-hidden /> Add chart
     </Button>
   );
 }
