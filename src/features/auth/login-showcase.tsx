@@ -6,7 +6,7 @@
  * grow, a line draws, the KPI counts up), which rests and draws itself again
  * every 9 s while it is on screen and the tab is visible. Its charts answer
  * the pointer like the real ones. The numbers are fixed sample values, made
- * up for this page and labelled "Sample data" beside it: no API call, no
+ * up for this page and described as sample data by the panel label: no API call, no
  * customer data (feature page decision 2).
  *
  * Loaded by `login-page.tsx` with `next/dynamic` and `ssr: false`, after the
