@@ -30,11 +30,14 @@ import { useCopilot } from "@/features/copilot/use-copilot"
  * which draws the same bar while the session is checked: one set of classes,
  * so the skeleton cannot drift from the real navbar.
  */
+// 48 px tall (owner 2026-11-14, "navbar ini terlalu tinggi"): its 32 px controls, the console's
+// height, with 8 px above and below. The sidebar's logo row (`SidebarBrand`) is the same 48 px, so
+// their bottom borders make one straight line. Every offset under the navbar reads 3rem from here.
 export const NAVBAR_CLASS =
-  "sticky top-0 z-20 flex h-16 shrink-0 items-center gap-4 border-b border-border bg-background/90 px-4 backdrop-blur-md sm:px-5"
+  "sticky top-0 z-20 flex h-12 shrink-0 items-center gap-4 border-b border-border bg-background/90 px-4 backdrop-blur-md sm:px-5"
 export const NAVBAR_GRID_CLASS =
   "grid min-h-0 min-w-0 flex-1 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-3"
-export const NAVBAR_TRIGGER_CLASS = "size-9 shrink-0 rounded-lg border-border bg-background shadow-xs"
+export const NAVBAR_TRIGGER_CLASS = "size-8 shrink-0 rounded-lg border-border bg-background shadow-xs"
 
 /** The page's title at the navbar's left, from the nav config (never from the session). */
 export function NavbarTitle({ title }: { readonly title: string }) {
@@ -64,7 +67,7 @@ export function NavbarSearch() {
         onClick={() => openCommandPalette()}
         onFocus={() => openCommandPalette()}
         placeholder="Search pages, tables, columns"
-        className="h-9 w-full cursor-pointer rounded-lg border-border bg-muted/40 py-2 pl-9 pr-14 text-sm leading-5 shadow-none placeholder:text-muted-foreground focus-visible:bg-background"
+        className="h-8 w-full cursor-pointer rounded-lg border-border bg-muted/40 py-2 pl-9 pr-14 text-sm leading-5 shadow-none placeholder:text-muted-foreground focus-visible:bg-background"
         aria-label="Open command palette"
       />
       <kbd className="pointer-events-none absolute right-2 top-1/2 hidden h-5 -translate-y-1/2 items-center rounded border border-border bg-background px-1.5 font-mono text-[10px] text-muted-foreground lg:flex">
@@ -165,7 +168,7 @@ export function AppNavbar() {
               size="icon"
               onClick={() => copilot.setExpanded((prev) => !prev)}
               className={cn(
-                "relative size-9 rounded-lg transition-colors",
+                "relative size-8 rounded-lg transition-colors",
                 copilot.expanded
                   ? "bg-primary/10 text-primary hover:bg-primary/20 hover:text-primary"
                   : "text-muted-foreground hover:bg-muted hover:text-foreground"
@@ -183,7 +186,7 @@ export function AppNavbar() {
                   <Button
                     variant="ghost"
                     size="icon"
-                    className="relative size-9 rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
+                    className="relative size-8 rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
                     aria-label="Notifications"
                   />
                 }
@@ -238,7 +241,7 @@ export function AppNavbar() {
             <Button
               variant="ghost"
               size="icon"
-              className="relative size-9 rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
+              className="relative size-8 rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
               aria-label="Notifications"
               render={
                 <Link href="/alerts">

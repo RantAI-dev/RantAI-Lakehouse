@@ -42,10 +42,10 @@ export function TabCount({ count, tone }: { count: number; tone?: TabCountTone }
 }
 
 /**
- * The app navbar's height (`h-16` in `app-navbar.tsx`): the tab strip
+ * The app navbar's height (`h-12` in `app-navbar.tsx`): the tab strip
  * sticks right under it.
  */
-const STICKY_TOP_PX = 64
+const STICKY_TOP_PX = 48
 
 /**
  * After a tab switch, scrolled past the strip, the new tab would open
@@ -85,7 +85,7 @@ export function LineTabsList({ tabs, active }: { tabs: LineTab[]; active: string
     // (`app-frame.tsx`) so content scrolling underneath never shows
     // beside it. Two layers repeat the page's own background: the
     // inset's `bg-muted/25` over the body's `bg-background`.
-    <div className="sticky top-16 z-10 -mx-4 bg-background sm:-mx-5 lg:-mx-6">
+    <div className="sticky top-12 z-10 -mx-4 bg-background sm:-mx-5 lg:-mx-6">
       <div
         ref={stripRef}
         className="overflow-x-auto border-b border-border bg-muted/25 px-4 [scrollbar-width:none] sm:px-5 lg:px-6"

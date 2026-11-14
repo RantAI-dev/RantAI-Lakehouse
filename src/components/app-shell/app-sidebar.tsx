@@ -60,13 +60,13 @@ function BrandLogo() {
  * does not change at all when the real sidebar mounts.
  */
 export function SidebarBrand() {
-  // `h-16` supaya persis setinggi navbar (`app-navbar.tsx` juga `h-16`),
+  // `h-12` supaya persis setinggi navbar (`app-navbar.tsx` juga `h-12`, 48 px sejak 2026-11-14),
   // sehingga garis bawah keduanya menyambung jadi satu garis lurus di seluruh
   // lebar layar. Sebelumnya tinggi header ini dihitung dari isinya (padding +
   // baris logo) dan jatuh di 69px — 5px lebih rendah dari navbar, dan
   // patahannya terlihat tepat di pertemuan sidebar dengan konten.
   return (
-    <SidebarHeader className="flex h-16 shrink-0 flex-col justify-center border-b border-sidebar-border px-3 py-0 group-data-[collapsible=icon]:px-2">
+    <SidebarHeader className="flex h-12 shrink-0 flex-col justify-center border-b border-sidebar-border px-3 py-0 group-data-[collapsible=icon]:px-2">
       <div className="flex min-w-0 items-center justify-start gap-2 group-data-[collapsible=icon]:justify-center">
         <BrandLogo />
         <div className="grid min-w-0 flex-1 gap-0.5 leading-none group-data-[collapsible=icon]:hidden">

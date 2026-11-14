@@ -501,7 +501,7 @@ export function HomePage() {
   // button was easy to miss. The second screen is top-aligned (cards
   // centred in a tall screen floated in empty space) and holds the
   // dashboard preview, Recent and Pipeline runs. The negative margins undo `AppFrame`'s padding so
-  // the scroller is exactly the viewport under the 4rem navbar, and each
+  // the scroller is exactly the viewport under the 3rem navbar, and each
   // screen puts the padding back. Snapping is `proximity`, not
   // `mandatory`: it settles on a screen when the scroll ends near one and
   // otherwise leaves the scroll alone.
@@ -514,7 +514,7 @@ export function HomePage() {
         // `relative`: without a positioned scroller, absolutely positioned
         // descendants (the `sr-only` labels in Recent) escape its clipping
         // and stretch the document, which then scrolls as well.
-        "relative -m-4 h-[calc(100svh-4rem)] snap-y snap-proximity overflow-y-auto sm:-m-5 lg:-m-6",
+        "relative -m-4 h-[calc(100svh-3rem)] snap-y snap-proximity overflow-y-auto sm:-m-5 lg:-m-6",
         !reduce && "scroll-smooth",
       )}
     >

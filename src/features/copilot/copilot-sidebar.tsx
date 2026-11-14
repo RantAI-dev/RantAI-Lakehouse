@@ -80,7 +80,7 @@ export function CopilotSidebar({ hasAssistant = true }: { readonly hasAssistant?
         ? ({ "--side-panel-w": `${c.sidebarWidth}px` } as React.CSSProperties)
         : { width: `${c.sidebarWidth}px`, minWidth: `${c.sidebarWidth}px`, maxWidth: "850px" }}
       className={cn(
-        "sticky top-16 flex h-[calc(100vh-4rem)] shrink-0 flex-col border-l border-border bg-card/95 backdrop-blur-md",
+        "sticky top-12 flex h-[calc(100vh-3rem)] shrink-0 flex-col border-l border-border bg-card/95 backdrop-blur-md",
         tabbed && "max-md:fixed max-md:inset-x-0 max-md:bottom-0 max-md:z-40 max-md:h-auto max-md:border-l-0 max-md:bg-card md:w-(--side-panel-w) md:max-w-[850px] md:min-w-(--side-panel-w)",
         isDragging && "select-none",
       )}
