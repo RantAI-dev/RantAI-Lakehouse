@@ -6,7 +6,7 @@
 | Backlog | `QS-5` (part 1: parameters in SQL, saved queries and the assistant) |
 | Kind | Feature |
 | Spec | `docs/core/specs/qs-5.md` (the spec's *(proposed)* limits are decision 6) |
-| Status | In Acceptance |
+| Status | Released: accepted by the product owner on 2026-11-14 (part 1; every row Pass) |
 | Priority | P1 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |
@@ -163,31 +163,33 @@ ids on this page otherwise number part 1 only.
 
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| `QS-5-AC1` | (operator) On ClickHouse and then on Trino, run `POST /api/query/run` with a statement that uses a text, a number, a date, a date range (`.start` and `.end`) and a multi-select (`IN ({{ids}})`) parameter, each with a value | Both engines return rows filtered by the values, and the statement the engine received holds the values as literals | Not run |
-| `QS-5-AC2` | (operator) Run a statement with a text parameter whose value is `x' OR '1'='1` or `'; DROP TABLE t; --`, on both engines | The value is one text literal; the filter matches nothing extra and nothing else runs. The statement in History shows the quote doubled or escaped inside one literal (on Trino, a backslash shows as `chr(92)` between pieces). | Not run |
-| `QS-5-AC3` | (operator) Run a statement with `{{region}}` and no value, where the parameter has no default; then add the default and run again | The first run is refused with "Fill in {{region}} to run this query." and the engine receives nothing; the second runs with the default | Not run |
-| `QS-5-AC4` | (operator) Save a query with a text parameter and a dropdown through the API, change only the parameter's default, read the versions, then revert to the first version | The change wrote a version; the revert brings back the first version's SQL and parameters; a duplicate carries the parameters | Not run |
-| `QS-5-AC5` | (console) Open that saved query in Query Studio | The tab shows the query's parameters with their defaults and options | Not run |
-| `QS-5-AC6` | In the assistant, say "run my saved query <title> for region EU"; then say it again for a query with a required parameter and give no value | The assistant runs the first with `{"region":"EU"}`; for the second it asks for the value instead of guessing | Not run |
-| `QS-5-AC7` | (operator) Send 21 parameters, a 201-character text value, a dropdown with 201 options and a multi-select with 201 values, one request each | Each is refused with a message that names the limit | Not run |
-| `QS-5-AC8` | Sign in as a user without `query:read` and run a parameterised statement | Refused with a permission message, and nothing runs on the engine | Not run |
-| `QS-5-AC9` | (operator) Run a parameterised statement, open History, and use Download on that run | History shows the statement with the values printed in it, and Download returns the same rows without asking for values | Not run |
-| `QS-5-AC10` | (operator) Put a parameterised statement in a dashboard's SQL source | Refused with "Parameters in a dashboard's SQL source come later: give the value in the SQL for now." | Not run |
-| `QS-5-AC11` | (console) On ClickHouse, write one statement that uses a text, a number, a date, a date range, a dropdown and a multi-select parameter; set each type in its field's menu, give each field a value, and run | Rows come back filtered by the six values, and History shows the statement with the values printed in it | Not run |
-| `QS-5-AC12` | (console) The same as `QS-5-AC11`, on Trino | The same result as on ClickHouse | Not run |
-| `QS-5-AC13` | (console) Type `x' OR '1'='1` in a text field, run it on ClickHouse, then run it on Trino | The field keeps the text as typed, and each run gives what `QS-5-AC2` expects, with nothing else run | Not run |
-| `QS-5-AC14` | (console) Write `{{region}}` with no default and no value, then run; type `EU` in the field and run again | The estimate sends no request while the field is empty, and the panel says "Fill in {{region}} for a pre-run estimate."; the first run is refused with "Fill in {{region}} to run this query.", and the field is marked; the second run goes, and the mark goes with the value | Not run |
-| `QS-5-AC15` | (console) Save a query with a text field whose default is `EU` and a dropdown with two options and no default; change the text field to `US` in the tab; save; reopen the saved query | The reopened fields show `EU` and no choice in the dropdown; `US` is not kept | Not run |
-| `QS-5-AC16` | (console) Open a saved query, change only the default of one field, save, and open its version history | The new version shows "Parameters changed" and lists the names of every parameter it holds, including that field; the oldest version shows no such line | Not run |
+| `QS-5-AC1` | (operator) On ClickHouse and then on Trino, run `POST /api/query/run` with a statement that uses a text, a number, a date, a date range (`.start` and `.end`) and a multi-select (`IN ({{ids}})`) parameter, each with a value | Both engines return rows filtered by the values, and the statement the engine received holds the values as literals | Pass (2026-11-11, 6d1ffed7, no case) |
+| `QS-5-AC2` | (operator) Run a statement with a text parameter whose value is `x' OR '1'='1` or `'; DROP TABLE t; --`, on both engines | The value is one text literal; the filter matches nothing extra and nothing else runs. The statement in History shows the quote doubled or escaped inside one literal (on Trino, a backslash shows as `chr(92)` between pieces). | Pass (2026-11-11, 6d1ffed7, no case) |
+| `QS-5-AC3` | (operator) Run a statement with `{{region}}` and no value, where the parameter has no default; then add the default and run again | The first run is refused with "Fill in {{region}} to run this query." and the engine receives nothing; the second runs with the default | Pass (2026-11-11, 6d1ffed7, no case) |
+| `QS-5-AC4` | (operator) Save a query with a text parameter and a dropdown through the API, change only the parameter's default, read the versions, then revert to the first version | The change wrote a version; the revert brings back the first version's SQL and parameters; a duplicate carries the parameters | Pass (2026-11-11, 6d1ffed7, no case) |
+| `QS-5-AC5` | (console) Open that saved query in Query Studio | The tab shows the query's parameters with their defaults and options | Pass (2026-11-11, 6d1ffed7, no case) |
+| `QS-5-AC6` | In the assistant, say "run my saved query <title> for region EU"; then say it again for a query with a required parameter and give no value | The assistant runs the first with `{"region":"EU"}`; for the second it asks for the value instead of guessing | Pass (2026-11-13, 80fb2f68, no case) |
+| `QS-5-AC7` | (operator) Send 21 parameters, a 201-character text value, a dropdown with 201 options and a multi-select with 201 values, one request each | Each is refused with a message that names the limit | Pass (2026-11-11, 6d1ffed7, no case) |
+| `QS-5-AC8` | Sign in as a user without `query:read` and run a parameterised statement | Refused with a permission message, and nothing runs on the engine | Pass (2026-11-11, 6d1ffed7, no case) |
+| `QS-5-AC9` | (operator) Run a parameterised statement, open History, and use Download on that run | History shows the statement with the values printed in it, and Download returns the same rows without asking for values | Pass (2026-11-11, 6d1ffed7, no case) |
+| `QS-5-AC10` | (operator) Put a parameterised statement in a dashboard's SQL source | Refused with "Parameters in a dashboard's SQL source come later: give the value in the SQL for now." | Pass (2026-11-11, 6d1ffed7, no case) |
+| `QS-5-AC11` | (console) On ClickHouse, write one statement that uses a text, a number, a date, a date range, a dropdown and a multi-select parameter; set each type in its field's menu, give each field a value, and run | Rows come back filtered by the six values, and History shows the statement with the values printed in it | Pass (2026-11-11, 6d1ffed7, no case) |
+| `QS-5-AC12` | (console) The same as `QS-5-AC11`, on Trino | The same result as on ClickHouse | Pass (2026-11-11, 6d1ffed7, no case) |
+| `QS-5-AC13` | (console) Type `x' OR '1'='1` in a text field, run it on ClickHouse, then run it on Trino | The field keeps the text as typed, and each run gives what `QS-5-AC2` expects, with nothing else run | Pass (2026-11-11, 6d1ffed7, no case) |
+| `QS-5-AC14` | (console) Write `{{region}}` with no default and no value, then run; type `EU` in the field and run again | The estimate sends no request while the field is empty, and the panel says "Fill in {{region}} for a pre-run estimate."; the first run is refused with "Fill in {{region}} to run this query.", and the field is marked; the second run goes, and the mark goes with the value | Pass (2026-11-13, 8b9c297c, no case) |
+| `QS-5-AC15` | (console) Save a query with a text field whose default is `EU` and a dropdown with two options and no default; change the text field to `US` in the tab; save; reopen the saved query | The reopened fields show `EU` and no choice in the dropdown; `US` is not kept | Pass (2026-11-11, 6d1ffed7, no case) |
+| `QS-5-AC16` | (console) Open a saved query, change only the default of one field, save, and open its version history | The new version shows "Parameters changed" and lists the names of every parameter it holds, including that field; the oldest version shows no such line | Pass (2026-11-11, 6d1ffed7, no case) |
 
-**Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
+**Acceptor** (not the Owner): product owner (recorded in the base) **Date:** 2026-11-14 **Build:** 80fb2f68
 
 Exceptions, each with an owner and a date:
+
+None.
 
 ## After acceptance
 
 - [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` status updated (part 1), with the PR in the PR column; follow-ups added
-- [ ] `BACKLOG.md` Dates has the Shipped date
-- [ ] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base
+- [x] `BACKLOG.md` status updated (part 1), with the PR in the PR column; follow-ups added
+- [x] `BACKLOG.md` Dates has the Shipped date
+- [x] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base (done by the auditor)
 - [ ] `CHANGELOG.md` entry a customer can read

@@ -31,7 +31,13 @@ const NOT_A_READ: &str =
 /// The fixed message `sql_rewrite::enforce` gives for a table function
 /// (`policy_engine::refusal_message`, `TableFunctionDenied`).
 const TABLE_FUNCTION_DENIED: &str =
-    "Table function tidak diizinkan pada query yang diatur kebijakan.";
+    "Table functions are not allowed in a query that policies govern.";
+
+/// The sentences `routes::query::run` gives for a statement that starts
+/// with no read keyword (a typo) and for one with a character the guard
+/// cannot read (a curly quote), QS-14.
+const TYPO_IN_FIRST_WORD: &str = "Query Studio runs only statements that start with SELECT, WITH, SHOW, DESCRIBE or EXPLAIN. Check the first word for a typo.";
+const CURLY_QUOTE: &str = "The query has a character Query Studio cannot read safely, such as a curly quote (\u{2018} \u{2019} \u{201C} \u{201D}) or a `$$` sequence. Type straight quotes (' or \") and run it again.";
 
 async fn spin_up_with_clickhouse(ch_uri: &str) -> TestApp {
     let mut overrides = HashMap::new();
@@ -130,6 +136,31 @@ async fn an_estimate_of_a_write_is_refused_and_nothing_reaches_the_engine() {
         sent.is_empty(),
         "the guard precedes the policy prefetch, so the engine is sent nothing: {sent:?}"
     );
+}
+
+/// QS-14: the estimate says why it refused, as the run does, and a
+/// refusal of either kind sends the engine nothing.
+#[tokio::test]
+async fn an_estimate_refused_for_a_typo_or_a_curly_quote_says_which() {
+    for (sql, sentence) in [
+        ("SELEC 1", TYPO_IN_FIRST_WORD),
+        ("\u{2018}SELECT\u{2019} 1", CURLY_QUOTE),
+        ("DROP TABLE t", NOT_A_READ),
+    ] {
+        let ch = MockServer::start().await;
+        mount_columns_then_explain(&ch).await;
+        let app = spin_up_with_clickhouse(&ch.uri()).await;
+
+        let (status, body) = estimate_as_reader(&app, sql).await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{sql}: {body}");
+        let json: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(json["error"], sentence, "{sql}: {body}");
+        assert!(
+            received_statements(&ch).await.is_empty(),
+            "{sql}: the guard precedes every engine call"
+        );
+    }
 }
 
 #[tokio::test]

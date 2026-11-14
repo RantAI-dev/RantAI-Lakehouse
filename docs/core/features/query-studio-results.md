@@ -6,12 +6,12 @@
 | Backlog | `QS-2` |
 | Kind | Feature |
 | Spec | `docs/core/specs/qs-2.md` |
-| Status | Building |
+| Status | Released: accepted by the product owner on 2026-11-14 (every row Pass; AC6 with findings, one exception under Exceptions) |
 | Priority | P2 |
 | Owner | Held in the base. |
 | Acceptor | Held in the base. |
 | Started | 2026-10-28; also in `BACKLOG.md` Dates |
-| Shipped | Not yet |
+| Shipped | 2026-10-30; fixes 2026-11-06 (#399, #403) |
 | Evidence | |
 | Plan | Plan files are not kept in the repository. |
 
@@ -90,24 +90,26 @@ Run on a running console by the product owner. A step not performed is never a p
 
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| `QS-2-AC1` | Run a query returning 100,000 rows | 64,000 rows shown, a banner says the result was cut at 64,000 rows | Not run |
-| `QS-2-AC2` | Download that run as Parquet | The file holds all 100,000 rows | Not run |
-| `QS-2-AC3` | Run a query with wide text columns that passes 10 MB | The banner says it was cut at 10 MB | Not run |
-| `QS-2-AC4` | Filter a column, open its statistics, inspect a JSON cell, copy the rows as TSV | Each works on the shown rows, and the statistics say "of the N rows shown" | Not run |
-| `QS-2-AC5` | Download as CSV, TSV and Excel a query on a masked column | Every file shows the masked value | Not run |
-| `QS-2-AC6` | As a role with downloads switched off, run a query, then request the download route directly | Download and "Copy as TSV" are disabled with "Downloads are switched off for your role." beside them; the direct request is refused with the same sentence | Not run |
-| `QS-2-AC7` | Start a large download, press Stop | The query ends on the engine (`system.processes`) within 5 seconds | Not run |
-| `QS-2-AC8` | A user without `query:read` downloads, and a download fails on the engine | Refused; the failure shows a fixed message, not the engine's text (principles 2 and 4) | Not run |
-| `QS-2-AC9` | On a Trino tab, write a valid Trino query, look at the Execution transparency panel, then run it | The panel says "No pre-run estimate" and names Trino, with no ClickHouse error and no ClickHouse source; the result summary's Engine says Trino | Not run |
+| `QS-2-AC1` | Run a query returning 100,000 rows | 64,000 rows shown, a banner says the result was cut at 64,000 rows | Pass (2026-11-04, f3cee927, LH-QS-2-01) |
+| `QS-2-AC2` | Download that run as Parquet | The file holds all 100,000 rows | Pass (2026-11-04, f3cee927, LH-QS-2-02) |
+| `QS-2-AC3` | Run a query with wide text columns that passes 10 MB | The banner says it was cut at 10 MB | Pass (2026-11-04, f3cee927, LH-QS-2-03) |
+| `QS-2-AC4` | Filter a column, open its statistics, inspect a JSON cell, copy the rows as TSV | Each works on the shown rows, and the statistics say "of the N rows shown" | Pass (2026-11-14, 240d2e62, LH-QS-2-04) |
+| `QS-2-AC5` | Download as CSV, TSV and Excel a query on a masked column | Every file shows the masked value | Pass (2026-11-04, f3cee927, LH-QS-2-05) |
+| `QS-2-AC6` | As a role with downloads switched off, run a query, then request the download route directly | Download and "Copy as TSV" are disabled with "Downloads are switched off for your role." beside them; the direct request is refused with the same sentence | Pass with findings (2026-11-14, 240d2e62, LH-QS-2-06). The API body carries the `permission_denied: ` prefix; see Exceptions |
+| `QS-2-AC7` | Start a large download, press Stop | The query ends on the engine (`system.processes`) within 5 seconds | Pass (2026-11-13, 80fb2f68, LH-QS-2-07), as written (owner option a) |
+| `QS-2-AC8` | A user without `query:read` downloads, and a download fails on the engine | Refused; the failure shows a fixed message, not the engine's text (principles 2 and 4) | Pass (2026-11-13, 7e8775fb, LH-QS-2-08) |
+| `QS-2-AC9` | On a Trino tab, write a valid Trino query, look at the Execution transparency panel, then run it | The panel says "No pre-run estimate" and names Trino, with no ClickHouse error and no ClickHouse source; the result summary's Engine says Trino | Pass (2026-11-14, 240d2e62, no case) |
 
-**Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
+**Acceptor** (not the Owner): product owner (recorded in the base) **Date:** 2026-11-14 **Build:** 240d2e62
 
 Exceptions, each with an owner and a date:
+
+- `QS-2-AC6`, owner 2026-11-14: the API body of a refused download carries the `permission_denied: ` prefix every 403 has; the console shows the sentence alone. Accepted; does not hold QS-2.
 
 ## After acceptance
 
 - [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
-- [ ] `BACKLOG.md` Dates has the Shipped date
-- [ ] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base
+- [x] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
+- [x] `BACKLOG.md` Dates has the Shipped date
+- [x] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base (done by the auditor)
 - [ ] `CHANGELOG.md` entry a customer can read

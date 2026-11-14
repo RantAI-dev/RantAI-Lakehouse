@@ -33,10 +33,12 @@ use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::QUERY_STRING_UNREADABLE;
 use crate::routes::saved_queries::{
-    FolderField, NOT_READ_ONLY, SavedQueryListQuery, TITLE_AND_SQL_REQUIRED, parse_folder_filter,
-    parse_folder_reference, require_query_placement,
+    FolderField, SavedQueryListQuery, TITLE_AND_SQL_REQUIRED, parse_folder_filter,
+    parse_folder_reference, refuse_unless_storable, require_query_placement,
 };
-use crate::sql_guard::{is_read_only, is_trino_safe};
+use crate::sql_guard::{
+    ReadOnlyVerdict, is_read_only, is_trino_safe, not_read_only_message, read_only_verdict,
+};
 use crate::state::AppState;
 use crate::upstream_error;
 
@@ -1984,11 +1986,12 @@ async fn run_statement_with(
     // The statement is read with the rules of the engine that will run it
     // (`SEC-62`): a `Trino` statement is not `ClickHouse` text, and the
     // guard reads each one the way its own engine reads it.
-    if !is_read_only(statement, crate::sql_rewrite::Engine::from_name(engine)) {
-        let refusal = ApiError::Unprocessable(
-            "Only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) are allowed in Query Studio."
-                .to_owned(),
-        );
+    let verdict = read_only_verdict(statement, crate::sql_rewrite::Engine::from_name(engine));
+    if verdict != ReadOnlyVerdict::Read {
+        // The sentence names the cause (a curly quote, a typo in the first
+        // word, a write), and the History row below records the same one
+        // (QS-14).
+        let refusal = ApiError::Unprocessable(not_read_only_message(verdict).to_owned());
         // No principal, no row: nobody to record the refusal against
         // (`QS-4`, decision 3).
         if let Some(p) = principal {
@@ -2676,12 +2679,9 @@ pub async fn estimate(
     // The guard reads the statement with the request's engine rules, as the
     // run does: a Trino statement that ClickHouse's dialect would misread is
     // refused by Trino's rule, not ClickHouse's.
-    if !is_read_only(&sql, crate::sql_rewrite::Engine::from_name(&engine)) {
-        return Err(ApiError::Unprocessable(
-            "Only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) are allowed in Query Studio."
-                .to_owned(),
-        )
-        .into());
+    let verdict = read_only_verdict(&sql, crate::sql_rewrite::Engine::from_name(&engine));
+    if verdict != ReadOnlyVerdict::Read {
+        return Err(ApiError::Unprocessable(not_read_only_message(verdict).to_owned()).into());
     }
     // QA `LH-QS-4-08` (`QS-6`), decision 7: estimating a Trino statement would
     // mean asking ClickHouse about Trino SQL — the bug this answers — and
@@ -3233,9 +3233,7 @@ pub async fn create_saved(
     // guard reads it with the `ClickHouse` rules, as it did before. A run
     // that names `Trino` reads the same statement with the `Trino` rules,
     // and may refuse what the save accepted.
-    if !is_read_only(&sql, crate::sql_rewrite::Engine::ClickHouse) {
-        return Err(ApiError::Unprocessable(NOT_READ_ONLY.to_owned()).into());
-    }
+    refuse_unless_storable(&sql)?;
     // `QS-5`: the definitions must fit the SQL they are saved with.
     let parameters = checked_saved_definitions(&sql, body.parameters)?;
     let principal = principal
@@ -5089,6 +5087,7 @@ mod tests {
 
         use super::*;
         use crate::config::Config;
+        use crate::routes::saved_queries::NOT_READ_ONLY;
 
         /// Builds `AppState` the way `routes::connectors::state_without_pool`
         /// does (`AppState::new(Config::from_map(..))`), overriding
@@ -6816,7 +6815,11 @@ mod tests {
             let state = state_without_pool(&ch.uri(), "http://unused.invalid");
 
             // The statement does not start with a read keyword once the
-            // placeholder is filled, so the read-only guard refuses it.
+            // placeholder is filled, so the read-only guard refuses it. The
+            // value arrives as a quoted literal (`'DROP' TABLE t`), so no
+            // denied word is left in the code: the guard names the cause
+            // as a statement that starts with no read word, not as a write
+            // (QS-14).
             let (status, message) = refusal(
                 run_on_clickhouse(
                     state,
@@ -6829,7 +6832,10 @@ mod tests {
             );
 
             assert_eq!(status, 422);
-            assert!(message.starts_with("Only read queries"), "{message}");
+            assert!(
+                message.starts_with("Query Studio runs only statements that start with"),
+                "{message}"
+            );
             assert_eq!(received(&ch).await, Vec::<String>::new());
         }
 

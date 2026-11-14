@@ -111,7 +111,7 @@ describe("QueryTransparencyPanel engine", () => {
     expect(screen.getByText("Hot analytics")).toBeTruthy()
   })
 
-  it("shows the server's `error` text when a query cannot be planned", () => {
+  it("shows the fixed sentence and its reference when a query cannot be planned", () => {
     panel({
       ...BASE,
       supported: true,
@@ -119,15 +119,13 @@ describe("QueryTransparencyPanel engine", () => {
       estimatedBytes: null,
       estimatedCostMin: null,
       estimatedCostMax: null,
-      error: "Code: 47. DB::Exception: Missing columns: 'revenue' while processing query: 'SELECT revenue FROM bronze.orders'",
+      error: "This query names a column that does not exist. Reference: a1b2c3d4e5",
       sources: [],
     })
 
     expect(screen.getByText("This query cannot be planned")).toBeTruthy()
     expect(
-      screen.getByText(
-        "Code: 47. DB::Exception: Missing columns: 'revenue' while processing query: 'SELECT revenue FROM bronze.orders'"
-      )
+      screen.getByText("This query names a column that does not exist. Reference: a1b2c3d4e5")
     ).toBeTruthy()
   })
 })
