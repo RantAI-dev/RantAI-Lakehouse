@@ -1,0 +1,130 @@
+# BI-59: the Dashboards page (home and table, with a gallery view), plan
+
+| | |
+| --- | --- |
+| Backlog | `BI-59` |
+| Spec | `docs/core/specs/bi-59.md` |
+| Feature page | `docs/core/features/dashboards-page.md` |
+| Base | `feat/bi-18d-reports-templates` at `0662957c` (PR #528). This PR follows #528 and is rebased on `main` once #528 merges |
+| Branch | `feat/bi-59-dashboards-page` |
+| Planner and reviewer | Claude Opus (hub session) |
+| Developer | an Opus developer agent (console design work, AGENTS.md exception) |
+
+## 1. Decisions already made
+
+- **Layout C (owner, 2026-11-14).**
+  - The reference is commit `df0f38bb` on the local branch `design/chart-builder-mockups`:
+    `src/features/mockups/dashboards/` (mockup C) and its screenshots in
+    `/home/hv/mtharreq/lakehouse-mockups/.mockup-shots/dashboards/c-*.png`.
+  - The same object store, so `git show df0f38bb:<path>` works here.
+  - Copy the layout and the components' look, not the fixture data.
+- **Gallery view (owner, 2026-11-14):** B's picture cards (`b-*.png`) become the Gallery view of
+  the same list. Table is the default, and the choice is kept in `localStorage`, wrapped in
+  try/catch so the page works without it.
+- **Pictures (P3):** drawn from chart definitions, never from a query.
+  - Read `GET /api/dashboard/specs` once for the whole page; it already returns every stored
+    chart the person can see, with `board` and `def`. The console client is in
+    `src/services/clients/dashboards.ts` (`getChart` reads it at `:231`). Add a list method
+    there rather than calling `apiFetch` from the feature.
+  - Group the charts by board and draw each tile as a small silhouette of its kind, in its
+    span, in the console's chart colours, with sample shapes and no numbers.
+  - Main (the built-in board) and a board with no charts get a neutral picture.
+  - Reports draw their first chart blocks. Templates draw their stored definition's charts,
+    which `list_templates` / the template list already carries; if it does not, a neutral
+    picture.
+  - Real-number pictures are `BI-60`, not this PR.
+- **One list:** dashboards, reports and templates, with a segmented control
+  **All / Dashboards / Reports / Templates** that replaces the tabs, plus a folder picker.
+- **Header:**
+  - one **New** menu: Dashboard, Report, From a template (each with its picture), Import;
+  - one page ⋯ menu: Metrics, Manage folders, Trash;
+  - a large search ("/" focuses it).
+  - Remove the toolbar row of 11 controls and the Favourites and Recent chip rows.
+- **Recent:** the four items opened last, as small picture cards, from what the page already
+  reads for its Recent strip today.
+- **Badges, one style** (P4, DESIGN.md "Badge tanpa border"): built-in grey, public link
+  amber, embedded sky, restricted rose. Soft fill, no border.
+- **Item ⋯ menu:** the same position on every row and card, Main included. Main's entries
+  that cannot apply are shown disabled with the reason, as in the mockup.
+- **No "No description."** Show the description when there is one; otherwise a useful fact
+  ("Made from the template X", a report's first sentence) or nothing.
+- **Bulk:** tick rows to Move to folder, Favourite, or Move to trash, through the existing
+  services. No new API.
+- **The assistant bar** covers no row. The list scrolls inside a frame that ends above the
+  bar, as the mockup does; the real page needs the same approach.
+- **Out of scope:**
+  - the dashboard page itself;
+  - sharing, folder access rules, trash behaviour;
+  - mockup A's rail;
+  - real-number pictures (`BI-60`).
+- **Assistant parity:** no tool change. The list reads the same routes, and the assistant
+  already has `list_boards`, `list_reports` and `list_templates`.
+
+## 2. Anchors (at `0662957c`)
+
+- **Route:** `src/app/(overview)/dashboards/browse/page.tsx` renders `DashboardListPage`.
+- **`src/features/dashboards/dashboard-list-page.tsx` (837 lines):**
+  - the "No description." fallback at `:277`;
+  - Favourites and Recent at `:356` and `:601–602`;
+  - the toolbar:
+    - New dashboard at `:534`;
+    - the Gallery and Table toggles at `:549` and `:565`;
+    - Metrics at `:611`, Trash at `:621`, Import… at `:630`;
+  - `TrashDialog` at `:797`.
+- **Columns:** `dashboard-list-columns.tsx`.
+- **Reports and templates lists:** `report-list.tsx`, `template-list.tsx`, `template-dialogs.tsx`.
+- **Folders:** `folder-dialogs.tsx`, `folder-options.tsx`.
+- **Tests to keep green**, updating selectors where things move and never weakening an
+  assertion: every `*.test.tsx` that renders these files, including
+  `folder-options.test.tsx` and `template-pages.test.tsx`.
+
+## 3. Tasks (one commit each, in order)
+
+1. **T1, header and page frame.**
+   - Build the title, search, New menu and page ⋯ menu, and the scroll frame that ends above
+     the assistant bar.
+   - Remove the old toolbar row and the chip rows.
+   - Check: spec T1, so no other button is visible.
+2. **T2, one list.**
+   - Build one table of dashboards, reports and templates with the columns name, type,
+     folder, owner, updated and sharing; every column sorts; plus the segmented type filter
+     and the folder picker.
+   - Badges per P4. The item ⋯ menu sits at the row end, the same for every row.
+   - Folder grouping, the restricted lock and personal space keep working.
+   - Check: each filter shows only its kind; sorting and the folder filter combine.
+3. **T3, pictures.** The specs list method, the silhouette renderer, and the Recent row.
+   - Check: a test proves the page makes one specs request and no dashboard read for the
+     pictures.
+4. **T4, Gallery view.**
+   - The view switch (Table / Gallery), remembered.
+   - Picture cards grouped by folder, folders collapsible, as in mockup B.
+   - Check: the choice survives a reload, and the page still renders if `localStorage`
+     throws.
+5. **T5, bulk and facts.**
+   - Bulk Move to folder, Favourite, Move to trash; restore from the trash still works.
+   - The useful fact replaces "No description.".
+   - Designed empty states: no reports, no templates, an empty folder, no search match, an
+     empty workspace.
+6. **T6, responsive and screenshots.**
+   - At phone width the table becomes a stacked list.
+   - Screenshots at 1190×800, 1366×900 and 390×844, light and dark, Table and Gallery, into
+     `docs/plans/bi-59-screens/`. Check them yourself.
+7. **T7, handoff:** "Handoff, BI-59" below, with the commands and counts.
+
+## 4. Machine rules (owner, 2026-11-14)
+
+- **No Rust:** no Rust compiles; this PR touches no Rust.
+- **Tests:** never the full `bun run test`. Run the touched test files only, under a memory cap:
+  `systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0 nice -n 15 bun test <files>`.
+- **Typecheck and lint:** `bun run typecheck` and `bun run lint` with `nice`, one at a time,
+  only when `free -m` shows at least 3 GB available.
+- **Dev server for screenshots:** at most one, briefly, on port 28622 if it is free. Stop it
+  by PID afterwards. Do not touch port 28620 (the mockup server) or the QA stack.
+
+## 5. Review
+
+(planner)
+
+## 6. Handoff
+
+(developer)
