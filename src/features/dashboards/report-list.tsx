@@ -2,7 +2,7 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { FileText, Folder, Lock, MoreHorizontal, Pencil, PlusIcon, Trash2 } from "lucide-react"
+import { FileText, Folder, Lock, MoreHorizontal, Pencil, Trash2 } from "lucide-react"
 
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
@@ -14,7 +14,6 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
-import { Input } from "@/components/ui/input"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { folderPath, type FolderLike } from "@/lib/folder-tree"
 import { formatRelativeTime } from "@/lib/format"
@@ -27,7 +26,8 @@ import type { ReportSummary } from "@/services"
  * R4): every report the person may read, grouped by the dashboard folder it is
  * filed in (`""` is "No folder"), newest first within a folder.
  *
- * "New report", Edit and Delete are offered only with `dashboard:write`
+ * The page's search narrows it (`query`), and "New report" is in the page's
+ * New menu (`BI-59` T1). Edit and Delete are offered only with `dashboard:write`
  * (`BI-18D-AC8`); the server refuses them anyway, and judges the folder's
  * level. Delete moves the report to the trash, which the Trash dialog lists
  * with the dashboards.
@@ -35,12 +35,13 @@ import type { ReportSummary } from "@/services"
 export function ReportList({
   folders,
   canWrite,
+  query,
 }: {
   readonly folders: readonly (FolderLike & { ownerId?: string })[]
   readonly canWrite: boolean
+  readonly query: string
 }) {
   const state = useService((s) => dashboardReportService.listReports(s), [])
-  const [search, setSearch] = React.useState("")
   const [deleting, setDeleting] = React.useState<ReportSummary | null>(null)
   const reload = state.reload
   const deleteAction = useServiceAction(
@@ -56,12 +57,12 @@ export function ReportList({
     [folders],
   )
   const shown = React.useMemo(() => {
-    const q = search.trim().toLowerCase()
+    const q = query.trim().toLowerCase()
     if (!q) return reports
     return reports.filter((r) =>
       [r.title, r.createdBy, r.updatedBy, pathOf(r)].some((field) => field.toLowerCase().includes(q)),
     )
-  }, [reports, search, pathOf])
+  }, [reports, query, pathOf])
   const sections = React.useMemo(() => {
     const by = new Map<string, ReportSummary[]>()
     for (const r of shown) {
@@ -72,13 +73,6 @@ export function ReportList({
       .map(([folderId, items]) => ({ folderId, path: folderId ? folderPath([...folders], folderId) : "", items }))
       .sort((a, b) => (a.folderId === "" ? 1 : b.folderId === "" ? -1 : a.path.localeCompare(b.path)))
   }, [shown, folders])
-
-  const newButton = canWrite ? (
-    <Button size="sm" render={<Link href="/dashboards/reports/new" />}>
-      <PlusIcon data-icon="inline-start" />
-      New report
-    </Button>
-  ) : null
 
   if (state.status === "loading") return <LoadingSkeleton />
   if (state.status === "error") return <ErrorState error={state.error} onRetry={reload} />
@@ -93,20 +87,9 @@ export function ReportList({
               ? "A report is a written page with live charts between the paragraphs. Pick the charts from your dashboards."
               : "Nobody has shared a report with you yet."
           }
-          action={newButton}
         />
       ) : (
         <>
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <Input
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search reports..."
-              aria-label="Search reports"
-              className="h-8 w-full max-w-xs"
-            />
-            {newButton}
-          </div>
           {state.data.truncated ? (
             <p className="text-xs text-muted-foreground">
               Showing the 1,000 most recently changed reports. Search to find an older one.

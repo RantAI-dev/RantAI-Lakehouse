@@ -23,7 +23,7 @@ import { UseTemplateDialog } from "./template-dialogs"
  * the new dashboard; Delete asks first. The page shows this tab only to a
  * holder of `dashboard:write`, and the server refuses everyone else anyway.
  */
-export function TemplateList({ folders }: { readonly folders: FolderLike[] }) {
+export function TemplateList({ folders, query = "" }: { readonly folders: FolderLike[]; readonly query?: string }) {
   const router = useRouter()
   const state = useService((s) => dashboardTemplateService.listTemplates(s), [])
   const [using, setUsing] = React.useState<DashboardTemplate | null>(null)
@@ -38,11 +38,17 @@ export function TemplateList({ folders }: { readonly folders: FolderLike[] }) {
 
   if (state.status === "loading") return <LoadingSkeleton />
   if (state.status === "error") return <ErrorState error={state.error} onRetry={reload} />
-  const templates = state.data.templates
+  // The page's search (`BI-59` T1) narrows the list by name and source.
+  const q = query.trim().toLowerCase()
+  const templates = q
+    ? state.data.templates.filter((t) => [t.name, t.sourceBoardName, t.createdBy].some((f) => f.toLowerCase().includes(q)))
+    : state.data.templates
 
   return (
     <div className="flex flex-col gap-4">
-      {templates.length === 0 ? (
+      {templates.length === 0 && q ? (
+        <EmptyState title="No matching templates" description="No template matches the search." />
+      ) : templates.length === 0 ? (
         <EmptyState
           title="No templates yet"
           description="Open a dashboard and choose Save as template in its ⋯ menu. Its layout, charts and filters are saved, without data."
