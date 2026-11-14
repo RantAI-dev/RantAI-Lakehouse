@@ -177,3 +177,35 @@ Measured: frame bottom / composer top 720/738 px at 1190x800, 820/838 at 1366x90
 - The hover-only ⋯ and "Data from" line rely on `pointer-fine`. Headless Chrome reports no fine pointer, so the screenshots show the ⋯ on every tile.
 - On a phone, the facts line can wrap so that a "·" starts the second line.
 - `--content-bottom` itself was not exercised: this branch has no BI-58. Only the fallbacks were measured.
+
+### Developer handoff, review round 1 (2026-11-14)
+
+**Commits:**
+
+| Fix | Commit |
+| --- | --- |
+| SHOULD-FIX 1–6: fade at cut edges, no sparkles, one-line tile note, short edit hint, chips at the left without tabs, Auto-refresh value beside its chevron | `2300963d` |
+| SHOULD-FIX 7: the account menu in the sidebar's footer | `a32f0f56` |
+| SHOULD-FIX 8–10: centred navbar search, 32 px header controls, Edit · settings · Share | `40108851` |
+| SHOULD-FIX 11: one time in the header; "Edited" in Details | `6ce96a10` |
+
+**Notes:**
+
+- **SHOULD-FIX 2:** the mark beside "jumlah by tahun" was the clickable-chart hint (`MousePointerClick`), not an AI mark. It is a pointing hand now. An AI-made chart gets a muted `Bot` mark with "Made with the assistant". The side panel's "AI Copilot" tab and the empty state use `Bot`. The Copilot's own sidebar header (other pages, not this branch) still has its `Sparkles`.
+- **SHOULD-FIX 1:** `useScrollFade` plus `.scroll-fade` (globals.css) fade an edge only while it hides something, over 150 ms, instantly under reduced motion. Used on the dashboard tile area (lg and up) and its frame (below lg); no other page on this branch scrolls inside a frame.
+- **SHOULD-FIX 7:**
+  - `UserMenu` moved to `user-menu.tsx` and takes a `trigger`.
+  - The menu opens upward from the footer, aligned to its start.
+  - **Not done:** `side="right"` when the sidebar is collapsed, because `DropdownMenuContent` forwards only `align` and `sideOffset` and the base component was not changed.
+- **SHOULD-FIX 8:** the search keeps the navbar's existing 36 px height (correction in SHOULD-FIX 9).
+
+**Checks** (under the 3 GB cap, one at a time):
+
+- `bun test`, one file per run, 58 files (the T7 set plus `details-panel`, `use-scroll-fade`): 470 pass, 0 fail.
+- eslint on `src/features/dashboards`, `src/features/copilot`, `src/components/app-shell` and the new hook: 0 errors, 1 warning (`use-copilot.ts`, not from this branch).
+- `bun run typecheck`: clean.
+
+**Not verified:**
+
+- No round-1 screenshots. Port 28622 was held by another developer, then 28620 ran a Next dev server, and the owner's rule is one Next dev server at a time. The coordinator screenshots from 28605 after deploy.
+- The fade, the footer menu (collapsed and in the phone sheet), the centred search and the 32 px header were checked by tests only, not in a browser.
