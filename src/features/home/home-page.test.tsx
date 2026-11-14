@@ -11,11 +11,12 @@ mock.module("next/navigation", () => ({
   }),
 }))
 
-import { cleanup, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import { CopilotProvider } from "@/features/copilot/use-copilot"
 import { HomePage } from "./home-page"
+import { resetHomeBackgroundMemory } from "./use-home-background"
 
 afterEach(() => {
   cleanup()
@@ -153,5 +154,61 @@ describe("HomePage per-role widgets (ADM-13 review round 1, B3)", () => {
     expect(document.body.textContent).not.toContain("no failing pipelines")
     expect(document.body.textContent).not.toContain("all sources healthy")
     expect(document.body.textContent).not.toContain("every dataset has data")
+  })
+})
+
+describe("Home background choice (WEB-17 T4)", () => {
+  const stubFetch = () =>
+    spyOn(globalThis, "fetch").mockImplementation(((input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.includes("/api/auth/me")) return Promise.resolve(me(["assistant:ask", "dashboard:read"]))
+      if (path.includes("/api/home/layout")) return Promise.resolve(layout())
+      if (path.includes("/api/dashboard/fields")) return Promise.resolve(json({ marts: [] }))
+      if (path.includes("/api/dashboard/shortcuts")) return Promise.resolve(json({ favourites: [], recent: [] }))
+      if (path.includes("/api/dashboard")) return Promise.resolve(boards())
+      if (path.includes("/api/ai/sessions")) return Promise.resolve(json({ sessions: [] }))
+      return Promise.resolve(json({}))
+    }) as unknown as typeof fetch)
+
+  // The page's scene, not the small previews in the open Customize menu.
+  const scene = () =>
+    [...document.querySelectorAll("canvas[data-slot=lake-scene]")].find((c) => !c.closest("[role=menu]")) ?? null
+
+  it("draws the Dither scene by default", async () => {
+    resetHomeBackgroundMemory()
+    stubFetch()
+    renderHome()
+    expect(await screen.findByText(/Alice Viewer/)).toBeTruthy()
+    expect(scene()?.getAttribute("data-variant")).toBe("dither")
+  })
+
+  it("Off from Customize removes the scene at once, is remembered, and still holds after a reload", async () => {
+    resetHomeBackgroundMemory()
+    stubFetch()
+    renderHome()
+    expect(await screen.findByText(/Alice Viewer/)).toBeTruthy()
+    expect(scene()).not.toBeNull()
+
+    fireEvent.click(screen.getByRole("button", { name: /Customize/ }))
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: /Off/ }))
+
+    await waitFor(() => expect(scene()).toBeNull())
+    expect(window.localStorage.getItem("home-background")).toBe("off")
+
+    // A reload: a fresh page reads the choice back before drawing anything.
+    cleanup()
+    resetHomeBackgroundMemory()
+    renderHome()
+    expect(await screen.findByText(/Alice Viewer/)).toBeTruthy()
+    expect(scene()).toBeNull()
+  })
+
+  it("ASCII draws the scene as glyphs", async () => {
+    resetHomeBackgroundMemory()
+    window.localStorage.setItem("home-background", "ascii")
+    stubFetch()
+    renderHome()
+    expect(await screen.findByText(/Alice Viewer/)).toBeTruthy()
+    expect(scene()?.getAttribute("data-variant")).toBe("ascii")
   })
 })

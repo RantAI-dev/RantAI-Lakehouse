@@ -186,9 +186,18 @@ function useMounted(): boolean {
   return React.useSyncExternalStore(subscribeNothing, () => true, () => false)
 }
 
-export function LakeScene({ variant, className }: { variant: SceneVariant; className?: string }) {
+export function LakeScene({
+  variant,
+  still = false,
+  className,
+}: {
+  variant: SceneVariant
+  /** Draw once and never move (the Background menu's previews). */
+  still?: boolean
+  className?: string
+}) {
   const canvasRef = React.useRef<HTMLCanvasElement>(null)
-  const reduce = useReducedMotion() ?? false
+  const reduce = (useReducedMotion() ?? false) || still
   const mounted = useMounted()
   const { resolvedTheme } = useTheme()
   const dark = mounted && resolvedTheme === "dark"
@@ -271,9 +280,10 @@ export function LakeScene({ variant, className }: { variant: SceneVariant; class
     /** Size everything and compute the still sky once. */
     const resize = () => {
       dpr = Math.min(2, window.devicePixelRatio || 1)
-      const r = canvas.getBoundingClientRect()
-      w = r.width
-      h = r.height
+      // The layout size, not the drawn one: a preview is drawn large and
+      // scaled down with a transform, which `getBoundingClientRect` includes.
+      w = canvas.clientWidth
+      h = canvas.clientHeight
       canvas.width = Math.max(1, Math.round(w * dpr))
       canvas.height = Math.max(1, Math.round(h * dpr))
       cols = Math.max(1, Math.ceil(w / cw))
@@ -335,7 +345,9 @@ export function LakeScene({ variant, className }: { variant: SceneVariant; class
       : window.setTimeout(start, 120)
 
     const ro = new ResizeObserver(() => {
-      if (!started) return
+      // Only a real change of the box redraws: setting the canvas's pixel
+      // size in `resize` must not feed back into another resize.
+      if (!started || (canvas.clientWidth === w && canvas.clientHeight === h)) return
       resize()
       draw(still ? STILL_T : STILL_T + performance.now() / 1000)
     })
@@ -376,7 +388,15 @@ export function LakeScene({ variant, className }: { variant: SceneVariant; class
  * Positioned by the caller (absolute, behind the greeting and composer);
  * its height sets the scene's size.
  */
-export function LakeBand({ variant, className }: { variant: SceneVariant; className?: string }) {
+export function LakeBand({
+  variant,
+  still,
+  className,
+}: {
+  variant: SceneVariant
+  still?: boolean
+  className?: string
+}) {
   return (
     <div
       aria-hidden
@@ -386,7 +406,7 @@ export function LakeBand({ variant, className }: { variant: SceneVariant; classN
         className,
       )}
     >
-      <LakeScene variant={variant} />
+      <LakeScene variant={variant} still={still} />
     </div>
   )
 }

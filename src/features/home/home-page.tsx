@@ -12,6 +12,7 @@ import { ChatComposer, type ChatComposerHandle } from "@/features/copilot/chat-c
 import { useCopilot, type Mode } from "@/features/copilot/use-copilot"
 import { readLastBoard } from "@/features/dashboards/last-board"
 import { useService } from "@/hooks/use-service"
+import { drawsScene } from "@/lib/home-background"
 import { cardRead } from "@/lib/home-cards"
 import { focalBoard } from "@/lib/home-focal"
 import {
@@ -57,6 +58,7 @@ import { LakeBand } from "./lake-scene"
 import { OpenAlertsCard } from "./open-alerts-card"
 import { SavedQueriesCard } from "./saved-queries-card"
 import { SourcesCard } from "./sources-card"
+import { useHomeBackground } from "./use-home-background"
 import { useHomeLayout } from "./use-home-layout"
 
 /**
@@ -206,6 +208,7 @@ export function HomePage() {
   // customising. Undecided until it has loaded (`phase`).
   const layout = useHomeLayout()
   const shown = layout.shown
+  const [background, setBackground] = useHomeBackground()
 
   // Read after mount: localStorage is not there during the server render.
   const [lastBoard, setLastBoard] = React.useState<string | null>(null)
@@ -410,8 +413,7 @@ export function HomePage() {
     />
   ) : null
 
-  const background = "dither"
-  const scene = true
+  const scene = drawsScene(background)
   const martCount = marts.status === "success" && Array.isArray(marts.data) ? marts.data.length : null
 
   // The page is its own scroller, exactly the viewport under the navbar
@@ -422,7 +424,7 @@ export function HomePage() {
   // stretch the document, which then scrolls as well.
   return (
     <div className="relative -m-4 h-[calc(100svh-var(--app-navbar-h))] overflow-y-auto sm:-m-5 lg:-m-6">
-      {scene ? (
+      {drawsScene(background) ? (
         <LakeBand variant={background} className="absolute inset-x-0 top-0 h-[300px] sm:h-[400px]" />
       ) : null}
       <div
@@ -500,11 +502,11 @@ export function HomePage() {
               {starts.map((id) => (
                 <ShortcutLink key={id} id={id} />
               ))}
-              {customize ? (
-                <div className="ml-auto">
-                  <CustomizeButton onClick={customize} />
-                </div>
-              ) : null}
+              {/* Customize is always offered: the Background lives in this
+                  browser, so it works even where the layout cannot be saved. */}
+              <div className="ml-auto">
+                <CustomizeButton onEdit={customize} background={background} onBackgroundChange={setBackground} />
+              </div>
             </>
           )}
         </div>

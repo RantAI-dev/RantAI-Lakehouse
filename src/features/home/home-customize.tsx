@@ -1,13 +1,18 @@
 "use client"
 
 import * as React from "react"
-import { GripVertical, Plus, SlidersHorizontal, X } from "lucide-react"
+import { GripVertical, LayoutGrid, Plus, SlidersHorizontal, X } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuGroupLabel,
   DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import {
@@ -23,8 +28,16 @@ import {
   SortableItem,
   SortableItemHandle,
 } from "@/components/ui/sortable"
+import {
+  drawsScene,
+  HOME_BACKGROUND_LABEL,
+  HOME_BACKGROUNDS,
+  parseHomeBackground,
+  type HomeBackground,
+} from "@/lib/home-background"
 import { WIDE_CARD, type CardId, type ShortcutId } from "@/lib/home-layout"
 import { SHORTCUTS } from "./home-shortcuts"
+import { LakeBand } from "./lake-scene"
 
 /**
  * Edit mode for Home: the pieces that make cards and shortcuts movable and
@@ -47,13 +60,91 @@ export const CARD_LABEL: Record<CardId, string> = {
   "saved-queries": "Saved queries",
 }
 
-/** The quiet entry point at the right of the row above the bento. */
-export function CustomizeButton({ onClick }: { onClick: () => void }) {
+/**
+ * Customize, at the right of the row above the bento: the Background
+ * choice (`WEB-17` D2) and, when the deployment stores Home layouts, the
+ * way into editing cards and shortcuts. The three backgrounds are shown as
+ * small pictures of Home, drawn with the real scene (DESIGN.md §2: a visual
+ * choice is a preview, not a list of words); the one in use has a ring.
+ * Picking one applies at once and is remembered in this browser.
+ */
+export function CustomizeButton({
+  onEdit,
+  background,
+  onBackgroundChange,
+}: {
+  onEdit?: () => void
+  background: HomeBackground
+  onBackgroundChange: (value: HomeBackground) => void
+}) {
   return (
-    <Button variant="ghost" size="sm" onClick={onClick} className="text-muted-foreground">
-      <SlidersHorizontal />
-      Customize
-    </Button>
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        render={
+          <Button variant="ghost" className="text-muted-foreground hover:text-foreground aria-expanded:bg-muted aria-expanded:text-foreground">
+            <SlidersHorizontal data-icon="inline-start" />
+            Customize
+          </Button>
+        }
+      />
+      <DropdownMenuContent align="end" className="w-80">
+        <DropdownMenuGroup>
+          <DropdownMenuGroupLabel>Background</DropdownMenuGroupLabel>
+          <DropdownMenuRadioGroup
+            value={background}
+            onValueChange={(v) => onBackgroundChange(parseHomeBackground(String(v)))}
+            className="grid grid-cols-3 gap-1.5 p-1"
+          >
+            {HOME_BACKGROUNDS.map((b) => (
+              <DropdownMenuRadioItem
+                key={b}
+                value={b}
+                closeOnClick={false}
+                className="group/bg flex-col items-stretch gap-1.5 p-1 pl-1 data-highlighted:bg-muted/60 [&>span:first-child]:hidden"
+              >
+                <BackgroundPreview value={b} />
+                <span className="px-0.5 text-xs leading-4 text-muted-foreground group-data-checked/bg:font-medium group-data-checked/bg:text-foreground">
+                  {HOME_BACKGROUND_LABEL[b]}
+                </span>
+              </DropdownMenuRadioItem>
+            ))}
+          </DropdownMenuRadioGroup>
+        </DropdownMenuGroup>
+        {onEdit ? (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuGroup>
+              <DropdownMenuItem onClick={onEdit}>
+                <LayoutGrid />
+                Edit cards and shortcuts
+              </DropdownMenuItem>
+            </DropdownMenuGroup>
+          </>
+        ) : null}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+/**
+ * One background as a small picture of Home: the scene (still, drawn at
+ * three times the size and scaled down so its dots and glyphs keep their
+ * texture), or the plain page for Off, with the composer's shape on top so
+ * it reads as Home rather than as a swatch.
+ */
+function BackgroundPreview({ value }: { value: HomeBackground }) {
+  return (
+    <span
+      aria-hidden
+      className="relative block h-14 overflow-hidden rounded-md bg-background ring-1 ring-foreground/10 group-data-checked/bg:ring-2 group-data-checked/bg:ring-primary"
+    >
+      {drawsScene(value) ? (
+        <span className="absolute top-0 left-0 block h-[300%] w-[300%] origin-top-left scale-[0.3333]">
+          <LakeBand variant={value} still className="size-full" />
+        </span>
+      ) : null}
+      <span className="absolute inset-x-[22%] top-[62%] block h-[18%] rounded-[3px] bg-card shadow-xs ring-1 ring-foreground/10" />
+    </span>
   )
 }
 
