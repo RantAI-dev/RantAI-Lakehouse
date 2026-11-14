@@ -81,7 +81,10 @@ export default async function RootLayout({
           attributes, never a mismatch inside it. */}
       <body suppressHydrationWarning>
         <ThemeProvider nonce={nonce}>
-          <TooltipProvider>
+          {/* Micro-interaction audit 2026-11-14 (emil): the first tooltip waits a beat so a
+              pointer passing over a toolbar does not flash labels; once one is open, the
+              next opens at once (Base UI's `timeout`, 400 ms) with no animation. */}
+          <TooltipProvider delay={350}>
             <AuthProvider>
               <TableProviders>
                 <AppFrame>{children}</AppFrame>
