@@ -247,7 +247,7 @@ export function LoginShowcase({ compact = false }: { compact?: boolean }) {
   const step = usePreviewLoop(ref, reduced);
   const total = sumOf(monthlyAt(step));
   const value = useCountedTotal(total, reduced);
-  const bars = <TileBody key={`bars-${dark}`} spec={BARS.spec} cell={barsCell(step)} dark={dark} loading={false} hideLegend />;
+  const bars = <TileBody key={`bars-${dark}`} spec={BARS.spec} cell={barsCell(step)} dark={dark} loading={false} hideLegend live />;
 
   const body = compact ? (
     <div className="flex h-full flex-col p-3">
@@ -287,7 +287,7 @@ export function LoginShowcase({ compact = false }: { compact?: boolean }) {
             <ShowcaseKpi value={value} total={total} />
           </PreviewTile>
           <PreviewTile title="Rows landed in Gold, this week" className="col-span-3">
-            <TileBody key={`line-${dark}`} spec={LINE.spec} cell={lineCell(step)} dark={dark} loading={false} hideLegend />
+            <TileBody key={`line-${dark}`} spec={LINE.spec} cell={lineCell(step)} dark={dark} loading={false} hideLegend live />
           </PreviewTile>
           <PreviewTile title="Visitors per month, 2024" className="col-span-5">
             {bars}
