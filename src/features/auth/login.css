@@ -1,0 +1,21 @@
+/*
+ * Motion for the sign-in page (`WEB-15`). Names start with `login-` so
+ * nothing else in the console can collide with them. All movement is inside
+ * `prefers-reduced-motion: no-preference`: with reduced motion the form
+ * changes state without moving.
+ */
+
+@media (prefers-reduced-motion: no-preference) {
+  /* The form after a refused sign-in: one short, damped shake (240 ms, spec). */
+  .login-shake {
+    animation: login-shake 240ms cubic-bezier(0.36, 0.07, 0.19, 0.97) both;
+  }
+}
+
+@keyframes login-shake {
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-6px); }
+  40% { transform: translateX(5px); }
+  60% { transform: translateX(-3px); }
+  80% { transform: translateX(2px); }
+}

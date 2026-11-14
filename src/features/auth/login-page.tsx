@@ -4,7 +4,7 @@ import * as React from "react";
 import Image from "next/image";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Eye, EyeOff, Lock, Mail, TriangleAlert } from "lucide-react";
+import { CircleAlert, Eye, EyeOff, KeyRound, Lock, Mail, TriangleAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Field, FieldLabel } from "@/components/ui/field";
 import {
@@ -15,13 +15,30 @@ import {
 } from "@/components/ui/input-group";
 import { Spinner } from "@/components/ui/spinner";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { ThemeToggle } from "@/components/theme-toggle";
+import { cn } from "@/lib/utils";
 import * as authClient from "@/services/clients/auth";
 import { toServiceError } from "@/services/errors";
 import { useAuth } from "./auth-provider";
 import { ChangePasswordStep } from "./change-password-step";
 import { LoginHero } from "./login-hero";
+import { LOGIN_DISPLAY, loginDisplay } from "./login-fonts";
 import { SsoNotice } from "./sso-notice";
+import "./login.css";
+
+/**
+ * The sign-in page (`/login`), laid out as the owner's mockup A (`WEB-15`,
+ * chosen 2026-11-14): the logo right above the title, visible labels, a
+ * password eye with its tooltip, a Caps Lock warning, a refusal that opens in
+ * place with one short shake and the password selected for retyping, and a
+ * loading button. The requests, redirects, `next` handling, SSO flag and
+ * notices are the ones this page had before; only the markup changed.
+ */
+
+/** The console's interaction easing: the properties that change, never `all`. */
+const EASE =
+  "transition-[background-color,border-color,color,box-shadow,opacity,transform] duration-200 ease-[cubic-bezier(0.2,0,0,1)]";
 
 /**
  * Whether an SSO button should render at all.
@@ -43,6 +60,18 @@ import { SsoNotice } from "./sso-notice";
 const ssoEnabled = process.env.NEXT_PUBLIC_SSO_ENABLED === "true";
 
 function SsoButton({ disabled }: { disabled?: boolean }) {
+  // The redirect takes a moment to leave the page; the button says so
+  // instead of sitting still (DESIGN.md §3: no button is silent when pressed).
+  const [redirecting, setRedirecting] = React.useState(false);
+  React.useEffect(() => {
+    // Back from the provider through the browser's page cache: the page is
+    // restored as it was left, "Redirecting…" included, so reset it.
+    const onPageShow = (e: PageTransitionEvent) => {
+      if (e.persisted) setRedirecting(false);
+    };
+    window.addEventListener("pageshow", onPageShow);
+    return () => window.removeEventListener("pageshow", onPageShow);
+  }, []);
   if (!ssoEnabled) return null;
   return (
     <>
@@ -55,9 +84,10 @@ function SsoButton({ disabled }: { disabled?: boolean }) {
         type="button"
         variant="outline"
         size="lg"
-        disabled={disabled}
-        className="h-11 w-full"
+        disabled={disabled || redirecting}
+        className={cn("h-11 w-full rounded-lg text-sm", EASE)}
         onClick={() => {
+          setRedirecting(true);
           // The authorization-code redirect itself is deliberately not
           // implemented here — `lakehouse-auth`'s `OidcAuthenticator` is a
           // resource server, not an OIDC client (see its README's "What
@@ -70,7 +100,8 @@ function SsoButton({ disabled }: { disabled?: boolean }) {
           window.location.assign("/api/auth/oidc/start");
         }}
       >
-        Continue with SSO
+        {redirecting ? <Spinner /> : <KeyRound aria-hidden />}
+        {redirecting ? "Redirecting…" : "Continue with SSO"}
       </Button>
     </>
   );
@@ -85,6 +116,21 @@ function nextPathFromQuery(): string {
   return raw;
 }
 
+/**
+ * The official Rantai Lake mark (`public/logo-*.png`), drawn whole in a
+ * square box with `object-contain`, so its own 196 x 167 proportion is kept
+ * (DESIGN.md §5: never squashed). Decorative: the title beside it already
+ * names the product.
+ */
+function Logo({ className }: { className?: string }) {
+  return (
+    <span className={cn("relative inline-block size-7 shrink-0", className)}>
+      <Image src="/logo-light.png" alt="" fill sizes="64px" className="object-contain dark:hidden" priority />
+      <Image src="/logo-dark.png" alt="" fill sizes="64px" className="hidden object-contain dark:block" priority />
+    </span>
+  );
+}
+
 export function LoginPage() {
   const router = useRouter();
   const { refresh, status, user } = useAuth();
@@ -92,12 +138,19 @@ export function LoginPage() {
   const [password, setPassword] = React.useState("");
   const [submitting, setSubmitting] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  // The refusal's text stays while its box closes, so it folds away instead
+  // of emptying first and then collapsing.
+  const [shownError, setShownError] = React.useState<string | null>(null);
+  const [shaking, setShaking] = React.useState(false);
   const [notice, setNotice] = React.useState<string | null>(null);
   const [pendingPasswordChange, setPendingPasswordChange] = React.useState(false);
   const [showPassword, setShowPassword] = React.useState(false);
   // Caps Lock silently breaks password entry more often than any other
   // input mistake, and the field is masked so the user cannot see why.
   const [capsLock, setCapsLock] = React.useState(false);
+  const passwordRef = React.useRef<HTMLInputElement>(null);
+
+  if (error !== null && error !== shownError) setShownError(error);
 
   // Already signed in (e.g. opened /login in a second tab) — bounce home
   // instead of showing the form again.
@@ -114,8 +167,18 @@ export function LoginPage() {
     }
   }, []);
 
+  // After a refusal the password is selected, ready to be typed again
+  // (WEB-15 spec: "the password is selected for retyping"). This runs once
+  // the inputs are enabled again, which is the same render as the error.
+  React.useEffect(() => {
+    if (!error) return;
+    passwordRef.current?.focus();
+    passwordRef.current?.select();
+  }, [error]);
+
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
+    if (submitting) return;
     setError(null);
     setNotice(null);
     setSubmitting(true);
@@ -162,6 +225,7 @@ export function LoginPage() {
             : serviceError.message || "Could not sign in. Try again."
         );
       }
+      setShaking(true);
     } finally {
       setSubmitting(false);
     }
@@ -190,41 +254,23 @@ export function LoginPage() {
   // While `/api/auth/me` is still in flight we do not yet know whether this
   // visitor already has a session. Rendering the form now means anyone with
   // a live cookie sees a sign-in prompt flash before the redirect above
-  // fires — so hold the column's shape with a skeleton instead.
+  // fires — so hold the column's shape with a skeleton instead. This is a
+  // real load, so a skeleton is the honest placeholder (DESIGN.md §3).
   const checkingSession = status === "loading";
+  const invalid = !!error;
 
   return (
-    <div className="flex min-h-screen flex-col bg-background lg:flex-row">
+    <div className={cn(loginDisplay.variable, "flex min-h-svh flex-col bg-background text-foreground lg:flex-row")}>
       <LoginHero />
 
-      <div className="flex flex-1 flex-col px-6 py-8 sm:px-12 lg:px-16 lg:py-10">
-        <header className="flex items-center justify-between">
-          <span className="flex items-center gap-2">
-            <span className="relative size-7">
-              <Image
-                src="/logo-light.png"
-                alt="Rantai Lake"
-                fill
-                sizes="28px"
-                className="object-contain dark:hidden"
-                priority
-              />
-              <Image
-                src="/logo-dark.png"
-                alt=""
-                fill
-                sizes="28px"
-                className="hidden object-contain dark:block"
-                priority
-              />
-            </span>
-            <span className="text-sm font-semibold">Rantai Lake</span>
-          </span>
+      {/* The form, centred, with the logo right above the title (mockup A). */}
+      <main className="relative flex min-h-svh flex-1 flex-col px-5 pt-5 pb-6 sm:px-10 lg:min-h-0 lg:px-14">
+        <div className="flex justify-end">
           <ThemeToggle />
-        </header>
+        </div>
 
-        <div className="flex flex-1 items-center justify-center py-12">
-          <div className="w-full max-w-[352px]">
+        <div className="flex flex-1 items-start justify-center py-4 lg:items-center lg:py-6">
+          <div className="w-full max-w-[360px]">
             {/* `SEC-65` D2: a callback refused because the provider did
                 not confirm the email redirects here with
                 `ssoNotice=email_not_verified`, so the sentence the person
@@ -233,27 +279,35 @@ export function LoginPage() {
             <React.Suspense fallback={null}>
               <SsoNotice />
             </React.Suspense>
-            <h1 className="text-3xl leading-[1.2] font-semibold tracking-[-0.02em] text-foreground">
+            <Logo className="size-9" />
+            <h1 className={cn(LOGIN_DISPLAY, "mt-5 text-[30px] leading-[1.1] text-foreground")}>
               Sign in to Rantai Lake
             </h1>
-            <p className="mt-2 text-sm text-muted-foreground">
-              Use your account credentials to continue.
-            </p>
+            <p className="mt-2 text-sm text-muted-foreground">Use your account to continue.</p>
 
             {checkingSession ? (
-              <div className="mt-8 flex flex-col gap-5" aria-label="Loading" role="status">
-                <Skeleton className="h-[68px] w-full" />
-                <Skeleton className="h-[68px] w-full" />
+              <div className="mt-7 flex flex-col gap-5" aria-label="Loading" role="status">
+                <Skeleton className="h-[72px] w-full" />
+                <Skeleton className="h-[72px] w-full" />
                 <Skeleton className="h-11 w-full" />
               </div>
             ) : (
-              <div className="mt-8 flex flex-col gap-5">
-                <form onSubmit={onSubmit} className="flex flex-col gap-5" noValidate>
-                  <Field data-invalid={!!error}>
+              <div className="mt-7 flex flex-col gap-5">
+                <form
+                  onSubmit={onSubmit}
+                  noValidate
+                  className={cn("flex flex-col gap-5", shaking && "login-shake")}
+                  onAnimationEnd={(e) => {
+                    // Only the form's own shake: the spinner and the tooltip
+                    // inside it animate too, and their events bubble here.
+                    if (e.target === e.currentTarget) setShaking(false);
+                  }}
+                >
+                  <Field data-invalid={invalid}>
                     <FieldLabel htmlFor="login-email" className="text-sm">
                       Username or email
                     </FieldLabel>
-                    <InputGroup className="h-11">
+                    <InputGroup className="h-11 bg-background dark:bg-input/30">
                       <InputGroupAddon className="pl-3">
                         <Mail />
                       </InputGroupAddon>
@@ -261,38 +315,48 @@ export function LoginPage() {
                         id="login-email"
                         type="text"
                         autoComplete="username"
+                        autoCapitalize="none"
+                        spellCheck={false}
                         autoFocus
                         required
                         placeholder="you or you@company.com"
-                        className="text-sm"
-                        aria-invalid={!!error}
-                        aria-describedby={error ? "login-error" : undefined}
+                        // 16 px on a phone, so iOS Safari does not zoom
+                        // into the field when it takes focus.
+                        className="text-base md:text-sm"
+                        aria-invalid={invalid}
+                        aria-describedby={invalid ? "login-error" : undefined}
                         value={email}
-                        onChange={(e) => setEmail(e.target.value)}
+                        onChange={(e) => {
+                          setEmail(e.target.value);
+                          setError(null);
+                        }}
                         disabled={submitting}
                       />
                     </InputGroup>
                   </Field>
 
-                  <Field data-invalid={!!error}>
+                  <Field data-invalid={invalid}>
                     <FieldLabel htmlFor="login-password" className="text-sm">
                       Password
                     </FieldLabel>
-                    <InputGroup className="h-11">
+                    <InputGroup className="h-11 bg-background dark:bg-input/30">
                       <InputGroupAddon className="pl-3">
                         <Lock />
                       </InputGroupAddon>
                       <InputGroupInput
+                        ref={passwordRef}
                         id="login-password"
                         type={showPassword ? "text" : "password"}
                         autoComplete="current-password"
                         required
-                        placeholder="••••••••"
-                        className="text-sm"
-                        aria-invalid={!!error}
-                        aria-describedby={error ? "login-error" : undefined}
+                        className="text-base md:text-sm"
+                        aria-invalid={invalid}
+                        aria-describedby={invalid ? "login-error" : undefined}
                         value={password}
-                        onChange={(e) => setPassword(e.target.value)}
+                        onChange={(e) => {
+                          setPassword(e.target.value);
+                          setError(null);
+                        }}
                         disabled={submitting}
                         // Read the modifier off real key events rather than
                         // tracking CapsLock presses: this also catches the
@@ -302,18 +366,26 @@ export function LoginPage() {
                         onBlur={() => setCapsLock(false)}
                       />
                       <InputGroupAddon align="inline-end" className="pr-2">
-                        <InputGroupButton
-                          size="icon-sm"
-                          // Skipped in the tab order: between password and
-                          // submit, a reveal toggle is a detour for keyboard
-                          // users, who can still reach it via shift-tab.
-                          tabIndex={-1}
-                          disabled={submitting}
-                          onClick={() => setShowPassword((v) => !v)}
-                          aria-label={showPassword ? "Hide password" : "Show password"}
-                        >
-                          {showPassword ? <EyeOff /> : <Eye />}
-                        </InputGroupButton>
+                        <Tooltip>
+                          <TooltipTrigger
+                            render={
+                              <InputGroupButton
+                                size="icon-sm"
+                                className="size-8"
+                                // Skipped in the tab order: between password and
+                                // submit, a reveal toggle is a detour for keyboard
+                                // users, who can still reach it via shift-tab.
+                                tabIndex={-1}
+                                disabled={submitting}
+                                onClick={() => setShowPassword((v) => !v)}
+                                aria-label={showPassword ? "Hide password" : "Show password"}
+                              />
+                            }
+                          >
+                            {showPassword ? <EyeOff /> : <Eye />}
+                          </TooltipTrigger>
+                          <TooltipContent>{showPassword ? "Hide password" : "Show password"}</TooltipContent>
+                        </Tooltip>
                       </InputGroupAddon>
                     </InputGroup>
                     {capsLock ? (
@@ -336,20 +408,33 @@ export function LoginPage() {
                     </p>
                   ) : null}
 
-                  {error ? (
-                    <p
-                      id="login-error"
-                      role="alert"
-                      className="rounded-lg bg-destructive/10 px-3.5 py-2.5 text-sm text-destructive"
-                    >
-                      {error}
-                    </p>
-                  ) : null}
+                  {/* The refusal opens in place (200 ms) rather than jumping
+                      the button down, and folds away the same way once the
+                      person types again. `role="alert"` is on it only while
+                      there is an error, so the closing text is not announced. */}
+                  <div
+                    className={cn(
+                      "grid transition-[grid-template-rows,opacity,margin] duration-200 ease-[cubic-bezier(0.2,0,0,1)] motion-reduce:transition-none",
+                      error ? "mt-0 grid-rows-[1fr] opacity-100" : "-mt-5 grid-rows-[0fr] opacity-0",
+                    )}
+                  >
+                    <div className="min-h-0 overflow-hidden">
+                      <p
+                        id={error ? "login-error" : undefined}
+                        role={error ? "alert" : undefined}
+                        aria-hidden={error ? undefined : true}
+                        className="flex items-start gap-2 rounded-lg bg-destructive/10 px-3.5 py-2.5 text-sm text-destructive"
+                      >
+                        <CircleAlert className="mt-0.5 size-4 shrink-0" aria-hidden />
+                        <span>{error ?? shownError}</span>
+                      </p>
+                    </div>
+                  </div>
 
                   <Button
                     type="submit"
                     size="lg"
-                    className="h-11 w-full"
+                    className={cn("h-11 w-full rounded-lg text-sm", EASE)}
                     disabled={submitting}
                   >
                     {submitting ? <Spinner /> : null}
@@ -363,15 +448,16 @@ export function LoginPage() {
           </div>
         </div>
 
-        <footer className="flex flex-col gap-1 text-sm text-muted-foreground sm:flex-row sm:items-center sm:justify-between">
+        <footer className="flex items-center justify-center gap-2 text-xs text-muted-foreground lg:justify-start">
           <span>© {new Date().getFullYear()} Rantai Lake</span>
+          <span aria-hidden>·</span>
           {/* Placeholder destination — point this at the docs site (or
               wherever support lives) once that URL exists. */}
-          <Link href="#" className="transition-colors hover:text-foreground">
+          <Link href="#" className={cn("rounded-sm outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50", EASE)}>
             Documentation
           </Link>
         </footer>
-      </div>
+      </main>
     </div>
   );
 }
