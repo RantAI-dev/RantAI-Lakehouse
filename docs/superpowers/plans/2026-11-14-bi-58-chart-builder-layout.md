@@ -169,4 +169,91 @@ so they ride along (feature page L5):
 
 ## 6. Handoff
 
-(developer)
+### Handoff, BI-58 (Opus developer agent, 2026-11-14)
+
+**Commits** on `feat/bi-58-chart-builder-revamp`, over `a986737f`, not pushed:
+
+| Task | Commit | What |
+| --- | --- | --- |
+| T1 | `302e6566` | Page frame: header row, three zones (container queries), FormPage, type column and resizable split removed; the round-trip guard test |
+| T2 | `11aa14f8` | Data panel: columns as Dates / Text / Numbers, joined tables under their own heading, chips, one-click use and the use menu |
+| T3 | `197285a9` | Canvas (title, description, states, result line, Data toggle) and the type toolbar with its gallery drawn from the preview's rows |
+| T4 | `5aee3a18` | Inspector tabs Data / Sort & filter / Style, nothing dropped |
+| T5 | `6dab5315` | The 1280 px fold ("Pick data" sheet), the phone stack, the assistant bar |
+| T6 | `2a390cc3` | Limit, number format, BI-11 parameter limit, KPI note, plain words, error sentences |
+| T5 | `baf193a2` | Fixes found in the screenshots, and the screenshots |
+| T7 | this entry | |
+
+**Checks on `baf193a2`**, each run alone, under `nice -n 15` and a cgroup cap
+(`systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0`):
+
+- `bun test` on the 18 builder files (`chart-builder`, `chart-builder-layout`, `chart-builder-page`,
+  `chart-shape-section`, `format-section`, `gantt-builder`, `type-b-builder`, `layers-section`,
+  `joins-section`, `rows-table`, and `lib/` `builder-rules`, `section-summary`, `style-draft`,
+  `format`, `kind-gallery`, `column-click`, `chart-coverage`, `chart-kind-search`):
+  **242 pass, 0 fail, 1,202 expect() calls**.
+- `bun run typecheck`: **0 errors**.
+- `bun run lint`: **0 errors, 11 warnings** (the 11 that were there before).
+- `bun run test` (the whole console suite): **not verified (CI)**. The planner stopped it on this
+  VM (OOM, 2026-11-14); it runs on the draft PR.
+- No Rust was touched or compiled.
+
+**Tests the plan names:**
+- The gallery makes no request: `chart-builder-layout.test.tsx`, "draws each type it can from the
+  preview's rows, with no request of its own and at most 200 rows" (fetch and every method of
+  `dashboardService`, `metricService` and `paramService` watched while it opens and draws).
+- A saved chart of each family round-trips: the same file, "saves an unchanged … chart back as the
+  same definition" for bar, line, KPI with compare, table, Gantt and combined. It was run against the
+  builder at `240d2e62` first and passed there, so its definitions are the old builder's own output.
+- One click on a date column and one on a number column give a preview: "gives a preview from a
+  source, one click on a date column and one on a number column" (and the same through the sheet).
+- The Limit can be emptied: "lets the Limit be emptied and typed into, and puts back the last number
+  when left empty".
+
+**Screenshots:** `docs/plans/bi-58-screens/`, taken on the QA data (dashboard `b_47cff752` "QA BI",
+Edit chart on `jumlah by tahun`) with a dev server of this worktree started briefly on port 28622
+and stopped by PID straight after: `new-` and `edit-` at `1190x800`, `1366x900` and `390x844`,
+`light` and `dark` (12), plus `gallery-1366x900-light` and `sheet-1190x800-dark`. Measured in each:
+no sideways scroll; at both laptop sizes the page height equals the window (the zones end above the
+assistant bar); at 1366x900 the canvas is 726 px wide, more than half of the window.
+
+**Choices the plan did not settle:**
+1. *"Below 1280 px wide"* is read as the builder's own width (a container query), not the window's.
+   With the window's, the data panel would be inline at 1366x900 and the canvas about 460 px, under
+   half the page (spec T1). With the builder's (about 1,060 px at 1366 with the sidebar open) the
+   panel is folded at 1190 and 1366 and inline from about 1,580 px windows. The planner and the
+   owner may prefer otherwise.
+2. The breadcrumb's heading is "New chart" / "Edit chart"; the chart's name is not repeated there,
+   since it is the large title right below (DESIGN.md: say it once).
+3. The description under the title is saved as `subtitle`, which `StoredChartSpec` already has and the
+   dashboard already shows. Sent only when filled, so every saved chart without one round-trips
+   unchanged; an edited chart that has one (the assistant writes it) now keeps it, where the old
+   builder dropped it on save.
+4. The result line says what is known: "5 groups", or "Showing 20 of 54 groups" when the limit cut,
+   rather than "N groups from M rows": the preview does not return the number of source rows read.
+5. Gallery rules (`lib/kind-gallery.ts`): a type draws a picture only from rows of the same shape
+   (one row per X, or per X and series). Others show their icon until picked (KPI, maps, scatter…).
+   A type is greyed out only for what the builder's own pickers require (a date column for Calendar
+   and Gantt, two text or date columns for heatmap/Sankey/sunburst, enough number columns for
+   `measureLimits`, a region column for the region map) and cannot be clicked then. Enter in the
+   search picks the first match the source can make.
+6. Words beyond the plan's list, to match the chips: "Dimension (X)" is "X axis", "Breakdown /
+   series" is "Split into series", and "split" replaces "breakdown" in the limit labels and the
+   split's grain and bins. Inside "Second source" each entry is still "Question n" (left as is).
+7. On click and Freshness (from More options, not in the plan's table) are in the Data tab.
+8. The toolbar's eight types are mockup A's (bar, horizontal bar, line, area, donut, treemap, KPI,
+   table).
+9. Removed as dead with the old layout: `lib/kind-list-pref.ts`, `AccordionSection`, `FoldSection`,
+   `moreOptionsUsed`, `formatUsed`, with their tests. The point map's grid picker and the calendar
+   note were rendered twice; they render once.
+10. A single value row hides its move buttons (all disabled), and the move and remove buttons sit on
+    the value's label line, so the column picker keeps its width in the narrow inspector.
+
+**Not done or not verified:**
+- `bun run test` in full: not verified (CI), as above.
+- The owner's preview server: not started (coordinator's instruction); ready for one.
+- Not checked in a real phone browser (iPhone Safari); the 390x844 shots are Chrome emulation.
+- The SQL source paths (write SQL, Edit SQL, the held preview's Chart/Rows) were not exercised in
+  the screenshots; their tests pass.
+- `AGENTS.md` carries the block `next dev` writes on start (uncommitted). Restoring it with
+  `git checkout` was refused by this session's permission check, so it is left for the planner.
