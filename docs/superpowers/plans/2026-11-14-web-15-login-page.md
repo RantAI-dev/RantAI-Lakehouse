@@ -188,3 +188,27 @@ with at least 4.4 GB available), last on the tree of `1f4eee44`:
 iPhone Safari; the contour drift and the motion pass judged by eye over a full cycle (only sampled by
 the probe); Safari's support of the mask stack (`mask-composite: intersect` is supported since
 Safari 15.4; not checked on a device).
+
+### Slice 3 (owner follow-ups T6 to T9, 2026-11-14), Opus developer
+
+Branch `feat/web-15-login-page`, base `f4669f5c`, not pushed.
+
+| Task | Commit | What |
+| --- | --- | --- |
+| T6 | `1b667ddb` | Contours ripple outward: each drawing lives 9 s (fade in, spread 3.5 % from the deep point with a few px of drift, fade out), one born every 3 s; transform/opacity only; edge fade moved into each layer's mask (container units); drawings 2000 x 1704; dark lines lake blue |
+| T7 | `2dcadaf3` | Panel solid navy `#0B1440` (light) / `#0A1030` (dark), lighter faint contours, white caption, soft navy-black lift on the desktop card |
+| T8 | `bd130f43` | Title centred over the form column |
+| T9 | `3f8a384f` | First-look sequence under 900 ms (contour "drop", form stagger 50 ms, caption, card rise), gated by `.login-first` for the first 900 ms |
+
+**Commands run** (each under the 3 GB scope, at least 3 GB available), last on the tree of `3f8a384f`:
+
+- `bun run typecheck`: no errors.
+- `bun test src/features/auth/login-page.test.tsx src/features/auth/login-showcase.test.tsx src/features/auth/login-contours.test.tsx`: 16 pass, 0 fail, 48 expect() calls.
+- `bun x eslint` on the changed TS/TSX files: 0 errors, 1 warning (the existing SSO `location.assign`).
+- CPU of this session's headless Chrome only (software compositing, no GPU on the VM), 1366x900,
+  4 samples x 3 s: contours moving, showcase hidden 78 % of a core with the fade on the container,
+  45 % after moving it into each layer's mask; reduced motion 0.2 %.
+
+**Not verified:** CPU in a GPU-composited browser (expected far lower; none on the VM); the full
+`bun run test`/`bun run lint` and `next build`; iPhone Safari; the reveal timed in real time (frames
+were taken with the CSS animations slowed 10x, while the dashboard's JS loading ran at full speed).
