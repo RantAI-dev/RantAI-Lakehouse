@@ -26,8 +26,8 @@ function shell(pathname: string) {
 describe("AppShellSkeleton", () => {
   it("draws the parts that do not depend on the person for real", () => {
     shell("/dashboards/browse")
-    expect(screen.getByText("Rantai Lake")).toBeTruthy()
-    expect(screen.getByText("Enterprise Lakehouse Console")).toBeTruthy()
+    expect(screen.getByText("RantAI Lakehouse")).toBeTruthy()
+    expect(screen.queryByText("Enterprise Lakehouse Console")).toBeNull()
     expect(screen.getByLabelText("Open command palette")).toBeTruthy()
     expect(document.querySelector("[data-slot='sidebar-trigger']")).not.toBeNull()
   })

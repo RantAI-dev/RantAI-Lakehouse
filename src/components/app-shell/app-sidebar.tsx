@@ -85,8 +85,7 @@ export function SidebarBrand() {
       <div className="flex min-w-0 items-center justify-start gap-2">
         <BrandLogo />
         <div className={cn("grid min-w-0 flex-1 gap-0.5 whitespace-nowrap leading-none", SIDEBAR_FADE)}>
-          <span className="text-sm font-semibold tracking-[-0.084px] text-sidebar-foreground">Rantai Lake</span>
-          <span className="text-[11px] font-normal tracking-[-0.04px] text-sidebar-foreground/60">Enterprise Lakehouse Console</span>
+          <span className="truncate text-sm font-semibold tracking-[-0.084px] text-sidebar-foreground">RantAI Lakehouse</span>
         </div>
       </div>
     </SidebarHeader>
