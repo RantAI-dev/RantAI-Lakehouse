@@ -90,7 +90,9 @@ export function CardSection({
         icon={icon}
         action={link ? <WidgetLink href={link.href}>{link.label}</WidgetLink> : undefined}
       />
-      <div className="mt-2 -mx-1.5">{children}</div>
+      {/* Micro-interaction audit 2026-11-14: the rows fade in when they land; the placeholder rows
+          (`aria-hidden`, the same ones the loading shell drew) do not, so loading never blinks. */}
+      <div className="mt-2 -mx-1.5 [&>:not([aria-hidden])]:transition-opacity [&>:not([aria-hidden])]:duration-200 [&>:not([aria-hidden])]:ease-ui starting:[&>:not([aria-hidden])]:opacity-0">{children}</div>
     </section>
   )
 }

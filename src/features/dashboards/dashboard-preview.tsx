@@ -115,11 +115,12 @@ export function DashboardPreview({
         <div key={spec.id} data-slot="preview-tile" className={cn(extra(i), "min-w-0 flex-col gap-2")}>
           <Link
             href={href}
-            className="h-5 truncate text-xs leading-5 font-medium text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
+            className="h-5 truncate text-xs leading-5 font-medium text-muted-foreground underline-offset-4 transition-colors duration-150 ease-ui hover:text-foreground hover:underline"
           >
             {spec.title}
           </Link>
-          <div className="min-h-0 flex-1">
+          {/* Micro-interaction audit 2026-11-14 (WEB-17): the chart fades in where its placeholder was, rather than in one frame. */}
+          <div className="min-h-0 flex-1 transition-opacity duration-200 ease-ui starting:opacity-0">
             <TileBody spec={spec} cell={state.data?.results[spec.id]} dark={resolvedTheme === "dark"} loading={false} hideLegend hideDataFrom />
           </div>
         </div>

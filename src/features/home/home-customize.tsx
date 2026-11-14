@@ -136,7 +136,9 @@ function BackgroundPreview({ value }: { value: HomeBackground }) {
   return (
     <span
       aria-hidden
-      className="relative block h-14 overflow-hidden rounded-md bg-background ring-1 ring-foreground/10 group-data-checked/bg:ring-2 group-data-checked/bg:ring-primary"
+      // Micro-interaction audit 2026-11-14: the ring moves to the picked picture with an eased change, and
+      // the picture gives a little under the press, so the pick is felt before the page's band cross-fades.
+      className="relative block h-14 overflow-hidden rounded-md bg-background ring-1 ring-foreground/10 transition-[box-shadow,scale] duration-200 ease-ui group-active/bg:scale-[0.97] group-data-checked/bg:ring-2 group-data-checked/bg:ring-primary"
     >
       {drawsScene(value) ? (
         <span className="absolute top-0 left-0 block h-[300%] w-[300%] origin-top-left scale-[0.3333]">

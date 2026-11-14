@@ -14,6 +14,8 @@
 
 - **Layout is mockup B** (owner, 2026-11-14): `design/chart-builder-mockups` at `a7779918`, `/mockups/home/b`, code in `src/features/mockups/home-history/` (`home-mockups.tsx`, `widgets.tsx`, `lake-art.tsx`, `shared.tsx`, `home-history.css`) in the worktree `/home/hv/mtharreq/lakehouse-mockups`. Port from it; it is our own code. The owner looked at the **Dither** style in dark mode and liked it.
 - **Background choice** (owner, 2026-11-14): Home's Customize menu gets **Background: Dither (default) · ASCII · Off**, remembered in `localStorage` (same approach as the Dashboards table/gallery choice). ~~Off = plain page, the bento moves up, no empty band.~~ Changed 2026-11-14 (owner QA): **Off keeps the layout; only the art is hidden**: the band keeps its height, the greeting, composer and chips stay where they are, the band shows the plain page, and switching cross-fades the art in place. Owner: "kalo pas off jangan naik ke atas gini composernya, tetap aja kek gitu tapi kosong aja backgroundnya". DESIGN.md: "Latar dekoratif di aplikasi bisa dimatikan pengguna".
+- **Greeting over the art without a hole** (owner QA, 2026-11-14): the art stays whole behind "Good morning, …" ("aku gasuka karena ini kek gambarnya hilang biar tulisan Good morning-nya tetap keliatan… biar tetap full backgroundnya muncul tapi tulisan itu tetap keliatan"). The text is readable through a soft veil over its own box (dots thin a little and lean towards the band's base colour, smooth falloff, no edge) and a soft halo in the base colour on the text. No hard cut-outs around the composer either.
+- **Day and night follow the theme** (owner, 2026-11-14: "kalo buat light mode berarti kondisinya dibuat siang juga, matahari muncul di sebelah kiri; kalo dark berarti matahari turun dan bulan naik di sebelah kanan"). Light theme: a day lake (lighter sky in the same dither/ASCII language, the sun on the left, sparkling water, the whale at the waterline). Dark theme: night (the moon on the right, stars). A theme switch on Home animates on the canvas: the moon sets on the right while the sun rises on the left (or the sun sets on the left below the waterline, its reflection fading, while the moon rises on the right), sky and water tones blend, 1.5 s eased, up to 30 fps only during the change, then back to the idle loop (≤10 fps, paused off screen and in a hidden tab). Reduced motion: the end state at once. The base colours (cream by day, navy by night) are the placeholder's, so the first paint does not flash.
 - **Only real data** (spec "Not in this item"): no activity heatmap, no month totals, no "Gold rows this month", no "opened N h ago". Use these instead:
   - **Focal dashboard:** the existing preview choice (`shown.previewBoardId`, else last board, else most recently updated with charts; `home-page.tsx:341-358`) drawn live with `DashboardPreview` (`home-page.tsx:459`). If the person has favourites (`dashboardService.shortcuts()`), prefer the first favourite when no preview board was chosen.
   - **Recent AI chats:** `copilot.sessions` (`home-page.tsx:371-377`), latest 4, "N more" → `/copilot/history`. Time is "updated", the only time the API has.
@@ -122,3 +124,32 @@ Branch `feat/web-17-home-revamp`, base `50451d5a`. Not pushed.
 - Phone: the three shortcuts and Customize wrap to two lines at 390 px; the composer's text box keeps its two-line minimum (`Textarea` `min-h-16`).
 
 Processes: dev server on 28699 (`bun x next dev` 373591, node 373608, next-server 373654) and headless Chrome on 28690 (373590) stopped by PID; both ports free. `AGENTS.md` rewrites by `next dev` reverted before every commit.
+
+## Micro-interaction audit (emil), 2026-11-14
+
+Owner request (2026-11-14): audit the revamped pages' micro-animations with the
+`emil-design-eng` checklist; DESIGN.md wins (150–250 ms, eased, never linear;
+motion with a reason; everything stops under reduced motion). Opus developer
+agent. Motion only: no layout, colour or copy changes; roles and accessible
+names unchanged. `lake-scene.tsx` is not touched (another session works on it).
+
+The shared part (easing tokens, the global reduced-motion rule, tooltips with
+a first delay and instant follow-ups, the button press, menus, popovers,
+dialogs, sheets, `useSlidingIndicator`) is the same commit as on BI-61,
+cherry-picked: its table is in the BI-61 plan.
+
+| Element | Now | Skill / DESIGN.md | Change |
+| --- | --- | --- | --- |
+| `EASE` (chips, widget rows, links, Ask why) | Lists `transform`, so every `active:scale-*` press jumped (Tailwind v4 sets `scale`) | Name the property; strong ease-out | `scale,rotate,translate`, `ease-ui` (the same hunk as BI-61, so the merge is clean) |
+| Background switch Dither ↔ ASCII | The band redraws the other art in one frame | Owner: cross-fade, never jump | The new art mounts as a second band over the old and fades in (300 ms); the old one goes once the new one is opaque. Off still fades out in place |
+| The scene's first appearance | Art appears in one frame over the base colour | Prevent jarring changes | Only the art fades in (400 ms) over the base colour the server painted, so the first frame never flashes the plain page |
+| Background previews (Customize) | The ring jumps to the picked picture | Eased state change; press feedback | Ring eases (200 ms), the picture gives 0.97 under the press |
+| Ask / Build switch | The raised fill jumps; `transition-colors` | Sliding indicator; press | One pill that slides (220 ms `ease-move`), press 0.97 |
+| Context strip under the composer | Text swaps in one frame on Ask / Build | Crossfade | The new line fades in (200 ms) |
+| Composer box | `transition-all` | Never `all` | Border, background and shadow named, `ease-ui` |
+| "Ask why" filling the composer | Text appears; a box out of view jumps into view (`focus()`) | A small, meaningful cue | The box's edge lights up in primary and eases back (650 ms); out of view, it glides into the middle (instant under reduced motion) |
+| Cycling example placeholder | 250 ms both ways, default curve | Exit faster than enter | In 250 ms / out 150 ms, `ease-ui` |
+| Send, Stop, Tools | Colour only | Press feedback | Press 0.95 (Send only while enabled), Tools 0.97 |
+| Suggestion chips, widget rows, Open links | Press scale written but not animated | Press 0.97 / 0.99, eased | Animated now (`EASE`) |
+| Focal dashboard tiles | Title hover not eased; chart replaces its placeholder in one frame | Fill in place | Title colour eases; the chart fades in (200 ms) |
+| Widget rows landing | Rows replace placeholder rows in one frame | Same | Rows fade in; the placeholder rows (`aria-hidden`) do not, so loading never blinks |
