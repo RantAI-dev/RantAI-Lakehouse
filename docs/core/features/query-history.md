@@ -6,12 +6,12 @@
 | Backlog | `QS-4` (history part) |
 | Kind | Feature |
 | Spec | `docs/core/specs/qs-4.md` (no *(proposed)* number; the 14 days are Snowflake's) |
-| Status | In Acceptance |
+| Status | Released: accepted by the product owner on 2026-11-14 (every row Pass; AC2 with findings; one exception under Exceptions) |
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |
 | Started | 2026-10-24; also in `BACKLOG.md` Dates |
-| Shipped | Not yet |
+| Shipped | 2026-10-27; fixes 2026-11-06 (#399, #403); Bronze link 2026-11-08 (#437) |
 | Evidence | |
 | Plan | Plan files are not kept in the repository. |
 
@@ -81,25 +81,27 @@ Run on a running console by the product owner. A step not performed is never a p
 
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| `QS-4-AC1` | (operator) Have a run on a table recorded 10 days ago; open History and filter on that table | The run is listed | Not run |
-| `QS-4-AC2` | Run SQL that fails, then SQL a policy refuses; open History | Two rows, Failed and Refused, each with a sentence that says why; the failed row ends with a reference id and holds no `Code:` or catalog name | Not run |
-| `QS-4-AC3` | Sign in as a user without `query:read` and open History | Refused with a permission message | Not run |
-| `QS-4-AC4` | Sign in as a second user and open History | None of the first user's runs is listed | Not run |
-| `QS-4-AC5` | (operator) Have a run recorded 15 days ago | It is not listed | Not run |
-| `QS-4-AC6` | Filter on engine Trino and a minimum of 5 seconds | Only Trino runs of 5 seconds or more | Not run |
-| `QS-4-AC7` | Click a run | Its SQL opens in a new Query Studio tab with its engine | Not run |
-| `QS-4-AC8` | In the editor, expand a Bronze table in the schema browser and click it; type its alias and a dot | The name is inserted and its columns are suggested | Not run |
+| `QS-4-AC1` | (operator) Have a run on a table recorded 10 days ago; open History and filter on that table | The run is listed | Pass (2026-11-12, 3cdd8332, LH-QS-4-01) |
+| `QS-4-AC2` | Run SQL that fails, then SQL a policy refuses; open History | Two rows, Failed and Refused, each with a sentence that says why; the failed row ends with a reference id and holds no `Code:` or catalog name | Pass with findings (2026-11-14, 240d2e62, LH-QS-4-02). See Exceptions |
+| `QS-4-AC3` | Sign in as a user without `query:read` and open History | Refused with a permission message | Pass (2026-11-04, f3cee927, LH-QS-4-03) |
+| `QS-4-AC4` | Sign in as a second user and open History | None of the first user's runs is listed | Pass (2026-11-04, f3cee927, LH-QS-4-04) |
+| `QS-4-AC5` | (operator) Have a run recorded 15 days ago | It is not listed | Pass (2026-11-04, f3cee927, LH-QS-4-05) |
+| `QS-4-AC6` | Filter on engine Trino and a minimum of 5 seconds | Only Trino runs of 5 seconds or more | Pass (2026-11-04, f3cee927, LH-QS-4-06) |
+| `QS-4-AC7` | Click a run | Its SQL opens in a new Query Studio tab with its engine | Pass (2026-11-04, f3cee927, LH-QS-4-07) |
+| `QS-4-AC8` | In the editor, expand a Bronze table in the schema browser and click it; type its alias and a dot | The name is inserted and its columns are suggested | Pass (2026-11-13, 8b9c297c, LH-QS-4-08) |
 
-**Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
+**Acceptor** (not the Owner): product owner (recorded in the base) **Date:** 2026-11-14 **Build:** 240d2e62
 
 Exceptions, each with an owner and a date:
+
+- `LH-QS-4-02`, owner 2026-11-14: Minor, the side-panel "Blocked" label and the Indonesian refusal text. Does not hold acceptance. The language part is `QS-14`; the rest of the finding is in `QS-11`.
 
 ## After acceptance
 
 - [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` status updated (history part), with the PR in the PR column; follow-ups added
-- [ ] `BACKLOG.md` Dates has the Shipped date
-- [ ] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base
+- [x] `BACKLOG.md` status updated (history part), with the PR in the PR column; follow-ups added
+- [x] `BACKLOG.md` Dates has the Shipped date
+- [x] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base (done by the auditor)
 - [ ] `CHANGELOG.md` entry a customer can read
 
 ## QA-1 decisions (product owner, 2026-11-02)

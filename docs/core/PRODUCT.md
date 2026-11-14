@@ -145,7 +145,7 @@ hands-on testing.
 
 | Capability | Ours | Competitors | Gap |
 | --- | --- | --- | --- |
-| SQL editor, saved queries, result download | **Partial.** Autocomplete knows table names only; 2,000 rows shown; saved queries cannot be edited or shared; downloads are a browser CSV | Yes: Databricks shows 64,000 rows and downloads up to 5 GB | `QS-1` to `QS-4` |
+| SQL editor, saved queries, result download | **Partial.** The schema browser and autocomplete list the tables the catalog shows, with their columns; several statements per tab, each with its own result tab; up to 64,000 rows or 10 MB shown, with filters and column statistics; a full download of up to 5 GB as CSV, TSV, Excel or Parquet, on ClickHouse only; saved queries in folders, shared at three levels, with 15 versions and a 30-day trash; a History page of your own runs for 14 days; `{{name}}` parameters. Not yet: a dashboard cannot drive a query's parameters; a Trino tab has no estimate and no download | Yes: Databricks shows 64,000 rows and downloads up to 5 GB | `QS-5` part 2; `QS-10` to `QS-12` |
 | Ask in plain language, get SQL | **Partial.** The chat's SQL runs inside the user's permissions with masking and row filters. It learns what a table means from the source's registry and from drafted descriptions a person can correct in Data Explorer's Schema tab. | Yes, inside the user's permissions | `AI-16` |
 | Scale out across servers | **Missing.** One server | Yes: elastic | Wanted later (product owner, 2026-11-04; `OPS-3`) |
 | Query other systems in place, without loading | **Missing** | Yes | Yes |
@@ -365,7 +365,7 @@ an order in its roadmap phase.
 | Dashboards | Filters, time grain, calculated fields, tables and KPIs first (`BI-18`, `BI-9`, `BI-8`, `BI-16`); then the builder, joins, metrics, formatting, layout, reports and sharing | The gaps a Metabase user hits on day one |
 | Assistant for dashboards | `AI-1`, `AI-12`, `AI-15` now; each other `AI-` item ships with its BI item | Agentic-first: what a user can click, they can ask for (`AGENTS.md`) |
 | Data | Fix and test every connector (`SRC-6`, `SRC-9`), failure alerts and schema changes (`SRC-7`, `SRC-8`), then the catalog (`DATA-11` to `DATA-16`) and upload depth (`DATA-17` to `DATA-19`) | Make what we advertise work before adding more |
-| Query Studio | Its security fixes (`SEC-19` to `SEC-21`), then editor, results, saved queries and history (`QS-1` to `QS-4`) | Every SQL user expects these |
+| Query Studio | Its security fixes (`SEC-19` to `SEC-21`); ~~editor, results, saved queries and history (`QS-1` to `QS-4`)~~ accepted 2026-11-14 | Every SQL user expects these |
 | Security and platform | `SEC-12`, `SEC-16` to `SEC-18`, single sign-on (`SEC-3`), audit coverage (`GOV-1`), row filters (`VER-1`), table cleanup (`OPS-1`), usage view (`OPS-8`) | Found in every evaluation |
 | Pipelines | Pipelines built from steps: SQL steps first, then joins and aggregations as forms (`BLD-1`) | Today a pipeline reads one table and has five operations; anything else needs SQL written outside the builder |
 
@@ -375,7 +375,7 @@ an order in its roadmap phase.
 | --- | --- |
 | Run on several servers | A stated goal; larger work |
 | Business-app connectors, the rest (`SRC-3` follow-ups `SRC-26` to `SRC-31`): the second wave by customer demand, real-account tests | The first ten are built in #216 (eight supported); the second wave of about 45 waits for demand |
-| Parameters, snippets and charts from SQL results (`QS-5`) | The bridge from Query Studio to dashboards, after the basics |
+| Snippets, charts from SQL results, and dashboard filters and dropdowns from parameters (`QS-5` part 2 and later) | The bridge from Query Studio to dashboards, after the basics. Part 1 (parameters in SQL) accepted 2026-11-14 |
 | Instant copies of a table; self-refreshing tables | Expected by Snowflake users |
 | Open-first Gold: store curated data in Iceberg, serve from a fast copy | Removes publishing entirely; needs a fresh measurement |
 | Import dashboards from other BI tools | Eases switching |
