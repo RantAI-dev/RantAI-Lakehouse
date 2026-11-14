@@ -165,7 +165,46 @@ so they ride along (feature page L5):
 
 ## 5. Review
 
-(planner)
+### Review, round 1 (planner, Opus, 2026-11-14, with the owner's QA)
+
+The planner re-ran, each under `systemd-run --user --scope -p MemoryMax=3G`:
+- `bun run typecheck`: OK;
+- `bun run lint`: 0 errors, the 11 existing warnings;
+- `bun test chart-builder-layout.test.tsx chart-builder.test.tsx chart-builder-page.test.tsx`: 80 pass, 0 fail.
+
+The code follows the plan. The owner's QA on the preview (port 28620) found these. The general
+rules they come from are now in `/home/hv/mtharreq/DESIGN.md` §3, "Form dan panel pengaturan
+rapi dan lega".
+
+- **SHOULD-FIX 1, the inspector tabs are cramped.**
+  - Data / Sort & filter / Style touch the panel's edges and each other, with no breathing
+    room. The inactive "Style" also reads as disabled.
+  - Give the tab row inner padding from the panel edge and real gaps.
+  - Make inactive tabs readable (muted, not greyed out like a disabled control), with a clear
+    active state.
+- **SHOULD-FIX 2, controls in the inspector are full width and uniform.**
+  - "On click" is a narrow select while "Freshness" is full width.
+  - Every select and input in the inspector spans the panel's content width, unless two
+    belong together on one row. Value plus aggregate stays a pair, as today, with matching
+    widths.
+- **SHOULD-FIX 3, the Style tab.** It still carries the old format section's look:
+  - Bordered fieldsets ("Values", "Dates", "Colours", "Axes") make boxes inside the panel.
+    Replace them with small group headings and spacing, no borders.
+  - Fields are labelled only by placeholders, and they are cut off ("Decima…", "Prefix",
+    "Suffix", "Series name", "X title"). Give every field a visible label above it, and no
+    placeholder that is cut off.
+  - The thousands toggle is labelled "1,000". Make it "Thousands separator".
+  - The "Short names" and "Colour by value" toggles get a label that says what they do.
+  - Uneven widths: "As it is now" and "Time as is" selects of different sizes. Make them
+    full width per SHOULD-FIX 2.
+  - Defaults read oddly ("As it is now", "Time as is"). Use "Automatic" where it means the
+    chart's own default, consistently.
+- **Open for the owner (L4):** at 1366 px the data panel is folded into a button. The owner has
+  not answered yet whether it stays folded or shows inline. Leave it as built until they decide.
+
+No `BLOCKER`. Fix SHOULD-FIX 1–3, cite "BI-58 review round 1" at the fix sites and in the
+commit, re-take the affected screenshots (the Style tab and the inspector at 1366×900, light
+and dark), and hand off again.
 
 ## 6. Handoff
 
