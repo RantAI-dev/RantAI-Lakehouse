@@ -28,6 +28,12 @@ describe("AppShellSkeleton", () => {
     shell("/dashboards/browse")
     expect(screen.getByText("RantAI Lakehouse")).toBeTruthy()
     expect(screen.queryByText("Enterprise Lakehouse Console")).toBeNull()
+    // The brand row is the real one: the mark first, in its own slot, then the name, left-aligned.
+    const logo = screen.getByRole("img", { name: "RantAI Lakehouse", hidden: true })
+    const row = screen.getByText("RantAI Lakehouse").closest("div.flex")
+    expect(row?.className).toContain("justify-start")
+    expect(row?.firstElementChild?.contains(logo)).toBe(true)
+    expect(row?.firstElementChild?.className).toContain("size-8")
     expect(screen.getByLabelText("Open command palette")).toBeTruthy()
     expect(document.querySelector("[data-slot='sidebar-trigger']")).not.toBeNull()
   })
