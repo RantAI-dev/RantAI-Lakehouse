@@ -5,7 +5,7 @@ import { createPortal } from "react-dom"
 import Image from "next/image"
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
-import { CircleUserRound, ChevronRight, ChevronsUpDown } from "lucide-react"
+import { ChevronDown, ChevronRight } from "lucide-react"
 import { useAuth } from "@/features/auth/auth-provider"
 import { rememberTableHref } from "@/hooks/use-table-memory"
 import {
@@ -46,14 +46,19 @@ export const SIDEBAR_CONTENT_CLASS = "min-w-0"
 export const SIDEBAR_GROUP_CLASS = "gap-0 px-2 py-2"
 export const SIDEBAR_MENU_CLASS = "mt-0 flex flex-col gap-0.5"
 export const SIDEBAR_FOOTER_CLASS = "border-t border-sidebar-border p-2"
-// Collapsed, the card is the avatar alone, 32 px on the icon column; the box narrows, its padding
-// eases to none and the avatar with it, in the sidebar's time.
-export const ACCOUNT_CARD_CLASS = "h-14 rounded-lg px-2 group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:p-0!"
-export const ACCOUNT_AVATAR_CLASS = cn(
-  "flex size-9 shrink-0 items-center justify-center rounded-full bg-primary/12 text-primary ring-1 ring-primary/20 transition-[width,height]",
-  SIDEBAR_MOTION,
-  "group-data-[collapsible=icon]:size-8",
-)
+// One compact row (Claude's footer): a 24 px avatar, the name and role, a chevron, 32 px tall.
+// Collapsed, it is the avatar alone, centred in the 32 px icon column.
+export const ACCOUNT_CARD_CLASS = "h-8 gap-2 rounded-lg px-1.5 group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:p-0!"
+export const ACCOUNT_AVATAR_CLASS =
+  "flex size-6 shrink-0 items-center justify-center rounded-full bg-primary/12 text-[10px] font-semibold text-primary"
+
+/** Up to two initials of a display name, for the avatar (the app has no pictures for people). */
+export function initialsOf(name: string | undefined): string {
+  const words = (name ?? "").trim().split(/\s+/).filter(Boolean)
+  if (words.length === 0) return "?"
+  const letters = words.length === 1 ? [...words[0]].slice(0, 2) : [[...words[0]][0], [...words[words.length - 1]][0]]
+  return letters.join("").toUpperCase()
+}
 export const NAV_ROW_CLASS = "h-8 rounded-md px-2 py-1.5 text-sm tracking-normal"
 export const SIDEBAR_SUB_CLASS = "mr-0 gap-0.5 border-sidebar-border pr-0 group-data-[collapsible=icon]:flex"
 
@@ -382,23 +387,23 @@ export function AppSidebar() {
               userName={user?.name}
               userEmail={user?.email}
               onLogout={logout}
+              side={state === "collapsed" ? "right" : "top"}
+              align={state === "collapsed" ? "end" : "start"}
               trigger={
                 <SidebarMenuButton
-                  size="lg"
                   tooltip={user?.name ?? "Signed in"}
                   aria-label={`Account menu, ${user?.name ?? "signed in"}`}
                   className={cn(ACCOUNT_CARD_CLASS, "hover:bg-sidebar-accent data-[popup-open]:bg-sidebar-accent")}
                 />
               }
             >
-              <div className={ACCOUNT_AVATAR_CLASS}>
-                <CircleUserRound className="size-5" aria-hidden />
-              </div>
-              <div className={cn("grid min-w-0 flex-1 whitespace-nowrap text-left leading-tight", SIDEBAR_FADE)}>
-                <span className="truncate text-sm font-semibold text-sidebar-foreground">{user?.name ?? "Signed in"}</span>
-                <span className="truncate text-xs text-sidebar-foreground/60">{user?.email ?? ""}</span>
-              </div>
-              <ChevronsUpDown className={cn("ml-auto size-4 shrink-0 text-sidebar-foreground/60", SIDEBAR_FADE)} aria-hidden />
+              <div className={ACCOUNT_AVATAR_CLASS} aria-hidden>{initialsOf(user?.name)}</div>
+              {/* The name, then the person's first role (from the session; nothing is shown without one). */}
+              <span className={cn("min-w-0 flex-1 truncate whitespace-nowrap text-left text-sm font-medium text-sidebar-foreground", SIDEBAR_FADE)}>
+                {user?.name ?? "Signed in"}
+                {user?.roles?.[0] ? <span className="font-normal text-sidebar-foreground/60"> · {user.roles[0]}</span> : null}
+              </span>
+              <ChevronDown className={cn("ml-auto size-4 shrink-0 text-sidebar-foreground/60", SIDEBAR_FADE)} aria-hidden />
             </UserMenu>
           </SidebarMenuItem>
         </SidebarMenu>

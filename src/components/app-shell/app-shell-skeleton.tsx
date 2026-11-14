@@ -1,6 +1,6 @@
 "use client";
 
-import { Bell, ChevronsUpDown, CircleUserRound } from "lucide-react";
+import { Bell, ChevronDown } from "lucide-react";
 import {
   Sidebar,
   SidebarContent,
@@ -23,7 +23,6 @@ import { DashboardListPageSkeleton } from "@/features/dashboards/dashboard-list-
 import { useSidebarGroups } from "@/hooks/use-sidebar-groups";
 import { cn } from "@/lib/utils";
 import {
-  ACCOUNT_AVATAR_CLASS,
   ACCOUNT_CARD_CLASS,
   NAV_ROW_CLASS,
   SIDEBAR_CLASS,
@@ -74,16 +73,13 @@ export function AppShellSkeleton({ pathname }: { pathname: string }) {
         <SidebarFooter className={SIDEBAR_FOOTER_CLASS} aria-hidden>
           <SidebarMenu>
             <SidebarMenuItem>
-              {/* The account card's box; the avatar glyph is the same for everyone. */}
-              <SidebarMenuButton size="lg" render={<div />} className={cn(ACCOUNT_CARD_CLASS, "hover:bg-transparent active:bg-transparent")}>
-                <div className={ACCOUNT_AVATAR_CLASS}>
-                  <CircleUserRound className="size-5" aria-hidden />
-                </div>
-                <div className={cn("grid min-w-0 flex-1 gap-1.5", SIDEBAR_FADE)}>
+              {/* The account row's box: an avatar circle and one name bar, as tall as the real row. */}
+              <SidebarMenuButton render={<div />} className={cn(ACCOUNT_CARD_CLASS, "hover:bg-transparent active:bg-transparent")}>
+                <Skeleton className="size-6 shrink-0 rounded-full" />
+                <div className={cn("min-w-0 flex-1", SIDEBAR_FADE)}>
                   <Skeleton className="h-3.5 w-24" />
-                  <Skeleton className="h-3 w-36" />
                 </div>
-                <ChevronsUpDown className={cn("ml-auto size-4 shrink-0 text-sidebar-foreground/60", SIDEBAR_FADE)} aria-hidden />
+                <ChevronDown className={cn("ml-auto size-4 shrink-0 text-sidebar-foreground/60", SIDEBAR_FADE)} aria-hidden />
               </SidebarMenuButton>
             </SidebarMenuItem>
           </SidebarMenu>
