@@ -202,6 +202,16 @@ rapi dan lega".
 - **Open for the owner (L4):** at 1366 px the data panel is folded into a button. The owner has
   not answered yet whether it stays folded or shows inline. Leave it as built until they decide.
 
+- **SHOULD-FIX 4 (owner, added during the round):** remove the header's Cancel. The back arrow
+  and Esc leave, with a "Discard changes?" confirm after a change (DESIGN.md "Satu aksi, satu
+  tombol").
+- **SHOULD-FIX 5 (owner, added during the round):**
+  - Merge "Add to" into the breadcrumb as a dashboard picker, so the header is only
+    "← [dashboard ⌄] / New chart" and Save.
+  - Move the width to the Style tab as "Size on dashboard": two pictures, "Half row" and
+    "Full row". The owner did not understand "Half width / Full width".
+  - The owner confirmed that SHOULD-FIX 2 means every inspector control is full width.
+
 No `BLOCKER`. Fix SHOULD-FIX 1–3, cite "BI-58 review round 1" at the fix sites and in the
 commit, re-take the affected screenshots (the Style tab and the inspector at 1366×900, light
 and dark), and hand off again.
