@@ -15,7 +15,7 @@ function renderMenu(over: Partial<React.ComponentProps<typeof DashboardActionsMe
     ...over,
   }
   render(<DashboardActionsMenu {...props} />)
-  fireEvent.click(screen.getByRole("button", { name: "More actions" }))
+  fireEvent.click(screen.getByRole("button", { name: "Dashboard settings" }))
 }
 
 /** BI-61 T2: the intervals and the exports are submenus; their entries show once the submenu opens. */

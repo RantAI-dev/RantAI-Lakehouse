@@ -91,7 +91,7 @@ function ParamField({ control, refusal, onChange, changed }: {
           ) : (
             <Input
               id={id}
-              className="h-9 w-full"
+              className="w-full"
               type={param.type === "number" ? "number" : param.type === "date" ? "date" : "text"}
               value={typed}
               min={param.type === "number" || param.type === "date" ? param.min : undefined}

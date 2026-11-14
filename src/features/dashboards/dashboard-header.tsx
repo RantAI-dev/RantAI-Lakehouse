@@ -4,8 +4,10 @@
  * The header of the page that shows one dashboard (`BI-61`, layout A of the
  * 2026-11-14 mockups, "Focused reader"): a breadcrumb, the title with its
  * star, one quiet line of facts, and on the right the few controls a reader
- * needs. Reading mode shows at most three (spec T1): Edit (a pencil, for
- * writers), Share (the one primary button) and ⋯. Everything else the old
+ * needs. Reading mode shows at most three (spec T1), left to right: Edit (a
+ * pencil, for writers), the dashboard's settings (a gear, the grouped menu)
+ * and Share, the one primary button, last (BI-61 review round 1, SHOULD-FIX
+ * 10). Everything else the old
  * header carried moved: Comments to the facts line, Parameters and New chart
  * to edit mode, and Stop to the facts line while the tiles load.
  */
@@ -23,8 +25,9 @@ export const EASE = "transition-[background-color,border-color,color,box-shadow,
 export const FOCUS = "outline-none focus-visible:ring-3 focus-visible:ring-ring/50";
 
 /**
- * A 36 px icon button with its name as the tooltip, for the header (the
- * console's `Button`, ghost, so it reads as quiet beside Share).
+ * An icon button with its name as the tooltip, for the header (the console's
+ * `Button`, ghost, so it reads as quiet beside Share), at the console's
+ * default 32 px like every other page (BI-61 review round 1, SHOULD-FIX 9).
  */
 export function HeaderIconButton({
   label, onClick, children, className, disabled,
@@ -39,7 +42,7 @@ export function HeaderIconButton({
     <Tooltip>
       <TooltipTrigger
         render={
-          <Button variant="ghost" size="icon-lg" aria-label={label} onClick={onClick} disabled={disabled}
+          <Button variant="ghost" size="icon" aria-label={label} onClick={onClick} disabled={disabled}
             className={cn("text-muted-foreground hover:text-foreground active:scale-95", EASE, className)} />
         }
       >
@@ -83,7 +86,7 @@ export function ShareButton({
       <Tooltip>
         {/* The wrapper carries the hover: a disabled button takes no pointer events. */}
         <TooltipTrigger render={<span className="inline-flex" tabIndex={0} />}>
-          <Button size="lg" disabled aria-label="Share">
+          <Button disabled aria-label="Share">
             <Share2 data-icon="inline-start" aria-hidden /> Share
           </Button>
         </TooltipTrigger>
@@ -93,7 +96,7 @@ export function ShareButton({
   }
   if (!canManage) return null;
   return (
-    <Button size="lg" onClick={onShare} className={cn("active:scale-[0.98]", EASE)}>
+    <Button onClick={onShare} className={cn("active:scale-[0.98]", EASE)}>
       <Share2 data-icon="inline-start" aria-hidden /> Share
     </Button>
   );

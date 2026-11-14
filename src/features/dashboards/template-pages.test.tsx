@@ -158,7 +158,7 @@ describe("Save as template in the dashboard's menu", () => {
   it("is offered to a writer on a saved dashboard", async () => {
     let opened = false
     render(<DashboardActionsMenu {...base} onSaveTemplate={() => { opened = true }} />)
-    fireEvent.click(screen.getByRole("button", { name: "More actions" }))
+    fireEvent.click(screen.getByRole("button", { name: "Dashboard settings" }))
     fireEvent.click(await screen.findByText("Save as template…"))
     expect(opened).toBe(true)
   })
@@ -172,7 +172,7 @@ describe("Save as template in the dashboard's menu", () => {
       { canDownload: false, onSaveTemplate: () => {} },
     ]) {
       render(<DashboardActionsMenu {...base} {...over} />)
-      fireEvent.click(screen.getByRole("button", { name: "More actions" }))
+      fireEvent.click(screen.getByRole("button", { name: "Dashboard settings" }))
       await screen.findByText("Print…")
       expect(screen.queryByText("Save as template…")).toBeNull()
       cleanup()

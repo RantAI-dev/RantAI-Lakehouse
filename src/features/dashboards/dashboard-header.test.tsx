@@ -76,18 +76,23 @@ function mount({ permissions, level, charts = [], results = {}, extra = {} }: { 
 const actions = () => document.querySelector("[data-slot='dashboard-header-actions']") as HTMLElement
 
 describe("the dashboard header (BI-61 T1)", () => {
-  it("shows Edit, Share and ⋯ only, to someone who manages the dashboard", async () => {
+  it("shows Edit, the settings menu and Share, in that order, to someone who manages the dashboard (review round 1, SHOULD-FIX 10)", async () => {
     mount({ permissions: ["dashboard:read", "dashboard:write"], level: "manage" })
     await screen.findByText("Quarterly Sales")
     await waitFor(() => expect(within(actions()).getAllByRole("button").map((b) => b.getAttribute("aria-label") ?? b.textContent?.trim()))
-      .toEqual(["Edit layout", "Share", "More actions"]))
+      .toEqual(["Edit layout", "Dashboard settings", "Share"]))
+    // BI-61 review round 1, SHOULD-FIX 9: the console's default 32 px, like every other page header.
+    for (const b of within(actions()).getAllByRole("button")) {
+      expect(b.className).toMatch(/(^|\s)(h-8|size-8)(\s|$)/)
+      expect(b.className).not.toMatch(/(^|\s)(h-9|size-9)(\s|$)/)
+    }
   })
 
-  it("shows only ⋯ to a reader who may neither edit nor share", async () => {
+  it("shows only the settings menu to a reader who may neither edit nor share", async () => {
     mount({ permissions: ["dashboard:read"], level: "view" })
     await screen.findByText("Quarterly Sales")
     await waitFor(() => expect(within(actions()).getAllByRole("button").map((b) => b.getAttribute("aria-label")))
-      .toEqual(["More actions"]))
+      .toEqual(["Dashboard settings"]))
   })
 
   it("names the folder in the breadcrumb, and the owner, the update and the comments in the facts line", async () => {
@@ -115,7 +120,7 @@ describe("edit mode (BI-61 T5)", () => {
     expect(screen.getByRole("button", { name: "Edit phone layout" })).toBeTruthy()
     fireEvent.click(within(actions()).getByRole("button", { name: "Done" }))
     await waitFor(() => expect(within(actions()).getAllByRole("button").map((b) => b.getAttribute("aria-label") ?? b.textContent?.trim()))
-      .toEqual(["Edit layout", "Share", "More actions"]))
+      .toEqual(["Edit layout", "Dashboard settings", "Share"]))
     expect(screen.queryByText(/^Drag tiles to move/)).toBeNull()
     expect(screen.queryByRole("button", { name: "Parameters" })).toBeNull()
   })

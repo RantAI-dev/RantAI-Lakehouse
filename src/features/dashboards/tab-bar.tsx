@@ -76,7 +76,7 @@ export function TabBar({
               role="tab"
               aria-selected={active}
               className={cn(
-                "relative h-9 rounded-sm text-sm font-medium whitespace-nowrap outline-none focus-visible:ring-3 focus-visible:ring-ring/50",
+                "relative h-8 rounded-sm text-sm font-medium whitespace-nowrap outline-none focus-visible:ring-3 focus-visible:ring-ring/50",
                 "transition-colors duration-200 ease-[cubic-bezier(0.2,0,0,1)]",
                 active ? "text-foreground" : "text-muted-foreground hover:text-foreground",
               )}

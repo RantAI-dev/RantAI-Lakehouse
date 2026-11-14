@@ -1475,7 +1475,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         actions={
           <>
             {fullscreen ? (
-              <Button variant="outline" size="lg" aria-pressed={fsDark} onClick={toggleFsDark}>
+              <Button variant="outline" aria-pressed={fsDark} onClick={toggleFsDark}>
                 <Moon className="size-4" /> Dark
               </Button>
             ) : null}
@@ -1483,14 +1483,13 @@ export function DashboardPage({ boardId }: { boardId: string }) {
               // BI-61 T5: edit mode's own two controls; Done is the one way back (one action, one button).
               <>
                 <NewChartButton canWrite={canWrite} onClick={() => router.push(chartNewHref(board, data?.appliedParams))} />
-                <Button variant="outline" size="lg" className="min-w-20" onClick={() => setEdit(false)}>
+                <Button variant="outline" className="min-w-20" onClick={() => setEdit(false)}>
                   <Check data-icon="inline-start" aria-hidden /> Done
                 </Button>
               </>
             ) : (
               <>
                 <EditPencil canWrite={canWrite} onEdit={() => setEdit(true)} />
-                <ShareButton isDefault={isDefault} isPrivate={Boolean(ownerId)} canManage={canManage} onShare={() => setShareOpen(true)} />
                 <DashboardActionsMenu
                   isDefault={isDefault}
                   canWrite={canWrite}
@@ -1520,6 +1519,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
                   onDuplicate={() => void duplicateDashboard()}
                   onDelete={() => void deleteDashboard()}
                 />
+                {/* BI-61 review round 1, SHOULD-FIX 10: Share, the primary, last, as New is on the Dashboards page. */}
+                <ShareButton isDefault={isDefault} isPrivate={Boolean(ownerId)} canManage={canManage} onShare={() => setShareOpen(true)} />
               </>
             )}
           </>
