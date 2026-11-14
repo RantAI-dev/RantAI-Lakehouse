@@ -460,6 +460,12 @@ describe("ChartBuilder zones (BI-58 T1)", () => {
     expect(zones[1]!.querySelector('section[aria-label="Preview"]')).not.toBeNull()
     expect(zones[2]!.querySelector('[aria-label="Aggregation of visitors"]')).not.toBeNull()
     expect(document.querySelector('[data-slot="resizable-handle"]')).toBeNull()
+    // BI-58 review round 2, SHOULD-FIX 7 (owner): the canvas toolbar and the tab row share one height
+    // (44 px), so their dividers are one line where they sit side by side (measured at 1366x900 and
+    // 1190x800 on the preview: both bottoms at 180 px).
+    const toolbar = document.querySelector("[data-slot=canvas-toolbar]") as HTMLElement
+    expect(toolbar.className).toContain("@3xl:h-11")
+    expect(screen.getByRole("tablist").className).toContain("h-11")
   })
 })
 
