@@ -88,6 +88,20 @@ const EASE =
   "transition-[background-color,border-color,color,box-shadow,opacity,transform] duration-200 ease-[cubic-bezier(0.2,0,0,1)]";
 
 /**
+ * The Sign in button in the logo's navy (`WEB-15` T4, owner 2026-11-14):
+ * `#050A2F` with white text on the light page (about 19:1), a shade lighter
+ * on hover. On the dark page a navy button would sink into the background,
+ * so it turns over like the logo's dark variant: near-white with navy text,
+ * pure white on hover. The focus ring stands off the button by the page's
+ * own colour so it reads against the navy as well as the white page. While
+ * signing in the button is disabled but keeps its colours (the console's
+ * button would fade to half), since the spinner already says it is busy.
+ * This page only: the console's primary colour and tokens are unchanged.
+ */
+const SIGN_IN_COLOURS =
+  "bg-[#050A2F] text-white hover:bg-[#161D4A] focus-visible:border-transparent focus-visible:ring-2 focus-visible:ring-[#050A2F]/45 focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:opacity-100 dark:bg-[#F1F4F9] dark:text-[#050A2F] dark:hover:bg-white dark:focus-visible:ring-white/55";
+
+/**
  * Whether an SSO button should render at all.
  *
  * The frontend has no way to read the Rust service's `OIDC_ISSUER` /
@@ -506,7 +520,7 @@ export function LoginPage() {
                   <Button
                     type="submit"
                     size="lg"
-                    className={cn("h-11 w-full rounded-lg text-sm", EASE)}
+                    className={cn("h-11 w-full rounded-lg text-sm", SIGN_IN_COLOURS, EASE)}
                     disabled={submitting}
                   >
                     {submitting ? <Spinner /> : null}
