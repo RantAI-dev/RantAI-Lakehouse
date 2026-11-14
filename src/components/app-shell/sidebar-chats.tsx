@@ -14,7 +14,6 @@ import {
   SIDEBAR_FADE,
   useSidebar,
 } from "@/components/ui/sidebar"
-import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
 import { useAuth } from "@/features/auth/auth-provider"
 import { SessionActionsMenu } from "@/features/copilot/session-parts"
@@ -24,7 +23,8 @@ import { useDebouncedCallback } from "@/hooks/use-debounced-callback"
 import { useScrollFade } from "@/hooks/use-scroll-fade"
 import { groupSessions } from "@/lib/copilot-sessions"
 import { cn } from "@/lib/utils"
-import { NAV_ROW_CLASS, SIDEBAR_GROUP_CLASS, SIDEBAR_MENU_CLASS, navRowClass } from "./sidebar-classes"
+import { ChatListSkeleton } from "./chat-list-skeleton"
+import { SIDEBAR_GROUP_CLASS, SIDEBAR_MENU_CLASS, navRowClass } from "./sidebar-classes"
 
 /** Where "AI settings" goes: the Assistant section of Settings (`ADM-9`). */
 export const AI_SETTINGS_HREF = "/admin/settings?section=assistant"
@@ -332,30 +332,5 @@ export function SidebarChats({
         )}
       </div>
     </>
-  )
-}
-
-/** Title bars' widths, in the order the rows take them: varied, like real titles, and fixed so the skeleton never shifts. */
-const SKELETON_TITLES = ["78%", "62%", "85%", "54%", "70%", "66%", "80%", "58%"]
-
-/**
- * The chat list while it loads: a day's label and title rows, the shape the
- * list lands in. The loading shell draws the same rows on `/copilot`
- * (`AppShellSkeleton`), so a refresh shows one loading look, not two.
- */
-export function ChatListSkeleton({ rows = SKELETON_TITLES.length }: { readonly rows?: number }) {
-  return (
-    <div aria-hidden className="pt-1">
-      <div className="flex h-5 items-center px-2 pb-1">
-        <Skeleton className="h-2.5 w-12" />
-      </div>
-      <div className={SIDEBAR_MENU_CLASS}>
-        {SKELETON_TITLES.slice(0, rows).map((w, i) => (
-          <div key={i} className={cn(NAV_ROW_CLASS, "flex items-center")}>
-            <Skeleton className="h-3" style={{ width: w }} />
-          </div>
-        ))}
-      </div>
-    </div>
   )
 }
