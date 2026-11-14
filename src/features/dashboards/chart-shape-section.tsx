@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { RowsTable } from "@/components/patterns/rows-table";
+import { formatLocaleNumber } from "@/lib/format";
 import { filterLabel, isActiveFilter } from "@/lib/dashboard-filter-state";
 import {
   MEASURE_AGGREGATES, MAX_GROUPINGS, MAX_STEPS, columnsAfterSteps, isMetricColumn, storedAggregate, visibleColumns,
@@ -73,14 +74,30 @@ export function MeasureRows({
     <div className="grid gap-2">
       {rows.map((row, i) => (
         <div key={i} className="grid gap-1.5">
-          <Label>{labels(i)} {i < min ? <span aria-hidden className="text-destructive">*</span> : null}</Label>
-          <div className="flex items-center gap-1.5">
+          {/* `BI-58` T5: the move and remove buttons sit on the label's line, so in the narrow inspector
+              the column picker keeps the row's width with its aggregate. */}
+          <div className="flex min-h-6 items-center gap-1">
+            <Label className="mr-auto">{labels(i)} {i < min ? <span aria-hidden className="text-destructive">*</span> : null}</Label>
+            {flexible ? (
+              <>
+                {rows.length > 1 ? (
+                  <>
+                    <Button type="button" size="icon-xs" variant="ghost" aria-label={`Move measure ${i + 1} up`} disabled={i === 0} onClick={() => onChange(moveItem(rows, i, -1))}><ArrowUp /></Button>
+                    <Button type="button" size="icon-xs" variant="ghost" aria-label={`Move measure ${i + 1} down`} disabled={i === rows.length - 1} onClick={() => onChange(moveItem(rows, i, 1))}><ArrowDown /></Button>
+                  </>
+                ) : null}
+                <Button type="button" size="icon-xs" variant="ghost" aria-label={`Remove measure ${i + 1}`} disabled={rows.length <= min} onClick={() => onChange(rows.filter((_, j) => j !== i))}><X /></Button>
+              </>
+            ) : null}
+          </div>
+          {/* BI-58 review round 1 (SHOULD-FIX 2): the column and its aggregate are a pair of matching widths. */}
+          <div className={(own || onDefaultAggregate || fixedNote) && !isMetricColumn(row.column) && !wholeMeasure.has(row.column) ? "grid grid-cols-2 items-center gap-1.5" : "grid grid-cols-[minmax(0,1fr)] gap-1.5"}>
             <Select value={row.column} items={columnItems(columns, fieldLabel, row.column)} onValueChange={(v) => set(i, { column: v ?? "" })} disabled={disabled}>
-              <SelectTrigger className="w-full min-w-0 flex-1" aria-label={labels(i)} title={row.column ? displayColumnFull(row.column) : undefined}><SelectValue placeholder={placeholder} /></SelectTrigger>
+              <SelectTrigger className="w-full min-w-0" aria-label={labels(i)} title={row.column ? displayColumnFull(row.column) : undefined}><SelectValue placeholder={placeholder} /></SelectTrigger>
               <SelectContent>{columns.map((m) => <SelectItem key={m} value={m}>{fieldLabel(m)}</SelectItem>)}</SelectContent>
             </Select>
             {fixedNote ? (
-              <span className="shrink-0 text-xs text-muted-foreground">{fixedNote}</span>
+              <span className="text-xs text-muted-foreground">{fixedNote}</span>
             ) : (own || onDefaultAggregate) && !isMetricColumn(row.column) && !wholeMeasure.has(row.column) ? (
               <Select
                 value={row.aggregate || defaultAggregate}
@@ -92,18 +109,11 @@ export function MeasureRows({
                 }}
                 disabled={disabled}
               >
-                <SelectTrigger className="w-28 shrink-0" aria-label={`Aggregation of ${row.column || labels(i)}`}><SelectValue /></SelectTrigger>
+                <SelectTrigger className="w-full min-w-0" aria-label={`Aggregation of ${row.column || labels(i)}`}><SelectValue /></SelectTrigger>
                 <SelectContent>
                   {MEASURE_AGGREGATES.map((a) => <SelectItem key={a} value={a}>{a}</SelectItem>)}
                 </SelectContent>
               </Select>
-            ) : null}
-            {flexible ? (
-              <>
-                <Button type="button" size="icon-xs" variant="ghost" aria-label={`Move measure ${i + 1} up`} disabled={i === 0} onClick={() => onChange(moveItem(rows, i, -1))}><ArrowUp /></Button>
-                <Button type="button" size="icon-xs" variant="ghost" aria-label={`Move measure ${i + 1} down`} disabled={i === rows.length - 1} onClick={() => onChange(moveItem(rows, i, 1))}><ArrowDown /></Button>
-                <Button type="button" size="icon-xs" variant="ghost" aria-label={`Remove measure ${i + 1}`} disabled={rows.length <= min} onClick={() => onChange(rows.filter((_, j) => j !== i))}><X /></Button>
-              </>
             ) : null}
           </div>
         </div>
@@ -111,7 +121,7 @@ export function MeasureRows({
       {flexible && rows.length < max ? (
         <div>
           <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" disabled={disabled} onClick={() => onChange([...rows, { column: "", aggregate: "" }])}>
-            <Plus className="size-3" aria-hidden /> Add measure
+            <Plus className="size-3" aria-hidden /> Add value
           </Button>
         </div>
       ) : null}
@@ -133,7 +143,7 @@ function FilterEditor({ kind, ...props }: EditorProps & { kind: string }) {
  * dashboard filter can only narrow them further.
  */
 export function ChartFilters({
-  value, onChange, columns, disabled, segments = [], source,
+  value, onChange, columns, disabled, segments = [], source, startWith,
 }: {
   readonly value: readonly FilterDef[];
   readonly onChange: (next: FilterDef[]) => void;
@@ -147,9 +157,17 @@ export function ChartFilters({
    * from every mart that happens to have the column.
    */
   readonly source: OwnSource;
+  /**
+   * `BI-58` T2: "Use as filter" in the data panel opens a new filter on that column here; `n`
+   * changes on each request, so asking for the same column twice opens it twice.
+   */
+  readonly startWith?: { column: string; n: number } | null;
 }) {
   // `null`: nothing open; a column: a new filter on it; a number: editing that one.
   const [open, setOpen] = React.useState<{ column: string } | { index: number } | null>(null);
+  React.useEffect(() => {
+    if (startWith?.column) setOpen({ column: startWith.column });
+  }, [startWith?.column, startWith?.n]);
   const kindOf = (column: string) => columns.find((c) => c.name === column)?.kind ?? "text";
   const unused = columns.filter((c) => !value.some((f) => !f.segment && f.column === c.name));
   const others = (column: string) => value.filter((f) => !f.segment && f.column !== column && isActiveFilter(f));
@@ -183,7 +201,8 @@ export function ChartFilters({
         </Select>
       ) : null}
       {open ? (
-        <div className="rounded-md border border-border p-2.5" aria-label={`Filter on ${column}`}>
+        // BI-58 review round 1 (SHOULD-FIX 3): set apart by a soft fill, not a box border.
+        <div className="rounded-lg bg-muted/40 p-3" aria-label={`Filter on ${column}`}>
           <p className="pb-2 text-xs font-medium text-muted-foreground">{column}</p>
           <FilterEditor
             board="" column={column} others={others(column)} kind={kindOf(column)} source={source}
@@ -299,25 +318,31 @@ function ConditionRow({
   const type = kind === "number" ? "number" : kind === "date" || kind === "datetime" ? "date" : "text";
   const ops = type === "text" ? ["eq", "ne"] : Object.keys(STEP_OPS);
   const input = (v: string | undefined, set: (v: string) => void, aria: string) => (
-    <Input type={type} step="any" value={v ?? ""} onChange={(e) => set(e.target.value)} aria-label={aria} className="min-w-28 flex-1" />
+    <Input type={type} step="any" value={v ?? ""} onChange={(e) => set(e.target.value)} aria-label={aria} className="w-full min-w-28" />
   );
+  // BI-58 review round 1 (SHOULD-FIX 2): the column spans the row (its remove button beside it),
+  // and the comparison and its value(s) are pairs of matching widths below it.
   return (
-    <div className="flex flex-wrap items-center gap-1.5">
-      <Select value={value.column} items={Object.fromEntries(columns.map((c) => [c, label(c)]))} onValueChange={(v) => onChange({ ...value, column: v ?? "" })}>
-        <SelectTrigger className="w-40 max-w-full shrink-0" aria-label="Condition column"><SelectValue placeholder="column" /></SelectTrigger>
-        <SelectContent>{columns.map((c) => <SelectItem key={c} value={c}>{label(c)}</SelectItem>)}</SelectContent>
-      </Select>
-      <Select value={ops.includes(value.op) ? value.op : ops[0]} items={STEP_OPS} onValueChange={(v) => onChange({ ...value, op: v ?? "eq" })}>
-        <SelectTrigger className="w-40 shrink-0" aria-label="Comparison"><SelectValue /></SelectTrigger>
-        <SelectContent>{ops.map((o) => <SelectItem key={o} value={o}>{STEP_OPS[o]}</SelectItem>)}</SelectContent>
-      </Select>
-      {value.op === "between" ? (
-        <>
-          {input(value.min, (min) => onChange({ ...value, min }), "From")}
-          {input(value.max, (max) => onChange({ ...value, max }), "To")}
-        </>
-      ) : input(value.value, (v) => onChange({ ...value, value: v }), "Value")}
-      <Button type="button" size="icon-xs" variant="ghost" aria-label="Remove condition" onClick={onRemove}><X /></Button>
+    <div className="grid grid-cols-[minmax(0,1fr)] gap-1.5">
+      <div className="flex min-w-0 items-center gap-1.5">
+        <Select value={value.column} items={Object.fromEntries(columns.map((c) => [c, label(c)]))} onValueChange={(v) => onChange({ ...value, column: v ?? "" })}>
+          <SelectTrigger className="w-full min-w-0 flex-1" aria-label="Condition column"><SelectValue placeholder="column" /></SelectTrigger>
+          <SelectContent>{columns.map((c) => <SelectItem key={c} value={c}>{label(c)}</SelectItem>)}</SelectContent>
+        </Select>
+        <Button type="button" size="icon-xs" variant="ghost" aria-label="Remove condition" onClick={onRemove}><X /></Button>
+      </div>
+      <div className={value.op === "between" ? "grid grid-cols-[minmax(0,1fr)] gap-1.5" : "grid grid-cols-2 gap-1.5"}>
+        <Select value={ops.includes(value.op) ? value.op : ops[0]} items={STEP_OPS} onValueChange={(v) => onChange({ ...value, op: v ?? "eq" })}>
+          <SelectTrigger className="w-full min-w-0" aria-label="Comparison"><SelectValue /></SelectTrigger>
+          <SelectContent>{ops.map((o) => <SelectItem key={o} value={o}>{STEP_OPS[o]}</SelectItem>)}</SelectContent>
+        </Select>
+        {value.op === "between" ? (
+          <div className="grid grid-cols-2 gap-1.5">
+            {input(value.min, (min) => onChange({ ...value, min }), "From")}
+            {input(value.max, (max) => onChange({ ...value, max }), "To")}
+          </div>
+        ) : input(value.value, (v) => onChange({ ...value, value: v }), "Value")}
+      </div>
     </div>
   );
 }
@@ -352,21 +377,23 @@ export function StepsEditor({
         const label = (c: string) => cols.labels[c] ?? c;
         const kindOf = (c: string) => (cols.measures.includes(c) ? "number" : cols.groups.find((g) => g.name === c)?.kind ?? "text");
         return (
-          <div key={i} className="grid gap-2 rounded-md border border-border p-2.5" aria-label={`Step ${i + 1}`}>
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-medium text-muted-foreground">Step {i + 1}</span>
-              <Select
-                value={step.summarise ? "summarise" : "filter"} items={STEP_TYPES}
-                onValueChange={(v) => set(i, v === "summarise" ? blankSummary(cols) : blankFilter(cols))}
-              >
-                <SelectTrigger className="h-7 w-36" aria-label={`Step ${i + 1} type`}><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="filter">Filter the result</SelectItem>
-                  <SelectItem value="summarise">Summarise again</SelectItem>
-                </SelectContent>
-              </Select>
-              <Button type="button" size="icon-xs" variant="ghost" className="ml-auto" aria-label={`Remove step ${i + 1}`} onClick={() => onChange(value.filter((_, j) => j !== i))}><X /></Button>
+          // BI-58 review round 1 (SHOULD-FIX 3): a step is set apart by a soft fill, not a box border,
+          // and its type select spans the step like every other field.
+          <div key={i} className="grid grid-cols-[minmax(0,1fr)] gap-2 rounded-lg bg-muted/40 p-3" aria-label={`Step ${i + 1}`}>
+            <div className="flex min-h-6 items-center justify-between gap-2">
+              <span className="text-xs font-medium">Step {i + 1}</span>
+              <Button type="button" size="icon-xs" variant="ghost" aria-label={`Remove step ${i + 1}`} onClick={() => onChange(value.filter((_, j) => j !== i))}><X /></Button>
             </div>
+            <Select
+              value={step.summarise ? "summarise" : "filter"} items={STEP_TYPES}
+              onValueChange={(v) => set(i, v === "summarise" ? blankSummary(cols) : blankFilter(cols))}
+            >
+              <SelectTrigger className="w-full" aria-label={`Step ${i + 1} type`}><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="filter">Filter the result</SelectItem>
+                <SelectItem value="summarise">Summarise again</SelectItem>
+              </SelectContent>
+            </Select>
             {step.summarise ? (
               <>
                 {cols.groups.length ? (
@@ -381,7 +408,7 @@ export function StepsEditor({
                 <MeasureRows
                   rows={step.summarise.measures.map((m) => ({ column: m.column, aggregate: m.aggregate }))}
                   onChange={(rows) => set(i, { summarise: { ...step.summarise!, measures: rows.map((r) => ({ column: r.column, aggregate: r.aggregate || "sum" })) } })}
-                  labels={(j) => `Measure ${j + 1}`} min={1} max={6} own columns={cols.measures} defaultAggregate="sum"
+                  labels={(j) => `Value ${j + 1}`} min={1} max={6} own columns={cols.measures} defaultAggregate="sum"
                   disabled={disabled} placeholder="pick a measure" wholeMeasure={new Set()} fieldLabel={label}
                 />
               </>
@@ -426,23 +453,25 @@ export function StepsEditor({
  * listed.
  */
 export function PreviewRowsTable({
-  data, open, labels,
+  data, open, labels, values,
 }: {
   /** Phase 2 QA R13: the headers read as the chart's table does ("total visitors", not "sum_visitors"); a joined column reads `table.column`. */
   readonly labels?: Readonly<Record<string, string>>;
   readonly data: { columns: string[]; rows: Record<string, unknown>[]; truncated: boolean; limit: number };
   readonly open: boolean;
+  /** `BI-58` T6: the value columns, whose numbers get thousands separators. */
+  readonly values?: readonly string[];
 }) {
   const columns = visibleColumns(data.columns);
   const headers = Object.fromEntries(columns.map((c) => [c, labels?.[c] ?? displayColumn(c)]));
   return (
     <details open={open} className="rounded-md border border-border text-xs">
       <summary className="cursor-pointer px-2 py-1.5 font-medium">
-        Rows ({data.rows.length.toLocaleString("en-US")}{data.truncated ? ` of more than ${data.limit.toLocaleString("en-US")}` : ""})
+        Rows ({formatLocaleNumber(data.rows.length)}{data.truncated ? ` of more than ${formatLocaleNumber(data.limit)}` : ""})
       </summary>
-      {data.truncated ? <p className="px-2 pb-1 text-muted-foreground">Only the first {data.limit.toLocaleString("en-US")} rows are shown.</p> : null}
+      {data.truncated ? <p className="px-2 pb-1 text-muted-foreground">Only the first {formatLocaleNumber(data.limit)} rows are shown.</p> : null}
       <div className="max-h-56 overflow-auto">
-        <RowsTable columns={columns} labels={headers} rows={data.rows} namePlaceholders />
+        <RowsTable columns={columns} labels={headers} rows={data.rows} namePlaceholders numberColumns={values} />
       </div>
     </details>
   );

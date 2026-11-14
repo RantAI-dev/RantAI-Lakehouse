@@ -1,7 +1,9 @@
 import { strict as assert } from "node:assert"
 import { test } from "node:test"
 import {
+  asSentence,
   formatBytes,
+  formatLocaleNumber,
   formatCompactNumber,
   formatCost,
   formatDuration,
@@ -62,4 +64,20 @@ test("formatTimeUntil untuk jadwal ingest berikutnya", () => {
   // Sudah lewat: run-nya sedang dimulai.
   assert.equal(formatTimeUntil("2026-09-30T01:00:00Z", now), "now")
   assert.equal(formatTimeUntil(null, now), "—")
+})
+
+// `BI-58` T6.
+test("formatLocaleNumber groups thousands in the browser's locale and reads a missing number as a dash", () => {
+  assert.equal(formatLocaleNumber(1571564), (1571564).toLocaleString())
+  assert.equal(formatLocaleNumber(1571564).replace(/\D/g, ""), "1571564")
+  assert.notEqual(formatLocaleNumber(1571564), "1571564")
+  assert.equal(formatLocaleNumber(null), "—")
+  assert.equal(formatLocaleNumber(Number.NaN), "—")
+})
+
+test("asSentence raises the first letter of a server's error and ends it with a full stop", () => {
+  assert.equal(asSentence("invalid or missing measure column"), "Invalid or missing measure column.")
+  assert.equal(asSentence("Preview failed."), "Preview failed.")
+  assert.equal(asSentence("  a parameter can stand for a column (not a pivot)."), "A parameter can stand for a column (not a pivot).")
+  assert.equal(asSentence(""), "")
 })

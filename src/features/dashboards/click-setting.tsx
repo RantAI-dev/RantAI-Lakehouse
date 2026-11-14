@@ -58,7 +58,9 @@ export function ClickSetting({
   return (
     <div className="grid gap-1.5">
       <Label>On click</Label>
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+      {/* BI-58 review round 1 (SHOULD-FIX 2): full width in the builder's narrow inspector; side by
+          side only where its container (`@container`) is wide enough. */}
+      <div className="grid grid-cols-1 gap-3 @md:grid-cols-2">
         <Select value={kind} items={KIND_LABELS} onValueChange={(v) => pickKind((v as ClickKind) ?? "menu")}>
           <SelectTrigger className="w-full" aria-label="On click"><SelectValue /></SelectTrigger>
           <SelectContent>
@@ -112,7 +114,7 @@ function DashboardFields({
         value={value.column} items={columnLabels} disabled={!value.board}
         onValueChange={(v) => onChange({ kind: "dashboard", board: value.board, column: v ?? "" })}
       >
-        <SelectTrigger className="w-full sm:col-start-2" aria-label="Column">
+        <SelectTrigger className="w-full @md:col-start-2" aria-label="Column">
           <SelectValue placeholder={columns.status === "loading" && value.board ? "Loading columns…" : "Column to filter"} />
         </SelectTrigger>
         <SelectContent>
@@ -120,7 +122,7 @@ function DashboardFields({
         </SelectContent>
       </Select>
       {columns.status === "error" ? (
-        <p role="alert" className="text-xs text-destructive sm:col-span-2">{columns.error.message}</p>
+        <p role="alert" className="text-xs text-destructive @md:col-span-2">{columns.error.message}</p>
       ) : null}
     </>
   );

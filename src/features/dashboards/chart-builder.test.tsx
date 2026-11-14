@@ -1,7 +1,8 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
-import { afterAll, afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
+import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
 
 import * as realAuth from "@/features/auth/auth-provider"
+import * as realEchartModule from "./echart"
 
 // The builder reads the signed-in user's permissions; a plain editor without `dashboard:sql` is enough here.
 // PR #160 CI fix: `mock.module` outlives this file in `bun test src`, so the real exports are kept and only
@@ -9,11 +10,17 @@ import * as realAuth from "@/features/auth/auth-provider"
 // `tenant-switcher.test.tsx`, which runs later, without `AuthProvider`.
 const real = { ...realAuth }
 mock.module("@/features/auth/auth-provider", () => ({ ...real, useAuth: () => ({ hasPermission: () => false }) }))
+// BI-58 review round 3, SHOULD-FIX 8: the type gallery always draws pictures, with ECharts, which
+// needs a canvas the test DOM does not have; each chart is a marker, and the real module goes back.
+const realEchart = { ...realEchartModule }
+mock.module("./echart", () => ({ EChart: () => <div data-testid="chart" /> }))
 afterAll(() => {
   mock.module("@/features/auth/auth-provider", () => real)
+  mock.module("./echart", () => realEchart)
 })
 
-import { ChartBuilder, type ChartDef } from "./chart-builder"
+import { ChartBuilder, KIND_GROUPS, type ChartDef } from "./chart-builder"
+import { kindShort } from "./chart-kinds"
 
 const originalFetch = global.fetch
 let bodies: Record<string, unknown>[] = []
@@ -55,55 +62,61 @@ function renderBuilder(initial?: ChartDef) {
   return render(<ChartBuilder onSaved={() => {}} onCancel={() => {}} initial={initial} editId={initial ? "c_1" : undefined} />)
 }
 
-describe("ChartBuilder sections (phase 2 QA R3)", () => {
-  it("shows five ordered sections and folds the last two", async () => {
+/** The inspector's tabs (`BI-58` T4): open one, and read which is open. */
+const openTab = (name: string) => fireEvent.click(screen.getByRole("tab", { name }))
+const selectedTab = () => screen.getAllByRole("tab").find((t) => t.getAttribute("aria-selected") === "true")?.textContent
+
+// `BI-58` T4: the five sections of phase 2 QA R3 are three tabs; nothing was dropped.
+describe("ChartBuilder inspector tabs (phase 2 QA R3, BI-58 T4)", () => {
+  it("has three tabs and opens on Data, with the source in the data panel and nothing of Style drawn", async () => {
     renderBuilder(barDef)
-    const headings = await screen.findAllByRole("heading", { level: 3 })
-    // A folded section also shows its summary after the title (phase 2 QA R10). BI-17 added "Format" as the fifth.
-    const titles = ["Data", "What to show", "Sort and filter", "More options", "Format"]
-    expect(headings.map((h) => h.textContent ?? "")).toHaveLength(5)
-    headings.forEach((h, i) => expect(h.textContent).toContain(titles[i]))
-    expect(screen.getByRole("button", { name: /More options/ }).getAttribute("aria-expanded")).toBe("false")
-    expect(screen.getByRole("button", { name: /Format/ }).getAttribute("aria-expanded")).toBe("false")
-    // Nothing of the folded options is drawn, and no row of chips or default-aggregate select stands in the form.
+    await screen.findByLabelText("Aggregation of visitors")
+    expect(screen.getAllByRole("tab").map((t) => t.textContent)).toEqual(["Data", "Sort & filter", "Style"])
+    // BI-58 review round 2, SHOULD-FIX 6 (owner): the row spans the inspector, the three tabs in equal thirds.
+    expect(screen.getByRole("tablist").className).toContain("w-full")
+    for (const tab of screen.getAllByRole("tab")) expect(tab.className).toContain("flex-1")
+    expect(selectedTab()).toBe("Data")
+    expect(screen.queryAllByRole("heading", { level: 3 })).toHaveLength(0)
+    expect(screen.getByRole("complementary", { name: "Data" }).textContent).toContain("Data source")
+    // Style and Sort & filter are not drawn until opened, and no row of chips or default-aggregate select stands in the form.
     expect(screen.queryByText("Reference lines")).toBeNull()
-    expect(screen.queryByText("Parameters")).toBeNull()
+    expect(screen.queryByText("Filters")).toBeNull()
     expect(screen.queryByText(/Aggregation .*default/)).toBeNull()
     expect(screen.queryByText("New calculated field")).toBeNull()
   })
 
-  it("opens the fold on its own when the edited chart uses something inside it", async () => {
+  it("keeps what More options held in the Data tab: parameters, the click and the freshness", async () => {
     renderBuilder({ ...barDef, click: { kind: "url", url: "https://example.com/x" } })
-    const toggle = await screen.findByRole("button", { name: /More options/ })
-    await waitFor(() => expect(toggle.getAttribute("aria-expanded")).toBe("true"))
-    expect(screen.getByText("Parameters")).toBeTruthy()
+    await screen.findByLabelText("Aggregation of visitors")
+    const data = screen.getByRole("tabpanel")
+    expect(within(data).getByText("Parameters")).toBeTruthy()
+    expect(within(data).getByLabelText("On click")).toBeTruthy()
+    expect(within(data).getByLabelText("Freshness")).toBeTruthy()
   })
 
-  // BI-17: the reference lines editor moved from More options to the Format section.
-  it("opens Format, not More options, for a chart with a reference line, and lists the line there", async () => {
+  // BI-17: the reference lines editor moved from More options to the Format section, now the Style tab.
+  it("lists a chart's reference line under Style", async () => {
     renderBuilder({ ...barDef, referenceLines: [{ value: 100 }] as never })
-    const format = await screen.findByRole("button", { name: /Format/ })
-    await waitFor(() => expect(format.getAttribute("aria-expanded")).toBe("true"))
-    expect(screen.getByRole("button", { name: /More options/ }).getAttribute("aria-expanded")).toBe("false")
-    expect(screen.getByLabelText("Line 1 value")).toBeTruthy()
+    await screen.findByLabelText("Aggregation of visitors")
+    expect(screen.queryByLabelText("Line 1 value")).toBeNull()
+    openTab("Style")
+    expect((await screen.findByLabelText("Line 1 value") as HTMLInputElement).value).toBe("100")
   })
 
-  it("opens the fold for steps, and a user can open it by hand", async () => {
-    const { unmount } = renderBuilder({ ...barDef, steps: [{ filter: [{ column: "visitors", op: "gt", value: "5" }] }] })
-    await waitFor(() => expect(screen.getByRole("button", { name: /More options/ }).getAttribute("aria-expanded")).toBe("true"))
-    unmount()
-    cleanup()
-    renderBuilder(barDef)
-    const toggle = await screen.findByRole("button", { name: /More options/ })
-    fireEvent.click(toggle)
-    expect(toggle.getAttribute("aria-expanded")).toBe("true")
-    expect(screen.getByText("Parameters")).toBeTruthy()
+  it("lists a chart's steps under Sort & filter", async () => {
+    renderBuilder({ ...barDef, steps: [{ filter: [{ column: "visitors", op: "gt", value: "5" }] }] })
+    await screen.findByLabelText("Aggregation of visitors")
+    expect(screen.queryByText("Steps")).toBeNull()
+    openTab("Sort & filter")
+    expect(await screen.findByText("Steps")).toBeTruthy()
   })
 
   it("keeps a text note to its title and content", async () => {
     renderBuilder({ title: "Note", kind: "text", text: "hello" })
     await screen.findByText(/Content \(markdown\)/)
-    expect(screen.queryAllByRole("heading", { level: 3 })).toHaveLength(0)
+    // No sections or tabs; the one group is its size on the dashboard (BI-58 review round 1, SHOULD-FIX 5).
+    expect(screen.queryAllByRole("heading", { level: 3 }).map((h) => h.textContent)).toEqual(["Size on dashboard"])
+    expect(screen.queryAllByRole("tab")).toHaveLength(0)
   })
 })
 
@@ -123,30 +136,32 @@ describe("ChartBuilder aggregation (phase 2 QA R4)", () => {
 describe("ChartBuilder kind rules (phase 2 QA R5)", () => {
   it("hides steps and questions while 'Other' is on and says why beside the switch", async () => {
     renderBuilder({ ...barDef, other: true, limit: 5, steps: undefined })
-    const toggle = await screen.findByRole("button", { name: /More options/ })
-    fireEvent.click(toggle)
-    await waitFor(() => expect(toggle.getAttribute("aria-expanded")).toBe("true"))
-    expect(screen.getByText("While this is on, steps and more questions are not available.")).toBeTruthy()
+    await screen.findByLabelText("Aggregation of visitors")
+    // The questions would be in the Data tab, open now.
+    expect(screen.queryByText("Second source")).toBeNull()
+    expect(screen.queryByText(/Remove .* to add a second source/)).toBeNull()
+    openTab("Sort & filter")
+    expect(await screen.findByText("While this is on, steps and a second source are not available.")).toBeTruthy()
     expect(screen.queryByText("Steps")).toBeNull()
-    expect(screen.queryByText("More questions")).toBeNull()
-    expect(screen.queryByText(/Remove .* to combine questions/)).toBeNull()
   })
 
   it("offers 'Other', steps and questions to a bar, and none of them to a KPI", async () => {
     const { unmount } = renderBuilder({ ...barDef, click: { kind: "url", url: "https://example.com/x" } })
+    expect(await screen.findByText("Second source")).toBeTruthy()
+    openTab("Sort & filter")
     await screen.findByLabelText("Group the rest as Other")
     expect(screen.getByText("Steps")).toBeTruthy()
-    expect(screen.getByText("More questions")).toBeTruthy()
     unmount()
     cleanup()
     renderBuilder({ title: "K", kind: "kpi", mart: "mart_visits", measures: ["visitors"], aggregate: "sum" })
+    await screen.findByLabelText("Aggregation of visitors").catch(() => screen.findByText("Compare with"))
+    expect(screen.queryByText("Second source")).toBeNull()
+    openTab("Sort & filter")
     await screen.findByText("Filters")
     expect(screen.queryByLabelText("Group the rest as Other")).toBeNull()
     expect(screen.queryByText("Sort")).toBeNull()
     expect(screen.queryByText("Steps")).toBeNull()
-    fireEvent.click(screen.getByRole("button", { name: /More options/ }))
-    expect(screen.queryByText("Steps")).toBeNull()
-    expect(screen.queryByText("More questions")).toBeNull()
+    openTab("Style")
     expect(screen.queryByText("Reference lines")).toBeNull()
   })
 })
@@ -191,8 +206,8 @@ describe("ChartBuilder dimension beside more questions (QA LH-BI-13-01)", () => 
     withNumberKinds()
     renderBuilder({ ...layered, dimension: "visitors" })
     await screen.findByLabelText("Aggregation of visitors")
-    // The trigger of the Dimension (X) select is the one in the same field as its label.
-    const field = screen.getByText(/^Dimension \(X\)/).closest("div") as HTMLElement
+    // The trigger of the X axis select is the one in the same field as its label.
+    const field = screen.getByText(/^X axis/, { selector: "label" }).closest("div") as HTMLElement
     fireEvent.click(field.querySelector('[role="combobox"]') as HTMLElement)
     // `stay` is a number column, in no way a dimension of the source: only the rule that keeps numbers offers it.
     expect(await screen.findByRole("option", { name: "stay" })).toBeTruthy()
@@ -212,61 +227,58 @@ describe("ChartBuilder kind switch (phase 2 QA R6)", () => {
   it("keeps the dimension as the first grouping of a data table and back as the dimension of a chart", async () => {
     renderBuilder({ ...barDef, breakdown: "category" })
     await screen.findByLabelText("Aggregation of visitors")
-    // The type list is folded for a chart being edited; the menu in the header changes the type.
-    fireEvent.click(screen.getByRole("button", { name: /Change chart type/ }))
+    // `BI-58` T3: both types are icons in the canvas toolbar.
     fireEvent.click(screen.getByRole("button", { name: "Data table" }))
     // The dimension and the breakdown are the first groupings, so the steps editor has something to keep.
     expect(await screen.findByLabelText("Move provinsi down")).toBeTruthy()
     expect(screen.getByLabelText("Remove category")).toBeTruthy()
-    fireEvent.click(screen.getByRole("button", { name: /Change chart type/ }))
     fireEvent.click(screen.getByRole("button", { name: "Bar" }))
     await waitFor(() => expect(screen.queryByLabelText("Remove category")).toBeNull())
     expect(screen.getAllByText("provinsi").length).toBeGreaterThan(0)
   })
 })
 
-const expanded = (name: RegExp | string) => screen.getByRole("button", { name }).getAttribute("aria-expanded")
+/** The pressed type in the canvas toolbar (`BI-58` T3). */
+const pressedKind = () => within(screen.getByRole("group", { name: "Chart type" })).getAllByRole("button").find((b) => b.getAttribute("aria-pressed") === "true")?.getAttribute("aria-label")
+const gallery = () => screen.getByRole("dialog", { name: "Chart type" })
 
-describe("ChartBuilder type list (phase 2 QA R9)", () => {
-  it("shows the list for a new chart, folds it once a type is chosen, and the choice of folding is remembered", async () => {
-    const { unmount } = renderBuilder()
-    expect(screen.getByRole("navigation", { name: "Chart type" })).toBeTruthy()
-    fireEvent.click(screen.getByRole("button", { name: "Line" }))
-    // No remembered choice yet: choosing a type folds the list away, and nothing is stored by that.
-    expect(screen.queryByRole("navigation", { name: "Chart type" })).toBeNull()
-    expect(window.localStorage.getItem("lh.chartBuilder.typeList")).toBeNull()
-    // Opening it by hand is remembered, and a builder opened later starts open.
-    fireEvent.click(screen.getByRole("button", { name: "Show the chart type list" }))
-    expect(screen.getByRole("navigation", { name: "Chart type" })).toBeTruthy()
-    expect(window.localStorage.getItem("lh.chartBuilder.typeList")).toBe("expanded")
-    unmount()
-    cleanup()
-    renderBuilder({ ...barDef })
-    expect(screen.getByRole("navigation", { name: "Chart type" })).toBeTruthy()
-    // Folding by hand is remembered too, and a new chart then opens folded.
-    fireEvent.click(screen.getByRole("button", { name: "Fold the chart type list" }))
-    expect(window.localStorage.getItem("lh.chartBuilder.typeList")).toBe("collapsed")
-    cleanup()
+describe("ChartBuilder type list (phase 2 QA R9, BI-58 T3)", () => {
+  // `BI-58` T1, T3: the long chart-type column is gone; the type is an icon above the canvas, for a new chart and an edited one.
+  it("has no chart-type column, and a new chart changes its type from the canvas toolbar", async () => {
     renderBuilder()
     expect(screen.queryByRole("navigation", { name: "Chart type" })).toBeNull()
+    expect(pressedKind()).toBe("Horizontal bar (ranking)")
+    fireEvent.click(screen.getByRole("button", { name: "Line" }))
+    await waitFor(() => expect(pressedKind()).toBe("Line"))
+    expect(window.localStorage.length).toBe(0)
   })
 
-  it("starts folded for an edited chart, and the folded control still searches the types", async () => {
+  it("searches every type in the gallery behind More, and Enter picks the first match", async () => {
     renderBuilder(barDef)
-    expect(screen.queryByRole("navigation", { name: "Chart type" })).toBeNull()
-    fireEvent.click(screen.getByRole("button", { name: /Change chart type, now Bar/ }))
-    const search = screen.getByLabelText("Search chart types")
+    fireEvent.click(screen.getByRole("button", { name: "More chart types" }))
+    const search = await screen.findByLabelText("Search chart types")
     fireEvent.change(search, { target: { value: "sankey" } })
-    expect(screen.queryByRole("button", { name: "Line" })).toBeNull()
+    expect(within(gallery()).queryByRole("button", { name: "Line" })).toBeNull()
     fireEvent.keyDown(search, { key: "Enter" })
-    // The first match was picked and the menu closed.
+    // The first match was picked and the gallery closed.
     await waitFor(() => expect(screen.queryByLabelText("Search chart types") === null).toBe(true))
-    expect(screen.getByRole("button", { name: /Change chart type, now Sankey/ })).toBeTruthy()
+    expect(screen.getByRole("button", { name: /More chart types, now Sankey/ })).toBeTruthy()
   })
 
-  it("closes the folded type menu on Escape and on an outside press, and focus returns to its trigger (phase 2 QA R17)", async () => {
+  it("reaches every kind of KIND_GROUPS from the toolbar or the gallery", async () => {
     renderBuilder(barDef)
-    const trigger = () => screen.getByRole("button", { name: /Change chart type, now Bar/ })
+    fireEvent.click(screen.getByRole("button", { name: "More chart types" }))
+    await screen.findByLabelText("Search chart types")
+    for (const g of KIND_GROUPS) for (const item of g.items) {
+      // BI-58 review round 3, SHOULD-FIX 8 (owner): gallery cards are named by their short names.
+      expect(within(gallery()).getByRole("button", { name: kindShort(item.value) }), item.value).toBeTruthy()
+    }
+  })
+
+  // BI-58 review round 4, SHOULD-FIX 9: the gallery is a modal dialog, so an outside press lands on its backdrop.
+  it("closes the gallery on Escape and on a press on its backdrop, and focus returns to its trigger (phase 2 QA R17)", async () => {
+    renderBuilder(barDef)
+    const trigger = () => screen.getByRole("button", { name: "More chart types" })
     fireEvent.click(trigger())
     const search = await screen.findByLabelText("Search chart types")
     fireEvent.keyDown(search, { key: "Escape" })
@@ -277,40 +289,25 @@ describe("ChartBuilder type list (phase 2 QA R9)", () => {
     expect(screen.getByText("Edit chart")).toBeTruthy()
     fireEvent.click(trigger())
     await screen.findByLabelText("Search chart types")
-    const heading = screen.getByText("Edit chart")
-    fireEvent.pointerDown(heading)
-    fireEvent.mouseDown(heading)
-    fireEvent.click(heading)
+    const backdrop = document.querySelector("[data-slot=dialog-overlay]") as HTMLElement
+    fireEvent.pointerDown(backdrop)
+    fireEvent.mouseDown(backdrop)
+    fireEvent.click(backdrop)
     await waitFor(() => expect(screen.queryByLabelText("Search chart types") === null).toBe(true))
     expect(screen.getByText("Edit chart")).toBeTruthy()
   })
-
-  it("works when the browser refuses storage", async () => {
-    const read = spyOn(Storage.prototype, "getItem").mockImplementation(() => { throw new Error("blocked") })
-    const write = spyOn(Storage.prototype, "setItem").mockImplementation(() => { throw new Error("blocked") })
-    try {
-      renderBuilder()
-      expect(screen.getByRole("navigation", { name: "Chart type" })).toBeTruthy()
-      fireEvent.click(screen.getByRole("button", { name: "Fold the chart type list" }))
-      expect(screen.queryByRole("navigation", { name: "Chart type" })).toBeNull()
-    } finally {
-      read.mockRestore()
-      write.mockRestore()
-    }
-  })
 })
 
-describe("ChartBuilder accordion (phase 2 QA R10)", () => {
-  it("opens only section 1 for a new chart, with no way on until its required field is filled", async () => {
+// `BI-58` T4: the accordion of phase 2 QA R10 became the inspector's tabs; the folded summaries are the tabs' hover titles.
+describe("ChartBuilder inspector placement (phase 2 QA R10, BI-58 T4)", () => {
+  it("opens a new chart on the Data tab with the source in the data panel, and a tab opens by a click", async () => {
     renderBuilder()
     await screen.findByText("Data source")
-    expect(expanded(/^Data(?! table)/)).toBe("true")
-    expect(expanded(/What to show/)).toBe("false")
-    expect(expanded(/Sort and filter/)).toBe("false")
-    // Opening another section folds the open one.
-    fireEvent.click(screen.getByRole("button", { name: /What to show/ }))
-    expect(expanded(/What to show/)).toBe("true")
-    expect(expanded(/^Data(?! table)/)).toBe("false")
+    expect(screen.getByRole("complementary", { name: "Data" }).textContent).toContain("Data source")
+    expect(selectedTab()).toBe("Data")
+    openTab("Sort & filter")
+    await waitFor(() => expect(selectedTab()).toBe("Sort & filter"))
+    expect(screen.queryByLabelText("Value")).toBeNull()
   })
 
   it("has no Next button, even once the source is picked (phase 2 QA R19)", async () => {
@@ -319,64 +316,75 @@ describe("ChartBuilder accordion (phase 2 QA R10)", () => {
     fireEvent.click(await screen.findByRole("option", { name: /mart_visits/ }))
     await screen.findByText("Data source")
     expect(screen.queryByRole("button", { name: /^Next/ })).toBeNull()
-    // Opening a section by its heading still folds the open one.
-    fireEvent.click(screen.getByRole("button", { name: /What to show/ }))
-    expect(expanded(/What to show/)).toBe("true")
-    expect(expanded(/^Data(?! table)/)).toBe("false")
   })
 
-  it("opens an edited chart with sections 1 to 3 folded to one-line summaries", async () => {
+  it("names what an edited chart shows and how it is sorted and filtered on the tabs, with its source in the data panel", async () => {
     renderBuilder({ ...barDef, measures: ["visitors", { column: "stay", aggregate: "avg" }] as never, filters: [{ column: "category", op: "eq", value: "a" }] as never, limit: 5 })
-    await waitFor(() => expect(screen.getByRole("button", { name: /^Data(?! table)/ }).textContent).toContain("mart_visits"))
-    expect(expanded(/^Data(?! table)/)).toBe("false")
-    expect(expanded(/What to show/)).toBe("false")
-    expect(expanded(/Sort and filter/)).toBe("false")
-    expect(screen.getByRole("button", { name: /What to show/ }).textContent).toContain("provinsi · visitors, avg of stay")
-    expect(screen.getByRole("button", { name: /Sort and filter/ }).textContent).toContain("highest first · top 5 · 1 filter")
-    // A folded section is opened by its heading, which is a button reached by Tab.
-    fireEvent.click(screen.getByRole("button", { name: /What to show/ }))
-    expect(expanded(/What to show/)).toBe("true")
+    await waitFor(() => expect(screen.getByRole("complementary", { name: "Data" }).textContent).toContain("mart_visits"))
+    await waitFor(() => expect(screen.getByRole("tab", { name: "Data" }).getAttribute("title")).toContain("provinsi · visitors, avg of stay"))
+    expect(screen.getByRole("tab", { name: "Sort & filter" }).getAttribute("title")).toContain("highest first · top 5 · 1 filter")
   })
 
-  it("opens the section that holds a missing field and focuses the field when saving", async () => {
+  it("opens the tab that holds a missing field and focuses the field when saving", async () => {
     renderBuilder({ title: "T", kind: "bar", mart: "mart_visits", measures: ["visitors"], aggregate: "sum" })
     await screen.findByLabelText("Aggregation of visitors")
-    expect(expanded(/What to show/)).toBe("false")
+    openTab("Style")
     fireEvent.click(screen.getByRole("button", { name: "Save changes" }))
-    await waitFor(() => expect(expanded(/What to show/)).toBe("true"))
-    expect(screen.getByRole("alert").textContent).toContain("Dimension (X)")
-    const focused = document.activeElement as HTMLElement
-    expect(focused.closest("section")?.querySelector("h3")?.textContent).toContain("What to show")
+    await waitFor(() => expect(selectedTab()).toBe("Data"))
+    expect(screen.getByRole("alert").textContent).toContain("X axis")
+    // A boolean, not the element: a failing match would print the whole form on every retry.
+    await waitFor(() => expect((document.activeElement as HTMLElement).closest("[data-slot=dimension-field]") !== null).toBe(true))
+    expect(document.activeElement?.hasAttribute("data-placeholder")).toBe(true)
   })
 
-  it("opens section 1 and focuses the source select when a new chart has no source", async () => {
+  it("focuses the source select in the data panel when a new chart has no source", async () => {
     renderBuilder()
     await screen.findByText("Data source")
-    fireEvent.click(screen.getByRole("button", { name: /What to show/ }))
     fireEvent.click(screen.getByRole("button", { name: "Create chart" }))
-    await waitFor(() => expect(expanded(/^Data(?! table)/)).toBe("true"))
+    await waitFor(() => expect((document.activeElement as HTMLElement).closest("aside")?.getAttribute("aria-label")).toBe("Data"))
     const focused = document.activeElement as HTMLElement
-    expect(focused.closest("section")?.querySelector("h3")?.textContent).toContain("Data")
     expect(focused.hasAttribute("data-placeholder")).toBe(true)
   })
 })
 
-describe("ChartBuilder header (phase 2 QA R11)", () => {
-  it("keeps title, dashboard and width in one row and has no helper line under the title", async () => {
+// BI-58 review round 1, SHOULD-FIX 4 and 5 (owner): the header is back, the dashboard picker in the
+// breadcrumb, the page's name and Save; Cancel is gone and the width is in Style.
+describe("ChartBuilder header (phase 2 QA R11, BI-58 T1, review round 1)", () => {
+  it("has only back, the dashboard picker and Save in the header, the title on the canvas, and no helper line under the title", async () => {
     renderBuilder()
-    const title = await screen.findByLabelText(/^Title/)
-    const row = title.closest("div.grid")?.parentElement as HTMLElement
-    expect(row.textContent).toContain("Dashboard")
-    expect(row.textContent).toContain("Width")
+    const header = (await screen.findByRole("heading", { level: 1 })).closest("header") as HTMLElement
+    const controls = [...header.querySelectorAll("button, [role=combobox], a")]
+    expect(controls.map((c) => c.getAttribute("aria-label") ?? c.textContent)).toEqual(["Back to dashboard", "Add to dashboard", "Create chart"])
+    expect(header.textContent).not.toContain("Cancel")
+    expect(header.querySelector('[role="radiogroup"], [aria-label="Width"]')).toBeNull()
+    const title = screen.getByLabelText(/^Title/)
+    expect(header.contains(title)).toBe(false)
+    expect(title.closest('section[aria-label="Chart"]')).not.toBeNull()
     expect(screen.queryByText(/Left empty, the chart is saved as/)).toBeNull()
+  })
+
+  it("sets the width from the pictures in Style, with radio semantics and arrow keys", async () => {
+    renderBuilder(barDef)
+    await waitFor(() => expect(bodies.length).toBeGreaterThan(0))
+    openTab("Style")
+    const group = await screen.findByRole("radiogroup", { name: "Width on the dashboard" })
+    const half = within(group).getByRole("radio", { name: "Half row" })
+    const full = within(group).getByRole("radio", { name: "Full row" })
+    expect(half.getAttribute("aria-checked")).toBe("true")
+    expect(full.getAttribute("tabindex")).toBe("-1")
+    fireEvent.click(full)
+    expect(full.getAttribute("aria-checked")).toBe("true")
+    await waitFor(() => expect(bodies[bodies.length - 1]!.span).toBe(2))
+    fireEvent.keyDown(full, { key: "ArrowLeft" })
+    expect(half.getAttribute("aria-checked")).toBe("true")
+    await waitFor(() => expect(bodies[bodies.length - 1]!.span).toBe(1))
   })
 })
 
 describe("ChartBuilder long column names (phase 2 QA R14)", () => {
   it("shows a picked joined measure by its own name with the table as a tag, and the full reference on hover", async () => {
     renderBuilder({ ...barDef, measures: ["mart_demo_province_capacity__rooms"] })
-    fireEvent.click(await screen.findByRole("button", { name: /What to show/ }))
-    const trigger = await screen.findByRole("combobox", { name: /^Measure/ })
+    const trigger = await screen.findByRole("combobox", { name: /^Value/ })
     await waitFor(() => expect(trigger.textContent).toContain("rooms"))
     expect(trigger.textContent).toContain("capacity")
     expect(trigger.textContent).not.toContain("__")
@@ -387,10 +395,10 @@ describe("ChartBuilder long column names (phase 2 QA R14)", () => {
 
   it("gives every grid of the form a column the container sizes, so no long name can scroll the form sideways", async () => {
     renderBuilder({ ...barDef, measures: ["mart_demo_province_capacity__rooms"] })
-    const section = (await screen.findByRole("button", { name: /What to show/ })).closest("section") as HTMLElement
-    expect(section.className).toContain("grid-cols-[minmax(0,1fr)]")
-    expect(section.querySelector("[id$=-panel]")?.className).toContain("grid-cols-[minmax(0,1fr)]")
-    const form = section.parentElement as HTMLElement
+    await screen.findByLabelText("Aggregation of rooms").catch(() => screen.findByRole("tabpanel"))
+    // `BI-58` T4: each tab's form is the grid; the rule reaches every grid inside it, and the tab's
+    // panel scrolls inside the inspector, never sideways.
+    const form = screen.getByRole("tabpanel").firstElementChild as HTMLElement
     expect(form.className).toContain("grid-cols-[minmax(0,1fr)]")
     expect(form.className).toContain("min-w-0")
     expect(form.className).toContain("[&_.grid:not([class*=grid-cols])]:grid-cols-[minmax(0,1fr)]")
@@ -400,7 +408,6 @@ describe("ChartBuilder long column names (phase 2 QA R14)", () => {
 describe("ChartBuilder conditional controls (phase 2 QA R15)", () => {
   it("puts the bin of a number dimension in a row of its own, so Dimension and Breakdown stay in one row", async () => {
     renderBuilder({ ...barDef, dimension: "visitors", measures: ["stay"] })
-    fireEvent.click(await screen.findByRole("button", { name: /What to show/ }))
     const bin = await screen.findByLabelText("Group in bins")
     const dimension = document.querySelector("[data-slot=dimension-field]") as HTMLElement
     const breakdown = document.querySelector("[data-slot=breakdown-field]") as HTMLElement
@@ -414,13 +421,14 @@ describe("ChartBuilder conditional controls (phase 2 QA R15)", () => {
     expect(dimension.className).toContain("content-start")
     expect(breakdown.className).toContain("content-start")
     expect(dimension.parentElement?.className).toContain("items-start")
-    expect(row.className).toContain("sm:col-span-2")
+    // `BI-58` T4: two columns where the inspector is wide enough (a container query), one in the narrow column.
+    expect(row.className).toContain("@md:col-span-2")
+    expect(dimension.parentElement?.className).toContain("@md:grid-cols-2")
   })
 
   it("draws no extra row when the dimension needs no bin or grain", async () => {
     renderBuilder(barDef)
-    fireEvent.click(await screen.findByRole("button", { name: /What to show/ }))
-    await screen.findByText(/Dimension \(X\)/)
+    await screen.findByText(/^X axis/, { selector: "label" })
     expect(document.querySelector("[data-slot=conditional-row]")).toBeNull()
   })
 })
@@ -432,51 +440,41 @@ describe("ChartBuilder labels (phase 2 QA R20)", () => {
     await waitFor(() => expect(field.getAttribute("placeholder")).toBe("Coba metrik by category"))
   })
 
-  // `WEB-7` D6: the breadcrumb was the dialog's; the page title is FormPage's,
-  // and the kind is named beside the type list, or on the control that changes
-  // it when that list is folded.
-  it("names the page in the header and the kind beside the list, and no chevron in the title", async () => {
+  // `WEB-7` D6, `BI-58` T1: the page is named last in the header's breadcrumb, after the
+  // dashboard, and the kind is named on the control that changes it.
+  it("names the page in the header after the dashboard, the kind on its control, and no chevron in the title", async () => {
     const { unmount } = renderBuilder()
     const heading = screen.getByRole("heading", { level: 1 })
     expect(heading.textContent).toBe("New chart")
     expect(heading.querySelector("svg")).toBeNull()
-    // The kind follows a chevron in the builder's own header row.
-    const kind = document.querySelector("[data-slot=chart-kind]") as HTMLElement
-    expect(kind.textContent).toContain("Horizontal bar")
-    expect(kind.querySelector("svg")).not.toBeNull()
+    // The dashboard is the picker before it (BI-58 review round 1, SHOULD-FIX 5).
+    expect(heading.parentElement?.querySelector('[role="combobox"]')?.textContent).toContain("Main")
+    expect(heading.previousElementSibling?.textContent).toBe("/")
+    expect(pressedKind()).toBe("Horizontal bar (ranking)")
     unmount()
     cleanup()
     renderBuilder(barDef)
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Edit chart")
-    // Folded, the same name is on the control that changes it.
-    expect(screen.getByRole("button", { name: /Change chart type, now Bar/ })).toBeTruthy()
-    expect(document.querySelector("[data-slot=chart-kind]")).toBeNull()
+    expect(pressedKind()).toBe("Bar")
   })
 })
 
-describe("ChartBuilder resizable split (phase 2 QA R18)", () => {
-  it("draws a focusable separator between the form panel and the preview panel at a wide screen", async () => {
-    const original = window.matchMedia
-    window.matchMedia = ((query: string) => ({
-      matches: true, media: query, onchange: null,
-      addEventListener: () => {}, removeEventListener: () => {}, addListener: () => {}, removeListener: () => {}, dispatchEvent: () => false,
-    })) as unknown as typeof window.matchMedia
-    try {
-      renderBuilder(barDef)
-      await screen.findByLabelText("Aggregation of visitors")
-      const handle = document.querySelector('[data-slot="resizable-handle"]') as HTMLElement
-      expect(handle).not.toBeNull()
-      expect(handle.getAttribute("role")).toBe("separator")
-      expect(handle.getAttribute("aria-orientation")).toBe("vertical")
-      expect(handle.getAttribute("tabindex")).toBe("0")
-      const panels = Array.from(document.querySelectorAll('[data-slot="resizable-panel"]'))
-      expect(panels.length).toBe(2)
-      // The form panel holds the form (its own scroller) and the preview panel the preview.
-      expect(panels[0].querySelector('[aria-label="Aggregation of visitors"]')).not.toBeNull()
-      expect(panels[1].querySelector('section[aria-label="Preview"]')).not.toBeNull()
-    } finally {
-      window.matchMedia = original
-    }
+// `BI-58` T1: the resizable form-and-preview split (phase 2 QA R18) became three zones.
+describe("ChartBuilder zones (BI-58 T1)", () => {
+  it("puts the data panel, the chart with its preview, and the settings side by side", async () => {
+    renderBuilder(barDef)
+    await screen.findByLabelText("Aggregation of visitors")
+    const zones = [...document.querySelectorAll("[data-slot=chart-builder] aside, [data-slot=chart-builder] section[aria-label=Chart]")]
+    expect(zones.map((z) => z.getAttribute("aria-label"))).toEqual(["Data", "Chart", "Settings"])
+    expect(zones[1]!.querySelector('section[aria-label="Preview"]')).not.toBeNull()
+    expect(zones[2]!.querySelector('[aria-label="Aggregation of visitors"]')).not.toBeNull()
+    expect(document.querySelector('[data-slot="resizable-handle"]')).toBeNull()
+    // BI-58 review round 2, SHOULD-FIX 7 (owner): the canvas toolbar and the tab row share one height
+    // (44 px), so their dividers are one line where they sit side by side (measured at 1366x900 and
+    // 1190x800 on the preview: both bottoms at 180 px).
+    const toolbar = document.querySelector("[data-slot=canvas-toolbar]") as HTMLElement
+    expect(toolbar.className).toContain("@3xl:h-11")
+    expect(screen.getByRole("tablist").className).toContain("h-11")
   })
 })
 
@@ -495,8 +493,8 @@ const FULL_STYLE = {
 describe("ChartBuilder Format section (BI-17 part A)", () => {
   it("reopens a chart saved with every field and sends the same style back", async () => {
     renderBuilder({ ...barDef, ...FULL_STYLE } as ChartDef)
-    const toggle = await screen.findByRole("button", { name: /Format/ })
-    await waitFor(() => expect(toggle.getAttribute("aria-expanded")).toBe("true"))
+    await screen.findByLabelText("Aggregation of visitors")
+    openTab("Style")
     // The controls hold what was saved.
     expect((screen.getByLabelText("Number format decimals") as HTMLInputElement).value).toBe("2")
     expect((screen.getByLabelText("Number format currency code") as HTMLInputElement).value).toBe("IDR")
@@ -512,7 +510,8 @@ describe("ChartBuilder Format section (BI-17 part A)", () => {
 
   it("a bar chart offers colours, axes, labels, notes and reference lines, and no conditional colours", async () => {
     renderBuilder(barDef)
-    fireEvent.click(await screen.findByRole("button", { name: /Format/ }))
+    await screen.findByLabelText("Aggregation of visitors")
+    openTab("Style")
     for (const title of ["Values", "Dates", "Colours", "Axes", "Labels", "Notes", "Tooltip"]) expect(screen.getByText(title), title).toBeTruthy()
     expect(screen.getByText("Reference lines")).toBeTruthy()
     expect(screen.queryByText("Conditional colours")).toBeNull()
@@ -520,15 +519,17 @@ describe("ChartBuilder Format section (BI-17 part A)", () => {
 
   it("a table offers conditional colours and number formats, and no axes or palette", async () => {
     renderBuilder({ title: "T", kind: "table", mart: "mart_visits", dimension: "provinsi", measures: ["visitors"], aggregate: "sum" })
-    fireEvent.click(await screen.findByRole("button", { name: /Format/ }))
-    expect(screen.getByText("Conditional colours", { selector: "legend" })).toBeTruthy()
+    await screen.findByLabelText("Aggregation of visitors")
+    openTab("Style")
+    expect(screen.getByText("Conditional colours", { selector: "h3" })).toBeTruthy()
     expect(screen.getByText("Values")).toBeTruthy()
     for (const title of ["Axes", "Colours", "Labels", "Notes", "Tooltip"]) expect(screen.queryByText(title), title).toBeNull()
   })
 
   it("does not send a conditional rule that has no column yet", async () => {
     renderBuilder({ title: "T", kind: "table", mart: "mart_visits", dimension: "provinsi", measures: ["visitors"], aggregate: "sum" })
-    fireEvent.click(await screen.findByRole("button", { name: /Format/ }))
+    await screen.findByLabelText("Aggregation of visitors")
+    openTab("Style")
     fireEvent.click(screen.getByRole("button", { name: /Add a rule/ }))
     fireEvent.change(screen.getByLabelText("Rule 1 value"), { target: { value: "1000" } })
     await waitFor(() => expect(bodies.length).toBeGreaterThan(0))
@@ -537,7 +538,8 @@ describe("ChartBuilder Format section (BI-17 part A)", () => {
 
   it("a line added to a bar chart is a goal line at the number given", async () => {
     renderBuilder(barDef)
-    fireEvent.click(await screen.findByRole("button", { name: /Format/ }))
+    await screen.findByLabelText("Aggregation of visitors")
+    openTab("Style")
     fireEvent.click(screen.getByRole("button", { name: /Add a line/ }))
     fireEvent.change(screen.getByLabelText("Line 1 value"), { target: { value: "1000" } })
     fireEvent.change(screen.getByLabelText("Line 1 label"), { target: { value: "Goal" } })
@@ -557,7 +559,6 @@ describe("ChartBuilder freshness (BI-4 part B)", () => {
 
   it("offers 'Follow the default' to a chart with no rule of its own and no minutes box", async () => {
     renderBuilder(barDef)
-    fireEvent.click(await screen.findByRole("button", { name: /More options/ }))
     expect(await screen.findByLabelText("Freshness")).toBeTruthy()
     expect(screen.queryByLabelText("Freshness: minutes")).toBeNull()
   })
@@ -566,9 +567,9 @@ describe("ChartBuilder freshness (BI-4 part B)", () => {
 describe("ChartBuilder scatter (BI-17 B QA fix F2)", () => {
   it("asks for an X metric and a Y metric, and a size for a bubble chart", async () => {
     renderBuilder(barDef)
-    const trigger = await screen.findByRole("button", { name: /Change chart type, now Bar/ })
-    fireEvent.click(trigger)
-    fireEvent.click(await screen.findByRole("button", { name: "Scatter (X vs Y)" }))
+    await screen.findByLabelText("Aggregation of visitors")
+    fireEvent.click(screen.getByRole("button", { name: "More chart types" }))
+    fireEvent.click(await screen.findByRole("button", { name: "Scatter" }))
     await waitFor(() => expect(screen.getByText("X metric")).toBeTruthy())
     expect(screen.getByText("Y metric")).toBeTruthy()
     expect(screen.queryByText("Size metric")).toBeNull()
@@ -576,7 +577,8 @@ describe("ChartBuilder scatter (BI-17 B QA fix F2)", () => {
 
   it("does the same when the chart is new and the data source is picked after the kind", async () => {
     renderBuilder()
-    const scatter = await screen.findByRole("button", { name: "Scatter (X vs Y)" })
+    fireEvent.click(screen.getByRole("button", { name: "More chart types" }))
+    const scatter = await screen.findByRole("button", { name: "Scatter" })
     fireEvent.click(scatter)
     await waitFor(() => expect(screen.getByText("X metric")).toBeTruthy())
     expect(screen.getByText("Y metric")).toBeTruthy()
@@ -584,11 +586,13 @@ describe("ChartBuilder scatter (BI-17 B QA fix F2)", () => {
 
   it("keeps the Y metric when the data source is picked after the kind (it used to reset to one row)", async () => {
     renderBuilder()
-    fireEvent.click(await screen.findByRole("button", { name: "Bubble (X, Y, size)" }))
+    fireEvent.click(screen.getByRole("button", { name: "More chart types" }))
+    fireEvent.click(await screen.findByRole("button", { name: "Bubble" }))
     fireEvent.click(await screen.findByRole("combobox", { name: /pick a mart/i }).catch(() => screen.getByText(/pick a mart/)))
     fireEvent.click(await screen.findByRole("option", { name: /mart_visits/ }))
     await screen.findByText("Data source")
-    fireEvent.click(screen.getByRole("button", { name: /What to show/ }))
+    // `BI-58` T4: the Data tab is the one a new chart opens on.
+    expect(selectedTab()).toBe("Data")
     await waitFor(() => expect(screen.getByText("X metric")).toBeTruthy())
     expect(screen.getByText("Y metric")).toBeTruthy()
     expect(screen.getByText("Size metric")).toBeTruthy()
@@ -652,12 +656,12 @@ describe("ChartBuilder and a parameter slot (QA LH-BI-6-01)", () => {
     renderBuilder(barDef)
     await screen.findByLabelText("Aggregation of visitors")
     // The slot is a dimension of the picker.
-    const dimensionField = screen.getByText(/^Dimension \(X\)/).closest("div") as HTMLElement
+    const dimensionField = screen.getByText(/^X axis/, { selector: "label" }).closest("div") as HTMLElement
     fireEvent.click(dimensionField.querySelector('[role="combobox"]') as HTMLElement)
     expect(await screen.findByRole("option", { name: /\{ukuran\}/ })).toBeTruthy()
     // Close that list, open the filter section, and ask for a filter column.
     fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" })
-    fireEvent.click(screen.getByRole("button", { name: /Sort and filter/ }))
+    openTab("Sort & filter")
     fireEvent.click(await screen.findByLabelText("Add a filter"))
     expect(await screen.findByRole("option", { name: "provinsi" })).toBeTruthy()
     expect(screen.queryByRole("option", { name: /\{ukuran\}/ })).toBeNull()
@@ -700,7 +704,7 @@ describe("ChartBuilder breakdown grain and limit label (QA LH-BI-6-01)", () => {
     await screen.findByLabelText("Aggregation of visitors")
     const breakdownField = document.querySelector('[data-slot="breakdown-field"]') as HTMLElement
     choose(breakdownField.querySelector('[role="combobox"]') as HTMLElement, "d")
-    const groupBy = await screen.findByLabelText("Group the breakdown by")
+    const groupBy = await screen.findByLabelText("Group the split by")
     choose(groupBy, "Month")
     await waitFor(() => expect(bodies.some((b) => b.breakdownGrain === "month")).toBe(true))
   })
@@ -708,15 +712,15 @@ describe("ChartBuilder breakdown grain and limit label (QA LH-BI-6-01)", () => {
   it("the limit label names the breakdown when the chart has one", async () => {
     renderBuilder({ ...barDef, breakdown: "category" })
     await screen.findByLabelText("Aggregation of visitors")
-    fireEvent.click(screen.getByRole("button", { name: /Sort and filter/ }))
-    expect(await screen.findByText("Limit (Top N, dimension and breakdown)")).toBeTruthy()
+    openTab("Sort & filter")
+    expect(await screen.findByText("Limit (Top N, X axis and split)")).toBeTruthy()
     cleanup()
     // A grain on a date dimension makes the limit the breakdown's alone.
     withDateColumn()
     renderBuilder({ ...barDef, dimension: "d", breakdown: "category", grain: "month" })
     await screen.findByLabelText("Aggregation of visitors")
-    fireEvent.click(screen.getByRole("button", { name: /Sort and filter/ }))
-    expect(await screen.findByText("Breakdown values (Top N)")).toBeTruthy()
+    openTab("Sort & filter")
+    expect(await screen.findByText("Split values (Top N)")).toBeTruthy()
   })
 
   /** Adds a table-calculation measure the base stub does not have. */
@@ -749,8 +753,12 @@ describe("ChartBuilder breakdown grain and limit label (QA LH-BI-6-01)", () => {
     renderBuilder()
     fireEvent.click(await screen.findByRole("combobox", { name: /pick a mart/i }).catch(() => screen.getByText(/pick a mart/)))
     fireEvent.click(await screen.findByRole("option", { name: /mart_visits/ }))
-    fireEvent.click(await screen.findByRole("button", { name: /What to show/ }))
-    const dimensionField = document.querySelector("[data-slot=dimension-field]") as HTMLElement
+    // The Data tab is open; its pickers wait for the source's columns.
+    const dimensionField = await waitFor(() => {
+      const field = document.querySelector("[data-slot=dimension-field]") as HTMLElement
+      expect(field.querySelector('[role="combobox"]')?.hasAttribute("data-disabled")).toBe(false)
+      return field
+    })
     choose(dimensionField.querySelector('[role="combobox"]') as HTMLElement, "d")
     // The pickers' lists close after a choice; wait for it so the next list is
     // the only one with its options.
@@ -758,7 +766,7 @@ describe("ChartBuilder breakdown grain and limit label (QA LH-BI-6-01)", () => {
     const breakdownField = document.querySelector('[data-slot="breakdown-field"]') as HTMLElement
     choose(breakdownField.querySelector('[role="combobox"]') as HTMLElement, "category")
     await waitFor(() => expect(screen.queryAllByRole("option")).toHaveLength(0))
-    choose(await screen.findByLabelText("Measure (Y)"), "visitors")
+    choose(await screen.findByLabelText("Value"), "visitors")
     await waitFor(() => expect(screen.queryAllByRole("option")).toHaveLength(0))
     choose(await screen.findByLabelText("Group by"), "Month")
     await waitFor(() => expect(bodies.some((b) => b.grain === "month" && b.limit === 20)).toBe(true))
@@ -771,10 +779,10 @@ describe("ChartBuilder breakdown grain and limit label (QA LH-BI-6-01)", () => {
     withTableCalc()
     renderBuilder({ ...barDef, measures: ["running"], breakdown: "category" })
     await screen.findByLabelText("Aggregation of running")
-    fireEvent.click(screen.getByRole("button", { name: /Sort and filter/ }))
+    openTab("Sort & filter")
     expect(await screen.findByText("Limit (Top N)")).toBeTruthy()
-    expect(screen.queryByText("Limit (Top N, dimension and breakdown)")).toBeNull()
-    expect(screen.queryByText("Breakdown values (Top N)")).toBeNull()
+    expect(screen.queryByText("Limit (Top N, X axis and split)")).toBeNull()
+    expect(screen.queryByText("Split values (Top N)")).toBeNull()
   })
 })
 
@@ -791,11 +799,10 @@ describe("ChartBuilder radar measures (QA LH-BI-6-25)", () => {
 
   it("a radar offers Add measure and sends both measures", async () => {
     renderBuilder({ ...barDef, kind: "radar" })
-    await screen.findByLabelText("Measure (Y)")
-    fireEvent.click(screen.getByRole("button", { name: /What to show/ }))
-    fireEvent.click(await screen.findByRole("button", { name: /Add measure/ }))
+    await screen.findByLabelText("Value")
+    fireEvent.click(await screen.findByRole("button", { name: /Add value/ }))
     await waitFor(() => expect(screen.queryAllByRole("option")).toHaveLength(0))
-    choose(await screen.findByLabelText("Measure 2"), "stay")
+    choose(await screen.findByLabelText("Value 2"), "stay")
     await waitFor(() => expect(bodies.some((b) => Array.isArray(b.measures) && b.measures.length === 2)).toBe(true))
     const body = bodies[bodies.length - 1]!
     expect(body.kind).toBe("radar")
