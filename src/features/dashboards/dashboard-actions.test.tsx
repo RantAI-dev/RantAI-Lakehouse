@@ -44,6 +44,17 @@ describe("DashboardActionsMenu groups (BI-61 T2)", () => {
     expect(top.length).toBeLessThanOrEqual(14)
   })
 
+  // BI-61 review round 1, SHOULD-FIX 6: the value sits beside the chevron, not in the middle.
+  it("lets the Auto-refresh label grow so its value sits at the right, beside the chevron", async () => {
+    renderMenu(all)
+    const label = await screen.findByText("Auto-refresh")
+    expect(label.className).toContain("flex-1")
+    const value = label.parentElement?.querySelector("[data-slot='menu-value']") as HTMLElement
+    expect(value.textContent).toBe("Off")
+    expect(value.className).not.toContain("ml-auto")
+    expect(value.nextElementSibling?.tagName.toLowerCase()).toBe("svg")
+  })
+
   it("keeps every entry of the old flat menu reachable: the intervals and Save as default in Auto-refresh, both exports in Export", async () => {
     renderMenu(all)
     await openSub("Auto-refresh")

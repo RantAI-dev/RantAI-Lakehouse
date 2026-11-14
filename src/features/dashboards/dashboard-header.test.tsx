@@ -17,9 +17,18 @@ mock.module("next/navigation", () => ({
 }))
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
-import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { afterAll, afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { TableProviders } from "@/components/app-shell/table-providers"
 import { AuthProvider } from "@/features/auth/auth-provider"
+import * as realEchart from "./echart"
+
+// A chart needs a canvas, which the test DOM has not; the marks beside the title do not.
+// The real module is put back for the files after this one, as dashboard-page-role does.
+mock.module("./echart", () => ({ EChart: () => <div data-testid="chart" /> }))
+afterAll(() => {
+  mock.module("./echart", () => realEchart)
+})
+
 import { DashboardPage } from "./dashboard-page"
 
 afterEach(() => {
@@ -31,7 +40,7 @@ afterEach(() => {
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } })
 
-function mount({ permissions, level }: { permissions: string[]; level: string }) {
+function mount({ permissions, level, charts = [], results = {}, extra = {} }: { permissions: string[]; level: string; charts?: unknown[]; results?: Record<string, unknown>; extra?: Record<string, unknown> }) {
   spyOn(globalThis, "fetch").mockImplementation(((input: RequestInfo | URL) => {
     const path = String(input)
     if (path.includes("/api/auth/me")) {
@@ -40,7 +49,7 @@ function mount({ permissions, level }: { permissions: string[]; level: string })
     if (path.startsWith("/api/dashboard?")) {
       return Promise.resolve(json({
         board: "b_1", boards: [{ id: "default", name: "Main" }, { id: "b_1", name: "Quarterly Sales", folderId: "f_2" }],
-        charts: [], kpis: [], filterColumns: [], results: {}, layout: {}, canDownload: true, access: { level },
+        charts, kpis: [], filterColumns: [], results, layout: {}, canDownload: true, access: { level }, ...extra,
       }))
     }
     if (path.includes("/api/dashboard/boards")) {
@@ -100,14 +109,14 @@ describe("edit mode (BI-61 T5)", () => {
     await screen.findByText("Quarterly Sales")
     fireEvent.click(await screen.findByRole("button", { name: "Edit layout" }))
     await waitFor(() => expect(within(actions()).getAllByRole("button").map((b) => b.textContent?.trim())).toEqual(["Add chart", "Done"]))
-    expect(screen.getByText(/Editing the layout\./)).toBeTruthy()
+    expect(screen.getByText("Drag tiles to move · drag a corner to resize · saves automatically")).toBeTruthy()
     expect(screen.getByRole("button", { name: "Parameters" })).toBeTruthy()
     expect(screen.getByText("Add tabs")).toBeTruthy()
     expect(screen.getByRole("button", { name: "Edit phone layout" })).toBeTruthy()
     fireEvent.click(within(actions()).getByRole("button", { name: "Done" }))
     await waitFor(() => expect(within(actions()).getAllByRole("button").map((b) => b.getAttribute("aria-label") ?? b.textContent?.trim()))
       .toEqual(["Edit layout", "Share", "More actions"]))
-    expect(screen.queryByText(/Editing the layout\./)).toBeNull()
+    expect(screen.queryByText(/^Drag tiles to move/)).toBeNull()
     expect(screen.queryByRole("button", { name: "Parameters" })).toBeNull()
   })
 })
@@ -123,5 +132,33 @@ describe("the page frame (BI-61 T7)", () => {
     expect(frame.className).toContain("var(--content-bottom,1.5rem)")
     expect(frame.className).not.toContain("var(--content-bottom,5rem)")
     expect((document.querySelector("[data-slot='dashboard-scroll']") as HTMLElement).className).toContain("lg:overflow-y-auto")
+  })
+})
+
+// BI-61 review round 1, SHOULD-FIX 2: no sparkles icon beside a tile's title. The mark
+// there says the chart can be clicked (a pointing hand); who made the chart is said in
+// words in its ⋯, never as a sparkle.
+describe("the marks beside a tile's title (BI-61 review round 1)", () => {
+  it("draws no sparkles icon, for a chart made with the assistant either", async () => {
+    const chart = {
+      id: "c_ai", title: "jumlah by tahun", kind: "bar", mart: "mart_x", x: "tahun", y: "jumlah", source: "ai", span: 1,
+      def: { title: "jumlah by tahun", kind: "bar", mart: "mart_x", dimension: "tahun", measures: ["jumlah"] },
+    }
+    mount({ permissions: ["dashboard:read"], level: "view", charts: [chart], results: { c_ai: { columns: ["tahun", "jumlah"], rows: [{ tahun: "2024", jumlah: 1 }] } } })
+    expect(await screen.findByText("jumlah by tahun")).toBeTruthy()
+    const tile = document.querySelector("[data-slot='tile']") as HTMLElement
+    expect(within(tile).getByLabelText("Clickable chart").getAttribute("class")).toContain("lucide-pointer")
+    expect(document.querySelector("[data-slot='tile'] .lucide-sparkles")).toBeNull()
+    expect(document.querySelector(".lucide-sparkles")).toBeNull()
+    // The quiet mark that says who made it, with its words.
+    expect(within(tile).getByLabelText("Made with the assistant").getAttribute("class")).toContain("lucide-bot")
+  })
+
+  // BI-61 review round 1, SHOULD-FIX 5: a dashboard with no tabs starts its chips at the left.
+  it("starts the filter chips at the left on a dashboard with no tabs", async () => {
+    const param = { param: { id: "p_top", name: "top", label: "Top berapa", type: "number", default: 5, min: 1, max: 12 }, value: 5 }
+    mount({ permissions: ["dashboard:read"], level: "view", extra: { params: [param], defaultParams: { top: 5 }, appliedParams: { top: 5 } } })
+    await screen.findByRole("button", { name: /^Top berapa/ })
+    expect((document.querySelector("[data-align]") as HTMLElement).dataset.align).toBe("start")
   })
 })

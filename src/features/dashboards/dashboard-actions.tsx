@@ -105,8 +105,10 @@ export function DashboardActionsMenu({
             {/* The seven intervals in one submenu; the trigger says the one in force. */}
             <DropdownMenuSub>
               <DropdownMenuSubTrigger>
-                <Timer /> Auto-refresh
-                <span className="ml-auto text-xs text-muted-foreground">{autoLabel === "Manual" ? "Off" : autoLabel.replace("Every ", "")}</span>
+                {/* BI-61 review round 1, SHOULD-FIX 6: the label grows, so the value sits right beside
+                    the chevron (the base trigger's own `ml-auto` chevron would otherwise split the space). */}
+                <Timer /> <span className="flex-1">Auto-refresh</span>
+                <span data-slot="menu-value" className="text-xs text-muted-foreground">{autoLabel === "Manual" ? "Off" : autoLabel.replace("Every ", "")}</span>
               </DropdownMenuSubTrigger>
               <DropdownMenuSubContent className="w-52">
                 {REFRESH_OPTIONS.map((opt) => {

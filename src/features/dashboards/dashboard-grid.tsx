@@ -44,8 +44,12 @@ export type GridItem = {
   body: React.ReactNode;
   /** Heading of the ⋯ menu (e.g. where the data comes from). */
   menuLabel?: string;
-  /** Quiet lines at the top of the ⋯ menu (`soft` look): the data's time, the refresh mode, what the tile reads. */
-  menuNotes?: string[];
+  /**
+   * One quiet line at the top of the ⋯ menu (`soft` look): when the data is from
+   * and what the tile reads ("12:47 · mart_wisman"), with the full sentence as
+   * `detail` for the tooltip and screen readers (BI-61 review round 1, SHOULD-FIX 3).
+   */
+  menuNote?: { label: string; detail: string };
   /** "Data from 12:47", shown on hover in the `soft` look's header. */
   dataFrom?: string | null;
   menu?: TileMenuItem[];

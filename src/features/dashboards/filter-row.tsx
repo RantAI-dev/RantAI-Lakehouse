@@ -15,7 +15,16 @@ import { cn } from "@/lib/utils";
  * avoids, and each chip still opens its own panel there. Required filters are
  * still enforced by the controls and the server, wherever they are shown.
  */
-export function FilterRow({ children, className }: { readonly children: React.ReactNode; readonly className?: string }) {
+export function FilterRow({ children, className, align = "end" }: {
+  readonly children: React.ReactNode;
+  readonly className?: string;
+  /**
+   * Where the chips sit on a wide line: `end` beside the tabs, `start` on a
+   * dashboard with no tabs, where the right-hand chips left the line's start
+   * empty (BI-61 review round 1, SHOULD-FIX 5).
+   */
+  readonly align?: "start" | "end";
+}) {
   const ref = React.useRef<HTMLDivElement>(null);
   const [width, setWidth] = React.useState(0);
   // The width of the line the row shares with the tabs, not the row's own: beside
@@ -36,11 +45,12 @@ export function FilterRow({ children, className }: { readonly children: React.Re
     <div ref={ref} data-print-hide className={cn("min-w-0", className)}>
       <div
         data-layout={narrow ? "scroll" : "wrap"}
+        data-align={align}
         className={cn(
           "flex items-center gap-1.5",
           narrow
             ? "-mx-4 flex-nowrap overflow-x-auto px-4 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
-            : "flex-wrap justify-end",
+            : cn("flex-wrap", align === "end" ? "justify-end" : "justify-start"),
         )}
       >
         {children}
