@@ -94,7 +94,8 @@ describe("the Dashboards page header (BI-59 T1)", () => {
     const head = await header()
     await waitFor(() => expect(within(head).getByRole("button", { name: "New" })).toBeTruthy())
     const buttons = within(head).getAllByRole("button").map((b) => b.getAttribute("aria-label") ?? b.textContent?.trim())
-    expect(buttons.sort()).toEqual(["More actions", "New"])
+    // BI-59 review round 1, SHOULD-FIX 1: the Table / Gallery switch joined the search row.
+    expect(buttons.sort()).toEqual(["Gallery view", "More actions", "New", "Table view"])
     expect(within(head).getByRole("searchbox")).toBeTruthy()
     // The old toolbar's controls are gone from the page.
     for (const gone of ["Metrics", "Folders", "Trash", "Import…", "New dashboard", "Refresh"]) {
@@ -480,5 +481,23 @@ describe("at phone width (BI-59 T6)", () => {
       if (own) Object.defineProperty(window, "innerWidth", own)
       else delete (window as { innerWidth?: number }).innerWidth
     }
+  })
+})
+
+describe("the search row (BI-59 review round 1, SHOULD-FIX 1)", () => {
+  it("puts the search, the view switch, the ⋯ and New on one row under the title at 1366", async () => {
+    serve(["dashboard:read", "dashboard:write"])
+    renderPage()
+    const head = await header()
+    const search = within(head).getByRole("searchbox")
+    const row = search.closest("header > div")
+    if (!row) throw new Error("no row")
+    for (const name of ["New", "More actions", "Gallery view"]) {
+      await waitFor(() => expect(row.contains(within(head).getByRole("button", { name }))).toBe(true))
+    }
+    // The title is above, alone.
+    const title = within(head).getByRole("heading", { name: "Dashboards" })
+    expect(row.contains(title)).toBe(false)
+    expect(title.parentElement).toBe(head)
   })
 })

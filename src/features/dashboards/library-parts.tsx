@@ -35,16 +35,24 @@ export function useHasDock(): boolean {
 /**
  * The page as a frame that ends above the assistant bar, so the bar never
  * covers a row or a card (spec `BI-59` T5): the list scrolls inside the frame
- * instead of under the bar.
+ * instead of under the bar. Its height is the viewport less the navbar (4rem),
+ * the shell's top padding (1, 1.25 or 1.5rem) and the room kept under the
+ * content.
  *
- * With the bar, the height leaves the navbar (4rem), the shell's top padding
- * (1, 1.25 or 1.5rem) and 5rem for the bar, and the negative bottom margin
- * gives back the bottom padding the app frame adds for the bar (`pb-24` /
- * `lg:pb-28`), so the window itself does not scroll. Without the bar the
- * frame is the viewport less the navbar and the shell's own padding.
+ * BI-59 review round 1, SHOULD-FIX 2: that room is read from the app shell's
+ * `--content-bottom`, the token BI-58 adds (`c4d87211`, `50295df6`: the
+ * composer's measured height plus its offset and gap while it shows, 1.5rem
+ * when it hides). Until that lands the variable is absent and the fallbacks
+ * are today's shell: with the bar, a 5rem dock spacer after `main` and a
+ * `pb-24` / `lg:pb-28` bottom padding that the negative margin gives back;
+ * without it, the shell's own bottom padding. With the token the frame's height
+ * alone puts its end where the shell says; the margin there works out at
+ * `--content-bottom - 6rem` (or `- 7rem`) against a `main` that pads by
+ * `--content-bottom`, which only shortens `main`'s box below the frame and
+ * moves nothing on screen. It goes when this branch has the token.
  *
  * Below `lg` the whole frame scrolls, header included, so a phone keeps the
- * room for the rows; from `lg` only the list scrolls (`ScrollRegion`).
+ * room for the rows; from `lg` only the list does (`ScrollRegion`).
  */
 export function PageFrame({ children, className }: { readonly children: React.ReactNode; readonly className?: string }) {
   const dock = useHasDock()
@@ -53,8 +61,11 @@ export function PageFrame({ children, className }: { readonly children: React.Re
       className={cn(
         "flex min-h-0 flex-col overflow-y-auto lg:overflow-hidden",
         dock
-          ? "-mb-24 h-[calc(100dvh-10rem)] sm:h-[calc(100dvh-10.25rem)] lg:-mb-28 lg:h-[calc(100dvh-10.5rem)]"
-          : "h-[calc(100dvh-6rem)] sm:h-[calc(100dvh-6.5rem)] lg:h-[calc(100dvh-7rem)]",
+          ? cn(
+              "h-[calc(100dvh-5rem-var(--content-bottom,5rem))] sm:h-[calc(100dvh-5.25rem-var(--content-bottom,5rem))] lg:h-[calc(100dvh-5.5rem-var(--content-bottom,5rem))]",
+              "mb-[calc(var(--content-bottom,0px)-6rem)] lg:mb-[calc(var(--content-bottom,0px)-7rem)]",
+            )
+          : "h-[calc(100dvh-5rem-var(--content-bottom,1rem))] sm:h-[calc(100dvh-5.25rem-var(--content-bottom,1.25rem))] lg:h-[calc(100dvh-5.5rem-var(--content-bottom,1.5rem))]",
         className,
       )}
     >
