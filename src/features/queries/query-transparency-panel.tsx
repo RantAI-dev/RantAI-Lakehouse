@@ -208,10 +208,9 @@ export function QueryTransparencyPanel({
           </dl>
         </div>
       ) : null}
-      {/* A query ClickHouse cannot even plan has no estimate — and its
-          reason (as the server sends it: today the engine's trimmed
-          diagnosis, `SEC-11` decision 4; review round 1, R1 restored this
-          after T1's held wording was written here) is the most useful thing
+      {/* A query ClickHouse cannot even plan has no estimate. Its reason is
+          the server's fixed sentence and reference id (the engine's text is
+          logged under that reference, `SEC-11`). It is the most useful thing
           on this panel, so it is shown instead of a row of zeros. */}
       {state.data?.error && state.data.supported !== false && estimatable !== false ? (
         <div className="space-y-1">
