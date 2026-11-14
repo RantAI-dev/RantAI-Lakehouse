@@ -24,7 +24,7 @@ import { GALLERY_ROW_CAP, MAIN_KINDS, drawsFrom, kindNeed, previewShape, type So
 import { cn } from "@/lib/utils";
 import { KIND_DESCRIPTIONS, KIND_GROUPS, KIND_KEYWORDS, KIND_LABELS, kindBlurb, kindIcon, kindShort } from "./chart-kinds";
 import { kindSample } from "@/lib/kind-sample";
-import { TileBody } from "./tile-body";
+import { ThumbnailContext, TileBody } from "./tile-body";
 
 const EASE = "transition-[background-color,color,box-shadow,opacity,transform] duration-200 ease-[cubic-bezier(0.2,0,0,1)]";
 const FOCUS = "outline-none focus-visible:ring-3 focus-visible:ring-ring/50";
@@ -136,35 +136,41 @@ function KindGallery({ kind, onPick, facts, preview, dark }: {
   const rows = React.useMemo(() => preview?.rows.slice(0, GALLERY_ROW_CAP) ?? [], [preview]);
   return (
     <>
-      {/* The title, the view switch (clear of the dialog's close button), then the search; they stay put while the types scroll. */}
+      {/* Owner QA 2026-11-14, gallery header: the title row holds only "Chart type" and the close
+          button; the search and the Cards / List switch share the next row, the search taking the
+          room and the switch the search's own height (32 px). On a phone the switch stays on that
+          row as two icons (their names are their accessible names and tooltips). The header stays
+          put while the types scroll. */}
       <div className="grid shrink-0 gap-3 border-b border-border/60 px-5 pt-4 pb-3">
-        <div className="flex items-center justify-between gap-3 pr-10">
+        <div className="flex min-h-8 items-center pr-10">
           <DialogTitle className="text-base font-semibold">Chart type</DialogTitle>
-          <div role="radiogroup" aria-label="View" className="inline-flex rounded-lg bg-muted p-0.5">
+        </div>
+        <div className="flex items-center gap-2" data-slot="gallery-search-row">
+          <div className="relative min-w-0 flex-1">
+            <Search aria-hidden className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              value={query} onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                // Enter picks the first match the source can make, so "sank⏎" is enough.
+                const first = groups.flatMap((g) => g.items).find((i) => !kindNeed(i.value, facts));
+                if (e.key === "Enter" && first) { e.preventDefault(); onPick(first.value); }
+              }}
+              placeholder="Search chart types" aria-label="Search chart types" className="h-8 bg-background pl-8"
+            />
+          </div>
+          <div role="radiogroup" aria-label="View" className="inline-flex h-8 shrink-0 items-center rounded-lg bg-muted p-0.5">
             {([["cards", "Cards", LayoutGrid], ["list", "List", List]] as const).map(([value, label, Icon]) => (
               <button
-                key={value} type="button" role="radio" aria-checked={view === value} onClick={() => pickView(value)}
+                key={value} type="button" role="radio" aria-checked={view === value} aria-label={label} title={label} onClick={() => pickView(value)}
                 className={cn(
-                  "inline-flex h-7 items-center gap-1.5 rounded-md px-2.5 text-xs font-medium", EASE, FOCUS,
+                  "inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium sm:px-2.5", EASE, FOCUS,
                   view === value ? "bg-background text-foreground shadow-sm dark:bg-input/40" : "text-muted-foreground hover:text-foreground",
                 )}
               >
-                <Icon aria-hidden className="size-3.5" /> {label}
+                <Icon aria-hidden className="size-3.5" /> <span className="hidden sm:inline">{label}</span>
               </button>
             ))}
           </div>
-        </div>
-        <div className="relative">
-          <Search aria-hidden className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            value={query} onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => {
-              // Enter picks the first match the source can make, so "sank⏎" is enough.
-              const first = groups.flatMap((g) => g.items).find((i) => !kindNeed(i.value, facts));
-              if (e.key === "Enter" && first) { e.preventDefault(); onPick(first.value); }
-            }}
-            placeholder="Search chart types" aria-label="Search chart types" className="h-8 bg-background pl-8"
-          />
         </div>
         {/* BI-58 review round 3, SHOULD-FIX 8 (owner): before any data, every picture is the sample. */}
         {preview ? null : <DialogDescription className="text-xs">Pick a source and columns to see your own numbers.</DialogDescription>}
@@ -232,7 +238,9 @@ function KindPicture({ kind, picture, hasData, dark, className, zoom = 2 }: {
         // Drawn at twice the size and scaled down: the chart's own margins are fixed in pixels, so at
         // card size they left the shape a sliver; scaled, it keeps the proportions of the real chart.
         <span className={cn("absolute top-0 left-0 block origin-top-left p-2", zoom === 4 ? "h-[400%] w-[400%] scale-25" : "h-[200%] w-[200%] scale-50")}>
-          <TileBody spec={drawn.spec} cell={drawn.cell} dark={dark} loading={false} hideLegend />
+          <ThumbnailContext.Provider value>
+            <TileBody spec={drawn.spec} cell={drawn.cell} dark={dark} loading={false} hideLegend />
+          </ThumbnailContext.Provider>
         </span>
       ) : sample.kind === "illustration" ? (
         <KindDrawing picture={sample.picture} />
