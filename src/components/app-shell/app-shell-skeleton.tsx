@@ -20,6 +20,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { LoadingSkeleton } from "@/components/patterns/page-states";
 import { DashboardPageSkeleton } from "@/features/dashboards/dashboard-skeleton";
 import { DashboardListPageSkeleton } from "@/features/dashboards/dashboard-list-skeleton";
+import { HomePlaceholder } from "@/features/home/home-frame";
 import { useSidebarGroups } from "@/hooks/use-sidebar-groups";
 import { cn } from "@/lib/utils";
 import {
@@ -105,7 +106,9 @@ export function AppShellSkeleton({ pathname }: { pathname: string }) {
         </header>
         <div className="flex flex-1 min-h-0 min-w-0">
           <div className="flex-1 min-w-0 p-4 sm:p-5 lg:p-6" aria-busy="true">
-            {placeholder === "dashboard-list" ? (
+            {placeholder === "home" ? (
+              <HomePlaceholder />
+            ) : placeholder === "dashboard-list" ? (
               <DashboardListPageSkeleton />
             ) : placeholder === "dashboard" ? (
               <DashboardPageSkeleton />
