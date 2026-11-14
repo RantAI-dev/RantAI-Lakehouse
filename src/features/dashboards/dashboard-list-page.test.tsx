@@ -484,20 +484,30 @@ describe("at phone width (BI-59 T6)", () => {
   })
 })
 
-describe("the search row (BI-59 review round 1, SHOULD-FIX 1)", () => {
-  it("puts the search, the view switch, the ⋯ and New on one row under the title at 1366", async () => {
+describe("the header row (BI-59 review rounds 1 and 2, SHOULD-FIX 1 and 3)", () => {
+  it("holds the title, the search, the view switch, the ⋯ and New in one row element at 1366", async () => {
     serve(["dashboard:read", "dashboard:write"])
     renderPage()
     const head = await header()
-    const search = within(head).getByRole("searchbox")
-    const row = search.closest("header > div")
-    if (!row) throw new Error("no row")
-    for (const name of ["New", "More actions", "Gallery view"]) {
-      await waitFor(() => expect(row.contains(within(head).getByRole("button", { name }))).toBe(true))
-    }
-    // The title is above, alone.
     const title = within(head).getByRole("heading", { name: "Dashboards" })
-    expect(row.contains(title)).toBe(false)
-    expect(title.parentElement).toBe(head)
+    const search = within(head).getByRole("searchbox")
+    await waitFor(() => expect(within(head).getByRole("button", { name: "New" })).toBeTruthy())
+    // One flex row: each control's own box is a direct child of the header.
+    const box = (el: Element) => {
+      let at: Element | null = el
+      while (at && at.parentElement !== head) at = at.parentElement
+      return at
+    }
+    const parts = [
+      title,
+      search,
+      within(head).getByRole("group", { name: "View" }),
+      within(head).getByRole("button", { name: "More actions" }),
+      within(head).getByRole("button", { name: "New" }),
+    ].map(box)
+    expect(parts.every(Boolean)).toBe(true)
+    expect(new Set(parts).size).toBe(5)
+    expect(head.className).toContain("flex")
+    expect(head.className).not.toContain("flex-wrap")
   })
 })

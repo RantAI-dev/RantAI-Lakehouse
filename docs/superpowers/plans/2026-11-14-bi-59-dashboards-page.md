@@ -231,3 +231,34 @@
 
 - No horizontal scroll at any size.
 - The five `state-*.png` shots predate this round and still show the old header.
+
+### Handoff, BI-59 review round 2 (developer, 2026-11-14)
+
+**SHOULD-FIX 3: one compact header row** (owner QA, "tingginya gede banget"; DESIGN.md §3 "Judul, pencarian, dan aksi halaman satu baris yang ringkas").
+
+- **Layout.** One row holds the title, the search (it takes the remaining width), the Table / Gallery switch, ⋯ and + New.
+  - Every control is 36 px tall, the console's `h-9`, and the title is centred on them (`leading-9`).
+  - The list's top margin went from `mt-5` to `mt-4`.
+  - The type filter and the folder picker stay on the list's own row.
+- **Shared look.** The controls are the shadcn components, sized to our tokens, with `rounded-lg` and no border:
+  - the search, the switch and ⋯ share one soft fill (`bg-muted/70`, `dark:bg-input/30`);
+  - ⋯ is the ghost `Button` at `icon-lg` with that fill, not the default outline button;
+  - New is the primary `Button` at `lg` (h-9).
+- **Phone.** The title has its own row. Under it: the search, ⋯ and an icon-only New. The view switch stays in the filters row.
+- **Measured in Chrome over CDP:**
+
+  | Viewport | Title | Search | Switch | ⋯ | New | Header height | Recent / list starts |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | 1366x900, all four Table/Gallery and light/dark shots | 88 / 36 | 88 / 36 | 88 / 36 | 88 / 36 | 88 / 36 | 36 (was 44 + 16 + 28) | 140 |
+  | 390x844 | 80 / 36 | 128 / 36 | in the filters row | 128 / 36 | 128 / 36 | n/a | n/a |
+
+  Each cell is top / height in px. No horizontal scroll at either size.
+- **Test.** The header is one flex row (no wrap at desktop width). The title, the search, the switch, ⋯ and New are five separate direct children of it.
+- **Checks** (each under `systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0 nice -n 15`, one at a time):
+  - `bun test` on three files (`dashboard-list-page.test.tsx`, `template-pages.test.tsx`, `library-item-menu.test.tsx`): 37 pass, 0 fail;
+  - eslint on `src/features/dashboards/`: clean;
+  - `bun run typecheck`: clean.
+  - **Not verified:** the full `bun run lint` and `bun run test`, left to CI.
+- **Screenshots.** Retaken at 1366: `{table,gallery}-{light,dark}-1366x900.png`.
+  - The 1190 and 390 shots, and the `state-*` shots, show the earlier headers.
+  - A brief dev server on 28622 and one headless Chrome were stopped by PID afterwards. 28620 was not touched.
