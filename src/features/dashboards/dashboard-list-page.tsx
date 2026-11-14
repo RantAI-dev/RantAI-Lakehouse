@@ -105,18 +105,21 @@ function useViewMode(): readonly [ViewMode, (next: ViewMode) => void] {
 }
 
 /** The Table / Gallery switch: two icon buttons with `aria-pressed`, in one soft group like the type filter. */
-function ViewSwitch({ value, onChange, tall }: {
+/**
+ * The Table / Gallery switch: two icon buttons with `aria-pressed` in one soft
+ * group, 36 px tall like the search and the buttons beside it (BI-59 review
+ * round 2, SHOULD-FIX 3): a filled group, no border, the console's `rounded-lg`.
+ */
+function ViewSwitch({ value, onChange }: {
   readonly value: ViewMode
   readonly onChange: (next: ViewMode) => void
-  /** In the search row: as tall as the search (BI-59 review round 1, SHOULD-FIX 1). */
-  readonly tall?: boolean
 }) {
   const options = [
     { value: "table" as const, label: "Table view", icon: Rows3 },
     { value: "gallery" as const, label: "Gallery view", icon: LayoutGrid },
   ]
   return (
-    <div role="group" aria-label="View" className={cn("inline-flex shrink-0 rounded-lg bg-muted p-0.5", tall && "h-11")}>
+    <div role="group" aria-label="View" className="inline-flex h-9 shrink-0 rounded-lg bg-muted/70 p-0.5 dark:bg-input/30">
       {options.map((o) => {
         const on = o.value === value
         return (
@@ -128,8 +131,7 @@ function ViewSwitch({ value, onChange, tall }: {
             title={o.label}
             onClick={() => onChange(o.value)}
             className={cn(
-              "grid place-items-center rounded-md",
-              tall ? "size-10" : "size-8",
+              "grid size-8 place-items-center rounded-md",
               EASE, FOCUS,
               on ? "bg-background text-foreground shadow-sm dark:bg-input/40" : "text-muted-foreground hover:text-foreground",
             )}
@@ -459,37 +461,36 @@ export function DashboardListPage() {
   return (
     <PageFrame>
       {/*
-        BI-59 review round 1, SHOULD-FIX 1 (owner QA; DESIGN.md §3 "Pencarian dan aksi halaman
-        satu baris"): the title alone, then one row with the search taking the width on the left
-        and the page's actions on the right, all 44 px tall and centred. From sm the Table /
-        Gallery switch joins them; on a phone it stays in the filters row so the search keeps
-        its room, and New is the plus alone.
+        BI-59 review round 2, SHOULD-FIX 3 (owner QA, "tingginya gede banget"; DESIGN.md §3 "Judul,
+        pencarian, dan aksi halaman satu baris yang ringkas"): one compact row, every control 36 px
+        (the console's h-9) with the title centred on them: the title, the search taking the
+        remaining width, the Table / Gallery switch, the page ⋯ and New. On a phone the title has
+        its own row, then the search, the ⋯ and an icon-only New; the switch stays in the filters
+        row there so the search keeps its room.
       */}
-      <header className="grid shrink-0 gap-4">
-        <h1 className="text-xl font-semibold tracking-tight">Dashboards</h1>
-        <div className="flex items-center gap-2">
-          <SearchField value={query} onChange={setQuery} className="min-w-0 flex-1" />
-          {phone ? null : <ViewSwitch value={view} onChange={setView} tall />}
-          <PageMenu
-            onFolders={canFile ? () => setFoldersOpen(true) : undefined}
-            onTrash={canFile ? () => setTrashOpen(true) : undefined}
+      <header className={cn("flex shrink-0 items-center gap-2", phone && "flex-wrap gap-y-3")}>
+        <h1 className={cn("mr-2 shrink-0 text-xl leading-9 font-semibold tracking-tight", phone && "w-full")}>Dashboards</h1>
+        <SearchField value={query} onChange={setQuery} className="min-w-0 flex-1" />
+        {phone ? null : <ViewSwitch value={view} onChange={setView} />}
+        <PageMenu
+          onFolders={canFile ? () => setFoldersOpen(true) : undefined}
+          onTrash={canFile ? () => setTrashOpen(true) : undefined}
+        />
+        {/* BI-18 part C review fix (SHOULD-FIX) R27: without `dashboard:write` there is no New. */}
+        {canFile ? (
+          <NewMenu
+            templates={templates}
+            renderPicture={(t) => (
+              <ItemPicture item={templateItem(t)} charts={null} size="sm" className="h-10 w-16 shrink-0" />
+            )}
+            onDashboard={() => setCreateOpen(true)}
+            onTemplate={setUsing}
+            onImport={() => setImportOpen(true)}
           />
-          {/* BI-18 part C review fix (SHOULD-FIX) R27: without `dashboard:write` there is no New. */}
-          {canFile ? (
-            <NewMenu
-              templates={templates}
-              renderPicture={(t) => (
-                <ItemPicture item={templateItem(t)} charts={null} size="sm" className="h-10 w-16 shrink-0" />
-              )}
-              onDashboard={() => setCreateOpen(true)}
-              onTemplate={setUsing}
-              onImport={() => setImportOpen(true)}
-            />
-          ) : null}
-        </div>
+        ) : null}
       </header>
 
-      <ScrollRegion className="-mx-2 mt-5 px-2 pb-6">
+      <ScrollRegion className="-mx-2 mt-4 px-2 pb-6">
         <div className="grid grid-cols-[minmax(0,1fr)] gap-7">
           {!query.trim() && state.status === "success" && !loading ? (
             <RecentRow recent={recent} boards={boardsById} source={pictures} />

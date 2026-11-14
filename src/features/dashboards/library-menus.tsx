@@ -51,9 +51,9 @@ export function NewMenu({
 }) {
   return (
     <DropdownMenu>
-      {/* BI-59 review round 1, SHOULD-FIX 1: as tall as the search beside it (h-11); on a phone the
-          word is for screen readers only and the button is the plus alone, so the row still fits. */}
-      <DropdownMenuTrigger render={<Button className="h-11 text-white max-sm:w-11 max-sm:px-0 sm:px-4" />}>
+      {/* BI-59 review round 2, SHOULD-FIX 3: 36 px like the search beside it (the console's h-9); on
+          a phone the word is for screen readers only and the button is the plus alone. */}
+      <DropdownMenuTrigger render={<Button size="lg" className="text-white max-sm:w-9 max-sm:px-0! sm:px-3" />}>
         <Plus data-icon="inline-start" className="max-sm:mx-auto" /> <span className="max-sm:sr-only">New</span>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-72">
@@ -125,8 +125,18 @@ export function PageMenu({
 }) {
   return (
     <DropdownMenu>
-      {/* BI-59 review round 1, SHOULD-FIX 1: the height of the search beside it. */}
-      <DropdownMenuTrigger render={<Button variant="outline" size="icon" aria-label="More actions" className="size-11" />}>
+      {/* BI-59 review round 2, SHOULD-FIX 3: 36 px and filled like the search and the view switch
+          beside it, no border, so the row reads as one set rather than a default outline button. */}
+      <DropdownMenuTrigger
+        render={
+          <Button
+            variant="ghost"
+            size="icon-lg"
+            aria-label="More actions"
+            className="bg-muted/70 text-muted-foreground hover:bg-muted hover:text-foreground aria-expanded:bg-muted dark:bg-input/30 dark:hover:bg-input/50"
+          />
+        }
+      >
         <MoreHorizontal />
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-56">

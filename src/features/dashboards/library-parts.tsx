@@ -115,7 +115,7 @@ export function SearchField({
   }, [])
   return (
     <div className={cn("relative", className)}>
-      <Search aria-hidden className="pointer-events-none absolute top-1/2 left-3 size-4.5 -translate-y-1/2 text-muted-foreground" />
+      <Search aria-hidden className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
       <input
         ref={ref}
         type="search"
@@ -130,7 +130,7 @@ export function SearchField({
         placeholder={placeholder}
         aria-label="Search dashboards, reports and templates"
         className={cn(
-          "h-11 w-full min-w-0 rounded-lg bg-muted/70 pr-16 pl-9 text-[15px] placeholder:text-muted-foreground hover:bg-muted focus:bg-background focus:ring-1 focus:ring-ring/60 dark:bg-input/30 dark:focus:bg-input/40 [&::-webkit-search-cancel-button]:hidden",
+          "h-9 w-full min-w-0 rounded-lg bg-muted/70 pr-12 pl-9 text-sm placeholder:text-muted-foreground hover:bg-muted focus:bg-background focus:ring-1 focus:ring-ring/60 dark:bg-input/30 dark:focus:bg-input/40 [&::-webkit-search-cancel-button]:hidden",
           EASE,
           "outline-none focus-visible:ring-3 focus-visible:ring-ring/40",
         )}
@@ -143,7 +143,7 @@ export function SearchField({
             onChange("")
             ref.current?.focus()
           }}
-          className={cn("absolute top-1/2 right-2 grid size-7 -translate-y-1/2 place-items-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground", EASE, FOCUS)}
+          className={cn("absolute top-1/2 right-1.5 grid size-6 -translate-y-1/2 place-items-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground", EASE, FOCUS)}
         >
           <X className="size-3.5" aria-hidden />
         </button>
