@@ -33,7 +33,7 @@ function BrandLogo() {
   // Logo follows the theme: navy for a light sidebar, white for a dark one.
   return (
     <div className="relative aspect-[196/167] h-8 shrink-0" aria-hidden>
-      <Image src="/logo-light.svg" alt="Rantai Lake" fill unoptimized sizes="32px" className="object-contain dark:hidden" priority />
+      <Image src="/logo-light.svg" alt="RantAI Lakehouse" fill unoptimized sizes="32px" className="object-contain dark:hidden" priority />
       <Image src="/logo-dark.svg" alt="" fill unoptimized sizes="32px" className="hidden object-contain dark:block" priority />
     </div>
   )
@@ -295,8 +295,8 @@ export function AppSidebar() {
         <div className="flex min-w-0 items-center justify-start gap-2 group-data-[collapsible=icon]:justify-center">
           <BrandLogo />
           {/* Owner QA 2026-11-14, sidebar width: at 14rem the name stands alone, on one line. */}
-          <span className="min-w-0 flex-1 text-sm leading-none font-semibold tracking-[-0.084px] whitespace-nowrap text-sidebar-foreground group-data-[collapsible=icon]:hidden">
-            Rantai Lake
+          <span className="min-w-0 flex-1 text-sm leading-none font-semibold tracking-[-0.084px] truncate whitespace-nowrap text-sidebar-foreground group-data-[collapsible=icon]:hidden">
+            RantAI Lakehouse
           </span>
         </div>
       </SidebarHeader>

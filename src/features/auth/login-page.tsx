@@ -218,7 +218,7 @@ function nextPathFromQuery(): string {
 }
 
 /**
- * The official Rantai Lake mark (`public/logo-*.svg`, viewBox 196 x 167),
+ * The official RantAI Lakehouse mark (`public/logo-*.svg`, viewBox 196 x 167),
  * drawn whole in a box with the mark's own aspect ratio, so it is never
  * letterboxed or squashed (DESIGN.md §5). Height is set by the caller; width
  * follows. Decorative: the title beside it already names the product.
@@ -416,8 +416,10 @@ export function LoginPage() {
             </React.Suspense>
             {/* Centred over the form column (T8, owner 2026-11-14); the
                 labels, fields and notices stay left-aligned for reading. */}
-            <h1 className={cn(LOGIN_DISPLAY, "login-reveal login-reveal-1 text-center text-[30px] leading-[1.1] text-foreground")}>
-              Sign in to Rantai Lake
+            <h1 className={cn(LOGIN_DISPLAY, "login-reveal login-reveal-1 text-center text-[28px] leading-[1.1] text-foreground sm:text-[30px]")}>
+              Sign in to
+              <br />
+              RantAI Lakehouse
             </h1>
 
             {checkingSession ? (
@@ -606,7 +608,7 @@ export function LoginPage() {
         </div>
 
         <footer className="login-reveal login-reveal-5 flex items-center justify-between gap-4 text-xs text-muted-foreground">
-          <span>© {new Date().getFullYear()} Rantai Lake</span>
+          <span>© {new Date().getFullYear()} RantAI Lakehouse</span>
           {/* Placeholder destination — point this at the docs site (or
               wherever support lives) once that URL exists. */}
           <Link href="#" className={cn("rounded-sm outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50", EASE)}>
