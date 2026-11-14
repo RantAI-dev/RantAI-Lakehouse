@@ -138,6 +138,28 @@
      (`/dashboards/<id>`), so the row never depends on the resolver's guess. Opening a board
      remembers it again. Check: a test that visiting Browse clears the name and the row's href
      becomes `/dashboards/browse`; opening a board sets both back.
+11. **T11, the row remembers dashboards and reports, in its own memory (owner QA 2026-11-15).**
+   Owner: "berlaku buat halaman dashboard dan reports ini juga. pokoknya halaman yang ada di
+   dashboards nih yang namanya kesimpan di menu". T10 stored the row's name in the last-board
+   memory, which also drives the `/dashboards` resolver and Home's focal dashboard, so Browse's
+   reset made Home lose its last board. Split the two:
+   - **Last board** (`last-board.ts`, id plus name): back to its pre-T10 meaning for the resolver
+     and Home. Opening Browse no longer forgets it. Deleting a board still does.
+   - **The row's memory** (new, e.g. `dashboards-row.ts`): `{kind: "dashboard" | "report", id,
+     name}`, the last dashboard or report opened. Set when a dashboard page or a report page
+     (view or edit, `/dashboards/reports/<id>…`) opens, and again on rename. Cleared when Browse
+     opens and when that item is deleted (the page's delete, Browse's bulk delete and trash).
+     Same tab and cross-tab updates and the same `useSyncExternalStore` hook pattern as T10.
+   - The row shows that item's name, and its icon is the item kind's icon, the same one Browse
+     uses for a dashboard or a report. Its label part links to `/dashboards/<id>` or
+     `/dashboards/reports/<id>`. With nothing remembered: "Dashboards", the row's own icon, and
+     a link to `/dashboards/browse`. `aria-label` "Dashboard: <name>" or "Report: <name>".
+   - Metrics (`/dashboards/metrics`) and templates are not remembered: they are not items one
+     reopens.
+   - Check: tests for a report setting the row (name, icon, href), a dashboard after a report
+     replacing it, Browse clearing the row but **not** the last board, deleting the remembered
+     item clearing it, and Home's focal board still following the last board after a Browse
+     visit.
 
 ## 4. Machine rules (owner, 2026-11-14)
 
