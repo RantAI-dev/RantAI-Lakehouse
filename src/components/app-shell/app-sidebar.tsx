@@ -5,7 +5,7 @@ import { createPortal } from "react-dom"
 import Image from "next/image"
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
-import { Bot, ChevronDown, ChevronRight } from "lucide-react"
+import { ChevronDown, ChevronRight } from "lucide-react"
 import { useAuth } from "@/features/auth/auth-provider"
 import { rememberTableHref } from "@/hooks/use-table-memory"
 import {
@@ -127,9 +127,12 @@ export function AppSidebar() {
   // resets it, so the next conversation opens on its chats again.
   const hasAssistant = hasPermission("assistant:use") || hasPermission("assistant:ask")
   const onConversation = pathname === CONVERSATION_PATH && hasAssistant
-  const [menuOnConversation, setMenuOnConversation] = React.useState(false)
-  React.useEffect(() => setMenuOnConversation(false), [pathname])
-  const showChats = onConversation && !menuOnConversation
+  // Owner QA 2026-11-14: Home's split row opens the list on any page, so the view is the route's
+  // default (the list on a conversation, the menu elsewhere) unless the person chose one for this
+  // visit; any pathname change drops the choice.
+  const [chatsChoice, setChatsChoice] = React.useState<boolean | null>(null)
+  React.useEffect(() => setChatsChoice(null), [pathname])
+  const showChats = hasAssistant && (chatsChoice ?? onConversation)
 
   // The slide between the two views. The chat view mounts the first time it is wanted, off to the
   // right, and only then moves in, so the browser has a place to move it from; after that it stays
@@ -158,11 +161,11 @@ export function AppSidebar() {
   }, [chatsIn])
   const backToMenu = () => {
     focusOnArrival.current = "menu"
-    setMenuOnConversation(true)
+    setChatsChoice(false)
   }
-  const backToChats = () => {
+  const openChats = () => {
     focusOnArrival.current = "chats"
-    setMenuOnConversation(false)
+    setChatsChoice(true)
   }
   const [flyout, setFlyout] = React.useState<FlyoutState>(null)
   const flyoutRef = React.useRef<HTMLDivElement>(null)
@@ -254,8 +257,15 @@ export function AppSidebar() {
             // part that is the whole touch target for a second destination, one thin separator
             // between them. Each part lights up on its own; the active route lights only its own part.
             const action = first.action
-            const actionActive = !!action && (pathname === action.href || pathname.startsWith(`${action.href}/`))
+            const href = action?.href
+            const actionActive = !!action && (href ? pathname === href || pathname.startsWith(`${href}/`) : onConversation)
             const labelActive = active && !actionActive
+            const actionClass = cn(
+              "grid size-8 shrink-0 place-items-center rounded-r-md outline-hidden ring-sidebar-ring transition-colors duration-150 focus-visible:ring-2 group-data-[collapsible=icon]:hidden [&>svg]:size-3.5",
+              actionActive
+                ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                : "text-sidebar-foreground/70 hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
+            )
             return (
               <>
                 <SidebarMenuButton
@@ -283,18 +293,24 @@ export function AppSidebar() {
                     <Tooltip>
                       <TooltipTrigger
                         render={
-                          <Link
-                            href={action.href}
-                            aria-label={action.title}
-                            aria-current={actionActive ? "page" : undefined}
-                            onClick={(e) => handleNavClick(e, action.href)}
-                            className={cn(
-                              "grid size-8 shrink-0 place-items-center rounded-r-md outline-hidden ring-sidebar-ring transition-colors duration-150 focus-visible:ring-2 group-data-[collapsible=icon]:hidden [&>svg]:size-3.5",
-                              actionActive
-                                ? "bg-sidebar-accent text-sidebar-accent-foreground"
-                                : "text-sidebar-foreground/70 hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
-                            )}
-                          />
+                          href ? (
+                            <Link
+                              href={href}
+                              aria-label={action.title}
+                              aria-current={actionActive ? "page" : undefined}
+                              onClick={(e) => handleNavClick(e, href)}
+                              className={actionClass}
+                            />
+                          ) : (
+                            <button
+                              type="button"
+                              aria-label={action.title}
+                              aria-current={actionActive ? "page" : undefined}
+                              data-view-focus="menu"
+                              onClick={openChats}
+                              className={actionClass}
+                            />
+                          )
                         }
                       >
                         <action.icon />
@@ -371,32 +387,7 @@ export function AppSidebar() {
 
   const openGroup = groups.find((g) => g.label === flyout?.label)
 
-  /**
-   * The menu's way back to the chats, shown only on a conversation, right
-   * under Home where the conversations used to be listed (`WEB-18`).
-   * Elsewhere chats are reached from Home and the navbar's AI Copilot panel.
-   */
-  const aiChatsEntry = (
-    <SidebarMenuItem key="ai-chats">
-      <SidebarMenuButton
-        isActive
-        tooltip="AI chats"
-        data-view-focus="menu"
-        className={menuBtnClass(true)}
-        onClick={backToChats}
-      >
-        <Bot className="size-4 shrink-0" />
-        <span className={cn("flex-1 truncate text-left leading-5", SIDEBAR_FADE)}>AI chats</span>
-        <ChevronRight
-          className="size-3.5 shrink-0 text-sidebar-foreground/50 transition-opacity duration-150 group-data-[collapsible=icon]:opacity-0"
-          aria-hidden
-        />
-      </SidebarMenuButton>
-    </SidebarMenuItem>
-  )
-  const menuEntries = groups.flatMap((g) =>
-    onConversation && g.label === "Home" ? [renderEntry(g), aiChatsEntry] : [renderEntry(g)],
-  )
+  const menuEntries = groups.map(renderEntry)
 
   return (
     <Sidebar data-print-hide collapsible="icon" side="left" className={SIDEBAR_CLASS}>
