@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { RowsTable } from "@/components/patterns/rows-table";
+import { formatLocaleNumber } from "@/lib/format";
 import { filterLabel, isActiveFilter } from "@/lib/dashboard-filter-state";
 import {
   MEASURE_AGGREGATES, MAX_GROUPINGS, MAX_STEPS, columnsAfterSteps, isMetricColumn, storedAggregate, visibleColumns,
@@ -116,7 +117,7 @@ export function MeasureRows({
       {flexible && rows.length < max ? (
         <div>
           <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" disabled={disabled} onClick={() => onChange([...rows, { column: "", aggregate: "" }])}>
-            <Plus className="size-3" aria-hidden /> Add measure
+            <Plus className="size-3" aria-hidden /> Add value
           </Button>
         </div>
       ) : null}
@@ -394,7 +395,7 @@ export function StepsEditor({
                 <MeasureRows
                   rows={step.summarise.measures.map((m) => ({ column: m.column, aggregate: m.aggregate }))}
                   onChange={(rows) => set(i, { summarise: { ...step.summarise!, measures: rows.map((r) => ({ column: r.column, aggregate: r.aggregate || "sum" })) } })}
-                  labels={(j) => `Measure ${j + 1}`} min={1} max={6} own columns={cols.measures} defaultAggregate="sum"
+                  labels={(j) => `Value ${j + 1}`} min={1} max={6} own columns={cols.measures} defaultAggregate="sum"
                   disabled={disabled} placeholder="pick a measure" wholeMeasure={new Set()} fieldLabel={label}
                 />
               </>
@@ -439,23 +440,25 @@ export function StepsEditor({
  * listed.
  */
 export function PreviewRowsTable({
-  data, open, labels,
+  data, open, labels, values,
 }: {
   /** Phase 2 QA R13: the headers read as the chart's table does ("total visitors", not "sum_visitors"); a joined column reads `table.column`. */
   readonly labels?: Readonly<Record<string, string>>;
   readonly data: { columns: string[]; rows: Record<string, unknown>[]; truncated: boolean; limit: number };
   readonly open: boolean;
+  /** `BI-58` T6: the value columns, whose numbers get thousands separators. */
+  readonly values?: readonly string[];
 }) {
   const columns = visibleColumns(data.columns);
   const headers = Object.fromEntries(columns.map((c) => [c, labels?.[c] ?? displayColumn(c)]));
   return (
     <details open={open} className="rounded-md border border-border text-xs">
       <summary className="cursor-pointer px-2 py-1.5 font-medium">
-        Rows ({data.rows.length.toLocaleString("en-US")}{data.truncated ? ` of more than ${data.limit.toLocaleString("en-US")}` : ""})
+        Rows ({formatLocaleNumber(data.rows.length)}{data.truncated ? ` of more than ${formatLocaleNumber(data.limit)}` : ""})
       </summary>
-      {data.truncated ? <p className="px-2 pb-1 text-muted-foreground">Only the first {data.limit.toLocaleString("en-US")} rows are shown.</p> : null}
+      {data.truncated ? <p className="px-2 pb-1 text-muted-foreground">Only the first {formatLocaleNumber(data.limit)} rows are shown.</p> : null}
       <div className="max-h-56 overflow-auto">
-        <RowsTable columns={columns} labels={headers} rows={data.rows} namePlaceholders />
+        <RowsTable columns={columns} labels={headers} rows={data.rows} namePlaceholders numberColumns={values} />
       </div>
     </details>
   );

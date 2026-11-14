@@ -110,7 +110,8 @@ export function LayersSection({ layers, onChange, baseKind, grained, marts, sqlS
   };
   return (
     <div className="grid gap-2" data-testid="layers-section">
-      <Label>More questions</Label>
+      {/* `BI-58` T6: the person's word for `layers` (BI-13) is "second source"; the code keeps "layers". */}
+      <Label>Second source</Label>
       {blocked ? (
         <p className="flex items-start gap-1.5 text-xs text-amber-600 dark:text-amber-400" role="status">
           <TriangleAlert className="mt-0.5 size-3.5 shrink-0" aria-hidden /> {blocked}
@@ -169,7 +170,7 @@ export function LayersSection({ layers, onChange, baseKind, grained, marts, sqlS
             {layer.source ? (
               <>
                 <div className="grid gap-1.5">
-                  <Label>Lined up on</Label>
+                  <Label>Matched on</Label>
                   <Select value={choices.has(layer.dimension) ? layer.dimension : ""} items={columnItems(dimensions.map((d) => d.name), columnLabel)} onValueChange={(v) => set(i, { dimension: v ?? "" })} disabled={disabled || !fields}>
                     <SelectTrigger className="w-full" aria-label={`Question ${n} dimension`}><SelectValue placeholder={fields ? "pick a column" : "loading"} /></SelectTrigger>
                     <SelectContent>{dimensions.map((d) => <SelectItem key={d.name} value={d.name}>{columnLabel(d.name)}</SelectItem>)}</SelectContent>
@@ -177,7 +178,7 @@ export function LayersSection({ layers, onChange, baseKind, grained, marts, sqlS
                   {fields && !dimensions.length ? <p className="text-xs text-muted-foreground">{noMatchNote(baseKind)}</p> : null}
                 </div>
                 <MeasureRows
-                  rows={layer.measures} onChange={(measures) => set(i, { measures })} labels={(k) => (k === 0 ? "Measure" : `Measure ${k + 1}`)}
+                  rows={layer.measures} onChange={(measures) => set(i, { measures })} labels={(k) => (k === 0 ? "Value" : `Value ${k + 1}`)}
                   min={1} max={6} own columns={fields?.measures ?? []} defaultAggregate={layer.aggregate}
                   disabled={disabled || !fields} placeholder={fields ? "pick a column" : "loading"} wholeMeasure={new Set<string>()}
                   fieldLabel={columnLabel}

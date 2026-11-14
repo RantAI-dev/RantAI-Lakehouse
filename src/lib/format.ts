@@ -22,6 +22,29 @@ export function formatNumber(value: number | null | undefined): string {
 }
 
 /**
+ * A number a person reads in the chart builder (`BI-58` T6: the preview's
+ * rows, the result line, a table's row count), in the browser's own locale
+ * with its thousands separators: 1571564 reads "1,571,564" in English and
+ * "1.571.564" in Indonesian. `null` and anything not finite read as "—".
+ */
+export function formatLocaleNumber(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "—"
+  return value.toLocaleString(undefined, { maximumFractionDigits: 2 })
+}
+
+/**
+ * An error text from the server as a sentence (`BI-58` T6): the server's own
+ * messages start in lower case ("invalid or missing measure column"), so the
+ * first letter is raised and a full stop is added when it has none.
+ */
+export function asSentence(text: string): string {
+  const t = text.trim()
+  if (!t) return t
+  const first = t.charAt(0).toUpperCase() + t.slice(1)
+  return /[.!?…]$/.test(first) ? first : `${first}.`
+}
+
+/**
  * Bytes → short human string, e.g. 1536 → "1.5 KB", 2.4e12 → "2.4 TB".
  * `null` means the size is not measurable from here, and reads as "—".
  */

@@ -23,6 +23,7 @@ afterAll(() => {
 })
 
 import { dashboardService, metricService, paramService } from "@/services"
+import { formatLocaleNumber } from "@/lib/format"
 import { ChartBuilder, type ChartDef } from "./chart-builder"
 import { ReportingProvider } from "./reporting-context"
 
@@ -45,6 +46,8 @@ const FIELDS = {
 
 /** The fields the stub answers; a test may take columns away. */
 let fieldsAnswer: typeof FIELDS = FIELDS
+/** The dashboard's parameters the stub answers. */
+let paramsAnswer: unknown[] = []
 let fetches: string[] = []
 let previews: Record<string, unknown>[] = []
 /** The preview route's answer: an error unless a test draws a chart. */
@@ -56,6 +59,7 @@ beforeEach(() => {
   drawn = []
   previewAnswer = null
   fieldsAnswer = FIELDS
+  paramsAnswer = []
   window.localStorage.clear()
   global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
@@ -74,6 +78,7 @@ beforeEach(() => {
     if (url.includes("/api/dashboard/fields")) return json({ marts: [{ name: "mart_visits", rows: 1571564 }] })
     if (url.includes("/api/dashboard/sources")) return json({ sources: [] })
     if (url.includes("/api/dashboard/metrics") && !url.includes("usage")) return json({ metrics: [] })
+    if (url.includes("/api/dashboard/params")) return json({ params: paramsAnswer })
     return json({ error: "not in this test" }, 500)
   }) as unknown as typeof fetch
 })
@@ -294,5 +299,60 @@ describe("the folded data panel (BI-58 T5)", () => {
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "Data" }) === null).toBe(true))
     expect(screen.getByRole("button", { name: "Data: mart_visits" })).toBeTruthy()
     await waitFor(() => expect(within(screen.getByRole("region", { name: "Preview" })).getByTestId("chart")).toBeTruthy())
+  })
+})
+
+// `BI-58` T6: the builder findings of the 2026-11-14 QA.
+describe("the builder findings of the 2026-11-14 QA (BI-58 T6)", () => {
+  const openTab = (name: string) => fireEvent.click(screen.getByRole("tab", { name }))
+
+  it("lets the Limit be emptied and typed into, and puts back the last number when left empty", async () => {
+    renderBuilder(SAVED.bar)
+    await waitFor(() => expect(previews.length).toBeGreaterThan(0))
+    openTab("Sort & filter")
+    const limit = (await screen.findByLabelText("Limit")) as HTMLInputElement
+    expect(limit.value).toBe("20")
+    fireEvent.focus(limit)
+    fireEvent.change(limit, { target: { value: "" } })
+    expect(limit.value).toBe("")
+    fireEvent.change(limit, { target: { value: "7" } })
+    expect(limit.value).toBe("7")
+    await waitFor(() => expect(previews[previews.length - 1]!.limit).toBe(7))
+    fireEvent.change(limit, { target: { value: "" } })
+    fireEvent.blur(limit)
+    expect(limit.value).toBe("7")
+  })
+
+  it("offers a number parameter as the limit, but not on a chart with steps, and says why", async () => {
+    paramsAnswer = [{ id: "p1", name: "top", label: "Top", type: "number", default: 10 }]
+    const { unmount } = renderBuilder(SAVED.bar)
+    await waitFor(() => expect(previews.length).toBeGreaterThan(0))
+    openTab("Sort & filter")
+    expect(await screen.findByLabelText("Limit from a parameter")).toBeTruthy()
+    unmount()
+    cleanup()
+    renderBuilder({ ...SAVED.bar, steps: [{ filter: [{ column: "visitors", op: "gt", value: "5" }] }] } as ChartDef)
+    await waitFor(() => expect(previews.length).toBeGreaterThan(0))
+    openTab("Sort & filter")
+    expect(await screen.findByText("A parameter cannot set the limit of a chart with steps.")).toBeTruthy()
+    expect(screen.queryByLabelText("Limit from a parameter")).toBeNull()
+  })
+
+  it("shows the server's lower-case error as a sentence", async () => {
+    previewAnswer = () => ({ status: 400, body: { error: "invalid or missing measure column" } })
+    renderBuilder(SAVED.bar)
+    expect(await screen.findByText("Invalid or missing measure column.")).toBeTruthy()
+  })
+
+  it("shows the values of the Rows table with the browser's thousands separators, and the X axis as it is", async () => {
+    previewAnswer = drawRows
+    renderBuilder(SAVED.bar)
+    const preview = screen.getByRole("region", { name: "Preview" })
+    await waitFor(() => expect(within(preview).getByTestId("chart")).toBeTruthy())
+    fireEvent.click(screen.getByRole("button", { name: "Data" }))
+    const rows = await within(preview).findByRole("table")
+    const cells = [...rows.querySelectorAll("tbody tr:first-child td")].map((td) => td.textContent)
+    expect(cells).toEqual(["2024-01-01", formatLocaleNumber(1571564)])
+    expect(cells[1]).not.toBe("1571564")
   })
 })

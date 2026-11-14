@@ -72,7 +72,7 @@ describe("missingSection", () => {
     expect(missingSection("Join 2 columns")).toBe(1)
   })
   it("puts the chart's own picks in section 2", () => {
-    for (const label of ["Dimension (X)", "Measure (Y)", "Group by", "Latitude", "Columns", "Rows", "Values", "Dimension bin width"]) expect(missingSection(label)).toBe(2)
+    for (const label of ["X axis", "Value", "Group by", "Latitude", "Columns", "Rows", "Values", "Dimension bin width"]) expect(missingSection(label)).toBe(2)
   })
   it("puts steps, questions and a KPI's comparison in section 4", () => {
     for (const label of ["Step 1 value", "Question 2 measure", "Date column", "Goal"]) expect(missingSection(label)).toBe(4)

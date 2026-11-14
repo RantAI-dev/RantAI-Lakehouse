@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 
-import { builderRules, carryOverOnKindSwitch, type BuilderState } from "./builder-rules"
+import { builderRules, carryOverOnKindSwitch, limitTakesParam, type BuilderState } from "./builder-rules"
 
 const plain: BuilderState = {
   kind: "bar", rowsMode: false, grained: false, breakdown: false, other: false, steps: 0, layers: 0,
@@ -91,12 +91,12 @@ test("with 'Other' on, steps and questions are hidden and the reason is one hint
   assert.equal(r.steps, false)
   assert.equal(r.layers, false)
   assert.equal(r.other.disabled, false)
-  assert.equal(r.other.hint, "While this is on, steps and more questions are not available.")
+  assert.equal(r.other.hint, "While this is on, steps and a second source are not available.")
 })
 
 test("with steps or questions present, 'Other' cannot be turned on and says why", () => {
   assert.deepEqual(rules({ steps: 1 }).other, { shown: true, disabled: true, hint: "Not available with steps." })
-  assert.deepEqual(rules({ layers: 1 }).other, { shown: true, disabled: true, hint: "Not available with more questions." })
+  assert.deepEqual(rules({ layers: 1 }).other, { shown: true, disabled: true, hint: "Not available with a second source." })
 })
 
 test("a breakdown, a time grain or questions rule steps out, and a breakdown or steps rule questions out", () => {
@@ -111,7 +111,7 @@ test("a breakdown, a time grain or questions rule steps out, and a breakdown or 
 })
 
 test("questions lock the breakdown and the bins", () => {
-  assert.equal(rules({ layers: 1 }).breakdownLocked, "Not available with more questions.")
+  assert.equal(rules({ layers: 1 }).breakdownLocked, "Not available with a second source.")
   assert.equal(rules({ layers: 1 }).bins, false)
   assert.equal(rules({}).breakdownLocked, undefined)
 })
@@ -137,4 +137,11 @@ test("a grouped table becoming a chart makes its first grouping the dimension", 
   assert.equal(patch.bin, null)
   // Raw rows have no groupings to carry.
   assert.deepEqual(carryOverOnKindSwitch({ ...sw, from: "table", to: "bar", rowsMode: true, groupings: [] }), {})
+})
+
+test("a parameter may be the limit of a chart along one dimension, not of a table, a map of points or a chart with steps (BI-58 T6)", () => {
+  assert.equal(limitTakesParam("bar", { steps: false, rowsMode: false }), true)
+  assert.equal(limitTakesParam("line", { steps: false, rowsMode: false }), true)
+  assert.equal(limitTakesParam("bar", { steps: true, rowsMode: false }), false)
+  for (const kind of ["table", "pivot", "pointmap", "boxplot", "bullet", "gantt", "histogram"]) assert.equal(limitTakesParam(kind, { steps: false, rowsMode: false }), false, kind)
 })

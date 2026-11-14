@@ -7,6 +7,7 @@
  * inspector's tabs (`BI-58` T4).
  */
 import * as React from "react";
+import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import type { ColumnRef } from "@/lib/chart-shape";
 
@@ -75,5 +76,42 @@ export function Segmented<T extends string>({ value, options, onChange, label, c
         );
       })}
     </div>
+  );
+}
+
+/**
+ * A whole number the person types, such as the chart's limit (`BI-58` T6, QA
+ * 2026-11-14): the box can be emptied and typed into, and each value in range
+ * is applied as it is typed. On leaving the box, an empty or unreadable value
+ * goes back to the last one applied, and one out of range is brought to the
+ * nearest end. (It used to snap to the default on every keystroke, so the
+ * first digit could not be deleted.)
+ */
+export function WholeNumberInput({ value, min, max, onCommit, ...props }: Omit<React.ComponentProps<typeof Input>, "value" | "onChange" | "min" | "max" | "type"> & {
+  readonly value: number;
+  readonly min: number;
+  readonly max: number;
+  readonly onCommit: (next: number) => void;
+}) {
+  const [text, setText] = React.useState(String(value));
+  const [editing, setEditing] = React.useState(false);
+  const shown = editing ? text : String(value);
+  return (
+    <Input
+      {...props} type="number" inputMode="numeric" min={min} max={max} value={shown}
+      onFocus={() => { setText(String(value)); setEditing(true); }}
+      onChange={(e) => {
+        const raw = e.target.value;
+        setText(raw);
+        setEditing(true);
+        const n = Number(raw);
+        if (raw.trim() !== "" && Number.isInteger(n) && n >= min && n <= max) onCommit(n);
+      }}
+      onBlur={() => {
+        const n = Number(text);
+        if (text.trim() !== "" && Number.isFinite(n)) onCommit(Math.max(min, Math.min(max, Math.round(n))));
+        setEditing(false);
+      }}
+    />
   );
 }

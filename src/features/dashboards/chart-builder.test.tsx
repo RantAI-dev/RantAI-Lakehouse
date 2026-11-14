@@ -126,16 +126,16 @@ describe("ChartBuilder kind rules (phase 2 QA R5)", () => {
     renderBuilder({ ...barDef, other: true, limit: 5, steps: undefined })
     await screen.findByLabelText("Aggregation of visitors")
     // The questions would be in the Data tab, open now.
-    expect(screen.queryByText("More questions")).toBeNull()
-    expect(screen.queryByText(/Remove .* to combine questions/)).toBeNull()
+    expect(screen.queryByText("Second source")).toBeNull()
+    expect(screen.queryByText(/Remove .* to add a second source/)).toBeNull()
     openTab("Sort & filter")
-    expect(await screen.findByText("While this is on, steps and more questions are not available.")).toBeTruthy()
+    expect(await screen.findByText("While this is on, steps and a second source are not available.")).toBeTruthy()
     expect(screen.queryByText("Steps")).toBeNull()
   })
 
   it("offers 'Other', steps and questions to a bar, and none of them to a KPI", async () => {
     const { unmount } = renderBuilder({ ...barDef, click: { kind: "url", url: "https://example.com/x" } })
-    expect(await screen.findByText("More questions")).toBeTruthy()
+    expect(await screen.findByText("Second source")).toBeTruthy()
     openTab("Sort & filter")
     await screen.findByLabelText("Group the rest as Other")
     expect(screen.getByText("Steps")).toBeTruthy()
@@ -143,7 +143,7 @@ describe("ChartBuilder kind rules (phase 2 QA R5)", () => {
     cleanup()
     renderBuilder({ title: "K", kind: "kpi", mart: "mart_visits", measures: ["visitors"], aggregate: "sum" })
     await screen.findByLabelText("Aggregation of visitors").catch(() => screen.findByText("Compare with"))
-    expect(screen.queryByText("More questions")).toBeNull()
+    expect(screen.queryByText("Second source")).toBeNull()
     openTab("Sort & filter")
     await screen.findByText("Filters")
     expect(screen.queryByLabelText("Group the rest as Other")).toBeNull()
@@ -194,8 +194,8 @@ describe("ChartBuilder dimension beside more questions (QA LH-BI-13-01)", () => 
     withNumberKinds()
     renderBuilder({ ...layered, dimension: "visitors" })
     await screen.findByLabelText("Aggregation of visitors")
-    // The trigger of the Dimension (X) select is the one in the same field as its label.
-    const field = screen.getByText(/^Dimension \(X\)/).closest("div") as HTMLElement
+    // The trigger of the X axis select is the one in the same field as its label.
+    const field = screen.getByText(/^X axis/, { selector: "label" }).closest("div") as HTMLElement
     fireEvent.click(field.querySelector('[role="combobox"]') as HTMLElement)
     // `stay` is a number column, in no way a dimension of the source: only the rule that keeps numbers offers it.
     expect(await screen.findByRole("option", { name: "stay" })).toBeTruthy()
@@ -293,7 +293,7 @@ describe("ChartBuilder inspector placement (phase 2 QA R10, BI-58 T4)", () => {
     expect(selectedTab()).toBe("Data")
     openTab("Sort & filter")
     await waitFor(() => expect(selectedTab()).toBe("Sort & filter"))
-    expect(screen.queryByLabelText("Measure (Y)")).toBeNull()
+    expect(screen.queryByLabelText("Value")).toBeNull()
   })
 
   it("has no Next button, even once the source is picked (phase 2 QA R19)", async () => {
@@ -317,7 +317,7 @@ describe("ChartBuilder inspector placement (phase 2 QA R10, BI-58 T4)", () => {
     openTab("Style")
     fireEvent.click(screen.getByRole("button", { name: "Save changes" }))
     await waitFor(() => expect(selectedTab()).toBe("Data"))
-    expect(screen.getByRole("alert").textContent).toContain("Dimension (X)")
+    expect(screen.getByRole("alert").textContent).toContain("X axis")
     // A boolean, not the element: a failing match would print the whole form on every retry.
     await waitFor(() => expect((document.activeElement as HTMLElement).closest("[data-slot=dimension-field]") !== null).toBe(true))
     expect(document.activeElement?.hasAttribute("data-placeholder")).toBe(true)
@@ -360,7 +360,7 @@ describe("ChartBuilder header (phase 2 QA R11, BI-58 T1)", () => {
 describe("ChartBuilder long column names (phase 2 QA R14)", () => {
   it("shows a picked joined measure by its own name with the table as a tag, and the full reference on hover", async () => {
     renderBuilder({ ...barDef, measures: ["mart_demo_province_capacity__rooms"] })
-    const trigger = await screen.findByRole("combobox", { name: /^Measure/ })
+    const trigger = await screen.findByRole("combobox", { name: /^Value/ })
     await waitFor(() => expect(trigger.textContent).toContain("rooms"))
     expect(trigger.textContent).toContain("capacity")
     expect(trigger.textContent).not.toContain("__")
@@ -404,7 +404,7 @@ describe("ChartBuilder conditional controls (phase 2 QA R15)", () => {
 
   it("draws no extra row when the dimension needs no bin or grain", async () => {
     renderBuilder(barDef)
-    await screen.findByText(/Dimension \(X\)/)
+    await screen.findByText(/^X axis/, { selector: "label" })
     expect(document.querySelector("[data-slot=conditional-row]")).toBeNull()
   })
 })
@@ -624,7 +624,7 @@ describe("ChartBuilder and a parameter slot (QA LH-BI-6-01)", () => {
     renderBuilder(barDef)
     await screen.findByLabelText("Aggregation of visitors")
     // The slot is a dimension of the picker.
-    const dimensionField = screen.getByText(/^Dimension \(X\)/).closest("div") as HTMLElement
+    const dimensionField = screen.getByText(/^X axis/, { selector: "label" }).closest("div") as HTMLElement
     fireEvent.click(dimensionField.querySelector('[role="combobox"]') as HTMLElement)
     expect(await screen.findByRole("option", { name: /\{ukuran\}/ })).toBeTruthy()
     // Close that list, open the filter section, and ask for a filter column.
@@ -672,7 +672,7 @@ describe("ChartBuilder breakdown grain and limit label (QA LH-BI-6-01)", () => {
     await screen.findByLabelText("Aggregation of visitors")
     const breakdownField = document.querySelector('[data-slot="breakdown-field"]') as HTMLElement
     choose(breakdownField.querySelector('[role="combobox"]') as HTMLElement, "d")
-    const groupBy = await screen.findByLabelText("Group the breakdown by")
+    const groupBy = await screen.findByLabelText("Group the split by")
     choose(groupBy, "Month")
     await waitFor(() => expect(bodies.some((b) => b.breakdownGrain === "month")).toBe(true))
   })
@@ -681,14 +681,14 @@ describe("ChartBuilder breakdown grain and limit label (QA LH-BI-6-01)", () => {
     renderBuilder({ ...barDef, breakdown: "category" })
     await screen.findByLabelText("Aggregation of visitors")
     openTab("Sort & filter")
-    expect(await screen.findByText("Limit (Top N, dimension and breakdown)")).toBeTruthy()
+    expect(await screen.findByText("Limit (Top N, X axis and split)")).toBeTruthy()
     cleanup()
     // A grain on a date dimension makes the limit the breakdown's alone.
     withDateColumn()
     renderBuilder({ ...barDef, dimension: "d", breakdown: "category", grain: "month" })
     await screen.findByLabelText("Aggregation of visitors")
     openTab("Sort & filter")
-    expect(await screen.findByText("Breakdown values (Top N)")).toBeTruthy()
+    expect(await screen.findByText("Split values (Top N)")).toBeTruthy()
   })
 
   /** Adds a table-calculation measure the base stub does not have. */
@@ -734,7 +734,7 @@ describe("ChartBuilder breakdown grain and limit label (QA LH-BI-6-01)", () => {
     const breakdownField = document.querySelector('[data-slot="breakdown-field"]') as HTMLElement
     choose(breakdownField.querySelector('[role="combobox"]') as HTMLElement, "category")
     await waitFor(() => expect(screen.queryAllByRole("option")).toHaveLength(0))
-    choose(await screen.findByLabelText("Measure (Y)"), "visitors")
+    choose(await screen.findByLabelText("Value"), "visitors")
     await waitFor(() => expect(screen.queryAllByRole("option")).toHaveLength(0))
     choose(await screen.findByLabelText("Group by"), "Month")
     await waitFor(() => expect(bodies.some((b) => b.grain === "month" && b.limit === 20)).toBe(true))
@@ -749,8 +749,8 @@ describe("ChartBuilder breakdown grain and limit label (QA LH-BI-6-01)", () => {
     await screen.findByLabelText("Aggregation of running")
     openTab("Sort & filter")
     expect(await screen.findByText("Limit (Top N)")).toBeTruthy()
-    expect(screen.queryByText("Limit (Top N, dimension and breakdown)")).toBeNull()
-    expect(screen.queryByText("Breakdown values (Top N)")).toBeNull()
+    expect(screen.queryByText("Limit (Top N, X axis and split)")).toBeNull()
+    expect(screen.queryByText("Split values (Top N)")).toBeNull()
   })
 })
 
@@ -767,10 +767,10 @@ describe("ChartBuilder radar measures (QA LH-BI-6-25)", () => {
 
   it("a radar offers Add measure and sends both measures", async () => {
     renderBuilder({ ...barDef, kind: "radar" })
-    await screen.findByLabelText("Measure (Y)")
-    fireEvent.click(await screen.findByRole("button", { name: /Add measure/ }))
+    await screen.findByLabelText("Value")
+    fireEvent.click(await screen.findByRole("button", { name: /Add value/ }))
     await waitFor(() => expect(screen.queryAllByRole("option")).toHaveLength(0))
-    choose(await screen.findByLabelText("Measure 2"), "stay")
+    choose(await screen.findByLabelText("Value 2"), "stay")
     await waitFor(() => expect(bodies.some((b) => Array.isArray(b.measures) && b.measures.length === 2)).toBe(true))
     const body = bodies[bodies.length - 1]!
     expect(body.kind).toBe("radar")

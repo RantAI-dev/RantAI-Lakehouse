@@ -82,11 +82,12 @@ import type { SourceFacts } from "@/lib/kind-gallery";
 
 export { KIND_GROUPS } from "./chart-kinds";
 import type { OwnSource } from "./filters/use-filter-values";
-import { ColumnLabel, Segmented, columnItems, focusFirstEmpty } from "./builder-sections";
+import { ColumnLabel, Segmented, WholeNumberInput, columnItems, focusFirstEmpty } from "./builder-sections";
+import { asSentence, formatLocaleNumber } from "@/lib/format";
 import { missingPlace, missingSection, sectionSummaries, type MissingPlace } from "@/lib/section-summary";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { CustomFieldsMenu } from "./custom-fields-menu";
-import { builderRules, carryOverOnKindSwitch } from "@/lib/builder-rules";
+import { builderRules, carryOverOnKindSwitch, limitTakesParam } from "@/lib/builder-rules";
 import type { StyleFields } from "@/lib/chart-style";
 import { effectivePalette, formatRules, styleFromDef, stylePayload, withCompanyPalette } from "@/lib/style-draft";
 import { FormatSection } from "./format-section";
@@ -199,11 +200,11 @@ const MEASURE_LABELS: Partial<Record<ChartKind, string[]>> = {
   scatter: ["X metric", "Y metric"],
   bubble: ["X metric", "Y metric", "Size metric"],
   combo: ["Bar metric", "Line metric"],
-  stacked: ["Measure", "2nd measure"],
-  pointmap: ["Measure (size and colour)"],
+  stacked: ["Value", "2nd value"],
+  pointmap: ["Value (size and colour)"],
   progress: ["Value"],
   bullet: ["Value"],
-  geoheat: ["Measure (weight)"],
+  geoheat: ["Value (weight)"],
 };
 
 /**
@@ -549,10 +550,12 @@ export function ChartBuilder({
     }));
   }
   const pivotNumberField = isPivot ? [...tableDraft.pivotRows, ...tableDraft.pivotColumns].find((c) => isNumber(c)) : undefined;
-  const mLabels = isSingle ? ["Measure"] : MEASURE_LABELS[kind] ?? ["Measure (Y)"];
-  const measureTitle = (i: number) => (limits.max > 1 && limits.max === limits.min ? mLabels[i] ?? `Measure ${i + 1}` : i === 0 ? mLabels[0] : `Measure ${i + 1}`);
-  const dimensionLabel = isChoropleth ? "Region column" : isPoints ? "Label" : isHistogram ? "Number column" : isGantt ? "Task column" : isBullet ? "Category" : "Dimension (X)";
-  const breakdownLabel = isGantt ? "Group" : kind === "sankey" ? "Flows to" : kind === "sunburst" ? "Outer ring" : isHeatmap ? "2nd dimension (Y)" : "Breakdown / series";
+  // `BI-58` T6: the labels say "X axis", "Split" and "Value", the words of the data panel's chips;
+  // the code keeps dimension, breakdown and measure, which the assistant and the docs use.
+  const mLabels = isSingle ? ["Value"] : MEASURE_LABELS[kind] ?? ["Value"];
+  const measureTitle = (i: number) => (limits.max > 1 && limits.max === limits.min ? mLabels[i] ?? `Value ${i + 1}` : i === 0 ? mLabels[0] : `Value ${i + 1}`);
+  const dimensionLabel = isChoropleth ? "Region column" : isPoints ? "Label" : isHistogram ? "Number column" : isGantt ? "Task column" : isBullet ? "Category" : "X axis";
+  const breakdownLabel = isGantt ? "Group" : kind === "sankey" ? "Flows to" : kind === "sunburst" ? "Outer ring" : isHeatmap ? "2nd dimension (Y)" : "Split into series";
   // Phase 2 QA R20: the title is built from the labels the pickers show (a metric's label, a
   // joined column's own name), never the stored reference (`metric:name`, `table__column`).
   const titleText = (name: string) => (name ? columnRef(name, {
@@ -635,7 +638,7 @@ export function ChartBuilder({
   // dimension, so a breakdown, "Other", steps or bins on the chart are refused with the questions.
   const layersApply = takesLayers(kind) && !rowsMode && layers.length > 0;
   const layersBlocked = [
-    ...(canBreakdown && breakdown ? ["a breakdown"] : []),
+    ...(canBreakdown && breakdown ? ["the split"] : []),
     ...(shape.other ? ["the 'Other' group"] : []),
     ...(shape.steps.length ? ["steps"] : []),
     ...(shape.bin || shape.breakdownBin ? ["bins"] : []),
@@ -676,7 +679,7 @@ export function ChartBuilder({
     ...sqlSources.map((s) => [encodeSourceChoice({ kind: "sql", id: s.id }), `SQL · ${s.title}`]),
     [NEW_SQL_CHOICE, "Custom SQL · new source"],
   ]);
-  const breakdownLabels: Record<string, string> = { [NO_BREAKDOWN]: "— no breakdown —" };
+  const breakdownLabels: Record<string, string> = { [NO_BREAKDOWN]: "— no split —" };
 
   async function loadFields(value: string, joins: readonly JoinDraft[] = shape.joins): Promise<Fields> {
     const picked = decodeSourceChoice(value);
@@ -886,6 +889,10 @@ export function ChartBuilder({
     bases: Object.fromEntries(measureRows.filter((r) => r.column).map((r) => [resultName(limits.own ? r : { ...r, aggregate: "" }, wholeMeasure), r.column])),
   };
   const stepsOn = stepsApply(shape, shapeContext);
+  // `BI-58` T6 (QA 2026-11-14): the server refuses a parameter as the limit of a chart with steps or
+  // of a kind that does not list groups along one dimension; the choice is hidden then, with why.
+  const limitParamOk = limitTakesParam(kind, { steps: stepsOn, rowsMode });
+  const limitParamUsed = limitParamOk ? limitParamName : "";
   const finalResult = stepsOn ? columnsAfterSteps(baseResult, shape.steps) : baseResult;
   const sortChoices = sortOptions(
     finalResult.groups.map((g) => g.name),
@@ -908,7 +915,7 @@ export function ChartBuilder({
     measures: measureRows.filter((r) => r.column).map((r) => measureLabel(limits.own ? r : { ...r, aggregate: "" }, wholeMeasure, aggregate)),
     mapLabel: isMap ? mapLabels[effectiveMap] ?? "" : "", lat, lon,
     sort: rules.sort === "choice" ? sortLabels[shape.sortChoice] ?? "" : rules.sort === "by-date" ? "by date" : rules.sort === "by-category" ? "by category" : "",
-    limit: rules.limit ? (limitParamName ? "param" : Math.min(limit, maxLimit)) : null,
+    limit: rules.limit ? (limitParamUsed ? "param" : Math.min(limit, maxLimit)) : null,
     filters: rules.filters ? shape.filters.length : 0, other: shape.other && rules.other.shown,
   });
   /** Shows the place that holds a missing field (the data panel or a tab) and moves focus to that field. */
@@ -996,7 +1003,7 @@ export function ChartBuilder({
         // A point map has a fixed cap of its own (lakehouse_bi::builder::POINT_LIMIT) and is not sorted.
         order: isCalendar ? "none" : isPoints ? undefined : legacyOrder,
         // A bullet graph without a category is one row and has no limit.
-        limit: isPoints || (isBullet && !dimension) ? undefined : limitParamName ? { param: limitParamName } : Math.min(limit, maxLimit),
+        limit: isPoints || (isBullet && !dimension) ? undefined : limitParamUsed ? { param: limitParamUsed } : Math.min(limit, maxLimit),
         referenceLines: takesLines && refLinesPayload(refLines).length ? refLinesPayload(refLines) : undefined,
         // BI-4 part B: left out when it follows the dashboard, which clears a rule the chart had.
         cache: forPreview || cacheDraft.mode === "default" || draftProblem(cacheDraft) ? undefined : ruleOf(cacheDraft),
@@ -1045,7 +1052,7 @@ export function ChartBuilder({
     // BI-8: a changed formula changes the rows a chart over the field returns.
     calc: JSON.stringify((fields?.calculated ?? []).map((f) => [f.name, f.formula])),
     // BI-11: the values the preview is drawn with, the limit's parameter and the reference lines.
-    params: JSON.stringify({ values: paramValues ?? null, limit: limitParamName, lines: refLines }),
+    params: JSON.stringify({ values: paramValues ?? null, limit: limitParamUsed, lines: refLines }),
     // BI-17: formats and colours change how the preview is drawn, and the rules of a kind change what is sent.
     style: JSON.stringify(stylePayload(style, fmtRules)),
     // BI-13: each question, and how the chart's own series is drawn, reaches the statements and the drawing.
@@ -1189,7 +1196,7 @@ export function ChartBuilder({
   // `BI-46` (plan D20): the period a date or timestamp breakdown is grouped by.
   const breakdownGrainPicker = breakdownGrainOptions.length > 0 ? (
     <div className="grid gap-1.5">
-      <Label>Group the breakdown by</Label>
+      <Label>Group the split by</Label>
       <Select
         value={shape.breakdownGrain || NO_GRAIN} items={GRAIN_ITEMS}
         onValueChange={(v) => setShape((d) => ({
@@ -1197,7 +1204,7 @@ export function ChartBuilder({
           breakdownGrain: v && v !== NO_GRAIN && (BREAKDOWN_GRAINS as readonly string[]).includes(v) ? (v as Grain) : "",
         }))}
       >
-        <SelectTrigger className="w-full" aria-label="Group the breakdown by"><SelectValue /></SelectTrigger>
+        <SelectTrigger className="w-full" aria-label="Group the split by"><SelectValue /></SelectTrigger>
         <SelectContent>
           <SelectItem value={NO_GRAIN}>No grouping</SelectItem>
           {breakdownGrainOptions.map((g) => <SelectItem key={g} value={g}>{GRAIN_LABELS[g]}</SelectItem>)}
@@ -1230,7 +1237,7 @@ export function ChartBuilder({
                     return (
                       <SelectItem key={m.name} value={encodeSourceChoice({ kind: "mart", name: m.name })}>
                         <span className="flex items-center gap-1.5 flex-wrap">
-                          <span>{m.name} · {m.rows.toLocaleString("id-ID")}</span>
+                          <span>{m.name} · {formatLocaleNumber(m.rows)}</span>
                           {/* DATA-12 part 3 & PR #106 review R1 BLOCKER 2: mark and tags */}
                           <CertificationBadge certification={m.certification} />
                           {governed.map((pair) => (
@@ -1340,7 +1347,7 @@ export function ChartBuilder({
         columns={panelColumns} fieldLabel={fieldLabel} textOf={titleText}
         xEmpty={!dimension} valueEmpty={!measureRows[0]?.column} onUse={applyColumnUse}
       />
-      {chosenMart ? <p className="px-2 text-xs text-muted-foreground tabular-nums">{chosenMart.rows.toLocaleString()} rows in {chosenMart.name}</p> : null}
+      {chosenMart ? <p className="px-2 text-xs text-muted-foreground tabular-nums">{formatLocaleNumber(chosenMart.rows)} rows in {chosenMart.name}</p> : null}
     </>
   );
   const FORM_GRID = "grid min-w-0 grid-cols-[minmax(0,1fr)] content-start gap-5 p-4 [&_.grid:not([class*=grid-cols])]:grid-cols-[minmax(0,1fr)]";
@@ -1419,9 +1426,9 @@ export function ChartBuilder({
                 <div className="grid content-start gap-1.5" data-slot="breakdown-field">
                   <Label>{breakdownLabel} {needsBreakdown ? <Req /> : <span className="font-normal text-muted-foreground">(optional)</span>}</Label>
                   <Select value={breakdown || NO_BREAKDOWN} items={{ ...breakdownLabels, ...columnItems(breakdownChoices, fieldLabel, breakdown) }} onValueChange={(v) => pickBreakdown(v === NO_BREAKDOWN ? "" : v ?? "")} disabled={!fields || !!rules.breakdownLocked}>
-                    <SelectTrigger className="w-full" title={breakdown ? displayColumnFull(breakdown) : undefined}><SelectValue placeholder={needsBreakdown ? "pick a 2nd column" : "no breakdown"} /></SelectTrigger>
+                    <SelectTrigger className="w-full" title={breakdown ? displayColumnFull(breakdown) : undefined}><SelectValue placeholder={needsBreakdown ? "pick a 2nd column" : "no split"} /></SelectTrigger>
                     <SelectContent>
-                      {needsBreakdown ? null : <SelectItem value={NO_BREAKDOWN}>— no breakdown —</SelectItem>}
+                      {needsBreakdown ? null : <SelectItem value={NO_BREAKDOWN}>— no split —</SelectItem>}
                       {breakdownChoices.map((d) => <SelectItem key={d} value={d}>{fieldLabel(d)}</SelectItem>)}
                     </SelectContent>
                   </Select>
@@ -1451,7 +1458,7 @@ export function ChartBuilder({
                     <div className="grid content-start gap-3 @md:col-start-2">
                       {breakdownGrainPicker}
                       {breakdownBinPicker ? (
-                        <BinPicker label="Group the breakdown in" value={shape.breakdownBin} sqlSource={onSqlSource} aria="Group the breakdown in bins"
+                        <BinPicker label="Group the split in" value={shape.breakdownBin} sqlSource={onSqlSource} aria="Group the split in bins"
                           onChange={(breakdownBin) => setShape((d) => ({ ...d, breakdownBin }))} />
                       ) : null}
                     </div>
@@ -1503,7 +1510,7 @@ export function ChartBuilder({
             </div>
           ) : isPoints ? (
             <p className="text-xs text-muted-foreground">
-              Up to {pointLimit(choice?.kind === "sql" ? choice.id : undefined).toLocaleString("en-US")} points, largest values first.
+              Up to {formatLocaleNumber(pointLimit(choice?.kind === "sql" ? choice.id : undefined))} points, largest values first.
               One point per distinct latitude and longitude{dimension ? " and label" : ""}.
             </p>
           ) : null}
@@ -1538,7 +1545,7 @@ export function ChartBuilder({
                 baseKind={dimension ? fields?.kinds?.[dimension] : undefined} grained={!!(grain && grainOptions.includes(grain))}
                 marts={marts.map((m) => m.name)} sqlSources={sqlSources.map((s) => ({ id: s.id, title: s.title }))}
                 ownDraw={ownDraw} ownAxis={ownAxis} onOwnChange={(patch) => { if (patch.draw !== undefined) setOwnDraw(patch.draw); if (patch.axis !== undefined) setOwnAxis(patch.axis); }}
-                blocked={layersBlocked.length ? `Remove ${layersBlocked.join(", ")} to combine questions.` : isNewSql ? "Save the SQL as a source first to combine it with other questions." : undefined}
+                blocked={layersBlocked.length ? `Remove ${layersBlocked.join(", ")} to add a second source.` : isNewSql ? "Save the SQL as a source first to add a second source to it." : undefined}
                 disabled={!fields}
               />,
             ) : null}
@@ -1582,12 +1589,16 @@ export function ChartBuilder({
                 )}
                 {rules.limit ? <div className="grid gap-1.5">
                   <Label>{capsBreakdown
-                    ? (grain ? "Breakdown values (Top N)" : "Limit (Top N, dimension and breakdown)")
+                    ? (grain ? "Split values (Top N)" : "Limit (Top N, X axis and split)")
                     : grain ? "Buckets (max 1000, latest kept)" : isCalendar ? "Days (max 366)" : "Limit (Top N)"}</Label>
-                  {limitParamName ? null : (
-                    <Input type="number" min={1} max={maxLimit} value={limit} onChange={(e) => { setLimitTouched(true); setLimit(Math.max(1, Math.min(maxLimit, Number(e.target.value) || 20))); }} />
+                  {limitParamUsed ? null : (
+                    <WholeNumberInput aria-label="Limit" min={1} max={maxLimit} value={Math.min(limit, maxLimit)} onCommit={(n) => { setLimitTouched(true); setLimit(n); }} />
                   )}
-                  {numberParamDefs.length ? (
+                  {numberParamDefs.length && !limitParamOk ? (
+                    <p className="text-xs text-muted-foreground">
+                      {stepsOn ? "A parameter cannot set the limit of a chart with steps." : "A parameter cannot set the limit of this chart type."}
+                    </p>
+                  ) : numberParamDefs.length ? (
                     <Select value={limitParamName || FIXED_LIMIT} items={{ [FIXED_LIMIT]: "A fixed number", ...Object.fromEntries(numberParamDefs.map((p) => [p.name, p.label || p.name])) }}
                       onValueChange={(v) => setLimitParamName(v && v !== FIXED_LIMIT ? v : "")}>
                       <SelectTrigger className="w-full" aria-label="Limit from a parameter"><SelectValue /></SelectTrigger>
@@ -1651,8 +1662,8 @@ export function ChartBuilder({
         const noun = rowsMode ? (n === 1 ? "row" : "rows") : isGantt ? (n === 1 ? "task" : "tasks") : n === 1 ? "group" : "groups";
         const before = preview?.previewRows;
         return before && before.rows.length > n
-          ? `Showing ${n.toLocaleString()} of ${before.truncated ? "more than " : ""}${before.rows.length.toLocaleString()} ${noun}`
-          : `${n.toLocaleString()} ${noun}`;
+          ? `Showing ${formatLocaleNumber(n)} of ${before.truncated ? "more than " : ""}${formatLocaleNumber(before.rows.length)} ${noun}`
+          : `${formatLocaleNumber(n)} ${noun}`;
       })();
 
   const previewBody = showRows ? (
@@ -1671,7 +1682,7 @@ export function ChartBuilder({
       </div>
       {dataOpen && rowsView ? (
         <div className="min-h-0 overflow-auto" data-slot="preview-rows">
-          <PreviewRowsTable data={rowsView} labels={finalResult.labels} open />
+          <PreviewRowsTable data={rowsView} labels={finalResult.labels} values={finalResult.measures} open />
         </div>
       ) : null}
     </div>
@@ -1685,7 +1696,7 @@ export function ChartBuilder({
       <span className="grid size-10 place-items-center rounded-xl bg-destructive/10 text-destructive"><CircleAlert className="size-5" aria-hidden /></span>
       <div className="grid max-w-sm gap-1">
         <p className="text-sm font-medium text-foreground">Preview unavailable</p>
-        <p className="text-sm text-muted-foreground">{previewError}</p>
+        <p className="text-sm text-muted-foreground">{asSentence(previewError)}</p>
       </div>
       <Button type="button" variant="outline" size="sm" onClick={() => setRetry((n) => n + 1)}>
         <RefreshCw aria-hidden /> Try again
@@ -1754,7 +1765,7 @@ export function ChartBuilder({
           </div>
         </header>
 
-        {error ? <p role="alert" className="text-sm text-destructive">{error}</p> : null}
+        {error ? <p role="alert" className="text-sm text-destructive">{asSentence(error)}</p> : null}
         {/* Why the chart cannot be saved yet; the API's own error is the line above. */}
         {!error && sqlActive && draft.blocker ? <p className="text-sm text-muted-foreground">{draft.blocker}</p> : null}
 
