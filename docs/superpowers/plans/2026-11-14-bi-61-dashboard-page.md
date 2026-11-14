@@ -112,6 +112,24 @@
    - Check: unit tests that `loading.tsx` draws the dashboard placeholder on `/dashboards/<id>`,
      the list placeholder on `/dashboards/browse`, nothing on `/login`, and the generic one on
      another page; the shell skeleton tests still pass.
+10. **T10, the Dashboards row is named after the dashboard it opens (owner QA 2026-11-15).**
+   Owner: "kalo emang pas di klik bukan ke halaman browse nama menunya diubah jadi nama dashboard
+   yang dibuka dong". The row's label part goes to `/dashboards`, which opens the board last
+   opened (`dashboard-resolver.tsx`), so its label says which board that is:
+   - `last-board.ts` remembers the board's name with its id (`rememberLastBoard(id, name)`), and
+     the dashboard page passes the name when it opens a board and again when the board is
+     renamed. Reading an old id-only value still works (no name: the label stays "Dashboards").
+     `forgetLastBoard` clears both. Changes are announced in this tab (a custom event) and in
+     other tabs (`storage`), so the sidebar updates at once.
+   - The sidebar's Dashboards row shows that name (truncated with an ellipsis, full name in the
+     collapsed-rail tooltip) with the same chart icon; "Dashboards" when nothing is remembered.
+     The right part (Browse) is unchanged. The row's `aria-label` keeps the word: "Dashboard:
+     <name>" so screen readers know what the row is. The navbar title and the breadcrumb are
+     not changed.
+   - Server-render and first paint use "Dashboards" (localStorage is not readable there); the
+     name swaps in after mount without moving the row (same height, same icon slot).
+   - Check: unit tests for the label with and without a remembered board, an old id-only value,
+     forget, and the update when another board is opened.
 
 ## 4. Machine rules (owner, 2026-11-14)
 
