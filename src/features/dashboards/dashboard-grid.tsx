@@ -236,7 +236,7 @@ export function DashboardGrid({
         const dragging = drag?.id === it.id;
         const onMove = editable ? (e: React.PointerEvent) => startDrag(e, it.id, "move") : undefined;
         return (
-          <div key={it.id} style={boxStyle(b)} className={cn("dash-tile transition-[left,top,width,height]", dragging && "z-20 transition-none")}>
+          <div key={it.id} style={boxStyle(b)} className={cn("dash-tile transition-[left,top,width,height] in-data-[sidebar-moving]:transition-none", dragging && "z-20 transition-none")}>
             {isSectionKind(it.kind) ? (
               <SectionTile item={it} editable={editable} folded={folded.has(it.id)} onToggle={() => toggleFold(it.id)} onHeaderPointerDown={onMove} />
             ) : (

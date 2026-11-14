@@ -206,6 +206,9 @@ function useSlideMainArea(
   isMobile: boolean,
 ) {
   const lastGap = React.useRef<number | null>(null)
+  // The slide in progress, so a quick second toggle's clean-up is the one that counts, and the
+  // main area's own shadow from before the first slide is the one put back.
+  const slideRef = React.useRef<{ insetShadow: string } | null>(null)
   React.useLayoutEffect(() => {
     const wrapper = wrapperRef.current
     const gap = wrapper?.querySelector<HTMLElement>("[data-slot=sidebar-gap]")
@@ -218,14 +221,73 @@ function useSlideMainArea(
     if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return
     const inset = wrapper.querySelector<HTMLElement>("[data-slot=sidebar-inset]")
     if (!inset) return
+    const shift = before - now
+    const viewport = document.documentElement.clientWidth
+    // While it slides, the main area is marked, so a part with its own size transition (the
+    // dashboard's tiles) takes its new size at once instead of animating it under the slide.
+    wrapper.dataset.sidebarMoving = ""
+    // Opening, the main area's own box is already at its new, narrower place, and the sidebar
+    // only reaches it at the end: its fill is drawn on to the left meanwhile (under the sidebar,
+    // which covers it as it grows), so no band of the page's plain background shows between.
+    const run = { insetShadow: slideRef.current?.insetShadow ?? inset.style.boxShadow }
+    slideRef.current = run
+    const insetShadow = run.insetShadow
+    const insetFill = getComputedStyle(inset).backgroundColor
+    inset.style.boxShadow = shift < 0 && insetFill && insetFill !== "rgba(0, 0, 0, 0)"
+      ? `${shift}px 0 0 0 ${insetFill}`
+      : insetShadow
+    const slides: Animation[] = []
     for (const child of Array.from(inset.children)) {
       if (!(child instanceof HTMLElement) || getComputedStyle(child).position === "fixed") continue
-      child.animate([{ transform: `translateX(${before - now}px)` }, { transform: "translateX(0)" }], {
+      // Opening, the main area is already laid out narrower and starts shifted left, which would
+      // leave its right edge short of the window's (owner QA 2026-11-14 follow-up). Whatever paints
+      // a surface up to that edge (the navbar, an open side panel) draws itself on past it for the
+      // move, so the right edge stays flush throughout.
+      if (shift < 0) extendRightEdge(child, -shift, viewport)
+      const animation = child.animate([{ transform: `translateX(${shift}px)` }, { transform: "translateX(0)" }], {
         duration: SIDEBAR_MOTION_MS,
         easing: SIDEBAR_EASE,
       })
+      slides.push(animation)
     }
+    // Everything put on for the slide comes off when it ends (or is cut short by another toggle).
+    const done = () => {
+      if (slideRef.current !== run) return
+      slideRef.current = null
+      delete wrapper.dataset.sidebarMoving
+      inset.style.boxShadow = insetShadow
+      for (const el of wrapper.querySelectorAll<HTMLElement>("[data-slide-shadow]")) {
+        el.style.boxShadow = el.dataset.slideShadow ?? ""
+        delete el.dataset.slideShadow
+      }
+    }
+    Promise.allSettled(slides.map((a) => a.finished)).then(done)
   }, [open, isMobile, wrapperRef, slideNextRef])
+}
+
+/**
+ * For the opening slide: every surface in `root` (itself and its children's children, which is
+ * where the navbar and the side panel are) that reaches the window's right edge gets a copy of
+ * itself `by` pixels further right, as box shadows: its fill, and its bottom border as a line.
+ * The inline shadow it had is kept in `data-slide-shadow` (once, across quick toggles) and put
+ * back when the slide ends.
+ */
+function extendRightEdge(root: HTMLElement, by: number, viewport: number): void {
+  const candidates = [root, ...Array.from(root.children), ...Array.from(root.children).flatMap((c) => Array.from(c.children))]
+  for (const el of candidates) {
+    if (!(el instanceof HTMLElement)) continue
+    if (Math.abs(el.getBoundingClientRect().right - viewport) > 1) continue
+    const style = getComputedStyle(el)
+    const fill = style.backgroundColor
+    if (!fill || fill === "transparent" || fill === "rgba(0, 0, 0, 0)") continue
+    const line = parseFloat(style.borderBottomWidth) || 0
+    const copies = line > 0
+      ? `${by}px -${line}px 0 0 ${fill}, ${by}px 0 0 0 ${style.borderBottomColor}`
+      : `${by}px 0 0 0 ${fill}`
+    if (el.dataset.slideShadow === undefined) el.dataset.slideShadow = el.style.boxShadow
+    const own = el.dataset.slideShadow
+    el.style.boxShadow = own ? `${copies}, ${own}` : copies
+  }
 }
 
 function Sidebar({
