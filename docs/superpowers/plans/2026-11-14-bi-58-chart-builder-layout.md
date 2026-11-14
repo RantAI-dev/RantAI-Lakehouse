@@ -503,3 +503,58 @@ before).
 `review-gallery-dialog-list-1366x900-dark.png`. Both are the Edit chart page on the 28620 preview;
 the dialog measures 960 × 720 px. They were taken with one headless Chrome, stopped by PID
 afterwards. No server was started.
+
+### Handoff, owner QA 2026-11-14 items after round 4 (Opus developer agent)
+
+**Commits:**
+- `50295df6` composer reserve: the room under a page follows whether the composer shows.
+- `1c113857` the type toolbar stays one row in a narrow canvas.
+- This entry's commit: the gallery pictures centred, and the gallery header.
+
+**Composer reserve:**
+- While the composer is on screen, the dock sets `--dock-reserve`: the composer's measured height
+  plus its 16 px offset and a 14 px gap. When the dock hides, the variable is removed.
+- `--content-bottom` is `var(--dock-reserve, 1.5rem)`; `main` and the builder follow it with a
+  200 ms transition (off under reduced motion).
+- Measured at 1366x900:
+  - composer shown: reserve 76 px, zones end at 824;
+  - Copilot panel open, app sidebar folded: no reserve, zones end at 876, no scroll
+    (`review-copilot-open-1366x900-dark.png`);
+  - Copilot panel open with the app sidebar also open: the builder has about 674 px and uses its
+    one-column layout.
+
+**Toolbar:** in a canvas under 36rem (the Copilot panel beside it), KPI and Table move into "More"
+(two more types under 26rem). The type in use always stays, so the 44 px row never wraps.
+
+**Gallery pictures centred:** inside a gallery picture, `TileBody` passes every chart through
+`thumbnailOption` (`src/lib/thumbnail-option.ts`). Outside the gallery nothing changes. The picture
+gets:
+- equal margins on all sides, at least the largest symbol's radius plus 4 px, so no bubble is cut;
+- no axes, legend or colour bar;
+- calendars boxed the same way, and a radar centred without its axis names.
+
+Checked in every group: scatter, bubble, heatmap, radar, box plot, histogram, Gantt, donut, rose,
+funnel, treemap, sunburst, gauge and KPI are centred. Progress, the tables and the note keep their
+top-left reading layout.
+
+**Gallery header:**
+- The title row holds only "Chart type" and ✕.
+- Search and the Cards / List switch share the next row; both are 32 px high and both top at 151 px
+  at 1366, measured.
+- On a phone the switch stays on that row as two icons (their names are tooltips and accessible
+  names). I picked this as the cleaner option.
+
+**Checks**, each run alone under the 3G cap after `free -m`:
+- `bun test` on 18 files (builder, gallery, chart tiles that draw through `TileBody`, dock, libs):
+  **200 pass, 0 fail, 1,564 expect() calls**;
+- `bun run typecheck`: **0 errors**;
+- `bun run lint`: **0 errors, 11 warnings** (the existing 11);
+- the full `bun run test`: **not verified (CI)**.
+
+**Screenshots:**
+- `review-gallery-dialog-cards-1366x900-dark.png`, scrolled to "Relationship / distribution". It was
+  taken a moment before the radar's axis names were turned off; the follow-up check shows the radar
+  without them.
+- `review-gallery-dialog-cards-390x844-dark.png`, the phone view.
+- Both come from this worktree on 28622, started briefly with one headless Chrome. Both were stopped
+  by PID straight after.

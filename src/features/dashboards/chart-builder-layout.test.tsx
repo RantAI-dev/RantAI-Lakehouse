@@ -511,3 +511,50 @@ describe("the chart-type dialog (BI-58 review round 4)", () => {
     expect(screen.getByRole("button", { name: /More chart types, now Funnel/ })).toBeTruthy()
   })
 })
+
+// Owner QA 2026-11-14, gallery pictures centred, and the gallery header.
+describe("the gallery's pictures and header (owner QA 2026-11-14)", () => {
+  type Drawn = { grid?: { left?: number; right?: number; top?: number; bottom?: number; containLabel?: boolean } | unknown[]; calendar?: { left?: number; right?: number }; series?: { type?: string; symbolSize?: unknown; data?: unknown[] }[] }
+
+  it("draws every cartesian picture with equal margins, wide enough for its largest symbol", async () => {
+    renderBuilder()
+    await screen.findByRole("complementary", { name: "Data" })
+    drawn = []
+    fireEvent.click(screen.getByRole("button", { name: "More chart types" }))
+    await screen.findByRole("dialog", { name: "Chart type" })
+    await waitFor(() => expect(drawn.length).toBeGreaterThan(15))
+    let cartesian = 0
+    for (const option of drawn as Drawn[]) {
+      const grid = option.grid && !Array.isArray(option.grid) ? option.grid : undefined
+      if (grid) {
+        cartesian += 1
+        expect(grid.left === grid.right && grid.top === grid.bottom && grid.containLabel === false, JSON.stringify(grid)).toBe(true)
+        // No symbol is wider than the margin it sits in.
+        for (const s of option.series ?? []) {
+          if (typeof s.symbolSize !== "function") continue
+          for (const d of s.data ?? []) {
+            const value = d && typeof d === "object" && "value" in (d as object) ? (d as { value: unknown }).value : d
+            const r = (s.symbolSize as (v: unknown) => number)(value) / 2
+            expect(r <= (grid.left ?? 0), `radius ${r} within ${grid.left}`).toBe(true)
+          }
+        }
+      }
+      if (option.calendar) expect(option.calendar.left === option.calendar.right).toBe(true)
+    }
+    expect(cartesian).toBeGreaterThan(10)
+  })
+
+  it("keeps the search and the Cards / List switch on one row, under a title row of the title alone", async () => {
+    renderBuilder()
+    fireEvent.click(screen.getByRole("button", { name: "More chart types" }))
+    const dialog = await screen.findByRole("dialog", { name: "Chart type" })
+    const search = within(dialog).getByLabelText("Search chart types")
+    const views = within(dialog).getByRole("radiogroup", { name: "View" })
+    const row = dialog.querySelector("[data-slot=gallery-search-row]") as HTMLElement
+    expect(row.contains(search) && row.contains(views)).toBe(true)
+    expect(views.className).toContain("h-8")
+    expect(search.className).toContain("h-8")
+    const title = within(dialog).getByText("Chart type")
+    expect(title.parentElement?.contains(views)).toBe(false)
+  })
+})
