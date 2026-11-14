@@ -604,6 +604,14 @@ fn decide_approval_audit_event(
     )
 }
 
+/// The name `crate::audit_coverage::AUDIT_TABLE` gives `POST
+/// /api/agents/approvals/{id}/decide`, and the action of the `refused` row
+/// `auth_gate` writes when it turns the call away (`GOV-1`). The row a
+/// decision itself writes carries the approval's own action (the tool the
+/// approval is for), which is chosen at run time and so cannot be the table's
+/// name.
+pub(crate) const APPROVAL_DECIDE_ACTION: &str = "agent.approval_decide";
+
 #[allow(
     clippy::too_many_lines,
     reason = "one straight-line sequence of terminal outcomes (reject / \

@@ -4228,6 +4228,13 @@ pub async fn access_request(
 /// exercises.
 pub(crate) const GRANT_DAYS: i64 = 30;
 
+/// The name `crate::audit_coverage::AUDIT_TABLE` gives `POST
+/// /api/catalog/access-requests/{id}/decide`, and the action of the `refused`
+/// row `auth_gate` writes when it turns the call away (`GOV-1`). The row a
+/// decision itself writes carries the request's own action (an `access:`
+/// permission), which is chosen at run time and so cannot be the table's name.
+pub(crate) const ACCESS_DECIDE_ACTION: &str = "catalog.access_decide";
+
 /// See [`DecideAccessRequestBody`]'s doc comment — reuses
 /// `routes::agents::DecideApprovalBody`'s exact shape (WS7 item E3, N1),
 /// never a redefined struct.
