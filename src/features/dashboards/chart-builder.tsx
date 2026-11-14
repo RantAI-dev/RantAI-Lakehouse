@@ -1555,7 +1555,7 @@ export function ChartBuilder({
               <>
                 {rules.parameters ? (
                   <div>
-                    <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => setParamsOpen(true)}>
+                    <Button type="button" size="sm" variant="ghost" className="-ml-2 h-7 px-2 text-xs" onClick={() => setParamsOpen(true)}>
                       <SlidersHorizontal className="size-3" aria-hidden /> Parameters
                     </Button>
                   </div>
@@ -1726,10 +1726,11 @@ export function ChartBuilder({
     // the inspector. The zones follow the builder's own width (a container query), not the
     // window's, because the app's sidebar takes a different share of each window.
     // `BI-58` T5: from two columns up the builder fits the window instead of scrolling it. The
-    // assistant dock keeps a 5rem spacer under `main` for pages that scroll; this one cancels it, so
-    // the zones end just above the dock (`main`'s own bottom padding still keeps the dock clear).
-    <div className="@container @3xl:-mb-20" data-slot="chart-builder">
-      <div className="flex flex-col gap-4 @3xl:h-[calc(100dvh-12.5rem)] @3xl:min-h-[34rem]">
+    // assistant dock keeps a 5rem spacer under `main` for pages that scroll; the inner frame cancels
+    // it (on the child: a container query never matches its own container), so the zones end just
+    // above the dock, and `main`'s own bottom padding still keeps the dock clear of them.
+    <div className="@container" data-slot="chart-builder">
+      <div className="flex flex-col gap-4 @3xl:-mb-20 @3xl:h-[calc(100dvh-12.5rem)] @3xl:min-h-[34rem]">
         <header className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
           <div className="flex min-w-0 items-center gap-2">
             <Button variant="ghost" size="icon-sm" aria-label="Back to dashboard" title="Back to dashboard" render={<Link href={backHref} />}>

@@ -74,7 +74,22 @@ export function MeasureRows({
     <div className="grid gap-2">
       {rows.map((row, i) => (
         <div key={i} className="grid gap-1.5">
-          <Label>{labels(i)} {i < min ? <span aria-hidden className="text-destructive">*</span> : null}</Label>
+          {/* `BI-58` T5: the move and remove buttons sit on the label's line, so in the narrow inspector
+              the column picker keeps the row's width with its aggregate. */}
+          <div className="flex min-h-6 items-center gap-1">
+            <Label className="mr-auto">{labels(i)} {i < min ? <span aria-hidden className="text-destructive">*</span> : null}</Label>
+            {flexible ? (
+              <>
+                {rows.length > 1 ? (
+                  <>
+                    <Button type="button" size="icon-xs" variant="ghost" aria-label={`Move measure ${i + 1} up`} disabled={i === 0} onClick={() => onChange(moveItem(rows, i, -1))}><ArrowUp /></Button>
+                    <Button type="button" size="icon-xs" variant="ghost" aria-label={`Move measure ${i + 1} down`} disabled={i === rows.length - 1} onClick={() => onChange(moveItem(rows, i, 1))}><ArrowDown /></Button>
+                  </>
+                ) : null}
+                <Button type="button" size="icon-xs" variant="ghost" aria-label={`Remove measure ${i + 1}`} disabled={rows.length <= min} onClick={() => onChange(rows.filter((_, j) => j !== i))}><X /></Button>
+              </>
+            ) : null}
+          </div>
           <div className="flex items-center gap-1.5">
             <Select value={row.column} items={columnItems(columns, fieldLabel, row.column)} onValueChange={(v) => set(i, { column: v ?? "" })} disabled={disabled}>
               <SelectTrigger className="w-full min-w-0 flex-1" aria-label={labels(i)} title={row.column ? displayColumnFull(row.column) : undefined}><SelectValue placeholder={placeholder} /></SelectTrigger>
@@ -98,18 +113,6 @@ export function MeasureRows({
                   {MEASURE_AGGREGATES.map((a) => <SelectItem key={a} value={a}>{a}</SelectItem>)}
                 </SelectContent>
               </Select>
-            ) : null}
-            {flexible ? (
-              <>
-                {/* `BI-58` T5: with one value there is nothing to move it past, and the narrow inspector needs the room for the column. */}
-                {rows.length > 1 ? (
-                  <>
-                    <Button type="button" size="icon-xs" variant="ghost" aria-label={`Move measure ${i + 1} up`} disabled={i === 0} onClick={() => onChange(moveItem(rows, i, -1))}><ArrowUp /></Button>
-                    <Button type="button" size="icon-xs" variant="ghost" aria-label={`Move measure ${i + 1} down`} disabled={i === rows.length - 1} onClick={() => onChange(moveItem(rows, i, 1))}><ArrowDown /></Button>
-                  </>
-                ) : null}
-                <Button type="button" size="icon-xs" variant="ghost" aria-label={`Remove measure ${i + 1}`} disabled={rows.length <= min} onClick={() => onChange(rows.filter((_, j) => j !== i))}><X /></Button>
-              </>
             ) : null}
           </div>
         </div>

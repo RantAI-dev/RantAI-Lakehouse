@@ -47,7 +47,8 @@ export function KindPicker({ kind, onPick, facts, preview, dark }: {
   const inMain = MAIN_KINDS.includes(kind);
   const choose = (next: ChartKind) => { onPick(next); setOpen(false); };
   return (
-    <div role="group" aria-label="Chart type" className="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto">
+    // `BI-58` T5: the icons wrap to a second row on a phone rather than hide "More" past the edge.
+    <div role="group" aria-label="Chart type" className="flex min-w-0 flex-1 flex-wrap items-center gap-0.5">
       {MAIN_KINDS.map((k) => {
         const on = k === kind;
         const need = kindNeed(k, facts);
@@ -177,9 +178,13 @@ function KindCard({ kind, label, on, need, picture, dark, onPick }: {
         "disabled:pointer-events-none disabled:opacity-50",
       )}
     >
-      <span aria-hidden className="pointer-events-none block h-16 overflow-hidden rounded-lg bg-card [&_.text-4xl]:text-2xl">
+      <span aria-hidden className="pointer-events-none relative block h-20 overflow-hidden rounded-lg bg-card">
         {spec && picture ? (
-          <TileBody spec={spec} cell={{ columns: picture.columns, rows: picture.rows }} dark={dark} loading={false} hideLegend />
+          // Drawn at twice the size and scaled down: the chart's own margins are fixed in pixels, so at
+          // card size they left the shape a sliver; scaled, it keeps the proportions of the real chart.
+          <span className="absolute top-0 left-0 block h-[200%] w-[200%] origin-top-left scale-50">
+            <TileBody spec={spec} cell={{ columns: picture.columns, rows: picture.rows }} dark={dark} loading={false} hideLegend />
+          </span>
         ) : (
           <span className="grid h-full place-items-center text-muted-foreground/70"><KindIcon kind={kind} className="size-6" /></span>
         )}
