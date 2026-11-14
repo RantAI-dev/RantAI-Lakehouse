@@ -80,4 +80,82 @@
 
 ## 6. Handoff
 
-(developer)
+### Slice 1 (the whole plan), developer, 2026-11-14
+
+Branch `feat/web-15-login-page`, base `40c876d9`, not pushed.
+
+| Task | Commit | What |
+| --- | --- | --- |
+| T1 | `1009469f` | The form of mockup A in `login-page.tsx`; Inter Tight under `src/app/fonts/inter-tight/` (+ README row), `login-fonts.ts`, `login.css` (the shake) |
+| T2 | `2b17c5a2` | `login-showcase.tsx` (sample dashboard, loop, phone tile), wired into the page; `login-hero.tsx` removed |
+| T3 | `b56d9858` | `docs/plans/web-15-screens/` (7 PNGs) |
+| T4 | this commit | This handoff |
+
+**Commands run** (each under `systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0 nice -n 15`,
+one at a time, with at least 4.5 GB available), last on the tree of `b56d9858`:
+
+- `bun install --frozen-lockfile`: 678 packages installed.
+- `bun run typecheck`: no errors.
+- `bun x eslint src/features/auth/login-page.tsx src/features/auth/login-page.test.tsx src/features/auth/login-showcase.tsx src/features/auth/login-showcase.test.tsx src/features/auth/login-fonts.ts`:
+  0 errors, 1 warning (`@next/next/no-location-assign-relative-destination` on the SSO button's
+  `window.location.assign("/api/auth/oidc/start")`, the same statement `main` has; it goes to an API
+  route, not a page).
+- `bun test src/features/auth src/app/fonts.test.ts`: 32 pass, 0 fail, 102 `expect()` calls, 6 files.
+  The five lockout/notice tests in `login-page.test.tsx` pass unchanged. New: 4 in `LoginPage form (WEB-15 T1)`
+  (refusal: message, `aria-describedby`, focus and full selection of the password, the shake class;
+  the refusal folds away on typing; Caps Lock on, off, and off on blur; the eye), 1 in
+  `LoginPage without the sample dashboard (WEB-15 T2)` (form signs in while the preview never loads),
+  3 in `login-showcase.test.tsx` (reduced motion desktop and phone: still render mode, final KPI,
+  no loop; with motion the 9 s interval exists only while on screen and the tab is visible).
+- Screenshots: `bun --bun next dev -p 28622` with `RUST_API_URL` pointed at a closed port (so
+  `/api/auth/me` fails and the form shows), one headless Chrome with its own profile, driven over
+  CDP; the refusal was a 401 `{"error":"invalid_or_expired"}` answered by the browser (`Fetch`
+  domain), so no account and no password was used. Both processes were stopped by PID afterwards,
+  and the `AGENTS.md` block `next dev` writes was reverted, not committed.
+
+**Compared with the mockup A shots** (`.mockup-shots/login/a-*.png`): light and dark 1366×900, phone
+390×844 and the dark refusal match in layout, sizes and colours; the differences are the demo bar
+(left out, plan §1) and the refusal's sentence (below). Measured in the shots: no horizontal scroll
+(`scrollWidth` 1366 and 390), the Sign in button's bottom at 648 px (desktop) and 652 px (phone, of
+844), so the form is fully on the first phone screen; after the refusal the password is focused
+with selection `[0, 16]` of 16 characters.
+
+**Choices the planner should look at** (none changes a request, redirect or id):
+
+1. **The refusal's sentence stays "Invalid username/email or password."** The mockup shows "Wrong
+   username or password." and its source says the owner asked for the shorter sentence. Plan §1 says
+   the behaviour and the existing tests stay, and a test asserts the old sentence, so I did not
+   change it. If the owner's sentence is wanted, it is one string and one test line.
+2. From the mockup, taken as markup: the subtitle "Use your account to continue." (was "Use your
+   account credentials to continue."); no `••••••••` placeholder in the password field; inputs at
+   16 px on a phone (no iOS zoom); `autoCapitalize="none"` and `spellCheck={false}` on the username;
+   typing in either field closes the refusal; the logo image is decorative (`alt=""`, the title
+   names the product; before, the light logo had `alt="Rantai Lake"`).
+3. Added for DESIGN.md §3 ("no button is silent"): the SSO button shows a spinner and
+   "Redirecting…" when pressed, and resets when the page comes back from the browser's page cache.
+   `onSubmit` returns early while a sign-in is in flight.
+4. `autoFocus` on the username stays, as on `main` (the mockup had none).
+5. The preview mounts after `requestIdleCallback` (300 ms timeout where it is missing, Safari), and
+   only the variant the layout shows is mounted (`matchMedia("(min-width: 1024px)")`), so a phone
+   never runs the hidden desktop dashboard.
+6. **Left without a user:** `src/components/ui/molten-metal.tsx` and the `ogl` dependency were used
+   only by the removed `login-hero.tsx` (its doc comment still names that file). I did not remove
+   them: dropping a dependency touches the lockfile and is outside this plan. Suggest a follow-up.
+7. Tests: `login-page.test.tsx` imports the page after its mocks (`await import`), because
+   `next/font/local` has no runtime default export and a static import links it before
+   `mock.module` applies; it also mocks `next/dynamic` to a never-loading component. The only other
+   `next/dynamic` user is `landing-page.tsx`, which no test renders.
+8. Inter Tight: the file is byte-identical to the landing site's (`site/src/fonts/inter-tight/`,
+   SHA-256 in `src/app/fonts/README.md`); that folder is not on `main` yet, so the README names it
+   by path and hash.
+
+**Not verified:**
+
+- The full `bun run test` and `bun run lint`, and `next build` (machine rules, §4).
+- A real sign-in against an API (success path and `next` redirect): no API ran; the code paths are
+  unchanged and covered by the existing tests only for the failure cases.
+- iPhone Safari on a real device; Caps Lock in a real browser (unit test only); the charts' hover
+  tooltips (not exercised in the shots); `NEXT_PUBLIC_SSO_ENABLED=true` (no screenshot).
+- The 9 s redraw in a browser was not timed; the loop's gating is proven by the unit test. The phone
+  refusal shot shows the KPI mid-count (1,572,507 of 1,572,524), consistent with a redraw in
+  progress when it was taken.
