@@ -61,13 +61,16 @@ export function PageFrame({ children, className }: { readonly children: React.Re
   return (
     <div
       className={cn(
-        "flex min-h-0 flex-col overflow-y-auto lg:overflow-hidden",
+        // The frame clips (overflow), so it pads 4 px on the sides and top for the focus rings of
+        // the header controls and cancels it with a negative margin and 4 px more height: nothing
+        // moves (BI-59 owner QA 2026-11-14: the rings were cut off).
+        "-mx-1 -mt-1 flex min-h-0 flex-col overflow-y-auto px-1 pt-1 lg:overflow-hidden",
         dock
           ? cn(
-              "h-[calc(100dvh-5rem-var(--content-bottom,5rem))] sm:h-[calc(100dvh-5.25rem-var(--content-bottom,5rem))] lg:h-[calc(100dvh-5.5rem-var(--content-bottom,5rem))]",
+              "h-[calc(100dvh-4.75rem-var(--content-bottom,5rem))] sm:h-[calc(100dvh-5rem-var(--content-bottom,5rem))] lg:h-[calc(100dvh-5.25rem-var(--content-bottom,5rem))]",
               "mb-[calc(var(--content-bottom,0px)-6rem)] lg:mb-[calc(var(--content-bottom,0px)-7rem)]",
             )
-          : "h-[calc(100dvh-5rem-var(--content-bottom,1rem))] sm:h-[calc(100dvh-5.25rem-var(--content-bottom,1.25rem))] lg:h-[calc(100dvh-5.5rem-var(--content-bottom,1.5rem))]",
+          : "h-[calc(100dvh-4.75rem-var(--content-bottom,1rem))] sm:h-[calc(100dvh-5rem-var(--content-bottom,1.25rem))] lg:h-[calc(100dvh-5.25rem-var(--content-bottom,1.5rem))]",
         className,
       )}
     >

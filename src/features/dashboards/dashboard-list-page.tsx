@@ -501,7 +501,7 @@ export function DashboardListPage() {
         ) : null}
       </header>
 
-      <ScrollRegion className="-mx-2 mt-4 px-2 pb-6">
+      <ScrollRegion className="-mx-2 mt-3 px-2 pt-1 pb-6">
         <div className="grid grid-cols-[minmax(0,1fr)] gap-7">
           {!query.trim() && state.status === "success" && !loading ? (
             <RecentRow recent={recent} boards={boardsById} source={pictures} />
