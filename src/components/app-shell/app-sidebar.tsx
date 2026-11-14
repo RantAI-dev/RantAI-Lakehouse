@@ -15,7 +15,6 @@ import {
   SidebarGroup,
   SidebarHeader,
   SidebarMenu,
-  SidebarMenuAction,
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarMenuSub,
@@ -227,52 +226,64 @@ export function AppSidebar() {
     // One page, or icon mode with one page: nothing to expand.
     if (single) {
       return (
-        <SidebarMenuItem key={group.label}>
-          <SidebarMenuButton
-            isActive={active}
-            tooltip={label}
-            className={menuBtnClass(active)}
-            render={
-              <Link href={first.href} onClick={(e) => handleNavClick(e, first.href)}>
-                <Icon className="size-4 shrink-0" />
-                <span className={cn("truncate leading-5", SIDEBAR_FADE)}>{label}</span>
-              </Link>
-            }
-          />
-          {/* A second destination at the row's right end, where a section's
-              chevron sits. `SidebarMenuAction` hides itself in icon mode. */}
-          {first.action ? (
-            // The app's tooltips open at once: the root `TooltipProvider`
-            // has delay 0, and in base-ui a provider's zero wins over a
-            // `delay` set on the trigger. This one sits on a navigation row
-            // the pointer crosses all the time, so it gets its own provider
-            // and waits for the pointer to rest.
-            <TooltipProvider delay={500}>
-            <Tooltip>
-              <TooltipTrigger
-                render={
-                  <SidebarMenuAction
-                    aria-label={first.action.title}
-                    // Sits where a section's chevron sits: same size
-                    // (3.5) and the same 18px from the row's right edge
-                    // to its centre, measured against the Data chevron.
-                    // Fades with the label instead of vanishing as the collapse starts.
-                    className={cn("right-2 text-sidebar-foreground/50 [&>svg]:size-3.5 group-data-[collapsible=icon]:flex", SIDEBAR_FADE)}
-                    render={
-                      <Link
-                        href={first.action.href}
-                        onClick={(e) => handleNavClick(e, first.action?.href ?? first.href)}
-                      />
-                    }
-                  />
-                }
-              >
-                <first.action.icon />
-              </TooltipTrigger>
-              <TooltipContent side="right">{first.action.title}</TooltipContent>
-            </Tooltip>
-            </TooltipProvider>
-          ) : null}
+        <SidebarMenuItem key={group.label} className={first.action ? "flex items-stretch" : undefined}>
+          {(() => {
+            // A split row (shadcn's button group): the label part and, at the right end, a square
+            // part that is the whole touch target for a second destination, one thin separator
+            // between them. Each part lights up on its own; the active route lights only its own part.
+            const action = first.action
+            const actionActive = !!action && (pathname === action.href || pathname.startsWith(`${action.href}/`))
+            const labelActive = active && !actionActive
+            return (
+              <>
+                <SidebarMenuButton
+                  isActive={labelActive}
+                  tooltip={label}
+                  className={cn(
+                    menuBtnClass(labelActive),
+                    action && "min-w-0 flex-1 rounded-r-none group-data-[collapsible=icon]:flex-none group-data-[collapsible=icon]:rounded-md",
+                  )}
+                  render={
+                    <Link href={first.href} onClick={(e) => handleNavClick(e, first.href)}>
+                      <Icon className="size-4 shrink-0" />
+                      <span className={cn("truncate leading-5", SIDEBAR_FADE)}>{label}</span>
+                    </Link>
+                  }
+                />
+                {action ? (
+                  // The app's tooltips open at once: the root `TooltipProvider` has delay 0, and in
+                  // base-ui a provider's zero wins over a `delay` set on the trigger. This sits on
+                  // a navigation row the pointer crosses all the time, so it gets its own provider
+                  // and waits for the pointer to rest. Hidden with the rail's collapse: Browse stays
+                  // reachable from the page itself.
+                  <TooltipProvider delay={500}>
+                    <span aria-hidden className="my-2 w-px shrink-0 bg-sidebar-border group-data-[collapsible=icon]:hidden" />
+                    <Tooltip>
+                      <TooltipTrigger
+                        render={
+                          <Link
+                            href={action.href}
+                            aria-label={action.title}
+                            aria-current={actionActive ? "page" : undefined}
+                            onClick={(e) => handleNavClick(e, action.href)}
+                            className={cn(
+                              "grid size-8 shrink-0 place-items-center rounded-r-md outline-hidden ring-sidebar-ring transition-colors duration-150 focus-visible:ring-2 group-data-[collapsible=icon]:hidden [&>svg]:size-3.5",
+                              actionActive
+                                ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                                : "text-sidebar-foreground/70 hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
+                            )}
+                          />
+                        }
+                      >
+                        <action.icon />
+                      </TooltipTrigger>
+                      <TooltipContent side="right">{action.title}</TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                ) : null}
+              </>
+            )
+          })()}
         </SidebarMenuItem>
       )
     }

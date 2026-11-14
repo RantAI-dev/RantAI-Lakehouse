@@ -150,6 +150,15 @@ function SkeletonNav({ pathname }: { pathname: string }) {
               <Skeleton className="size-4 shrink-0 rounded" />
               <Skeleton className={cn("h-3", SIDEBAR_FADE)} style={{ width: barWidth(label) }} />
             </div>
+            {single && group.items[0].action ? (
+              // The split row's right part: a separator and a 32 px square, as the real row draws them.
+              <div className="absolute inset-y-0 right-0 flex group-data-[collapsible=icon]:hidden">
+                <span className="my-2 w-px bg-sidebar-border" />
+                <span className="grid size-8 place-items-center">
+                  <Skeleton className="size-3.5 rounded" />
+                </span>
+              </div>
+            ) : null}
             {!single && !collapsed && isOpen(group.label) ? (
               <SidebarMenuSub className={SIDEBAR_SUB_CLASS}>
                 {group.items.map((item) => (

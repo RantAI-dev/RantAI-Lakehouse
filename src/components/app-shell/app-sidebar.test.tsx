@@ -57,3 +57,18 @@ describe("AppSidebar, one row per section in both states", () => {
     expect(screen.getAllByRole("link", { name: "Catalog" }).some((a) => a.closest("[inert]") === null)).toBe(true)
   })
 })
+
+// Owner 2026-11-14: the Dashboards row is a split button group; the right part is the whole
+// touch target for Browse, its own link and tab stop, with the label for assistive tech.
+describe("AppSidebar, the Dashboards split row", () => {
+  it("has the label link and a separate full-height Browse link, joined by a separator", async () => {
+    renderSidebar(true)
+    const dashboards = await screen.findByRole("link", { name: "Dashboards" })
+    const browse = screen.getByRole("link", { name: "Browse all dashboards" })
+    expect(browse.getAttribute("href")).toBe("/dashboards/browse")
+    expect(dashboards).not.toBe(browse)
+    expect(browse.className).toContain("size-8")
+    expect(dashboards.closest("li")).toBe(browse.closest("li"))
+    expect(browse.previousElementSibling?.className).toContain("w-px")
+  })
+})
