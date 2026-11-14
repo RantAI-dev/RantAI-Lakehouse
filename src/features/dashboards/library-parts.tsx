@@ -279,11 +279,11 @@ const AVATAR_TONES = [
   "bg-violet-500/15 text-violet-800 dark:text-violet-200",
 ]
 
-/** Initials in a circle, a colour per name; the built-in board has a box instead of a person. */
+/** Initials in a circle (`leading-none`, last so a `text-[8px]` className cannot merge it away: the row's tall line height would sit 9 px capitals low), a colour per name; the built-in board has a box instead of a person. */
 export function Avatar({ owner, builtin, className }: { readonly owner: string; readonly builtin?: boolean; readonly className?: string }) {
   if (builtin) {
     return (
-      <span aria-hidden className={cn("grid size-5 shrink-0 place-items-center rounded-full bg-muted text-muted-foreground", className)}>
+      <span aria-hidden className={cn("grid size-5 shrink-0 place-items-center rounded-full bg-muted text-muted-foreground", className, "leading-none")}>
         <Package className="size-3" />
       </span>
     )
@@ -291,7 +291,7 @@ export function Avatar({ owner, builtin, className }: { readonly owner: string; 
   const initials = owner.split(/\s+/).filter(Boolean).map((w) => w[0]).slice(0, 2).join("").toUpperCase() || "?"
   const tone = AVATAR_TONES[[...owner].reduce((sum, c) => sum + c.charCodeAt(0), 0) % AVATAR_TONES.length]
   return (
-    <span aria-hidden className={cn("grid size-5 shrink-0 place-items-center rounded-full text-[9px] font-semibold", tone, className)}>
+    <span aria-hidden className={cn("grid size-5 shrink-0 place-items-center rounded-full text-[9px] font-semibold", tone, className, "leading-none")}>
       {initials}
     </span>
   )
