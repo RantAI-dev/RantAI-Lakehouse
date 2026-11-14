@@ -104,7 +104,9 @@ describe("ChartBuilder inspector tabs (phase 2 QA R3, BI-58 T4)", () => {
   it("keeps a text note to its title and content", async () => {
     renderBuilder({ title: "Note", kind: "text", text: "hello" })
     await screen.findByText(/Content \(markdown\)/)
-    expect(screen.queryAllByRole("heading", { level: 3 })).toHaveLength(0)
+    // No sections or tabs; the one group is its size on the dashboard (BI-58 review round 1, SHOULD-FIX 5).
+    expect(screen.queryAllByRole("heading", { level: 3 }).map((h) => h.textContent)).toEqual(["Size on dashboard"])
+    expect(screen.queryAllByRole("tab")).toHaveLength(0)
   })
 })
 
@@ -333,27 +335,37 @@ describe("ChartBuilder inspector placement (phase 2 QA R10, BI-58 T4)", () => {
   })
 })
 
-describe("ChartBuilder header (phase 2 QA R11, BI-58 T1)", () => {
-  it("keeps the dashboard, the width, Cancel and Save in one header row, the title on the canvas, and no helper line under the title", async () => {
+// BI-58 review round 1, SHOULD-FIX 4 and 5 (owner): the header is back, the dashboard picker in the
+// breadcrumb, the page's name and Save; Cancel is gone and the width is in Style.
+describe("ChartBuilder header (phase 2 QA R11, BI-58 T1, review round 1)", () => {
+  it("has only back, the dashboard picker and Save in the header, the title on the canvas, and no helper line under the title", async () => {
     renderBuilder()
     const header = (await screen.findByRole("heading", { level: 1 })).closest("header") as HTMLElement
-    expect(header.querySelector('[aria-label="Add to dashboard"]')).not.toBeNull()
-    expect(header.querySelector('[role="group"][aria-label="Width"]')?.textContent).toBe("Half widthFull width")
-    expect([...header.querySelectorAll("button")].map((b) => b.textContent)).toEqual(expect.arrayContaining(["Cancel", "Create chart"]))
+    const controls = [...header.querySelectorAll("button, [role=combobox], a")]
+    expect(controls.map((c) => c.getAttribute("aria-label") ?? c.textContent)).toEqual(["Back to dashboard", "Add to dashboard", "Create chart"])
+    expect(header.textContent).not.toContain("Cancel")
+    expect(header.querySelector('[role="radiogroup"], [aria-label="Width"]')).toBeNull()
     const title = screen.getByLabelText(/^Title/)
     expect(header.contains(title)).toBe(false)
     expect(title.closest('section[aria-label="Chart"]')).not.toBeNull()
     expect(screen.queryByText(/Left empty, the chart is saved as/)).toBeNull()
   })
 
-  it("sets the width from the header's segmented control", async () => {
+  it("sets the width from the pictures in Style, with radio semantics and arrow keys", async () => {
     renderBuilder(barDef)
     await waitFor(() => expect(bodies.length).toBeGreaterThan(0))
-    const full = screen.getByRole("button", { name: "Full width" })
-    expect(full.getAttribute("aria-pressed")).toBe("false")
+    openTab("Style")
+    const group = await screen.findByRole("radiogroup", { name: "Width on the dashboard" })
+    const half = within(group).getByRole("radio", { name: "Half row" })
+    const full = within(group).getByRole("radio", { name: "Full row" })
+    expect(half.getAttribute("aria-checked")).toBe("true")
+    expect(full.getAttribute("tabindex")).toBe("-1")
     fireEvent.click(full)
-    expect(full.getAttribute("aria-pressed")).toBe("true")
+    expect(full.getAttribute("aria-checked")).toBe("true")
     await waitFor(() => expect(bodies[bodies.length - 1]!.span).toBe(2))
+    fireEvent.keyDown(full, { key: "ArrowLeft" })
+    expect(half.getAttribute("aria-checked")).toBe("true")
+    await waitFor(() => expect(bodies[bodies.length - 1]!.span).toBe(1))
   })
 })
 
@@ -423,7 +435,9 @@ describe("ChartBuilder labels (phase 2 QA R20)", () => {
     const heading = screen.getByRole("heading", { level: 1 })
     expect(heading.textContent).toBe("New chart")
     expect(heading.querySelector("svg")).toBeNull()
-    expect(heading.parentElement?.textContent).toBe("Main/New chart")
+    // The dashboard is the picker before it (BI-58 review round 1, SHOULD-FIX 5).
+    expect(heading.parentElement?.querySelector('[role="combobox"]')?.textContent).toContain("Main")
+    expect(heading.previousElementSibling?.textContent).toBe("/")
     expect(pressedKind()).toBe("Horizontal bar (ranking)")
     unmount()
     cleanup()
@@ -489,7 +503,7 @@ describe("ChartBuilder Format section (BI-17 part A)", () => {
     renderBuilder({ title: "T", kind: "table", mart: "mart_visits", dimension: "provinsi", measures: ["visitors"], aggregate: "sum" })
     await screen.findByLabelText("Aggregation of visitors")
     openTab("Style")
-    expect(screen.getByText("Conditional colours", { selector: "legend" })).toBeTruthy()
+    expect(screen.getByText("Conditional colours", { selector: "h3" })).toBeTruthy()
     expect(screen.getByText("Values")).toBeTruthy()
     for (const title of ["Axes", "Colours", "Labels", "Notes", "Tooltip"]) expect(screen.queryByText(title), title).toBeNull()
   })

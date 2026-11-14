@@ -141,7 +141,8 @@ export function LayersSection({ layers, onChange, baseKind, grained, marts, sqlS
         const dimensions = fields ? matchingDimensions(baseKind, grained, fields.columns) : [];
         const choices = new Set(dimensions.map((d) => d.name));
         return (
-          <div key={i} className="grid gap-2 rounded-md border border-border p-2" data-testid={`layer-${n}`}>
+          // BI-58 review round 1 (SHOULD-FIX 3): set apart by a soft fill, not a box border.
+          <div key={i} className="grid gap-2 rounded-lg bg-muted/40 p-3" data-testid={`layer-${n}`}>
             <div className="flex items-center gap-1.5">
               <span className="text-xs font-medium text-muted-foreground">Question {n}</span>
               <span className="flex-1" />

@@ -356,3 +356,75 @@ describe("the builder findings of the 2026-11-14 QA (BI-58 T6)", () => {
     expect(cells[1]).not.toBe("1571564")
   })
 })
+
+// BI-58 review round 1, SHOULD-FIX 4 and 5 (owner).
+describe("leaving and the target dashboard (BI-58 review round 1)", () => {
+  const boards = [{ id: "default", name: "Main" }, { id: "b_other", name: "Other board" }]
+  function renderLeaving(initial: ChartDef) {
+    const onCancel = mock(() => {})
+    render(
+      <ReportingProvider reporting={{ timeZone: "UTC", weekStart: "monday" }}>
+        <ChartBuilder onSaved={() => {}} onCancel={onCancel} initial={initial} editId="c_1" boards={boards} />
+      </ReportingProvider>,
+    )
+    return onCancel
+  }
+  /** A person's edit of the title: a press in the field, then the new text. */
+  async function editTitle(text: string) {
+    const title = await screen.findByLabelText("Title")
+    fireEvent.pointerDown(title)
+    fireEvent.change(title, { target: { value: text } })
+  }
+
+  it("leaves at once by the back arrow when nothing changed", async () => {
+    const onCancel = renderLeaving(SAVED.bar)
+    await waitFor(() => expect(previews.length).toBeGreaterThan(0))
+    fireEvent.click(screen.getByRole("button", { name: "Back to dashboard" }))
+    expect(onCancel).toHaveBeenCalledTimes(1)
+    expect(screen.queryByRole("dialog", { name: "Discard changes?" }) === null).toBe(true)
+  })
+
+  it("asks before leaving with a change: Keep editing stays, Discard leaves", async () => {
+    const onCancel = renderLeaving(SAVED.bar)
+    await waitFor(() => expect(previews.length).toBeGreaterThan(0))
+    await editTitle("Visitors, renamed")
+    fireEvent.click(screen.getByRole("button", { name: "Back to dashboard" }))
+    const confirm = await screen.findByRole("dialog", { name: "Discard changes?" })
+    fireEvent.click(within(confirm).getByRole("button", { name: "Keep editing" }))
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Discard changes?" }) === null).toBe(true))
+    expect(onCancel).not.toHaveBeenCalled()
+    expect((screen.getByLabelText("Title") as HTMLInputElement).value).toBe("Visitors, renamed")
+    fireEvent.click(screen.getByRole("button", { name: "Back to dashboard" }))
+    fireEvent.click(within(await screen.findByRole("dialog", { name: "Discard changes?" })).getByRole("button", { name: "Discard" }))
+    expect(onCancel).toHaveBeenCalledTimes(1)
+  })
+
+  it("leaves by Esc when nothing is open over the page, asking first after a change", async () => {
+    const onCancel = renderLeaving(SAVED.bar)
+    await waitFor(() => expect(previews.length).toBeGreaterThan(0))
+    await editTitle("Changed")
+    fireEvent.keyDown(document.body, { key: "Escape" })
+    expect(await screen.findByRole("dialog", { name: "Discard changes?" })).toBeTruthy()
+    expect(onCancel).not.toHaveBeenCalled()
+  })
+
+  it("saves the chart on the dashboard picked in the breadcrumb", async () => {
+    const save = spyOn(dashboardService, "saveChart").mockResolvedValue({ id: "c_1" })
+    try {
+      renderLeaving(SAVED.bar)
+      await waitFor(() => expect(previews.length).toBeGreaterThan(0))
+      const picker = screen.getByRole("combobox", { name: "Add to dashboard" })
+      expect(picker.textContent).toContain("Main")
+      fireEvent.click(picker)
+      const option = await screen.findByRole("option", { name: "Other board" })
+      fireEvent.focus(option)
+      fireEvent.click(option)
+      await waitFor(() => expect(picker.textContent).toContain("Other board"))
+      fireEvent.click(screen.getByRole("button", { name: "Save changes" }))
+      await waitFor(() => expect(save).toHaveBeenCalledTimes(1))
+      expect(wire(save.mock.calls[0]![0]).board).toBe("b_other")
+    } finally {
+      save.mockRestore()
+    }
+  })
+})

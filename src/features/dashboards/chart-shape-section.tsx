@@ -90,13 +90,14 @@ export function MeasureRows({
               </>
             ) : null}
           </div>
-          <div className="flex items-center gap-1.5">
+          {/* BI-58 review round 1 (SHOULD-FIX 2): the column and its aggregate are a pair of matching widths. */}
+          <div className={(own || onDefaultAggregate || fixedNote) && !isMetricColumn(row.column) && !wholeMeasure.has(row.column) ? "grid grid-cols-2 items-center gap-1.5" : "grid grid-cols-[minmax(0,1fr)] gap-1.5"}>
             <Select value={row.column} items={columnItems(columns, fieldLabel, row.column)} onValueChange={(v) => set(i, { column: v ?? "" })} disabled={disabled}>
-              <SelectTrigger className="w-full min-w-0 flex-1" aria-label={labels(i)} title={row.column ? displayColumnFull(row.column) : undefined}><SelectValue placeholder={placeholder} /></SelectTrigger>
+              <SelectTrigger className="w-full min-w-0" aria-label={labels(i)} title={row.column ? displayColumnFull(row.column) : undefined}><SelectValue placeholder={placeholder} /></SelectTrigger>
               <SelectContent>{columns.map((m) => <SelectItem key={m} value={m}>{fieldLabel(m)}</SelectItem>)}</SelectContent>
             </Select>
             {fixedNote ? (
-              <span className="shrink-0 text-xs text-muted-foreground">{fixedNote}</span>
+              <span className="text-xs text-muted-foreground">{fixedNote}</span>
             ) : (own || onDefaultAggregate) && !isMetricColumn(row.column) && !wholeMeasure.has(row.column) ? (
               <Select
                 value={row.aggregate || defaultAggregate}
@@ -108,7 +109,7 @@ export function MeasureRows({
                 }}
                 disabled={disabled}
               >
-                <SelectTrigger className="w-24 shrink-0" aria-label={`Aggregation of ${row.column || labels(i)}`}><SelectValue /></SelectTrigger>
+                <SelectTrigger className="w-full min-w-0" aria-label={`Aggregation of ${row.column || labels(i)}`}><SelectValue /></SelectTrigger>
                 <SelectContent>
                   {MEASURE_AGGREGATES.map((a) => <SelectItem key={a} value={a}>{a}</SelectItem>)}
                 </SelectContent>
@@ -200,7 +201,8 @@ export function ChartFilters({
         </Select>
       ) : null}
       {open ? (
-        <div className="rounded-md border border-border p-2.5" aria-label={`Filter on ${column}`}>
+        // BI-58 review round 1 (SHOULD-FIX 3): set apart by a soft fill, not a box border.
+        <div className="rounded-lg bg-muted/40 p-3" aria-label={`Filter on ${column}`}>
           <p className="pb-2 text-xs font-medium text-muted-foreground">{column}</p>
           <FilterEditor
             board="" column={column} others={others(column)} kind={kindOf(column)} source={source}
@@ -316,25 +318,31 @@ function ConditionRow({
   const type = kind === "number" ? "number" : kind === "date" || kind === "datetime" ? "date" : "text";
   const ops = type === "text" ? ["eq", "ne"] : Object.keys(STEP_OPS);
   const input = (v: string | undefined, set: (v: string) => void, aria: string) => (
-    <Input type={type} step="any" value={v ?? ""} onChange={(e) => set(e.target.value)} aria-label={aria} className="min-w-28 flex-1" />
+    <Input type={type} step="any" value={v ?? ""} onChange={(e) => set(e.target.value)} aria-label={aria} className="w-full min-w-28" />
   );
+  // BI-58 review round 1 (SHOULD-FIX 2): the column spans the row (its remove button beside it),
+  // and the comparison and its value(s) are pairs of matching widths below it.
   return (
-    <div className="flex flex-wrap items-center gap-1.5">
-      <Select value={value.column} items={Object.fromEntries(columns.map((c) => [c, label(c)]))} onValueChange={(v) => onChange({ ...value, column: v ?? "" })}>
-        <SelectTrigger className="w-40 max-w-full shrink-0" aria-label="Condition column"><SelectValue placeholder="column" /></SelectTrigger>
-        <SelectContent>{columns.map((c) => <SelectItem key={c} value={c}>{label(c)}</SelectItem>)}</SelectContent>
-      </Select>
-      <Select value={ops.includes(value.op) ? value.op : ops[0]} items={STEP_OPS} onValueChange={(v) => onChange({ ...value, op: v ?? "eq" })}>
-        <SelectTrigger className="w-40 shrink-0" aria-label="Comparison"><SelectValue /></SelectTrigger>
-        <SelectContent>{ops.map((o) => <SelectItem key={o} value={o}>{STEP_OPS[o]}</SelectItem>)}</SelectContent>
-      </Select>
-      {value.op === "between" ? (
-        <>
-          {input(value.min, (min) => onChange({ ...value, min }), "From")}
-          {input(value.max, (max) => onChange({ ...value, max }), "To")}
-        </>
-      ) : input(value.value, (v) => onChange({ ...value, value: v }), "Value")}
-      <Button type="button" size="icon-xs" variant="ghost" aria-label="Remove condition" onClick={onRemove}><X /></Button>
+    <div className="grid grid-cols-[minmax(0,1fr)] gap-1.5">
+      <div className="flex min-w-0 items-center gap-1.5">
+        <Select value={value.column} items={Object.fromEntries(columns.map((c) => [c, label(c)]))} onValueChange={(v) => onChange({ ...value, column: v ?? "" })}>
+          <SelectTrigger className="w-full min-w-0 flex-1" aria-label="Condition column"><SelectValue placeholder="column" /></SelectTrigger>
+          <SelectContent>{columns.map((c) => <SelectItem key={c} value={c}>{label(c)}</SelectItem>)}</SelectContent>
+        </Select>
+        <Button type="button" size="icon-xs" variant="ghost" aria-label="Remove condition" onClick={onRemove}><X /></Button>
+      </div>
+      <div className={value.op === "between" ? "grid grid-cols-[minmax(0,1fr)] gap-1.5" : "grid grid-cols-2 gap-1.5"}>
+        <Select value={ops.includes(value.op) ? value.op : ops[0]} items={STEP_OPS} onValueChange={(v) => onChange({ ...value, op: v ?? "eq" })}>
+          <SelectTrigger className="w-full min-w-0" aria-label="Comparison"><SelectValue /></SelectTrigger>
+          <SelectContent>{ops.map((o) => <SelectItem key={o} value={o}>{STEP_OPS[o]}</SelectItem>)}</SelectContent>
+        </Select>
+        {value.op === "between" ? (
+          <div className="grid grid-cols-2 gap-1.5">
+            {input(value.min, (min) => onChange({ ...value, min }), "From")}
+            {input(value.max, (max) => onChange({ ...value, max }), "To")}
+          </div>
+        ) : input(value.value, (v) => onChange({ ...value, value: v }), "Value")}
+      </div>
     </div>
   );
 }
@@ -369,21 +377,23 @@ export function StepsEditor({
         const label = (c: string) => cols.labels[c] ?? c;
         const kindOf = (c: string) => (cols.measures.includes(c) ? "number" : cols.groups.find((g) => g.name === c)?.kind ?? "text");
         return (
-          <div key={i} className="grid gap-2 rounded-md border border-border p-2.5" aria-label={`Step ${i + 1}`}>
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-medium text-muted-foreground">Step {i + 1}</span>
-              <Select
-                value={step.summarise ? "summarise" : "filter"} items={STEP_TYPES}
-                onValueChange={(v) => set(i, v === "summarise" ? blankSummary(cols) : blankFilter(cols))}
-              >
-                <SelectTrigger className="h-7 w-36" aria-label={`Step ${i + 1} type`}><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="filter">Filter the result</SelectItem>
-                  <SelectItem value="summarise">Summarise again</SelectItem>
-                </SelectContent>
-              </Select>
-              <Button type="button" size="icon-xs" variant="ghost" className="ml-auto" aria-label={`Remove step ${i + 1}`} onClick={() => onChange(value.filter((_, j) => j !== i))}><X /></Button>
+          // BI-58 review round 1 (SHOULD-FIX 3): a step is set apart by a soft fill, not a box border,
+          // and its type select spans the step like every other field.
+          <div key={i} className="grid grid-cols-[minmax(0,1fr)] gap-2 rounded-lg bg-muted/40 p-3" aria-label={`Step ${i + 1}`}>
+            <div className="flex min-h-6 items-center justify-between gap-2">
+              <span className="text-xs font-medium">Step {i + 1}</span>
+              <Button type="button" size="icon-xs" variant="ghost" aria-label={`Remove step ${i + 1}`} onClick={() => onChange(value.filter((_, j) => j !== i))}><X /></Button>
             </div>
+            <Select
+              value={step.summarise ? "summarise" : "filter"} items={STEP_TYPES}
+              onValueChange={(v) => set(i, v === "summarise" ? blankSummary(cols) : blankFilter(cols))}
+            >
+              <SelectTrigger className="w-full" aria-label={`Step ${i + 1} type`}><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="filter">Filter the result</SelectItem>
+                <SelectItem value="summarise">Summarise again</SelectItem>
+              </SelectContent>
+            </Select>
             {step.summarise ? (
               <>
                 {cols.groups.length ? (

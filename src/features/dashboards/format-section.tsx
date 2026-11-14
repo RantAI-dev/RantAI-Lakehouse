@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Switch } from "@/components/ui/switch";
+import { SettingField, SettingGroup, SettingSwitch } from "./builder-sections";
 import {
   BUILTIN_PALETTES, DATE_STYLES, MAX_ANNOTATIONS, MAX_AFFIX_LEN, MAX_AXIS_TITLE_LEN, MAX_CONDITIONAL_RULES, MAX_DECIMALS, MAX_NOTE_LEN,
   type Annotation, type AxisStyle, type CompareOp, type CondRule, type CondRuleTest, type DateFormat, type StyleFields, type ValueFormat,
@@ -22,8 +22,10 @@ import { ColourInput } from "./colour-input";
  * the form never offers what the server would refuse.
  */
 
+// BI-58 review round 1 (SHOULD-FIX 3): "Automatic" wherever the choice means the chart's own
+// default ("As it is now" and "Time as is" read oddly to the owner).
 const STYLE_LABELS: Record<string, string> = {
-  auto: "As it is now", number: "Number", percent: "Percent", currency: "Currency", scientific: "Scientific", compact: "Compact (1.2 K)",
+  auto: "Automatic", number: "Number", percent: "Percent", currency: "Currency", scientific: "Scientific", compact: "Compact (1.2 K)",
   currencyCompact: "Currency, compact (1.2 M)",
 };
 // QA LH-BI-1-06 (BI-55, D12): a compact amount of money is one choice of its
@@ -31,8 +33,9 @@ const STYLE_LABELS: Record<string, string> = {
 // mirrors the server and is not changed; this list is what the editor offers.
 const STYLE_CHOICES = ["auto", "number", "percent", "currency", "currencyCompact", "scientific", "compact"] as const;
 const DATE_LABELS: Record<string, string> = {
-  auto: "As it is now", short: "15/10/26", medium: "15 Oct 2026", long: "15 October 2026", iso: "2026-10-15", monthYear: "October 2026",
+  auto: "Automatic", short: "15/10/26", medium: "15 Oct 2026", long: "15 October 2026", iso: "2026-10-15", monthYear: "October 2026",
 };
+const TIME_LABELS: Record<string, string> = { locale: "Automatic", "12": "12-hour", "24": "24-hour" };
 const PALETTE_LABELS: Record<string, string> = {
   default: "Default", bright: "Bright", muted: "Muted", "sequential-blue": "Sequential blue", "diverging-red-blue": "Diverging red-blue", company: "Company palette",
 };
@@ -41,17 +44,18 @@ const RULE_LABELS: Record<CondRuleTest["type"], string> = { compare: "Compare", 
 const ROTATIONS: Record<string, string> = { "": "Automatic", "0": "Flat", "45": "45°", "90": "Upright" };
 const ALL_VALUES = "__all__";
 
-function Group({ title, children }: { readonly title: string; readonly children: React.ReactNode }) {
-  return (
-    <fieldset className="grid gap-2 rounded-lg border border-border p-3">
-      <legend className="px-1 text-xs font-medium text-muted-foreground">{title}</legend>
-      {children}
-    </fieldset>
-  );
-}
-
 function num(text: string): number | undefined {
   return text.trim() === "" || !Number.isFinite(Number(text)) ? undefined : Number(text);
+}
+
+/** A sub-heading inside a group (an axis, a note, a rule), with its remove button when it has one. */
+function ItemHeading({ children, onRemove, removeLabel }: { readonly children: React.ReactNode; readonly onRemove?: () => void; readonly removeLabel?: string }) {
+  return (
+    <div className="flex min-h-6 items-center justify-between gap-2 pt-2">
+      <p className="text-sm font-semibold text-foreground">{children}</p>
+      {onRemove ? <Button type="button" size="icon-xs" variant="ghost" aria-label={removeLabel} onClick={onRemove}><X /></Button> : null}
+    </div>
+  );
 }
 
 /** One number format: style, decimals, thousands, currency, prefix and suffix. */
@@ -73,28 +77,44 @@ export function ValueFormatEditor({ value, onChange, label }: {
     else set({ style: (v ?? "auto") as ValueFormat["style"] });
   };
   return (
-    <div className="flex flex-wrap items-center gap-1.5">
-      <Select value={choice} items={STYLE_LABELS} onValueChange={choose}>
-        <SelectTrigger className="w-40 shrink-0" aria-label={`${label} style`}><SelectValue /></SelectTrigger>
-        <SelectContent>{STYLE_CHOICES.map((s) => <SelectItem key={s} value={s}>{STYLE_LABELS[s]}</SelectItem>)}</SelectContent>
-      </Select>
-      <Input className="h-8 w-20" type="number" min={0} max={MAX_DECIMALS} value={f.decimals ?? ""} placeholder="Decimals" aria-label={`${label} decimals`}
-        onChange={(e) => set({ decimals: num(e.target.value) })} />
-      {currencyStyle ? (
-        <>
-          <Input className="h-8 w-20 uppercase" maxLength={3} value={f.currency ?? ""} placeholder="IDR" aria-label={`${label} currency code`}
-            onChange={(e) => set({ currency: e.target.value.toUpperCase() || undefined })} />
-          <Select value={f.currencyDisplay ?? "symbol"} items={{ symbol: "Symbol", code: "Code" }} onValueChange={(v) => set({ currencyDisplay: v === "code" ? "code" : "symbol" })}>
-            <SelectTrigger className="w-24 shrink-0" aria-label={`${label} currency display`}><SelectValue /></SelectTrigger>
-            <SelectContent><SelectItem value="symbol">Symbol</SelectItem><SelectItem value="code">Code</SelectItem></SelectContent>
+    <div className="grid grid-cols-[minmax(0,1fr)] gap-3">
+      <SettingField label="Style">
+        {(id) => (
+          <Select value={choice} items={STYLE_LABELS} onValueChange={choose}>
+            <SelectTrigger id={id} className="w-full" aria-label={`${label} style`}><SelectValue /></SelectTrigger>
+            <SelectContent>{STYLE_CHOICES.map((s) => <SelectItem key={s} value={s}>{STYLE_LABELS[s]}</SelectItem>)}</SelectContent>
           </Select>
-        </>
+        )}
+      </SettingField>
+      <div className={currencyStyle ? "grid grid-cols-2 gap-3" : "grid grid-cols-[minmax(0,1fr)]"}>
+        <SettingField label="Decimals">
+          {(id) => <Input id={id} type="number" min={0} max={MAX_DECIMALS} value={f.decimals ?? ""} placeholder="Auto" aria-label={`${label} decimals`} onChange={(e) => set({ decimals: num(e.target.value) })} />}
+        </SettingField>
+        {currencyStyle ? (
+          <SettingField label="Currency">
+            {(id) => <Input id={id} className="uppercase" maxLength={3} value={f.currency ?? ""} placeholder="IDR" aria-label={`${label} currency code`} onChange={(e) => set({ currency: e.target.value.toUpperCase() || undefined })} />}
+          </SettingField>
+        ) : null}
+      </div>
+      {currencyStyle ? (
+        <SettingField label="Currency shown as">
+          {(id) => (
+            <Select value={f.currencyDisplay ?? "symbol"} items={{ symbol: "Symbol (Rp)", code: "Code (IDR)" }} onValueChange={(v) => set({ currencyDisplay: v === "code" ? "code" : "symbol" })}>
+              <SelectTrigger id={id} className="w-full" aria-label={`${label} currency display`}><SelectValue /></SelectTrigger>
+              <SelectContent><SelectItem value="symbol">Symbol (Rp)</SelectItem><SelectItem value="code">Code (IDR)</SelectItem></SelectContent>
+            </Select>
+          )}
+        </SettingField>
       ) : null}
-      <span className="flex items-center gap-1 text-xs text-muted-foreground">
-        <Switch size="sm" checked={f.thousands !== false} onCheckedChange={(c) => set({ thousands: c === true ? undefined : false })} aria-label={`${label} thousands separator`} /> 1,000
-      </span>
-      <Input className="h-8 w-20" maxLength={MAX_AFFIX_LEN} value={f.prefix ?? ""} placeholder="Prefix" aria-label={`${label} prefix`} onChange={(e) => set({ prefix: e.target.value || undefined })} />
-      <Input className="h-8 w-20" maxLength={MAX_AFFIX_LEN} value={f.suffix ?? ""} placeholder="Suffix" aria-label={`${label} suffix`} onChange={(e) => set({ suffix: e.target.value || undefined })} />
+      <div className="grid grid-cols-2 gap-3">
+        <SettingField label="Prefix">
+          {(id) => <Input id={id} maxLength={MAX_AFFIX_LEN} value={f.prefix ?? ""} aria-label={`${label} prefix`} onChange={(e) => set({ prefix: e.target.value || undefined })} />}
+        </SettingField>
+        <SettingField label="Suffix">
+          {(id) => <Input id={id} maxLength={MAX_AFFIX_LEN} value={f.suffix ?? ""} aria-label={`${label} suffix`} onChange={(e) => set({ suffix: e.target.value || undefined })} />}
+        </SettingField>
+      </div>
+      <SettingSwitch label="Thousands separator" ariaLabel={`${label} thousands separator`} checked={f.thousands !== false} onCheckedChange={(on) => set({ thousands: on ? undefined : false })} />
     </div>
   );
 }
@@ -103,19 +123,25 @@ function DateFormatEditor({ value, onChange }: { readonly value: DateFormat | un
   const f = value ?? {};
   const set = (patch: Partial<DateFormat>) => onChange({ ...f, ...patch });
   return (
-    <div className="flex flex-wrap items-center gap-1.5">
-      <Select value={f.style ?? "auto"} items={DATE_LABELS} onValueChange={(v) => set({ style: (v ?? "auto") as DateFormat["style"] })}>
-        <SelectTrigger className="w-44 shrink-0" aria-label="Date style"><SelectValue /></SelectTrigger>
-        <SelectContent>{DATE_STYLES.map((s) => <SelectItem key={s} value={s}>{DATE_LABELS[s]}</SelectItem>)}</SelectContent>
-      </Select>
-      <Select value={f.hour12 === undefined ? "locale" : f.hour12 ? "12" : "24"} items={{ locale: "Time as is", "12": "12-hour", "24": "24-hour" }}
-        onValueChange={(v) => set({ hour12: v === "12" ? true : v === "24" ? false : undefined })}>
-        <SelectTrigger className="w-28 shrink-0" aria-label="Time format"><SelectValue /></SelectTrigger>
-        <SelectContent><SelectItem value="locale">Time as is</SelectItem><SelectItem value="12">12-hour</SelectItem><SelectItem value="24">24-hour</SelectItem></SelectContent>
-      </Select>
-      <span className="flex items-center gap-1 text-xs text-muted-foreground">
-        <Switch size="sm" checked={f.abbreviate === true} onCheckedChange={(c) => set({ abbreviate: c === true ? true : undefined })} aria-label="Short month and day names" /> Short names
-      </span>
+    <div className="grid grid-cols-[minmax(0,1fr)] gap-3">
+      <SettingField label="Date style">
+        {(id) => (
+          <Select value={f.style ?? "auto"} items={DATE_LABELS} onValueChange={(v) => set({ style: (v ?? "auto") as DateFormat["style"] })}>
+            <SelectTrigger id={id} className="w-full" aria-label="Date style"><SelectValue /></SelectTrigger>
+            <SelectContent>{DATE_STYLES.map((s) => <SelectItem key={s} value={s}>{DATE_LABELS[s]}</SelectItem>)}</SelectContent>
+          </Select>
+        )}
+      </SettingField>
+      <SettingField label="Time">
+        {(id) => (
+          <Select value={f.hour12 === undefined ? "locale" : f.hour12 ? "12" : "24"} items={TIME_LABELS}
+            onValueChange={(v) => set({ hour12: v === "12" ? true : v === "24" ? false : undefined })}>
+            <SelectTrigger id={id} className="w-full" aria-label="Time format"><SelectValue /></SelectTrigger>
+            <SelectContent>{Object.entries(TIME_LABELS).map(([v, l]) => <SelectItem key={v} value={v}>{l}</SelectItem>)}</SelectContent>
+          </Select>
+        )}
+      </SettingField>
+      <SettingSwitch label="Short month and day names (Oct, Mon)" ariaLabel="Short month and day names" checked={f.abbreviate === true} onCheckedChange={(on) => set({ abbreviate: on ? true : undefined })} />
     </div>
   );
 }
@@ -130,26 +156,35 @@ function AxisEditor({ title, value, onChange, canLog, rotate }: {
   const a = value ?? {};
   const set = (patch: Partial<AxisStyle>) => onChange({ ...a, ...patch });
   return (
-    <div className="flex flex-wrap items-center gap-1.5">
-      <Input className="h-8 w-36" maxLength={MAX_AXIS_TITLE_LEN} value={a.title ?? ""} placeholder={`${title} title`} aria-label={`${title} axis title`} onChange={(e) => set({ title: e.target.value || undefined })} />
+    <div className="grid grid-cols-[minmax(0,1fr)] gap-3">
+      <ItemHeading>{title} axis</ItemHeading>
+      <SettingField label="Title">
+        {(id) => <Input id={id} maxLength={MAX_AXIS_TITLE_LEN} value={a.title ?? ""} aria-label={`${title} axis title`} onChange={(e) => set({ title: e.target.value || undefined })} />}
+      </SettingField>
       {canLog ? (
-        <>
-          <Input className="h-8 w-20" type="number" value={a.min ?? ""} placeholder="Min" aria-label={`${title} axis minimum`} onChange={(e) => set({ min: num(e.target.value) })} />
-          <Input className="h-8 w-20" type="number" value={a.max ?? ""} placeholder="Max" aria-label={`${title} axis maximum`} onChange={(e) => set({ max: num(e.target.value) })} />
-          <span className="flex items-center gap-1 text-xs text-muted-foreground">
-            <Switch size="sm" checked={a.log === true} onCheckedChange={(c) => set({ log: c === true ? true : undefined })} aria-label={`${title} axis logarithmic`} /> Log
-          </span>
-        </>
+        <div className="grid grid-cols-2 gap-3">
+          <SettingField label="Minimum">
+            {(id) => <Input id={id} type="number" value={a.min ?? ""} placeholder="Auto" aria-label={`${title} axis minimum`} onChange={(e) => set({ min: num(e.target.value) })} />}
+          </SettingField>
+          <SettingField label="Maximum">
+            {(id) => <Input id={id} type="number" value={a.max ?? ""} placeholder="Auto" aria-label={`${title} axis maximum`} onChange={(e) => set({ max: num(e.target.value) })} />}
+          </SettingField>
+        </div>
       ) : null}
       {rotate ? (
-        <Select value={a.rotate === undefined ? "" : String(a.rotate)} items={ROTATIONS} onValueChange={(v) => set({ rotate: v === "" || v == null ? undefined : (Number(v) as 0 | 45 | 90) })}>
-          <SelectTrigger className="w-28 shrink-0" aria-label={`${title} axis label rotation`}><SelectValue /></SelectTrigger>
-          <SelectContent>{Object.entries(ROTATIONS).map(([v, l]) => <SelectItem key={v} value={v}>{l}</SelectItem>)}</SelectContent>
-        </Select>
+        <SettingField label="Label angle">
+          {(id) => (
+            <Select value={a.rotate === undefined ? "" : String(a.rotate)} items={ROTATIONS} onValueChange={(v) => set({ rotate: v === "" || v == null ? undefined : (Number(v) as 0 | 45 | 90) })}>
+              <SelectTrigger id={id} className="w-full" aria-label={`${title} axis label rotation`}><SelectValue /></SelectTrigger>
+              <SelectContent>{Object.entries(ROTATIONS).map(([v, l]) => <SelectItem key={v} value={v}>{l}</SelectItem>)}</SelectContent>
+            </Select>
+          )}
+        </SettingField>
       ) : null}
-      <span className="flex items-center gap-1 text-xs text-muted-foreground">
-        <Switch size="sm" checked={a.show !== false} onCheckedChange={(c) => set({ show: c === true ? undefined : false })} aria-label={`Show the ${title} axis`} /> Show
-      </span>
+      {canLog ? (
+        <SettingSwitch label="Logarithmic scale" ariaLabel={`${title} axis logarithmic`} checked={a.log === true} onCheckedChange={(on) => set({ log: on ? true : undefined })} />
+      ) : null}
+      <SettingSwitch label="Show this axis" ariaLabel={`Show the ${title} axis`} checked={a.show !== false} onCheckedChange={(on) => set({ show: on ? undefined : false })} />
     </div>
   );
 }
@@ -174,71 +209,105 @@ function RuleRow({ rule, columns, index, onChange, onRemove }: {
     else setTest({ type, colors: ["#fee2e2", "#dc2626"] });
   };
   return (
-    <div className="flex flex-wrap items-center gap-1.5">
-      <Select value={rule.column || "__none__"} items={{ __none__: "Column", ...Object.fromEntries(columns.map((c) => [c, c])) }} onValueChange={(v) => onChange({ ...rule, column: v && v !== "__none__" ? v : "" })}>
-        <SelectTrigger className="w-32 shrink-0" aria-label={`Rule ${n} column`}><SelectValue /></SelectTrigger>
-        <SelectContent>{columns.map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
-      </Select>
-      <Select value={t.type} items={RULE_LABELS} onValueChange={(v) => switchType((v ?? "compare") as CondRuleTest["type"])}>
-        <SelectTrigger className="w-32 shrink-0" aria-label={`Rule ${n} kind`}><SelectValue /></SelectTrigger>
-        <SelectContent>{Object.entries(RULE_LABELS).map(([v, l]) => <SelectItem key={v} value={v}>{l}</SelectItem>)}</SelectContent>
-      </Select>
-      {t.type === "compare" ? (
-        <>
-          <Select value={t.op} items={COMPARE_LABELS} onValueChange={(v) => setTest({ ...t, op: (v ?? "lt") as CompareOp })}>
-            <SelectTrigger className="w-32 shrink-0" aria-label={`Rule ${n} operator`}><SelectValue /></SelectTrigger>
-            <SelectContent>{Object.entries(COMPARE_LABELS).map(([v, l]) => <SelectItem key={v} value={v}>{l}</SelectItem>)}</SelectContent>
+    <div className="grid grid-cols-[minmax(0,1fr)] gap-3">
+      <ItemHeading onRemove={onRemove} removeLabel={`Remove rule ${n}`}>Rule {n}</ItemHeading>
+      <SettingField label="Column">
+        {(id) => (
+          <Select value={rule.column || "__none__"} items={{ __none__: "Pick a column", ...Object.fromEntries(columns.map((c) => [c, c])) }} onValueChange={(v) => onChange({ ...rule, column: v && v !== "__none__" ? v : "" })}>
+            <SelectTrigger id={id} className="w-full" aria-label={`Rule ${n} column`}><SelectValue /></SelectTrigger>
+            <SelectContent>{columns.map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
           </Select>
-          <Input className="h-8 w-24" type="number" value={Number.isFinite(t.value) ? t.value : ""} aria-label={`Rule ${n} value`} onChange={(e) => setTest({ ...t, value: num(e.target.value) ?? Number.NaN })} />
-        </>
+        )}
+      </SettingField>
+      <SettingField label="When">
+        {(id) => (
+          <Select value={t.type} items={RULE_LABELS} onValueChange={(v) => switchType((v ?? "compare") as CondRuleTest["type"])}>
+            <SelectTrigger id={id} className="w-full" aria-label={`Rule ${n} kind`}><SelectValue /></SelectTrigger>
+            <SelectContent>{Object.entries(RULE_LABELS).map(([v, l]) => <SelectItem key={v} value={v}>{l}</SelectItem>)}</SelectContent>
+          </Select>
+        )}
+      </SettingField>
+      {t.type === "compare" ? (
+        <div className="grid grid-cols-2 gap-3">
+          <SettingField label="Comparison">
+            {(id) => (
+              <Select value={t.op} items={COMPARE_LABELS} onValueChange={(v) => setTest({ ...t, op: (v ?? "lt") as CompareOp })}>
+                <SelectTrigger id={id} className="w-full" aria-label={`Rule ${n} operator`}><SelectValue /></SelectTrigger>
+                <SelectContent>{Object.entries(COMPARE_LABELS).map(([v, l]) => <SelectItem key={v} value={v}>{l}</SelectItem>)}</SelectContent>
+              </Select>
+            )}
+          </SettingField>
+          <SettingField label="Value">
+            {(id) => <Input id={id} type="number" value={Number.isFinite(t.value) ? t.value : ""} aria-label={`Rule ${n} value`} onChange={(e) => setTest({ ...t, value: num(e.target.value) ?? Number.NaN })} />}
+          </SettingField>
+        </div>
       ) : null}
       {t.type === "between" ? (
-        <>
-          <Input className="h-8 w-20" type="number" value={Number.isFinite(t.from) ? t.from : ""} aria-label={`Rule ${n} from`} onChange={(e) => setTest({ ...t, from: num(e.target.value) ?? Number.NaN })} />
-          <Input className="h-8 w-20" type="number" value={Number.isFinite(t.to) ? t.to : ""} aria-label={`Rule ${n} to`} onChange={(e) => setTest({ ...t, to: num(e.target.value) ?? Number.NaN })} />
-        </>
+        <div className="grid grid-cols-2 gap-3">
+          <SettingField label="From">
+            {(id) => <Input id={id} type="number" value={Number.isFinite(t.from) ? t.from : ""} aria-label={`Rule ${n} from`} onChange={(e) => setTest({ ...t, from: num(e.target.value) ?? Number.NaN })} />}
+          </SettingField>
+          <SettingField label="To">
+            {(id) => <Input id={id} type="number" value={Number.isFinite(t.to) ? t.to : ""} aria-label={`Rule ${n} to`} onChange={(e) => setTest({ ...t, to: num(e.target.value) ?? Number.NaN })} />}
+          </SettingField>
+        </div>
       ) : null}
-      {t.type === "contains" ? <Input className="h-8 w-32" value={t.text} maxLength={80} aria-label={`Rule ${n} text`} onChange={(e) => setTest({ ...t, text: e.target.value })} /> : null}
+      {t.type === "contains" ? (
+        <SettingField label="Text">
+          {(id) => <Input id={id} value={t.text} maxLength={80} aria-label={`Rule ${n} text`} onChange={(e) => setTest({ ...t, text: e.target.value })} />}
+        </SettingField>
+      ) : null}
       {t.type === "range" ? (
-        <>
-          {t.colors.map((c, i) => (
-            <ColourInput key={i} value={c} label={`Rule ${n} range colour ${i + 1}`} onChange={(next) => { if (next) setTest({ ...t, colors: t.colors.map((x, j) => (j === i ? next : x)) }); }} />
-          ))}
-          <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs"
-            onClick={() => setTest({ ...t, colors: t.colors.length === 2 ? [t.colors[0]!, "#f59e0b", t.colors[1]!] : [t.colors[0]!, t.colors[2]!] })}>
-            {t.colors.length === 2 ? "Add a middle colour" : "Remove the middle colour"}
-          </Button>
-        </>
+        <div className="grid gap-1.5">
+          <p className="text-xs font-medium">Colours, lowest to highest</p>
+          <div className="flex flex-wrap items-center gap-1.5">
+            {t.colors.map((c, i) => (
+              <ColourInput key={i} value={c} label={`Rule ${n} range colour ${i + 1}`} onChange={(next) => { if (next) setTest({ ...t, colors: t.colors.map((x, j) => (j === i ? next : x)) }); }} />
+            ))}
+            <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs"
+              onClick={() => setTest({ ...t, colors: t.colors.length === 2 ? [t.colors[0]!, "#f59e0b", t.colors[1]!] : [t.colors[0]!, t.colors[2]!] })}>
+              {t.colors.length === 2 ? "Add a middle colour" : "Remove the middle colour"}
+            </Button>
+          </div>
+        </div>
       ) : (
-        <ColourInput value={rule.color} label={`Rule ${n} colour`} onChange={(c) => onChange({ ...rule, color: c })} fallback="#dc2626" />
+        <div className="grid grid-cols-[auto_minmax(0,1fr)] items-end gap-3">
+          <div className="grid gap-1.5">
+            <p className="text-xs font-medium">Colour</p>
+            <ColourInput value={rule.color} label={`Rule ${n} colour`} onChange={(c) => onChange({ ...rule, color: c })} fallback="#dc2626" />
+          </div>
+          <SettingField label="Colours">
+            {(id) => (
+              <Select value={rule.target ?? "cell"} items={{ cell: "The cell", text: "The text" }} onValueChange={(v) => onChange({ ...rule, target: v === "text" ? "text" : "cell" })}>
+                <SelectTrigger id={id} className="w-full" aria-label={`Rule ${n} colours`}><SelectValue /></SelectTrigger>
+                <SelectContent><SelectItem value="cell">The cell</SelectItem><SelectItem value="text">The text</SelectItem></SelectContent>
+              </Select>
+            )}
+          </SettingField>
+        </div>
       )}
-      {t.type !== "range" ? (
-        <Select value={rule.target ?? "cell"} items={{ cell: "Colour the cell", text: "Colour the text" }} onValueChange={(v) => onChange({ ...rule, target: v === "text" ? "text" : "cell" })}>
-          <SelectTrigger className="w-36 shrink-0" aria-label={`Rule ${n} colours`}><SelectValue /></SelectTrigger>
-          <SelectContent><SelectItem value="cell">Colour the cell</SelectItem><SelectItem value="text">Colour the text</SelectItem></SelectContent>
-        </Select>
-      ) : null}
-      <Button type="button" size="icon-xs" variant="ghost" aria-label={`Remove rule ${n}`} onClick={onRemove}><X /></Button>
     </div>
   );
 }
 
 /** Colours by rule for a table, a pivot or a KPI. */
-export function ConditionalEditor({ value, onChange, columns }: {
+export function ConditionalEditor({ value, onChange, columns, showLabel = true }: {
   readonly value: readonly CondRule[];
   readonly onChange: (next: CondRule[]) => void;
   readonly columns: readonly string[];
+  /** False inside the Style tab, where the group's heading already says it. */
+  readonly showLabel?: boolean;
 }) {
   return (
-    <div className="grid gap-1.5">
-      <Label>Conditional colours</Label>
+    <div className="grid grid-cols-[minmax(0,1fr)] gap-4">
+      {showLabel ? <Label>Conditional colours</Label> : null}
       {value.map((rule, i) => (
         <RuleRow key={i} rule={rule} columns={columns} index={i}
           onChange={(next) => onChange(value.map((r, j) => (j === i ? next : r)))} onRemove={() => onChange(value.filter((_, j) => j !== i))} />
       ))}
       {value.length < MAX_CONDITIONAL_RULES ? (
         <div>
-          <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => onChange([...value, { ...NEW_RULE, column: columns.length === 1 ? columns[0]! : "" }])}>
+          <Button type="button" size="sm" variant="ghost" className="-ml-2 h-7 px-2 text-xs" onClick={() => onChange([...value, { ...NEW_RULE, column: columns.length === 1 ? columns[0]! : "" }])}>
             <Plus className="size-3" aria-hidden /> Add a rule
           </Button>
         </div>
@@ -286,152 +355,167 @@ export function FormatSection({ rules, style, onChange, valueNames, seriesNames,
   const pickedSeries = Object.entries(colors.series ?? {});
   const byValue = colors.byValue;
   return (
-    <div className="grid gap-3">
+    // BI-58 review round 1 (SHOULD-FIX 3): groups under small headings, set apart by space, not
+    // bordered boxes; every field labelled above it and as wide as the panel.
+    <div className="grid grid-cols-[minmax(0,1fr)] gap-7">
       {rules.values ? (
-        <Group title="Values">
+        <SettingGroup title="Values">
           {valueNames.length > 1 ? (
-            <Select value={formatOf} items={{ [ALL_VALUES]: "All values", ...Object.fromEntries(valueNames.map((n) => [n, n])) }} onValueChange={(v) => setFormatOf(v ?? ALL_VALUES)}>
-              <SelectTrigger className="w-48" aria-label="Format of"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value={ALL_VALUES}>All values</SelectItem>
-                {valueNames.map((n) => <SelectItem key={n} value={n}>{n}</SelectItem>)}
-              </SelectContent>
-            </Select>
+            <SettingField label="Format of">
+              {(id) => (
+                <Select value={formatOf} items={{ [ALL_VALUES]: "All values", ...Object.fromEntries(valueNames.map((n) => [n, n])) }} onValueChange={(v) => setFormatOf(v ?? ALL_VALUES)}>
+                  <SelectTrigger id={id} className="w-full" aria-label="Format of"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value={ALL_VALUES}>All values</SelectItem>
+                    {valueNames.map((n) => <SelectItem key={n} value={n}>{n}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              )}
+            </SettingField>
           ) : null}
           <ValueFormatEditor value={current} onChange={setFormat} label="Number format" />
-        </Group>
+        </SettingGroup>
       ) : null}
       {rules.dates ? (
-        <Group title="Dates"><DateFormatEditor value={style.dateFormat} onChange={(f) => set({ dateFormat: f })} /></Group>
+        <SettingGroup title="Dates"><DateFormatEditor value={style.dateFormat} onChange={(f) => set({ dateFormat: f })} /></SettingGroup>
       ) : null}
       {rules.colors ? (
-        <Group title="Colours">
+        <SettingGroup title="Colours">
           {/* The palette the person chose is stored as it is, "default" included:
               it is a choice of its own, so a company palette does not take it
               (`PR #199 review O SHOULD-FIX 4`). */}
-          <Select value={paletteValue} items={PALETTE_LABELS} onValueChange={(v) => setColors({ palette: v || undefined })}>
-            <SelectTrigger className="w-48" aria-label="Palette"><SelectValue /></SelectTrigger>
-            <SelectContent>{[...BUILTIN_PALETTES, "company"].map((p) => <SelectItem key={p} value={p}>{PALETTE_LABELS[p]}</SelectItem>)}</SelectContent>
-          </Select>
-          <div className="grid gap-1">
-            <Label className="text-xs text-muted-foreground">Colour of a series</Label>
+          <SettingField label="Palette">
+            {(id) => (
+              <Select value={paletteValue} items={PALETTE_LABELS} onValueChange={(v) => setColors({ palette: v || undefined })}>
+                <SelectTrigger id={id} className="w-full" aria-label="Palette"><SelectValue /></SelectTrigger>
+                <SelectContent>{[...BUILTIN_PALETTES, "company"].map((p) => <SelectItem key={p} value={p}>{PALETTE_LABELS[p]}</SelectItem>)}</SelectContent>
+              </Select>
+            )}
+          </SettingField>
+          <div className="grid gap-1.5">
+            <p className="text-xs font-medium">Colour of a series</p>
             {pickedSeries.map(([name, colour]) => (
-              <div key={name} className="flex items-center gap-1.5">
-                <span className="w-32 truncate text-xs" title={name}>{name}</span>
+              <div key={name} className="flex min-w-0 items-center gap-2">
                 <ColourInput value={colour} label={`Colour of ${name}`} onChange={(c) => {
                   const next = { ...colors.series };
                   if (c) next[name] = c; else delete next[name];
                   setColors({ series: next });
                 }} />
+                <span className="min-w-0 truncate text-sm" title={name}>{name}</span>
               </div>
             ))}
             <SeriesAdder names={valueNames} taken={pickedSeries.map(([n]) => n)} onAdd={(name) => setColors({ series: { ...colors.series, [name]: "#6366f1" } })} />
           </div>
           {rules.colorByValue ? (
-            <div className="flex flex-wrap items-center gap-1.5">
-              <span className="flex items-center gap-1 text-xs">
-                <Switch size="sm" checked={!!byValue} onCheckedChange={(c) => setColors({ byValue: c === true ? ["#dbeafe", "#1d4ed8"] : undefined })} aria-label="Colour by value" /> Colour by value
-              </span>
-              {byValue?.map((c, i) => (
-                <ColourInput key={i} value={c} label={`Colour by value stop ${i + 1}`} onChange={(next) => { if (next) setColors({ byValue: byValue.map((x, j) => (j === i ? next : x)) }); }} />
-              ))}
+            <div className="grid gap-2">
+              <SettingSwitch label="Shade each mark by its value" ariaLabel="Colour by value" checked={!!byValue} onCheckedChange={(on) => setColors({ byValue: on ? ["#dbeafe", "#1d4ed8"] : undefined })} />
               {byValue ? (
-                <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs"
-                  onClick={() => setColors({ byValue: byValue.length === 2 ? [byValue[0]!, "#60a5fa", byValue[1]!] : [byValue[0]!, byValue[2]!] })}>
-                  {byValue.length === 2 ? "Add a middle colour" : "Remove the middle colour"}
-                </Button>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {byValue.map((c, i) => (
+                    <ColourInput key={i} value={c} label={`Colour by value stop ${i + 1}`} onChange={(next) => { if (next) setColors({ byValue: byValue.map((x, j) => (j === i ? next : x)) }); }} />
+                  ))}
+                  <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs"
+                    onClick={() => setColors({ byValue: byValue.length === 2 ? [byValue[0]!, "#60a5fa", byValue[1]!] : [byValue[0]!, byValue[2]!] })}>
+                    {byValue.length === 2 ? "Add a middle colour" : "Remove the middle colour"}
+                  </Button>
+                </div>
               ) : null}
             </div>
           ) : null}
-        </Group>
+        </SettingGroup>
       ) : null}
       {rules.axes ? (
-        <Group title="Axes">
+        <SettingGroup title="Axes">
           <AxisEditor title="X" value={axes.x} onChange={(a) => setAxes({ x: a })} canLog={false} rotate />
           <AxisEditor title="Y" value={axes.y} onChange={(a) => setAxes({ y: a })} canLog rotate={false} />
           {rules.secondAxis ? (
             <>
               <AxisEditor title="Second Y" value={axes.y2} onChange={(a) => setAxes({ y2: a })} canLog rotate={false} />
-              <div className="flex flex-wrap items-center gap-3">
-                <span className="text-xs text-muted-foreground">On the right axis</span>
+              <fieldset className="grid gap-1.5">
+                <legend className="mb-1.5 text-xs font-medium">Values on the right axis</legend>
                 {valueNames.map((n) => (
-                  <label key={n} className="flex items-center gap-1 text-xs">
-                    <input type="checkbox" checked={right.includes(n)} onChange={(e) => setAxes({ rightValues: toggle(right, n, e.target.checked) })} aria-label={`${n} on the right axis`} /> {n}
+                  <label key={n} className="flex min-w-0 items-center gap-2 text-sm">
+                    <input type="checkbox" checked={right.includes(n)} onChange={(e) => setAxes({ rightValues: toggle(right, n, e.target.checked) })} aria-label={`${n} on the right axis`} />
+                    <span className="truncate">{n}</span>
                   </label>
                 ))}
-              </div>
+              </fieldset>
             </>
           ) : null}
-        </Group>
+        </SettingGroup>
       ) : null}
       {rules.clusters ? (
-        <Group title="Clusters">
-          <span className="flex items-center gap-2 text-xs">
-            <Switch size="sm" checked={style.clusters !== undefined} onCheckedChange={(c) => set({ clusters: c === true ? { k: "auto" } : undefined })} aria-label="Colour points by cluster" /> Colour points by cluster
-          </span>
+        <SettingGroup title="Clusters">
+          <SettingSwitch label="Colour points by cluster" checked={style.clusters !== undefined} onCheckedChange={(on) => set({ clusters: on ? { k: "auto" } : undefined })} />
           {style.clusters ? (
-            <div className="flex items-center gap-2 text-xs">
-              <span className="text-muted-foreground">Number of groups</span>
-              <Select value={String(style.clusters.k)} items={CLUSTER_ITEMS} onValueChange={(v) => set({ clusters: { k: !v || v === "auto" ? "auto" : Number(v) } })}>
-                <SelectTrigger className="w-28" aria-label="Number of clusters"><SelectValue /></SelectTrigger>
-                <SelectContent>{Object.entries(CLUSTER_ITEMS).map(([value, label]) => <SelectItem key={value} value={value}>{label}</SelectItem>)}</SelectContent>
-              </Select>
-            </div>
+            <SettingField label="Number of groups">
+              {(id) => (
+                <Select value={String(style.clusters!.k)} items={CLUSTER_ITEMS} onValueChange={(v) => set({ clusters: { k: !v || v === "auto" ? "auto" : Number(v) } })}>
+                  <SelectTrigger id={id} className="w-full" aria-label="Number of clusters"><SelectValue /></SelectTrigger>
+                  <SelectContent>{Object.entries(CLUSTER_ITEMS).map(([value, label]) => <SelectItem key={value} value={value}>{label}</SelectItem>)}</SelectContent>
+                </Select>
+              )}
+            </SettingField>
           ) : null}
-        </Group>
+        </SettingGroup>
       ) : null}
       {rules.todayLine ? (
-        <Group title="Today line">
-          <span className="flex items-center gap-2 text-xs">
-            <Switch size="sm" checked={style.todayLine !== false} onCheckedChange={(c) => set({ todayLine: c === true ? undefined : false })} aria-label="Today line" /> Show a line at today
-          </span>
-        </Group>
+        <SettingGroup title="Today line">
+          <SettingSwitch label="Show a line at today" ariaLabel="Today line" checked={style.todayLine !== false} onCheckedChange={(on) => set({ todayLine: on ? undefined : false })} />
+        </SettingGroup>
       ) : null}
       {rules.labels ? (
-        <Group title="Labels">
-          <span className="flex items-center gap-2 text-xs">
-            <Switch size="sm" checked={style.labels?.show === true} onCheckedChange={(c) => set({ labels: c === true ? { show: true } : undefined })} aria-label="Show values on the chart" /> Show values on the chart
-          </span>
-        </Group>
+        <SettingGroup title="Labels">
+          <SettingSwitch label="Show values on the chart" checked={style.labels?.show === true} onCheckedChange={(on) => set({ labels: on ? { show: true } : undefined })} />
+        </SettingGroup>
       ) : null}
       {children}
       {rules.notes ? (
-        <Group title="Notes">
+        <SettingGroup title="Notes">
           {notes.map((a, i) => (
-            <div key={i} className="flex flex-wrap items-center gap-1.5">
-              <Input className="h-8 w-28" value={a.x} placeholder="Point" aria-label={`Note ${i + 1} point`} onChange={(e) => setNote(i, { x: e.target.value })} />
-              {valueNames.length > 1 ? (
-                <Input className="h-8 w-28" value={a.series ?? ""} placeholder="Series (optional)" aria-label={`Note ${i + 1} series`} onChange={(e) => setNote(i, { series: e.target.value || undefined })} />
-              ) : null}
-              <Input className="h-8 min-w-0 flex-1" value={a.text} maxLength={MAX_NOTE_LEN} placeholder="Note" aria-label={`Note ${i + 1} text`} onChange={(e) => setNote(i, { text: e.target.value })} />
-              <Button type="button" size="icon-xs" variant="ghost" aria-label={`Remove note ${i + 1}`} onClick={() => set({ annotations: notes.filter((_, j) => j !== i) })}><X /></Button>
+            <div key={i} className="grid grid-cols-[minmax(0,1fr)] gap-3">
+              <ItemHeading onRemove={() => set({ annotations: notes.filter((_, j) => j !== i) })} removeLabel={`Remove note ${i + 1}`}>Note {i + 1}</ItemHeading>
+              <div className={valueNames.length > 1 ? "grid grid-cols-2 gap-3" : "grid grid-cols-[minmax(0,1fr)]"}>
+                <SettingField label="At point">
+                  {(id) => <Input id={id} value={a.x} placeholder="e.g. 2024" aria-label={`Note ${i + 1} point`} onChange={(e) => setNote(i, { x: e.target.value })} />}
+                </SettingField>
+                {valueNames.length > 1 ? (
+                  <SettingField label="Series (optional)">
+                    {(id) => <Input id={id} value={a.series ?? ""} aria-label={`Note ${i + 1} series`} onChange={(e) => setNote(i, { series: e.target.value || undefined })} />}
+                  </SettingField>
+                ) : null}
+              </div>
+              <SettingField label="Text">
+                {(id) => <Input id={id} value={a.text} maxLength={MAX_NOTE_LEN} aria-label={`Note ${i + 1} text`} onChange={(e) => setNote(i, { text: e.target.value })} />}
+              </SettingField>
             </div>
           ))}
           {notes.length < MAX_ANNOTATIONS ? (
             <div>
-              <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => set({ annotations: [...notes, { x: "", text: "" }] })}>
+              <Button type="button" size="sm" variant="ghost" className="-ml-2 h-7 px-2 text-xs" onClick={() => set({ annotations: [...notes, { x: "", text: "" }] })}>
                 <Plus className="size-3" aria-hidden /> Add a note
               </Button>
             </div>
           ) : null}
-        </Group>
+        </SettingGroup>
       ) : null}
       {rules.tooltip ? (
-        <Group title="Tooltip">
-          <div className="flex flex-wrap items-center gap-3">
-            <span className="text-xs text-muted-foreground">Show only</span>
+        <SettingGroup title="Tooltip">
+          <fieldset className="grid gap-1.5">
+            <legend className="mb-1.5 text-xs font-medium">Show only these values (none checked shows all)</legend>
             {valueNames.map((n) => (
-              <label key={n} className="flex items-center gap-1 text-xs">
-                <input type="checkbox" checked={tooltip.includes(n)} onChange={(e) => set({ tooltip: { fields: toggle(tooltip, n, e.target.checked) } })} aria-label={`${n} in the tooltip`} /> {n}
+              <label key={n} className="flex min-w-0 items-center gap-2 text-sm">
+                <input type="checkbox" checked={tooltip.includes(n)} onChange={(e) => set({ tooltip: { fields: toggle(tooltip, n, e.target.checked) } })} aria-label={`${n} in the tooltip`} />
+                <span className="truncate">{n}</span>
               </label>
             ))}
-          </div>
-        </Group>
+          </fieldset>
+        </SettingGroup>
       ) : null}
       {rules.conditional ? (
-        <Group title="Conditional colours">
-          <ConditionalEditor value={style.conditional ?? []} onChange={(c) => set({ conditional: c })} columns={seriesNames ?? valueNames} />
-        </Group>
+        <SettingGroup title="Conditional colours">
+          <ConditionalEditor value={style.conditional ?? []} onChange={(c) => set({ conditional: c })} columns={seriesNames ?? valueNames} showLabel={false} />
+        </SettingGroup>
       ) : null}
     </div>
   );
@@ -447,10 +531,10 @@ function SeriesAdder({ names, taken, onAdd }: { readonly names: readonly string[
     setText("");
   };
   return (
-    <div className="flex items-center gap-1.5">
-      <Input className="h-8 w-40" value={text} list="series-names" placeholder="Series name" aria-label="Series name" onChange={(e) => setText(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); add(); } }} />
+    <div className="flex min-w-0 items-center gap-1.5">
+      <Input className="min-w-0 flex-1" value={text} list="series-names" placeholder="Pick or type a series" aria-label="Series name" onChange={(e) => setText(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); add(); } }} />
       <datalist id="series-names">{names.map((n) => <option key={n} value={n} />)}</datalist>
-      <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={add}><Plus className="size-3" aria-hidden /> Add colour</Button>
+      <Button type="button" size="sm" variant="outline" className="shrink-0" onClick={add}><Plus className="size-3" aria-hidden /> Add</Button>
     </div>
   );
 }

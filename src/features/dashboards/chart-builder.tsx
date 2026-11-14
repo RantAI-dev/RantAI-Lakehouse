@@ -4,7 +4,6 @@ import { governedPairLabels } from "@/features/catalog/governed-tags"
 import { Pill } from "@/components/patterns/status-badge"
 
 import * as React from "react";
-import Link from "next/link";
 import { useTheme } from "next-themes";
 import { ArrowLeft, ChartColumn, CircleAlert, Code, Database, Pencil, RefreshCw, SlidersHorizontal, Table2 } from "lucide-react";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
@@ -82,7 +81,8 @@ import type { SourceFacts } from "@/lib/kind-gallery";
 
 export { KIND_GROUPS } from "./chart-kinds";
 import type { OwnSource } from "./filters/use-filter-values";
-import { ColumnLabel, Segmented, WholeNumberInput, columnItems, focusFirstEmpty } from "./builder-sections";
+import { ColumnLabel, SettingGroup, SpanPicker, WholeNumberInput, columnItems, focusFirstEmpty } from "./builder-sections";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { asSentence, formatLocaleNumber } from "@/lib/format";
 import { missingPlace, missingSection, sectionSummaries, type MissingPlace } from "@/lib/section-summary";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -178,7 +178,6 @@ function withCalculated(base: Fields, columns: string[], calculated: CalcField[]
 }
 /** Map id → label for the base-ui select (see KIND_LABELS). */
 const NO_LABEL_ITEMS: Record<string, string> = { [NO_BREAKDOWN]: "— no label —" };
-const SPAN_LABELS: Record<string, string> = { "1": "Half width", "2": "Full width" };
 
 /** One focus ring and easing for the title and description edited in place (owner taste: 150–250 ms, eased). */
 const INLINE_EDIT = "outline-none transition-[background-color,color,box-shadow] duration-200 ease-[cubic-bezier(0.2,0,0,1)] focus-visible:ring-3 focus-visible:ring-ring/50";
@@ -233,14 +232,12 @@ function measureRowsOf(def: ChartDef): MeasureRow[] {
  * re-fetching in place.
  */
 export function ChartBuilder({
-  onSaved, onCancel, backHref = "/dashboards", board = "default", boards = [], initial, editId, paramValues,
+  onSaved, onCancel, board = "default", boards = [], initial, editId, paramValues,
 }: {
   /** Receives the definition that was saved; the page leaves for the dashboard with it. */
   onSaved: (saved: ChartDef) => void;
-  /** Cancel; the page goes back to where it came from. */
+  /** Leaving by the back arrow or Esc (after "Discard changes?" when something changed); the page goes back to where it came from. */
   onCancel: () => void;
-  /** The back link and a successful save's destination. */
-  backHref?: string;
   board?: string;
   boards?: BoardOpt[];
   initial?: ChartDef;
@@ -1350,7 +1347,7 @@ export function ChartBuilder({
       {chosenMart ? <p className="px-2 text-xs text-muted-foreground tabular-nums">{formatLocaleNumber(chosenMart.rows)} rows in {chosenMart.name}</p> : null}
     </>
   );
-  const FORM_GRID = "grid min-w-0 grid-cols-[minmax(0,1fr)] content-start gap-5 p-4 [&_.grid:not([class*=grid-cols])]:grid-cols-[minmax(0,1fr)]";
+  const FORM_GRID = "grid min-w-0 grid-cols-[minmax(0,1fr)] content-start gap-5 px-5 py-4 [&_.grid:not([class*=grid-cols])]:grid-cols-[minmax(0,1fr)]";
   /** A group of settings under the main ones of a tab, set apart by a rule. */
   const group = (children: React.ReactNode) => <div className="grid grid-cols-[minmax(0,1fr)] gap-4 border-t border-border/60 pt-5">{children}</div>;
 
@@ -1359,6 +1356,10 @@ export function ChartBuilder({
   // Style: the Format section as it is. A kind's own panels show only for it, as before.
   const inspector = isStaticTile ? (
     <div className={FORM_GRID}>
+      {/* BI-58 review round 1, SHOULD-FIX 5 (owner): a note, an image or a web page keeps its width here. */}
+      <SettingGroup title="Size on dashboard">
+        <SpanPicker value={span} onChange={setSpan} />
+      </SettingGroup>
       {isText ? (
         <div className="grid gap-1.5">
           <Label>Content (markdown) <Req /></Label>
@@ -1370,10 +1371,17 @@ export function ChartBuilder({
     </div>
   ) : (
     <Tabs value={tab} onValueChange={(v) => setTab(v as InspectorTab)} className="flex min-h-0 flex-1 flex-col gap-0">
-      <TabsList variant="line" className="h-11 w-full shrink-0 justify-start gap-0 rounded-none border-b border-border/60 px-2">
-        <TabsTrigger value="data" title={summaries.show}>Data</TabsTrigger>
-        <TabsTrigger value="sort" title={summaries.sortAndFilter}>Sort &amp; filter</TabsTrigger>
-        <TabsTrigger value="style">Style</TabsTrigger>
+      {/* BI-58 review round 1 (SHOULD-FIX 1): the tabs keep room from the panel's edge and from each
+          other, and an inactive tab reads as muted text, not as a disabled control. */}
+      <TabsList variant="line" className="h-12 w-full shrink-0 justify-start gap-2 rounded-none border-b border-border/60 px-4">
+        {([["data", "Data", summaries.show], ["sort", "Sort & filter", summaries.sortAndFilter], ["style", "Style", undefined]] as const).map(([value, label, title]) => (
+          <TabsTrigger
+            key={value} value={value} title={title}
+            className="h-9 flex-none px-3 text-muted-foreground hover:text-foreground data-active:text-foreground dark:text-muted-foreground dark:data-active:text-foreground"
+          >
+            {label}
+          </TabsTrigger>
+        ))}
       </TabsList>
       <div className="@container min-h-0 flex-1 overflow-y-auto">
         <TabsContent value="data">
@@ -1629,6 +1637,10 @@ export function ChartBuilder({
         <TabsContent value="style">
           {/* BI-17 part A: formats, colours, axes, labels, reference lines, notes, tooltip; conditional colours for tables and KPIs. */}
           <div className={FORM_GRID}>
+            {/* BI-58 review round 1, SHOULD-FIX 5 (owner): the width moved here from the header. */}
+            <SettingGroup title="Size on dashboard">
+              <SpanPicker value={span} onChange={setSpan} />
+            </SettingGroup>
             <FormatSection rules={fmtRules} style={style} onChange={setStyle} valueNames={formatValueNames} seriesNames={formatValueNames} paletteValue={effectivePalette(style, palette, isEdit)}>
               {rules.referenceLines ? <ReferenceLinesEditor value={refLines} onChange={setRefLines} numberParams={numberParamDefs} valueNames={resultNames} takesForecast={kind !== "hbar"} /> : null}
             </FormatSection>
@@ -1717,8 +1729,65 @@ export function ChartBuilder({
     </StateBox>
   );
 
-  const boardName = boardLabels[board] ?? board;
   const canSubmit = !busy && !(sqlActive && !!draft.runBlocker);
+
+  // BI-58 review round 1, SHOULD-FIX 4 (owner): with no Cancel button, leaving asks first when the
+  // chart changed. Everything the chart is saved with is in this key; until the person first
+  // touches the builder, the baseline follows it, so the loading and the builder's own settling of
+  // an edited chart do not count as changes.
+  const dirtyKey = JSON.stringify([previewInputsKey, subtitle, cacheDraft, click ?? null, sqlActive ? [draft.sql, draft.name] : null]);
+  const [touched, setTouched] = React.useState(false);
+  const [baseline, setBaseline] = React.useState<string | null>(null);
+  React.useEffect(() => { if (!touched) setBaseline(dirtyKey); }, [dirtyKey, touched]);
+  const dirty = touched && baseline !== null && baseline !== dirtyKey && !busy;
+  const markTouched = () => { if (!touched) setTouched(true); };
+  /** The confirm is open: for the back arrow or Esc (no anchor), or for a link that was held back. */
+  const [leaving, setLeaving] = React.useState<{ anchor?: HTMLAnchorElement } | null>(null);
+  const passLink = React.useRef(false);
+  function leave() {
+    if (dirty) setLeaving({}); else onCancel();
+  }
+  function discard() {
+    const anchor = leaving?.anchor;
+    setLeaving(null);
+    if (!anchor) { onCancel(); return; }
+    // The held-back link goes on as the person clicked it, past the guard this once.
+    passLink.current = true;
+    anchor.click();
+    passLink.current = false;
+  }
+  // Esc leaves when nothing is open over the page (a popover, a list, a menu or a dialog closes first).
+  React.useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented) return;
+      if (document.querySelector('[role="dialog"], [role="alertdialog"], [role="listbox"], [role="menu"]')) return;
+      if (dirty) setLeaving({}); else onCancel();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [dirty, onCancel]);
+  // A link inside the console (the sidebar, a breadcrumb) is held back while there are changes.
+  // Next has no way to stop its router, so the click is stopped before its handler sees it. The
+  // browser's own back button cannot be held back this way; a reload or a tab close asks below.
+  React.useEffect(() => {
+    if (!dirty) return;
+    const onClick = (e: MouseEvent) => {
+      if (passLink.current || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+      const anchor = (e.target as Element | null)?.closest?.("a[href]") as HTMLAnchorElement | null;
+      if (!anchor || anchor.target === "_blank" || anchor.hasAttribute("download")) return;
+      if (new URL(anchor.href, window.location.href).origin !== window.location.origin) return;
+      e.preventDefault();
+      e.stopPropagation();
+      setLeaving({ anchor });
+    };
+    const onUnload = (e: BeforeUnloadEvent) => { e.preventDefault(); e.returnValue = ""; };
+    window.addEventListener("click", onClick, true);
+    window.addEventListener("beforeunload", onUnload);
+    return () => {
+      window.removeEventListener("click", onClick, true);
+      window.removeEventListener("beforeunload", onUnload);
+    };
+  }, [dirty]);
 
   return (
     // `BI-58` T1 (layout A of 2026-11-14): the chart is the page. A header row (where the chart
@@ -1729,41 +1798,40 @@ export function ChartBuilder({
     // assistant dock keeps a 5rem spacer under `main` for pages that scroll; the inner frame cancels
     // it (on the child: a container query never matches its own container), so the zones end just
     // above the dock, and `main`'s own bottom padding still keeps the dock clear of them.
-    <div className="@container" data-slot="chart-builder">
+    <div className="@container" data-slot="chart-builder" onPointerDownCapture={markTouched} onKeyDownCapture={markTouched} onInputCapture={markTouched}>
       <div className="flex flex-col gap-4 @3xl:-mb-20 @3xl:h-[calc(100dvh-12.5rem)] @3xl:min-h-[34rem]">
+        {/*
+          BI-58 review round 1, SHOULD-FIX 4 and 5 (owner): one action, one button. The back arrow
+          leaves (asking first when something changed), the dashboard name in the breadcrumb is
+          where the chart goes (the old "Add to" select), and Save is the only other button. The
+          width moved to the Style tab.
+        */}
         <header className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-          <div className="flex min-w-0 items-center gap-2">
-            <Button variant="ghost" size="icon-sm" aria-label="Back to dashboard" title="Back to dashboard" render={<Link href={backHref} />}>
+          <div className="flex min-w-0 items-center gap-1">
+            <Button type="button" variant="ghost" size="icon-sm" aria-label="Back to dashboard" title="Back to dashboard" onClick={leave}>
               <ArrowLeft aria-hidden />
             </Button>
-            <div className="flex min-w-0 items-baseline gap-1.5 text-sm">
-              <Link href={backHref} className="truncate text-muted-foreground transition-colors duration-200 hover:text-foreground">{boardName}</Link>
-              <span aria-hidden className="text-muted-foreground">/</span>
-              <h1 className="truncate text-sm font-medium text-foreground">{isEdit ? "Edit chart" : "New chart"}</h1>
-            </div>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-sm text-muted-foreground" aria-hidden>Add to</span>
             <Select value={targetBoard} items={boardLabels} onValueChange={(v) => setTargetBoard(v ?? "default")}>
-              <SelectTrigger className="w-40" aria-label="Add to dashboard"><SelectValue /></SelectTrigger>
+              <SelectTrigger
+                aria-label="Add to dashboard" title="The dashboard this chart is saved on"
+                className="h-8 w-auto max-w-56 min-w-0 gap-1 border-transparent bg-transparent px-2 text-sm text-muted-foreground shadow-none transition-colors duration-200 hover:bg-muted hover:text-foreground dark:bg-transparent dark:hover:bg-muted"
+              >
+                <SelectValue />
+              </SelectTrigger>
               <SelectContent>
                 {boardOptions.map((b) => (
                   <SelectItem key={b.id} value={b.id}>{b.name}</SelectItem>
                 ))}
               </SelectContent>
             </Select>
-            <Segmented
-              label="Width" value={String(span)} onChange={(v) => setSpan(v === "2" ? 2 : 1)}
-              options={[{ value: "1", label: SPAN_LABELS["1"] }, { value: "2", label: SPAN_LABELS["2"] }]}
-            />
-            <span aria-hidden className="mx-1 hidden h-5 w-px bg-border @3xl:block" />
-            <Button type="button" variant="ghost" disabled={busy} onClick={onCancel}>Cancel</Button>
-            {/* The SQL source of a new chart must be run once before the chart can be saved over it;
-                until then the builder says so (`draft.runBlocker`). */}
-            <Button type="button" className="min-w-28" disabled={!canSubmit} onClick={() => void save()}>
-              {busy ? (isEdit ? "Saving…" : "Creating…") : isEdit ? "Save changes" : "Create chart"}
-            </Button>
+            <span aria-hidden className="text-sm text-muted-foreground">/</span>
+            <h1 className="ml-1.5 truncate text-sm font-medium text-foreground">{isEdit ? "Edit chart" : "New chart"}</h1>
           </div>
+          {/* The SQL source of a new chart must be run once before the chart can be saved over it;
+              until then the builder says so (`draft.runBlocker`). */}
+          <Button type="button" className="min-w-28" disabled={!canSubmit} onClick={() => void save()}>
+            {busy ? (isEdit ? "Saving…" : "Creating…") : isEdit ? "Save changes" : "Create chart"}
+          </Button>
         </header>
 
         {error ? <p role="alert" className="text-sm text-destructive">{asSentence(error)}</p> : null}
@@ -1861,6 +1929,18 @@ export function ChartBuilder({
           </aside>
         </div>
       </div>
+      <Dialog open={leaving !== null} onOpenChange={(open) => { if (!open) setLeaving(null); }}>
+        <DialogContent className="sm:max-w-sm" showCloseButton={false}>
+          <DialogHeader>
+            <DialogTitle>Discard changes?</DialogTitle>
+            <DialogDescription>Your changes to this chart are not saved.</DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => setLeaving(null)}>Keep editing</Button>
+            <Button type="button" variant="destructive" onClick={discard}>Discard</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       {isStaticTile ? null : (
         <Sheet open={dataSheet} onOpenChange={setDataSheet}>
           <SheetContent side="left" className="w-[min(22rem,calc(100vw-2rem))] gap-0 p-0 sm:max-w-none">
