@@ -12,7 +12,7 @@ import { FileText, FolderInput, LayoutDashboard, LayoutTemplate, Lock, Plus, Sea
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 import type { KindFilter } from "./library-items"
-import { EASE, FOCUS, useHasDock } from "./library-parts"
+import { EASE, FOCUS, SOFT_LIFT, useHasDock } from "./library-parts"
 
 /** An icon in a soft square, a title, a sentence, and an optional next step. */
 export function LibraryEmpty({ icon: Icon, title, body, action, compact, className }: {
@@ -134,8 +134,8 @@ export function EmptyWorkspace({ canWrite, onNewDashboard }: { readonly canWrite
     )
   }
   const card = cn(
-    "grid h-full w-full justify-items-start gap-2 rounded-xl bg-card p-4 text-left shadow-xs hover:-translate-y-0.5 hover:shadow-md active:translate-y-0",
-    EASE, FOCUS,
+    "grid h-full w-full justify-items-start gap-2 rounded-xl bg-card p-4 text-left shadow-xs hover:-translate-y-0.5 active:translate-y-0",
+    SOFT_LIFT, EASE, FOCUS,
   )
   return (
     <div className="grid justify-items-center gap-6 rounded-2xl bg-muted/40 px-6 py-10 text-center">

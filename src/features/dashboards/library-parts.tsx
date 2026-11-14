@@ -18,6 +18,8 @@ import { PRIVATE_TIP } from "./private-badge"
 
 /** One easing and duration for every hover, press and change (owner taste: 150–250 ms, eased, never linear). */
 export const EASE = "transition-[background-color,border-color,color,box-shadow,opacity,transform] duration-200 ease-[cubic-bezier(0.2,0,0,1)]"
+/** Soft, diffuse hover lift for cards (BI-59 owner QA 2026-11-14: hover shadow softer). Dark mode: no black shadow, the ring brightens instead. */
+export const SOFT_LIFT = "hover:shadow-[0_6px_20px_-8px_rgb(0_0_0/0.10)] dark:hover:shadow-none dark:hover:ring-foreground/15"
 /** The keyboard focus ring every custom control here uses. */
 export const FOCUS = "outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
 
