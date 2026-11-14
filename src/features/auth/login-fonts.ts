@@ -18,6 +18,6 @@ export const loginDisplay = localFont({
   display: "swap",
 });
 
-/** Inter Tight, semibold (600) and tight, as on the landing site (DESIGN.md §4). */
+/** Inter Tight, medium (500) and tight, as on the landing site (DESIGN.md §4). */
 export const LOGIN_DISPLAY =
-  "font-[family-name:var(--font-login-display)] font-semibold tracking-[-0.035em]";
+  "font-[family-name:var(--font-login-display)] font-medium tracking-[-0.035em]";
