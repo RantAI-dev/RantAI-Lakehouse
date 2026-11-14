@@ -5,7 +5,7 @@ import dynamic from "next/dynamic";
 import Image from "next/image";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { CircleAlert, Eye, EyeOff, KeyRound, Lock, Mail, TriangleAlert } from "lucide-react";
+import { CircleAlert, Eye, EyeOff, KeyRound, Lock, TriangleAlert, User } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Field, FieldLabel } from "@/components/ui/field";
 import {
@@ -29,7 +29,7 @@ import "./login.css";
 
 /**
  * The sign-in page (`/login`), laid out as the owner's mockup A (`WEB-15`,
- * chosen 2026-11-14): the logo right above the title, visible labels, a
+ * chosen 2026-11-14): the brand mark top-left, visible labels, a
  * password eye with its tooltip, a Caps Lock warning, a refusal that opens in
  * place with one short shake and the password selected for retyping, and a
  * loading button. The requests, redirects, `next` handling, SSO flag and
@@ -163,16 +163,16 @@ function nextPathFromQuery(): string {
 }
 
 /**
- * The official Rantai Lake mark (`public/logo-*.png`), drawn whole in a
- * square box with `object-contain`, so its own 196 x 167 proportion is kept
- * (DESIGN.md §5: never squashed). Decorative: the title beside it already
- * names the product.
+ * The official Rantai Lake mark (`public/logo-*.svg`, viewBox 196 x 167),
+ * drawn whole in a box with the mark's own aspect ratio, so it is never
+ * letterboxed or squashed (DESIGN.md §5). Height is set by the caller; width
+ * follows. Decorative: the title beside it already names the product.
  */
 function Logo({ className }: { className?: string }) {
   return (
-    <span className={cn("relative inline-block size-7 shrink-0", className)}>
-      <Image src="/logo-light.png" alt="" fill sizes="64px" className="object-contain dark:hidden" priority />
-      <Image src="/logo-dark.png" alt="" fill sizes="64px" className="hidden object-contain dark:block" priority />
+    <span className={cn("relative inline-block aspect-[196/167] h-7 shrink-0 self-start", className)}>
+      <Image src="/logo-light.svg" alt="" fill unoptimized sizes="64px" className="object-contain dark:hidden" priority />
+      <Image src="/logo-dark.svg" alt="" fill unoptimized sizes="64px" className="hidden object-contain dark:block" priority />
     </span>
   );
 }
@@ -324,13 +324,13 @@ export function LoginPage() {
         </div>
         <div className="absolute bottom-8 left-[8%] flex items-center gap-3">
           <p className="text-sm font-medium text-foreground/80">Every dataset, pipeline and dashboard in one place.</p>
-          <span className="rounded-full bg-foreground/6 px-2 py-0.5 text-[11px] text-muted-foreground">Sample data</span>
         </div>
       </section>
 
-      {/* The form, centred, with the logo right above the title (mockup A). */}
+      {/* The form, centred; the brand mark sits top-left in the panel's own padding. */}
       <main className="relative flex min-h-svh flex-1 flex-col px-5 pt-5 pb-6 sm:px-10 lg:min-h-0 lg:px-14">
-        <div className="flex justify-end">
+        <div className="flex items-center justify-between">
+          <Logo className="h-7" />
           <ThemeToggle />
         </div>
 
@@ -349,11 +349,9 @@ export function LoginPage() {
             <React.Suspense fallback={null}>
               <SsoNotice />
             </React.Suspense>
-            <Logo className="size-9" />
-            <h1 className={cn(LOGIN_DISPLAY, "mt-5 text-[30px] leading-[1.1] text-foreground")}>
+            <h1 className={cn(LOGIN_DISPLAY, "text-[30px] leading-[1.1] text-foreground")}>
               Sign in to Rantai Lake
             </h1>
-            <p className="mt-2 text-sm text-muted-foreground">Use your account to continue.</p>
 
             {checkingSession ? (
               <div className="mt-7 flex flex-col gap-5" aria-label="Loading" role="status">
@@ -379,7 +377,7 @@ export function LoginPage() {
                     </FieldLabel>
                     <InputGroup className="h-11 bg-background dark:bg-input/30">
                       <InputGroupAddon className="pl-3">
-                        <Mail />
+                        <User />
                       </InputGroupAddon>
                       <InputGroupInput
                         id="login-email"
@@ -389,7 +387,7 @@ export function LoginPage() {
                         spellCheck={false}
                         autoFocus
                         required
-                        placeholder="you or you@company.com"
+                        placeholder="Enter your username or email"
                         // 16 px on a phone, so iOS Safari does not zoom
                         // into the field when it takes focus.
                         className="text-base md:text-sm"
@@ -419,6 +417,7 @@ export function LoginPage() {
                         type={showPassword ? "text" : "password"}
                         autoComplete="current-password"
                         required
+                        placeholder="Enter your password"
                         className="text-base md:text-sm"
                         aria-invalid={invalid}
                         aria-describedby={invalid ? "login-error" : undefined}
@@ -518,9 +517,8 @@ export function LoginPage() {
           </div>
         </div>
 
-        <footer className="flex items-center justify-center gap-2 text-xs text-muted-foreground lg:justify-start">
+        <footer className="flex items-center justify-between gap-4 text-xs text-muted-foreground">
           <span>© {new Date().getFullYear()} Rantai Lake</span>
-          <span aria-hidden>·</span>
           {/* Placeholder destination — point this at the docs site (or
               wherever support lives) once that URL exists. */}
           <Link href="#" className={cn("rounded-sm outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50", EASE)}>

@@ -32,9 +32,9 @@ import { UserMenu } from "./user-menu"
 function BrandLogo() {
   // Logo follows the theme: navy for a light sidebar, white for a dark one.
   return (
-    <div className="relative size-8 shrink-0" aria-hidden>
-      <Image src="/logo-light.png" alt="Rantai Lake" fill sizes="32px" className="object-contain dark:hidden" priority />
-      <Image src="/logo-dark.png" alt="" fill sizes="32px" className="hidden object-contain dark:block" priority />
+    <div className="relative aspect-[196/167] h-8 shrink-0" aria-hidden>
+      <Image src="/logo-light.svg" alt="Rantai Lake" fill unoptimized sizes="32px" className="object-contain dark:hidden" priority />
+      <Image src="/logo-dark.svg" alt="" fill unoptimized sizes="32px" className="hidden object-contain dark:block" priority />
     </div>
   )
 }

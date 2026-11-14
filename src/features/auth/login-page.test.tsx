@@ -297,7 +297,7 @@ describe("LoginPage without the sample dashboard (WEB-15 T2)", () => {
 
     // The panel and its caption are there; the dashboard inside is not.
     const panel = screen.getByRole("region", { name: "A preview of the console (sample data)" })
-    expect(panel.textContent).toContain("Sample data")
+    expect(panel.textContent).toContain("Every dataset, pipeline and dashboard in one place.")
     expect(panel.querySelector("[data-motion]")).toBeNull()
   })
 })

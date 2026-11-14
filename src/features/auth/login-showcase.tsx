@@ -6,7 +6,7 @@
  * grow, a line draws, the KPI counts up), which rests and draws itself again
  * every 9 s while it is on screen and the tab is visible. Its charts answer
  * the pointer like the real ones. The numbers are fixed sample values, made
- * up for this page and labelled "Sample data" beside it: no API call, no
+ * up for this page and described as sample data by the panel label: no API call, no
  * customer data (feature page decision 2).
  *
  * Loaded by `login-page.tsx` with `next/dynamic` and `ssr: false`, after the
@@ -180,9 +180,9 @@ function PreviewTile({ title, className, children }: { title: string; className?
 /** The official mark at its own proportions (DESIGN.md §5), small, in the drawn sidebar. */
 function SidebarLogo() {
   return (
-    <span className="relative mb-2 inline-block size-6 shrink-0">
-      <Image src="/logo-light.png" alt="" fill sizes="24px" className="object-contain dark:hidden" />
-      <Image src="/logo-dark.png" alt="" fill sizes="24px" className="hidden object-contain dark:block" />
+    <span className="relative mb-2 inline-block aspect-[196/167] h-6 shrink-0">
+      <Image src="/logo-light.svg" alt="" fill unoptimized sizes="24px" className="object-contain dark:hidden" />
+      <Image src="/logo-dark.svg" alt="" fill unoptimized sizes="24px" className="hidden object-contain dark:block" />
     </span>
   );
 }
