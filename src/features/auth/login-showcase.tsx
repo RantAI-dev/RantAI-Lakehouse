@@ -20,7 +20,9 @@ import Image from "next/image";
 import { RenderModeProvider, type RenderMode } from "@/features/dashboards/render-mode";
 import type { Rows } from "@/features/dashboards/tile-dialogs";
 import { TileBody } from "@/features/dashboards/tile-body";
-import { useReducedMotionSafe } from "@/features/landing/use-reduced-motion";
+// WEB-15 review BLOCKER 1: from the shared hooks, never from `features/landing`,
+// which the console image does not contain (`.dockerignore`, WEB-2).
+import { useReducedMotionSafe } from "@/hooks/use-reduced-motion";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import { cn } from "@/lib/utils";
 
