@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { usePathname } from "next/navigation";
-import { Bot, Plus, PanelBottom, PanelRightClose, X } from "lucide-react";
+import { Bot, Plus, PanelBottom, X } from "lucide-react";
 import { useSidePanel } from "@/components/app-shell/side-panel";
 import { SuggestionButton } from "@/features/copilot/suggestion-button";
 import { useCopilot } from "./use-copilot";
@@ -175,15 +175,6 @@ export function CopilotSidebar({ hasAssistant = true }: { readonly hasAssistant?
             className="grid size-7 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
           >
             <Plus className="size-4" />
-          </button>
-          <button
-            type="button"
-            onClick={() => c.setExpanded(false)}
-            aria-label="Collapse AI Copilot"
-            title="Collapse AI Copilot"
-            className="grid size-7 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-          >
-            <PanelRightClose className="size-4" />
           </button>
         </div>
       </div>
