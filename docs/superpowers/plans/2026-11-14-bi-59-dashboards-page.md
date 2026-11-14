@@ -127,4 +127,65 @@
 
 ## 6. Handoff
 
-(developer)
+### Handoff, BI-59 (developer, Opus, 2026-11-14)
+
+**Commits** on `feat/bi-59-dashboards-page`, over `d1aa6a87`, not pushed:
+
+| Task | Commit | What |
+| --- | --- | --- |
+| T1 | `fcdc8885` | Header: title, New menu, page ⋯ menu, large search ("/" and Esc); the page frame that ends above the assistant bar; toolbar and chip rows removed |
+| T2 | `dd4eeed6` | One sortable list of dashboards, reports and templates; segmented type filter in `?tab=`; folder picker; P4 badges; the same ⋯ menu on every row, Main included |
+| T3 | `7cd31f6d` | `listChartOutlines` (one `GET /api/dashboard/specs`), the silhouette pictures, the Recent row |
+| T4 | `85fd8a49` | Table / Gallery switch, remembered per browser; gallery grouped by folder |
+| T5 | `35a20b1a` | Bulk Move to folder, Favourite, Move to trash; facts instead of "No description."; designed empty states |
+| T6 | `1d4b4392` | Stacked rows below 768 px; screenshots |
+| T6 follow-up | `77e42271` | DESIGN.md §3 rules added on 2026-11-14: one control per action (no second "Clear search"), a visible label in the move dialog |
+
+**Commands and counts** (each under `systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0 nice -n 15`):
+
+- `bun test src/features/dashboards src/services/clients/dashboards.test.ts`, at `1d4b4392`: 781 pass, 0 fail, 91 files.
+- `bun test dashboard-list-page.test.tsx template-pages.test.tsx library-item-menu.test.tsx`, at `77e42271`: 36 pass, 0 fail.
+- `bun run typecheck`, at `77e42271`: clean.
+- `bun --bun eslint src/features/dashboards/`, at `77e42271`: clean. `src/services/` at `7cd31f6d`: one warning that was already there (`http.ts:106`).
+- **Not verified:**
+  - the full `bun run lint`: killed by the OOM killer (exit 137) on the shared VM, so only the scoped eslint above ran. Left to CI.
+  - the full `bun run test`: not run on the VM (machine rule). Left to CI.
+- No Rust touched, no cargo run.
+
+**Screenshots** in `docs/plans/bi-59-screens/`, taken against the QA stack's API with a dev server on 28622 and one headless Chrome, both stopped by PID afterwards:
+
+- Table and Gallery, light and dark, at 1190x800, 1366x900 and 390x844: `{table,gallery}-{light,dark}-{1190x800,1366x900,390x844}.png`, 12 shots. No horizontal scroll at any size, and the assistant bar covers no row.
+- States:
+  - `state-bulk-light-1366x900.png`;
+  - `state-new-menu-light-1366x900.png`;
+  - `state-main-menu-dark-1366x900.png`: Main's disabled entries with the reason;
+  - `state-page-menu-light-1190x800.png`;
+  - `state-degraded-reads-light-1366x900.png`: the QA API dropped some reads during that shot. It shows the degraded page: glyph pictures, and "could not be listed" notes for reports and templates.
+- Headless Chrome reports `hover: none`, so the outline stars that a laptop shows only on hover are visible in every shot.
+- `next dev` rewrites `AGENTS.md`. The change was reverted and not committed.
+
+**Choices the plan did not settle**
+
+1. **No data in the lists for some of what the plan names.** These items use the plan's own fallback (a neutral picture, or nothing) and need the planner's decision:
+   - **Report pictures.** `ReportSummary` carries no blocks, so a report cannot be drawn from its first chart blocks without one read per report. It is drawn as a page with its real title, and one grey block per chart, two at most.
+   - **The report's "first sentence" fact.** Not available, for the same reason.
+   - **"Made from the template X".** Boards do not record their source template.
+   - **Template pictures.** The template list carries no definition, so a template gets a glyph and its chart count.
+   - **The rose "Restricted" badge.** Whether a folder is restricted is only known per item (`GET /api/dashboard/access`). The tone is defined but never shown. The personal space keeps its lock and "Private" badge.
+2. **Bulk actions are for writers only.** A reader has no tick boxes. Favourite skips reports, because the favourites API takes only `board` and `chart`, and the toast says so.
+3. **The bulk move previews access.** `MoveItemsDialog` calls `previewMove` for each dashboard it moves (feature B7). It does not offer a personal space while a report is among the items. A single report's "Move to folder" uses the same dialog. A single dashboard keeps `MoveBoardDialog`.
+4. **The item ⋯ menu** holds Open, Favourite (dashboards only), Copy link, Rename / Edit, Duplicate, Move to folder and Move to trash. "Sharing and embed" and "Save as template" were left out:
+   - sharing is out of scope;
+   - the list does not know the download switch that Save as template follows (BI-18 D review, BLOCKER 1).
+5. **The view key is new.** The view choice uses a new key, `dashboards:browse-view`. The old page's key defaulted to Gallery, so reusing it would open some browsers on a view the owner did not choose.
+6. **The Recent cards say "Dashboard · N tiles" instead of "opened N min ago".** The shortcuts list carries no time.
+7. **The phone layout is chosen in script.** The page picks the stacked rows from the viewport (`useIsMobile`) instead of rendering both layouts and hiding one with CSS, so a screen reader does not read the rows twice.
+8. **DESIGN.md "Satu aksi, satu tombol".** The no-match state lost its "Clear search" button, which duplicated the visible ✕ in the search box. Two empty-state buttons stay, because they are shortcuts to entries inside menus:
+   - "Show all folders" (the folder picker);
+   - "New report" (New).
+   The star and "Add to favourites" in the ⋯ menu also both stay: the star is hidden on hover devices until hover. The planner may want either pair cut.
+9. **The app-shell changes on BI-58** (`8f625135`: a 14rem sidebar; `c4d87211`: the composer centred on the content area, with a shared bottom reserve token). This branch does not have them and does not copy them.
+   - `PageFrame` assumes nothing about where the composer sits horizontally.
+   - Its height does hard-code the app frame's current bottom reserve: `pb-24` / `lg:pb-28`, 5rem for the bar.
+   - When BI-58 merges, `PageFrame` (`library-parts.tsx`) should read the shared reserve token instead.
+
