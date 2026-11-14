@@ -60,9 +60,12 @@ export const SIDEBAR_SUB_CLASS = "mr-0 gap-0.5 border-sidebar-border pr-0 group-
 function BrandLogo() {
   // Logo follows the theme: navy for a light sidebar, white for a dark one.
   return (
-    <div className="relative size-8 shrink-0" aria-hidden>
-      <Image src="/logo-light.png" alt="RantAI Lakehouse" fill sizes="32px" className="object-contain dark:hidden" priority />
-      <Image src="/logo-dark.png" alt="" fill sizes="32px" className="hidden object-contain dark:block" priority />
+    // A 32 px slot (the rail's icon column) holds the 24 px mark, centred in it.
+    <div className="grid size-8 shrink-0 place-items-center" aria-hidden>
+      <span className="relative block aspect-[196/167] h-6">
+        <Image src="/logo-light.png" alt="RantAI Lakehouse" fill sizes="28px" className="object-contain dark:hidden" priority />
+        <Image src="/logo-dark.png" alt="" fill sizes="28px" className="hidden object-contain dark:block" priority />
+      </span>
     </div>
   )
 }
