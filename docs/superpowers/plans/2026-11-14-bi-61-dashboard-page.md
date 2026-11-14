@@ -95,6 +95,23 @@
    - Screenshots at 1190×800, 1366×900 and 390×844, light and dark, reading and editing, plus
      the ⋯ menu and the Comments panel, into `docs/plans/bi-61-screens/`. Check them yourself.
 8. **T8, handoff.**
+9. **T9, the route loading fallback draws the page's own placeholder (owner QA 2026-11-15).**
+   Owner: "ini pas aku ketiga halaman ini skeleton yang list itu masih ada… pas logout juga ada
+   tu skeletonnya". `src/app/loading.tsx` draws the generic `LoadingSkeleton rows={8}` for every
+   route while a segment loads (visible on a slow network on every navigation), so Home and a
+   dashboard show the generic list first and then their own placeholder, and `/login` after
+   sign-out shows the list full width. Fix:
+   - Lift the main-area switch of `AppShellSkeleton` (`app-shell-skeleton.tsx`, the
+     `placeholder === …` branch) into one exported component (e.g. `ShellMainPlaceholder`
+     taking `pathname`), used by both `AppShellSkeleton` and `src/app/loading.tsx`. One source,
+     so the auth check, the route fallback and the page's own loading look are the same shapes.
+   - `loading.tsx` becomes a client component: on a public path (`isPublicPath`, e.g. `/login`,
+     the landing, public dashboards, embed, render) it draws nothing on the page background (no
+     list); inside the app it draws `ShellMainPlaceholder` for `usePathname()`, with the same
+     outer padding/frame as the real main area so nothing jumps when the page replaces it.
+   - Check: unit tests that `loading.tsx` draws the dashboard placeholder on `/dashboards/<id>`,
+     the list placeholder on `/dashboards/browse`, nothing on `/login`, and the generic one on
+     another page; the shell skeleton tests still pass.
 
 ## 4. Machine rules (owner, 2026-11-14)
 
@@ -209,6 +226,19 @@ Measured: frame bottom / composer top 720/738 px at 1190x800, 820/838 at 1366x90
 
 - No round-1 screenshots. Port 28622 was held by another developer, then 28620 ran a Next dev server, and the owner's rule is one Next dev server at a time. The coordinator screenshots from 28605 after deploy.
 - The fade, the footer menu (collapsed and in the phone sheet), the centred search and the 32 px header were checked by tests only, not in a browser.
+
+### T9 handoff, 2026-11-15 (Sonnet developer agent)
+
+**Commit** `71b81eb7` (`fix(console): BI-61 T9, the route loading fallback draws the page's own placeholder`; not pushed).
+
+- New `src/components/app-shell/shell-main-placeholder.tsx`: `ShellMainPlaceholder({ pathname })`, the main-area switch lifted out of `AppShellSkeleton`; it draws no padding.
+- `app-shell-skeleton.tsx` uses it inside its existing `p-4 sm:p-5 lg:p-6` wrapper.
+- `src/app/loading.tsx` is a client component: `null` on `isPublicPath`, else `ShellMainPlaceholder`. No wrapper padding, because it renders inside `AuthenticatedFrame`'s `<main>`, which already pads (the same box as the skeleton's wrapper).
+- New `src/app/loading.test.tsx`: `/dashboards/b1`, `/dashboards/browse`, `/login` (empty), `/alerts` (generic).
+
+**Checks** (each under `systemd-run --user --scope -p MemoryMax=3G -p MemorySwapMax=0 nice -n 15`, one at a time, after `free -m` showed over 3 GB available): `bun run typecheck` clean; `bun test src/components/app-shell src/app/loading.test.tsx` 58 pass, 0 fail (10 files); `bun x eslint` on the 4 changed files clean.
+
+**Not verified:** a real browser on a slow network (no dev server run); the full test and lint runs. The skeleton's wrapper has no `pb-24` as `<main>` has when the Copilot dock shows, as before this change.
 
 ## Micro-interaction audit (emil), 2026-11-14
 
