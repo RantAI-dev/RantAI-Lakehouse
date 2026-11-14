@@ -3519,6 +3519,46 @@ pub async fn ingest_spec_put(
     Ok(saved)
 }
 
+/// The fields every save of an ingest spec writes, by their wire names: what
+/// the audit row of a save without a credential records in place of values.
+const INGEST_SPEC_FIELDS: [&str; 5] = [
+    "adapter",
+    "ingestMode",
+    "dial",
+    "sourceObjects",
+    "scheduleCron",
+];
+
+/// `GOV-1`: a save with no credential is on the audit trail like the one with
+/// credentials, which writes its own row in [`save_with_credentials`]. The
+/// row names the fields saved, never a value: the dial and the table names
+/// stay out. The assistant's save has no principal; its tool call is audited
+/// by the assistant's own gate. Best effort: the save already happened.
+async fn record_spec_save(
+    state: &AppState,
+    principal: Option<&Extension<Principal>>,
+    id: &str,
+    repoint: bool,
+) {
+    let (Some(Extension(principal)), Some(pool)) = (principal, state.pg.as_deref()) else {
+        return;
+    };
+    let event = connector_audit_event(
+        principal,
+        if repoint {
+            "connector.repoint"
+        } else {
+            "connector.update"
+        },
+        id,
+        json!({ "fields": INGEST_SPEC_FIELDS }),
+        "executed",
+    );
+    if let Err(err) = store_audit::insert(pool, event).await {
+        tracing::warn!(%err, connector_id = %id, "failed to record the connector ingest spec audit event");
+    }
+}
+
 /// The save behind [`ingest_spec_put`]; see its doc for the order of the answers.
 async fn save_ingest_spec(
     state: &AppState,
@@ -3634,10 +3674,13 @@ async fn save_ingest_spec(
             connectors::set_ingest_spec(pool(&state)?, &id, &input).await
         };
         return match saved {
-            Ok(spec) => Ok(ApiJson(IngestSpecResponse::new(
-                spec,
-                time::OffsetDateTime::now_utc(),
-            ))),
+            Ok(spec) => {
+                record_spec_save(&state, principal.as_ref(), &id, repoint).await;
+                Ok(ApiJson(IngestSpecResponse::new(
+                    spec,
+                    time::OffsetDateTime::now_utc(),
+                )))
+            }
             Err(lakehouse_store::StoreError::NotFound) => {
                 Err(ApiError::NotFound(format!("Connector {id} not found")).into())
             }
@@ -3871,7 +3914,8 @@ fn cdc_ingest_run_unsupported_reason() -> &'static str {
 /// stream connector answers `supported: false` as before. The run config gets
 /// `object` and `action` beside `connector_id`, and an audit event
 /// `connector.ingest.<action>` names the table and the action, never row data.
-/// An empty body behaves exactly as it always did.
+/// An empty body behaves exactly as it always did, and its run is audited as
+/// `connector.ingest.run`, naming only the run (`GOV-1`).
 pub async fn ingest_run_request(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -4139,17 +4183,25 @@ async fn launch_ingest(
                 )
                 .into());
             }
-            if let (Some((object, action)), Some(principal)) = (&request, principal) {
+            if let Some(principal) = principal {
                 // The table's name and the action, never a row or a count.
-                let event = connector_audit_event(
-                    principal,
-                    &format!("connector.ingest.{}", action.as_str()),
-                    &id,
-                    json!({"object": object, "action": action.as_str(), "runId": outcome.run_id}),
-                    "executed",
-                );
+                // `GOV-1`: a run of every table is audited too, as
+                // `connector.ingest.run`, naming the run and nothing else.
+                // The assistant's run has no principal; its tool call is
+                // audited by the assistant's own gate.
+                let (action, args) = match &request {
+                    Some((object, action)) => (
+                        format!("connector.ingest.{}", action.as_str()),
+                        json!({"object": object, "action": action.as_str(), "runId": outcome.run_id}),
+                    ),
+                    None => (
+                        "connector.ingest.run".to_owned(),
+                        json!({"runId": outcome.run_id}),
+                    ),
+                };
+                let event = connector_audit_event(principal, &action, &id, args, "executed");
                 if let Err(err) = store_audit::insert(pool(&state)?, event).await {
-                    tracing::warn!(%err, connector_id = %id, "failed to record the connector table action audit event");
+                    tracing::warn!(%err, connector_id = %id, "failed to record the connector ingest run audit event");
                 }
             }
             Ok(ApiJson(json!({ "runId": outcome.run_id })))

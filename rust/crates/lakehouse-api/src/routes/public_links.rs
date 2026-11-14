@@ -412,7 +412,14 @@ pub async fn unlock(
         if attempt == LOCK_FAILURES {
             // The try that reached the limit set the lock. Best effort, like the
             // sign-in lock's record: the visitor's answer is the same either way.
-            if let Err(err) = record_lock(pool, &open.link.board_id).await {
+            if let Err(err) = record_link_event(
+                pool,
+                &open.link.board_id,
+                "dashboard.public_link_locked",
+                "refused",
+            )
+            .await
+            {
                 tracing::warn!(%err, "failed to record dashboard.public_link_locked");
             }
             // The fifth wrong try is the one that locks the link: say so now.
@@ -432,11 +439,27 @@ pub async fn unlock(
     )
     .await;
     match issued {
-        Ok(Some(expires_at)) => (
-            StatusCode::OK,
-            ApiJson(json!({ "ticket": ticket.expose(), "expiresAt": rfc3339(expires_at) })),
-        )
-            .into_response(),
+        Ok(Some(expires_at)) => {
+            // `GOV-1`: a link opened with its password is on the audit trail,
+            // like the lock. Best effort, as the lock's record is: the
+            // visitor's answer is the same either way. The row names the
+            // dashboard and never the link's token, the password or the ticket.
+            if let Err(err) = record_link_event(
+                pool,
+                &open.link.board_id,
+                "dashboard.public_link_unlocked",
+                "executed",
+            )
+            .await
+            {
+                tracing::warn!(%err, "failed to record dashboard.public_link_unlocked");
+            }
+            (
+                StatusCode::OK,
+                ApiJson(json!({ "ticket": ticket.expose(), "expiresAt": rfc3339(expires_at) })),
+            )
+                .into_response()
+        }
         // The password changed, or the link ended, between the two statements:
         // the visitor typed a password that is no longer the password.
         Ok(None) => wrong_password(),
@@ -444,13 +467,20 @@ pub async fn unlock(
     }
 }
 
-async fn record_lock(pool: &PgPool, board_id: &str) -> Result<(), lakehouse_store::StoreError> {
+/// One audit row of a visitor's try on a link: the lock and the unlock. The
+/// resource is the dashboard's id, never the link's token (a secret).
+async fn record_link_event(
+    pool: &PgPool,
+    board_id: &str,
+    action: &str,
+    outcome: &str,
+) -> Result<(), lakehouse_store::StoreError> {
     let event = lakehouse_store::audit::NewAuditEvent {
-        action: "dashboard.public_link_locked".to_owned(),
-        outcome: "refused".to_owned(),
+        action: action.to_owned(),
+        outcome: outcome.to_owned(),
         resource_kind: Some("dashboard".to_owned()),
         resource_id: Some(board_id.to_owned()),
-        // QA LH-SEC-2-06 (SEC-70, decision D3): a visitor locking a link is
+        // QA LH-SEC-2-06 (SEC-70, decision D3): a visitor on a link is
         // nobody the product signed in, so the row has no principal and names
         // what caused it.
         actor_label: Some(lakehouse_store::audit::ACTOR_PUBLIC_LINK.to_owned()),

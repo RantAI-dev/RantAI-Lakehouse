@@ -94,6 +94,98 @@ fn cleared_session_cookie_header(is_dev: bool) -> HeaderValue {
     session_cookie_header(is_dev, "", Duration::ZERO)
 }
 
+/// Write one audit row for an auth route, best effort: a failed write is
+/// logged and swallowed, so the response on the wire is always the route's
+/// own and never the audit's. Every audit write in this file goes through
+/// here, so the day a failed write must be counted or surfaced, that is one
+/// change.
+async fn record_audit(pool: &PgPool, event: NewAuditEvent) {
+    let action = event.action.clone();
+    if let Err(err) = store_audit::insert(pool, event).await {
+        tracing::warn!(%err, action, "failed to record an audit event");
+    }
+}
+
+/// An event caused by a person who is signed in: the principal and its name.
+fn principal_audit_event(principal: &Principal, action: &str, outcome: &str) -> NewAuditEvent {
+    NewAuditEvent {
+        action: action.to_owned(),
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        outcome: outcome.to_owned(),
+        ..Default::default()
+    }
+}
+
+/// The fixed sentence of a refused sign-in. It never says which half was
+/// wrong, the same as the response.
+const SIGN_IN_REFUSED_DETAIL: &str = "The email or the password did not match.";
+
+/// The `auth.login` row of a sign-in that worked. Nobody was signed in when
+/// the form was submitted, so the actor is the form; the principal is set
+/// only because the password verified. Nothing the visitor typed is in it:
+/// not the email, not the password.
+fn sign_in_executed_event(user_id: Uuid, principal_kind: &str) -> NewAuditEvent {
+    NewAuditEvent {
+        action: "auth.login".to_owned(),
+        outcome: "executed".to_owned(),
+        principal_id: Some(user_id.to_string()),
+        principal_kind: Some(principal_kind.to_owned()),
+        actor_label: Some(store_audit::ACTOR_SIGN_IN_FORM.to_owned()),
+        resource_kind: Some("user".to_owned()),
+        resource_id: Some(user_id.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The `auth.login` row of a refused sign-in: no principal (nobody proved who
+/// they were). The resource is the hashed key the throttle counts by, as for
+/// the lock row, so tries against one account can be told from tries against
+/// another without the row holding the email. An unknown email writes the
+/// identical row: the trail is not an account oracle.
+fn sign_in_refused_event(key: &str) -> NewAuditEvent {
+    NewAuditEvent {
+        action: "auth.login".to_owned(),
+        outcome: "refused".to_owned(),
+        resource_kind: Some("login_key".to_owned()),
+        resource_id: Some(key[..12].to_owned()),
+        actor_label: Some(store_audit::ACTOR_SIGN_IN_FORM.to_owned()),
+        detail: Some(SIGN_IN_REFUSED_DETAIL.to_owned()),
+        ..Default::default()
+    }
+}
+
+/// The fixed sentence of a password change refused for its current password.
+const PASSWORD_CHANGE_WRONG_CURRENT: &str = "The current password did not match.";
+
+/// The fixed sentence of a password change refused for its new password.
+const PASSWORD_CHANGE_BREAKS_RULES: &str = "The new password does not meet the password rules.";
+
+/// The `auth.password_change` row: `executed`, or `refused` with the fixed
+/// sentence that says why. The resource is the caller's own account. Neither
+/// password, nor the text of a rule that the new one broke, is in it.
+fn password_change_event(
+    principal: &Principal,
+    user_id: Uuid,
+    refusal: Option<&str>,
+) -> NewAuditEvent {
+    NewAuditEvent {
+        resource_kind: Some("user".to_owned()),
+        resource_id: Some(user_id.to_string()),
+        detail: refusal.map(str::to_owned),
+        ..principal_audit_event(
+            principal,
+            "auth.password_change",
+            if refusal.is_some() {
+                "refused"
+            } else {
+                "executed"
+            },
+        )
+    }
+}
+
 /// `{ identifier, password }` — `POST /api/auth/login` body.
 /// Accepts `email` as an alias for backwards compatibility (ADM-11 D6).
 #[derive(Debug, Deserialize)]
@@ -231,6 +323,7 @@ pub async fn login(
                 )
                 .into());
             };
+            let principal_kind = principal.kind_for_audit();
             let must_change_password = password::must_change_password(pool, user_id)
                 .await
                 .unwrap_or(false);
@@ -250,6 +343,11 @@ pub async fn login(
                 name: principal.display_name,
                 must_change_password,
             };
+            // `GOV-1`: the sign-in is on the audit trail. Nobody was signed in
+            // when the form was submitted, so the actor is the form, and the
+            // principal is set only because the password verified. Nothing the
+            // visitor typed goes in: not the email, not the password.
+            record_audit(pool, sign_in_executed_event(user_id, principal_kind)).await;
             let mut response = (StatusCode::OK, ApiJson(body)).into_response();
             response.headers_mut().append(
                 header::SET_COOKIE,
@@ -283,10 +381,15 @@ pub async fn login(
                     actor_label: Some(lakehouse_store::audit::ACTOR_SIGN_IN_FORM.to_owned()),
                     ..Default::default()
                 };
-                if let Err(err) = store_audit::insert(pool, event).await {
-                    tracing::warn!(%err, "failed to record auth.login_locked audit event");
-                }
+                record_audit(pool, event).await;
             }
+            // `GOV-1`: every refused sign-in is on the audit trail, with no
+            // principal (nobody proved who they were). The resource is the
+            // hashed key the throttle counts by, as for the lock row, so
+            // tries against one account can be told from tries against
+            // another without the row holding the email. An unknown email
+            // writes the identical row: the trail is not an account oracle.
+            record_audit(pool, sign_in_refused_event(&key)).await;
             tracing::warn!("login failed");
             Err(ApiError::Unauthorized("Invalid username/email or password.".to_owned()).into())
         }
@@ -317,11 +420,20 @@ pub async fn login(
 pub async fn logout(
     State(state): State<AppState>,
     headers: HeaderMap,
-    AuthenticatedPrincipal(_principal): AuthenticatedPrincipal,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
 ) -> ApiResult<Response> {
     let pool = pool(&state)?;
     if let Some(token) = session_cookie_from_headers(&headers) {
         session::revoke_session(pool, &Secret::new(token)).await?;
+        // `GOV-1`: only a session that was revoked is a sign-out; a bearer
+        // call has nothing to end. The row names the person, never the
+        // cookie. (`auth.session.revoke` is the row of ending another
+        // session by id, `DELETE /api/auth/sessions/{id}`.)
+        record_audit(
+            pool,
+            principal_audit_event(&principal, "auth.logout", "executed"),
+        )
+        .await;
     }
     let mut response = StatusCode::NO_CONTENT.into_response();
     response.headers_mut().append(
@@ -567,15 +679,7 @@ pub async fn revoke_session(
     // write is logged and swallowed, never propagated, so the response
     // code on the wire is always the underlying revoke's, not the
     // audit's.
-    let audit_event = session_revoke_audit_event(&principal, session_id);
-    if let Err(err) = store_audit::insert(pool, audit_event).await {
-        tracing::warn!(
-            %err,
-            action = "auth.session.revoke",
-            session_id = %session_id,
-            "failed to record session revoke audit event"
-        );
-    }
+    record_audit(pool, session_revoke_audit_event(&principal, session_id)).await;
 
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -635,19 +739,36 @@ pub async fn change_password(
         let Some(old_password) = old_password else {
             return Err(ApiError::BadRequest("oldPassword is required".to_owned()).into());
         };
-        password::verify_for_user(pool, user_id, &Secret::new(old_password))
-            .await
-            .inspect_err(|_| {
-                tracing::warn!("change-password rejected: old password did not verify");
-            })?;
+        if let Err(err) = password::verify_for_user(pool, user_id, &Secret::new(old_password)).await
+        {
+            tracing::warn!("change-password rejected: old password did not verify");
+            // `GOV-1`: a wrong current password is a refused change. A storage
+            // error is not, and leaves no row for a change nobody refused.
+            if matches!(err, AuthError::InvalidCredentials) {
+                record_audit(
+                    pool,
+                    password_change_event(&principal, user_id, Some(PASSWORD_CHANGE_WRONG_CURRENT)),
+                )
+                .await;
+            }
+            return Err(ApiError::from(err).into());
+        }
     }
 
     let user = identity::get_user(pool, &user_id.to_string()).await?;
-    password::check_rules(&new_password, Some(&user.username), user.email.as_deref())
-        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    let rules = password::check_rules(&new_password, Some(&user.username), user.email.as_deref());
+    if rules.is_err() {
+        record_audit(
+            pool,
+            password_change_event(&principal, user_id, Some(PASSWORD_CHANGE_BREAKS_RULES)),
+        )
+        .await;
+    }
+    rules.map_err(|err| ApiError::BadRequest(err.to_string()))?;
 
     password::change_password(pool, user_id, &Secret::new(new_password)).await?;
     session::revoke_all_sessions_for_user(pool, user_id).await?;
+    record_audit(pool, password_change_event(&principal, user_id, None)).await;
 
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -1214,15 +1335,7 @@ pub async fn oidc_callback(
     // carries `principal_id`. Best-effort: a failed audit write is
     // logged and swallowed, never propagated, so the response on the
     // wire is always the underlying login's, not the audit's.
-    let audit_event = oidc_login_audit_event(&login.principal, user_id);
-    if let Err(err) = store_audit::insert(pool, audit_event).await {
-        tracing::warn!(
-            %err,
-            action = "auth.oidc.login",
-            user_id = %user_id,
-            "failed to record oidc login audit event"
-        );
-    }
+    record_audit(pool, oidc_login_audit_event(&login.principal, user_id)).await;
 
     let mut response = (StatusCode::FOUND, ()).into_response();
     // `flow.next` was already validated by `is_safe_relative_path` inside
@@ -1651,9 +1764,7 @@ pub(crate) async fn audit_sso_test(
         approval_id: None,
         session_id: None,
     };
-    if let Err(err) = store_audit::insert(pool, event).await {
-        tracing::warn!(%err, action = "settings.sso.test", "failed to record the sso test audit event");
-    }
+    record_audit(pool, event).await;
 }
 
 /// Build the `NewAuditEvent` for a successful session revoke — same
