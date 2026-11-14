@@ -106,7 +106,9 @@ describe("AppSidebar, the Dashboards row names what it opens", () => {
     act(() => rememberRow("dashboard", "b2", "Ops"))
     const dash = await screen.findByRole("link", { name: "Dashboard: Ops" })
     expect(dash.getAttribute("href")).toBe("/dashboards/b2")
-    expect(dash.querySelector("svg")?.getAttribute("class")).toContain("lucide-layout-grid")
+    // BI-61 T11 review: the dashboard keeps the row's chart icon, not the grid the Browse part uses.
+    expect(dash.querySelector("svg")?.getAttribute("class")).not.toContain("lucide-layout-grid")
+    expect(dash.querySelector("svg")?.getAttribute("class")).toContain("lucide-chart-column")
   })
 
   it("Browse clears the row but not the last board", async () => {
