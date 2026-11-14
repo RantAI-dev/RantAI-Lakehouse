@@ -94,8 +94,9 @@ import { useHomeLayout } from "./use-home-layout"
  *    open beside it, it folds to two columns rather than squeeze.
  *
  * The background is the person's: Dither (default), ASCII or Off, from
- * Customize, kept in this browser (`lib/home-background`). Off draws no band
- * and the page closes up.
+ * Customize, kept in this browser (`lib/home-background`). Off hides the art
+ * and keeps the layout: the greeting, composer and chips stay where they
+ * are (owner QA 2026-11-14), and switching fades the art in place.
  *
  * Status is not a floating pill beside the greeting any more: it is Needs
  * attention (`lib/home-status`, same semantics: a check the person may not

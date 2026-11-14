@@ -15,8 +15,9 @@
  * The Background choice lives in this browser, and the shell's placeholder
  * is rendered on the server, where it is not known. A small script in the
  * root layout (`HOME_BACKGROUND_SCRIPT`) marks `<html data-home-bg="off">`
- * before the first paint, and the placeholder's band and top padding follow
- * that mark in CSS, so an Off page never draws a band and then closes it.
+ * before the first paint, and the placeholder's band follows that mark in
+ * CSS, so an Off page never shows the band's colour. The layout is the same
+ * for every Background (owner QA 2026-11-14), so nothing else depends on it.
  */
 import * as React from "react"
 import { Database } from "lucide-react"
@@ -31,8 +32,15 @@ import { FocalSkeleton, NeedsAttention, PipelinesWidget, RecentChats } from "./h
 import { LakeBand, LakeBandBase } from "./lake-scene"
 
 const BAND = "absolute inset-x-0 top-0 h-[300px] sm:h-[400px]"
-const TOP_WITH_BAND = "pt-[128px] sm:pt-[172px]"
-const TOP_WITHOUT_BAND = "pt-8"
+/**
+ * The hero's top padding, the same for every Background: Off hides the
+ * art and keeps the place, so the greeting, composer and chips never move
+ * (owner QA 2026-11-14: "kalo pas off jangan naik ke atas gini
+ * composernya, tetap aja kek gitu tapi kosong aja backgroundnya").
+ */
+const TOP = "pt-[128px] sm:pt-[172px]"
+/** The art fades in and out in place when the Background changes; no movement. */
+const ART_FADE = "motion-safe:transition-opacity motion-safe:duration-300 motion-safe:ease-out"
 
 /** The row between the hero and the bento: shortcuts at the left, Customize at the right. */
 export const TOOLBAR_ROW = "mt-6 flex min-h-8 flex-wrap items-center gap-1"
@@ -69,23 +77,37 @@ export function HomeFrame({
       className="relative -m-4 h-[calc(100svh-var(--app-navbar-h))] overflow-y-auto sm:-m-5 lg:-m-6"
     >
       {background === null ? (
-        <LakeBandBase className={cn(BAND, "in-data-[home-bg=off]:hidden")} />
-      ) : drawsScene(background) ? (
-        <LakeBand variant={background} className={BAND} />
-      ) : null}
-      <div
-        className={cn(
-          "relative mx-auto flex max-w-[1180px] flex-col px-4 pb-6 sm:px-6",
-          background === null
-            ? cn(TOP_WITH_BAND, "in-data-[home-bg=off]:pt-8!")
-            : drawsScene(background)
-              ? TOP_WITH_BAND
-              : TOP_WITHOUT_BAND,
-        )}
-      >
+        <LakeBandBase className={cn(BAND, "in-data-[home-bg=off]:opacity-0")} />
+      ) : (
+        <SceneBand background={background} />
+      )}
+      <div className={cn("relative mx-auto flex max-w-[1180px] flex-col px-4 pb-6 sm:px-6", TOP)}>
         {children}
       </div>
     </div>
+  )
+}
+
+/**
+ * The band for a known Background. Off fades the art out and leaves the
+ * band's place empty (the plain page shows through); the last art stays
+ * mounted, still, so switching back fades it in again without a redraw
+ * flash. A page that opens with Off never mounts the scene at all.
+ */
+function SceneBand({ background }: { background: HomeBackground }) {
+  const off = !drawsScene(background)
+  const [art, setArt] = React.useState<Exclude<HomeBackground, "off"> | null>(drawsScene(background) ? background : null)
+  React.useEffect(() => {
+    if (drawsScene(background)) setArt(background)
+  }, [background])
+  if (art === null) return null
+  return (
+    <LakeBand
+      variant={art}
+      still={off}
+      data-state={off ? "off" : "on"}
+      className={cn(BAND, ART_FADE, off && "opacity-0")}
+    />
   )
 }
 

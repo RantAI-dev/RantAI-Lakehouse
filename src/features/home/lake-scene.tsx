@@ -389,11 +389,20 @@ export function LakeScene({
  * Positioned by the caller (absolute, behind the greeting and composer);
  * its height sets the scene's size.
  */
-export function LakeBandBase({ className, children }: { className?: string; children?: React.ReactNode }) {
+export function LakeBandBase({
+  className,
+  children,
+  "data-state": state,
+}: {
+  className?: string
+  children?: React.ReactNode
+  "data-state"?: "on" | "off"
+}) {
   return (
     <div
       aria-hidden
       data-slot="lake-band"
+      data-state={state}
       className={cn(
         "pointer-events-none [mask-image:linear-gradient(to_bottom,black_58%,transparent)]",
         SCENE_BASE,
@@ -410,13 +419,15 @@ export function LakeBand({
   variant,
   still,
   className,
+  "data-state": state,
 }: {
   variant: SceneVariant
   still?: boolean
   className?: string
+  "data-state"?: "on" | "off"
 }) {
   return (
-    <LakeBandBase className={className}>
+    <LakeBandBase className={className} data-state={state}>
       <LakeScene variant={variant} still={still} />
     </LakeBandBase>
   )
