@@ -147,6 +147,19 @@ Branch `feat/web-17-home-revamp`, base `50451d5a`. Not pushed.
 
 Processes: dev server on 28699 (`bun x next dev` 373591, node 373608, next-server 373654) and headless Chrome on 28690 (373590) stopped by PID; both ports free. `AGENTS.md` rewrites by `next dev` reverted before every commit.
 
+### T9 handoff, 2026-11-15 (Sonnet developer agent)
+
+**Commit** `53239526` (`feat(home): WEB-17 T9, the scene is a dim background`; not pushed).
+
+- `lake-scene.tsx`: veil removed (`veilAt`, `Box`, `VEIL_*`, `measureVeil`, the veil buckets and steps; the resize observer now watches only the canvas). New `DIM = { day: 0.75, night: 0.8 }` and exported `sceneInks(phase)`: every ink (moon, sun, whale's eye and glints included) is blended day to night, then moved towards the blended base by `DIM` interpolated on the phase, so a theme change stays continuous. Both styles use it. Shapes and motion are unchanged.
+- `home-frame.tsx` / `home-page.tsx`: `GREETING_TEXT`, `--home-scene-base` and `data-scene-veil` are gone; the greeting is plain text.
+- `lake-scene.test.ts`: WCAG contrast test. Ink against base at most 2.0:1 at 7 phases from day to night (worst 1.76 day, 1.74 night). Greeting text (theme foreground as sRGB, #0b0f11 and #f8fbfc) against every ink and the base at least 4.5:1 at rest (worst 9.47 day, 10.23 night).
+- Not asserted: the midpoints of a theme change against the text. The text takes the new theme's colour at once while the scene eases for 1.5 s, so that moment was never readable by design.
+
+**Checks:** typecheck clean; `bun test src/features/home src/lib/home-*.test.ts` 63 pass, 0 fail; eslint on the 4 changed files clean.
+
+**Not verified:** no screenshots (`after-dim-*` not taken) and no browser; how dim it looks is for the owner to judge.
+
 ## Micro-interaction audit (emil), 2026-11-14
 
 Owner request (2026-11-14): audit the revamped pages' micro-animations with the
