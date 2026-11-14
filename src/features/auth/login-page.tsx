@@ -416,8 +416,8 @@ export function LoginPage() {
             </React.Suspense>
             {/* Centred over the form column (T8, owner 2026-11-14); the
                 labels, fields and notices stay left-aligned for reading. */}
-            <h1 className={cn(LOGIN_DISPLAY, "login-reveal login-reveal-1 text-center text-[34px] leading-[1.05] text-foreground sm:text-[40px]")}>
-              Sign in
+            <h1 className={cn(LOGIN_DISPLAY, "login-reveal login-reveal-1 text-center text-[28px] leading-[1.05] text-foreground sm:text-[36px]")}>
+              Sign in to Lakehouse
             </h1>
 
             {checkingSession ? (

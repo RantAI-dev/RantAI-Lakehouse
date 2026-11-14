@@ -4,10 +4,10 @@ import { useRenderMode } from "@/features/dashboards/render-mode"
 
 // The charts need a canvas; what matters here is how the preview asks for
 // them: with the still render mode (no animation) or without it.
-const drawn: { still: boolean }[] = []
+const drawn: { still: boolean; live: boolean }[] = []
 mock.module("@/features/dashboards/echart", () => ({
-  EChart: function FakeChart() {
-    drawn.push({ still: useRenderMode() !== null })
+  EChart: function FakeChart({ live }: { live?: boolean }) {
+    drawn.push({ still: useRenderMode() !== null, live: live === true })
     return <div data-testid="chart" />
   },
 }))
@@ -98,6 +98,13 @@ describe("the sign-in page's sample dashboard (WEB-15 T2)", () => {
     expect(container.textContent).toContain(FINAL)
     // And no redraw loop, even on screen.
     expect([...running.values()]).not.toContain(LOOP_MS)
+  })
+
+  it("asks every chart to update in place (live), so a tick morphs the data instead of redrawing", () => {
+    stubReducedMotion(false)
+    render(<LoginShowcase />)
+    expect(drawn.length).toBeGreaterThan(0)
+    expect(drawn.every((c) => c.live)).toBe(true)
   })
 
   it("shows the phone's tile with the final KPI under reduced motion", () => {
