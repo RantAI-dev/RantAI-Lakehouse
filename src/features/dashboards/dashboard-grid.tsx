@@ -221,12 +221,12 @@ export function DashboardGrid({
     <div ref={ref} className="dash-canvas relative w-full" style={{ height: canvasH, minHeight: 200 }}>
       {editable ? (
         <div
-          className="pointer-events-none absolute inset-0 rounded-lg"
+          // Micro-interaction audit 2026-11-14: the column lines fade in with edit mode.
+          className="pointer-events-none absolute inset-0 rounded-lg opacity-25 transition-opacity duration-200 ease-ui starting:opacity-0"
           style={{
             backgroundImage: `linear-gradient(90deg, var(--border) 1px, transparent 1px)`,
             backgroundSize: `${unitX}px 100%`,
             backgroundPosition: "0 0",
-            opacity: 0.25,
           }}
         />
       ) : null}
@@ -236,7 +236,12 @@ export function DashboardGrid({
         const dragging = drag?.id === it.id;
         const onMove = editable ? (e: React.PointerEvent) => startDrag(e, it.id, "move") : undefined;
         return (
-          <div key={it.id} style={boxStyle(b)} className={cn("dash-tile transition-[left,top,width,height] in-data-[sidebar-moving]:transition-none", dragging && "z-20 transition-none")}>
+          <div key={it.id} style={boxStyle(b)} className={cn(
+            // Micro-interaction audit 2026-11-14: the tiles a drag pushes aside glide on the console's
+            // ease-out (was Tailwind's 150 ms default curve); the one under the pointer follows it at once.
+            "dash-tile transition-[left,top,width,height] duration-200 ease-ui in-data-[sidebar-moving]:transition-none",
+            dragging && "z-20 transition-none",
+          )}>
             {isSectionKind(it.kind) ? (
               <SectionTile item={it} editable={editable} folded={folded.has(it.id)} onToggle={() => toggleFold(it.id)} onHeaderPointerDown={onMove} />
             ) : (
@@ -247,7 +252,9 @@ export function DashboardGrid({
               <div
                 onPointerDown={(e) => startDrag(e, it.id, "resize")}
                 className={cn(
+                  // Micro-interaction audit 2026-11-14: the corner grows in with edit mode and answers hover and press.
                   "absolute -bottom-1 -right-1 z-10 grid size-6 cursor-se-resize place-items-center rounded-md text-muted-foreground shadow-sm hover:bg-muted hover:text-foreground",
+                  "transition-[opacity,scale,background-color,color] duration-200 ease-ui starting:scale-90 starting:opacity-0 active:scale-110",
                   look === "soft" ? "bg-background ring-1 ring-foreground/10" : "border border-border bg-card",
                 )}
                 style={{ touchAction: "none" }}

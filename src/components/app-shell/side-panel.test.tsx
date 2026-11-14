@@ -117,6 +117,8 @@ describe("the shell's one side panel (BI-61 T6)", () => {
     render(<CopilotProvider><SidePanelProvider><CopilotSidebar /></SidePanelProvider></CopilotProvider>)
     await waitFor(() => expect(panels()).toHaveLength(1))
     expect(screen.queryByRole("tablist", { name: "Side panel" })).toBeNull()
-    expect(screen.getByRole("button", { name: "Collapse AI Copilot" })).toBeTruthy()
+    // The navbar's AI Copilot toggle closes it; the panel header keeps only "New chat" (owner, 2026-11-14).
+    expect(screen.queryByRole("button", { name: "Collapse AI Copilot" })).toBeNull()
+    expect(screen.getByRole("button", { name: "New chat" })).toBeTruthy()
   })
 })

@@ -1,4 +1,3 @@
-import { SIDEBAR_MOTION } from "@/components/ui/sidebar"
 import { cn } from "@/lib/utils"
 
 /*
@@ -18,14 +17,19 @@ export const SIDEBAR_CONTENT_CLASS = "min-w-0"
 export const SIDEBAR_GROUP_CLASS = "gap-0 px-2 py-2"
 export const SIDEBAR_MENU_CLASS = "mt-0 flex flex-col gap-0.5"
 export const SIDEBAR_FOOTER_CLASS = "border-t border-sidebar-border p-2"
-// Collapsed, the card is the avatar alone, 32 px on the icon column; the box narrows, its padding
-// eases to none and the avatar with it, in the sidebar's time.
-export const ACCOUNT_CARD_CLASS = "h-14 rounded-lg px-2 group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:p-0!"
-export const ACCOUNT_AVATAR_CLASS = cn(
-  "flex size-9 shrink-0 items-center justify-center rounded-full bg-primary/12 text-primary ring-1 ring-primary/20 transition-[width,height]",
-  SIDEBAR_MOTION,
-  "group-data-[collapsible=icon]:size-8",
-)
+// One compact row (Claude's footer): a 24 px avatar, the name and role, a chevron, 32 px tall.
+// Collapsed, it is the avatar alone, centred in the 32 px icon column.
+export const ACCOUNT_CARD_CLASS = "h-8 gap-2 rounded-lg px-1.5 group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:p-0!"
+export const ACCOUNT_AVATAR_CLASS =
+  "flex size-6 shrink-0 items-center justify-center rounded-full bg-primary/12 text-[10px] font-semibold text-primary"
+
+/** Up to two initials of a display name, for the avatar (the app has no pictures for people). */
+export function initialsOf(name: string | undefined): string {
+  const words = (name ?? "").trim().split(/\s+/).filter(Boolean)
+  if (words.length === 0) return "?"
+  const letters = words.length === 1 ? [...words[0]].slice(0, 2) : [[...words[0]][0], [...words[words.length - 1]][0]]
+  return letters.join("").toUpperCase()
+}
 export const NAV_ROW_CLASS = "h-8 rounded-md px-2 py-1.5 text-sm tracking-normal"
 export const SIDEBAR_SUB_CLASS = "mr-0 gap-0.5 border-sidebar-border pr-0 group-data-[collapsible=icon]:flex"
 

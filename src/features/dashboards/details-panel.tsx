@@ -103,7 +103,8 @@ export function DetailsPanel({
     access.status === "loading" ? "…" : access.status === "error" || !access.data ? "Not available" : pick(access.data);
 
   return (
-    <div className="grid min-h-0 grid-cols-1 content-start gap-6 overflow-y-auto p-4" data-slot="details-panel">
+    // Micro-interaction audit 2026-11-14: switching the side panel's tab fades the new content in.
+    <div className="grid min-h-0 grid-cols-1 content-start gap-6 overflow-y-auto p-4 transition-opacity duration-200 ease-ui starting:opacity-0" data-slot="details-panel">
       <Section title="Sharing" action={canShare ? <SectionLink onClick={onShare}>Share…</SectionLink> : undefined}>
         {canManage ? (
           <>
