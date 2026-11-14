@@ -40,7 +40,7 @@ export function RecentRow({ recent, boards, source }: {
           return (
             <li
               key={`${r.kind}:${r.id}`}
-              className={cn("group relative grid min-w-0 gap-2 rounded-2xl bg-card p-2 ring-1 ring-foreground/5 hover:-translate-y-0.5 hover:ring-foreground/10", SOFT_LIFT, EASE)}
+              className={cn("group relative grid min-w-0 gap-2 rounded-2xl bg-card p-2 ring-1 ring-foreground/5 hover:-translate-y-0.5 hover:ring-foreground/10 active:translate-y-0 active:scale-[0.99]", SOFT_LIFT, EASE)}
             >
               {board ? (
                 <ItemPicture item={board} charts={chartsOf(source, board.id)} size="md" className="h-24" />

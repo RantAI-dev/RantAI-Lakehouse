@@ -272,3 +272,31 @@ SHOULD-FIX 4 (owner QA; DESIGN.md §3, a search of normal width):
   - `bun test` on three files (`dashboard-list-page.test.tsx`, `template-pages.test.tsx`, `library-item-menu.test.tsx`): 37 pass, 0 fail. The structure test now also asserts that the gap is the flexible child and the search is not.
   - eslint on `src/features/dashboards/`: clean.
   - `bun run typecheck`: clean.
+
+## Micro-interaction audit (emil), 2026-11-14
+
+Owner request (2026-11-14): audit the revamped pages' micro-animations with the
+`emil-design-eng` checklist; DESIGN.md wins (150–250 ms, eased, never linear;
+motion with a reason; everything stops under reduced motion). Opus developer
+agent. Motion only: no layout, colour or copy changes; roles and accessible
+names unchanged.
+
+The shared part (easing tokens, the global reduced-motion rule, tooltips with
+a first delay and instant follow-ups, the button press, menus, popovers,
+dialogs, sheets, `useSlidingIndicator`) is the same commit as on BI-61,
+cherry-picked: its table is in the BI-61 plan.
+
+| Element | Now | Skill / DESIGN.md | Change |
+| --- | --- | --- | --- |
+| `EASE` (every hover and press here) | Lists `transform`, so `hover:-translate-y-0.5` lifts, `active:scale-*` presses and the star's `scale-125` jumped (Tailwind v4 sets `translate`/`scale`) | Name the property; strong ease-out | `scale,rotate,translate`, `ease-ui` |
+| Gallery, Recent and empty-state cards | Lift jumped 2 px | Soft, eased lift (§3) | Lift eases; a press on the card settles it (0.99) |
+| Table / Gallery switch | Raised fill jumps between the two | Motion that shows where the choice went | One raised square that slides (`SegmentPill`, 240 ms `ease-move`), press 0.97 |
+| Type filter (All, Dashboards, …) | Same as above | Same | Same sliding pill; press 0.97 |
+| Switching view or type | Old rows swapped for new in one frame | Crossfade; blur hides the overlap | New rows or cards fade in with a 2 px blur, 200 ms; the first load does not fade (the placeholder has the rows' shapes) |
+| Star (row, card) | Changed after the save and the favourites reload; pop jumped | Feedback at once (§3) | Optimistic, back on a failed save; `animate-pop` when it turns on |
+| Search (icon → field) | Width 200 ms Tailwind `ease-out` | Strong ease-out | `ease-ui` |
+| Row checkbox | Fill eases, tick appears in one frame, no press | Never from 0; press feedback | Tick grows from 0.6 with the fill; press 0.9 (base `Checkbox`, motion only) |
+| Bulk bar (rows ticked) | Replaces the controls row in one frame | Prevent jarring changes | Rises 4 px and fades in, 200 ms |
+| ⋯, New, folder picker menus | 150 ms `ease-out` both ways, scale 0.95 | Origin-aware, exit faster | Shared: 150 in / 100 out, `ease-ui`, 0.97 (origin was already the trigger) |
+| Row hover | Colour, 200 ms | Rows seen tens of times a day: keep small | Kept |
+| Loading → data | Placeholder rows and cards in the same shapes | One loading look | Kept (no fade on first data, so nothing blinks) |

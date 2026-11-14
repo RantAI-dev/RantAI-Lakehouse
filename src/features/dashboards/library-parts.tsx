@@ -12,12 +12,18 @@ import { Code2, FileText, Globe, LayoutDashboard, LayoutTemplate, Lock, Package,
 
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { useAuth } from "@/features/auth/auth-provider"
+import { useSlidingIndicator } from "@/hooks/use-sliding-indicator"
 import { cn } from "@/lib/utils"
 import type { LibraryItem, LibraryKind } from "./library-items"
 import { PRIVATE_TIP } from "./private-badge"
 
-/** One easing and duration for every hover, press and change (owner taste: 150–250 ms, eased, never linear). */
-export const EASE = "transition-[background-color,border-color,color,box-shadow,opacity,transform] duration-200 ease-[cubic-bezier(0.2,0,0,1)]"
+/**
+ * One easing and duration for every hover, press and change (owner taste: 150–250 ms, eased, never linear).
+ * Micro-interaction audit 2026-11-14 (emil): Tailwind v4's `translate-*`, `scale-*` and `rotate-*` set the
+ * `translate`, `scale` and `rotate` properties, not `transform`, so the list names those. With `transform`
+ * the cards' hover lift, the star's pop and every press jumped instead of easing.
+ */
+export const EASE = "transition-[background-color,border-color,color,box-shadow,opacity,scale,rotate,translate] duration-200 ease-ui"
 /** Soft, diffuse hover lift for cards (BI-59 owner QA 2026-11-14: hover shadow softer). Dark mode: no black shadow, the ring brightens instead. */
 export const SOFT_LIFT = "hover:shadow-[0_6px_20px_-8px_rgb(0_0_0/0.10)] dark:hover:shadow-none dark:hover:ring-foreground/15"
 /** The keyboard focus ring every custom control here uses. */
@@ -141,7 +147,7 @@ export function SearchField({
     return () => window.removeEventListener("keydown", onKey)
   }, [])
   return (
-    <div className={cn("relative h-8 transition-[width] duration-200 ease-out motion-reduce:transition-none", expanded ? expandedClassName : "w-8 shrink-0", className)}>
+    <div className={cn("relative h-8 transition-[width] duration-200 ease-ui motion-reduce:transition-none", expanded ? expandedClassName : "w-8 shrink-0", className)}>
       {expanded ? (
         <>
           <Search aria-hidden className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
@@ -308,6 +314,30 @@ export function ownerLabel(item: Pick<LibraryItem, "owner" | "builtin">, myName:
   return myName && item.owner === myName ? "You" : item.owner
 }
 
+/**
+ * The chosen segment's raised fill as one pill that slides to the segment chosen (micro-interaction
+ * audit 2026-11-14, emil: the eye follows where the choice went), for `Segmented` and the view switch.
+ * Put it first inside a `relative isolate` row; the segments mark themselves with
+ * `data-indicator-item` and the chosen one with `data-indicator-active`.
+ */
+export function SegmentPill({ indicatorRef, className }: {
+  readonly indicatorRef: React.RefObject<HTMLSpanElement | null>
+  readonly className?: string
+}) {
+  return (
+    <span
+      ref={indicatorRef}
+      aria-hidden
+      data-slot="segment-pill"
+      className={cn(
+        "pointer-events-none absolute top-0 left-0 -z-10 rounded-md bg-background shadow-sm dark:bg-input/40",
+        "data-ready:transition-[transform,width,height] data-ready:duration-[240ms] data-ready:ease-move",
+        className,
+      )}
+    />
+  )
+}
+
 /** A row of mutually exclusive choices; each is a real button with `aria-pressed`, reachable by Tab. */
 export function Segmented<T extends string>({
   value, options, onChange, label, size = "default", className,
@@ -320,8 +350,10 @@ export function Segmented<T extends string>({
   readonly size?: "sm" | "default"
   readonly className?: string
 }) {
+  const { listRef, indicatorRef } = useSlidingIndicator<HTMLDivElement>(`${value}|${options.map((o) => o.value).join(",")}|${size}`, { box: true })
   return (
-    <div role="group" aria-label={label} className={cn("inline-flex rounded-lg bg-muted p-0.5", className)}>
+    <div ref={listRef} role="group" aria-label={label} className={cn("relative isolate inline-flex rounded-lg bg-muted p-0.5", className)}>
+      <SegmentPill indicatorRef={indicatorRef} />
       {options.map((o) => {
         const on = o.value === value
         return (
@@ -330,11 +362,13 @@ export function Segmented<T extends string>({
             type="button"
             aria-pressed={on}
             onClick={() => onChange(o.value)}
+            data-indicator-item
+            data-indicator-active={on || undefined}
             className={cn(
-              "inline-flex flex-1 items-center justify-center gap-1.5 rounded-md font-medium whitespace-nowrap",
+              "inline-flex flex-1 items-center justify-center gap-1.5 rounded-md font-medium whitespace-nowrap active:scale-[0.97]",
               size === "sm" ? "h-7 px-2.5 text-xs" : "h-8 px-3 text-sm",
               EASE, FOCUS,
-              on ? "bg-background text-foreground shadow-sm dark:bg-input/40" : "text-muted-foreground hover:text-foreground",
+              on ? "text-foreground" : "text-muted-foreground hover:text-foreground",
             )}
           >
             {o.label}
@@ -345,36 +379,46 @@ export function Segmented<T extends string>({
   )
 }
 
-/** The favourite star: filled amber when on, with a short pop when it changes. */
+/**
+ * The favourite star: filled amber when on.
+ *
+ * Micro-interaction audit 2026-11-14 (emil, DESIGN.md §3 "no button that sits still when clicked"):
+ * the star shows the new state the moment it is pressed, not after the save and the favourites
+ * reload. When `onToggle` returns a promise, a rejection puts it back. Turning it on pops it
+ * (`animate-pop`); the old pop set `scale-125` with an easing list naming `transform`, so it jumped.
+ */
 export function StarButton({ on, name, onToggle, className }: {
   readonly on: boolean
   readonly name: string
-  readonly onToggle: () => void
+  readonly onToggle: () => void | Promise<unknown>
   readonly className?: string
 }) {
-  const [pop, setPop] = React.useState(false)
-  React.useEffect(() => {
-    if (!pop) return
-    const t = window.setTimeout(() => setPop(false), 220)
-    return () => window.clearTimeout(t)
-  }, [pop])
+  // What the person asked for while the server has not confirmed it; null when `on` is the truth.
+  const [asked, setAsked] = React.useState<boolean | null>(null)
+  const [seenOn, setSeenOn] = React.useState(on)
+  if (seenOn !== on) {
+    setSeenOn(on)
+    setAsked(null)
+  }
+  const shown = asked ?? on
   return (
     <button
       type="button"
-      aria-pressed={on}
-      aria-label={on ? `Remove ${name} from favourites` : `Add ${name} to favourites`}
+      aria-pressed={shown}
+      aria-label={shown ? `Remove ${name} from favourites` : `Add ${name} to favourites`}
       onClick={(e) => {
         e.preventDefault()
         e.stopPropagation()
-        onToggle()
-        setPop(true)
+        setAsked(!shown)
+        const done = onToggle()
+        if (done && typeof done.then === "function") done.then(() => undefined, () => setAsked(null))
       }}
       className={cn(
         "relative z-10 grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground active:scale-90",
         EASE, FOCUS, className,
       )}
     >
-      <Star aria-hidden className={cn("size-4", EASE, on && "fill-amber-400 text-amber-500", pop && "scale-125")} />
+      <Star key={shown ? "on" : "off"} aria-hidden className={cn("size-4", EASE, shown && "animate-pop fill-amber-400 text-amber-500")} />
     </button>
   )
 }

@@ -7,6 +7,7 @@ import { LayoutGrid, Rows3 } from "lucide-react"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { ErrorState } from "@/components/patterns/page-states"
 import { useIsMobile } from "@/hooks/use-mobile"
+import { useSlidingIndicator } from "@/hooks/use-sliding-indicator"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { useUrlTab } from "@/hooks/use-url-tab"
 import { useAuth } from "@/features/auth/auth-provider"
@@ -32,7 +33,7 @@ import { FolderPicker, NewMenu, PageMenu, type FolderChoice, type ItemActions } 
 import { BulkBar, favouriteItems, pickable, trashItems } from "./library-bulk"
 import { EmptyFolder, EmptyWorkspace, NoMatch, NoneOfKind } from "./library-empty"
 import { LibraryGallery } from "./library-gallery"
-import { EASE, FOCUS, PageFrame, ScrollRegion, SearchField, Segmented } from "./library-parts"
+import { EASE, FOCUS, PageFrame, ScrollRegion, SearchField, SegmentPill, Segmented } from "./library-parts"
 import { LibraryTable, type FolderLookup } from "./library-table"
 import { ItemPicture, pictureSource } from "./library-picture"
 import { RecentRow } from "./library-recent"
@@ -119,8 +120,11 @@ function ViewSwitch({ value, onChange }: {
     { value: "table" as const, label: "Table view", icon: Rows3 },
     { value: "gallery" as const, label: "Gallery view", icon: LayoutGrid },
   ]
+  // Micro-interaction audit 2026-11-14 (emil): the raised square slides to the view chosen.
+  const { listRef, indicatorRef } = useSlidingIndicator<HTMLDivElement>(value, { box: true })
   return (
-    <div role="group" aria-label="View" className="inline-flex h-8 shrink-0 rounded-lg bg-muted/70 p-0.5 dark:bg-input/30">
+    <div ref={listRef} role="group" aria-label="View" className="relative isolate inline-flex h-8 shrink-0 rounded-lg bg-muted/70 p-0.5 dark:bg-input/30">
+      <SegmentPill indicatorRef={indicatorRef} />
       {options.map((o) => {
         const on = o.value === value
         return (
@@ -131,10 +135,12 @@ function ViewSwitch({ value, onChange }: {
             aria-label={o.label}
             title={o.label}
             onClick={() => onChange(o.value)}
+            data-indicator-item
+            data-indicator-active={on || undefined}
             className={cn(
-              "grid size-7 place-items-center rounded-md",
+              "grid size-7 place-items-center rounded-md active:scale-[0.97]",
               EASE, FOCUS,
-              on ? "bg-background text-foreground shadow-sm dark:bg-input/40" : "text-muted-foreground hover:text-foreground",
+              on ? "text-foreground" : "text-muted-foreground hover:text-foreground",
             )}
           >
             <o.icon aria-hidden className="size-4" />
@@ -257,8 +263,14 @@ export function DashboardListPage() {
   const [sort, setSort] = React.useState<SortState>({ column: "updated", dir: "desc" })
   const [view, setViewRaw] = useViewMode()
   const phone = useIsMobile()
+  // Micro-interaction audit 2026-11-14 (emil): once the person switches the view or the type, the new
+  // rows or cards fade in (with a 2 px blur that hides the two layouts overlapping) instead of the old
+  // ones being swapped out in one frame. The first load does not fade: the placeholder already has the
+  // rows' shapes, so the data fills in place (one loading look).
+  const [switched, setSwitched] = React.useState(false)
   const setView = (next: ViewMode) => {
     setViewRaw(next)
+    setSwitched(true)
     clearSelection()
   }
   const [trashOpen, setTrashOpen] = React.useState(false)
@@ -326,16 +338,18 @@ export function DashboardListPage() {
     ),
   )
 
+  // Micro-interaction audit 2026-11-14: the promise rejects when the save failed, so the star (which
+  // shows the change at once) goes back; the error is still told here, once.
   const toggleFavourite = React.useCallback(
-    (item: LibraryItem) => {
-      void (async () => {
-        try {
-          await dashboardService.setFavourite("board", item.id, !favouriteIds.has(item.id))
-        } catch (err) {
-          notifyError("Could not save the favourite", err)
-        }
+    async (item: LibraryItem) => {
+      try {
+        await dashboardService.setFavourite("board", item.id, !favouriteIds.has(item.id))
+      } catch (err) {
+        notifyError("Could not save the favourite", err)
         reloadShortcuts()
-      })()
+        throw err
+      }
+      reloadShortcuts()
     },
     [favouriteIds, reloadShortcuts],
   )
@@ -413,6 +427,7 @@ export function DashboardListPage() {
   const tabs = tabValues.map((v) => ({ value: v, label: TAB_LABEL[v] }))
   const setTab = (next: TabValue) => {
     setTabRaw(next)
+    setSwitched(true)
     clearSelection()
   }
   const ticked = rows.filter((r) => selected.has(r.key) && pickable(r))
@@ -552,7 +567,15 @@ export function DashboardListPage() {
                 for this page (`dashboard-list-skeleton.tsx`), not a generic one. */}
             {state.status !== "error" && loading ? <DashboardListRowsSkeleton view={view} /> : null}
             {state.status === "success" && !loading ? (
-              rows.length === 0 ? (
+              <div
+                key={`${view}|${tab}`}
+                data-slot="library-results"
+                className={cn(
+                  "grid grid-cols-[minmax(0,1fr)]",
+                  switched && "transition-[opacity,filter] duration-200 ease-ui starting:opacity-0 starting:blur-[2px]",
+                )}
+              >
+              {rows.length === 0 ? (
                 <ListEmpty
                   kind={kind}
                   query={query}
@@ -587,7 +610,8 @@ export function DashboardListPage() {
                   selection={selection}
                   phone={phone}
                 />
-              )
+              )}
+              </div>
             ) : null}
             {reportsState.status === "error" ? (
               <p className="text-xs text-destructive">

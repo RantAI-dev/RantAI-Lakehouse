@@ -86,7 +86,8 @@ export function BulkBar({ count, canFavourite, onClear, onMove, onFavourite, onT
 }) {
   const on = "text-background hover:bg-background/15 hover:text-background disabled:opacity-50"
   return (
-    <div role="toolbar" aria-label="Selected items" className="flex w-full flex-wrap items-center gap-1 rounded-xl bg-foreground px-2 py-1 text-background">
+    // Micro-interaction audit 2026-11-14: the bar takes the controls row's place with a short rise and fade, so the switch reads.
+    <div role="toolbar" aria-label="Selected items" className="flex w-full flex-wrap items-center gap-1 rounded-xl bg-foreground px-2 py-1 text-background transition-[opacity,translate] duration-200 ease-ui starting:translate-y-1 starting:opacity-0">
       <Button variant="ghost" size="icon-sm" aria-label="Clear selection" onClick={onClear} className={on}>
         <X />
       </Button>

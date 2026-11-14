@@ -169,7 +169,8 @@ export function PageMenu({
 export type ItemActions = {
   readonly isFavourite: (item: LibraryItem) => boolean
   /** Dashboards only: the favourites list holds dashboards and charts, not reports. */
-  readonly onToggleFavourite: (item: LibraryItem) => void
+  /** May return a promise that rejects when the change did not save, so the star can show the change at once and undo it. */
+  readonly onToggleFavourite: (item: LibraryItem) => void | Promise<unknown>
   readonly onRename?: (item: LibraryItem) => void
   readonly onDuplicate?: (item: LibraryItem) => void
   readonly onMove?: (item: LibraryItem) => void
@@ -240,7 +241,7 @@ export function ItemMenu({ item, actions, className }: {
               <ExternalLink /> Open
             </DropdownMenuItem>
             {item.kind === "dashboard" ? (
-              <DropdownMenuItem onClick={() => actions.onToggleFavourite(item)}>
+              <DropdownMenuItem onClick={() => void Promise.resolve(actions.onToggleFavourite(item)).catch(() => undefined)}>
                 <Star className={cn(fav && "fill-amber-400 text-amber-500")} />
                 {fav ? "Remove from favourites" : "Add to favourites"}
               </DropdownMenuItem>
