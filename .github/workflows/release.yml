@@ -333,7 +333,7 @@ jobs:
       # The signer. Pinned to a commit SHA, the release in the comment:
       # the signer of a release must not change under the release's feet.
       - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       # The throwaway key. It signs this job's images and this job's
       # manifest, and it is verified against its own public key below —
@@ -985,7 +985,7 @@ jobs:
       # The signer. Pinned to a commit SHA, the release in the comment:
       # the signer of a release must not change under the release's feet.
       - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Sign each image
         # The release key, for THIS step only (REL-2 S2 review BLOCKER 2):
@@ -1719,7 +1719,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       # The proof's own throwaway key.
       #
