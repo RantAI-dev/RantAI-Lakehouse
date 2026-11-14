@@ -34,7 +34,7 @@ const SECTIONS = [
 function Section({ id, children }: { id: string; children: React.ReactNode }) {
   // `scroll-mt` keeps an anchored section clear of the sticky top bar.
   return (
-    <section id={id} className="scroll-mt-16">
+    <section id={id} className="scroll-mt-[calc(var(--app-navbar-h)+1rem)]">
       {children}
     </section>
   )

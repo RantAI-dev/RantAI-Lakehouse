@@ -37,7 +37,10 @@ export function AppFrame({ children }: Readonly<{ children: React.ReactNode }>) 
   if (isPublicPath(pathname)) return <>{children}</>;
 
   return (
-    <SidebarProvider>
+    // `--app-navbar-h`: the navbar's height, set once here for the whole shell. The navbar, the
+    // sidebar's logo row and every offset under the navbar (page frames, sticky strips, side panels)
+    // read it, so a change of height is one edit (owner 2026-11-14: 48 px, was 64).
+    <SidebarProvider className="[--app-navbar-h:3rem]">
       <AuthenticatedShell>{children}</AuthenticatedShell>
     </SidebarProvider>
   );

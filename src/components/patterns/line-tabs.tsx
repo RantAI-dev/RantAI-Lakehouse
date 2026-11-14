@@ -42,10 +42,17 @@ export function TabCount({ count, tone }: { count: number; tone?: TabCountTone }
 }
 
 /**
- * The app navbar's height (`h-12` in `app-navbar.tsx`): the tab strip
- * sticks right under it.
+ * The app navbar's height in pixels, read from `--app-navbar-h` (set on the
+ * shell root, `app-frame.tsx`): the tab strip sticks right under it. 0
+ * outside the shell, where nothing sticks above the strip.
  */
-const STICKY_TOP_PX = 48
+function navbarHeightPx(el: Element): number {
+  const raw = getComputedStyle(el).getPropertyValue("--app-navbar-h").trim()
+  const n = parseFloat(raw)
+  if (!Number.isFinite(n)) return 0
+  if (raw.endsWith("rem")) return n * parseFloat(getComputedStyle(document.documentElement).fontSize)
+  return n
+}
 
 /**
  * After a tab switch, scrolled past the strip, the new tab would open
@@ -53,9 +60,11 @@ const STICKY_TOP_PX = 48
  * is the element that wraps the `Tabs` the strip belongs to.
  */
 export function keepStripInView(root: HTMLElement | null) {
-  const top = root?.getBoundingClientRect().top
-  if (top !== undefined && top < STICKY_TOP_PX && window.scrollY > 0) {
-    window.scrollTo({ top: window.scrollY + top - STICKY_TOP_PX })
+  if (!root) return
+  const top = root.getBoundingClientRect().top
+  const stickyTop = navbarHeightPx(root)
+  if (top < stickyTop && window.scrollY > 0) {
+    window.scrollTo({ top: window.scrollY + top - stickyTop })
   }
 }
 
@@ -85,7 +94,7 @@ export function LineTabsList({ tabs, active }: { tabs: LineTab[]; active: string
     // (`app-frame.tsx`) so content scrolling underneath never shows
     // beside it. Two layers repeat the page's own background: the
     // inset's `bg-muted/25` over the body's `bg-background`.
-    <div className="sticky top-12 z-10 -mx-4 bg-background sm:-mx-5 lg:-mx-6">
+    <div className="sticky top-(--app-navbar-h) z-10 -mx-4 bg-background sm:-mx-5 lg:-mx-6">
       <div
         ref={stripRef}
         className="overflow-x-auto border-b border-border bg-muted/25 px-4 [scrollbar-width:none] sm:px-5 lg:px-6"

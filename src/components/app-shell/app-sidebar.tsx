@@ -74,14 +74,14 @@ function BrandLogo() {
  * does not change at all when the real sidebar mounts.
  */
 export function SidebarBrand() {
-  // `h-12` supaya persis setinggi navbar (`app-navbar.tsx` juga `h-12`, 48 px sejak 2026-11-14),
+  // `--app-navbar-h` supaya persis setinggi navbar (`app-navbar.tsx` membaca variabel yang sama),
   // sehingga garis bawah keduanya menyambung jadi satu garis lurus di seluruh
   // lebar layar. Sebelumnya tinggi header ini dihitung dari isinya (padding +
   // baris logo) dan jatuh di 69px — 5px lebih rendah dari navbar, dan
   // patahannya terlihat tepat di pertemuan sidebar dengan konten.
   return (
     // The logo sits 8 px in, centred on the 48 px rail, in both states; the name fades.
-    <SidebarHeader className="flex h-12 shrink-0 flex-col justify-center border-b border-sidebar-border px-2 py-0">
+    <SidebarHeader className="flex h-(--app-navbar-h) shrink-0 flex-col justify-center border-b border-sidebar-border px-2 py-0">
       <div className="flex min-w-0 items-center justify-start gap-2">
         <BrandLogo />
         <div className={cn("grid min-w-0 flex-1 gap-0.5 whitespace-nowrap leading-none", SIDEBAR_FADE)}>
