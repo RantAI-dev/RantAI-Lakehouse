@@ -2,50 +2,44 @@
 
 import * as React from "react"
 import { useRouter } from "next/navigation"
-import { FileText, LayoutGrid, LayoutTemplate } from "lucide-react"
 
-import { DataTable } from "@/components/data-table/data-table"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
-import { LineTabsList, type LineTab } from "@/components/patterns/line-tabs"
 import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
-import { Tabs, TabsContent } from "@/components/ui/tabs"
-import { useDataTable } from "@/hooks/use-data-table"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { useUrlTab } from "@/hooks/use-url-tab"
 import { useAuth } from "@/features/auth/auth-provider"
-import { filterDataClientSide } from "@/lib/data-table"
 import { folderChoices, labelledFolders, manageableFolders } from "@/lib/dashboard-organise"
-import { folderPath } from "@/lib/folder-tree"
+import { buildFolderTree, flattenFolders, folderPath } from "@/lib/folder-tree"
 import { notifyError, notifyInfo, withNotify } from "@/lib/notify"
-import { dashboardService, dashboardTemplateService } from "@/services"
+import { dashboardReportService, dashboardService, dashboardTemplateService } from "@/services"
 import type { Board, DashboardTemplate } from "@/services"
 import { BoardFormDialog } from "./board-form-dialog"
 import { notifyDashboardsChanged } from "./dashboard-events"
-import { getDashboardColumns, type BoardRowActions } from "./dashboard-list-columns"
 import { ImportDashboardDialog } from "./import-dashboard-dialog"
 import { ManageFoldersDialog, MoveBoardDialog } from "./folder-dialogs"
-import { NewMenu, PageMenu } from "./library-menus"
-import { PageFrame, ScrollRegion, SearchField } from "./library-parts"
-import { ReportList } from "./report-list"
+import {
+  boardItem, filterItems, firstDirection, reportItem, sortItems, templateItem,
+  type KindFilter, type FolderFilter, type LibraryItem, type SortColumn, type SortState,
+} from "./library-items"
+import { FolderPicker, NewMenu, PageMenu, type FolderChoice, type ItemActions } from "./library-menus"
+import { PageFrame, ScrollRegion, SearchField, Segmented } from "./library-parts"
+import { LibraryTable, type FolderLookup } from "./library-table"
+import { MoveItemsDialog } from "./move-items-dialog"
 import { UseTemplateDialog } from "./template-dialogs"
-import { TemplateList } from "./template-list"
 import { forgetLastBoard } from "./last-board"
 import { TrashDialog } from "./trash-dialog"
 
 /**
- * The tabs of the Dashboards page (`BI-18` part D): the dashboards, the
- * reports and, for a holder of `dashboard:write`, the templates. The open one
- * is in `?tab=`, so a report's "Reports" link lands on it.
+ * The type filter, kept in `?tab=` so a link can open one kind (the report
+ * page's "Reports" link is `?tab=reports`). It replaces the three tabs of
+ * `BI-18` part D. Templates are for a holder of `dashboard:write` (BI-18 part
+ * D, T4), so a reader's filter has no Templates.
  */
-type ListTab = "dashboards" | "reports" | "templates"
-const READER_TABS: readonly ListTab[] = ["dashboards", "reports"]
-/** BI-18 part D (T6, T4): templates are for those who may save and use them. */
-const WRITER_TABS: readonly ListTab[] = ["dashboards", "reports", "templates"]
-const TAB_STRIP: Record<ListTab, LineTab> = {
-  dashboards: { value: "dashboards", label: "Dashboards", icon: LayoutGrid },
-  reports: { value: "reports", label: "Reports", icon: FileText },
-  templates: { value: "templates", label: "Templates", icon: LayoutTemplate },
-}
+type TabValue = "all" | "dashboards" | "reports" | "templates"
+const READER_TABS: readonly TabValue[] = ["all", "dashboards", "reports"]
+const WRITER_TABS: readonly TabValue[] = ["all", "dashboards", "reports", "templates"]
+const TAB_LABEL: Record<TabValue, string> = { all: "All", dashboards: "Dashboards", reports: "Reports", templates: "Templates" }
+const TAB_KIND: Record<TabValue, KindFilter> = { all: "all", dashboards: "dashboard", reports: "report", templates: "template" }
 
 /**
  * The Dashboards page (`/dashboards/browse`, `BI-59`): find, make and organise
@@ -70,14 +64,50 @@ const TAB_STRIP: Record<ListTab, LineTab> = {
  * `ReplacingMergeTree(created_at)`, so `created_at` is the version column
  * rewritten on every save and has always meant "last changed".
  */
+/** What the list says when it has no row: why, in words that fit the filter. */
+function ListEmpty({ kind, query, folderFilter, canWrite, anyOfKind }: {
+  readonly kind: KindFilter
+  readonly query: string
+  readonly folderFilter: FolderFilter
+  readonly canWrite: boolean
+  /** Whether anything of this kind exists at all, before the search and folder. */
+  readonly anyOfKind: boolean
+}) {
+  if (query.trim()) return <EmptyState title={`Nothing matches “${query.trim()}”`} description="Search looks at names, owners, folders and types." />
+  if (folderFilter !== null && anyOfKind) return <EmptyState title="Nothing in this folder" description="Move a dashboard or a report here from its ⋯ menu." />
+  if (kind === "template") {
+    return (
+      <EmptyState
+        title="No templates yet"
+        description="Open a dashboard and choose Save as template in its ⋯ menu. Its layout, charts and filters are saved, without data."
+      />
+    )
+  }
+  if (kind === "report") {
+    return (
+      <EmptyState
+        title="No reports yet"
+        description={
+          canWrite
+            ? "A report is a written page with live charts between the paragraphs. Pick the charts from your dashboards."
+            : "Nobody has shared a report with you yet."
+        }
+      />
+    )
+  }
+  return <EmptyState title="No dashboards yet" description="A dashboard collects charts, KPIs and tables on one canvas." />
+}
+
 export function DashboardListPage() {
   const router = useRouter()
   const state = useService((s) => dashboardService.listBoards(s), [])
   // Folders are listed to everyone who can see dashboards; filing needs
   // `dashboard:write`, which the API enforces (policy.rs).
   const foldersState = useService((s) => dashboardService.listFolders(s), [])
+  const reportsState = useService((s) => dashboardReportService.listReports(s), [])
   const auth = useAuth()
   const me = auth.user?.id
+  const myName = auth.user?.name
   // The caller's own personal space is called "Personal space"; the folder
   // manager never offers one, and a dashboard is filed only in an ordinary
   // folder or the caller's own space (BI-18 part C, part 2).
@@ -89,8 +119,7 @@ export function DashboardListPage() {
   const reloadFolders = foldersState.reload
   const canFile = auth.hasPermission("dashboard:write")
   const tabValues = canFile ? WRITER_TABS : READER_TABS
-  const [tab, setTab] = useUrlTab<ListTab>("tab", tabValues)
-  const listTabs = tabValues.map((t) => TAB_STRIP[t])
+  const [tab, setTab] = useUrlTab<TabValue>("tab", tabValues)
   // The personal space is created on first use: a writer with none yet opens it
   // once, then the folder list is read again.
   const spaceAsked = React.useRef(false)
@@ -103,13 +132,23 @@ export function DashboardListPage() {
       .then(() => reloadFolders())
       .catch(() => undefined)
   }, [canFile, me, foldersState.status, foldersState.data, reloadFolders])
-  // Templates are for a holder of `dashboard:write` (BI-18 part D, T4); the
-  // New menu offers them. A reader asks for nothing.
+  // Templates are for a holder of `dashboard:write` (BI-18 part D, T4). A
+  // reader asks for nothing.
+  // The answer names the permission it was read for: `useService` shows the
+  // previous answer for one render after `canFile` changes, and a reader's
+  // empty stand-in must not pass for a writer's list.
   const templatesState = useService(
-    (s) => (canFile ? dashboardTemplateService.listTemplates(s) : Promise.resolve({ templates: [], truncated: false })),
+    async (s) => ({
+      forWriter: canFile,
+      list: canFile ? await dashboardTemplateService.listTemplates(s) : { templates: [], truncated: false },
+    }),
     [canFile],
   )
-  const templates = templatesState.status === "success" ? templatesState.data.templates : templatesState.status === "error" ? null : []
+  const templatesReady = templatesState.status === "error" || (templatesState.status === "success" && templatesState.data.forWriter === canFile)
+  const templates = React.useMemo(
+    () => (templatesState.status === "success" ? templatesState.data.list.templates : templatesState.status === "error" ? null : []),
+    [templatesState.status, templatesState.data],
+  )
   // Favourites (best effort: the list works without them).
   const shortcuts = useService((s) => dashboardService.shortcuts(s), [])
   const favouriteIds = React.useMemo(
@@ -118,16 +157,23 @@ export function DashboardListPage() {
   )
   const reloadShortcuts = shortcuts.reload
   const [query, setQuery] = React.useState("")
+  const [folderFilter, setFolderFilter] = React.useState<FolderFilter>(null)
+  const [sort, setSort] = React.useState<SortState>({ column: "updated", dir: "desc" })
   const [trashOpen, setTrashOpen] = React.useState(false)
   const [foldersOpen, setFoldersOpen] = React.useState(false)
   const [importOpen, setImportOpen] = React.useState(false)
   const [moving, setMoving] = React.useState<Board | null>(null)
+  const [movingItems, setMovingItems] = React.useState<readonly LibraryItem[] | null>(null)
   const [using, setUsing] = React.useState<DashboardTemplate | null>(null)
   const [createOpen, setCreateOpen] = React.useState(false)
   const [renaming, setRenaming] = React.useState<Board | null>(null)
   const [deleting, setDeleting] = React.useState<Board | null>(null)
+  const [deletingReport, setDeletingReport] = React.useState<LibraryItem | null>(null)
+  const [deletingTemplate, setDeletingTemplate] = React.useState<LibraryItem | null>(null)
 
   const reload = state.reload
+  const reloadReports = reportsState.reload
+  const reloadTemplates = templatesState.reload
   const createAction = useServiceAction(
     withNotify(
       { success: "Dashboard created", error: "Could not create dashboard" },
@@ -165,75 +211,104 @@ export function DashboardListPage() {
       (signal, id: string) => dashboardService.deleteBoard(id, signal),
     ),
   )
+  const deleteReportAction = useServiceAction(
+    withNotify(
+      { success: "Moved to the trash", error: "Could not delete the report" },
+      (signal, id: string) => dashboardReportService.deleteReport(id, signal),
+    ),
+  )
+  const deleteTemplateAction = useServiceAction(
+    withNotify(
+      { success: "Template deleted", error: "Could not delete the template" },
+      (signal, id: string) => dashboardTemplateService.deleteTemplate(id, signal),
+    ),
+  )
 
-  const actions = React.useMemo<BoardRowActions>(
+  const toggleFavourite = React.useCallback(
+    (item: LibraryItem) => {
+      void (async () => {
+        try {
+          await dashboardService.setFavourite("board", item.id, !favouriteIds.has(item.id))
+        } catch (err) {
+          notifyError("Could not save the favourite", err)
+        }
+        reloadShortcuts()
+      })()
+    },
+    [favouriteIds, reloadShortcuts],
+  )
+  const actions = React.useMemo<ItemActions>(
     () => ({
-      onRename: canFile ? setRenaming : undefined,
-      onDelete: canFile ? setDeleting : undefined,
-      onMove: canFile ? setMoving : undefined,
-      isFavourite: (b) => favouriteIds.has(b.id),
-      onToggleFavourite: (b) => {
-        void (async () => {
-          try {
-            await dashboardService.setFavourite("board", b.id, !favouriteIds.has(b.id))
-          } catch (err) {
-            notifyError("Could not save the favourite", err)
-          }
-          reloadShortcuts()
-        })()
-      },
+      isFavourite: (item) => item.kind === "dashboard" && favouriteIds.has(item.id),
+      onToggleFavourite: toggleFavourite,
+      onRename: canFile ? (item) => item.board && setRenaming(item.board) : undefined,
+      onMove: canFile
+        ? (item) => (item.kind === "dashboard" && item.board ? setMoving(item.board) : setMovingItems([item]))
+        : undefined,
+      onTrash: canFile
+        ? (item) => (item.kind === "dashboard" && item.board ? setDeleting(item.board) : setDeletingReport(item))
+        : undefined,
       onDuplicate: canFile
-        ? (b) => {
+        ? (item) => {
             void (async () => {
-              const created = await duplicateAction.run(b.id)
+              const created = await duplicateAction.run(item.id)
               notifyDashboardsChanged()
               reload()
               if (created?.id) router.push(`/dashboards/${created.id}`)
             })()
           }
         : undefined,
+      onUseTemplate: canFile ? (item) => item.template && setUsing(item.template) : undefined,
+      onDeleteTemplate: canFile ? setDeletingTemplate : undefined,
     }),
-    [canFile, duplicateAction, favouriteIds, reload, reloadShortcuts, router],
-  )
-  const folderPathOf = React.useCallback(
-    (b: Board) => (b.folderId ? folderPath(folders, b.folderId) : ""),
-    [folders],
-  )
-  const columns = React.useMemo(
-    () => getDashboardColumns(actions, folderPathOf),
-    [actions, folderPathOf],
+    [canFile, duplicateAction, favouriteIds, reload, router, toggleFavourite],
   )
 
-  const boards = React.useMemo(() => state.data ?? [], [state.data])
-  const filtered = React.useMemo(
+  const pathOf = React.useCallback((folderId: string) => (folderId ? folderPath(folders, folderId) : ""), [folders])
+  const folderLookup = React.useMemo<FolderLookup>(
+    () => ({ pathOf, isPersonal: (id) => Boolean(folders.find((f) => f.id === id)?.ownerId) }),
+    [folders, pathOf],
+  )
+
+  const items = React.useMemo<LibraryItem[]>(
+    () => [
+      ...(state.data ?? []).map(boardItem),
+      ...(reportsState.data?.reports ?? []).map(reportItem),
+      ...(templates ?? []).map(templateItem),
+    ],
+    [state.data, reportsState.data, templates],
+  )
+  const kind = TAB_KIND[tab]
+  const rows = React.useMemo(
+    () => sortItems(filterItems(items, { kind, folder: folderFilter, query }, pathOf), sort, pathOf),
+    [items, kind, folderFilter, query, sort, pathOf],
+  )
+  const folderChoicesList = React.useMemo<FolderChoice[]>(
     () =>
-      filterDataClientSide(boards, {
-        search: query,
-        // The folder path is searchable, so typing a folder's name
-        // narrows the list to what is filed in it.
-        searchFields: [
-          (b) => b.name,
-          (b) => b.description ?? "",
-          (b) => b.createdBy ?? "",
-          folderPathOf,
-        ],
-        filters: [],
-        joinOperator: "and",
-      }),
-    [boards, folderPathOf, query],
+      flattenFolders(buildFolderTree(folders, []).folders).map(({ folder }) => ({
+        id: folder.id,
+        path: folderPath(folders, folder.id),
+        personal: Boolean(folder.ownerId),
+        count: items.filter((i) => i.kind !== "template" && i.folderId === folder.id).length,
+      })),
+    [folders, items],
   )
+  // A folder filter that names a folder no longer listed (it was deleted
+  // from the folder manager) falls back to every folder.
+  React.useEffect(() => {
+    if (folderFilter && foldersState.status === "success" && !folders.some((f) => f.id === folderFilter)) setFolderFilter(null)
+  }, [folderFilter, folders, foldersState.status])
 
-  const { table } = useDataTable({
-    data: filtered,
-    columns,
-    paginationMode: "infinite",
-    manualPagination: false,
-    manualSorting: false,
-    manualFiltering: true,
-    persistKey: "/dashboards/browse",
-    initialState: { columnPinning: { right: ["actions"] } },
-    getRowId: (row) => row.id,
-  })
+  const sortBy = (column: SortColumn) =>
+    setSort((s) => (s.column === column ? { column, dir: s.dir === "asc" ? "desc" : "asc" } : { column, dir: firstDirection(column) }))
+
+  // The list waits for the three reads, so rows do not jump in as each one
+  // lands; a failed read of reports or templates is said under the list and
+  // leaves the dashboards usable.
+  // Until the session is known the templates read is a stand-in (`canFile` is
+  // still false), so the list also waits for it.
+  const loading = auth.status === "loading" || state.status === "loading" || reportsState.status === "loading" || !templatesReady
+  const tabs = tabValues.map((v) => ({ value: v, label: TAB_LABEL[v] }))
 
   return (
     <PageFrame>
@@ -260,37 +335,59 @@ export function DashboardListPage() {
       </header>
 
       <ScrollRegion className="-mx-2 mt-5 px-2 pb-6">
-        <Tabs value={tab} onValueChange={(v) => setTab(v as ListTab)} className="gap-4">
-          <LineTabsList tabs={listTabs} active={tab} />
-          <TabsContent value="dashboards" className="flex flex-col gap-4">
-            {state.status === "loading" ? <LoadingSkeleton /> : null}
-            {state.status === "error" ? <ErrorState error={state.error} onRetry={reload} /> : null}
-            {state.status === "success" && boards.length === 0 ? (
-              <EmptyState
-                title="No dashboards yet"
-                description="Create a dashboard to collect charts, KPIs and tables on one canvas."
+        <section aria-label="Dashboards, reports and templates" className="grid grid-cols-[minmax(0,1fr)] gap-3">
+          <div className="flex min-h-9 flex-wrap items-center justify-between gap-2">
+            <Segmented<TabValue> label="Type" value={tab} onChange={setTab} options={tabs} />
+            <FolderPicker
+              value={folderFilter}
+              onChange={setFolderFilter}
+              choices={folderChoicesList}
+              noFolderCount={items.filter((i) => i.kind !== "template" && !i.folderId).length}
+            />
+          </div>
+
+          {state.status === "error" ? <ErrorState error={state.error} onRetry={reload} /> : null}
+          {state.status !== "error" && loading ? <LoadingSkeleton /> : null}
+          {state.status === "success" && !loading ? (
+            rows.length === 0 ? (
+              <ListEmpty
+                kind={kind}
+                query={query}
+                folderFilter={folderFilter}
+                canWrite={canFile}
+                anyOfKind={items.some((i) => kind === "all" || i.kind === kind)}
               />
-            ) : null}
-            {state.status === "success" && boards.length > 0 ? (
-              filtered.length === 0 ? (
-                <EmptyState title="No matching dashboards" description="No dashboard matches the search." />
-              ) : (
-                <div className="rounded-md border">
-                  <DataTable table={table} />
-                </div>
-              )
-            ) : null}
-          </TabsContent>
-          <TabsContent value="reports">
-            {/* BI-18 part D (T5): reports live in the same folders, under the same access. */}
-            <ReportList folders={folders} canWrite={canFile} query={query} />
-          </TabsContent>
-          {canFile ? (
-            <TabsContent value="templates">
-              <TemplateList folders={fileable} query={query} />
-            </TabsContent>
+            ) : (
+              <LibraryTable
+                items={rows}
+                sort={sort}
+                onSort={sortBy}
+                actions={actions}
+                folders={folderLookup}
+                myName={myName}
+                onOpenTemplate={(item) => item.template && setUsing(item.template)}
+              />
+            )
           ) : null}
-        </Tabs>
+          {reportsState.status === "error" ? (
+            <p className="text-xs text-destructive">
+              Reports could not be listed: {reportsState.error.message}{" "}
+              <button type="button" className="underline underline-offset-4" onClick={reloadReports}>Try again</button>
+            </p>
+          ) : null}
+          {templatesState.status === "error" ? (
+            <p className="text-xs text-destructive">
+              Templates could not be listed: {templatesState.error.message}{" "}
+              <button type="button" className="underline underline-offset-4" onClick={reloadTemplates}>Try again</button>
+            </p>
+          ) : null}
+          {reportsState.data?.truncated ? (
+            <p className="text-xs text-muted-foreground">Showing the 1,000 most recently changed reports. Search to find an older one.</p>
+          ) : null}
+          {templatesState.data?.list.truncated ? (
+            <p className="text-xs text-muted-foreground">Showing the 500 newest templates.</p>
+          ) : null}
+        </section>
       </ScrollRegion>
 
       <BoardFormDialog
@@ -390,6 +487,21 @@ export function DashboardListPage() {
         />
       ) : null}
 
+      {canFile && movingItems ? (
+        <MoveItemsDialog
+          items={movingItems}
+          folders={fileable}
+          onOpenChange={(open) => !open && setMovingItems(null)}
+          onDone={(outcome) => {
+            if (outcome.moved > 0) {
+              notifyDashboardsChanged()
+              reload()
+              reloadReports()
+            }
+          }}
+        />
+      ) : null}
+
       {trashOpen ? (
         <TrashDialog
           canWrite={canFile}
@@ -397,6 +509,7 @@ export function DashboardListPage() {
           onRestored={() => {
             notifyDashboardsChanged()
             reload()
+            reloadReports()
             reloadShortcuts()
           }}
         />
@@ -426,6 +539,43 @@ export function DashboardListPage() {
             forgetLastBoard(target.id)
             notifyDashboardsChanged()
             reload()
+          })()
+        }}
+      />
+      <ConfirmActionDialog
+        open={deletingReport !== null}
+        onOpenChange={(open) => !open && setDeletingReport(null)}
+        title={`Delete ${deletingReport?.name ?? "report"}?`}
+        description="The report goes to the trash. You can restore it for 30 days. Its charts stay on their dashboards."
+        confirmLabel="Delete"
+        destructive
+        confirming={deleteReportAction.status === "pending"}
+        onConfirm={() => {
+          const target = deletingReport
+          if (!target) return
+          void (async () => {
+            await deleteReportAction.run(target.id)
+            setDeletingReport(null)
+            reloadReports()
+          })()
+        }}
+      />
+
+      <ConfirmActionDialog
+        open={deletingTemplate !== null}
+        onOpenChange={(open) => !open && setDeletingTemplate(null)}
+        title={`Delete the template ${deletingTemplate?.name ?? ""}?`}
+        description="The template is deleted for good. Dashboards already made from it are not changed."
+        confirmLabel="Delete"
+        destructive
+        confirming={deleteTemplateAction.status === "pending"}
+        onConfirm={() => {
+          const target = deletingTemplate
+          if (!target) return
+          void (async () => {
+            await deleteTemplateAction.run(target.id)
+            setDeletingTemplate(null)
+            reloadTemplates()
           })()
         }}
       />

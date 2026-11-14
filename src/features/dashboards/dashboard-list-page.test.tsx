@@ -104,10 +104,11 @@ describe("the Dashboards page header (BI-59 T1)", () => {
     renderPage()
     const head = await header()
     fireEvent.click(await within(head).findByRole("button", { name: "New" }))
-    expect(await screen.findByText("A canvas of charts, KPIs and tables")).toBeTruthy()
-    expect(screen.getByText("A written page with live charts")).toBeTruthy()
-    expect(await screen.findByText("Sales overview")).toBeTruthy()
-    expect(screen.getByText("Import a dashboard file…")).toBeTruthy()
+    const menu = await screen.findByRole("menu")
+    expect(within(menu).getByText("A canvas of charts, KPIs and tables")).toBeTruthy()
+    expect(within(menu).getByText("A written page with live charts")).toBeTruthy()
+    expect(await within(menu).findByText("Sales overview")).toBeTruthy()
+    expect(within(menu).getByText("Import a dashboard file…")).toBeTruthy()
   })
 
   it("the page's ⋯ holds Metrics, Manage folders and Trash for a writer", async () => {
@@ -140,5 +141,65 @@ describe("the Dashboards page header (BI-59 T1)", () => {
     fireEvent.change(search, { target: { value: "qa" } })
     fireEvent.keyDown(search, { key: "Escape" })
     expect(search.value).toBe("")
+  })
+})
+
+const REPORT = {
+  id: "r1", title: "Wisman 2020-2024", folderId: "f1", createdBy: "Bima", updatedBy: "Bima",
+  updatedAt: "2026-11-14T08:00:00Z", blockCount: 4, chartCount: 2,
+}
+const FOLDERS = [{ id: "f1", name: "Tourism", parentId: "", createdBy: "u1" }]
+
+/** The names in the table, top to bottom. */
+function rowNames(): string[] {
+  return [...document.querySelectorAll("tbody tr")].map((tr) => tr.querySelector("td a, td button")?.textContent?.trim() ?? "")
+}
+
+describe("the one list (BI-59 T2)", () => {
+  function serveList() {
+    return serve(["dashboard:read", "dashboard:write"], {
+      "GET /api/dashboard/reports": () => json({ reports: [REPORT], truncated: false, maxCharts: 30 }),
+      "GET /api/dashboard/folders": () => json({ folders: FOLDERS }),
+    })
+  }
+
+  it("holds dashboards, reports and templates, newest first, and each filter keeps only its kind", async () => {
+    serveList()
+    renderPage()
+    await screen.findByText("Wisman 2020-2024")
+    expect(rowNames()).toEqual(["Wisman 2020-2024", "QA BI", "Sales overview", "Main"])
+    fireEvent.click(screen.getByRole("button", { name: "Reports" }))
+    expect(rowNames()).toEqual(["Wisman 2020-2024"])
+    fireEvent.click(screen.getByRole("button", { name: "Templates" }))
+    expect(rowNames()).toEqual(["Sales overview"])
+    fireEvent.click(screen.getByRole("button", { name: "Dashboards" }))
+    expect(rowNames()).toEqual(["QA BI", "Main"])
+  })
+
+  it("sorts by a column header, and the sort combines with the folder picker", async () => {
+    serveList()
+    renderPage()
+    await screen.findByText("Wisman 2020-2024")
+    fireEvent.click(screen.getByRole("button", { name: "Name" }))
+    expect(rowNames()).toEqual(["Main", "QA BI", "Sales overview", "Wisman 2020-2024"])
+    fireEvent.click(screen.getByRole("button", { name: "Name" }))
+    expect(rowNames()).toEqual(["Wisman 2020-2024", "Sales overview", "QA BI", "Main"])
+    fireEvent.click(screen.getByRole("button", { name: "Folder: All folders" }))
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Tourism/ }))
+    await waitFor(() => expect(rowNames()).toEqual(["Wisman 2020-2024"]))
+    fireEvent.click(screen.getByRole("button", { name: "Folder: Tourism" }))
+    fireEvent.click(await screen.findByRole("menuitem", { name: /No folder/ }))
+    await waitFor(() => expect(rowNames()).toEqual(["QA BI", "Main"]))
+  })
+
+  it("gives every row the ⋯ menu in the same place, Main included", async () => {
+    serveList()
+    renderPage()
+    await screen.findByText("Wisman 2020-2024")
+    for (const tr of document.querySelectorAll("tbody tr")) {
+      const last = tr.querySelector("td:last-child")
+      expect(last?.querySelector('button[aria-label^="Actions for"]')).toBeTruthy()
+    }
+    expect(screen.getByRole("button", { name: "Actions for Main" })).toBeTruthy()
   })
 })

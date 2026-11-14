@@ -8,10 +8,13 @@
  * table and the gallery draw them the same way.
  */
 import * as React from "react"
-import { Search, X } from "lucide-react"
+import { Code2, FileText, Globe, LayoutDashboard, LayoutTemplate, Lock, Package, Search, Star, X, type LucideIcon } from "lucide-react"
 
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { useAuth } from "@/features/auth/auth-provider"
 import { cn } from "@/lib/utils"
+import type { LibraryItem, LibraryKind } from "./library-items"
+import { PRIVATE_TIP } from "./private-badge"
 
 /** One easing and duration for every hover, press and change (owner taste: 150–250 ms, eased, never linear). */
 export const EASE = "transition-[background-color,border-color,color,box-shadow,opacity,transform] duration-200 ease-[cubic-bezier(0.2,0,0,1)]"
@@ -139,5 +142,179 @@ export function SearchField({
         </kbd>
       )}
     </div>
+  )
+}
+
+/* ------------------------------------------------------------------ */
+/* Kinds, badges and people                                            */
+/* ------------------------------------------------------------------ */
+
+const KIND_ICON: Record<LibraryKind, LucideIcon> = { dashboard: LayoutDashboard, report: FileText, template: LayoutTemplate }
+
+export function KindIcon({ kind, className }: { readonly kind: LibraryKind; readonly className?: string }) {
+  const Icon = KIND_ICON[kind]
+  return <Icon aria-hidden className={cn("size-4 shrink-0 text-muted-foreground", className)} />
+}
+
+/**
+ * The badge tones (decision P4): one colour per meaning, the same on every
+ * row and card. Built-in grey, public link amber, embedded sky; rose is kept
+ * for "restricted" so the meaning has its colour, but the list does not show
+ * it: whether a folder shows only the people listed is read per item
+ * (`GET /api/dashboard/access`), and the boards and folders lists do not carry
+ * it.
+ */
+type Tone = "neutral" | "amber" | "sky" | "rose"
+const TONE: Record<Tone, string> = {
+  neutral: "bg-muted text-muted-foreground",
+  amber: "bg-amber-500/12 text-amber-700 dark:text-amber-300",
+  sky: "bg-sky-500/12 text-sky-700 dark:text-sky-300",
+  rose: "bg-rose-500/12 text-rose-700 dark:text-rose-300",
+}
+
+/** A label that cannot be clicked: soft fill, no border (DESIGN.md "Badge tanpa border", owner 2026-11-08). */
+export function Badge({ tone, icon: Icon, children, className }: {
+  readonly tone: Tone
+  readonly icon?: LucideIcon
+  readonly children: React.ReactNode
+  readonly className?: string
+}) {
+  return (
+    <span className={cn("inline-flex h-5 items-center gap-1 rounded-full px-2 text-[11px] font-medium whitespace-nowrap", TONE[tone], className)}>
+      {Icon ? <Icon aria-hidden className="size-3" /> : null}
+      {children}
+    </span>
+  )
+}
+
+/**
+ * Who can see an item beyond the folder it is in: built in, a live public
+ * link, embedding on, or private to its owner's personal space (the lock, as
+ * before, with the same tip as the dashboard's own badge).
+ */
+export function ItemBadges({ item, className, max }: {
+  readonly item: LibraryItem
+  readonly className?: string
+  /** At most this many, on a card where room is short. */
+  readonly max?: number
+}) {
+  const list: React.ReactNode[] = []
+  if (item.builtin) list.push(<Badge key="builtin" tone="neutral" icon={Package}>Built-in</Badge>)
+  if (item.publicLink) list.push(<Badge key="public" tone="amber" icon={Globe}>Public link</Badge>)
+  if (item.embedded) list.push(<Badge key="embed" tone="sky" icon={Code2}>Embedded</Badge>)
+  if (item.personal) {
+    list.push(
+      <Tooltip key="private">
+        <TooltipTrigger render={<span className="inline-flex" />}>
+          <Badge tone="neutral" icon={Lock}>Private</Badge>
+        </TooltipTrigger>
+        <TooltipContent>{PRIVATE_TIP}</TooltipContent>
+      </Tooltip>,
+    )
+  }
+  if (list.length === 0) return null
+  return <span className={cn("flex flex-wrap items-center gap-1", className)}>{max ? list.slice(0, max) : list}</span>
+}
+
+const AVATAR_TONES = [
+  "bg-sky-500/15 text-sky-800 dark:text-sky-200",
+  "bg-emerald-500/15 text-emerald-800 dark:text-emerald-200",
+  "bg-amber-500/15 text-amber-800 dark:text-amber-200",
+  "bg-violet-500/15 text-violet-800 dark:text-violet-200",
+]
+
+/** Initials in a circle, a colour per name; the built-in board has a box instead of a person. */
+export function Avatar({ owner, builtin, className }: { readonly owner: string; readonly builtin?: boolean; readonly className?: string }) {
+  if (builtin) {
+    return (
+      <span aria-hidden className={cn("grid size-5 shrink-0 place-items-center rounded-full bg-muted text-muted-foreground", className)}>
+        <Package className="size-3" />
+      </span>
+    )
+  }
+  const initials = owner.split(/\s+/).filter(Boolean).map((w) => w[0]).slice(0, 2).join("").toUpperCase() || "?"
+  const tone = AVATAR_TONES[[...owner].reduce((sum, c) => sum + c.charCodeAt(0), 0) % AVATAR_TONES.length]
+  return (
+    <span aria-hidden className={cn("grid size-5 shrink-0 place-items-center rounded-full text-[9px] font-semibold", tone, className)}>
+      {initials}
+    </span>
+  )
+}
+
+/** The owner's name as the list says it: "You" for the person reading, "Built-in" for the built-in board, "—" when unknown. */
+export function ownerLabel(item: Pick<LibraryItem, "owner" | "builtin">, myName: string | undefined): string {
+  if (item.builtin) return "Built-in"
+  if (!item.owner) return "—"
+  return myName && item.owner === myName ? "You" : item.owner
+}
+
+/** A row of mutually exclusive choices; each is a real button with `aria-pressed`, reachable by Tab. */
+export function Segmented<T extends string>({
+  value, options, onChange, label, size = "default", className,
+}: {
+  readonly value: T
+  readonly options: readonly { value: T; label: string }[]
+  readonly onChange: (value: T) => void
+  /** Read by screen readers. */
+  readonly label: string
+  readonly size?: "sm" | "default"
+  readonly className?: string
+}) {
+  return (
+    <div role="group" aria-label={label} className={cn("inline-flex rounded-lg bg-muted p-0.5", className)}>
+      {options.map((o) => {
+        const on = o.value === value
+        return (
+          <button
+            key={o.value}
+            type="button"
+            aria-pressed={on}
+            onClick={() => onChange(o.value)}
+            className={cn(
+              "inline-flex flex-1 items-center justify-center gap-1.5 rounded-md font-medium whitespace-nowrap",
+              size === "sm" ? "h-7 px-2.5 text-xs" : "h-8 px-3 text-sm",
+              EASE, FOCUS,
+              on ? "bg-background text-foreground shadow-sm dark:bg-input/40" : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {o.label}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+/** The favourite star: filled amber when on, with a short pop when it changes. */
+export function StarButton({ on, name, onToggle, className }: {
+  readonly on: boolean
+  readonly name: string
+  readonly onToggle: () => void
+  readonly className?: string
+}) {
+  const [pop, setPop] = React.useState(false)
+  React.useEffect(() => {
+    if (!pop) return
+    const t = window.setTimeout(() => setPop(false), 220)
+    return () => window.clearTimeout(t)
+  }, [pop])
+  return (
+    <button
+      type="button"
+      aria-pressed={on}
+      aria-label={on ? `Remove ${name} from favourites` : `Add ${name} to favourites`}
+      onClick={(e) => {
+        e.preventDefault()
+        e.stopPropagation()
+        onToggle()
+        setPop(true)
+      }}
+      className={cn(
+        "relative z-10 grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground active:scale-90",
+        EASE, FOCUS, className,
+      )}
+    >
+      <Star aria-hidden className={cn("size-4", EASE, on && "fill-amber-400 text-amber-500", pop && "scale-125")} />
+    </button>
   )
 }

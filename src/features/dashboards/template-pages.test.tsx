@@ -19,9 +19,8 @@ import { AuthProvider } from "@/features/auth/auth-provider"
 import { DashboardActionsMenu } from "./dashboard-actions"
 import { DashboardListPage } from "./dashboard-list-page"
 import { SaveTemplateDialog } from "./template-dialogs"
-import { TemplateList } from "./template-list"
 
-// BI-18 part D (T6): the Templates tab, its dialogs and "Save as template".
+// BI-18 part D (T6): the templates, their dialogs and "Save as template".
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } })
@@ -39,7 +38,7 @@ function serve(permissions: string[], routes: Record<string, (call: Call) => Res
     }
     calls.push(call)
     if (url.includes("/api/auth/me")) {
-      return Promise.resolve(json({ id: "u1", name: "Rina", email: null, roles: ["R"], permissions, tenants: [] }))
+      return Promise.resolve(json({ id: "u1", name: "Ana", email: null, roles: ["R"], permissions, tenants: [] }))
     }
     const key = Object.keys(routes)
       .filter((k) => {
@@ -52,6 +51,7 @@ function serve(permissions: string[], routes: Record<string, (call: Call) => Res
     if (url.includes("/api/dashboard/boards")) return Promise.resolve(json({ boards: [] }))
     if (url.includes("/api/dashboard/shortcuts")) return Promise.resolve(json({ favourites: [], recent: [] }))
     if (url.includes("/api/dashboard/reports")) return Promise.resolve(json({ reports: [], truncated: false, maxCharts: 30 }))
+    if (url.includes("/api/dashboard/templates")) return Promise.resolve(json({ templates: [], truncated: false }))
     return Promise.resolve(json({}))
   }) as unknown as typeof fetch)
   return calls
@@ -68,19 +68,28 @@ const template = {
   chartCount: 3, createdBy: "Rina", createdAt: "2026-11-13T00:00:00Z",
 }
 
-describe("TemplateList", () => {
+// BI-59 T2: the templates are rows of the one list, under the Templates filter.
+async function openTemplates() {
+  render(<AuthProvider><TableProviders><DashboardListPage /></TableProviders></AuthProvider>)
+  fireEvent.click(await screen.findByRole("button", { name: "Templates" }))
+}
+
+describe("the templates on the Dashboards page", () => {
   it("lists each template with its source, who saved it and its charts", async () => {
     serve(["dashboard:write"], { "GET /api/dashboard/templates": () => json({ templates: [template], truncated: false }) })
-    render(<AuthProvider><TemplateList folders={[]} /></AuthProvider>)
-    expect(await screen.findByText("Sales overview")).toBeTruthy()
-    expect(screen.getByText("From Quarterly sales")).toBeTruthy()
-    expect(screen.getByText("3 charts")).toBeTruthy()
-    expect(screen.getByText("Rina")).toBeTruthy()
+    await openTemplates()
+    const row = (await screen.findByRole("button", { name: "Sales overview" })).closest("tr")
+    if (!row) throw new Error("no row")
+    expect(within(row).getByText("Template")).toBeTruthy()
+    expect(within(row).getByText("Rina")).toBeTruthy()
+    // The New menu shows each template with its charts and its source.
+    fireEvent.click(screen.getByRole("button", { name: "New" }))
+    expect(await screen.findByText("3 charts · from Quarterly sales")).toBeTruthy()
   })
 
   it("says how to make one when there are none", async () => {
     serve(["dashboard:write"], { "GET /api/dashboard/templates": () => json({ templates: [], truncated: false }) })
-    render(<AuthProvider><TemplateList folders={[]} /></AuthProvider>)
+    await openTemplates()
     expect(await screen.findByText("No templates yet")).toBeTruthy()
     expect(screen.getByText(/Save as template/)).toBeTruthy()
   })
@@ -90,14 +99,15 @@ describe("TemplateList", () => {
       "GET /api/dashboard/templates": () => json({ templates: [template], truncated: false }),
       "POST /api/dashboard/templates/t1/use": () => json({ ok: true, board: { id: "b_new", name: "Q4" }, leftOut: [] }),
     })
-    render(<AuthProvider><TemplateList folders={[]} /></AuthProvider>)
-    fireEvent.click(await screen.findByRole("button", { name: "Use template" }))
+    await openTemplates()
+    fireEvent.click(await screen.findByRole("button", { name: "Sales overview" }))
     const name = await screen.findByLabelText("Name")
     expect((name as HTMLInputElement).value).toBe("Sales overview")
     fireEvent.change(name, { target: { value: "Q4" } })
     fireEvent.click(screen.getByRole("button", { name: "Create dashboard" }))
     await waitFor(() => expect(pushed).toContain("/dashboards/b_new"))
-    expect(calls.find((c) => c.method === "POST")?.body).toEqual({ name: "Q4", folderId: "" })
+    // The page also opens the writer's personal space with a POST, so the use is found by its address.
+    expect(calls.find((c) => c.method === "POST" && c.url.includes("/templates/t1/use"))?.body).toEqual({ name: "Q4", folderId: "" })
   })
 
   it("shows the server's refusal in the dialog and opens nothing", async () => {
@@ -105,8 +115,8 @@ describe("TemplateList", () => {
       "GET /api/dashboard/templates": () => json({ templates: [template], truncated: false }),
       "POST /api/dashboard/templates/t1/use": () => json({ error: "permission_denied: edit on this dashboard" }, 403),
     })
-    render(<AuthProvider><TemplateList folders={[]} /></AuthProvider>)
-    fireEvent.click(await screen.findByRole("button", { name: "Use template" }))
+    await openTemplates()
+    fireEvent.click(await screen.findByRole("button", { name: "Sales overview" }))
     fireEvent.click(await screen.findByRole("button", { name: "Create dashboard" }))
     expect((await screen.findByRole("alert")).textContent).toContain("edit on this dashboard")
     expect(pushed).toHaveLength(0)
@@ -117,8 +127,9 @@ describe("TemplateList", () => {
       "GET /api/dashboard/templates": () => json({ templates: [template], truncated: false }),
       "DELETE /api/dashboard/templates/t1": () => json({ ok: true, id: "t1" }),
     })
-    render(<AuthProvider><TemplateList folders={[]} /></AuthProvider>)
-    fireEvent.click(await screen.findByRole("button", { name: "Delete Sales overview" }))
+    await openTemplates()
+    fireEvent.click(await screen.findByRole("button", { name: "Actions for Sales overview" }))
+    fireEvent.click(await screen.findByText("Delete template…"))
     expect(calls.some((c) => c.method === "DELETE")).toBe(false)
     const dialog = await screen.findByRole("alertdialog").catch(() => screen.findByRole("dialog"))
     expect(within(dialog).getByText(/deleted for good/)).toBeTruthy()
@@ -180,20 +191,20 @@ describe("Save as template in the dashboard's menu", () => {
   })
 })
 
-describe("the Dashboards page tabs", () => {
-  it("shows Dashboards, Reports and Templates to a writer", async () => {
+// BI-59 T2: the segmented type filter replaced the tabs.
+describe("the Dashboards page type filter", () => {
+  it("offers All, Dashboards, Reports and Templates to a writer", async () => {
     serve(["dashboard:read", "dashboard:write"], {})
     render(<AuthProvider><TableProviders><DashboardListPage /></TableProviders></AuthProvider>)
-    expect(await screen.findByRole("tab", { name: /Templates/ })).toBeTruthy()
-    expect(screen.getByRole("tab", { name: /Reports/ })).toBeTruthy()
-    expect(screen.getByRole("tab", { name: /Dashboards/ })).toBeTruthy()
+    expect(await screen.findByRole("button", { name: "Templates" })).toBeTruthy()
+    for (const name of ["All", "Dashboards", "Reports"]) expect(screen.getByRole("button", { name })).toBeTruthy()
   })
 
-  it("shows a reader no Templates tab and no New report", async () => {
+  it("offers a reader no Templates and no New report", async () => {
     serve(["dashboard:read"], {})
     render(<AuthProvider><TableProviders><DashboardListPage /></TableProviders></AuthProvider>)
-    const reports = await screen.findByRole("tab", { name: /Reports/ })
-    expect(screen.queryByRole("tab", { name: /Templates/ })).toBeNull()
+    const reports = await screen.findByRole("button", { name: "Reports" })
+    expect(screen.queryByRole("button", { name: "Templates" })).toBeNull()
     fireEvent.click(reports)
     expect(await screen.findByText("Nobody has shared a report with you yet.")).toBeTruthy()
     expect(screen.queryByText("New report")).toBeNull()
