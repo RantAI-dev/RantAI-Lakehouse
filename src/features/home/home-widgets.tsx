@@ -291,9 +291,12 @@ export function PipelinesWidget({
   hasPipelines,
   canConnect,
   onAskWhy,
+  errorText = "Couldn't load pipelines.",
   className,
 }: {
   state: CheckState
+  /** The one line for a failed read, when there is a more exact one. */
+  errorText?: string
   rows: readonly PipelineRow[]
   /** Pipelines exist, though none has run or is scheduled. */
   hasPipelines: boolean
@@ -313,7 +316,7 @@ export function PipelinesWidget({
         {state === "loading" ? (
           <CardSkeleton rows={3} />
         ) : state === "error" ? (
-          <CardNote>Couldn&apos;t load pipelines.</CardNote>
+          <CardNote>{errorText}</CardNote>
         ) : rows.length === 0 ? (
           <div className="flex flex-col items-start gap-2 px-1.5 py-1.5">
             <p className="text-xs leading-5 text-muted-foreground">

@@ -279,7 +279,7 @@ describe("Home's states (WEB-17 T5)", () => {
     ])
     renderHome()
 
-    expect(await screen.findByText("Couldn't load pipelines.")).toBeTruthy()
+    expect(await screen.findByText("Couldn't reach the orchestrator to list pipelines.")).toBeTruthy()
     expect(screen.queryByText(/No pipelines yet/)).toBeNull()
   })
 })

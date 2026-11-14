@@ -315,8 +315,10 @@ export function HomePage() {
     favouriteIds: (favourites.data?.favourites ?? []).filter((f) => f.kind === "board").map((f) => f.id),
     lastOpenedId: lastBoard,
   })
+  // Wait for the favourites too (a failed read only drops that rule), or
+  // the widget would draw one board and then switch to the favourite.
   const focal: FocalState =
-    boards.status === "loading"
+    boards.status === "loading" || favourites.status === "loading"
       ? { kind: "loading" }
       : boards.status === "error"
         ? { kind: "error" }
@@ -337,8 +339,9 @@ export function HomePage() {
   const starts = shown.shortcuts.filter((id) => canOpen(SHORTCUTS[id].href, hasPermission))
 
   const pipelineList = pipelines.data?.pipelines ?? []
-  // The list route answers 200 with `error` set and no pipelines when it
-  // could not read them; that is a failed read, not "no pipelines yet".
+  // The list route answers 503 with `error` set when the orchestrator could
+  // not be reached (`routes::pipelines`, the Pipelines page's amber note):
+  // with nothing else listed, that is a failed read, not "no pipelines yet".
   const pipelinesRead: CheckState =
     pipelines.status === "success" && pipelines.data.error && pipelineList.length === 0
       ? "error"
@@ -388,6 +391,7 @@ export function HomePage() {
     "pipeline-runs": (
       <PipelinesWidget
         state={pipelinesRead}
+        errorText={pipelines.data?.error ? "Couldn't reach the orchestrator to list pipelines." : undefined}
         rows={pipelineRows(pipelineList, 4)}
         hasPipelines={pipelineList.length > 0}
         canConnect={canOpen("/connectors/create", hasPermission)}
