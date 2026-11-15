@@ -64,7 +64,7 @@ function pillClip(surface: HTMLElement, pill: HTMLElement | null): string {
   const s = surface.getBoundingClientRect();
   if (!pill) {
     // No pill on screen (should not happen while animating): centre a pill-sized box on the bottom edge.
-    const w = Math.min(window.innerWidth * 0.88, 460);
+    const w = Math.min(s.width, 460);
     const side = Math.max(0, (s.width - w) / 2);
     return `inset(${s.height - 46}px ${side}px 0px ${side}px round 23px)`;
   }
@@ -246,7 +246,7 @@ function DockPill({
   }, [isPresent]);
 
   return (
-    <div ref={scope} data-dock-pill inert={!isPresent} className="pointer-events-auto w-[min(88vw,460px)] justify-self-center [grid-area:1/1] self-end">
+    <div ref={scope} data-dock-pill inert={!isPresent} className="pointer-events-auto w-full max-w-[460px] justify-self-center [grid-area:1/1] self-end">
       {children}
     </div>
   );
@@ -327,14 +327,16 @@ export function CopilotDock() {
 
   return (
     <>
-    {/* The bar floats over the page; this keeps the last row of content
-        scrollable out from under it. */}
-    <div aria-hidden className="h-20 shrink-0 print:hidden" />
-    {/* One fixed cell, as wide as the open dock, that the pill and the open
-        stack share, both pinned to its bottom centre: neither half moves the
-        other, and the page behind never shifts. The cell itself lets clicks
-        through; only the halves take them. */}
-    <div ref={wrapper} className="pointer-events-none fixed bottom-4 left-1/2 z-50 grid w-[min(92vw,560px)] -translate-x-1/2 print:hidden">
+    {/* The bar floats over the page. Owner QA 2026-11-14, composer: it is centred on the content
+        area, right of the sidebar (`--content-left`, set by AppFrame), not on the window, and it
+        follows the sidebar as it folds. The room under the page is AppFrame's `--content-bottom`
+        (`ComposerReserve`); the 5rem spacer this rendered on top of that is gone. */}
+    <div className="pointer-events-none fixed right-0 bottom-4 left-(--content-left,0px) z-50 flex justify-center px-4 transition-[left] duration-200 ease-ui print:hidden">
+    {/* One cell, as wide as the open dock, that the pill and the open stack
+        share, both pinned to its bottom centre: neither half moves the other,
+        and the page behind never shifts. The cell itself lets clicks through;
+        only the halves take them. */}
+    <div ref={wrapper} className="grid w-full max-w-[560px]">
       <AnimatePresence initial={false}>
         {showPanel ? (
           <DockStack key="stack" plan={plan} getPill={getPill} onCollapse={collapse}>
@@ -407,7 +409,7 @@ export function CopilotDock() {
                 )}
               </div>
             </div>
-            {composer(false)}
+            <ComposerReserve>{composer(false)}</ComposerReserve>
           </DockStack>
         ) : (
           <DockPill key="pill" plan={plan} focusRef={restoringFocus}>
@@ -420,12 +422,66 @@ export function CopilotDock() {
               onClick={(e) => { if (!(e.target as HTMLElement).closest("button")) open(); }}
               onKeyDown={(e) => { if (e.key === "Enter" && !draft.trim()) open(); }}
             >
-              {composer(true)}
+              <ComposerReserve>{composer(true)}</ComposerReserve>
             </div>
           </DockPill>
         )}
       </AnimatePresence>
     </div>
+    </div>
     </>
   );
+}
+
+/** The bar's distance from the window's bottom edge (`bottom-4`) and the gap kept above it. */
+export const DOCK_OFFSET_PX = 16;
+export const DOCK_GAP_PX = 14;
+
+/**
+ * Owner QA 2026-11-14, composer reserve: the room a page keeps under its content while the floating
+ * composer shows, in px: the composer's own height, its offset from the bottom, and a 14 px gap.
+ */
+export function dockReserve(composerHeight: number): number {
+  return Math.round(composerHeight + DOCK_OFFSET_PX + DOCK_GAP_PX);
+}
+
+/** The composers on screen. While the dock opens or closes the pill and the box are both there for a moment. */
+const reserving = new Set<HTMLElement>();
+
+function updateReserve() {
+  const root = document.documentElement;
+  if (reserving.size === 0) {
+    root.style.removeProperty("--dock-reserve");
+    return;
+  }
+  const height = Math.max(...Array.from(reserving, (el) => el.getBoundingClientRect().height));
+  root.style.setProperty("--dock-reserve", `${dockReserve(height)}px`);
+}
+
+/**
+ * Owner QA 2026-11-14, composer reserve: while a composer is on screen, `--dock-reserve` on the
+ * document is the room it takes (`dockReserve` of its measured height, kept current as it grows); it
+ * is removed when the dock hides itself (the Copilot side panel, a page without the dock), so
+ * AppFrame's `--content-bottom` falls back to the page's normal padding. The composer's height,
+ * not the open chat card above it, is what is reserved. The pill and the open box each wrap their
+ * composer in one of these, and both are mounted while one hands over to the other (the open and
+ * close motion), so the reserve is the taller of those on screen and goes only when the last one
+ * leaves: the pill leaving after the box arrived must not drop it.
+ */
+function ComposerReserve({ children }: { readonly children: React.ReactNode }) {
+  const ref = React.useRef<HTMLDivElement>(null);
+  React.useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    reserving.add(el);
+    updateReserve();
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(updateReserve);
+    observer?.observe(el);
+    return () => {
+      observer?.disconnect();
+      reserving.delete(el);
+      updateReserve();
+    };
+  }, []);
+  return <div ref={ref} data-slot="dock-composer">{children}</div>;
 }

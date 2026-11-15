@@ -37,18 +37,18 @@ describe("MeasureRows", () => {
   it("adds an empty measure up to the maximum and removes none below the minimum", () => {
     const onChange = mock<(rows: MeasureRow[]) => void>(() => {})
     const { rerender } = render(<MeasureRows {...baseProps} rows={rows3} onChange={onChange} />)
-    fireEvent.click(screen.getByText("Add measure"))
+    fireEvent.click(screen.getByText("Add value"))
     expect(onChange.mock.calls[0][0]).toHaveLength(4)
     expect(onChange.mock.calls[0][0][3]).toEqual({ column: "", aggregate: "" })
     rerender(<MeasureRows {...baseProps} rows={[...rows3, { column: "x", aggregate: "" }]} onChange={onChange} />)
-    expect(screen.queryByText("Add measure")).toBeNull()
+    expect(screen.queryByText("Add value")).toBeNull()
     rerender(<MeasureRows {...baseProps} rows={[rows3[0]]} onChange={onChange} />)
     expect((screen.getByLabelText("Remove measure 1") as HTMLButtonElement).disabled).toBe(true)
   })
 
   it("shows no add, move or remove for a fixed number of measures", () => {
     render(<MeasureRows {...baseProps} min={2} max={2} rows={rows3.slice(0, 2)} onChange={() => {}} />)
-    expect(screen.queryByText("Add measure")).toBeNull()
+    expect(screen.queryByText("Add value")).toBeNull()
     expect(screen.queryByLabelText("Remove measure 1")).toBeNull()
   })
 

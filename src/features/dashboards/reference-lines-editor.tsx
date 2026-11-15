@@ -3,10 +3,10 @@
 import { Plus, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { DEFAULT_FORECAST_HORIZON, LINE_KINDS, MAX_FORECAST_HORIZON, MAX_REFERENCE_LINES, MIN_FORECAST_HORIZON, isComputedLine, type LineKind, type ParamDef, type RefLineDraft } from "@/lib/params";
 import { ColourInput } from "./colour-input";
+import { SettingField, SettingGroup } from "./builder-sections";
 
 const FIXED = "__fixed__";
 const FIRST = "__first__";
@@ -37,8 +37,9 @@ export function ReferenceLinesEditor({
   const forecastAt = value.findIndex((l) => l.kind === "forecast");
   const offered = (i: number) => LINE_KINDS.filter((k) => k !== "forecast" || (takesForecast && (forecastAt < 0 || forecastAt === i)));
   return (
-    <div className="grid gap-1.5">
-      <Label>Reference lines</Label>
+    // BI-58 review round 1 (SHOULD-FIX 3): a group of the Style tab like the others; each line is a
+    // short stack of labelled, full-width fields instead of one row of narrow unlabelled ones.
+    <SettingGroup title="Reference lines">
       {value.map((line, i) => {
         const kind: LineKind = line.kind ?? "value";
         const computed = isComputedLine(kind);
@@ -47,65 +48,89 @@ export function ReferenceLinesEditor({
           const text = which === "from" ? line.value : line.to ?? "";
           const param = which === "from" ? line.param : line.toParam ?? "";
           const name = which === "from" ? (kind === "band" ? "from" : "value") : "to";
+          const word = which === "to" ? "To" : kind === "band" ? "From" : "Value";
           const patch = (t: string, p: string): Partial<RefLineDraft> => (which === "from" ? { value: t, param: p } : { to: t, toParam: p });
           return (
-            <span key={which} className="flex items-center gap-1.5">
+            <div key={which} className={numberParams.length ? "grid grid-cols-2 gap-3" : "grid grid-cols-[minmax(0,1fr)]"}>
               {numberParams.length ? (
-                <Select value={param || FIXED} items={items} onValueChange={(v) => set(i, patch("", v && v !== FIXED ? v : ""))}>
-                  <SelectTrigger className="w-28 shrink-0" aria-label={`Line ${i + 1} ${which === "to" ? "upper edge follows" : "follows"}`}><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value={FIXED}>A number</SelectItem>
-                    {numberParams.map((p) => <SelectItem key={p.name} value={p.name}>{p.label || p.name}</SelectItem>)}
-                  </SelectContent>
-                </Select>
+                <SettingField label={`${word} from`}>
+                  {(id) => (
+                    <Select value={param || FIXED} items={items} onValueChange={(v) => set(i, patch("", v && v !== FIXED ? v : ""))}>
+                      <SelectTrigger id={id} className="w-full" aria-label={`Line ${i + 1} ${which === "to" ? "upper edge follows" : "follows"}`}><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value={FIXED}>A number</SelectItem>
+                        {numberParams.map((p) => <SelectItem key={p.name} value={p.name}>{p.label || p.name}</SelectItem>)}
+                      </SelectContent>
+                    </Select>
+                  )}
+                </SettingField>
               ) : null}
               {param ? null : (
-                <Input className="h-8 w-24" type="number" value={text} placeholder={which === "to" ? "To" : kind === "band" ? "From" : "Value"} aria-label={`Line ${i + 1} ${name}`} onChange={(e) => set(i, patch(e.target.value, ""))} />
+                <SettingField label={word}>
+                  {(id) => <Input id={id} type="number" value={text} aria-label={`Line ${i + 1} ${name}`} onChange={(e) => set(i, patch(e.target.value, ""))} />}
+                </SettingField>
               )}
-            </span>
+            </div>
           );
         };
         return (
-          <div key={i} className="flex flex-wrap items-center gap-1.5">
-            <Select value={kind} items={KIND_LABELS} onValueChange={(v) => {
-              const next = (v ?? "value") as LineKind;
-              set(i, next === "forecast" && !line.horizon ? { kind: next, horizon: String(DEFAULT_FORECAST_HORIZON) } : { kind: next });
-            }}>
-              <SelectTrigger className="w-32 shrink-0" aria-label={`Line ${i + 1} kind`}><SelectValue /></SelectTrigger>
-              <SelectContent>
-                {offered(i).map((k) => <SelectItem key={k} value={k}>{KIND_LABELS[k]}</SelectItem>)}
-              </SelectContent>
-            </Select>
+          <div key={i} className="grid grid-cols-[minmax(0,1fr)] gap-3">
+            <div className="flex min-h-6 items-center justify-between gap-2 pt-2">
+              <p className="text-sm font-semibold">Line {i + 1}</p>
+              <Button type="button" size="icon-xs" variant="ghost" aria-label={`Remove line ${i + 1}`} onClick={() => onChange(value.filter((_, j) => j !== i))}><X /></Button>
+            </div>
+            <SettingField label="Kind">
+              {(id) => (
+                <Select value={kind} items={KIND_LABELS} onValueChange={(v) => {
+                  const next = (v ?? "value") as LineKind;
+                  set(i, next === "forecast" && !line.horizon ? { kind: next, horizon: String(DEFAULT_FORECAST_HORIZON) } : { kind: next });
+                }}>
+                  <SelectTrigger id={id} className="w-full" aria-label={`Line ${i + 1} kind`}><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {offered(i).map((k) => <SelectItem key={k} value={k}>{KIND_LABELS[k]}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              )}
+            </SettingField>
             {computed ? null : edge("from")}
-            {kind === "forecast" ? (
-              <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                <Input className="h-8 w-16" type="number" min={MIN_FORECAST_HORIZON} max={MAX_FORECAST_HORIZON} step={1} value={line.horizon ?? ""} placeholder="6" aria-label={`Line ${i + 1} horizon`} onChange={(e) => set(i, { horizon: e.target.value })} />
-                periods ahead
-              </span>
-            ) : null}
             {kind === "band" ? edge("to") : null}
-            {computed && valueNames.length > 1 ? (
-              <Select value={line.measure || FIRST} items={{ [FIRST]: "First value", ...Object.fromEntries(valueNames.map((n) => [n, n])) }} onValueChange={(v) => set(i, { measure: v && v !== FIRST ? v : undefined })}>
-                <SelectTrigger className="w-32 shrink-0" aria-label={`Line ${i + 1} describes`}><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value={FIRST}>First value</SelectItem>
-                  {valueNames.map((n) => <SelectItem key={n} value={n}>{n}</SelectItem>)}
-                </SelectContent>
-              </Select>
+            {kind === "forecast" ? (
+              <SettingField label="Periods ahead">
+                {(id) => <Input id={id} type="number" min={MIN_FORECAST_HORIZON} max={MAX_FORECAST_HORIZON} step={1} value={line.horizon ?? ""} aria-label={`Line ${i + 1} horizon`} onChange={(e) => set(i, { horizon: e.target.value })} />}
+              </SettingField>
             ) : null}
-            <Input className="h-8 min-w-0 flex-1" value={line.label} maxLength={60} placeholder="Label" aria-label={`Line ${i + 1} label`} onChange={(e) => set(i, { label: e.target.value })} />
-            <ColourInput value={line.color} onChange={(c) => set(i, { color: c })} label={`Line ${i + 1} colour`} fallback="#d97706" />
-            <Button type="button" size="icon-xs" variant="ghost" aria-label={`Remove line ${i + 1}`} onClick={() => onChange(value.filter((_, j) => j !== i))}><X /></Button>
+            {computed && valueNames.length > 1 ? (
+              <SettingField label="Of the value">
+                {(id) => (
+                  <Select value={line.measure || FIRST} items={{ [FIRST]: "First value", ...Object.fromEntries(valueNames.map((n) => [n, n])) }} onValueChange={(v) => set(i, { measure: v && v !== FIRST ? v : undefined })}>
+                    <SelectTrigger id={id} className="w-full" aria-label={`Line ${i + 1} describes`}><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value={FIRST}>First value</SelectItem>
+                      {valueNames.map((n) => <SelectItem key={n} value={n}>{n}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                )}
+              </SettingField>
+            ) : null}
+            <div className="grid grid-cols-[auto_minmax(0,1fr)] items-end gap-3">
+              <div className="grid gap-1.5">
+                <p className="text-xs font-medium">Colour</p>
+                <ColourInput value={line.color} onChange={(c) => set(i, { color: c })} label={`Line ${i + 1} colour`} fallback="#d97706" />
+              </div>
+              <SettingField label="Label">
+                {(id) => <Input id={id} value={line.label} maxLength={60} aria-label={`Line ${i + 1} label`} onChange={(e) => set(i, { label: e.target.value })} />}
+              </SettingField>
+            </div>
           </div>
         );
       })}
       {value.length < MAX_REFERENCE_LINES ? (
         <div>
-          <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => onChange([...value, { value: "", param: "", label: "" }])}>
+          <Button type="button" size="sm" variant="ghost" className="-ml-2 h-7 px-2 text-xs" onClick={() => onChange([...value, { value: "", param: "", label: "" }])}>
             <Plus className="size-3" aria-hidden /> Add a line
           </Button>
         </div>
       ) : null}
-    </div>
+    </SettingGroup>
   );
 }
