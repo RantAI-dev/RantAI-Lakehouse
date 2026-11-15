@@ -11,13 +11,13 @@ import { useService } from "@/hooks/use-service";
 import { normalizeFilters } from "@/lib/dashboard-filter-state";
 import { listTimeZones } from "@/lib/time-zones";
 import { reportService } from "@/services";
+import type { FilterDef } from "@/services";
 import type {
   ReportPerson,
   ReportSchedule,
   ReportSubscription,
   ReportSubscriptionInput,
 } from "@/services/contracts/reports";
-import type { FilterDef } from "@/services/clients/bi-store";
 import type { ReadState } from "./chart-download";
 import { clock, describeAttachments, describeNotSent, describeSchedule, describeStatus, WEEKDAYS } from "./report-words";
 

@@ -13,6 +13,7 @@ import { ReportingProvider } from "@/features/dashboards/reporting-context";
 import { TileBody } from "@/features/dashboards/tile-body";
 import { useService } from "@/hooks/use-service";
 import { settingsService } from "@/services";
+import type { ChartClick, FilterDef } from "@/services";
 import type { ChartKind, ChartRenderSpec } from "@/lib/dashboard-specs";
 import type { BinDef, GridDef } from "@/lib/chart-bins";
 import type { JoinDef } from "@/lib/chart-joins";
@@ -20,7 +21,6 @@ import type { LayerDef } from "@/lib/chart-layers";
 import { columnRef, metricColumn, type Grouping, type MeasureEntry, type SortSpec, type StepDef } from "@/lib/chart-shape";
 import type { RefLineDef } from "@/lib/params";
 import type { ColumnSetting, KpiCompare, PivotValue } from "@/lib/table-types";
-import type { ChartClick, FilterDef } from "@/services/clients/bi-store";
 import { apiFetch } from "@/services/http";
 import type { TileFailure } from "@/services/contracts/dashboards";
 

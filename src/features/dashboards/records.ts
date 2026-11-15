@@ -1,5 +1,5 @@
 import { normalizeFilters } from "@/lib/dashboard-filter-state";
-import type { FilterDef, FilterSkip } from "@/services/clients/bi-store";
+import type { FilterDef, FilterSkip } from "@/services";
 import { apiFetch } from "@/services/http";
 
 /**
