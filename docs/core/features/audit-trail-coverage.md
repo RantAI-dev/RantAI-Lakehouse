@@ -12,8 +12,8 @@
 | Acceptor | In the base |
 | Plan | Engineering plan kept by the planner |
 | Started | 2026-11-14 |
-| Shipped | |
-| Evidence | PR #546 (part A: coverage, central writer, append-only trail, audit:read) |
+| Shipped | 2026-11-15 |
+| Evidence | PR #546 (part A: coverage, central writer, append-only trail, audit:read), PR #549 (part B: server-side search, paging, CSV export) |
 
 ## Problem
 
