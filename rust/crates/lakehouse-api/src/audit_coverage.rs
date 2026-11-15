@@ -76,9 +76,19 @@
 //!   send the query parameter. A value in a body or in a response is never
 //!   read for it (feature page Decision 3): the row then names the kind and
 //!   the action, not the object.
-//! - A key name in a body is recorded as sent. At most [`MAX_FIELD_NAMES`]
-//!   names of at most [`MAX_FIELD_NAME_CHARS`] characters are kept, so one
-//!   request cannot write a megabyte row.
+//! - A key name in a body is recorded as sent, except that a NUL character
+//!   becomes U+FFFD. At most [`MAX_FIELD_NAMES`] names of at most
+//!   [`MAX_FIELD_NAME_CHARS`] characters are kept, so one request cannot write
+//!   a megabyte row.
+//! - Postgres refuses a NUL in a `TEXT` column and in `jsonb`, and a client
+//!   can put one in a key name (`{"\u0000": 1}`) or, percent-encoded, in an
+//!   id (`?id=%00`). A row that kept it would fail to insert and the change
+//!   would stand with no row, or a refusal at the gate would go unrecorded.
+//!   [`without_nul`] is applied to every client-supplied string a row stores:
+//!   the field names and the resource id. The other columns hold text the
+//!   server wrote (the action and kind from the table, the status code, the
+//!   missing permission, the principal's own name and id), so a client has no
+//!   way to put a character in them.
 //! - The assistant's tools and the other in-process callers call Rust
 //!   functions, never a route over HTTP, so a `Central` row does not repeat
 //!   a row the assistant wrote (verified at `212b431a6`).
@@ -169,13 +179,13 @@ const ACTOR_NOT_SIGNED_IN: &str = "No signed-in caller";
 
 const EX_PUBLIC: &str =
     "Decision 1: public data and frame route; it serves a view and changes nothing";
-const EX_READ_LIKE: &str = "Decision 1: read-like POST (preview, validate, estimate, compile, generate, lag-check, check or compare); it answers a question and records no change";
-const EX_OVERVIEW: &str = "Read-like POST: `POST /api/overview` only reads recent activity and orchestrator runs; it is a POST for its request body, not for a change";
+const EX_READ_LIKE: &str = "Decision 1: read-like POST (preview, validate, estimate, compile, lag-check, check or compare); it answers a question and records no change";
+const EX_OVERVIEW: &str = "Read-like POST: `POST /api/overview` takes no body and only reads the latest audit rows (the orchestrator's run list when there is no database); it is a POST for historical reasons, not for a change";
 const EX_TEST_BUTTON: &str = "Decision 1: a connection, email or notification \"test\" button; it sends a probe and changes no configuration";
 const EX_MACHINE: &str = "Decision 1: machine callback from an ingestion or orchestrator job; the console user's change it reports is audited where the job was started";
 const EX_PART: &str =
     "Decision 1: one part of a multipart upload; the finished upload is audited by `upload.create`";
-const EX_UI_STATE: &str = "Decision 1: personal UI state (favourites, recent, read marks, home layout, chat session create, rename and delete)";
+const EX_UI_STATE: &str = "Personal UI state: favourites, recent items, home layout, chat session create, rename and delete (Decision 1), and the read marks of mentions (`POST /api/dashboard/comments/mentions/read`), which are the same kind of state as favourites and which Decision 1 does not name yet";
 
 /// Every route of [`crate::policy::POLICY_TABLE`] that changes something, in
 /// the order of that table, with who writes its audit row. Keyed by the
@@ -229,7 +239,7 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("POST", "/api/alerts", Coverage::Central { action: "alert.create", resource_kind: "alert", id_param: IdParam::None }),
     ("PUT", "/api/alerts", Coverage::Central { action: "alert.update", resource_kind: "alert", id_param: IdParam::None }),
     ("DELETE", "/api/alerts", Coverage::Central { action: "alert.delete", resource_kind: "alert", id_param: IdParam::Query("id") }),
-    ("POST", "/api/alerts/test", Coverage::Excluded { reason: EX_TEST_BUTTON }),
+    ("POST", "/api/alerts/test", Coverage::Central { action: "alert.test", resource_kind: "alert", id_param: IdParam::Query("id") }),
     ("POST", "/api/alerts/run", Coverage::Central { action: "alert.run", resource_kind: "alert", id_param: IdParam::Query("id") }),
     ("POST", "/api/gold/export/{mart}", Coverage::Central { action: "gold.export", resource_kind: "gold_mart", id_param: IdParam::Path("mart") }),
     ("PUT", "/api/gold/export/{mart}/publication", Coverage::Handler { action: "gold.publication_set" }),
@@ -247,7 +257,7 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("PUT", "/api/query/saved/{id}/access", Coverage::Central { action: "saved_query.access_update", resource_kind: "saved_query", id_param: IdParam::Path("id") }),
     ("PUT", "/api/query/folders/{id}/access", Coverage::Central { action: "query_folder.access_update", resource_kind: "query_folder", id_param: IdParam::Path("id") }),
     ("POST", "/api/pipelines", Coverage::Handler { action: "pipeline.create" }),
-    ("POST", "/api/pipelines/generate", Coverage::Excluded { reason: EX_READ_LIKE }),
+    ("POST", "/api/pipelines/generate", Coverage::Handler { action: "pipeline.generate" }),
     ("POST", "/api/pipelines/preview", Coverage::Excluded { reason: EX_READ_LIKE }),
     ("PUT", "/api/pipelines/{id}", Coverage::Handler { action: "pipeline.update" }),
     ("PUT", "/api/pipelines/{id}/target-lag", Coverage::Handler { action: "pipeline.target_lag.set" }),
@@ -460,10 +470,20 @@ pub(crate) async fn path_params(parts: &mut Parts) -> Vec<(String, String)> {
     }
 }
 
+/// `text` with every NUL character replaced by U+FFFD (`GOV-1 review`,
+/// blocker 1). Postgres refuses a NUL in a `TEXT` column and in `jsonb`, so a
+/// client string that reaches an audit row goes through this first, or the
+/// insert fails and the change stands with no row. The replacement keeps the
+/// character count, so the bounds of this module still hold.
+pub(crate) fn without_nul(text: &str) -> String {
+    text.replace('\0', "\u{fffd}")
+}
+
 /// The object id a request names, cut to [`MAX_RESOURCE_ID_CHARS`]: the path
 /// parameter, or the first query-string parameter of that name,
-/// percent-decoded as the handler's own `Query` extractor decodes it. `None`
-/// when the route has no id there, or the request did not send one.
+/// percent-decoded as the handler's own `Query` extractor decodes it, with a
+/// NUL replaced ([`without_nul`]). `None` when the route has no id there, or
+/// the request did not send one.
 fn object_id(
     id_param: IdParam,
     params: &[(String, String)],
@@ -479,11 +499,18 @@ fn object_id(
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.into_owned())?,
     };
-    Some(value.chars().take(MAX_RESOURCE_ID_CHARS).collect())
+    Some(
+        without_nul(&value)
+            .chars()
+            .take(MAX_RESOURCE_ID_CHARS)
+            .collect(),
+    )
 }
 
-/// The audit columns that name who did it.
-fn actor(principal: Option<&Principal>) -> (Option<String>, Option<String>, String) {
+/// The audit columns that name who did it: the id, the kind and the display
+/// name of the principal, all text the server holds (`GOV-1 review`, so the
+/// handler rows of `routes::auth` fill them the same way).
+pub(crate) fn actor(principal: Option<&Principal>) -> (Option<String>, Option<String>, String) {
     match principal {
         Some(p) => (
             Some(p.id.uuid().to_string()),
@@ -598,7 +625,12 @@ fn args_for(fields: Option<Vec<String>>) -> Value {
     let names: Vec<String> = names
         .into_iter()
         .take(MAX_FIELD_NAMES)
-        .map(|name| name.chars().take(MAX_FIELD_NAME_CHARS).collect())
+        .map(|name| {
+            without_nul(&name)
+                .chars()
+                .take(MAX_FIELD_NAME_CHARS)
+                .collect()
+        })
         .collect();
     if truncated {
         json!({ "fields": names, "fieldsTruncated": true })

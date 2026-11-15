@@ -97,11 +97,14 @@ fn cleared_session_cookie_header(is_dev: bool) -> HeaderValue {
 
 /// An event caused by a person who is signed in: the principal and its name.
 fn principal_audit_event(principal: &Principal, action: &str, outcome: &str) -> NewAuditEvent {
+    // `GOV-1 review`: the one mapping of a principal to the three actor
+    // columns, shared with the central writer.
+    let (principal_id, principal_kind, actor_label) = audit_coverage::actor(Some(principal));
     NewAuditEvent {
         action: action.to_owned(),
-        principal_id: Some(principal.id.uuid().to_string()),
-        principal_kind: Some(principal.kind_for_audit().to_owned()),
-        actor_label: Some(principal.display_name.clone()),
+        principal_id,
+        principal_kind,
+        actor_label: Some(actor_label),
         outcome: outcome.to_owned(),
         ..Default::default()
     }
@@ -129,16 +132,16 @@ fn sign_in_executed_event(user_id: Uuid, principal_kind: &str) -> NewAuditEvent 
 }
 
 /// The `auth.login` row of a refused sign-in: no principal (nobody proved who
-/// they were). The resource is the hashed key the throttle counts by, as for
-/// the lock row, so tries against one account can be told from tries against
-/// another without the row holding the email. An unknown email writes the
-/// identical row: the trail is not an account oracle.
-fn sign_in_refused_event(key: &str) -> NewAuditEvent {
+/// they were) and no resource. `GOV-1 review`: the row used to name the first
+/// 48 bits of the unsalted SHA-256 the throttle counts by, which a reader of
+/// the trail could match against guessed emails, and which leaks a prefix of
+/// the hash of a password typed into the identifier box. An unknown email
+/// writes the identical row: the trail is not an account oracle. (The lock
+/// row, `auth.login_locked`, keeps its older key prefix.)
+fn sign_in_refused_event() -> NewAuditEvent {
     NewAuditEvent {
         action: "auth.login".to_owned(),
         outcome: "refused".to_owned(),
-        resource_kind: Some("login_key".to_owned()),
-        resource_id: Some(key[..12].to_owned()),
         actor_label: Some(lakehouse_store::audit::ACTOR_SIGN_IN_FORM.to_owned()),
         detail: Some(SIGN_IN_REFUSED_DETAIL.to_owned()),
         ..Default::default()
@@ -377,12 +380,10 @@ pub async fn login(
                 audit_coverage::record_best_effort(&state, event).await;
             }
             // `GOV-1`: every refused sign-in is on the audit trail, with no
-            // principal (nobody proved who they were). The resource is the
-            // hashed key the throttle counts by, as for the lock row, so
-            // tries against one account can be told from tries against
-            // another without the row holding the email. An unknown email
+            // principal (nobody proved who they were) and nothing the visitor
+            // typed, not even a hash of it (`GOV-1 review`). An unknown email
             // writes the identical row: the trail is not an account oracle.
-            audit_coverage::record_best_effort(&state, sign_in_refused_event(&key)).await;
+            audit_coverage::record_best_effort(&state, sign_in_refused_event()).await;
             tracing::warn!("login failed");
             Err(ApiError::Unauthorized("Invalid username/email or password.".to_owned()).into())
         }

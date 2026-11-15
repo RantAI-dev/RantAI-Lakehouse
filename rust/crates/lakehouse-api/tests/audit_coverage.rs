@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use crate::common::{
     TestApp, audit_rows, create_principal_with_permissions, create_zero_permission_principal,
-    session_cookie_for_seeded_user, session_cookie_for_user, spin_up,
+    in_the_catalog_tenant, session_cookie_for_seeded_user, session_cookie_for_user, spin_up,
 };
 
 // ── The guard ──────────────────────────────────────────────────────────────
@@ -976,4 +976,136 @@ async fn a_policy_change_records_the_old_and_the_new_value() {
     assert_eq!(delete["args"]["oldStatus"], "draft");
     assert_eq!(delete["args"]["kind"], "Agent autonomy");
     assert_eq!(delete["args"]["effect"], "Permit with obligation");
+}
+
+// ── Client text that Postgres refuses ───────────────────────────────────────
+
+/// `GOV-1 review` blocker 1: `jsonb` and `TEXT` refuse a NUL, and a body
+/// key `"\u0000"` is ignored by the handler, so the change stands. The row
+/// must still be written, with the NUL replaced, or the trail misses a change
+/// a client chose to hide.
+#[tokio::test]
+async fn a_body_key_with_a_nul_byte_still_writes_one_executed_row_without_the_nul() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let id = save_a_query(&router, &cookie, "Revenue").await;
+
+    let (status, patched) = call(
+        &router,
+        "PATCH",
+        &format!("/api/query/saved/{id}"),
+        &cookie,
+        Some(json!({"title": "Revenue by region", "\u{0}": 1})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+
+    let row = the_row(&pool, "saved_query.update").await;
+    assert_eq!(row["outcome"], "executed");
+    let fields: Vec<&str> = row["args"]["fields"]
+        .as_array()
+        .expect("field names")
+        .iter()
+        .map(|name| name.as_str().expect("a name is text"))
+        .collect();
+    assert!(fields.contains(&"title"), "{fields:?}");
+    assert!(
+        fields.contains(&"\u{fffd}"),
+        "the NUL is replaced, so the key is still counted: {fields:?}"
+    );
+    assert!(
+        fields.iter().all(|name| !name.contains('\0')),
+        "no NUL in a stored name: {fields:?}"
+    );
+}
+
+/// `GOV-1 review` blocker 1: a `%00` in the query-string id decodes to a NUL,
+/// which a `TEXT` column refuses. On a route whose handler runs, the row is
+/// still written, naming the id with the replacement character.
+#[tokio::test]
+async fn a_nul_in_the_query_string_id_still_writes_the_row_of_a_central_change() {
+    let TestApp { router, pool } = spin_up().await;
+    let user = create_principal_with_permissions(&pool, "alert:write").await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let (_, _) = call(&router, "DELETE", "/api/alerts?id=%00", &cookie, None).await;
+
+    let row = the_row(&pool, "alert.delete").await;
+    assert_eq!(row["resource_id"], json!("\u{fffd}"));
+}
+
+/// `GOV-1 review` blocker 1: the same NUL in the id must not let a client
+/// suppress the `refused` row the gate writes (the module doc says a client
+/// cannot influence it), whether the id is in the query string or the path.
+#[tokio::test]
+async fn a_nul_in_the_id_does_not_suppress_the_refused_row_at_the_gate() {
+    let TestApp { router, pool } = spin_up().await;
+    let nobody = create_zero_permission_principal(&pool).await;
+    let cookie = session_cookie_for_user(&pool, nobody).await;
+
+    let (status, _) = call(
+        &router,
+        "DELETE",
+        "/api/dashboard/boards?id=%00",
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let row = the_row(&pool, "dashboard.delete").await;
+    assert_eq!(row["outcome"], "refused");
+    assert_eq!(row["resource_id"], json!("\u{fffd}"));
+
+    let (status, _) = call(&router, "DELETE", "/api/query/saved/%00", &cookie, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let row = the_row(&pool, "saved_query.delete").await;
+    assert_eq!(row["outcome"], "refused");
+    assert_eq!(row["resource_id"], json!("\u{fffd}"));
+}
+
+// ── A route that creates something is audited whatever its name says ────────
+
+/// `GOV-1 review` blocker 2: `POST /api/pipelines/generate` authors a
+/// pipeline (it answers 201), so it is not a read-like POST. Its row names
+/// the pipeline it created, like the row of `POST /api/pipelines`.
+#[tokio::test]
+async fn generating_a_pipeline_writes_one_row_that_names_the_pipeline() {
+    let TestApp { router, pool } = spin_up().await;
+    let user = create_principal_with_permissions(&pool, "pipeline:write").await;
+    in_the_catalog_tenant(&pool, user).await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let (status, created) = call(
+        &router,
+        "POST",
+        "/api/pipelines/generate",
+        &cookie,
+        Some(json!({"instruction": "load the daily sales files", "database": "bronze"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+
+    let row = the_row(&pool, "pipeline.generate").await;
+    assert_eq!(row["outcome"], "executed");
+    assert_eq!(row["resource_kind"], "pipeline");
+    assert_eq!(row["resource_id"], created["id"]);
+    assert_eq!(row["principal_id"], json!(user.to_string()));
+}
+
+/// `GOV-1 review` blocker 2, second look: `POST /api/alerts/test` is not one
+/// of the "test" buttons of Decision 1. It runs the rule for real: the email
+/// or webhook goes out, the rule's state settles and a fired result is saved.
+/// It is audited like `POST /api/alerts/run`, with the id the person named.
+#[tokio::test]
+async fn testing_an_alert_rule_writes_a_row_that_names_the_rule() {
+    let TestApp { router, pool } = spin_up().await;
+    let user = create_principal_with_permissions(&pool, "alert:write").await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let (_, _) = call(&router, "POST", "/api/alerts/test?id=rule-9", &cookie, None).await;
+
+    let row = the_row(&pool, "alert.test").await;
+    assert_eq!(row["resource_kind"], "alert");
+    assert_eq!(row["resource_id"], json!("rule-9"));
+    assert_eq!(row["principal_id"], json!(user.to_string()));
 }

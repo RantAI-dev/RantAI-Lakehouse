@@ -3274,10 +3274,10 @@ pub(crate) async fn require_connector_in_tenant(
 /// `changed_by` is the principal the route had on the
 /// `Extension<Principal>`; it lands in the `created` version row's
 /// `changed_by` column (Plan R4 2b). `routes::pipelines::generate`'s
-/// own caller passes its own principal — `generate` does not audit today
-/// (WS5 item D4), but the version row still goes through `create_pipeline`
-/// so the create is captured in history without a separate route-side
-/// write.
+/// own caller passes its own principal; the version row goes through
+/// `create_pipeline`, so the create is captured in history without a separate
+/// route-side write, and `generate` writes its own audit row
+/// (`pipeline.generate`, `GOV-1 review`).
 async fn create_named_pipeline(
     pool: &PgPool,
     input: &CreatePipelineInput,
@@ -3431,6 +3431,18 @@ pub async fn generate(
         run_as: author_id(&principal),
     };
     let created = create_named_pipeline(pool(&state)?, &input, Some(principal.id.uuid())).await?;
+    // `GOV-1 review`: the route authors a pipeline, so it is on the audit
+    // trail like `create`, under its own action so that a pipeline a model
+    // drafted can be told from one a person wrote. The row names the
+    // pipeline and carries no argument: the instruction stays out of it.
+    record_pipeline_audit(
+        &state,
+        &principal,
+        "pipeline.generate",
+        &created.id,
+        Value::Null,
+    )
+    .await;
     Ok((StatusCode::CREATED, ApiJson(created)))
 }
 

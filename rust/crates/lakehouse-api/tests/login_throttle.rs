@@ -517,6 +517,11 @@ async fn a_wrong_password_writes_one_refused_auth_login_row_without_the_email_or
         assert!(row["principal_id"].is_null(), "nobody signed in: {row}");
         assert!(row["principal_kind"].is_null(), "nobody signed in: {row}");
         assert_eq!(row["detail"], "The email or the password did not match.");
+        // `GOV-1 review`: the first 48 bits of an unsalted hash of what the
+        // visitor typed would let a reader of the trail test guessed emails
+        // against it (and a password typed into the identifier box leaks a
+        // prefix of its hash), so the row names no key at all.
+        assert!(row["resource_id"].is_null(), "no key prefix: {row}");
         let text = row.to_string();
         for forbidden in [THROTTLED_EMAIL, GHOST_EMAIL, WRONG_PASSWORD, REAL_PASSWORD] {
             assert!(
