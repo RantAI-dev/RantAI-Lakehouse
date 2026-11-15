@@ -177,6 +177,13 @@ export type DashboardService = {
    * page; it runs no query.
    */
   listChartOutlines(signal?: AbortSignal): Promise<ChartOutline[]>
+  /**
+   * `BI-62` (decision D5): every stored chart the caller can see with its
+   * title, kind and dashboard, for the report editor's picker and Charts tab
+   * (grouped by dashboard, searched by title). One read of
+   * `GET /api/dashboard/specs`; it runs no query.
+   */
+  listCharts(signal?: AbortSignal): Promise<(BoardChart & { board: string })[]>
   /** `BI-19` part A. Needs `dashboard:write`. */
   getPublicLink(board: string, signal?: AbortSignal): Promise<PublicLinkState>
   /** Make a link or change its expiry or password; refusals carry the server's sentence. */

@@ -6152,7 +6152,7 @@
     "type": "function",
     "function": {
       "name": "create_report",
-      "description": "Write a report: a page of headings, paragraphs, lists and links with live charts between them, picked from existing dashboards by chart id (list_charts). Each reader sees every chart with their own access, as on its dashboard. At most 30 charts. Needs a confirm in this chat.",
+      "description": "Write a report: a page of headings, paragraphs, lists, quotes and dividers with live charts between them, picked from existing dashboards by chart id (list_charts). Each reader sees every chart with their own access, as on its dashboard. At most 30 charts. Needs a confirm in this chat.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -6176,13 +6176,15 @@
                     "heading",
                     "paragraph",
                     "list",
+                    "quote",
+                    "divider",
                     "link",
                     "chart"
                   ]
                 },
                 "text": {
                   "type": "string",
-                  "description": "heading, paragraph or link words; plain text, never HTML or Markdown"
+                  "description": "the words of a heading, paragraph, quote or link. Except in a link, they may hold **bold**, *italic* and [words](address) with the link's address rules; a \\ before * [ ] ( ) \\ keeps it literal. Never HTML"
                 },
                 "level": {
                   "type": "integer",
@@ -6198,7 +6200,7 @@
                   "items": {
                     "type": "string"
                   },
-                  "description": "a list's items"
+                  "description": "a list's items, with the marks of text"
                 },
                 "ordered": {
                   "type": "boolean",
@@ -6211,6 +6213,14 @@
                 "chart": {
                   "type": "string",
                   "description": "a chart block's chart id, from list_charts"
+                },
+                "width": {
+                  "type": "string",
+                  "enum": [
+                    "text",
+                    "wide"
+                  ],
+                  "description": "a chart block's width: text (the default) or wide, past the text column"
                 }
               },
               "required": [
@@ -6257,13 +6267,15 @@
                     "heading",
                     "paragraph",
                     "list",
+                    "quote",
+                    "divider",
                     "link",
                     "chart"
                   ]
                 },
                 "text": {
                   "type": "string",
-                  "description": "heading, paragraph or link words; plain text, never HTML or Markdown"
+                  "description": "the words of a heading, paragraph, quote or link. Except in a link, they may hold **bold**, *italic* and [words](address) with the link's address rules; a \\ before * [ ] ( ) \\ keeps it literal. Never HTML"
                 },
                 "level": {
                   "type": "integer",
@@ -6279,7 +6291,7 @@
                   "items": {
                     "type": "string"
                   },
-                  "description": "a list's items"
+                  "description": "a list's items, with the marks of text"
                 },
                 "ordered": {
                   "type": "boolean",
@@ -6292,6 +6304,14 @@
                 "chart": {
                   "type": "string",
                   "description": "a chart block's chart id, from list_charts"
+                },
+                "width": {
+                  "type": "string",
+                  "enum": [
+                    "text",
+                    "wide"
+                  ],
+                  "description": "a chart block's width: text (the default) or wide, past the text column"
                 }
               },
               "required": [
@@ -6311,13 +6331,15 @@
                     "heading",
                     "paragraph",
                     "list",
+                    "quote",
+                    "divider",
                     "link",
                     "chart"
                   ]
                 },
                 "text": {
                   "type": "string",
-                  "description": "heading, paragraph or link words; plain text, never HTML or Markdown"
+                  "description": "the words of a heading, paragraph, quote or link. Except in a link, they may hold **bold**, *italic* and [words](address) with the link's address rules; a \\ before * [ ] ( ) \\ keeps it literal. Never HTML"
                 },
                 "level": {
                   "type": "integer",
@@ -6333,7 +6355,7 @@
                   "items": {
                     "type": "string"
                   },
-                  "description": "a list's items"
+                  "description": "a list's items, with the marks of text"
                 },
                 "ordered": {
                   "type": "boolean",
@@ -6346,6 +6368,14 @@
                 "chart": {
                   "type": "string",
                   "description": "a chart block's chart id, from list_charts"
+                },
+                "width": {
+                  "type": "string",
+                  "enum": [
+                    "text",
+                    "wide"
+                  ],
+                  "description": "a chart block's width: text (the default) or wide, past the text column"
                 }
               },
               "required": [

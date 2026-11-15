@@ -371,6 +371,14 @@ export const clickhouseDashboardService: DashboardService = {
       .filter((c) => c.board === board)
       .map((c) => ({ id: c.id, title: c.title ?? c.id, kind: c.kind }))
   },
+  async listCharts(signal) {
+    const json = await request<{ charts?: { id: string; title?: string; board?: string; kind?: string }[] }>(
+      "/api/dashboard/specs",
+      { cache: "no-store", signal },
+      "The charts could not be loaded"
+    )
+    return (json.charts ?? []).map((c) => ({ id: c.id, title: c.title ?? c.id, kind: c.kind, board: c.board || "default" }))
+  },
   async listChartOutlines(signal) {
     const json = await request<{
       charts?: { id: string; board?: string; kind?: string; span?: number; def?: { kind?: string } }[]
