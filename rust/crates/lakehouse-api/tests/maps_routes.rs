@@ -758,6 +758,7 @@ fn render_token(person: uuid::Uuid, board_id: &str) -> String {
             aud: "render".to_owned(),
             board: board_id.to_owned(),
             chart: None,
+            report: None,
             principal: person.to_string(),
             filters: None,
             params: None,
