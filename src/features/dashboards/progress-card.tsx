@@ -5,6 +5,8 @@ import type { StyleFields } from "@/lib/chart-style";
 import { progressView, type TypeDefFields } from "@/lib/type-b";
 import { cn } from "@/lib/utils";
 import { formatValue } from "@/lib/value-format";
+import { compactKpiText } from "@/lib/kpi-fit";
+import { KpiValue } from "./fit-text";
 import { useReporting } from "./reporting-context";
 import type { Rows } from "./tile-dialogs";
 
@@ -40,9 +42,14 @@ export function ProgressCard({
   const fmt = format ?? def.format;
   if (view.kind === "no-goal") {
     return (
-      <div className="grid h-full place-content-center gap-1 px-2 text-center">
+      // Owner QA 2026-11-15: one column as wide as the tile, so the value fits it (`KpiValue`).
+      <div className="grid h-full grid-cols-[minmax(0,1fr)] content-center gap-1 px-2 text-center">
         {value !== null ? (
-          <p className="text-2xl font-semibold tabular-nums">{formatValue(value, fmt, numberLocale, decimalsFor([value]))}</p>
+          <KpiValue
+            className="text-2xl font-semibold tabular-nums"
+            full={formatValue(value, fmt, numberLocale, decimalsFor([value]))}
+            compact={compactKpiText(value, fmt, numberLocale, decimalsFor([value]))}
+          />
         ) : null}
         <p className="text-xs text-muted-foreground">No goal to compare with</p>
       </div>
