@@ -1627,6 +1627,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/dashboard/embed-info", get(dashboard::embed_info))
         .route("/api/embed/data", axum::routing::post(embed::data))
         .route("/api/render/data", axum::routing::post(render::data))
+        // BI-36: the print view's uploaded maps, behind the same render token
+        // as the data.
+        .route(
+            "/api/render/maps/{id}/geojson",
+            axum::routing::post(render::map_geojson),
+        )
         // RPT-1 (D7): scheduled reports. Authorisation beyond `dashboard:read`
         // (owner or administrator, download right) is in the handlers.
         .route(

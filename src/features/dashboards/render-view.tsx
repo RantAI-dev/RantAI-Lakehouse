@@ -12,6 +12,7 @@ import type { BoardTab, LayoutMap, PhoneTile } from "@/services";
 import type { FilterDef } from "@/services/clients/bi-store";
 import type { TileFailure } from "@/services/contracts/dashboards";
 import { DashboardGrid, type GridItem } from "./dashboard-grid";
+import type { MapLoader } from "./echarts-maps";
 import { RenderModeProvider, type RenderMode } from "./render-mode";
 import { ReportingProvider } from "./reporting-context";
 import { TileBody } from "./tile-body";
@@ -144,6 +145,18 @@ export function RenderView({ token, chart = false }: { token: string; chart?: bo
     return () => { cancelAnimationFrame(first); cancelAnimationFrame(second); };
   }, [state, counts]);
 
+  // BI-36: an uploaded map's boundary is read through the render token, like the
+  // data. The signed-in loader (`apiFetch`, the default) answers this view, which
+  // has no session, with a 401 and a redirect to the login page, so a map tile
+  // of a PDF did not draw. The route opens the token's own board's maps only.
+  const loadMap = React.useCallback<MapLoader>(
+    (id) => fetch(`/api/render/maps/${encodeURIComponent(id)}/geojson`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token }), cache: "no-store",
+    }),
+    [token],
+  );
+
   if (state === "error") {
     return <div role="alert" className="grid h-screen place-content-center px-4 text-center text-sm">{message}</div>;
   }
@@ -165,7 +178,7 @@ export function RenderView({ token, chart = false }: { token: string; chart?: bo
     subtitle: spec.subtitle,
     body: spec.kind === "image" || spec.kind === "web"
       ? <p role="status" className="grid h-full place-items-center px-3 text-center text-xs text-muted-foreground">{NOT_IN_PDF}</p>
-      : <TileBody spec={spec} cell={data.results[spec.id]} dark={look.dark} loading={false} />,
+      : <TileBody spec={spec} cell={data.results[spec.id]} dark={look.dark} loading={false} loadMap={loadMap} />,
   }));
   const tabs = data.tabs ?? [];
 

@@ -3912,6 +3912,8 @@ async fn the_public_map_boundary_routes_are_not_refused_by_the_auth_gate() {
             "/api/public/dashboard/tok/maps/m_0123456789ab/geojson",
         ),
         ("POST", "/api/embed/maps/m_0123456789ab/geojson"),
+        // BI-36: the print view's own route, behind the render token.
+        ("POST", "/api/render/maps/m_0123456789ab/geojson"),
     ] {
         let resp = router
             .clone()

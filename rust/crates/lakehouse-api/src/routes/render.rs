@@ -25,7 +25,7 @@
 //! board; the board is in the signed token. Every refusal reads the same.
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -74,45 +74,10 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         )
             .into_response();
     };
-    let Some(secret) = state.config.render_token_secret.as_ref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": PDF_NOT_SET_UP })),
-        )
-            .into_response();
-    };
-    let claims = match lakehouse_embed::verify_render(
-        &token,
-        secret.expose_secret(),
-        lakehouse_embed::unix_now(),
-    ) {
-        Ok(claims) => claims,
-        Err(reason) => {
-            tracing::info!(%reason, "render token refused");
-            return refused();
-        }
-    };
-    let principal = match principal_of(&state, &claims.principal).await {
-        Ok(Some(principal)) => principal,
-        Ok(None) => return refused(),
+    let (claims, principal) = match admit(&state, &token).await {
+        Ok(admitted) => admitted,
         Err(response) => return response,
     };
-    // BI-1 review fix (SHOULD-FIX) R9: the person's rights are read now, on every
-    // data call, not taken from the moment the token was minted. A role removed,
-    // or downloads switched off for it, inside the token's two minutes stops the
-    // data at the next call. (Replaying the token inside those two minutes by
-    // someone who holds it stays accepted, D2.)
-    if !principal.has("dashboard:read") {
-        return refused();
-    }
-    match crate::routes::settings::format_settings(&state).await {
-        Ok(settings) => {
-            if !crate::routes::settings::may_download(&principal, &settings.download_denied_roles) {
-                return refused();
-            }
-        }
-        Err(err) => return crate::error::ApiRejection(err).into_response(),
-    }
     // BI-53 (QA LH-BI-1-01 F3): the print view's own read is a stage of one
     // PDF; durations only, never a token or a name.
     tracing::info!("render data requested");
@@ -160,6 +125,111 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         }
         Err(response) => response,
     }
+}
+
+/// A render token that verifies, and the person it names, or the response to
+/// send instead (one fixed sentence for every refusal).
+///
+/// The one admission of every route that takes a render token: the data and an
+/// uploaded map's boundary (`BI-36`), so they cannot disagree about what a token opens.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is a ready Response the caller returns verbatim; boxing it would change every call site for no gain on the success path"
+)]
+async fn admit(
+    state: &AppState,
+    token: &str,
+) -> Result<(lakehouse_embed::RenderClaims, lakehouse_auth::Principal), Response> {
+    let Some(secret) = state.config.render_token_secret.as_ref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            ApiJson(json!({ "error": PDF_NOT_SET_UP })),
+        )
+            .into_response());
+    };
+    let claims = match lakehouse_embed::verify_render(
+        token,
+        secret.expose_secret(),
+        lakehouse_embed::unix_now(),
+    ) {
+        Ok(claims) => claims,
+        Err(reason) => {
+            tracing::info!(%reason, "render token refused");
+            return Err(refused());
+        }
+    };
+    let principal = match principal_of(state, &claims.principal).await {
+        Ok(Some(principal)) => principal,
+        Ok(None) => return Err(refused()),
+        Err(response) => return Err(response),
+    };
+    // BI-1 review fix (SHOULD-FIX) R9: the person's rights are read now, on every
+    // data call, not taken from the moment the token was minted. A role removed,
+    // or downloads switched off for it, inside the token's two minutes stops the
+    // data at the next call. (Replaying the token inside those two minutes by
+    // someone who holds it stays accepted, D2.)
+    if !principal.has("dashboard:read") {
+        return Err(refused());
+    }
+    match crate::routes::settings::format_settings(state).await {
+        Ok(settings) => {
+            if !crate::routes::settings::may_download(&principal, &settings.download_denied_roles) {
+                return Err(refused());
+            }
+        }
+        Err(err) => return Err(crate::error::ApiRejection(err).into_response()),
+    }
+    Ok((claims, principal))
+}
+
+/// Body of the route that takes only the token (the map
+/// boundary): `{ "token": string }` and nothing else.
+fn token_of(body: &Bytes) -> Option<String> {
+    serde_json::from_slice::<RenderBody>(body)
+        .ok()
+        .map(|b| b.token)
+}
+
+/// `POST /api/render/maps/{id}/geojson { token }` — the boundary file of an
+/// uploaded map one of the board's charts draws on, for the print view
+/// (`BI-36`).
+///
+/// The print view has no session, so the signed-in loader (`GET
+/// /api/maps/{id}/geojson`) answered it with a redirect to the login page and
+/// the map tile did not draw. The public link and the embed got their own token
+/// routes in `PR #246`; this is the print view's, with the same rule: the token
+/// opens its board's maps and nothing else, and a map no chart on that board
+/// draws on is the same 404 as a map that does not exist. The token is checked
+/// as [`data`] checks it (the person's rights are read now), and the charts are
+/// read as that person.
+///
+/// # Errors
+///
+/// 400 for a body that is not `{ "token": string }`; 503 when PDF export is not
+/// set up; 401 (one sentence) for a token that is refused; 404 for a map the
+/// board does not use.
+pub async fn map_geojson(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    let Some(token) = token_of(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            ApiJson(json!({ "error": "body must be { \"token\": string }" })),
+        )
+            .into_response();
+    };
+    let (claims, principal) = match admit(&state, &token).await {
+        Ok(admitted) => admitted,
+        Err(response) => return response,
+    };
+    let viewer = match crate::routes::dashboard_access::viewer_for(&state, &principal).await {
+        Ok(viewer) => viewer,
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
+    crate::routes::embed::map_for_board(&state, &claims.board, &id, &headers, &viewer).await
 }
 
 /// Keep `chart` and nothing else of the board's tiles: its spec, its result and

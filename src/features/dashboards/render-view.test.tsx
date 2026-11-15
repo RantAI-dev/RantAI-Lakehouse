@@ -12,9 +12,11 @@ const rendered: string[] = []
 /** The `dark` each chart was drawn with, so a test can see what the print view told it. */
 const darks: boolean[] = []
 let captured: RenderMode | null = null
+/** The map loader each chart was given. */
+const loaders: (((id: string) => Promise<Response>) | undefined)[] = []
 mock.module("./tile-body", () => ({
   ...tileBody,
-  TileBody: function Body({ spec, dark }: { spec: { id: string }; dark?: boolean }) {
+  TileBody: function Body({ spec, dark, loadMap }: { spec: { id: string }; dark?: boolean; loadMap?: (id: string) => Promise<Response> }) {
     const mode = useRenderMode()
     React.useEffect(() => {
       if (spec.id !== "c_chart" || !mode) return
@@ -22,6 +24,7 @@ mock.module("./tile-body", () => ({
       mode.chartMounted()
     }, [mode, spec.id])
     rendered.push(spec.id)
+    loaders.push(loadMap)
     darks.push(dark === true)
     return <div data-testid={`tile-${spec.id}`} />
   },
@@ -52,6 +55,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup()
   rendered.length = 0
+  loaders.length = 0
   darks.length = 0
   global.fetch = originalFetch
 })
@@ -150,6 +154,22 @@ describe("the PDF print view", () => {
     await screen.findByRole("heading", { name: "Visits" })
     const landscape = second.container.querySelector("[data-render-view]") as HTMLElement
     expect(landscape.style.width).toBe("1027px")
+  })
+
+  // BI-36: the map's boundary is read through the render token, not through the
+  // signed-in loader, which a print view with no session cannot pass.
+  it("gives every chart a map loader that reads the boundary through the render token", async () => {
+    const calls = serve(payload())
+    render(<RenderView token="a.b.c" />)
+    await waitFor(() => expect(loaders.length).toBeGreaterThan(0))
+    const loader = loaders.find((l) => l !== undefined)
+    expect(loader).toBeDefined()
+    await loader!("m_0123456789ab")
+    const last = calls[calls.length - 1]
+    expect(last.url).toBe("/api/render/maps/m_0123456789ab/geojson")
+    expect(JSON.parse(last.body)).toEqual({ token: "a.b.c" })
+    const init = (global.fetch as unknown as { mock: { calls: [unknown, RequestInit][] } }).mock.calls.at(-1)![1]
+    expect(init.method).toBe("POST")
   })
 
   it("prints an image or web-page card as a placeholder and never mounts it", async () => {
