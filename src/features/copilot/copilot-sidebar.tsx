@@ -19,6 +19,7 @@ import { ChatMessages } from "./chat-messages";
 import { ChatComposer } from "./chat-composer";
 import { CopilotHistoryButton } from "./history-menu";
 import { RecentSessionsMenuContent } from "./session-parts";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useSlidingIndicator } from "@/hooks/use-sliding-indicator";
 import { cn } from "@/lib/utils";
 
@@ -47,7 +48,6 @@ export function CopilotSidebar({ hasAssistant = true }: { readonly hasAssistant?
   const c = useCopilot();
   const { tabs: pageTabs, active: activeTab, setHost, open: openTab, close: closePanel, dismiss } = useSidePanel();
   const [isDragging, setIsDragging] = React.useState(false);
-  const isDraggingRef = React.useRef(false);
   const [aside, setAside] = React.useState<HTMLElement | null>(null);
 
   // Owner QA 2026-11-15: Escape closes the panel while the focus is in it.
@@ -74,41 +74,19 @@ export function CopilotSidebar({ hasAssistant = true }: { readonly hasAssistant?
   }
   const tabbed = pageTabs.length > 0;
 
-  const startResizing = (e: React.MouseEvent) => {
-    e.preventDefault();
-    isDraggingRef.current = true;
-    setIsDragging(true);
-
-    const onMouseMove = (moveEvent: MouseEvent) => {
-      if (!isDraggingRef.current) return;
-      const rawWidth = window.innerWidth - moveEvent.clientX;
-      const maxWidth = Math.max(MIN_WIDTH, Math.min(850, window.innerWidth - 320));
-      const clamped = Math.max(MIN_WIDTH, Math.min(maxWidth, rawWidth));
-      c.setSidebarWidth(clamped);
-    };
-
-    const onMouseUp = () => {
-      isDraggingRef.current = false;
-      setIsDragging(false);
-      window.removeEventListener("mousemove", onMouseMove);
-      window.removeEventListener("mouseup", onMouseUp);
-      document.body.style.removeProperty("cursor");
-      document.body.style.removeProperty("user-select");
-    };
-
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-    window.addEventListener("mousemove", onMouseMove);
-    window.addEventListener("mouseup", onMouseUp);
-  };
-
-  const handleDoubleClick = () => {
-    c.setSidebarWidth(420);
-  };
-
   // A width saved before the minimum went up still opens at the minimum.
   const width = Math.max(MIN_WIDTH, c.sidebarWidth);
   const copilotShown = !pageTab;
+  const maxWidth = typeof window === "undefined" ? 850 : Math.max(MIN_WIDTH, Math.min(850, window.innerWidth - 320));
+  const resizeTo = (w: number) => c.setSidebarWidth(Math.round(Math.max(MIN_WIDTH, Math.min(maxWidth, w))));
+  // Owner QA 2026-11-15: a click on the edge folds the panel away; the Copilot goes back to the bottom bar.
+  const collapse = () => {
+    dismiss();
+    if (hasAssistant) {
+      if (c.dockPosition !== "bottom") c.setDockPosition("bottom");
+      c.setExpanded(false);
+    }
+  };
   const toBottom = () => {
     if (pageTab) {
       // From a page tab: the panel closes and the Copilot waits in the bottom bar.
@@ -140,26 +118,16 @@ export function CopilotSidebar({ hasAssistant = true }: { readonly hasAssistant?
         isDragging && "select-none",
       )}
     >
-      {/* Resizing drag handle */}
       {hasAssistant ? (
-      <button
-        type="button"
-        aria-label="Resize AI Copilot sidebar"
-        onMouseDown={startResizing}
-        onDoubleClick={handleDoubleClick}
-        title="Drag to resize, double click to reset"
-        className={cn(
-          "group absolute -left-2 top-0 bottom-0 z-30 flex w-4 cursor-col-resize select-none items-center justify-center border-0 bg-transparent p-0 transition-colors focus:outline-none",
-          isDragging ? "bg-primary/10" : "hover:bg-primary/10",
-        )}
-      >
-        <span
-          className={cn(
-            "h-12 w-1 rounded-full transition-[height,background-color] duration-200 ease-ui pointer-events-none",
-            isDragging ? "h-16 w-1 bg-primary" : "bg-border/80 group-hover:h-14 group-hover:bg-primary/70",
-          )}
+        <EdgeHandle
+          width={width}
+          min={MIN_WIDTH}
+          max={maxWidth}
+          dragging={isDragging}
+          onDragging={setIsDragging}
+          onResize={resizeTo}
+          onCollapse={collapse}
         />
-      </button>
       ) : null}
 
       {/* Owner QA 2026-11-15 ("panel copilotnya ada dua component kah?"): one
@@ -376,5 +344,114 @@ function PanelHeader({
         ) : null}
       </div>
     </div>
+  );
+}
+
+/** Below this many pixels of travel a press on the edge is a click, past it a drag. */
+const DRAG_THRESHOLD = 4;
+/** One arrow key press on the focused edge. */
+const KEY_STEP = 16;
+
+/**
+ * The panel's left edge (owner QA 2026-11-15: "kalo di click doang dia bakal
+ * collapse, tapi kalo di hold dan di drag dia bakal resize"). A press that
+ * travels less than `DRAG_THRESHOLD` px before it is released is a click and
+ * folds the panel away; once it passes the threshold it is a drag that
+ * resizes, and letting go then never folds. The pointer is captured, so a
+ * fast drag that leaves the edge keeps resizing, and no `click` handler is
+ * used, so a drag cannot also count as one. The panel already closes in one
+ * frame (its entrance is the only motion, so the page gets its width back at
+ * once), which reduced motion leaves as it is.
+ *
+ * It is a focusable window splitter: Left and Right resize by `KEY_STEP`,
+ * Enter and Space fold the panel. The old double click to reset the width is
+ * gone: its first click now folds the panel.
+ */
+function EdgeHandle({
+  width, min, max, dragging, onDragging, onResize, onCollapse,
+}: {
+  readonly width: number;
+  readonly min: number;
+  readonly max: number;
+  readonly dragging: boolean;
+  readonly onDragging: (on: boolean) => void;
+  readonly onResize: (width: number) => void;
+  readonly onCollapse: () => void;
+}) {
+  const press = React.useRef<{ x: number; y: number; width: number; moved: boolean } | null>(null);
+  const [tip, setTip] = React.useState(false);
+
+  const end = (el: HTMLElement, pointerId: number) => {
+    press.current = null;
+    try { el.releasePointerCapture(pointerId); } catch { /* not captured */ }
+    onDragging(false);
+    document.body.style.removeProperty("cursor");
+    document.body.style.removeProperty("user-select");
+  };
+
+  return (
+    <Tooltip open={tip && !dragging} onOpenChange={setTip}>
+      <TooltipTrigger
+        render={
+          <div
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize AI Copilot sidebar"
+            aria-valuenow={width}
+            aria-valuemin={min}
+            aria-valuemax={max}
+            tabIndex={0}
+            onPointerDown={(e) => {
+              if (e.button !== 0) return;
+              e.preventDefault();
+              try { e.currentTarget.setPointerCapture(e.pointerId); } catch { /* the pointer is gone already */ }
+              press.current = { x: e.clientX, y: e.clientY, width, moved: false };
+            }}
+            onPointerMove={(e) => {
+              const p = press.current;
+              if (!p) return;
+              if (!p.moved) {
+                if (Math.hypot(e.clientX - p.x, e.clientY - p.y) < DRAG_THRESHOLD) return;
+                p.moved = true;
+                onDragging(true);
+                document.body.style.cursor = "col-resize";
+                document.body.style.userSelect = "none";
+              }
+              // The panel is on the right: dragging its left edge left makes it wider.
+              onResize(p.width + (p.x - e.clientX));
+            }}
+            onPointerUp={(e) => {
+              const p = press.current;
+              if (!p) return;
+              end(e.currentTarget, e.pointerId);
+              if (!p.moved) onCollapse();
+            }}
+            onPointerCancel={(e) => { if (press.current) end(e.currentTarget, e.pointerId); }}
+            onKeyDown={(e) => {
+              if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+                e.preventDefault();
+                onResize(width + (e.key === "ArrowLeft" ? KEY_STEP : -KEY_STEP));
+              } else if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                onCollapse();
+              }
+            }}
+            className={cn(
+              "group absolute -left-2 top-0 bottom-0 z-30 flex w-4 cursor-col-resize touch-none select-none items-center justify-center transition-colors duration-150 ease-ui outline-none focus-visible:bg-primary/10",
+              dragging ? "bg-primary/10" : "hover:bg-primary/10",
+            )}
+          />
+        }
+      >
+        <span
+          aria-hidden
+          className={cn(
+            "pointer-events-none h-12 w-1 rounded-full transition-[height,background-color] duration-200 ease-ui",
+            dragging ? "h-16 bg-primary" : "bg-border/80 group-hover:h-14 group-hover:bg-primary/70 group-focus-visible:h-14 group-focus-visible:bg-primary/70",
+          )}
+        />
+      </TooltipTrigger>
+      <TooltipContent side="left">Drag to resize · Click to close</TooltipContent>
+    </Tooltip>
   );
 }

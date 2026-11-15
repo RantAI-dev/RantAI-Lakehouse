@@ -156,6 +156,47 @@ describe("the shell's one side panel (BI-61 T6)", () => {
     }
   })
 
+  describe("its left edge (owner QA 2026-11-15: a click closes, a drag resizes)", () => {
+    const edge = () => screen.getByRole("separator", { name: "Resize AI Copilot sidebar" })
+    const width = () => Number(edge().getAttribute("aria-valuenow"))
+
+    it("closes the panel on a press released where it started, and sends the Copilot to the bottom bar", async () => {
+      mount({ dock: "right", expanded: true })
+      await waitFor(() => expect(panels()).toHaveLength(1))
+      fireEvent.pointerDown(edge(), { pointerId: 1, button: 0, clientX: 600, clientY: 300 })
+      fireEvent.pointerMove(edge(), { pointerId: 1, clientX: 602, clientY: 301 })
+      fireEvent.pointerUp(edge(), { pointerId: 1, clientX: 602, clientY: 301 })
+      await waitFor(() => expect(panels()).toHaveLength(0))
+      expect(window.localStorage.getItem("copilot-dock-pos")).toBe("bottom")
+      expect(screen.getByPlaceholderText("Ask anything about your lakehouse…")).toBeTruthy()
+    })
+
+    it("resizes on a drag and leaves the panel open when it is let go", async () => {
+      mount({ dock: "right", expanded: true })
+      await waitFor(() => expect(panels()).toHaveLength(1))
+      const before = width()
+      fireEvent.pointerDown(edge(), { pointerId: 1, button: 0, clientX: 600, clientY: 300 })
+      fireEvent.pointerMove(edge(), { pointerId: 1, clientX: 580, clientY: 300 })
+      fireEvent.pointerMove(edge(), { pointerId: 1, clientX: 560, clientY: 300 })
+      fireEvent.pointerUp(edge(), { pointerId: 1, clientX: 560, clientY: 300 })
+      await waitFor(() => expect(width()).toBe(before + 40))
+      expect(panels()).toHaveLength(1)
+    })
+
+    it("resizes with the arrow keys and closes with Enter", async () => {
+      mount({ dock: "right", expanded: true })
+      await waitFor(() => expect(panels()).toHaveLength(1))
+      const before = width()
+      expect(edge().getAttribute("aria-orientation")).toBe("vertical")
+      fireEvent.keyDown(edge(), { key: "ArrowLeft" })
+      await waitFor(() => expect(width()).toBe(before + 16))
+      fireEvent.keyDown(edge(), { key: "ArrowRight" })
+      await waitFor(() => expect(width()).toBe(before))
+      fireEvent.keyDown(edge(), { key: "Enter" })
+      await waitFor(() => expect(panels()).toHaveLength(0))
+    })
+  })
+
   it("opens the page's tabs alone for someone without the assistant", async () => {
     mount({ dock: "bottom", expanded: false, assistant: false })
     fireEvent.click(screen.getByText("open comments"))
