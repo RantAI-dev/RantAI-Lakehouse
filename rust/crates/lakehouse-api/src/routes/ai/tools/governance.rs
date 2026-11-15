@@ -30,11 +30,10 @@ use super::{api_result_to_value, arg_str, response_to_value};
 use crate::state::AppState;
 
 async fn governance_kind(state: &AppState, kind: &str) -> Value {
-    // No principal: this serves the kinds this change does not narrow —
-    // classification and maintenance rows do name tables, but the plan's
-    // scope is the quality rules (`GOV-15`), and narrowing those kinds is a
-    // separate item. A call with no person is not narrowed, the convention
-    // `ensure_rule_table` has (`GOV-15` D7).
+    // No principal: this is the headless path, and it does not narrow the
+    // rows it reads. A call with no person is not narrowed, the convention
+    // `ensure_rule_table` has (`GOV-15` D7). A person's maintenance history is
+    // narrowed in `get_maintenance_metrics`, which passes the principal.
     response_to_value(
         crate::routes::governance::read_kind(state, None, &axum::http::HeaderMap::new(), kind)
             .await,
@@ -159,53 +158,51 @@ pub(super) async fn get_maintenance_metrics(
 /// cover. An answer with no `maintenance` list (an error body) is left as it
 /// is.
 ///
-/// One claim is read per table, not per run: the history holds every run, so
-/// a table appears many times.
+/// The claims are read once for the distinct tables ([`crate::routes::query::claims_on`]):
+/// the history holds every run, so a table appears many times.
 ///
 /// # Errors
 ///
-/// The 503 of [`crate::routes::query::claim_on`] when a claim cannot be read;
-/// the caller answers with a fixed sentence, never the cause.
+/// The 503 of [`crate::routes::query::claims_on`] when the claims cannot be
+/// read; the caller answers with a fixed sentence, never the cause.
 async fn leave_out_runs_out_of_reach(
     state: &AppState,
     reach: crate::routes::query::TenantReach,
     history: &mut Value,
 ) -> Result<(), lakehouse_core::ApiError> {
-    use crate::routes::query::{TenantReach, claim_on, table_is_reachable};
+    use crate::routes::query::{TenantReach, claims_on, table_is_reachable};
 
     let tenant_id = match reach {
         TenantReach::All => return Ok(()),
+        // `table_is_reachable` answers `false` for this reach whatever the
+        // claim is, so no claim needs reading.
         TenantReach::NoTenant => None,
         TenantReach::Tenant { tenant_id, .. } => Some(tenant_id),
     };
     let Some(rows) = history.get_mut("maintenance").and_then(Value::as_array_mut) else {
         return Ok(());
     };
-    let mut verdicts: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
-    let mut kept = Vec::with_capacity(rows.len());
-    for row in rows.drain(..) {
-        let table = row
-            .get("tableName")
+    let table_of = |row: &Value| {
+        row.get("tableName")
             .and_then(Value::as_str)
             .unwrap_or("")
-            .to_owned();
-        let reachable = match (verdicts.get(&table), tenant_id) {
-            (Some(known), _) => *known,
-            // `table_is_reachable` answers `false` for this reach whatever
-            // the claim is, so no claim needs reading.
-            (None, None) => false,
-            (None, Some(tenant_id)) => {
-                let claim = claim_on(state, tenant_id, &table).await?;
-                let known = table_is_reachable(reach, claim);
-                verdicts.insert(table, known);
-                known
-            }
-        };
-        if reachable {
-            kept.push(row);
+            .to_owned()
+    };
+    let claims = match tenant_id {
+        Some(tenant_id) => {
+            let mut tables: Vec<String> = rows.iter().map(table_of).collect();
+            tables.sort();
+            tables.dedup();
+            claims_on(state, tenant_id, &tables).await?
         }
-    }
-    *rows = kept;
+        None => std::collections::HashMap::new(),
+    };
+    rows.retain(|row| {
+        tenant_id.is_some()
+            && claims
+                .get(&table_of(row))
+                .is_some_and(|claim| table_is_reachable(reach, *claim))
+    });
     Ok(())
 }
 

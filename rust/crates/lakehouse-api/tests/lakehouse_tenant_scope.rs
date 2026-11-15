@@ -34,6 +34,7 @@ use std::collections::HashMap;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
+use lakehouse_store::column_lineage::{NewMapping, replace_producer};
 use lakehouse_store::uploads::claim_table;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -204,6 +205,45 @@ async fn mount_namespaces(server: &MockServer) {
         )
         .mount(server)
         .await;
+}
+
+/// A pipeline of the owning tenant that names both uploads as inputs: the
+/// table the other tenant holds is not the owner's to draw. It builds
+/// `silver.group_mixed`.
+async fn add_the_mixed_pipeline(pool: &PgPool) {
+    sqlx::query(
+        "INSERT INTO pipeline_definition \
+            (id, name, kind, status, source, target, schedule, tenant_id, input_tables) \
+         VALUES ('pl-mixed', 'Mixed', 'batch', 'draft', 'bronze.group_orders', \
+                 'silver.group_mixed', '@hourly', $1, \
+                 ARRAY['bronze.group_orders', 'bronze.retail_orders'])",
+    )
+    .bind(CATALOG_TENANT.parse::<Uuid>().expect("a seeded tenant id"))
+    .execute(pool)
+    .await
+    .expect("add the pipeline");
+}
+
+/// The recorded column mappings of that pipeline: one from each upload.
+async fn record_the_mixed_pipelines_column_mappings(pool: &PgPool) {
+    let map = |from: &str| NewMapping {
+        from_table: Some(from.to_owned()),
+        from_column: Some("order_total".to_owned()),
+        to_table: "silver.group_mixed".to_owned(),
+        to_column: "total".to_owned(),
+        transform: "copy".to_owned(),
+        partial: false,
+        reason: None,
+    };
+    replace_producer(
+        pool,
+        "pipeline",
+        "pl-mixed",
+        Some(CATALOG_TENANT.parse::<Uuid>().expect("a seeded tenant id")),
+        &[map("bronze.group_orders"), map("bronze.retail_orders")],
+    )
+    .await
+    .expect("record the mappings");
 }
 
 /// The names of the maintenance rows a tool answered, in order.
@@ -705,7 +745,7 @@ async fn setting_the_maintenance_of_another_tenants_upload_table_in_the_chat_is_
 // (e) The readers that answer from the shared catalog.
 
 #[tokio::test]
-async fn the_dataset_tools_refuse_a_tenant_that_does_not_own_the_shared_catalog() {
+async fn listing_datasets_is_refused_to_a_tenant_that_does_not_own_the_shared_catalog() {
     let catalog = MockServer::start().await;
     mount_catalog(&catalog).await;
     let ch = MockServer::start().await;
@@ -716,8 +756,21 @@ async fn the_dataset_tools_refuse_a_tenant_that_does_not_own_the_shared_catalog(
     let reason = the_rules_reason(&router, &pool).await;
 
     let listed = call_tool(&router, &other, "list_datasets", json!({})).await;
+
     assert_refused_like_the_catalog(&listed["result"], &reason);
     assert_none_of_the_groups_data(&listed);
+}
+
+#[tokio::test]
+async fn describing_a_dataset_is_refused_to_a_tenant_that_does_not_own_the_shared_catalog() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_clickhouse_with_data(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let other = cookie_in_tenant(&pool, CATALOG_READER, OTHER_TENANT).await;
+    let reason = the_rules_reason(&router, &pool).await;
 
     let described = call_tool(
         &router,
@@ -726,6 +779,7 @@ async fn the_dataset_tools_refuse_a_tenant_that_does_not_own_the_shared_catalog(
         json!({ "slug": DATASET_SLUG }),
     )
     .await;
+
     assert_refused_like_the_catalog(&described["result"], &reason);
     assert_none_of_the_groups_data(&described);
 }
@@ -818,19 +872,7 @@ async fn the_lineage_tool_leaves_out_another_tenants_upload_table_for_the_owning
     mount_clickhouse_with_data(&ch).await;
     let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
     claim_the_uploads(&pool).await;
-    // A pipeline of the owning tenant that names both uploads as inputs: the
-    // table the other tenant holds is not the owner's to draw.
-    sqlx::query(
-        "INSERT INTO pipeline_definition \
-            (id, name, kind, status, source, target, schedule, tenant_id, input_tables) \
-         VALUES ('pl-mixed', 'Mixed', 'batch', 'draft', 'bronze.group_orders', \
-                 'silver.group_mixed', '@hourly', $1, \
-                 ARRAY['bronze.group_orders', 'bronze.retail_orders'])",
-    )
-    .bind(CATALOG_TENANT.parse::<Uuid>().expect("a seeded tenant id"))
-    .execute(&pool)
-    .await
-    .expect("add the pipeline");
+    add_the_mixed_pipeline(&pool).await;
     let owner = cookie_in_tenant(&pool, LINEAGE_READER, CATALOG_TENANT).await;
 
     let graph = call_tool(
@@ -934,4 +976,100 @@ async fn the_namespace_count_holds_only_the_tables_the_caller_may_read() {
     let (status, body) = get(&router, uri, &operator, None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(table_count(&body, "bronze"), json!(3), "{body}");
+}
+
+#[tokio::test]
+async fn the_lineage_tool_leaves_out_the_column_mappings_of_another_tenants_upload_table() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_clickhouse_with_data(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    add_the_mixed_pipeline(&pool).await;
+    record_the_mixed_pipelines_column_mappings(&pool).await;
+    let owner = cookie_in_tenant(&pool, LINEAGE_READER, CATALOG_TENANT).await;
+
+    // Focus on the table the pipeline builds: the mapping from the owner's
+    // own upload is drawn, the one from the other tenant's is not.
+    let graph = call_tool(
+        &router,
+        &owner,
+        "get_lineage",
+        json!({ "focus": "silver.group_mixed" }),
+    )
+    .await;
+    let mappings = graph["result"]["columnMappings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a list of mappings: {graph}"));
+    assert_eq!(mappings.len(), 1, "{graph}");
+    assert_eq!(
+        mappings[0]["from"]["table"],
+        json!(format!("bronze.{GROUP_TABLE}")),
+        "{graph}"
+    );
+    assert!(!graph.to_string().contains(RETAIL_TABLE), "{graph}");
+
+    // Focus on the other tenant's table itself: nothing is drawn for it.
+    let graph = call_tool(
+        &router,
+        &owner,
+        "get_lineage",
+        json!({ "focus": format!("bronze.{RETAIL_TABLE}") }),
+    )
+    .await;
+    assert_eq!(graph["result"]["columnMappings"], json!([]), "{graph}");
+    assert!(
+        !node_ids(&graph["result"]).contains(&format!("bronze:{RETAIL_TABLE}")),
+        "{graph}"
+    );
+}
+
+#[tokio::test]
+async fn the_namespace_count_of_a_listing_of_many_claimed_tables_is_complete() {
+    // 250 tables, all claimed by the owning tenant, in one namespace.
+    let catalog = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/config"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"defaults":{},"overrides":{}}"#),
+        )
+        .mount(&catalog)
+        .await;
+    mount_namespaces(&catalog).await;
+    let identifiers: Vec<Value> = (0..250)
+        .map(|n| json!({ "namespace": ["bronze"], "name": format!("many_{n}") }))
+        .collect();
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces/bronze/tables"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "identifiers": identifiers })),
+        )
+        .mount(&catalog)
+        .await;
+    let ch = MockServer::start().await;
+    mount_empty_clickhouse(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    for n in 0..250 {
+        let claimed = claim_table(
+            &pool,
+            CATALOG_TENANT.parse::<Uuid>().expect("a seeded tenant id"),
+            &format!("many_{n}"),
+            &format!("upload-many-{n}"),
+        )
+        .await
+        .expect("claim the upload table");
+        assert!(claimed);
+    }
+    let owner = cookie_in_tenant(&pool, "catalog:read", CATALOG_TENANT).await;
+    let other = cookie_in_tenant(&pool, "catalog:read", OTHER_TENANT).await;
+
+    let (status, body) = get(&router, "/api/lakehouse/namespaces", &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(table_count(&body, "bronze"), json!(250), "{body}");
+
+    // All 250 belong to the owner: the other tenant counts none of them.
+    let (status, body) = get(&router, "/api/lakehouse/namespaces", &other, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(table_count(&body, "bronze"), Value::Null, "{body}");
 }

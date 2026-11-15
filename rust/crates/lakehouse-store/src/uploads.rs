@@ -1439,6 +1439,41 @@ pub async fn table_claim(
     })
 }
 
+/// Who holds each of `tables`, as `tenant_id` sees it, in ONE query.
+///
+/// The answer for a name is the one [`table_claim`] gives. A name nobody holds
+/// is not in the map: a caller reads a missing name as
+/// [`TableClaim::Unclaimed`]. It exists for a listing that asks about every
+/// table of a namespace (hundreds in one), where a query per table cost a
+/// round trip each.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn table_claims(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    tables: &[String],
+) -> Result<std::collections::HashMap<String, TableClaim>, StoreError> {
+    // `Option<Uuid>` as in `table_claim`: a row whose tenant is NULL.
+    let held: Vec<(String, Option<Uuid>)> = sqlx::query_as(
+        "SELECT bronze_table, tenant_id FROM upload_table_claim WHERE bronze_table = ANY($1)",
+    )
+    .bind(tables)
+    .fetch_all(pool)
+    .await?;
+    Ok(held
+        .into_iter()
+        .map(|(table, holder)| {
+            let claim = match holder {
+                Some(holder) if holder == tenant_id => TableClaim::Ours,
+                _ => TableClaim::Theirs,
+            };
+            (table, claim)
+        })
+        .collect())
+}
+
 /// Claim `table` for `tenant_id`, on behalf of `upload_id`, in ONE statement:
 /// `true` when the claim is the tenant's afterwards, whether it was made now
 /// or held before; `false` when another tenant holds it, or when its tenant

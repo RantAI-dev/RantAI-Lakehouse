@@ -1032,6 +1032,54 @@ pub(crate) async fn claim_on(
         })
 }
 
+/// `SEC-20`: [`claim_on`] for a listing, in one read.
+///
+/// A namespace can hold hundreds of upload tables (498 measured in `bronze`
+/// on staging), and a query per table does not fit the two seconds a
+/// namespace count has. The answer for each name is [`claim_on`]'s: only a
+/// `bronze.<raw>` name can be claimed, every other name is
+/// [`TableClaim::Unclaimed`]. The map holds an entry for every name asked.
+///
+/// # Errors
+///
+/// 503 when the claims cannot be read: the store's own fixed message and a
+/// reference id, through [`upstream_error`] (the raw error text never
+/// reaches the response, `AGENTS.md` principle 4).
+pub(crate) async fn claims_on(
+    state: &AppState,
+    tenant_id: Uuid,
+    tables: &[String],
+) -> Result<std::collections::HashMap<String, TableClaim>, ApiError> {
+    let mut claims: std::collections::HashMap<String, TableClaim> = tables
+        .iter()
+        .map(|table| (table.clone(), TableClaim::Unclaimed))
+        .collect();
+    let Some(pool) = state.pg.as_deref() else {
+        return Ok(claims);
+    };
+    let raw: std::collections::BTreeSet<String> = tables
+        .iter()
+        .filter_map(|table| raw_table_name(table))
+        .map(str::to_owned)
+        .collect();
+    if raw.is_empty() {
+        return Ok(claims);
+    }
+    let raw: Vec<String> = raw.into_iter().collect();
+    let held = lakehouse_store::uploads::table_claims(pool, tenant_id, &raw)
+        .await
+        .map_err(|err| {
+            upstream_error::store(&upstream_error::STORE, &err)
+                .into_api_error(upstream_error::FailedAs::ServiceUnavailable)
+        })?;
+    for (table, claim) in &mut claims {
+        if let Some(held) = raw_table_name(table).and_then(|raw| held.get(raw)) {
+            *claim = *held;
+        }
+    }
+    Ok(claims)
+}
+
 /// `SEC-50` slice 2 M1/M2: the tables a statement names, checked against a
 /// reach that is already resolved.
 ///
@@ -7890,5 +7938,85 @@ mod history_query_tests {
             parse_history_query(&just_over).unwrap().page,
             super::HISTORY_MAX_PAGE
         );
+    }
+}
+
+#[cfg(test)]
+mod claim_reads_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use lakehouse_store::uploads::{TableClaim, claim_table};
+    use uuid::Uuid;
+
+    use super::{claim_on, claims_on};
+    use crate::config::Config;
+    use crate::state::AppState;
+
+    fn state_for(pool: &lakehouse_store::PgPool) -> AppState {
+        let options = pool.connect_options();
+        let url = format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options.get_database().unwrap_or_default(),
+        );
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), url);
+        AppState::new(Config::from_map(&env).unwrap())
+    }
+
+    async fn tenant(pool: &lakehouse_store::PgPool, n: u128) -> Uuid {
+        let id = Uuid::from_u128(n);
+        sqlx::query(
+            "INSERT INTO tenant (id, name, slug, plan, residency) \
+             VALUES ($1, $2, $3, 'Standard', 'US')",
+        )
+        .bind(id)
+        .bind(format!("Tenant {n}"))
+        .bind(format!("tenant-{n}"))
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// The listing read answers what the single read answers, for every kind
+    /// of name a listing holds: the asking tenant's upload, another tenant's,
+    /// a Bronze table nobody claimed, and tables outside `bronze`, which are
+    /// never claimable.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_listing_read_answers_what_the_single_read_answers(pool: lakehouse_store::PgPool) {
+        let (ours, theirs) = (tenant(&pool, 1).await, tenant(&pool, 2).await);
+        assert!(claim_table(&pool, ours, "mine", "up-1").await.unwrap());
+        assert!(claim_table(&pool, theirs, "theirs", "up-2").await.unwrap());
+        // A claim on a raw name must not make `silver.mine` claimable.
+        let names: Vec<String> = [
+            "bronze.mine",
+            "bronze.theirs",
+            "bronze.free",
+            "silver.mine",
+            "serving.theirs",
+            "orders",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let state = state_for(&pool);
+
+        let batch = claims_on(&state, ours, &names).await.unwrap();
+
+        assert_eq!(batch.len(), names.len(), "an entry for every name asked");
+        for name in &names {
+            assert_eq!(
+                batch[name],
+                claim_on(&state, ours, name).await.unwrap(),
+                "{name}"
+            );
+        }
+        assert_eq!(batch["bronze.mine"], TableClaim::Ours);
+        assert_eq!(batch["bronze.theirs"], TableClaim::Theirs);
+        assert_eq!(batch["silver.mine"], TableClaim::Unclaimed);
     }
 }

@@ -107,16 +107,20 @@ async fn ensure_table_in_reach(
 /// is never reachable, and a table nobody claimed is reachable only by the
 /// tenant that owns the shared catalog.
 ///
+/// The claims are read once for the whole namespace
+/// ([`crate::routes::query::claims_on`]), not once per table: `bronze` holds
+/// hundreds of tables, and the namespace count has two seconds.
+///
 /// # Errors
 ///
-/// 503 when a table's claim cannot be read.
+/// 503 when the claims cannot be read.
 async fn leave_out_tables_out_of_reach(
     state: &AppState,
     reach: crate::routes::query::TenantReach,
     namespace: &str,
     idents: Vec<TableIdent>,
 ) -> Result<Vec<TableIdent>, ApiError> {
-    use crate::routes::query::{TenantReach, claim_on, table_is_reachable};
+    use crate::routes::query::{TenantReach, claims_on, table_is_reachable};
 
     let tenant_id = match reach {
         TenantReach::All => return Ok(idents),
@@ -125,14 +129,22 @@ async fn leave_out_tables_out_of_reach(
         TenantReach::NoTenant => return Ok(Vec::new()),
         TenantReach::Tenant { tenant_id, .. } => tenant_id,
     };
-    let mut kept = Vec::with_capacity(idents.len());
-    for ident in idents {
-        let claim = claim_on(state, tenant_id, &format!("{namespace}.{}", ident.name())).await?;
-        if table_is_reachable(reach, claim) {
-            kept.push(ident);
-        }
-    }
-    Ok(kept)
+    let names: Vec<String> = idents
+        .iter()
+        .map(|ident| format!("{namespace}.{}", ident.name()))
+        .collect();
+    let claims = claims_on(state, tenant_id, &names).await?;
+    Ok(idents
+        .into_iter()
+        .zip(names)
+        .filter(|(_, name)| {
+            // `claims_on` holds an entry for every name it was asked about.
+            claims
+                .get(name)
+                .is_some_and(|claim| table_is_reachable(reach, *claim))
+        })
+        .map(|(ident, _)| ident)
+        .collect())
 }
 
 /// Borrow the Postgres pool, or fail with a 503. Shared by every Postgres-
@@ -593,6 +605,11 @@ pub struct NamespacesQuery {
 /// `SEC-20`: a namespace's `tableCount` is of the tables the caller's tenant
 /// may read (see [`leave_out_tables_out_of_reach`]), so another tenant's
 /// upload table is not counted.
+///
+/// `tableCount: null` has two causes for a caller whose roles hide no table:
+/// the namespace's tables could not be loaded in time, or none of them is in
+/// the caller's tenant's reach. The row is kept in both cases (it names no
+/// table); a caller whose roles do hide tables loses the row instead.
 ///
 /// # Errors
 /// 404 if `warehouse` names anything other than the configured warehouse, or
