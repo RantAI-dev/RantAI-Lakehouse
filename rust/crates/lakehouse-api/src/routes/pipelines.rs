@@ -9698,6 +9698,7 @@ mod tests {
                     resource_id: Some("silver_rebuild".to_owned()),
                     principal_id: None,
                     since: None,
+                    ..AuditFilter::default()
                 },
             )
             .await
