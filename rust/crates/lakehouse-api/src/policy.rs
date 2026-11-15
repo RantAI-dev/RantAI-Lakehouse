@@ -343,6 +343,12 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    classification, audit, residency) has the same fan-out problem as
     //    ops — auth only for that one. ────────────────────────────────────
     ("GET",  "/api/governance/lineage",   Policy::RequiresPermission("lineage:read")),
+    // GOV-1 part B: the audit trail's search, one event and export. Each is its
+    // own route with `audit:read` and nothing else, so `governance:read`,
+    // which every role holds, opens none of them (feature page Decision 9).
+    ("GET",  "/api/governance/audit/events", Policy::RequiresPermission("audit:read")),
+    ("GET",  "/api/governance/audit/events/{id}", Policy::RequiresPermission("audit:read")),
+    ("GET",  "/api/governance/audit/export.csv", Policy::RequiresPermission("audit:read")),
     // DATA-13: column-level lineage reads the same records' lineage, so the
     // same permission; charts and dashboards in the answer are listed only
     // to `dashboard:read` inside the handler.

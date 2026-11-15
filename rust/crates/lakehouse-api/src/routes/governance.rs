@@ -543,7 +543,7 @@ const UNKNOWN_ACTOR: &str = "System";
 /// only for an event whose kind is `copilot` and that carries no name —
 /// `AI-23`'s one name for the assistant, and otherwise [`UNKNOWN_ACTOR`],
 /// which is what rows stored before `SEC-70` read as.
-fn actor_of(
+pub(super) fn actor_of(
     label: Option<&str>,
     principal_id: Option<&str>,
     principal_kind: Option<&str>,
@@ -604,6 +604,50 @@ fn policy_decision_of(outcome: &str) -> &'static str {
     }
 }
 
+/// One stored `audit_event` as the JSON object the audit list shows: the shape
+/// `GET /api/governance/audit` has always answered, and the shape every event of
+/// the search and single-event routes (`routes::audit_events`) has too, so a
+/// console or a tool reads one object for one event whichever route it came
+/// from.
+pub(super) fn audit_event_row(e: &lakehouse_store::audit::AuditEvent) -> Value {
+    let resource = match (&e.resource_kind, &e.resource_id) {
+        (Some(kind), Some(id)) => format!("{kind}:{id}"),
+        (Some(kind), None) => kind.clone(),
+        (None, Some(id)) => id.clone(),
+        (None, None) => e.action.clone(),
+    };
+    let mut row = json!({
+        "id": e.id,
+        "at": e.at,
+        // AI-23 (product owner 2026-11-02): one name for the
+        // assistant — "AI Copilot", for an event whose kind is
+        // `copilot`; SEC-70 D4: an event nobody signed in caused
+        // carries only its label, and reads as "System" otherwise.
+        "actor": actor_of(
+            e.actor_label.as_deref(),
+            e.principal_id.as_deref(),
+            e.principal_kind.as_deref(),
+        ),
+        "actorKind": actor_kind_of(e.principal_kind.as_deref()),
+        "tenant": TENANT_ID.as_str(),
+        "action": e.action,
+        "resource": resource,
+        "outcome": outcome_of(&e.outcome),
+        "policyDecision": policy_decision_of(&e.outcome),
+        "obligations": [],
+        "approvalId": e.approval_id,
+        // QA LH-DATA-15-03 F3 (plan D9): every row used to say
+        // "copilot", whoever acted.
+        "source": source_of(e.principal_kind.as_deref()),
+    });
+    // QA LH-DATA-15-03 F1 (plan D9): the row names who got which
+    // permission, from the stored fields only.
+    if let (Some(detail), Some(o)) = (detail_of(&e.action, &e.args), row.as_object_mut()) {
+        o.insert("detail".to_owned(), json!(detail));
+    }
+    row
+}
+
 /// `GET /api/governance/audit`. Unions `audit_event` rows (copilot/console
 /// actions) onto the `Dagster`-run-derived pipeline history, adding a
 /// `source` field (`"console" | "copilot" | "schedule" | "service" |
@@ -657,44 +701,7 @@ async fn audit(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, GovErro
         let events =
             lakehouse_store::audit::list(pg, lakehouse_store::audit::AuditFilter::default())
                 .await?;
-        audit.extend(events.iter().map(|e| {
-            let resource = match (&e.resource_kind, &e.resource_id) {
-                (Some(kind), Some(id)) => format!("{kind}:{id}"),
-                (Some(kind), None) => kind.clone(),
-                (None, Some(id)) => id.clone(),
-                (None, None) => e.action.clone(),
-            };
-            let mut row = json!({
-                "id": e.id,
-                "at": e.at,
-                // AI-23 (product owner 2026-11-02): one name for the
-                // assistant — "AI Copilot", for an event whose kind is
-                // `copilot`; SEC-70 D4: an event nobody signed in caused
-                // carries only its label, and reads as "System" otherwise.
-                "actor": actor_of(
-                    e.actor_label.as_deref(),
-                    e.principal_id.as_deref(),
-                    e.principal_kind.as_deref(),
-                ),
-                "actorKind": actor_kind_of(e.principal_kind.as_deref()),
-                "tenant": TENANT_ID.as_str(),
-                "action": e.action,
-                "resource": resource,
-                "outcome": outcome_of(&e.outcome),
-                "policyDecision": policy_decision_of(&e.outcome),
-                "obligations": [],
-                "approvalId": e.approval_id,
-                // QA LH-DATA-15-03 F3 (plan D9): every row used to say
-                // "copilot", whoever acted.
-                "source": source_of(e.principal_kind.as_deref()),
-            });
-            // QA LH-DATA-15-03 F1 (plan D9): the row names who got which
-            // permission, from the stored fields only.
-            if let (Some(detail), Some(o)) = (detail_of(&e.action, &e.args), row.as_object_mut()) {
-                o.insert("detail".to_owned(), json!(detail));
-            }
-            row
-        }));
+        audit.extend(events.iter().map(audit_event_row));
     }
     // Newest first across both sources: both `at` values are the same
     // fixed-width `YYYY-MM-DDTHH:MM:SS.mmmZ` format, so lexicographic

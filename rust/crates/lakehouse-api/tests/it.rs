@@ -73,6 +73,7 @@ mod alert_targets_hidden;
 mod alert_test_route;
 mod assistant_settings_route;
 mod audit_coverage;
+mod audit_search;
 mod auth_password_rules;
 mod breakdown_cap;
 mod catalog_grants;

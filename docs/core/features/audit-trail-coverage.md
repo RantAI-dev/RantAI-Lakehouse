@@ -6,14 +6,14 @@
 | Backlog | `GOV-1` |
 | Kind | Feature |
 | Spec | `docs/core/specs/gov-1.md` |
-| Status | Building |
+| Status | In Acceptance |
 | Priority | P1 |
 | Owner | In the base |
 | Acceptor | In the base |
 | Plan | Engineering plan kept by the planner |
 | Started | 2026-11-14 |
-| Shipped | |
-| Evidence | PR #546 (part A: coverage, central writer, append-only trail, audit:read) |
+| Shipped | 2026-11-15 |
+| Evidence | PR #546 (part A: coverage, central writer, append-only trail, audit:read), PR #549 (part B: server-side search, paging, CSV export) |
 
 ## Problem
 
@@ -68,6 +68,9 @@ No new assistant work. Its tool calls are already recorded.
 - Machine callbacks are not audited. The pipeline run events, the schema and capture observations and the connector run reports accept a service identity or an unrestricted administrator account. A person who calls one of these routes by hand with an unrestricted account leaves no row. A pipeline run started from the console is audited as `pipeline.trigger`. The orchestrator's lag call (`POST /api/pipelines/runnable/{id}/lag-check`) is also open to an unrestricted administrator account. It advances the pipeline's lag streak and can send the behind-target alert, and it writes no audit row.
 - Marking a dashboard comment mention as read is not recorded. It counts as personal UI state, like favourites.
 - Each failed sign-in that reaches the password check adds one row with outcome `refused`. The try that makes an identifier locked adds two rows: the `auth.login_locked` row and the refused row. The row holds no email, no password and no identifier. An unknown email adds the same row, so a visitor who tries many different identifiers adds a row for each try. A try refused because that identifier is locked adds no row. Nothing removes these rows and there is no retention setting yet, so the growth is permanent. A rate limit or retention rule is a follow-up.
+- The CSV export holds the newest 100,000 matching events per file. When more match, the audit page shows a notice, and the response carries two headers, `x-audit-export-truncated` and `x-audit-export-total`. To get the rest, narrow the time range and export again.
+- The Person filter takes the person's id, not a name. A person who holds only `audit:read` cannot list users (`GET /api/identity/users` needs `identity:read`).
+- Dates in the filters are UTC days. A day in `from` starts at 00:00 UTC, and a day in `to` is included in full.
 
 ## Acceptance checklist
 
