@@ -55,7 +55,7 @@ Part 2:
 
 ## Limits to tell a customer
 
-- A sum is a whole number. An average, a minimum and a maximum keep up to six decimals; with no number format a value shows about four significant digits (1,466; 146.6; 14.66), and with decimals set it shows exactly those. A chart saved before this rule, with an average, a minimum or a maximum for the whole chart, shows whole numbers until it is saved again, unless a dashboard filter applies to it. *(proposed, not yet signed; `BI-55`)*
+- A sum, an average, a minimum and a maximum keep up to six decimals, and a sum of whole numbers is a whole number; with no number format a value shows about four significant digits (1,466; 146.6; 14.66), and with decimals set it shows exactly those. A chart saved before this rule, with a sum, an average, a minimum or a maximum for the whole chart, shows whole numbers until it is saved again, unless a dashboard filter applies to it. *(proposed, not yet signed; `BI-55`, `BI-57`)*
 - A second step works on the summarised result, so it can use only the columns and measures of the step before it.
 - A chart with steps or an "Other" group is rebuilt from its definition on every read; it cannot be edited as SQL.
 - A chart with a time grain and a breakdown shows every period (up to the chart row limit); to keep only recent periods, add a relative date filter to the chart.

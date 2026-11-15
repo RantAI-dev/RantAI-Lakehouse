@@ -930,7 +930,7 @@ mod tests {
                 &[filter(r#"{"column":"province","values":["Bali"]}"#)]
             )
             .sql,
-            "SELECT round(sum(visitors)) AS v FROM serving.mart_x WHERE province IN ('Bali')"
+            "SELECT round(sum(visitors), 6) AS v FROM serving.mart_x WHERE province IN ('Bali')"
         );
         let value = stored(
             ChartKind::Progress,
@@ -945,8 +945,8 @@ mod tests {
                 &[filter(r#"{"column":"province","values":["Bali"]}"#)]
             )
             .sql,
-            "SELECT __m0 AS v, __m1 AS g FROM (SELECT round(sum(visitors)) AS __m0, \
-             round(sum(target)) AS __m1 FROM serving.mart_x WHERE province IN ('Bali'))"
+            "SELECT __m0 AS v, __m1 AS g FROM (SELECT round(sum(visitors), 6) AS __m0, \
+             round(sum(target), 6) AS __m1 FROM serving.mart_x WHERE province IN ('Bali'))"
         );
     }
 
@@ -972,7 +972,7 @@ mod tests {
         // The filter on `v` is moved under the aggregate, onto the table's column.
         assert_eq!(
             got.sql,
-            "SELECT round(sum(visitors)) AS v FROM (SELECT * FROM serving.mart_x WHERE v >= 1) AS flt"
+            "SELECT round(sum(visitors), 6) AS v FROM (SELECT * FROM serving.mart_x WHERE v >= 1) AS flt"
         );
     }
 
@@ -1008,7 +1008,7 @@ mod tests {
             .sql
             .split(" FROM ")
             .next(),
-            Some("SELECT province, round(sum(visitors)) AS visitors")
+            Some("SELECT province, round(sum(visitors), 6) AS visitors")
         );
         let with_goal_value = stored(
             ChartKind::Bullet,
@@ -1020,7 +1020,7 @@ mod tests {
         assert!(
             built(&with_goal_value, &[filter(r#"{"column":"price","op":"between","min":"1"}"#)])
                 .sql
-                .starts_with("SELECT province, round(sum(visitors)) AS visitors, round(sum(target)) AS target FROM serving.mart_x WHERE")
+                .starts_with("SELECT province, round(sum(visitors), 6) AS visitors, round(sum(target), 6) AS target FROM serving.mart_x WHERE")
         );
     }
 

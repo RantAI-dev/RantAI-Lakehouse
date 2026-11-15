@@ -950,6 +950,53 @@ async fn resolve(state: &AppState, asset: &str) -> Option<ReadSource> {
     }
 }
 
+/// The one sentence a table that is not there and one the caller's roles hide
+/// both get, so neither answer says which tables exist.
+///
+/// One function, not a literal at each site: `ensure_rule_table` gives it to a
+/// rule, and `routes::quality_schedules` gives the same sentence to a schedule
+/// that names the table instead of a rule on it (`GOV-15`).
+pub(crate) fn unreadable_table(asset: &str) -> ApiError {
+    ApiError::BadRequest(format!(
+        "\"{asset}\" is not a table you can read. Pick the table as \
+         silver.<table>, serving.<table> or bronze.<table>."
+    ))
+}
+
+/// What a person acting on quality rules, schedules or incidents may read.
+///
+/// The catalog's tenant rule runs first, so a caller outside the tenant that
+/// owns the shared catalog is answered the same way for every table and learns
+/// nothing about one; the role's table access runs second, so a table it hides
+/// is never asked about either. No principal is a system call (the scheduled
+/// and on-load passes), which `TableAccess` documents as not narrowed.
+///
+/// Consumers ([`ensure_rule_table`], `routes::quality_schedules`, the incident
+/// resolve) do not repeat these two steps by hand: one caller, one order, one
+/// answer (`GOV-15 (GOV-12 plan, section 4)`, `AGENTS.md` rule 4).
+///
+/// # Errors
+///
+/// [`ApiError::PermissionDenied`] (`403`) from the catalog's tenant rule, with
+/// the reason [`crate::routes::catalog::catalog_tenant_refusal`] gives; the
+/// errors of that function and of
+/// [`crate::routes::catalog::table_access_for`] otherwise.
+pub(crate) async fn quality_table_access(
+    state: &AppState,
+    principal: Option<&Principal>,
+    headers: &HeaderMap,
+) -> Result<crate::table_access::TableAccess, ApiError> {
+    let Some(principal) = principal else {
+        return Ok(crate::table_access::TableAccess::All);
+    };
+    if let Some(reason) =
+        crate::routes::catalog::catalog_tenant_refusal(state, principal, headers).await?
+    {
+        return Err(ApiError::PermissionDenied(reason.to_owned()));
+    }
+    crate::routes::catalog::table_access_for(state, principal).await
+}
+
 /// Refuses a quality rule written for a table that is not there, or that the
 /// author's roles do not let them read (QA `LH-DATA-14-01` F2, `DATA-54`).
 ///
@@ -982,12 +1029,7 @@ pub(crate) async fn ensure_rule_table(
     asset: &str,
 ) -> Result<(), ApiError> {
     let asset = asset.trim();
-    let refused = || {
-        ApiError::BadRequest(format!(
-            "\"{asset}\" is not a table you can read. Pick the table as \
-             silver.<table>, serving.<table> or bronze.<table>."
-        ))
-    };
+    let refused = || unreadable_table(asset);
     let Some((zone, table)) = asset.split_once('.') else {
         return Err(refused());
     };
@@ -1008,16 +1050,9 @@ pub(crate) async fn ensure_rule_table(
     // so the table check below cannot say which tables exist through it.
     // Access second, so a hidden table is never asked about either. No
     // principal (a system call) is not narrowed, as `TableAccess` documents.
-    if let Some(principal) = principal {
-        if let Some(reason) =
-            crate::routes::catalog::catalog_tenant_refusal(state, principal, headers).await?
-        {
-            return Err(ApiError::PermissionDenied(reason.to_owned()));
-        }
-        let access = crate::routes::catalog::table_access_for(state, principal).await?;
-        if !access.allows(&zone, table) {
-            return Err(refused());
-        }
+    let access = quality_table_access(state, principal, headers).await?;
+    if !access.allows(&zone, table) {
+        return Err(refused());
     }
     match zone.as_str() {
         "silver" | "serving" => {
@@ -1218,8 +1253,11 @@ pub struct UpdateRuleBody {
 /// `400` when the body is malformed, leaves the table, the threshold or the
 /// severity empty, or names a table that is not there or that the caller may
 /// not read (QA `LH-DATA-14-01` F2, `DATA-54`); `403` when the caller is
-/// outside the tenant that owns the shared catalog; `404` when no rule has
-/// that id; `503` when the table cannot be checked; `500` on a store failure.
+/// outside the tenant that owns the shared catalog — for every edit, not only
+/// one that changes the table; `404` when no rule has that id, and for a rule
+/// on a table the caller's role does not read (it answers as an unknown rule,
+/// `GOV-15`); `503` when the table cannot be checked; `500` on a store
+/// failure.
 pub async fn update_rule(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1227,6 +1265,9 @@ pub async fn update_rule(
     Path(id): Path<String>,
     body: axum::body::Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    // GOV-15 (GOV-12 plan, section 4): the tenant gate comes first, before the
+    // body is read, so a caller outside it learns nothing about a rule id (D4).
+    let access = quality_table_access(&state, Some(&principal), &headers).await?;
     let body: UpdateRuleBody = serde_json::from_slice(&body)
         .map_err(|err| ApiError::BadRequest(format!("Invalid request body: {err}")))?;
     let input = lakehouse_store::governance::UpdateQualityRuleInput {
@@ -1250,6 +1291,11 @@ pub async fn update_rule(
         .into_iter()
         .find(|r| r.id == id)
         .ok_or_else(|| ApiError::NotFound("Quality rule not found".to_owned()))?;
+    // GOV-15 (GOV-12 plan, section 4): a rule on a table the role does not
+    // read is not on the caller's list, so it answers as an unknown rule (D5).
+    if !access.allows_key(before.asset.trim()) {
+        return Err(ApiError::NotFound("Quality rule not found".to_owned()).into());
+    }
     // A rewrite that keeps the table is not checked, so a rule whose table
     // has since been dropped can still be edited or loosened (QA
     // `LH-DATA-14-01` F2, `DATA-54`). A rewrite that changes it gets the same
@@ -1309,13 +1355,31 @@ pub async fn update_rule(
 ///
 /// # Errors
 ///
-/// `404` when no rule has that id; `503`/`500` on a store failure.
+/// `403` when the caller is outside the tenant that owns the shared catalog;
+/// `404` when no rule has that id, and for a rule on a table the caller's role
+/// does not read (it answers as an unknown rule, `GOV-15`); `503`/`500` on a
+/// store failure.
 pub async fn delete_rule(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<ApiJson<Value>> {
+    // GOV-15 (GOV-12 plan, section 4): the tenant gate comes first, before
+    // anything is looked up, so a caller outside it learns nothing about a
+    // rule id (D4).
+    let access = quality_table_access(&state, Some(&principal), &headers).await?;
     let pool = pool(&state)?;
+    let before = lakehouse_store::governance::list_quality_rules(pool)
+        .await?
+        .into_iter()
+        .find(|r| r.id == id)
+        .ok_or_else(|| ApiError::NotFound("Quality rule not found".to_owned()))?;
+    // GOV-15 (GOV-12 plan, section 4): a rule on a table the role does not
+    // read is not on the caller's list, so it answers as an unknown rule (D5).
+    if !access.allows_key(before.asset.trim()) {
+        return Err(ApiError::NotFound("Quality rule not found".to_owned()).into());
+    }
     let rule = lakehouse_store::governance::delete_quality_rule(pool, &id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Quality rule not found".to_owned()))?;

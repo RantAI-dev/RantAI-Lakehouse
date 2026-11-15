@@ -17,7 +17,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
@@ -556,9 +556,13 @@ async fn the_row_query_carries_the_previews_row_and_time_limits() {
     );
 }
 
-/// S2-T2, D16 and spec rule 7: a `ClickHouse` failure reaches the preview's
+/// S2-T2, D16 and spec rule 7 (a preview reports an error the way Query Studio
+/// reports one for the same SQL): a `ClickHouse` failure reaches the preview's
 /// caller in the same form `POST /api/query/run` gives for the same failure —
-/// the author's trimmed diagnosis and a reference id, at 422.
+/// the fixed sentence for the engine's code and a reference id, at 422, and
+/// never the engine's own text (`LH-QS-2-08`, owner, 2026-11-12). The
+/// expectation changed from the author's trimmed diagnosis on the owner's
+/// decision of 2026-11-13; the comparison with `query/run` stays.
 #[tokio::test]
 async fn a_clickhouse_failure_answers_the_way_query_run_answers_the_same_failure() {
     const ENGINE_TEXT: &str = "Code: 60. DB::Exception: upstream-secret-detail";
@@ -598,7 +602,7 @@ async fn a_clickhouse_failure_answers_the_way_query_run_answers_the_same_failure
     let message = answer["error"].as_str().unwrap_or_default();
     let studio_message = studio["error"].as_str().unwrap_or_default();
     // The reference id is per failure, so the two are compared up to it: the
-    // form — the author's diagnosis, then `Reference: <id>` — must match.
+    // form, the fixed sentence then `Reference: <id>`, must match.
     let before_reference = |message: &str| {
         message
             .split(" Reference: ")
@@ -611,12 +615,21 @@ async fn a_clickhouse_failure_answers_the_way_query_run_answers_the_same_failure
         before_reference(studio_message),
         "the preview and query/run must report the engine the same way: {message:?} vs {studio_message:?}"
     );
-    assert!(
-        message.starts_with(ENGINE_TEXT),
-        "the author's own step must get the engine's diagnosis: {message}"
+    assert_eq!(
+        before_reference(message),
+        "This query reads a table that does not exist or that you cannot read.",
+        "code 60 must read as its fixed sentence: {message}"
     );
-    assert!(
-        message.contains(" Reference: "),
-        "the diagnosis must carry a reference id: {message}"
-    );
+    for (who, text) in [("preview", message), ("query/run", studio_message)] {
+        assert!(
+            text.contains(" Reference: "),
+            "the {who} answer must carry a reference id: {text}"
+        );
+        for engine_detail in ["Code:", "DB::Exception", "upstream-secret-detail"] {
+            assert!(
+                !text.contains(engine_detail),
+                "the {who} answer must not carry the engine's text ({engine_detail}): {text}"
+            );
+        }
+    }
 }

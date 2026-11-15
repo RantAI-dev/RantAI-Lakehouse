@@ -23,7 +23,7 @@ API as Platform Admin and in the code:
 | Model-written SQL goes through the masking and row-filter rewrite | Met. `run_sql` calls `routes::query::run`, which calls `rewrite_sql_for_principal`; a test pins that `run_sql` is masked the same way Query Studio is. |
 | `query:read` is needed | Met. `/api/ai/chat` and `/api/ai/tool` need only a sign-in, but the tool gate refuses any tool whose `ToolSpec::permission` the caller lacks, and `run_sql` and `run_saved_query` declare `query:read`. |
 | Tenant gate as in Query Studio | Met by construction: it is the same handler. |
-| Fixed, classified error text | Met by `SEC-11`, with one thing to state plainly: because `run_sql` is the Query Studio handler, it returns the engine's diagnosis of a statement error to the model, as Query Studio does to an author. The caller holds `query:read` and it is their question's statement. |
+| Fixed, classified error text | Met by `SEC-11`, with one thing to state plainly: because `run_sql` is the Query Studio handler, it returns the engine's trimmed diagnosis of a statement error to the model, so the model can correct its SQL. Query Studio no longer shows that text to its author (owner, 2026-11-12, LH-QS-2-08). The caller holds `query:read` and it is their question's statement. |
 | A table-function statement is refused before reaching `ClickHouse` (`SEC-9-AC3`) | **Not met.** `SELECT * FROM url('http://169.254.169.254/…')` is refused with "table function not allowed", and nothing is fetched, but the engine's query log shows it received `EXPLAIN AST SELECT * FROM url(…)` first: the tool's engine dry run comes before the policy refusal. |
 
 ## What the user can do when this is done

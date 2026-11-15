@@ -71,7 +71,7 @@ use crate::json::ApiJson;
 use crate::routes::QUERY_STRING_UNREADABLE;
 use crate::routes::quality::pool;
 use crate::routes::query::{checked_saved_definitions, saved_query_scope, saved_query_viewer};
-use crate::sql_guard::is_read_only;
+use crate::sql_guard::{ReadOnlyVerdict, not_read_only_message, read_only_verdict};
 use crate::sql_rewrite::Engine;
 use crate::state::AppState;
 use crate::upstream_error;
@@ -161,6 +161,28 @@ pub(crate) const FOLDER_ID_INVALID: &str = "A folder must be an id or \"root\"."
 /// cannot be saved cannot be changed into one that can.
 pub(crate) const NOT_READ_ONLY: &str =
     "only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) can be saved";
+
+/// Refuses a statement a saved query may not hold, with the sentence of its
+/// cause (QS-14).
+///
+/// A write keeps [`NOT_READ_ONLY`]. A curly quote and a typo in the first
+/// word get the sentences Query Studio's run gives
+/// ([`not_read_only_message`]), so the person sees what to change. A saved
+/// query records no engine, so the guard reads the statement with the
+/// `ClickHouse` rules, as every store path did before.
+///
+/// # Errors
+///
+/// [`ApiError::Unprocessable`] (422) when the statement is not a read.
+pub(crate) fn refuse_unless_storable(sql: &str) -> Result<(), ApiError> {
+    match read_only_verdict(sql, Engine::ClickHouse) {
+        ReadOnlyVerdict::Read => Ok(()),
+        ReadOnlyVerdict::Writes => Err(ApiError::Unprocessable(NOT_READ_ONLY.to_owned())),
+        refused @ (ReadOnlyVerdict::Unreadable | ReadOnlyVerdict::NotARead) => Err(
+            ApiError::Unprocessable(not_read_only_message(refused).to_owned()),
+        ),
+    }
+}
 
 /// The sentence a saved query without a title or without a statement is
 /// refused with.
@@ -1100,10 +1122,8 @@ pub async fn patch_saved(
     // guard the save route uses. A saved query records no engine, so the
     // guard reads the statement with the `ClickHouse` rules; a run that
     // names `Trino` reads it with the `Trino` rules.
-    if let Some(statement) = sql.as_deref()
-        && !is_read_only(statement, Engine::ClickHouse)
-    {
-        return Err(ApiError::Unprocessable(NOT_READ_ONLY.to_owned()).into());
+    if let Some(statement) = sql.as_deref() {
+        refuse_unless_storable(statement)?;
     }
     // The SQL and the definitions travel as a pair: when either changes,
     // the pair the query will hold is checked.
@@ -1210,9 +1230,7 @@ pub async fn duplicate_saved(
         .ok_or_else(|| ApiError::NotFound(QUERY_NOT_FOUND.to_owned()))?;
     // The copy stores the same statement, so it meets the same guard: a
     // saved query records no engine, so the `ClickHouse` rules apply.
-    if !is_read_only(&source.sql, Engine::ClickHouse) {
-        return Err(ApiError::Unprocessable(NOT_READ_ONLY.to_owned()).into());
-    }
+    refuse_unless_storable(&source.sql)?;
     // The copy is a new row, so it belongs to the tenant the request acts
     // as — not to the reach the read above used. The reach of a
     // deployment with a single tenant names no tenant at all, and a row
@@ -1381,9 +1399,7 @@ pub async fn revert_version(
         .iter()
         .find(|candidate| candidate.version == version)
         .ok_or_else(|| ApiError::NotFound(QUERY_NOT_FOUND.to_owned()))?;
-    if !is_read_only(&wanted.sql, Engine::ClickHouse) {
-        return Err(ApiError::Unprocessable(NOT_READ_ONLY.to_owned()).into());
-    }
+    refuse_unless_storable(&wanted.sql)?;
     let reverted = queries::revert_to_version(pool(&state)?, &viewer, query_id, version)
         .await
         .map_err(query_failure)?;

@@ -16,7 +16,7 @@
     reason = "test timestamps are Unix seconds, a few billion, exact in an f64"
 )]
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

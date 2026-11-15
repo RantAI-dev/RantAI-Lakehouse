@@ -31,13 +31,16 @@
 //! - The gate's or the rewrite's refusal: 422 with the fixed sentence this
 //!   code base wrote, the same status the save path gives it. An outage keeps
 //!   its own status — an unreachable database is not a bad request.
-//! - A `ClickHouse` failure: reported the way `POST /api/query/run` reports
-//!   one for the same SQL (spec rule 7), through
-//!   [`upstream_error::ch_failure_for_author`] — the same function, not a
-//!   second classification.
+//! - A `ClickHouse` failure: reported the way Query Studio reports one for the
+//!   same SQL (`BLD-1` spec rule 7: a preview reports an error the way Query
+//!   Studio reports one for the same SQL), through
+//!   [`upstream_error::ch_failure_for_console`] — the same function
+//!   `POST /api/query/run` uses, not a second classification. The answer is
+//!   the fixed sentence for the engine's code plus ` Reference: <id>`, and the
+//!   engine's text goes to the log only (`LH-QS-2-08`, owner, 2026-11-12).
 //!
 //! No input table or column name comes from anywhere but the caller's own
-//! request; `ClickHouse`'s text reaches only the person who wrote the step.
+//! request, and `ClickHouse`'s text reaches no caller.
 
 use axum::Extension;
 use axum::body::Bytes;
@@ -132,18 +135,19 @@ pub async fn preview(
     Ok(ApiJson(answer(&columns, &result.data)))
 }
 
-/// A `ClickHouse` failure, reported the way `POST /api/query/run` reports one
-/// for the same SQL (D16, spec rule 7): the query-author exception's own
-/// function, so there is no second classification to drift — the caller wrote
-/// the step's SQL and is previewing it, exactly the person Query Studio shows
-/// a trimmed diagnosis to.
+/// A `ClickHouse` failure, reported the way Query Studio reports one for the
+/// same SQL (D16, `BLD-1` spec rule 7): the fixed sentence for the engine's
+/// code plus ` Reference: <id>`, never the engine's text. It calls the
+/// function `POST /api/query/run` calls, so there is no second classification
+/// to drift. `LH-QS-2-08` (owner, 2026-11-12) ended the diagnosis for the
+/// console, and the preview follows `run`.
 ///
 /// The 30 second limit is this route's own (decision 17), not one of the
 /// caller's configured limits, so a timeout reads as the engine's fixed
 /// failure sentence rather than Query Studio's "stopped after N seconds, the
 /// limit for your role".
 fn preview_failure(err: &lakehouse_clickhouse::ChError) -> ApiError {
-    upstream_error::ch_failure_for_author(&upstream_error::DATABASE, err).response
+    upstream_error::ch_failure_for_console(&upstream_error::DATABASE, err).response
 }
 
 /// The tenant gate and the policy rewrite for `sql`, as the CALLER (D16,

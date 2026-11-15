@@ -20,7 +20,7 @@ import type {
   CommentPerson, DashboardComment, EmbedInfo, GranteeMatches, ItemAccess, MoveEffect, PublicLink, PublicLinkState,
 } from "../contracts/dashboards"
 import { apiFetch } from "../http"
-import { ServiceError, type ServiceErrorCode } from "../errors"
+import { ServiceError, deniedFor, type ServiceErrorCode } from "../errors"
 
 /**
  * DashboardService NYATA — board disimpan di ClickHouse
@@ -41,12 +41,12 @@ import { ServiceError, type ServiceErrorCode } from "../errors"
  */
 
 /**
- * The service error code for a status: 401 and 403 are a permission, 404 is
- * "not found", a 5xx is the service being unavailable, the rest is a request
- * the server refused. One rule for every call here.
+ * The service error code for a status: a 401 or 403 goes through `deniedFor`
+ * (`errors.ts`, WEB-12), so it never reaches here; 404 is "not found", a 5xx
+ * is the service being unavailable, the rest is a request the server refused.
+ * One rule for every call here.
  */
 function codeFor(status: number): ServiceErrorCode {
-  if (status === 401 || status === 403) return "permission_denied"
   if (status === 404) return "not_found"
   if (status >= 500) return "unavailable"
   return "invalid_request"
@@ -55,6 +55,9 @@ function codeFor(status: number): ServiceErrorCode {
 async function readJson<T>(res: Response): Promise<T> {
   const json = await res.json().catch(() => null)
   if (!res.ok) {
+    // WEB-12: a refusal goes through deniedFor (errors.ts).
+    const denied = deniedFor(res.status, json)
+    if (denied) throw denied
     throw new ServiceError(codeFor(res.status), json?.error ?? `Gagal (${res.status})`)
   }
   return json as T
@@ -70,6 +73,9 @@ async function readJson<T>(res: Response): Promise<T> {
 async function checkedWrite<T>(res: Response): Promise<T> {
   const json = await res.json().catch(() => null)
   if (!res.ok) {
+    // WEB-12: a refusal goes through deniedFor (errors.ts).
+    const denied = deniedFor(res.status, json)
+    if (denied) throw denied
     throw new ServiceError(
       codeFor(res.status),
       json?.error ?? `The change was refused (${res.status}).`
@@ -86,6 +92,9 @@ async function request<T>(
   const res = await apiFetch(url, init)
   const json = await res.json().catch(() => null)
   if (!res.ok) {
+    // WEB-12: a refusal goes through deniedFor (errors.ts).
+    const denied = deniedFor(res.status, json)
+    if (denied) throw denied
     throw new ServiceError(codeFor(res.status), json?.error ?? fallbackMessage)
   }
   return json as T
@@ -174,6 +183,9 @@ export const clickhouseDashboardService: DashboardService = {
     })
     if (!res.ok) {
       const json = (await res.json().catch(() => null)) as { error?: string } | null
+      // WEB-12: a refusal goes through deniedFor (errors.ts).
+      const denied = deniedFor(res.status, json)
+      if (denied) throw denied
       throw new ServiceError(codeFor(res.status), json?.error ?? "Failed to save chart", res.status)
     }
     // `BI-48`: the route answers `{ ok, chart }`; a tile's Duplicate places the

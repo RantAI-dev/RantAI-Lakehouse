@@ -4,6 +4,12 @@ version = "0.2.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+# OPS-32: the integration tests are the explicit `[[test]]` targets below, not
+# one crate per file. `tests/it.rs` declares every file in `tests/` as a module
+# and links `lakehouse-api` once instead of 119 times; a file that is neither a
+# `[[test]]` path nor declared in a root does not run at all, which
+# `scripts/ci/check_test_modules.sh` fails the build for.
+autotests = false
 
 [lib]
 name = "lakehouse_api"
@@ -12,6 +18,31 @@ path = "src/lib.rs"
 [[bin]]
 name = "lakehouse-api"
 path = "src/main.rs"
+
+# OPS-32: every integration test module, in one binary.
+[[test]]
+name = "it"
+path = "tests/it.rs"
+
+# SEC-22: re-runs itself with `--exact` and a bare test name under `ulimit -v`
+# 512 MiB, so it must stay a small binary that does not link the Postgres
+# testcontainer bootstrap its child would have to start.
+[[test]]
+name = "hostile_uploads"
+path = "tests/hostile_uploads.rs"
+
+# Installs a global `tracing` subscriber, as `report_runner` in `it` does, and
+# one process can hold only one (`cargo test`/`cargo llvm-cov` run a binary's
+# tests in one process).
+[[test]]
+name = "identity_password"
+path = "tests/identity_password.rs"
+
+# Opt-in parity tooling that mints a token against the operator's own
+# `DATABASE_URL`; the test-support bootstrap in `it` would overwrite it.
+[[test]]
+name = "parity"
+path = "tests/parity.rs"
 
 [dependencies]
 lakehouse-core = { path = "../lakehouse-core" }

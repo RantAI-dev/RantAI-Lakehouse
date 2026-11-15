@@ -128,14 +128,15 @@ fn the_committed_fixture_equals_the_catalog() {
     assert_eq!(
         actual, committed,
         "tests/fixtures/permissions.json drifted from PERMISSIONS — regenerate it ONLY for \
-         a reviewed catalog change, with: cargo test -p lakehouse-api \
-         --test permission_catalog write_permission_catalog_fixture -- --ignored"
+         a reviewed catalog change, with: cargo test -p lakehouse-api --test it \
+         permission_catalog::write_permission_catalog_fixture -- --ignored"
     );
 }
 
 /// One-off fixture writer, run by hand only after an intentional catalog
-/// change: `cargo test -p lakehouse-api --test permission_catalog
-/// write_permission_catalog_fixture -- --ignored`.
+/// change: `cargo test -p lakehouse-api --test it
+/// permission_catalog::write_permission_catalog_fixture -- --ignored`
+/// (`OPS-32`: the file is a module of the `it` binary now).
 #[test]
 #[ignore = "writes tests/fixtures/permissions.json; run only for a reviewed catalog change"]
 fn write_permission_catalog_fixture() {

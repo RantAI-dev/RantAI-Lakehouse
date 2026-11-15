@@ -320,3 +320,41 @@ describe("the chart builder's write and read (WEB-7 D6)", () => {
     expect(await clickhouseDashboardService.getChart("gone")).toBeNull()
   })
 })
+
+describe("a refusal reads as the sentence that names the permission (WEB-12)", () => {
+  it("listBoards rejects with permission_denied, the status and the sentence", async () => {
+    stubFetch(() => json({ error: "permission_denied: dashboard:read" }, 403))
+    await expect(clickhouseDashboardService.listBoards()).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the dashboard:read permission.",
+    })
+  })
+
+  it("deleteBoard rejects with permission_denied, the status and the sentence", async () => {
+    stubFetch(() => json({ error: "permission_denied: dashboard:write" }, 403))
+    await expect(clickhouseDashboardService.deleteBoard("b1")).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the dashboard:write permission.",
+    })
+  })
+
+  it("revokeAllEmbedTokens rejects with permission_denied, the status and the sentence", async () => {
+    stubFetch(() => json({ error: "permission_denied: dashboard:write" }, 403))
+    await expect(clickhouseDashboardService.revokeAllEmbedTokens("b_1")).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the dashboard:write permission.",
+    })
+  })
+
+  it("saveChart rejects with permission_denied, the status and the sentence", async () => {
+    stubFetch(() => json({ error: "permission_denied: dashboard:write" }, 403))
+    await expect(clickhouseDashboardService.saveChart({ title: "T" }, false)).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the dashboard:write permission.",
+    })
+  })
+})

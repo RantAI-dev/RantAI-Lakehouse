@@ -171,7 +171,7 @@ pub enum Aggregate {
 }
 
 impl Aggregate {
-    /// The decimals an average, a minimum and a maximum keep (`BI-55`).
+    /// The decimals every aggregate but `count` keeps (`BI-55`, `BI-57`).
     pub const DECIMAL_SCALE: u8 = 6;
 
     /// The lowercase `ClickHouse` function name this aggregate renders as
@@ -188,22 +188,21 @@ impl Aggregate {
     }
 
     /// The statement fragment this aggregate writes for `operand`, rounded
-    /// per `BI-55` (QA `LH-BI-6-04`).
+    /// per `BI-55` (QA `LH-BI-6-04`) and `BI-57` (D9).
     ///
-    /// `sum` and `count` stay whole numbers: a sum of a decimal column is
-    /// left rounded to a whole number in this slice (a `BI-55` follow-up
-    /// names it), and a count is whole by construction. `avg`, `min` and
-    /// `max` keep [`Aggregate::DECIMAL_SCALE`] decimals: enough for a percent
-    /// shown with four decimals, and it cuts the tail of a binary fraction
-    /// (`1466.1833333333334`). `round(x, 6)` of a whole number is that number
-    /// in `ClickHouse`, so a minimum or a maximum of whole numbers stays
-    /// whole.
+    /// Every aggregate but `count` keeps [`Aggregate::DECIMAL_SCALE`]
+    /// decimals: enough for a percent shown with four decimals, and it cuts
+    /// the tail of a binary fraction (`1466.1833333333334`). A count is whole
+    /// by construction. `round(x, 6)` of a whole number is that number in
+    /// `ClickHouse`, of the same type, so a sum, a minimum or a maximum of
+    /// whole numbers stays whole, and a sum of a `Float*` or `Decimal*`
+    /// column keeps its decimals without the builder having to know the
+    /// column's type (`BI-57`, D9).
     #[must_use]
     pub fn rounded(self, operand: &str) -> String {
         match self {
             Self::Count => "count()".to_owned(),
-            Self::Sum => format!("round(sum({operand}))"),
-            Self::Avg | Self::Max | Self::Min => {
+            Self::Sum | Self::Avg | Self::Max | Self::Min => {
                 format!("round({self}({operand}), {})", Self::DECIMAL_SCALE)
             }
         }
@@ -526,10 +525,11 @@ mod tests {
     }
 
     // QA LH-BI-6-04 (BI-55, D4): an average, a minimum and a maximum keep six
-    // decimals; a sum and a count stay whole numbers.
+    // decimals. QA LH-BI-6-04 (BI-55), BI-57 (D9): a sum keeps them too, and a
+    // count is whole by construction.
     #[test]
-    fn a_sum_is_a_whole_number_and_an_average_a_minimum_and_a_maximum_keep_six_decimals() {
-        assert_eq!(Aggregate::Sum.rounded("v"), "round(sum(v))");
+    fn every_aggregate_but_a_count_keeps_six_decimals() {
+        assert_eq!(Aggregate::Sum.rounded("v"), "round(sum(v), 6)");
         assert_eq!(Aggregate::Avg.rounded("v"), "round(avg(v), 6)");
         assert_eq!(Aggregate::Max.rounded("v"), "round(max(v), 6)");
         assert_eq!(Aggregate::Min.rounded("v"), "round(min(v), 6)");

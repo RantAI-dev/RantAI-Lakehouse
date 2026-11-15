@@ -72,3 +72,15 @@ describe("clickhouseAlertRuleService.testRule", () => {
     expect(missing.message).toBe("alert rule not found.")
   })
 })
+
+describe("clickhouseAlertRuleService refusals (WEB-12)", () => {
+  it("listRules rejects with permission_denied, the status and the sentence", async () => {
+    stubFetch(() => json({ error: "permission_denied: alert:read" }, 403))
+
+    await expect(clickhouseAlertRuleService.listRules()).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the alert:read permission.",
+    })
+  })
+})

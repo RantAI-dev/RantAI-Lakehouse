@@ -118,6 +118,7 @@ A spec is not a plan. Before building, a task still needs a feature page in [`..
 | --- | --- | --- | --- |
 | [`ADM-13`](adm-13.md) | Each role sees only the pages it may use | Now | M |
 | [`GOV-7`](gov-7.md) | Read access per schema and table | Now | L |
+| [`GOV-1`](gov-1.md) | Audit trail covers every console change | Now | L, in two parts |
 | [`ADM-11`](adm-11.md) | Usernames, optional email, admin-set first password | Next | M |
 | [`ADM-12`](adm-12.md) | Single sign-on in Settings (OIDC; SAML after ADR 0017) | Next | M |
 | [`WEB-7`](web-7.md) | Side-panel forms become full pages | Next | M |

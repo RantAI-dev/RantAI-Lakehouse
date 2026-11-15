@@ -308,10 +308,9 @@ describe("a refusal on the alert rule page (LH-SRC-7-10)", () => {
     stubReads()
     // `GET /api/connectors` takes `connector:manage`; the form only needs
     // `alert:write`.
-    // The shape the connector client really produces for a 403: `getJson`
-    // maps it to `invalid_request` and keeps the status.
+    // The shape the connector client produces for a 403 since WEB-11 (deniedFor).
     spyOn(connectorService, "listConnectors").mockRejectedValue(
-      new ServiceError("invalid_request", "permission_denied: connector:manage", 403)
+      new ServiceError("permission_denied", "You don't have access. This needs the connector:manage permission.", 403)
     )
     render(<AlertRulePage />)
     fireEvent.change(await screen.findByPlaceholderText("e.g. Foreign visitors dropped"), {

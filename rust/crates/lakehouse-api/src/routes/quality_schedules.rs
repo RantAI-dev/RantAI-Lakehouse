@@ -85,16 +85,24 @@ pub struct ScheduleBody {
 ///
 /// # Errors
 ///
-/// `400` when the table is not `bronze.`/`silver.`/`serving.` plus a plain
-/// name, the mode is not `on_load` or `interval`, the interval is missing for
-/// `interval` or outside 60 to 1440, or the body is malformed; `503`/`500`
-/// on a store failure.
+/// `403` when the caller is outside the tenant that owns the shared catalog
+/// (that answer is the same for every table); `400` when the table is not
+/// `bronze.`/`silver.`/`serving.` plus a plain name, when the caller's table
+/// access hides it (the sentence a rule on that table gets, `GOV-15`), when the
+/// mode is not `on_load` or `interval`, the interval is missing for `interval`
+/// or outside 60 to 1440, or the body is malformed; `503`/`500` on a store
+/// failure. The table's existence is not checked, as before.
 pub async fn put_schedule(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path(asset): Path<String>,
     body: axum::body::Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    // GOV-15 (GOV-12 plan, section 4): the tenant gate comes first, before the
+    // body is read and before anything is looked up (D4).
+    let access =
+        crate::routes::quality::quality_table_access(&state, Some(&principal), &headers).await?;
     let body: ScheduleBody = serde_json::from_slice(&body)
         // SEC-11 (CI run on DATA-14): a fixed sentence, not serde's text.
         .map_err(|_| {
@@ -105,6 +113,12 @@ pub async fn put_schedule(
             "Name the table as bronze.<table>, silver.<table> or serving.<table>.".to_owned(),
         )
     })?;
+    // GOV-15 (GOV-12 plan, section 4): a schedule names a table, not a rule, so
+    // a table the role does not read is refused with the sentence a rule on it
+    // gets (D5). Existence is not checked, so the two refusals read alike.
+    if !access.allows_key(&key) {
+        return Err(crate::routes::quality::unreadable_table(asset.trim()).into());
+    }
     let mode = ScheduleMode::parse(&body.mode)
         .ok_or_else(|| ApiError::BadRequest("mode must be on_load or interval.".to_owned()))?;
     let interval = match (mode, body.interval_minutes) {
@@ -138,18 +152,31 @@ pub async fn put_schedule(
 ///
 /// # Errors
 ///
+/// `403` when the caller is outside the tenant that owns the shared catalog;
 /// `400` when the table is not `bronze.`/`silver.`/`serving.` plus a plain
-/// name; `503`/`500` on a store failure.
+/// name, or when the caller's table access hides it (the sentence a rule on
+/// that table gets, `GOV-15`); `503`/`500` on a store failure. The table's
+/// existence is not checked, as before.
 pub async fn delete_schedule(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path(asset): Path<String>,
 ) -> ApiResult<StatusCode> {
+    // GOV-15 (GOV-12 plan, section 4): the tenant gate comes first, before
+    // anything is looked up (D4).
+    let access =
+        crate::routes::quality::quality_table_access(&state, Some(&principal), &headers).await?;
     let key = table_key(&asset).ok_or_else(|| {
         ApiError::BadRequest(
             "Name the table as bronze.<table>, silver.<table> or serving.<table>.".to_owned(),
         )
     })?;
+    // GOV-15 (GOV-12 plan, section 4): refusing first, so a reset changes
+    // nothing for a table the role does not read (D8).
+    if !access.allows_key(&key) {
+        return Err(crate::routes::quality::unreadable_table(asset.trim()).into());
+    }
     quality::delete_schedule(pool(&state)?, &key).await?;
     crate::routes::governance::audit_table_change(
         &state,

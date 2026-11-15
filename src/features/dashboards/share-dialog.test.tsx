@@ -112,12 +112,13 @@ describe("ShareDialog: signed embedding (SEC-12)", () => {
     expect(screen.getByText(/Tokens issued before .* are withdrawn\./)).toBeDefined()
   })
 
-  it("shows the server's refusal when withdrawing is not allowed", async () => {
+  it("shows the refusal as the sentence that names the permission when withdrawing is not allowed", async () => {
     stub(INFO, () => json({ error: "permission_denied: dashboard:write" }, 403))
     open()
     fireEvent.click(await screen.findByText("Withdraw all embed tokens"))
     fireEvent.click(await screen.findByText("Withdraw all"))
-    await screen.findByText(/permission_denied: dashboard:write/)
+    await screen.findByText("You don't have access. This needs the dashboard:write permission.")
+    expect(document.body.textContent).not.toMatch(/permission_denied/)
   })
 
   it("withdraws one pasted token and reports its id", async () => {

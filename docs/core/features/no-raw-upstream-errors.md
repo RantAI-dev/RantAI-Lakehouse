@@ -22,7 +22,7 @@ signed in or not. Principle 4 in `AGENTS.md` forbids it.
 2. Quote a reference id from that message to an administrator.
 3. As an operator, find the full error in the server log by that id.
 4. Keep seeing our own messages unchanged: validation errors, "not found", permission refusals and policy refusals still say what is wrong.
-5. As the author of a statement in Query Studio, still see the engine's diagnosis of that statement (an unknown column, a syntax error, a type mismatch), without the server's version or any host, and with a reference id.
+5. As the author of a statement in Query Studio, see what kind of failure it is (a missing table or database, a missing column, a syntax error, a wrong type, too little memory, or that the engine could not run the statement) in a fixed sentence, with a reference id and no engine text.
 
 ## Not included
 
@@ -43,7 +43,7 @@ text it was never given.
 | 1 | Scope is every route under `routes/`, not only the files the audit named | Planner default | Owner said to proceed with phase 0, 2026-10-10 |
 | 2 | The raw text goes to the log only, keyed by a reference id shown to the user | Spec | 2026-10-10 |
 | 3 | A guard test fails the build when a route builds a response from an upstream error's text | Spec `SEC-11-AC1` | 2026-10-10 |
-| 4 | Query Studio (run and cost estimate) shows the author the engine's diagnosis of their own statement. Nothing else does: tiles, public links, embeds, SQL sources and saved-query runs stay closed. Correction, 2026-10-10: the assistant's `run_sql` tool is the Query Studio handler, called for a signed-in caller holding `query:read`, so it returns the same diagnosis to the model (seen on a running API while checking `SEC-9`); the assistant's other tools stay closed. An unreachable or timed-out engine is still the fixed message. | Planner recommended it after the first build hid these errors | Owner, 2026-10-10 |
+| 4 | Query Studio (run and cost estimate) shows a fixed sentence for the statement's cause, followed by ` Reference: <id>`, never the engine's own text. The raw text goes to the log under that id. Nothing else shows engine text: tiles, public links, embeds, SQL sources and saved-query runs stay closed. The assistant's `run_sql` tool is the Query Studio handler, called for a signed-in caller holding `query:read`, and it still returns the engine's trimmed diagnosis to the model so the model can correct its SQL (seen on a running API while checking `SEC-9`); the assistant's other tools stay closed. An unreachable, timed-out or stopped engine keeps its fixed message. | Planner recommended it after the first build hid these errors | Owner, 2026-10-10; changed: Owner, 2026-11-12, LH-QS-2-08 |
 | 5 | `POST /api/pipelines/{id}/trigger` answers `Dagster`'s `PipelineNotFoundError` with 503, `Retry-After` and `orchestrator_job_not_loaded`, not `#80`'s 404. An unknown or out-of-scope pipeline id is refused before any `Dagster` call (`authored_pipelines::in_scope`, `authored_launch_target`), so a not-found after that is a job the product knows that the orchestrator has not loaded: a code location reloading (retry) or a broken one (an operator problem). Neither is the caller's 404. The console shows it as unavailable with the fixed sentence, which says to try again | Planner, PR #105 review | Owner waived the review on 2026-10-15; confirm at QA |
 | 6 | `orchestrator_unreachable` (the code the gates retry) is given only to a transport failure and an HTTP status of 500 or more from `Dagster`. A GraphQL error, an answer that does not parse, or a 4xx is a 502 with the fixed message and no `code`, so a protocol bug is not retried as an outage | Planner, PR #105 review | 2026-10-15 |
 
@@ -52,7 +52,7 @@ text it was never given.
 - A failed chart says that it failed and gives a reference id; it does not say why. The reason is in the server log.
 - Messages written by the product itself (a bad filter, a missing permission) are unchanged.
 - A condition a client must act on is told by a stable `code` field beside `error`, never by the message text. Today: `orchestrator_job_not_loaded` and `orchestrator_unreachable` (HTTP 503 with `Retry-After`, from `POST /api/connectors/{id}/ingest/run`; the first also from `POST /api/pipelines/{id}/trigger`). The acceptance gates retry on these codes only (PR #105 CI fix).
-- In Query Studio the author sees the database's own description of what is wrong with their statement. That text can name tables and columns the author asked about; it never includes the server version or an address.
+- In Query Studio the author sees a fixed sentence for the kind of failure and a reference id, not the database's own description. The description is in the server log under that id. The assistant's `run_sql` tool still gives the model the database's description, so it can correct the statement (decision 4).
 
 ## Acceptance checklist
 
@@ -66,7 +66,7 @@ text it was never given.
 | 6 | `SEC-11-AC3`: as a role without `dashboard:read`, open a dashboard | Refused with the usual permission message | |
 | 7 | Ask the assistant to run a query against a table that does not exist | It reports a failure with a reference id, not database text | |
 | 8 | Stop `ClickHouse` and open a dashboard (operator) | Fixed "unavailable" message; nothing upstream | |
-| 9 | In Query Studio run a statement with a misspelt column | The engine's message naming the column, a reference id, no version and no host | |
+| 9 | In Query Studio run a statement with a misspelt column | "This query names a column that does not exist. Reference: …", with no `Code:`, no engine text, no version and no host | |
 | 10 | Put the same misspelt column in a dashboard SQL source chart | The fixed message, not the engine's | |
 
 **Accepted by:** __________ **Date:** ______ **Build:** ______

@@ -5,28 +5,29 @@ import type {
   ReportService,
   ReportSubscription,
 } from "../contracts/reports"
-import { ServiceError } from "../errors"
+import { ServiceError, deniedFor } from "../errors"
 import { apiFetch } from "../http"
 
 /**
  * ReportService over `/api/reports/...`. A non-OK answer becomes a
  * `ServiceError` carrying the route's own fixed sentence (it never holds
- * upstream text), which the dialog shows as it is.
+ * upstream text), which the dialog shows as it is. A 401 or 403 goes through
+ * `deniedFor` (WEB-12).
  */
 async function call<T>(url: string, init: RequestInit, fallback: string): Promise<T> {
   const res = await apiFetch(url, init)
   const json = await res.json().catch(() => null)
   if (!res.ok) {
+    // WEB-12: a refusal goes through deniedFor (errors.ts).
+    const denied = deniedFor(res.status, json)
+    if (denied) throw denied
     const kind =
-      res.status === 401 || res.status === 403
-        ? "permission_denied"
-        : res.status === 404
-          ? "not_found"
-          : res.status >= 500
-            ? "unavailable"
-            : "invalid_request"
-    // The API writes a refusal as `permission_denied: <sentence>`; the sentence is what a person reads.
-    const text = typeof json?.error === "string" ? json.error.replace(/^permission_denied:\s*/, "") : fallback
+      res.status === 404
+        ? "not_found"
+        : res.status >= 500
+          ? "unavailable"
+          : "invalid_request"
+    const text = typeof json?.error === "string" ? json.error : fallback
     throw new ServiceError(kind, text, res.status)
   }
   return json as T

@@ -22,7 +22,7 @@
               orchestrator's wire shape; no meaningful precision is lost"
 )]
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 

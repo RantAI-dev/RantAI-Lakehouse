@@ -118,24 +118,16 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "invalid retry body: {err}",
         "serde error over the caller's own request body",
     ),
-    // SEC-11, product owner decision 2026-10-10: Query Studio (`/api/query/run`
-    // for both engines, and the cost estimate) shows the signed-in author the
-    // engine's diagnosis of their own statement, trimmed. Only this file.
+    // SEC-11, product owner decision 2026-10-10, ended for the console by the
+    // owner on 2026-11-12 (LH-QS-2-08): the console's `run` and cost estimate
+    // answer a fixed sentence and a reference (`_for_console`). The assistant's
+    // paths in this file still give the model the trimmed engine diagnosis so
+    // it can correct its SQL: `run_statement` (`FailureText::Assistant`) and
+    // `check_statement_would_run`. Only this file.
     (
         "query.rs",
         "_for_author(",
-        "query-author exception: the author of the statement is shown the trimmed engine diagnosis",
-    ),
-    // BLD-1 part 1 / D16 and the spec's rule 7: a preview reports an error the
-    // way `POST /api/query/run` reports one for the same SQL. The person
-    // previewing is the one who wrote the step's SQL, so the engine's trimmed
-    // diagnosis of it is theirs — the same exception Query Studio has, through
-    // the same function (`upstream_error::ch_failure_for_author`), never a
-    // second classification.
-    (
-        "pipeline_preview.rs",
-        "_for_author(",
-        "BLD-1 part 1 D16 / spec rule 7: the caller wrote the previewed step's SQL, so the engine's trimmed diagnosis is theirs — the same query-author exception as Query Studio, through the same function",
+        "query-author exception, assistant paths only: the model is shown the trimmed engine diagnosis to correct its SQL",
     ),
     (
         "query.rs",

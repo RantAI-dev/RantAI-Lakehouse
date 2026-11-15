@@ -18,7 +18,7 @@ import type {
   User,
 } from "../contracts/identity";
 import { apiFetch } from "../http";
-import { ServiceError } from "../errors";
+import { ServiceError, deniedFor } from "../errors";
 
 /**
  * IdentityService is real — users, roles, tenants, and service identities
@@ -32,13 +32,18 @@ import { ServiceError } from "../errors";
  * separately, not something patched over in this adapter.
  */
 
-/** Map an error response body onto the ServiceError code its status implies. */
-function errorFor(status: number, message: string): ServiceError {
+/**
+ * Map an error response body onto the ServiceError code its status implies.
+ * A 401 or 403 goes through `deniedFor` (QA `LH-BLD-2-03`, WEB-12).
+ */
+function errorFor(status: number, body: { error?: string } | null, fallback: string): ServiceError {
+  // QA LH-BLD-2-03 (WEB-12): a refusal goes through deniedFor.
+  const denied = deniedFor(status, body);
+  if (denied) return denied;
+  const message = body?.error ?? fallback;
   if (status === 404) return new ServiceError("not_found", message);
   if (status === 400 || status === 409 || status === 422)
     return new ServiceError("invalid_request", message);
-  if (status === 401 || status === 403)
-    return new ServiceError("permission_denied", message);
   return new ServiceError("unavailable", message);
 }
 
@@ -50,7 +55,7 @@ async function request<T>(
   const res = await apiFetch(url, init);
   const json = await res.json().catch(() => null);
   if (!res.ok) {
-    throw errorFor(res.status, json?.error ?? fallback);
+    throw errorFor(res.status, json, fallback);
   }
   return json as T;
 }

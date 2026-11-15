@@ -39,7 +39,8 @@ describe("governanceService: row filter grammar (WEB-8 D8; S2 review round 1, S2
     stubFetch(() => json({ error: "permission_denied: policy:read" }, 403))
     await expect(service.getRowFilterGrammar()).rejects.toMatchObject({
       code: "permission_denied",
-      message: "permission_denied: policy:read",
+      status: 403,
+      message: "You don't have access. This needs the policy:read permission.",
     })
   })
 })
@@ -96,5 +97,27 @@ describe("governanceService: quality incidents, schedules and history (DATA-14)"
     const runs = stubFetch(() => json({ runs: [run] }))
     expect(await service.listQualityRuns("r 1")).toEqual([run])
     expect(runs[0].url).toBe("/api/governance/quality/r%201/runs")
+  })
+})
+
+describe("governanceService refusals (TC-1724, WEB-12)", () => {
+  const helpers: [string, () => Promise<unknown>][] = [
+    ["listQuality", () => service.listQuality()],
+    ["createPolicy", () => service.createPolicy({} as never)],
+    ["updateQualityRule", () => service.updateQualityRule("r1", {} as never)],
+    ["deletePolicy", () => service.deletePolicy("p1")],
+    ["deleteQualityRule", () => service.deleteQualityRule("r1")],
+    ["deleteClassificationRule", () => service.deleteClassificationRule("c1")],
+  ]
+
+  it("every governance helper rejects a refusal with permission_denied, the status and the sentence", async () => {
+    for (const [, call] of helpers) {
+      stubFetch(() => json({ error: "permission_denied: governance:write" }, 403))
+      await expect(call()).rejects.toMatchObject({
+        code: "permission_denied",
+        status: 403,
+        message: "You don't have access. This needs the governance:write permission.",
+      })
+    }
   })
 })

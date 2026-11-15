@@ -1734,7 +1734,7 @@ mod tests {
             statements(&all)
                 .first()
                 .map(|s| s.trim_end_matches("\nFORMAT JSON")),
-            Some("SELECT round(sum(visitors)) AS v FROM serving.mart_x")
+            Some("SELECT round(sum(visitors), 6) AS v FROM serving.mart_x")
         );
         let stored = writes(&all);
         assert!(

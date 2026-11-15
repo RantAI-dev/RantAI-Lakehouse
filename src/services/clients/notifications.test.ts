@@ -49,3 +49,23 @@ describe("marking mentions read (BI-38 D5)", () => {
     await expect(failure).rejects.toThrow("The mentions could not be marked as read")
   })
 })
+
+describe("notification refusals (WEB-12)", () => {
+  it("the notification list rejects a refusal as permission_denied, not unavailable", async () => {
+    stubFetch(() => json({ error: "permission_denied: dashboard:read" }, 403))
+    await expect(notificationsService.list()).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the dashboard:read permission.",
+    })
+  })
+
+  it("marking mentions read that is refused rejects as permission_denied with the sentence", async () => {
+    stubFetch(() => json({ error: "permission_denied: dashboard:write" }, 403))
+    await expect(notificationsService.markMentionsRead("b1")).rejects.toMatchObject({
+      code: "permission_denied",
+      status: 403,
+      message: "You don't have access. This needs the dashboard:write permission.",
+    })
+  })
+})

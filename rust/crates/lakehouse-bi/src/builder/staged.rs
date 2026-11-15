@@ -91,7 +91,7 @@ impl QueryBuilder<Ready> {
 
         // 0. the grouped result with the hidden columns.
         // A plain measure is named `__m<i>` here and takes its own name in
-        // step 2: `round(sum(v)) AS v` beside a hidden `sum(v)` would make the
+        // step 2: `round(sum(v), 6) AS v` beside a hidden `sum(v)` would make the
         // engine read the second `v` as the first (error 184, measured).
         let mut items: Vec<(String, String)> = Vec::new();
         for (i, m) in self
