@@ -296,6 +296,10 @@ function blockLabel(block: ReportBlock): string {
       return "Paragraph"
     case "list":
       return block.ordered ? "Numbered list" : "Bulleted list"
+    case "quote":
+      return "Quote"
+    case "divider":
+      return "Divider"
     case "link":
       return "Link"
     case "chart":

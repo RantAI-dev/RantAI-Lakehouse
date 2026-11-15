@@ -46,6 +46,10 @@ export function emptyBlock(type: Exclude<ReportBlockType, "chart">): ReportBlock
       return { type: "paragraph", text: "" }
     case "list":
       return { type: "list", items: [""], ordered: false }
+    case "quote":
+      return { type: "quote", text: "" }
+    case "divider":
+      return { type: "divider" }
     case "link":
       return { type: "link", text: "", url: "https://" }
   }
@@ -88,13 +92,14 @@ export function listItems(text: string): string[] {
 
 /**
  * The blocks as they are saved: a list's blank lines dropped, a chart block
- * without the dashboard the server fills in anyway. Nothing else is changed;
- * the text is the person's own.
+ * without the dashboard the server fills in anyway, and its width only when it
+ * is wide (`BI-62`: the text width is the default the server does not write).
+ * Nothing else is changed; the text is the person's own.
  */
 export function blocksForSave(blocks: readonly ReportBlock[]): ReportBlock[] {
   return blocks.map((b) => {
     if (b.type === "list") return { ...b, items: b.items.filter((i) => i.trim() !== "") }
-    if (b.type === "chart") return { type: "chart", chart: b.chart }
+    if (b.type === "chart") return b.width === "wide" ? { type: "chart", chart: b.chart, width: "wide" } : { type: "chart", chart: b.chart }
     return b
   })
 }
