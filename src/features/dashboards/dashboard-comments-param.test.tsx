@@ -62,7 +62,9 @@ describe("DashboardPage ?comments=1 (BI-19 QA-3)", () => {
 
     expect(await screen.findByRole("list", { name: "Comments" })).toBeTruthy()
     expect(screen.getByRole("tab", { name: "Comments" }).getAttribute("aria-selected")).toBe("true")
-    fireEvent.click(screen.getByRole("button", { name: "Close panel" }))
+    // The panel has no close button (owner QA 2026-11-15): the page's own Comments button closes it again.
+    fireEvent.click(screen.getByRole("button", { name: "0 comments" }))
+    await waitFor(() => expect(screen.queryByRole("list", { name: "Comments" }) === null).toBe(true))
     await waitFor(() => expect(replaced.at(-1)).toBe("/dashboards/b_1?f=x"))
   })
 })

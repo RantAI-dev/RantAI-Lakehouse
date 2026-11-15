@@ -1484,8 +1484,10 @@ export function DashboardPage({ boardId }: { boardId: string }) {
             {phoneEdit && phone?.length ? <Button variant="ghost" size="sm" onClick={() => void resetPhone()}>Use the computed order</Button> : null}
           </div>
         ) : undefined}
-        onComments={isDefault ? undefined : () => openSide("comments")}
-        onDetails={isDefault ? undefined : () => openSide("details")}
+        // Owner QA 2026-11-15: the side panel has no close button; pressing the
+        // one that opened it again closes it.
+        onComments={isDefault ? undefined : () => sidePanel.toggle("comments")}
+        onDetails={isDefault ? undefined : () => sidePanel.toggle("details")}
         actions={
           <>
             {fullscreen ? (
