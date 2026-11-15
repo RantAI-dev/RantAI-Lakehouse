@@ -13,12 +13,14 @@
 
 use crate::common;
 
+use std::collections::HashMap;
+
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use common::{TestApp, session_cookie_for_seeded_user, spin_up};
+use common::{CATALOG_TENANT, TestApp, session_cookie_for_seeded_user, spin_up, spin_up_with_env};
 
 async fn request(
     router: &axum::Router,
@@ -66,7 +68,14 @@ fn valid_policy_body() -> Value {
 /// exactly what was stored.
 #[tokio::test]
 async fn governance_admin_sets_a_policy_and_reads_it_back() {
-    let TestApp { router, pool } = spin_up().await;
+    // `SEC-20`: `silver.orders` is a shared table, and only the tenant that
+    // owns the shared catalog reads one. The deployment names that tenant
+    // (Meridian Group, where Dewi acts by default), as a real one does.
+    let TestApp { router, pool } = spin_up_with_env(&HashMap::from([(
+        "CATALOG_TENANT_ID".to_owned(),
+        CATALOG_TENANT.to_owned(),
+    )]))
+    .await;
     let cookie = session_cookie_for_seeded_user(&pool, "dewi@meridian.example").await;
 
     let post_resp = request(

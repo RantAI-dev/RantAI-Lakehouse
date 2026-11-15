@@ -54,8 +54,8 @@ This feature is the assistant working inside Query Studio. The user asks with on
 
 - A proposal is checked for the caller's permissions and for the names the engine resolves, and it is never run. A statement that plans can still return rows other than the ones the person meant.
 - The console refuses to send a statement of more than 20,000 characters to be fixed; it says the query is too long for the assistant to fix.
-- The assistant sees the tables the chat's data map lists, and learns of other tables only from the error text. The data map goes only to a user with `catalog:read`, and its sample values and ranges go only to a user who also has `query:read` (`SEC-24`).
-- The engine's own text is not sent to the console (owner, 2026-11-12, LH-QS-2-08). Fix with AI sends the model only the fixed sentence and the reference, so a proposal for a failed run may be less exact than before. The assistant's own tools still get the engine's diagnosis.
+- The assistant sees the tables the data map lists. The data map goes only to a user with `catalog:read`, and its sample values and ranges go only to a user who also has `query:read` (`SEC-24`).
+- The engine's own text is not sent to the console (owner, 2026-11-12, LH-QS-2-08). Fix with AI sends the model only the fixed sentence and the reference, so a proposal for a failed run may be less exact than before. The engine's diagnosis reaches only the assistant's own tools, `propose_sql` and `run_sql`.
 - The diff is against the editor as it was when the proposal came back. Typing in the editor closes the proposal, and so does running the query.
 - In an Explain turn the assistant is offered no tool, so it can neither propose a fix nor run a query.
 - A chat the console opened with a tool list refuses any tool outside that list.
@@ -68,7 +68,7 @@ Run on a running deployment. Mark each Pass, Fail, or Not run with the reason. A
 
 | # | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| 1 | In Query Studio's SQL tab, run on ClickHouse a statement against a `silver` table that fails on a misspelled column, then press "Fix with AI". | The page shows one sentence on what was wrong and a line diff that names the right column. Nothing runs, so the editor holds the statement that failed until Accept. | |
+| 1 | In Query Studio's SQL tab, run on ClickHouse a statement against a `silver` table that fails on a misspelled column, then press "Fix with AI". | The page shows one sentence on what was wrong and a line diff that names the right column. Nothing runs, so the editor holds the statement that failed until Accept. | Accepted by the AI owner, 2026-11-13 (staging `80fb2f68`) |
 | 2 | With a ClickHouse statement in the editor, press "Explain". | The page explains the statement in plain words, and no query runs. | |
 | 3 | With a Trino statement in the editor, press "Explain". | The page explains the statement in plain words, and no query runs. | |
 | 4 | After a proposal is shown, press Reject. | The proposal closes and the editor holds the statement it held before. | |

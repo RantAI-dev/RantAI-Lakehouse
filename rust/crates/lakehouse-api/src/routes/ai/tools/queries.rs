@@ -15,6 +15,8 @@ use lakehouse_store::queries;
 use serde_json::{Map, Value, json};
 
 use super::{api_result_to_value, arg_str};
+use crate::error::ApiResult;
+use crate::json::ApiJson;
 use crate::state::AppState;
 use crate::upstream_error;
 
@@ -204,17 +206,28 @@ pub(super) async fn run_saved_query(
     // The chat sends no `X-Tenant` header, so the tenant is the caller's
     // first one — the same answer `tenant_scope::resolve` gives every
     // caller without headers.
-    api_result_to_value(
-        crate::routes::query::run_statement(
-            state,
-            Some(principal),
-            &axum::http::HeaderMap::new(),
-            &statement,
-            "clickhouse",
-        )
-        .await,
+    //
+    // LH-QS-2-08 (owner 2026-11-12): a failure comes in two copies — the
+    // model's copy (the engine's trimmed diagnosis, so the model can
+    // correct its SQL) and the browser's copy (a fixed sentence and the same
+    // reference). The model's copy goes in `error`, as it always did; the
+    // browser's copy goes next to it, in the one key only the server reads.
+    match crate::routes::query::run_statement(
+        state,
+        Some(principal),
+        &axum::http::HeaderMap::new(),
+        &statement,
+        "clickhouse",
     )
     .await
+    {
+        Ok(ok) => api_result_to_value(Ok(ok)).await,
+        Err(failure) => {
+            let failed: ApiResult<ApiJson<Value>> = Err(failure.response.into());
+            let result = api_result_to_value(failed).await;
+            crate::routes::ai::with_browser_error(result, &failure.browser)
+        }
+    }
 }
 
 #[cfg(test)]

@@ -135,7 +135,7 @@ function ReadyMap({ spec, rows, dark, onDataClick, format, locale, byValue }: {
     <div className="flex h-full flex-col">
       <div className="group/geo relative min-h-0 flex-1">
         <div className="absolute inset-0">
-          <EChart option={option} height="100%" keepView onChart={setChart}
+          <EChart option={option} height="100%" keepView optionDeps={[format, locale, byValue, dark]} onChart={setChart}
             onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { regionNames }) : undefined} />
         </div>
         <div className={CONTROLS_CLASS} role="group" aria-label="Map zoom">
