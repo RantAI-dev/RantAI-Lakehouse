@@ -85,6 +85,11 @@ database.
   the shared catalog. After this, each tenant is let into its own warehouse and refused the
   others. The 404 and 422 sentences in the `SEC-20` decisions stay, but their trigger moves.
   That is why the build waits for `SEC-20` to merge.
+  The `SEC-20` work (plans 94 to 96, #538, #547, #548) keeps the rule in four helpers:
+  `resolve_reach`, `claim_on`, `table_is_reachable` and `catalog_tenant_refusal`. The rule
+  changes there and nowhere else; the ADM-1 plan anchors them (AI Chat planner, 2026-11-16).
+  Audit rows owned by the deployment (Dagster, services) follow the shared-catalog rule only
+  through `catalog_tenant_refusal`, so they change with it.
 - Uploads (ADR 0014 decision 6) move from the shared `bronze` namespace to the uploading
   tenant's warehouse. Existing uploaded tables need a move or stay where they are; the plan
   decides with the owner.
