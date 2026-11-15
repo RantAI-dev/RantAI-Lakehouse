@@ -1887,16 +1887,16 @@ export function ChartBuilder({
               <KindPicker kind={kind} onPick={pickKind} facts={sourceFacts} preview={galleryPreview} dark={resolvedTheme === "dark"} />
             </div>
             <div className="flex min-h-0 flex-1 flex-col gap-3 px-5 pt-4 pb-4">
-              <div className="grid gap-0.5">
-                <Label htmlFor="ch-title" className="text-xs font-normal text-muted-foreground">Title {isStaticTile ? <Req /> : null}</Label>
+              <div className="grid">
+                <Label htmlFor="ch-title" className="sr-only">Title</Label>
                 <input
-                  id="ch-title" value={title} onChange={(e) => setTitle(e.target.value)}
+                  id="ch-title" aria-required={isStaticTile || undefined} value={title} onChange={(e) => setTitle(e.target.value)}
                   placeholder={suggestedTitle || "e.g. Visitors by Region"}
                   className={cn("-mx-1.5 min-w-0 rounded-md bg-transparent px-1.5 py-0.5 text-xl font-semibold tracking-tight placeholder:text-muted-foreground/70 hover:bg-muted/70 focus-visible:bg-muted/70", INLINE_EDIT)}
                 />
                 {isStaticTile ? null : describing || subtitle ? (
-                  <div className="mt-1 grid gap-0.5">
-                    <Label htmlFor="ch-description" className="text-xs font-normal text-muted-foreground">Description</Label>
+                  <div className="mt-1 grid">
+                    <Label htmlFor="ch-description" className="sr-only">Description</Label>
                     <input
                       id="ch-description" value={subtitle} autoFocus={describing} onChange={(e) => setSubtitle(e.target.value)}
                       onBlur={() => setDescribing(false)} placeholder="One line under the title"
