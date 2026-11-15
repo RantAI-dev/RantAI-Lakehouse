@@ -792,7 +792,10 @@ async fn board_for_frame(state: &AppState, body: FrameBody) -> Result<Option<Boa
 /// the frame answer's content sites ([`board_content_sites`]) select the
 /// board's cards here and only here, so the page and its policy cannot
 /// disagree about which cards are on the board.
-fn board_cards<'a>(stored: &'a [StoredChartSpec], board_id: &str) -> Vec<&'a StoredChartSpec> {
+pub(crate) fn board_cards<'a>(
+    stored: &'a [StoredChartSpec],
+    board_id: &str,
+) -> Vec<&'a StoredChartSpec> {
     stored
         .iter()
         .filter(|c| {

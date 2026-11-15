@@ -25,7 +25,7 @@
 //! board; the board is in the signed token. Every refusal reads the same.
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -232,6 +232,182 @@ pub async fn map_geojson(
     crate::routes::embed::map_for_board(&state, &claims.board, &id, &headers, &viewer).await
 }
 
+/// The most bytes of an image card's picture the print view takes (`BI-42`).
+const IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
+
+/// How long the fetch of one picture may take.
+const IMAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What a picture that is not one of the board's allowed image cards gets: one
+/// sentence, so the route is no oracle for what a board holds.
+const IMAGE_NOT_AVAILABLE: &str = "image is not available";
+
+/// What the route says for a body that is not a PNG, JPEG, GIF or WebP.
+const IMAGE_NOT_SUPPORTED: &str = "the address does not give a supported image";
+
+/// What the route says for a picture over [`IMAGE_MAX_BYTES`].
+const IMAGE_TOO_LARGE: &str = "the image is too large to print";
+
+#[derive(Debug, Deserialize)]
+struct ImageQuery {
+    token: Option<String>,
+    src: Option<String>,
+}
+
+/// The media type of `bytes` by its magic numbers: PNG, JPEG, GIF or WebP.
+/// SVG, and anything else, is `None`, whatever the server's header said.
+fn sniff_image(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+fn image_refusal(status: StatusCode, sentence: &'static str) -> Response {
+    (status, ApiJson(json!({ "error": sentence }))).into_response()
+}
+
+/// `GET /api/render/image?token=&src=` — one image card's picture for the print
+/// view (`BI-42`, plan D6b). Gotenberg's Chromium may open only the console
+/// (feature decision 3), so the print view points the card's `<img>` here and
+/// the API fetches the picture from the card's site.
+///
+/// What it fetches is decided by the saved board, never by the request: `src`
+/// must be exactly the address of an image card on the token's board (read as
+/// the person the token names), and that address's site must be among the
+/// board's content sites now. Anything else is a 404 with one sentence. The
+/// fetch is `https` only, through a client pinned to the addresses
+/// [`crate::connector_probe::resolve_checked`] approved (so a name that
+/// resolves inside the deployment's network is refused), follows no redirect,
+/// stops at 10 seconds and reads at most 5 MiB. Only PNG, JPEG, GIF and WebP
+/// pass, judged by the first bytes; SVG never does. Upstream error text never
+/// reaches the answer (`upstream_error`).
+///
+/// # Errors
+///
+/// 400 without `token` and `src`; the refusals of [`admit`] for a bad token; 404
+/// for an address that is not an allowed image card of the board; 413 over the
+/// size cap; 415 for a body that is not a supported image; a classified 500 when
+/// the fetch fails.
+pub async fn image(State(state): State<AppState>, Query(query): Query<ImageQuery>) -> Response {
+    let (Some(token), Some(src)) = (query.token, query.src) else {
+        return image_refusal(StatusCode::BAD_REQUEST, "token and src are required");
+    };
+    let (claims, principal) = match admit(&state, &token).await {
+        Ok(admitted) => admitted,
+        Err(response) => return response,
+    };
+    let viewer = match crate::routes::dashboard_access::viewer_for(&state, &principal).await {
+        Ok(viewer) => viewer,
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
+    match image_card_allowed(&state, &claims.board, &viewer, &src).await {
+        Ok(true) => {}
+        Ok(false) => return image_refusal(StatusCode::NOT_FOUND, IMAGE_NOT_AVAILABLE),
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    }
+    fetch_image(&state, &src).await
+}
+
+/// Whether `src` is exactly the address of an image card on `board_id` whose
+/// site is in the deployment's content sites now.
+async fn image_card_allowed(
+    state: &AppState,
+    board_id: &str,
+    viewer: &lakehouse_bi::access::Viewer,
+    src: &str,
+) -> Result<bool, lakehouse_core::ApiError> {
+    let format = crate::routes::settings::format_settings(state).await?;
+    if format.content_sites.is_empty() {
+        return Ok(false);
+    }
+    let stored = lakehouse_bi::store::list_stored_charts(&state.clickhouse, viewer)
+        .await
+        .map_err(|err| {
+            upstream_error::report_ch(&upstream_error::DATABASE, &err)
+                .into_api_error(upstream_error::FailedAs::Internal)
+        })?;
+    let cards = crate::routes::embed::board_cards(&stored, board_id);
+    Ok(cards.into_iter().any(|card| {
+        card.spec.kind == lakehouse_bi::specs::ChartKind::Image
+            && card.def.types.url.as_deref() == Some(src)
+            && !crate::routes::settings::content_sites_of_cards(&[card], &format).is_empty()
+    }))
+}
+
+/// Fetch `src` under the rules of [`image`] and answer with the picture.
+async fn fetch_image(state: &AppState, src: &str) -> Response {
+    let failed = |what: &str| {
+        crate::error::ApiRejection(upstream_error::internal_error(
+            &upstream_error::SERVICE,
+            &what,
+        ))
+        .into_response()
+    };
+    let internal_hosts = state.config.connector_internal_hosts();
+    let Some((host, port)) = crate::connector_probe::parse_endpoint_host_port(src)
+        .filter(|_| src.starts_with("https://"))
+    else {
+        return image_refusal(StatusCode::NOT_FOUND, IMAGE_NOT_AVAILABLE);
+    };
+    let Ok(checked) = crate::connector_probe::resolve_checked(host, port, &internal_hosts).await
+    else {
+        return failed("the image host was refused or did not resolve");
+    };
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(IMAGE_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(host, checked.all())
+        .build()
+    else {
+        return failed("the image client could not be built");
+    };
+    let mut response = match client.get(src).send().await {
+        Ok(response) if response.status().is_success() => response,
+        Ok(_) => return failed("the image host did not answer with the image"),
+        Err(err) => return failed(&err.to_string()),
+    };
+    if response
+        .content_length()
+        .is_some_and(|n| n > IMAGE_MAX_BYTES as u64)
+    {
+        return image_refusal(StatusCode::PAYLOAD_TOO_LARGE, IMAGE_TOO_LARGE);
+    }
+    let mut body: Vec<u8> = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len() + chunk.len() > IMAGE_MAX_BYTES {
+                    return image_refusal(StatusCode::PAYLOAD_TOO_LARGE, IMAGE_TOO_LARGE);
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(err) => return failed(&err.to_string()),
+        }
+    }
+    let Some(media_type) = sniff_image(&body) else {
+        return image_refusal(StatusCode::UNSUPPORTED_MEDIA_TYPE, IMAGE_NOT_SUPPORTED);
+    };
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, media_type),
+            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (axum::http::header::CACHE_CONTROL, "private, max-age=300"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 /// Keep `chart` and nothing else of the board's tiles: its spec, its result and
 /// its place. Returns `false` when the payload has no such chart. The board's
 /// other tiles' data never reaches a chart image's view.
@@ -322,5 +498,35 @@ pub(crate) async fn principal_of(
         )
         .into_response()),
         Err(other) => Err(store_failed(&other)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `BI-42`: the type is judged by the first bytes, never by a header; SVG,
+    /// HTML and an empty body are refused.
+    #[test]
+    fn an_image_is_known_by_its_magic_numbers_and_svg_is_refused() {
+        assert_eq!(
+            sniff_image(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0]),
+            Some("image/png")
+        );
+        assert_eq!(sniff_image(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
+        assert_eq!(sniff_image(b"GIF89a\x01\x00"), Some("image/gif"));
+        assert_eq!(sniff_image(b"GIF87a"), Some("image/gif"));
+        assert_eq!(
+            sniff_image(b"RIFF\x10\x00\x00\x00WEBPVP8 "),
+            Some("image/webp")
+        );
+        assert_eq!(sniff_image(b"RIFF\x10\x00\x00\x00WAVEfmt "), None);
+        assert_eq!(
+            sniff_image(b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"),
+            None
+        );
+        assert_eq!(sniff_image(b"<?xml version=\"1.0\"?><svg/>"), None);
+        assert_eq!(sniff_image(b"<html></html>"), None);
+        assert_eq!(sniff_image(b""), None);
     }
 }

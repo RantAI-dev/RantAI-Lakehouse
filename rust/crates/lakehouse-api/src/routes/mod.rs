@@ -1627,6 +1627,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/dashboard/embed-info", get(dashboard::embed_info))
         .route("/api/embed/data", axum::routing::post(embed::data))
         .route("/api/render/data", axum::routing::post(render::data))
+        // BI-42: one image card's picture for the print view, behind the render token.
+        .route("/api/render/image", get(render::image))
         // BI-36: the print view's uploaded maps, behind the same render token
         // as the data.
         .route(

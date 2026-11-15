@@ -60,6 +60,16 @@ afterEach(() => {
   global.fetch = originalFetch
 })
 
+// happy-dom would load (and fail) a real picture the moment it is mounted, which would fire `error`
+// before the test does; the tests fire `load` and `error` themselves.
+function quietImages() {
+  const happyDOM = (window as unknown as { happyDOM?: { settings: Record<string, unknown>; setURL: (u: string) => void } }).happyDOM
+  if (happyDOM) {
+    happyDOM.settings.disableImageLoading = true
+    happyDOM.setURL("http://localhost/")
+  }
+}
+
 function payload(extra: Record<string, unknown> = {}) {
   return {
     board: "b1",
@@ -170,6 +180,51 @@ describe("the PDF print view", () => {
     expect(JSON.parse(last.body)).toEqual({ token: "a.b.c" })
     const init = (global.fetch as unknown as { mock: { calls: [unknown, RequestInit][] } }).mock.calls.at(-1)![1]
     expect(init.method).toBe("POST")
+  })
+
+  // BI-42 (plan D6b): an image card's picture comes through the console's own
+  // origin; the view waits for it, and the placeholder stands in when it fails.
+  it("points an image card at the render image route with the token, and waits for the picture", async () => {
+    const charts = [
+      { id: "c_img", title: "Logo", kind: "image", source: "ui", def: { url: "https://img.example/logo.png" } },
+      { id: "c_web", title: "Status", kind: "web", source: "ui", def: { url: "https://img.example/status" } },
+    ]
+    quietImages()
+    serve(payload({ charts, layout: { c_img: { x: 0, y: 0, w: 6, h: 3, tab: "t1" }, c_web: { x: 6, y: 0, w: 6, h: 3, tab: "t1" } } }))
+    const { container } = render(<RenderView token="a.b.c" />)
+    const img = (await waitFor(() => {
+      const found = container.querySelector("img")
+      expect(found).not.toBeNull()
+      return found
+    })) as HTMLImageElement
+    expect(img.getAttribute("src")).toBe(
+      `/api/render/image?token=${encodeURIComponent("a.b.c")}&src=${encodeURIComponent("https://img.example/logo.png")}`,
+    )
+    expect(img.getAttribute("loading")).toBe("eager")
+    // The web card keeps the placeholder and mounts no frame.
+    expect(screen.getAllByText(NOT_IN_PDF).length).toBe(1)
+    expect(container.querySelector("iframe")).toBeNull()
+    // Not ready while the picture is loading, ready after it has.
+    await new Promise((r) => setTimeout(r, 100))
+    expect(flag()).toBeUndefined()
+    act(() => { img.dispatchEvent(new Event("load")) })
+    await waitFor(() => expect(flag()).toBe(true))
+  })
+
+  it("prints the placeholder for an image card whose picture fails, and is ready", async () => {
+    quietImages()
+    const charts = [{ id: "c_img", title: "Logo", kind: "image", source: "ui", def: { url: "https://img.example/logo.png" } }]
+    serve(payload({ charts, layout: { c_img: { x: 0, y: 0, w: 6, h: 3, tab: "t1" } } }))
+    const { container } = render(<RenderView token="t" />)
+    const img = (await waitFor(() => {
+      const found = container.querySelector("img")
+      expect(found).not.toBeNull()
+      return found
+    })) as HTMLImageElement
+    act(() => { img.dispatchEvent(new Event("error")) })
+    await screen.findByText(NOT_IN_PDF)
+    expect(container.querySelector("img")).toBeNull()
+    await waitFor(() => expect(flag()).toBe(true))
   })
 
   it("prints an image or web-page card as a placeholder and never mounts it", async () => {

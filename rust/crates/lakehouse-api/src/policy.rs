@@ -148,7 +148,7 @@ pub enum Policy {
 /// this table never needs to know about path-parameter values.
 #[rustfmt::skip]
 pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
-    // ── Public: the ONLY sixteen routes in the whole service. (Was "six" —
+    // ── Public: the ONLY seventeen routes in the whole service. (Was "six" —
     // corrected when the seventh was added, since Task A5's
     // `/api/auth/oidc/callback` had already made the old count stale; the
     // eighth is `POST /api/embed/frame`, SEC-12; the ninth is
@@ -158,7 +158,8 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // and the thirteenth are the public link's and the embed's map boundary
     // route, `PR #246 review BLOCKER 1`; the fourteenth is the readiness
     // probe, REL-2 decision D7; the fifteenth is the password rules, ADM-11; the
-    // sixteenth is the print view's map boundary route, BI-36.) ──────────────────────────────────────────────
+    // sixteenth and the seventeenth are the print view's map and image routes,
+    // BI-36 and BI-42.) ──────────────────────────────────────────────
     ("GET",  "/health",                          Policy::Public),
     // REL-2 (D7): the readiness probe an installer or an updater waits on.
     // Public because it answers only whether this stack is ready — three
@@ -171,6 +172,11 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // authenticated by the signed render token in the body, and reads as the
     // person the token names (never as the embed viewer role).
     ("POST", "/api/render/data",                  Policy::Public),
+    // BI-42 (plan D6b): one image card's picture for the print view, fetched by
+    // the API because the PDF renderer may open only the console. Public
+    // because the render token is the credential; only an address saved on an
+    // image card of the token's board, on a listed site, is ever fetched.
+    ("GET",  "/api/render/image",                 Policy::Public),
     // BI-36: an uploaded map's boundary for the print view, behind the same
     // render token; a map no chart on the token's board draws on is a 404.
     ("POST", "/api/render/maps/{id}/geojson",     Policy::Public),
@@ -1554,7 +1560,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_sixteen_public_entries_exist() {
+    fn exactly_seventeen_public_entries_exist() {
         // Pre-existing drift found while landing the `/api/auth/providers`
         // route: this assertion was still pinned at 4 even though the two
         // earlier OIDC public routes (`/api/auth/oidc/start`,
@@ -1580,9 +1586,9 @@ mod tests {
         // REL-2 decision D7 added `GET /health/ready`, the readiness probe an
         // installer or an updater waits on: 13 -> 14.
         // ADM-11 (D4) / ADM-11 review 1 B3 added `GET /api/auth/password-rules`: 14 -> 15.
-        // BI-36 added the print view's map boundary route, authenticated by the
-        // render token: 15 -> 16.
-        assert_eq!(public_count, 16);
+        // BI-36 and BI-42 added the print view's map and image routes, each
+        // authenticated by the render token: 15 -> 17.
+        assert_eq!(public_count, 17);
     }
 
     /// SEC-23 (F1), ADM-13 (D5): adding a governance rule needs `governance:write`;
