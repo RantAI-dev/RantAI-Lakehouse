@@ -590,16 +590,25 @@ pub struct NamespacesQuery {
 
 /// `GET /api/lakehouse/namespaces?warehouse=`.
 ///
+/// `SEC-20`: a namespace's `tableCount` is of the tables the caller's tenant
+/// may read (see [`leave_out_tables_out_of_reach`]), so another tenant's
+/// upload table is not counted.
+///
 /// # Errors
-/// 404 if `warehouse` names anything other than the configured warehouse,
-/// 503 if the catalog cannot be reached, or if the reader token is
-/// unavailable.
+/// 404 if `warehouse` names anything other than the configured warehouse, or
+/// if `X-Tenant` names a tenant the caller does not belong to, 503 if the
+/// catalog cannot be reached, if the reader token is unavailable, or if the
+/// deployment's tenant count cannot be read.
 pub async fn namespaces(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Query(query): Query<NamespacesQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     validate_warehouse(&state, query.warehouse.as_deref())?;
+    // `SEC-20`: the reach is resolved once, before the catalog is asked, as
+    // `tables` does, so every namespace is counted under the same answer.
+    let reach = crate::routes::query::resolve_reach(&state, &principal, &headers).await?;
 
     let idents = lakehouse_catalog::call(&state, |client| async move {
         rest::list_namespaces(&client).await
@@ -623,14 +632,22 @@ pub async fn namespaces(
     // namespace with none of them is not listed at all — a hidden table does
     // not appear anywhere. A lookup that failed leaves the caller unable to
     // prove the namespace holds anything visible, so it goes too.
+    //
+    // `SEC-20`: "may read" also means in the caller's tenant's reach, so a
+    // claim that cannot be read fails the lookup like a catalog error does.
     let table_counts = bounded::run_with_budget(names.clone(), Duration::from_secs(2), 8, {
         let access = access.clone();
+        let state = state.clone();
         move |name: String| {
             let access = access.clone();
             let client = client.clone();
+            let state = state.clone();
             async move {
                 let ns = NamespaceIdent::from_strs([name.as_str()]).ok()?;
                 let idents = rest::list_table_idents(&client, &ns).await.ok()?;
+                let idents = leave_out_tables_out_of_reach(&state, reach, &name, idents)
+                    .await
+                    .ok()?;
                 let visible = idents
                     .iter()
                     .filter(|ident| access.allows(&name, ident.name()))
@@ -1824,6 +1841,7 @@ mod tests {
             let body = namespaces(
                 State(state),
                 Extension(principal),
+                HeaderMap::new(),
                 Query(NamespacesQuery { warehouse: None }),
             )
             .await

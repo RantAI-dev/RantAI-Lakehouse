@@ -591,8 +591,8 @@ async fn assemble(
 ///
 /// [`ApiError::NotFound`] when `X-Tenant` names a tenant the caller does
 /// not belong to, and [`ApiError::Unavailable`] when the shared-catalog
-/// rule cannot be evaluated: both from the same helpers the catalog and
-/// connector routes use.
+/// rule cannot be evaluated or an upload table's claim cannot be read: all
+/// from the same helpers the catalog and connector routes use.
 pub(crate) async fn build(
     state: &AppState,
     principal: &Principal,
@@ -640,6 +640,32 @@ pub(crate) async fn build(
             .collect();
         for id in hidden {
             keep.remove(&id);
+        }
+    }
+    // SEC-20, plan 95: a Bronze node for an upload table another tenant holds
+    // is not drawn either, and neither are the edges that touch it, even for
+    // the tenant that owns the shared catalog. A tenant's own records name
+    // only its own claims, but an authored pipeline can name any table as an
+    // input.
+    //
+    // Only the claim [`TableClaim::Theirs`] is acted on, not the whole of
+    // `table_is_reachable`: a Bronze table no upload claimed (one a connector
+    // ingests into) is unclaimed and the caller's own, and the lineage page
+    // draws it. "Another tenant holds it" is the one arm that rule never
+    // reaches for anybody (`table_is_reachable`'s own doc comment).
+    if let crate::routes::query::TenantReach::Tenant { tenant_id, .. } =
+        crate::routes::query::resolve_reach(state, principal, headers).await?
+    {
+        let bronze: Vec<(String, String)> = keep
+            .iter()
+            .filter_map(|id| node_table_key(id).map(|key| (id.clone(), key)))
+            .filter(|(_, key)| key.starts_with("bronze."))
+            .collect();
+        for (id, key) in bronze {
+            let claim = crate::routes::query::claim_on(state, tenant_id, &key).await?;
+            if claim == lakehouse_store::uploads::TableClaim::Theirs {
+                keep.remove(&id);
+            }
         }
     }
     let nodes: Vec<Value> = g

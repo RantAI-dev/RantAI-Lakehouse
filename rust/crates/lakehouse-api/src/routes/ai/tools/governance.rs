@@ -119,8 +119,94 @@ fn latest_per_slot(result: Value) -> Value {
     json!({ "slots": slots, "note": "each slot's most recent check" })
 }
 
-pub(super) async fn get_maintenance_metrics(state: &AppState) -> Value {
-    governance_kind(state, "maintenance").await
+/// `SEC-20` (plan 95): every table's maintenance history, as the person
+/// behind the chat may read it.
+///
+/// The history names every table the Bronze job ever compacted, upload
+/// tables included. A person the shared-catalog rule refuses gets that rule's
+/// answer and no row; a person it admits gets the rows of the tables in the
+/// caller's reach, by the rule Query Studio keeps
+/// ([`crate::routes::query::table_is_reachable`]): another tenant's upload
+/// table is left out even for the tenant that owns the catalog.
+///
+/// No principal is a headless run: it is not narrowed, the convention
+/// `list_datasets` and `draft_quality_rule` have.
+pub(super) async fn get_maintenance_metrics(
+    state: &AppState,
+    principal: Option<&Principal>,
+) -> Value {
+    let Some(principal) = principal else {
+        return governance_kind(state, "maintenance").await;
+    };
+    if let Some(refusal) = super::data::shared_catalog_refusal(state, principal).await {
+        return refusal;
+    }
+    let headers = axum::http::HeaderMap::new();
+    let Ok(reach) = crate::routes::query::resolve_reach(state, principal, &headers).await else {
+        return json!({ "error": "the shared-catalog rule could not be evaluated" });
+    };
+    let mut history = governance_kind(state, "maintenance").await;
+    if leave_out_runs_out_of_reach(state, reach, &mut history)
+        .await
+        .is_err()
+    {
+        return json!({ "error": "the table claims could not be read right now" });
+    }
+    history
+}
+
+/// Drops, in place, the maintenance rows of the tables `reach` does not
+/// cover. An answer with no `maintenance` list (an error body) is left as it
+/// is.
+///
+/// One claim is read per table, not per run: the history holds every run, so
+/// a table appears many times.
+///
+/// # Errors
+///
+/// The 503 of [`crate::routes::query::claim_on`] when a claim cannot be read;
+/// the caller answers with a fixed sentence, never the cause.
+async fn leave_out_runs_out_of_reach(
+    state: &AppState,
+    reach: crate::routes::query::TenantReach,
+    history: &mut Value,
+) -> Result<(), lakehouse_core::ApiError> {
+    use crate::routes::query::{TenantReach, claim_on, table_is_reachable};
+
+    let tenant_id = match reach {
+        TenantReach::All => return Ok(()),
+        TenantReach::NoTenant => None,
+        TenantReach::Tenant { tenant_id, .. } => Some(tenant_id),
+    };
+    let Some(rows) = history.get_mut("maintenance").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    let mut verdicts: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut kept = Vec::with_capacity(rows.len());
+    for row in rows.drain(..) {
+        let table = row
+            .get("tableName")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let reachable = match (verdicts.get(&table), tenant_id) {
+            (Some(known), _) => *known,
+            // `table_is_reachable` answers `false` for this reach whatever
+            // the claim is, so no claim needs reading.
+            (None, None) => false,
+            (None, Some(tenant_id)) => {
+                let claim = claim_on(state, tenant_id, &table).await?;
+                let known = table_is_reachable(reach, claim);
+                verdicts.insert(table, known);
+                known
+            }
+        };
+        if reachable {
+            kept.push(row);
+        }
+    }
+    *rows = kept;
+    Ok(())
 }
 
 /// Builds the `POST /api/governance/policies` body from the tool's args,
