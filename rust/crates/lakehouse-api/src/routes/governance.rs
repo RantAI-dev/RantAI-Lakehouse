@@ -139,10 +139,12 @@ const AUDIT_READ_DENIED: &str = "reading the audit trail needs the audit:read pe
 /// person behind the chat and no request headers of their own. A quality list
 /// is narrowed by the catalog's tenant rule and by the caller's table access
 /// (`GOV-15 (GOV-12 plan, section 4)`), because every row is a rule on a
-/// table. The other kinds are not narrowed by this change — classification
-/// and maintenance rows do name tables, but the plan's scope is the quality
-/// rules (`GOV-15`); narrowing them is a separate item. No principal is a
-/// system call and is not narrowed, which
+/// table. A maintenance history is narrowed by the caller's reach over
+/// tables (`SEC-20`, plan 95), because every row names a table and the
+/// history names upload tables of every tenant: see
+/// [`retain_runs_in_reach`]. The other kinds are not narrowed by this
+/// change — classification rows do name tables, but narrowing them is a
+/// separate item. No principal is a system call and is not narrowed, which
 /// [`crate::routes::quality::quality_table_access`] documents.
 pub(crate) async fn read_kind(
     state: &AppState,
@@ -176,6 +178,20 @@ pub(crate) async fn read_kind(
     } else {
         None
     };
+    // `SEC-20` (plan 95): the reach is resolved here for the same reason, so
+    // a header naming a tenant the caller does not belong to is the 404 every
+    // route answers, and causes no `ClickHouse` query. It is not a refusal of
+    // the whole list: a caller the shared catalog is closed to still reads
+    // the runs of the upload tables its own tenant holds.
+    let maintenance_reach = match principal {
+        Some(principal) if parsed == Kind::Maintenance => {
+            match crate::routes::query::resolve_reach(state, principal, headers).await {
+                Ok(reach) => Some(reach),
+                Err(err) => return ApiRejection(err).into_response(),
+            }
+        }
+        _ => None,
+    };
     match parsed {
         Kind::Unknown => (
             StatusCode::BAD_REQUEST,
@@ -186,6 +202,11 @@ pub(crate) async fn read_kind(
             Ok(mut body) => {
                 if let Some(access) = narrowing {
                     retain_readable_rules(&access, &mut body);
+                }
+                if let Some(reach) = maintenance_reach
+                    && let Err(err) = retain_runs_in_reach(state, reach, &mut body).await
+                {
+                    return ApiRejection(err).into_response();
                 }
                 (StatusCode::OK, ApiJson(body)).into_response()
             }
@@ -239,6 +260,46 @@ fn retain_readable_rules(access: &crate::table_access::TableAccess, body: &mut V
     {
         row["id"] = json!(format!("q-{index}"));
     }
+}
+
+/// `SEC-20` (plan 95): drops, in place, the maintenance runs of the tables
+/// `reach` does not cover.
+///
+/// The history names every table the Bronze job ever compacted, upload
+/// tables included, so a person reads the rows of the tables in their reach
+/// by the rule Query Studio keeps ([`crate::routes::query::reachable_names`]):
+/// another tenant's upload table is left out even for the tenant that owns the
+/// shared catalog. The claims are read once for the distinct tables, because
+/// the history holds every run and a table appears many times. A row with no
+/// `tableName` is left out of a narrowed answer (fail closed). An answer with
+/// no `maintenance` list is left as it is.
+///
+/// # Errors
+///
+/// The 503 of [`crate::routes::query::claims_on`] when the claims cannot be
+/// read; the response carries its fixed sentence, never the cause.
+async fn retain_runs_in_reach(
+    state: &AppState,
+    reach: crate::routes::query::TenantReach,
+    body: &mut Value,
+) -> Result<(), ApiError> {
+    if reach == crate::routes::query::TenantReach::All {
+        return Ok(());
+    }
+    let Some(rows) = body.get_mut("maintenance").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    let table_of = |row: &Value| {
+        row.get("tableName")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    let mut tables: Vec<String> = rows.iter().filter_map(table_of).collect();
+    tables.sort();
+    tables.dedup();
+    let reachable = crate::routes::query::reachable_names(state, reach, &tables).await?;
+    rows.retain(|row| table_of(row).is_some_and(|table| reachable.contains(&table)));
+    Ok(())
 }
 
 /// A fixed, classified message for a failed governance read. The raw

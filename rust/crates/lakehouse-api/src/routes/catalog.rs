@@ -294,17 +294,28 @@ pub async fn list(
         Ok(access) => access,
         Err(err) => return ApiRejection(err).into_response(),
     };
+    // `SEC-20` (plan 95): the reach over upload tables, resolved before the
+    // snapshot is read, so a caller that holds the shared catalog still does
+    // not list another tenant's upload.
+    let reach = match crate::routes::query::resolve_reach(&state, &principal, &headers).await {
+        Ok(reach) => reach,
+        Err(err) => return ApiRejection(err).into_response(),
+    };
+    let unnarrowed = access.is_all() && reach == crate::routes::query::TenantReach::All;
     if let Some(term) = params.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
         return match search_snapshot(&state).await {
             Ok(snapshot) => {
                 // A narrowed caller's count must be of the tables it may see,
                 // so it searches the whole ranked list and counts after the
                 // filter; an unrestricted caller keeps the limit in the index.
-                let search_limit = if access.is_all() { limit } else { None };
+                let search_limit = if unnarrowed { limit } else { None };
                 let outcome =
                     catalog_search::search(&snapshot.index, &snapshot.usage, term, search_limit);
                 let mut assets = outcome.assets;
                 retain_visible(&access, &mut assets);
+                if let Err(err) = retain_in_reach(&state, reach, &mut assets).await {
+                    return ApiRejection(err).into_response();
+                }
                 let mut body = json!({
                     "assets": assets,
                     "namespaces": build_namespaces(&assets),
@@ -315,7 +326,7 @@ pub async fn list(
                 // index applied the limit after ranking); a narrowed one's is
                 // the visible matches it filtered above.
                 if let Some(limit) = limit {
-                    let total = if access.is_all() {
+                    let total = if unnarrowed {
                         outcome.total
                     } else {
                         assets.len()
@@ -342,6 +353,9 @@ pub async fn list(
                 .cloned()
                 .unwrap_or_default();
             retain_visible(&access, &mut assets);
+            if let Err(err) = retain_in_reach(&state, reach, &mut assets).await {
+                return ApiRejection(err).into_response();
+            }
             if let Some(limit) = limit {
                 let total = assets.len();
                 assets.truncate(limit);
@@ -524,6 +538,8 @@ pub async fn query(
     // before anything is counted or paged, so a hidden table is never in the
     // answer or its `totalItems`.
     retain_visible(&table_access_for(&state, &principal).await?, &mut filtered);
+    // `SEC-20` (plan 95): the same, for the reach over upload tables.
+    retain_in_callers_reach(&state, &principal, &headers, &mut filtered).await?;
     order_results(&mut filtered, term.is_some(), &sort);
     // `DATA-41` D6: with no filters the rows are not copied at all.
     catalog_query::apply_filters(&mut filtered, &filters, join);
@@ -1792,7 +1808,15 @@ pub async fn detail(
         // A Bronze id is a registry slug; the body names the table it serves
         // (`tableKey`), so the registry answers the question, not a guess.
         match bronze_asset_detail_body(&state, &principal, &headers, &id).await {
-            Ok(Some(body)) if asset_visible(&access, &body) => body,
+            // `SEC-20` (plan 95): the table the body names, not the slug in
+            // `id`, is what an upload's claim is held under. A body that
+            // names none is not an upload.
+            Ok(Some(body)) if asset_visible(&access, &body) => {
+                if let Some(key) = asset_table_key(&body) {
+                    ensure_key_in_reach(&state, &principal, &headers, key).await?;
+                }
+                body
+            }
             Ok(_) => return Err(not_found()),
             // `catch (e) { return NextResponse.json({ error: String(e) }, {
             // status: 503 }); }` in `catalog/[id]/route.ts`.
@@ -2415,6 +2439,10 @@ pub async fn sample(
     if let Some(source) = source.as_ref() {
         let access = table_access_for(&state, &principal).await?;
         ensure_key_readable_with(&access, &source.policy_key)?;
+        // `SEC-20` (plan 95): an upload another tenant holds answers the same
+        // 404. The rewrite in `governed_sample` would also withhold the rows,
+        // but it answers an empty 200 that tells the asset exists.
+        ensure_key_in_reach(&state, &principal, &headers, &source.policy_key).await?;
     }
     let (rows, _) = governed_sample(&state, &principal, &headers, source.as_ref(), limit).await;
     Ok(ApiJson(json!({ "rows": rows, "limit": limit })))
@@ -3255,6 +3283,85 @@ pub(crate) fn retain_visible(access: &crate::table_access::TableAccess, assets: 
         return;
     }
     assets.retain(|asset| asset_visible(access, asset));
+}
+
+/// `SEC-20` (plan 95): drop every asset of `assets` whose table is out of the
+/// caller's reach, in place.
+///
+/// The role's table access ([`retain_visible`]) says which tables a role may
+/// read; the reach says which tenant's tables the caller may read at all.
+/// The catalog is shared, so the tenant that owns it passes
+/// [`catalog_tenant_refusal`] and would otherwise list an upload another
+/// tenant made: the registry row's `tableKey` is `bronze.<table_name>`, the
+/// key the claim is held under. The rule is
+/// [`crate::routes::query::reachable_names`], read once for the whole list.
+/// An asset that names no table cannot be claimed and stays.
+///
+/// # Errors
+///
+/// The 503 of [`crate::routes::query::claims_on`] when the claims cannot be
+/// read.
+pub(crate) async fn retain_in_reach(
+    state: &AppState,
+    reach: crate::routes::query::TenantReach,
+    assets: &mut Vec<Value>,
+) -> Result<(), ApiError> {
+    if reach == crate::routes::query::TenantReach::All {
+        return Ok(());
+    }
+    let keys: Vec<String> = assets
+        .iter()
+        .filter_map(|asset| asset_table_key(asset))
+        .map(str::to_owned)
+        .collect();
+    let reachable = crate::routes::query::reachable_names(state, reach, &keys).await?;
+    assets.retain(|asset| asset_table_key(asset).is_none_or(|key| reachable.contains(key)));
+    Ok(())
+}
+
+/// `SEC-20` (plan 95): [`retain_in_reach`] for a route that has no use for the
+/// reach itself.
+///
+/// # Errors
+///
+/// 404 for an `X-Tenant` header that names a tenant the caller does not
+/// belong to; 503 when the claims cannot be read.
+async fn retain_in_callers_reach(
+    state: &AppState,
+    principal: &Principal,
+    headers: &HeaderMap,
+    assets: &mut Vec<Value>,
+) -> Result<(), ApiError> {
+    let reach = crate::routes::query::resolve_reach(state, principal, headers).await?;
+    retain_in_reach(state, reach, assets).await
+}
+
+/// `SEC-20` (plan 95): refuses a read of one asset whose table `key` is out of
+/// the caller's reach, with the 404 an unknown id answers.
+///
+/// [`retain_in_reach`] for a read that names one asset. The answer is
+/// [`asset_not_found`], not Query Studio's sentence, so the refusal does not
+/// say whether the asset exists: an asset out of reach and an id no asset
+/// has read the same.
+///
+/// # Errors
+///
+/// 404 [`asset_not_found`] for a table out of reach, and for an `X-Tenant`
+/// header that names a tenant the caller does not belong to; 503 when the
+/// claim cannot be read.
+pub(crate) async fn ensure_key_in_reach(
+    state: &AppState,
+    principal: &Principal,
+    headers: &HeaderMap,
+    key: &str,
+) -> Result<(), ApiError> {
+    let reach = crate::routes::query::resolve_reach(state, principal, headers).await?;
+    let reachable = crate::routes::query::reachable_names(state, reach, &[key.to_owned()]).await?;
+    if reachable.contains(key) {
+        Ok(())
+    } else {
+        Err(asset_not_found())
+    }
 }
 
 /// The names of the tables among `ids` that `access` may read, in the order

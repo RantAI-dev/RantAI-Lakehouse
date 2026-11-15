@@ -363,6 +363,11 @@ pub async fn profile(
     // asset answers.
     let access = crate::routes::catalog::table_access_for(&state, &principal).await?;
     crate::routes::catalog::ensure_key_readable_with(&access, &source.policy_key)?;
+    // `SEC-20` (plan 95): an upload another tenant holds answers the same 404.
+    // The rewrite below refuses it too, but with Query Studio's sentence,
+    // which names the table and so tells the asset exists.
+    crate::routes::catalog::ensure_key_in_reach(&state, &principal, &headers, &source.policy_key)
+        .await?;
     // Underscore-prefixed columns are loader bookkeeping, hidden from the
     // detail schema and sample too.
     let all: Vec<(String, String)> = source

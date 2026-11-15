@@ -1073,3 +1073,424 @@ async fn the_namespace_count_of_a_listing_of_many_claimed_tables_is_complete() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(table_count(&body, "bronze"), Value::Null, "{body}");
 }
+
+// ── Plan 95, part 2: the maintenance routes and the catalog routes ──────
+
+/// A service identity with no scopes, and its bearer token: the shape of
+/// `lakehouse-maintenance-policy-reader`, the identity Dagster reads the
+/// policy list with (`bootstrap_lakehouse_maintenance_service`).
+async fn service_token_without_scopes(pool: &PgPool) -> String {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO service_identity (id, name, scopes, environment, expires_at) \
+         VALUES ($1, $2, '{}', 'production', now() + interval '1 day')",
+    )
+    .bind(id)
+    .bind(format!("tenant-scope-reader-{id}"))
+    .execute(pool)
+    .await
+    .expect("create the service identity");
+    lakehouse_auth::service_token::create_service_credential(pool, id)
+        .await
+        .expect("mint the service identity's credential")
+        .expose()
+        .to_owned()
+}
+
+/// `GET uri` as the holder of a service bearer token.
+async fn get_as_service(router: &axum::Router, uri: &str, token: &str) -> (StatusCode, Value) {
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+    let body = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
+    (status, body)
+}
+
+/// The `namespace.tableName` of each policy a policy list answered, sorted.
+fn policy_names(body: &Value) -> Vec<String> {
+    let mut names: Vec<String> = body["policies"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a list of policies: {body}"))
+        .iter()
+        .map(|p| {
+            format!(
+                "{}.{}",
+                p["namespace"].as_str().expect("a namespace"),
+                p["tableName"].as_str().expect("a table name")
+            )
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// One policy for each of the three Bronze tables, written by an operator
+/// (whose reach is everything).
+async fn store_a_policy_for_each_table(router: &axum::Router, operator: &str) {
+    for table in [GROUP_TABLE, RETAIL_TABLE, SHARED_TABLE] {
+        let (status, body) = send(
+            router,
+            "POST",
+            &format!("/api/lakehouse/tables/bronze/{table}/maintenance"),
+            operator,
+            None,
+            Some(policy_body()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn the_maintenance_history_route_leaves_out_the_tables_the_caller_may_not_read() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_clickhouse_with_data(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let uri = "/api/governance/maintenance";
+    let owner = cookie_in_tenant(&pool, "governance:read", CATALOG_TENANT).await;
+    let other = cookie_in_tenant(&pool, "governance:read", OTHER_TENANT).await;
+    let operator = operator_cookie(&pool).await;
+
+    // The owning tenant: its own upload and the shared table, never the
+    // upload the other tenant holds.
+    let (status, body) = get(&router, uri, &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        maintenance_tables(&body),
+        vec![
+            format!("bronze.{GROUP_TABLE}"),
+            format!("bronze.{SHARED_TABLE}")
+        ],
+        "{body}"
+    );
+
+    // Another tenant: its own upload only. The shared table and the owning
+    // tenant's upload are named nowhere.
+    let (status, body) = get(&router, uri, &other, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        maintenance_tables(&body),
+        vec![format!("bronze.{RETAIL_TABLE}")],
+        "{body}"
+    );
+
+    // An operator reaches everything.
+    let (status, body) = get(&router, uri, &operator, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(maintenance_tables(&body).len(), 3, "{body}");
+}
+
+#[tokio::test]
+async fn the_policy_list_holds_only_the_policies_of_the_tables_a_person_may_read() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_empty_clickhouse(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let operator = operator_cookie(&pool).await;
+    store_a_policy_for_each_table(&router, &operator).await;
+    let uri = "/api/lakehouse/maintenance-policies";
+    let owner = cookie_in_tenant(&pool, "catalog:read", CATALOG_TENANT).await;
+    let other = cookie_in_tenant(&pool, "catalog:read", OTHER_TENANT).await;
+
+    // The owning tenant: its own upload and the shared table, not the other
+    // tenant's upload (the reverse direction).
+    let (status, body) = get(&router, uri, &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        policy_names(&body),
+        vec![
+            format!("bronze.{GROUP_TABLE}"),
+            format!("bronze.{SHARED_TABLE}")
+        ],
+        "{body}"
+    );
+
+    // Another tenant: its own upload only.
+    let (status, body) = get(&router, uri, &other, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        policy_names(&body),
+        vec![format!("bronze.{RETAIL_TABLE}")],
+        "{body}"
+    );
+
+    // An operator reaches all three.
+    let (status, body) = get(&router, uri, &operator, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(policy_names(&body).len(), 3, "{body}");
+}
+
+#[tokio::test]
+async fn the_policy_list_stays_whole_for_the_service_identity_dagster_reads_it_with() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_empty_clickhouse(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let operator = operator_cookie(&pool).await;
+    store_a_policy_for_each_table(&router, &operator).await;
+    let token = service_token_without_scopes(&pool).await;
+
+    // The maintenance job runs every table's policy, whichever tenant holds
+    // it, so its identity (no tenant, no scope) reads the whole list.
+    let (status, body) =
+        get_as_service(&router, "/api/lakehouse/maintenance-policies", &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        policy_names(&body),
+        vec![
+            format!("bronze.{GROUP_TABLE}"),
+            format!("bronze.{RETAIL_TABLE}"),
+            format!("bronze.{SHARED_TABLE}")
+        ],
+        "{body}"
+    );
+}
+
+/// The registry rows of the two upload assets: the slug each is addressed
+/// by, and the table it names.
+const GROUP_SLUG: &str = "ds_group_orders";
+const RETAIL_SLUG: &str = "ds_retail_orders";
+
+/// `ClickHouse` as the Bronze registry holds two upload datasets, one on the
+/// owning tenant's table and one on the other tenant's, both readable
+/// through the Iceberg query database. Every other query answers no rows.
+#[derive(Clone, Default)]
+struct RegistryFake;
+
+fn ch_rows(meta: &[&str], data: &[Value]) -> ResponseTemplate {
+    let count = data.len();
+    let meta: Vec<Value> = meta
+        .iter()
+        .map(|name| json!({ "name": name, "type": "String" }))
+        .collect();
+    ResponseTemplate::new(200).set_body_json(json!({ "meta": meta, "data": data, "rows": count }))
+}
+
+/// The table a slug of the two registry rows names.
+fn table_of_slug(sql: &str) -> Option<&'static str> {
+    [(GROUP_SLUG, GROUP_TABLE), (RETAIL_SLUG, RETAIL_TABLE)]
+        .into_iter()
+        .find(|(slug, _)| sql.contains(&format!("'{slug}'")))
+        .map(|(_, table)| table)
+}
+
+impl wiremock::Respond for RegistryFake {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let sql = String::from_utf8_lossy(&request.body).into_owned();
+        // The list: both registry rows.
+        if sql.starts_with("SELECT slug, title, description, tier, updated_at, table_name") {
+            let rows: Vec<Value> = [(GROUP_SLUG, GROUP_TABLE), (RETAIL_SLUG, RETAIL_TABLE)]
+                .into_iter()
+                .map(|(slug, table)| {
+                    json!({
+                        "slug": slug, "title": slug, "description": "orders",
+                        "tier": "primer", "updated_at": "2026-11-01T00:00:00Z",
+                        "table_name": table, "lag": "60",
+                    })
+                })
+                .collect();
+            return ch_rows(&["slug"], &rows);
+        }
+        // The page's header row for one slug.
+        if sql.starts_with("SELECT slug, title, description, tier, table_name, toString(total)") {
+            return match table_of_slug(&sql) {
+                Some(table) => ch_rows(
+                    &["slug"],
+                    &[json!({
+                        "slug": if table == GROUP_TABLE { GROUP_SLUG } else { RETAIL_SLUG },
+                        "title": "orders", "description": "orders", "tier": "primer",
+                        "table_name": table, "total": "10", "author": "", "frekuensi": "",
+                        "satuan": "", "klasifikasi": "", "updated_at": "2026-11-01T00:00:00Z",
+                        "lag": "60",
+                    })],
+                ),
+                None => ch_rows(&[], &[]),
+            };
+        }
+        // The table a slug names, for the sample and the profile.
+        if sql.starts_with("SELECT table_name FROM lake.`bronze_meta.dataset_sync`") {
+            return match table_of_slug(&sql) {
+                Some(table) => ch_rows(&["table_name"], &[json!({ "table_name": table })]),
+                None => ch_rows(&[], &[]),
+            };
+        }
+        if sql.contains("FROM system.columns") && sql.contains("default_kind") {
+            return ch_rows(
+                &["name", "default_kind", "default_expression"],
+                &[json!({ "name": "id", "default_kind": "", "default_expression": "" })],
+            );
+        }
+        if sql.starts_with("DESCRIBE TABLE") {
+            return ch_rows(
+                &["name", "type"],
+                &[json!({ "name": "id", "type": "Int64" })],
+            );
+        }
+        if sql.contains("icecat_api") {
+            return ch_rows(&["id"], &[json!({ "id": "1" })]);
+        }
+        ch_rows(&[], &[])
+    }
+}
+
+/// The deployment of the catalog routes: Meridian Group owns the shared
+/// catalog, and the registry holds the two upload datasets.
+async fn spin_up_with_registry(ch: &MockServer) -> TestApp {
+    Mock::given(method("POST"))
+        .respond_with(RegistryFake)
+        .mount(ch)
+        .await;
+    let mut env = HashMap::new();
+    env.insert("CH_URL".to_owned(), ch.uri());
+    env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
+    env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
+    spin_up_with_env(&env).await
+}
+
+/// The ids of the assets a catalog list or page answered.
+fn asset_ids(body: &Value, key: &str) -> Vec<String> {
+    let mut ids: Vec<String> = body[key]
+        .as_array()
+        .unwrap_or_else(|| panic!("a list of {key}: {body}"))
+        .iter()
+        .map(|a| a["id"].as_str().expect("an asset id").to_owned())
+        .collect();
+    ids.sort();
+    ids
+}
+
+const CATALOG_READER_WITH_SAMPLES: &str = "catalog:read, query:read";
+
+/// The registry, as the owning tenant and an operator read it.
+async fn registry_readers() -> (MockServer, axum::Router, String, String) {
+    let ch = MockServer::start().await;
+    let TestApp { router, pool } = spin_up_with_registry(&ch).await;
+    claim_the_uploads(&pool).await;
+    let owner = cookie_in_tenant(&pool, "catalog:read", CATALOG_TENANT).await;
+    let operator = operator_cookie(&pool).await;
+    // The mock server stands in for `ClickHouse` only while it is alive.
+    (ch, router, owner, operator)
+}
+
+/// The other tenant's upload is named nowhere in `body`.
+fn assert_no_trace_of_the_retail_upload(uri: &str, body: &Value) {
+    let text = body.to_string();
+    assert!(
+        !text.contains(RETAIL_TABLE) && !text.contains(RETAIL_SLUG),
+        "the other tenant's upload is named nowhere in {uri}: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_catalog_list_leaves_out_another_tenants_upload_asset_for_the_owning_tenant() {
+    let (_ch, router, owner, operator) = registry_readers().await;
+
+    let (status, body) = get(&router, "/api/catalog", &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(asset_ids(&body, "assets"), vec![GROUP_SLUG], "{body}");
+    assert_no_trace_of_the_retail_upload("/api/catalog", &body);
+
+    // An operator reaches both.
+    let (status, body) = get(&router, "/api/catalog", &operator, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(asset_ids(&body, "assets").len(), 2, "{body}");
+}
+
+#[tokio::test]
+async fn the_catalog_search_leaves_out_another_tenants_upload_asset_for_the_owning_tenant() {
+    let (_ch, router, owner, _operator) = registry_readers().await;
+
+    let (status, body) = get(&router, "/api/catalog?q=orders", &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(asset_ids(&body, "assets"), vec![GROUP_SLUG], "{body}");
+    assert_no_trace_of_the_retail_upload("/api/catalog?q=orders", &body);
+
+    // The count of a limited search is of the assets the caller may see.
+    let (status, body) = get(&router, "/api/catalog?q=orders&limit=1", &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total"], json!(1), "{body}");
+}
+
+#[tokio::test]
+async fn the_paged_catalog_query_leaves_out_another_tenants_upload_asset_for_the_owning_tenant() {
+    let (_ch, router, owner, _operator) = registry_readers().await;
+
+    // The page counts what it holds before it pages, so the total is the
+    // caller's.
+    let (status, body) = get(&router, "/api/catalog/query", &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(asset_ids(&body, "items"), vec![GROUP_SLUG], "{body}");
+    assert_eq!(body["totalItems"], json!(1), "{body}");
+    assert_no_trace_of_the_retail_upload("/api/catalog/query", &body);
+}
+
+/// The read at `/api/catalog/{slug}{suffix}`, as the owning tenant makes it:
+/// the other tenant's upload answers the 404 an unknown id answers, byte for
+/// byte, and the owning tenant's own upload still opens.
+async fn assert_the_other_tenants_upload_is_the_unknown_404(suffix: &str) {
+    let ch = MockServer::start().await;
+    let TestApp { router, pool } = spin_up_with_registry(&ch).await;
+    claim_the_uploads(&pool).await;
+    let owner = cookie_in_tenant(&pool, CATALOG_READER_WITH_SAMPLES, CATALOG_TENANT).await;
+
+    let (status, unknown) = get(
+        &router,
+        &format!("/api/catalog/ds_no_such{suffix}"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{unknown}");
+
+    let (status, refused) = get(
+        &router,
+        &format!("/api/catalog/{RETAIL_SLUG}{suffix}"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
+    assert_eq!(refused, unknown, "a refusal is no oracle");
+
+    let (status, own) = get(
+        &router,
+        &format!("/api/catalog/{GROUP_SLUG}{suffix}"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{own}");
+}
+
+#[tokio::test]
+async fn the_page_of_another_tenants_upload_asset_is_the_unknown_404_for_the_owning_tenant() {
+    assert_the_other_tenants_upload_is_the_unknown_404("").await;
+}
+
+#[tokio::test]
+async fn the_sample_of_another_tenants_upload_asset_is_the_unknown_404_for_the_owning_tenant() {
+    assert_the_other_tenants_upload_is_the_unknown_404("/sample").await;
+}
+
+#[tokio::test]
+async fn the_profile_of_another_tenants_upload_asset_is_the_unknown_404_for_the_owning_tenant() {
+    assert_the_other_tenants_upload_is_the_unknown_404("/profile").await;
+}

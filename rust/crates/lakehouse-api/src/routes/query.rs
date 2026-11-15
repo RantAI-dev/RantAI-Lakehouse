@@ -1081,6 +1081,41 @@ pub(crate) async fn claims_on(
     Ok(claims)
 }
 
+/// `SEC-20` (plan 95): the names of `names` that `reach` covers, in one read.
+///
+/// The one place a reader that lists or counts tables asks "which of these
+/// may the caller read". It composes [`claims_on`] and [`table_is_reachable`]
+/// and adds no rule of its own, so the catalog routes, the maintenance
+/// readers and the assistant's tools cannot each keep a slightly different
+/// copy of the answer (`AGENTS.md` rule 4).
+///
+/// [`TenantReach::All`] covers every name and [`TenantReach::NoTenant`]
+/// covers none, so neither reads a claim: `table_is_reachable` answers both
+/// whatever the claim is. A name that is not `bronze.<raw>` cannot be
+/// claimed, so it is covered only for the tenant that owns the shared
+/// catalog.
+///
+/// # Errors
+///
+/// The 503 of [`claims_on`] when the claims cannot be read.
+pub(crate) async fn reachable_names(
+    state: &AppState,
+    reach: TenantReach,
+    names: &[String],
+) -> Result<std::collections::HashSet<String>, ApiError> {
+    let tenant_id = match reach {
+        TenantReach::All => return Ok(names.iter().cloned().collect()),
+        TenantReach::NoTenant => return Ok(std::collections::HashSet::new()),
+        TenantReach::Tenant { tenant_id, .. } => tenant_id,
+    };
+    let claims = claims_on(state, tenant_id, names).await?;
+    Ok(claims
+        .into_iter()
+        .filter(|(_, claim)| table_is_reachable(reach, *claim))
+        .map(|(name, _)| name)
+        .collect())
+}
+
 /// `SEC-50` slice 2 M1/M2: the tables a statement names, checked against a
 /// reach that is already resolved.
 ///
