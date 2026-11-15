@@ -155,3 +155,18 @@ describe("dashboard grid reflow on a narrow canvas", () => {
     expect(boxOf("K4").top).toBe("0px")
   })
 })
+
+describe("edit mode canvas", () => {
+  it("keeps every resize handle inside its tile box, so the scroll region never widens", () => {
+    atWidth(1200)
+    grid({ editable: true, tabs: undefined, tab: undefined })
+    const handles = document.querySelectorAll('[title="Drag to resize"]')
+    expect(handles.length).toBeGreaterThan(0)
+    for (const h of Array.from(handles)) {
+      const cls = h.className
+      expect(cls).not.toMatch(/-(right|bottom|left|top)-\d/)
+      expect(cls).toMatch(/\bbottom-\d/)
+      expect(cls).toMatch(/\bright-\d/)
+    }
+  })
+})
