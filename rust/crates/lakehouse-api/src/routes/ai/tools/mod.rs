@@ -247,7 +247,7 @@ pub(in crate::routes) async fn run_tool(
         "list_classification_rules" => governance::list_classification_rules(state).await,
         "list_quality_rules" => governance::list_quality_rules(state, principal).await,
         "get_cdc_health" => governance::get_cdc_health(state).await,
-        "get_maintenance_metrics" => governance::get_maintenance_metrics(state).await,
+        "get_maintenance_metrics" => governance::get_maintenance_metrics(state, principal).await,
         "run_bronze_maintenance" => pipelines::run_bronze_maintenance(&state.dagster).await,
         "list_workloads" => ops::list_workloads(state).await,
         "kill_query" => ops::kill_query(state, args).await,

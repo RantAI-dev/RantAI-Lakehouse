@@ -19,6 +19,12 @@
 //! tables and loads each with a column only an upload table has, so a test
 //! can assert that the column never reached a caller who may not read the
 //! table.
+//!
+//! The last section holds the readers that are not about one table: the
+//! namespace counts, and the assistant's dataset, lineage and maintenance
+//! tools. They answer from the shared catalog, so a tenant that does not own
+//! it is refused with the catalog's own rule, and a tenant that does own it
+//! still does not see another tenant's claimed upload table.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -28,12 +34,13 @@ use std::collections::HashMap;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
+use lakehouse_store::column_lineage::{NewMapping, replace_producer};
 use lakehouse_store::uploads::claim_table;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{
@@ -112,6 +119,201 @@ async fn mount_empty_clickhouse(server: &MockServer) {
         .mount(server)
         .await;
 }
+
+/// The dataset the shared catalog registers: nothing a tenant that does not
+/// own the catalog may learn.
+const DATASET_SLUG: &str = "group-sales-ledger";
+const DATASET_TITLE: &str = "Group Sales Ledger";
+const DATASET_TABLE: &str = "group_sales_ledger";
+/// A dashboard chart over a Gold mart, and the mart it reads.
+const CHART_ID: &str = "chart_group_visits";
+const CHART_TITLE: &str = "Group Visitors Chart";
+const CHART_MART: &str = "mart_group_visits";
+
+/// Serves `data` to every `ClickHouse` query whose text holds `needle`.
+async fn clickhouse_rows(server: &MockServer, needle: &str, data: Vec<Value>) {
+    Mock::given(method("POST"))
+        .and(body_string_contains(needle))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "meta": [], "data": data, "rows": data.len() })),
+        )
+        .with_priority(1)
+        .mount(server)
+        .await;
+}
+
+/// `ClickHouse` as a deployment with data holds it: one registered dataset,
+/// one stored chart, and a maintenance run for each of the three Bronze
+/// tables. Every other query answers no rows.
+async fn mount_clickhouse_with_data(server: &MockServer) {
+    mount_empty_clickhouse(server).await;
+    clickhouse_rows(
+        server,
+        "bronze_meta.dataset_catalog",
+        vec![json!({
+            "slug": DATASET_SLUG,
+            "title": DATASET_TITLE,
+            "description": "every sale the group booked",
+            "tier": "primer",
+            "table_name": DATASET_TABLE,
+        })],
+    )
+    .await;
+    clickhouse_rows(
+        server,
+        "FROM console.bi_chart",
+        vec![json!({
+            "id": CHART_ID,
+            "spec_json": json!({
+                "spec": { "id": CHART_ID, "title": CHART_TITLE, "kind": "bar", "mart": CHART_MART,
+                          "sql": "SELECT 1", "x": "province", "y": "visitors" },
+                "def": { "title": CHART_TITLE, "mart": CHART_MART, "kind": "bar",
+                         "dimension": "province", "measures": ["visitors"], "board": "b_1" },
+                "hasYear": false,
+            })
+            .to_string(),
+            "board": "b_1",
+            "created_by": "ui",
+            "created_at": "2026-10-01 10:00:00",
+        })],
+    )
+    .await;
+    let runs: Vec<Value> = [GROUP_TABLE, RETAIL_TABLE, SHARED_TABLE]
+        .iter()
+        .map(|table| {
+            json!({
+                "table_name": format!("bronze.{table}"),
+                "run_at": "2026-11-14 03:00:00",
+                "dry_data": "1",
+                "dry_manifests": "1",
+                "applied_data": "2",
+                "applied_manifests": "2",
+                "skipped_verbs": "",
+            })
+        })
+        .collect();
+    clickhouse_rows(server, "bronze_meta.maintenance_run", runs).await;
+}
+
+/// The catalog's namespace list: only `bronze`, which holds the three tables.
+async fn mount_namespaces(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "namespaces": [["bronze"]] })),
+        )
+        .mount(server)
+        .await;
+}
+
+/// A pipeline of the owning tenant that names both uploads as inputs: the
+/// table the other tenant holds is not the owner's to draw. It builds
+/// `silver.group_mixed`.
+async fn add_the_mixed_pipeline(pool: &PgPool) {
+    sqlx::query(
+        "INSERT INTO pipeline_definition \
+            (id, name, kind, status, source, target, schedule, tenant_id, input_tables) \
+         VALUES ('pl-mixed', 'Mixed', 'batch', 'draft', 'bronze.group_orders', \
+                 'silver.group_mixed', '@hourly', $1, \
+                 ARRAY['bronze.group_orders', 'bronze.retail_orders'])",
+    )
+    .bind(CATALOG_TENANT.parse::<Uuid>().expect("a seeded tenant id"))
+    .execute(pool)
+    .await
+    .expect("add the pipeline");
+}
+
+/// The recorded column mappings of that pipeline: one from each upload.
+async fn record_the_mixed_pipelines_column_mappings(pool: &PgPool) {
+    let map = |from: &str| NewMapping {
+        from_table: Some(from.to_owned()),
+        from_column: Some("order_total".to_owned()),
+        to_table: "silver.group_mixed".to_owned(),
+        to_column: "total".to_owned(),
+        transform: "copy".to_owned(),
+        partial: false,
+        reason: None,
+    };
+    replace_producer(
+        pool,
+        "pipeline",
+        "pl-mixed",
+        Some(CATALOG_TENANT.parse::<Uuid>().expect("a seeded tenant id")),
+        &[map("bronze.group_orders"), map("bronze.retail_orders")],
+    )
+    .await
+    .expect("record the mappings");
+}
+
+/// The names of the maintenance rows a tool answered, in order.
+fn maintenance_tables(result: &Value) -> Vec<String> {
+    result["maintenance"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a list of maintenance rows: {result}"))
+        .iter()
+        .map(|row| row["tableName"].as_str().expect("a table name").to_owned())
+        .collect()
+}
+
+/// The ids of the nodes of a lineage graph, in order.
+fn node_ids(graph: &Value) -> Vec<String> {
+    graph["nodes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a list of lineage nodes: {graph}"))
+        .iter()
+        .map(|n| n["id"].as_str().expect("a node id").to_owned())
+        .collect()
+}
+
+/// The `tableCount` of the namespace `name` in a `namespaces` body.
+fn table_count(body: &Value, name: &str) -> Value {
+    body["namespaces"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a list of namespaces: {body}"))
+        .iter()
+        .find(|ns| ns["name"] == json!(name))
+        .unwrap_or_else(|| panic!("namespace {name} in {body}"))["tableCount"]
+        .clone()
+}
+
+/// The reason the shared catalog's own rule gives a tenant that does not own
+/// it, read from `GET /api/catalog` (the route the rule was written for) so
+/// the tools' sentence is compared with that route's, not retyped here. The
+/// caller is a member of the other tenant, which does not own the catalog.
+async fn the_rules_reason(router: &axum::Router, pool: &PgPool) -> String {
+    let cookie = cookie_in_tenant(pool, "catalog:read", OTHER_TENANT).await;
+    let (status, body) = get(router, "/api/catalog", &cookie, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["supported"], json!(false), "{body}");
+    body["reason"].as_str().expect("a reason").to_owned()
+}
+
+/// What a tool says to a tenant that does not own the shared catalog.
+fn assert_refused_like_the_catalog(result: &Value, reason: &str) {
+    assert_eq!(result["supported"], json!(false), "{result}");
+    assert_eq!(result["reason"], json!(reason), "{result}");
+}
+
+/// Nothing the shared catalog holds may appear in `answer`.
+fn assert_none_of_the_groups_data(answer: &Value) {
+    let text = answer.to_string();
+    for secret in [
+        DATASET_SLUG,
+        DATASET_TITLE,
+        DATASET_TABLE,
+        CHART_ID,
+        CHART_TITLE,
+        CHART_MART,
+        GROUP_TABLE,
+        SHARED_TABLE,
+    ] {
+        assert!(!text.contains(secret), "{secret} must not appear: {answer}");
+    }
+}
+
+const CATALOG_READER: &str = "assistant:use, assistant:ask, catalog:read";
+const LINEAGE_READER: &str = "assistant:use, assistant:ask, lineage:read, dashboard:read";
 
 /// The deployment: Meridian Group owns the shared catalog, the catalog is
 /// the mock above, and `ClickHouse` has no history.
@@ -538,4 +740,336 @@ async fn setting_the_maintenance_of_another_tenants_upload_table_in_the_chat_is_
     let set = call_tool(&router, &owner, "set_table_maintenance", args).await;
     assert_eq!(set["result"]["configured"], json!(true), "{set}");
     assert_eq!(stored_policies(&pool, GROUP_TABLE).await, 1);
+}
+
+// (e) The readers that answer from the shared catalog.
+
+#[tokio::test]
+async fn listing_datasets_is_refused_to_a_tenant_that_does_not_own_the_shared_catalog() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_clickhouse_with_data(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let other = cookie_in_tenant(&pool, CATALOG_READER, OTHER_TENANT).await;
+    let reason = the_rules_reason(&router, &pool).await;
+
+    let listed = call_tool(&router, &other, "list_datasets", json!({})).await;
+
+    assert_refused_like_the_catalog(&listed["result"], &reason);
+    assert_none_of_the_groups_data(&listed);
+}
+
+#[tokio::test]
+async fn describing_a_dataset_is_refused_to_a_tenant_that_does_not_own_the_shared_catalog() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_clickhouse_with_data(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let other = cookie_in_tenant(&pool, CATALOG_READER, OTHER_TENANT).await;
+    let reason = the_rules_reason(&router, &pool).await;
+
+    let described = call_tool(
+        &router,
+        &other,
+        "describe_dataset",
+        json!({ "slug": DATASET_SLUG }),
+    )
+    .await;
+
+    assert_refused_like_the_catalog(&described["result"], &reason);
+    assert_none_of_the_groups_data(&described);
+}
+
+#[tokio::test]
+async fn the_owning_tenant_still_lists_and_describes_its_datasets() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_clickhouse_with_data(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let owner = cookie_in_tenant(&pool, CATALOG_READER, CATALOG_TENANT).await;
+
+    let listed = call_tool(&router, &owner, "list_datasets", json!({})).await;
+    assert_eq!(listed["result"]["total"], json!(1), "{listed}");
+    assert_eq!(
+        listed["result"]["datasets"][0]["slug"],
+        json!(DATASET_SLUG),
+        "{listed}"
+    );
+
+    let described = call_tool(
+        &router,
+        &owner,
+        "describe_dataset",
+        json!({ "slug": DATASET_SLUG }),
+    )
+    .await;
+    assert_eq!(
+        described["result"]["title"],
+        json!(DATASET_TITLE),
+        "{described}"
+    );
+}
+
+#[tokio::test]
+async fn the_lineage_tool_refuses_a_tenant_that_does_not_own_the_shared_catalog() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_clickhouse_with_data(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let other = cookie_in_tenant(&pool, LINEAGE_READER, OTHER_TENANT).await;
+    let reason = the_rules_reason(&router, &pool).await;
+
+    let graph = call_tool(
+        &router,
+        &other,
+        "get_lineage",
+        json!({ "focus": format!("serving.{CHART_MART}") }),
+    )
+    .await;
+
+    assert_refused_like_the_catalog(&graph["result"], &reason);
+    assert_none_of_the_groups_data(&graph);
+}
+
+#[tokio::test]
+async fn the_owning_tenant_still_reads_the_lineage_of_its_chart() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_clickhouse_with_data(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let owner = cookie_in_tenant(&pool, LINEAGE_READER, CATALOG_TENANT).await;
+
+    let graph = call_tool(
+        &router,
+        &owner,
+        "get_lineage",
+        json!({ "focus": format!("serving.{CHART_MART}") }),
+    )
+    .await;
+
+    let ids = node_ids(&graph["result"]);
+    assert!(
+        ids.contains(&format!("chart:{CHART_ID}")),
+        "the owner's chart is drawn: {ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_lineage_tool_leaves_out_another_tenants_upload_table_for_the_owning_tenant() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_clickhouse_with_data(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    add_the_mixed_pipeline(&pool).await;
+    let owner = cookie_in_tenant(&pool, LINEAGE_READER, CATALOG_TENANT).await;
+
+    let graph = call_tool(
+        &router,
+        &owner,
+        "get_lineage",
+        json!({ "focus": "silver.group_mixed" }),
+    )
+    .await;
+
+    let ids = node_ids(&graph["result"]);
+    assert!(
+        ids.contains(&format!("bronze:{GROUP_TABLE}")),
+        "the owner's own upload is drawn: {ids:?}"
+    );
+    assert!(
+        !graph.to_string().contains(RETAIL_TABLE),
+        "the other tenant's upload is named nowhere: {graph}"
+    );
+}
+
+#[tokio::test]
+async fn the_maintenance_tool_refuses_a_tenant_that_does_not_own_the_shared_catalog() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_clickhouse_with_data(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let other = cookie_in_tenant(&pool, CHAT_AND_OPS_READ, OTHER_TENANT).await;
+    let reason = the_rules_reason(&router, &pool).await;
+
+    let metrics = call_tool(&router, &other, "get_maintenance_metrics", json!({})).await;
+
+    assert_refused_like_the_catalog(&metrics["result"], &reason);
+    assert_none_of_the_groups_data(&metrics);
+    assert!(
+        !metrics.to_string().contains(RETAIL_TABLE),
+        "a refused caller gets no maintenance row at all: {metrics}"
+    );
+}
+
+#[tokio::test]
+async fn the_maintenance_tool_leaves_out_another_tenants_upload_table_for_the_owning_tenant() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_clickhouse_with_data(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let owner = cookie_in_tenant(&pool, CHAT_AND_OPS_READ, CATALOG_TENANT).await;
+    let operator = operator_cookie(&pool).await;
+
+    // The owning tenant: its own upload and the unclaimed shared table, never
+    // the table the other tenant holds.
+    let metrics = call_tool(&router, &owner, "get_maintenance_metrics", json!({})).await;
+    assert_eq!(
+        maintenance_tables(&metrics["result"]),
+        vec![
+            format!("bronze.{GROUP_TABLE}"),
+            format!("bronze.{SHARED_TABLE}")
+        ],
+        "{metrics}"
+    );
+    assert!(
+        !metrics.to_string().contains(RETAIL_TABLE),
+        "the other tenant's table is named nowhere: {metrics}"
+    );
+
+    // An operator reaches everything.
+    let metrics = call_tool(&router, &operator, "get_maintenance_metrics", json!({})).await;
+    assert_eq!(maintenance_tables(&metrics["result"]).len(), 3, "{metrics}");
+}
+
+#[tokio::test]
+async fn the_namespace_count_holds_only_the_tables_the_caller_may_read() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    mount_namespaces(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_empty_clickhouse(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let uri = "/api/lakehouse/namespaces";
+    let owner = cookie_in_tenant(&pool, "catalog:read", CATALOG_TENANT).await;
+    let other = cookie_in_tenant(&pool, "catalog:read", OTHER_TENANT).await;
+    let operator = operator_cookie(&pool).await;
+
+    // The owning tenant counts its own upload and the shared table, not the
+    // upload the other tenant holds.
+    let (status, body) = get(&router, uri, &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(table_count(&body, "bronze"), json!(2), "{body}");
+
+    // Another tenant counts its own upload only.
+    let (status, body) = get(&router, uri, &other, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(table_count(&body, "bronze"), json!(1), "{body}");
+
+    // An operator reaches all three.
+    let (status, body) = get(&router, uri, &operator, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(table_count(&body, "bronze"), json!(3), "{body}");
+}
+
+#[tokio::test]
+async fn the_lineage_tool_leaves_out_the_column_mappings_of_another_tenants_upload_table() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_clickhouse_with_data(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    add_the_mixed_pipeline(&pool).await;
+    record_the_mixed_pipelines_column_mappings(&pool).await;
+    let owner = cookie_in_tenant(&pool, LINEAGE_READER, CATALOG_TENANT).await;
+
+    // Focus on the table the pipeline builds: the mapping from the owner's
+    // own upload is drawn, the one from the other tenant's is not.
+    let graph = call_tool(
+        &router,
+        &owner,
+        "get_lineage",
+        json!({ "focus": "silver.group_mixed" }),
+    )
+    .await;
+    let mappings = graph["result"]["columnMappings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a list of mappings: {graph}"));
+    assert_eq!(mappings.len(), 1, "{graph}");
+    assert_eq!(
+        mappings[0]["from"]["table"],
+        json!(format!("bronze.{GROUP_TABLE}")),
+        "{graph}"
+    );
+    assert!(!graph.to_string().contains(RETAIL_TABLE), "{graph}");
+
+    // Focus on the other tenant's table itself: nothing is drawn for it.
+    let graph = call_tool(
+        &router,
+        &owner,
+        "get_lineage",
+        json!({ "focus": format!("bronze.{RETAIL_TABLE}") }),
+    )
+    .await;
+    assert_eq!(graph["result"]["columnMappings"], json!([]), "{graph}");
+    assert!(
+        !node_ids(&graph["result"]).contains(&format!("bronze:{RETAIL_TABLE}")),
+        "{graph}"
+    );
+}
+
+#[tokio::test]
+async fn the_namespace_count_of_a_listing_of_many_claimed_tables_is_complete() {
+    // 250 tables, all claimed by the owning tenant, in one namespace.
+    let catalog = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/config"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"defaults":{},"overrides":{}}"#),
+        )
+        .mount(&catalog)
+        .await;
+    mount_namespaces(&catalog).await;
+    let identifiers: Vec<Value> = (0..250)
+        .map(|n| json!({ "namespace": ["bronze"], "name": format!("many_{n}") }))
+        .collect();
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces/bronze/tables"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "identifiers": identifiers })),
+        )
+        .mount(&catalog)
+        .await;
+    let ch = MockServer::start().await;
+    mount_empty_clickhouse(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    for n in 0..250 {
+        let claimed = claim_table(
+            &pool,
+            CATALOG_TENANT.parse::<Uuid>().expect("a seeded tenant id"),
+            &format!("many_{n}"),
+            &format!("upload-many-{n}"),
+        )
+        .await
+        .expect("claim the upload table");
+        assert!(claimed);
+    }
+    let owner = cookie_in_tenant(&pool, "catalog:read", CATALOG_TENANT).await;
+    let other = cookie_in_tenant(&pool, "catalog:read", OTHER_TENANT).await;
+
+    let (status, body) = get(&router, "/api/lakehouse/namespaces", &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(table_count(&body, "bronze"), json!(250), "{body}");
+
+    // All 250 belong to the owner: the other tenant counts none of them.
+    let (status, body) = get(&router, "/api/lakehouse/namespaces", &other, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(table_count(&body, "bronze"), Value::Null, "{body}");
 }
