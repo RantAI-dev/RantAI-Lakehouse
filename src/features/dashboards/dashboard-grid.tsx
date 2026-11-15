@@ -274,13 +274,15 @@ export function DashboardGrid({
             ) : (
               <TileCard item={it} editable={editable} dragging={dragging} onHeaderPointerDown={onMove} look={look} />
             )}
-            {/* Resize handle (bottom-right corner, visible) */}
+            {/* Resize handle (bottom-right corner, visible). Inside the tile box: a handle that sticks out
+                (it was -bottom-1 -right-1) widens the scroll region by 4 px on the rightmost column, which is
+                what gave edit mode a horizontal scrollbar (owner QA 2026-11-15). */}
             {editable ? (
               <div
                 onPointerDown={(e) => startDrag(e, it.id, "resize")}
                 className={cn(
                   // Micro-interaction audit 2026-11-14: the corner grows in with edit mode and answers hover and press.
-                  "absolute -bottom-1 -right-1 z-10 grid size-6 cursor-se-resize place-items-center rounded-md text-muted-foreground shadow-sm hover:bg-muted hover:text-foreground",
+                  "absolute bottom-1 right-1 z-10 grid size-6 cursor-se-resize place-items-center rounded-md text-muted-foreground shadow-sm hover:bg-muted hover:text-foreground",
                   "transition-[opacity,scale,background-color,color] duration-200 ease-ui starting:scale-90 starting:opacity-0 active:scale-110",
                   look === "soft" ? "bg-background ring-1 ring-foreground/10" : "border border-border bg-card",
                 )}
