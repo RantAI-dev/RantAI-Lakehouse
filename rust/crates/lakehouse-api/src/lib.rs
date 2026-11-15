@@ -6,6 +6,7 @@
 //! target (`src/main.rs`) is a thin wrapper that invokes [`run`].
 #![allow(clippy::multiple_crate_versions)]
 
+pub mod audit_coverage;
 pub mod auth;
 pub mod bounded;
 pub mod bronze_stats_cache;

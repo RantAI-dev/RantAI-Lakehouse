@@ -51,6 +51,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::time::Instant;
 
+use crate::audit_coverage;
 use crate::bounded;
 use crate::bronze_stats_cache::{BronzeStatsCache, CachedTableStats};
 use crate::error::{ApiRejection, ApiResult};
@@ -3812,8 +3813,8 @@ pub async fn put_annotation(
     // audit write here: it never fails the edit it records. A save that
     // changed nothing records nothing.
     if !changed.is_empty() {
-        let _ = lakehouse_store::audit::insert(
-            pool,
+        audit_coverage::record_best_effort(
+            &state,
             lakehouse_store::audit::NewAuditEvent {
                 principal_id: Some(principal.id.uuid().to_string()),
                 principal_kind: Some("user".to_owned()),
@@ -4096,8 +4097,8 @@ pub async fn put_certification(
     };
     state.catalog_search_cache.invalidate().await;
     if let Some(action) = action {
-        let _ = lakehouse_store::audit::insert(
-            pool,
+        audit_coverage::record_best_effort(
+            &state,
             lakehouse_store::audit::NewAuditEvent {
                 principal_id: Some(principal.id.uuid().to_string()),
                 principal_kind: Some("user".to_owned()),
@@ -4178,8 +4179,8 @@ pub async fn access_request(
     .await?;
     // Best-effort, matching WS5 item D1's own posture: an audit-write
     // failure never fails the request that triggered it.
-    let _ = lakehouse_store::audit::insert(
-        pool,
+    audit_coverage::record_best_effort(
+        &state,
         lakehouse_store::audit::NewAuditEvent {
             principal_id: Some(principal.id.uuid().to_string()),
             principal_kind: Some("user".to_owned()),
@@ -4227,6 +4228,29 @@ pub async fn access_request(
 /// (`lakehouse_store::agents::decide_access_request_approved_creates_a_time_bounded_grant`)
 /// exercises.
 pub(crate) const GRANT_DAYS: i64 = 30;
+
+/// The name `crate::audit_coverage::AUDIT_TABLE` gives `POST
+/// /api/catalog/access-requests/{id}/decide`, and the action of the `refused`
+/// row `auth_gate` writes when it turns the call away (`GOV-1`). The row a
+/// decision itself writes carries the request's own action (an `access:`
+/// permission), which is chosen at run time and so cannot be the table's name.
+pub(crate) const ACCESS_DECIDE_ACTION: &str = "catalog.access_decide";
+
+/// `args` of an access decision's audit row: the comment, and for an approval
+/// the grant it made: who received which permission until when (`GOV-1`
+/// Decision 3). A rejection grants nothing, so it names no grantee.
+fn decision_args(
+    comment: Option<&str>,
+    grant: Option<&lakehouse_store::agents::AccessGrant>,
+) -> Value {
+    let mut args = json!({ "comment": comment });
+    if let (Some(args), Some(grant)) = (args.as_object_mut(), grant) {
+        args.insert("permission".to_owned(), json!(grant.permission));
+        args.insert("grantee".to_owned(), json!(grant.user_id.to_string()));
+        args.insert("expiresAt".to_owned(), json!(grant.expires_at));
+    }
+    args
+}
 
 /// See [`DecideAccessRequestBody`]'s doc comment — reuses
 /// `routes::agents::DecideApprovalBody`'s exact shape (WS7 item E3, N1),
@@ -4338,8 +4362,8 @@ pub async fn decide_access_request(
         lakehouse_store::agents::Decision::Rejected => "rejected",
     };
     // Best-effort, matching WS5 item D1's own posture.
-    let _ = lakehouse_store::audit::insert(
-        pool,
+    audit_coverage::record_best_effort(
+        &state,
         lakehouse_store::audit::NewAuditEvent {
             principal_id: Some(principal.id.uuid().to_string()),
             principal_kind: Some("user".to_owned()),
@@ -4347,7 +4371,7 @@ pub async fn decide_access_request(
             action: existing.action.clone(),
             resource_kind: Some("approval".to_owned()),
             resource_id: Some(id.clone()),
-            args: Some(json!({ "comment": body.comment })),
+            args: Some(decision_args(body.comment.as_deref(), grant.as_ref())),
             outcome: decide_outcome.to_owned(),
             approval_id: Some(id.clone()),
             ..Default::default()

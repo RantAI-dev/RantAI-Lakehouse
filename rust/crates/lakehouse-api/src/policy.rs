@@ -1287,6 +1287,12 @@ fn allowed_while_must_change_password(method: &str, path: &str) -> bool {
         .any(|(m, p)| *m == method && *p == path)
 }
 
+/// What a principal that still has to rotate its password is told by every
+/// route outside [`ALLOWED_WHILE_MUST_CHANGE_PASSWORD`] (and what its audited
+/// refusal row says).
+const PASSWORD_ROTATION_REQUIRED: &str =
+    "password rotation required before this route is reachable";
+
 /// The one middleware layered onto the whole router (`routes::router`).
 /// Looks up [`POLICY_TABLE`] for the request's matched route and either
 /// lets it through (`Policy::Public`), requires and checks a
@@ -1343,23 +1349,38 @@ pub async fn auth_gate(
             let (mut parts, body) = req.into_parts();
             let AuthenticatedPrincipal(principal) =
                 AuthenticatedPrincipal::from_request_parts(&mut parts, &state).await?;
-            if let Policy::RequiresPermission(permission) = policy
-                && !principal.has(permission)
-            {
-                return Err(ApiError::PermissionDenied(permission.to_owned()).into());
-            }
-            if let Policy::RequiresAnyPermission(permissions) = policy
-                && !permissions.iter().any(|perm| principal.has(perm))
-            {
-                return Err(ApiError::PermissionDenied(permissions.join(", ")).into());
-            }
-            if principal.must_change_password
-                && !allowed_while_must_change_password(&method, matched_path.as_str())
-            {
-                return Err(ApiError::PermissionDenied(
-                    "password rotation required before this route is reachable".to_owned(),
+            // `GOV-1`: a refusal below is audited before it is returned (the
+            // handler never runs, so nothing else would). A 401 above is not:
+            // nobody is signed in.
+            let refusal = match policy {
+                Policy::RequiresPermission(permission) if !principal.has(permission) => {
+                    Some(permission.to_owned())
+                }
+                Policy::RequiresAnyPermission(permissions)
+                    if !permissions.iter().any(|perm| principal.has(perm)) =>
+                {
+                    Some(permissions.join(", "))
+                }
+                _ if principal.must_change_password
+                    && !allowed_while_must_change_password(&method, matched_path.as_str()) =>
+                {
+                    Some(PASSWORD_ROTATION_REQUIRED.to_owned())
+                }
+                _ => None,
+            };
+            if let Some(detail) = refusal {
+                let params = crate::audit_coverage::path_params(&mut parts).await;
+                crate::audit_coverage::record_gate_refusal(
+                    &state,
+                    &principal,
+                    &method,
+                    matched_path.as_str(),
+                    &params,
+                    parts.uri.query(),
+                    &detail,
                 )
-                .into());
+                .await;
+                return Err(ApiError::PermissionDenied(detail).into());
             }
             parts.extensions.insert(principal);
             let req = Request::from_parts(parts, body);

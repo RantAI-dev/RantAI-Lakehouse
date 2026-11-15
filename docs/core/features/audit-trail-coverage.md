@@ -6,14 +6,14 @@
 | Backlog | `GOV-1` |
 | Kind | Feature |
 | Spec | `docs/core/specs/gov-1.md` |
-| Status | Planned |
+| Status | Building |
 | Priority | P1 |
 | Owner | In the base |
 | Acceptor | In the base |
 | Plan | Engineering plan kept by the planner |
 | Started | 2026-11-14 |
 | Shipped | |
-| Evidence | |
+| Evidence | PR #546 (part A: coverage, central writer, append-only trail, audit:read) |
 
 ## Problem
 
@@ -55,6 +55,19 @@ No new assistant work. Its tool calls are already recorded.
 - Reads and downloads are recorded as today, not every page view.
 - Events are kept forever; there is no retention setting yet.
 - Events cannot be sent to an outside system yet; export is CSV from the audit page.
+- The database owner can still run `ALTER TABLE audit_event DISABLE TRIGGER ...` and turn off the trigger that makes the trail append-only. Nothing in the trail records that.
+- The database allows an `UPDATE` that only clears a row's `run_id` or `approval_id`, because it clears those links when an agent run or an approval is deleted. Every other change to a row is refused.
+- A request that the service's timeout cuts off writes no row.
+- A change made through a create route does not name the new object when its id is only in the response. The row then names the kind and the action, not the object.
+- The row names the fields a change touched and never their values. The exceptions are the old and new values that the identity, policy, table-access and grant rows record.
+- The scheduler's alert tick (`POST /api/alerts/run`) writes one row per tick.
+- Writes through the Iceberg REST door are refused by that door and are not in the trail.
+- The assistant's own reads of the trail are not narrowed by `audit:read` yet. Its audit tool (`get_audit_history`) needs only `governance:read`.
+- The Overview page's activity feed (`POST /api/overview`) shows the 20 newest audit rows to every signed-in person: who acted, the action, the object and the outcome. `audit:read` does not narrow it.
+- An asset page's change history shows up to 50 audit rows about that asset to anyone who can open the asset. `audit:read` does not narrow it either.
+- Machine callbacks are not audited. The pipeline run events, the schema and capture observations and the connector run reports accept a service identity or an unrestricted administrator account. A person who calls one of these routes by hand with an unrestricted account leaves no row. A pipeline run started from the console is audited as `pipeline.trigger`. The orchestrator's lag call (`POST /api/pipelines/runnable/{id}/lag-check`) is also open to an unrestricted administrator account. It advances the pipeline's lag streak and can send the behind-target alert, and it writes no audit row.
+- Marking a dashboard comment mention as read is not recorded. It counts as personal UI state, like favourites.
+- Each failed sign-in that reaches the password check adds one row with outcome `refused`. The try that makes an identifier locked adds two rows: the `auth.login_locked` row and the refused row. The row holds no email, no password and no identifier. An unknown email adds the same row, so a visitor who tries many different identifiers adds a row for each try. A try refused because that identifier is locked adds no row. Nothing removes these rows and there is no retention setting yet, so the growth is permanent. A rate limit or retention rule is a follow-up.
 
 ## Acceptance checklist
 

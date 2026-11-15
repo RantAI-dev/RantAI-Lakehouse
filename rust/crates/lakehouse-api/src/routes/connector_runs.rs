@@ -49,7 +49,6 @@ use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
-use lakehouse_store::audit as store_audit;
 use lakehouse_store::connector_run::{
     self, AttemptReport, EndReason, ErrorClass, LogEvent, RUN_HISTORY_LIMIT, RunStatus, RunSummary,
     RunTrigger,
@@ -62,6 +61,7 @@ use time::format_description::well_known::Rfc3339;
 
 use super::load_alerts::{FinalStatus, close_run_record};
 use super::schema_changes::{check_name, require_orchestrator};
+use crate::audit_coverage;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::connectors::{connector_audit_event, parse_body, pool};
@@ -356,9 +356,7 @@ pub async fn resume(
         json!({ "pausedBy": "auto_disable" }),
         "executed",
     );
-    if let Err(err) = store_audit::insert(pool, event).await {
-        tracing::warn!(%err, connector_id = %id, "failed to record connector.resume audit event");
-    }
+    audit_coverage::record_best_effort(&state, event).await;
     Ok(ApiJson(ResumeResponse { resumed: true }))
 }
 
@@ -406,9 +404,7 @@ pub async fn pause(
         return Err(err.into());
     }
     let event = connector_audit_event(&principal, "connector.pause", &id, json!({}), "executed");
-    if let Err(err) = store_audit::insert(pool, event).await {
-        tracing::warn!(%err, connector_id = %id, "failed to record connector.pause audit event");
-    }
+    audit_coverage::record_best_effort(&state, event).await;
     Ok(ApiJson(PauseResponse { paused: true }))
 }
 
