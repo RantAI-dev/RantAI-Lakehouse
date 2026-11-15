@@ -180,6 +180,7 @@ const ACTOR_NOT_SIGNED_IN: &str = "No signed-in caller";
 const EX_PUBLIC: &str =
     "Decision 1: public data and frame route; it serves a view and changes nothing";
 const EX_READ_LIKE: &str = "Decision 1: read-like POST (preview, validate, estimate, compile, lag-check, check or compare); it answers a question and records no change";
+const EX_LAG_CHECK: &str = "Decision 1 lists lag-check among the read-like POSTs, but it changes state: the orchestrator calls it on a schedule, it advances the pipeline's lag streak and can send the behind-target alert, and no console user's change is behind it (the run a `run` decision asks for is launched by the orchestrator and kept in its run history)";
 const EX_OVERVIEW: &str = "Read-like POST: `POST /api/overview` takes no body and only reads the latest audit rows (the orchestrator's run list when there is no database); it is a POST for historical reasons, not for a change";
 const EX_TEST_BUTTON: &str = "Decision 1: a connection, email or notification \"test\" button; it sends a probe and changes no configuration";
 const EX_MACHINE: &str = "Decision 1: machine callback from an ingestion or orchestrator job; the console user's change it reports is audited where the job was started";
@@ -262,7 +263,7 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("PUT", "/api/pipelines/{id}", Coverage::Handler { action: "pipeline.update" }),
     ("PUT", "/api/pipelines/{id}/target-lag", Coverage::Handler { action: "pipeline.target_lag.set" }),
     ("DELETE", "/api/pipelines/{id}", Coverage::Handler { action: "pipeline.delete" }),
-    ("POST", "/api/pipelines/runnable/{id}/lag-check", Coverage::Excluded { reason: EX_READ_LIKE }),
+    ("POST", "/api/pipelines/runnable/{id}/lag-check", Coverage::Excluded { reason: EX_LAG_CHECK }),
     ("POST", "/api/pipelines/runnable/{id}/compile", Coverage::Excluded { reason: EX_READ_LIKE }),
     ("POST", "/api/pipelines/{id}/trigger", Coverage::Handler { action: "pipeline.trigger" }),
     ("POST", "/api/pipelines/{id}/status", Coverage::Central { action: "pipeline.status_set", resource_kind: "pipeline", id_param: IdParam::Path("id") }),
