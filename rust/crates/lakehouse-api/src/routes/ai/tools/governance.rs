@@ -33,7 +33,7 @@ async fn governance_kind(state: &AppState, kind: &str) -> Value {
     // No principal: this is the headless path, and it does not narrow the
     // rows it reads. A call with no person is not narrowed, the convention
     // `ensure_rule_table` has (`GOV-15` D7). A person's maintenance history is
-    // narrowed in `get_maintenance_metrics`, which passes the principal.
+    // narrowed by `read_kind` when `get_maintenance_metrics` passes the principal.
     response_to_value(
         crate::routes::governance::read_kind(state, None, &axum::http::HeaderMap::new(), kind)
             .await,
@@ -124,9 +124,10 @@ fn latest_per_slot(result: Value) -> Value {
 /// The history names every table the Bronze job ever compacted, upload
 /// tables included. A person the shared-catalog rule refuses gets that rule's
 /// answer and no row; a person it admits gets the rows of the tables in the
-/// caller's reach, by the rule Query Studio keeps
-/// ([`crate::routes::query::table_is_reachable`]): another tenant's upload
-/// table is left out even for the tenant that owns the catalog.
+/// caller's reach, by the rule Query Studio keeps. The route
+/// `GET /api/governance/maintenance` narrows its rows the same way, in
+/// [`crate::routes::governance::read_kind`], and this tool reads through it,
+/// so the two cannot disagree.
 ///
 /// No principal is a headless run: it is not narrowed, the convention
 /// `list_datasets` and `draft_quality_rule` have.
@@ -140,70 +141,18 @@ pub(super) async fn get_maintenance_metrics(
     if let Some(refusal) = super::data::shared_catalog_refusal(state, principal).await {
         return refusal;
     }
-    let headers = axum::http::HeaderMap::new();
-    let Ok(reach) = crate::routes::query::resolve_reach(state, principal, &headers).await else {
-        return json!({ "error": "the shared-catalog rule could not be evaluated" });
-    };
-    let mut history = governance_kind(state, "maintenance").await;
-    if leave_out_runs_out_of_reach(state, reach, &mut history)
-        .await
-        .is_err()
-    {
-        return json!({ "error": "the table claims could not be read right now" });
-    }
-    history
-}
-
-/// Drops, in place, the maintenance rows of the tables `reach` does not
-/// cover. An answer with no `maintenance` list (an error body) is left as it
-/// is.
-///
-/// The claims are read once for the distinct tables ([`crate::routes::query::claims_on`]):
-/// the history holds every run, so a table appears many times.
-///
-/// # Errors
-///
-/// The 503 of [`crate::routes::query::claims_on`] when the claims cannot be
-/// read; the caller answers with a fixed sentence, never the cause.
-async fn leave_out_runs_out_of_reach(
-    state: &AppState,
-    reach: crate::routes::query::TenantReach,
-    history: &mut Value,
-) -> Result<(), lakehouse_core::ApiError> {
-    use crate::routes::query::{TenantReach, claims_on, table_is_reachable};
-
-    let tenant_id = match reach {
-        TenantReach::All => return Ok(()),
-        // `table_is_reachable` answers `false` for this reach whatever the
-        // claim is, so no claim needs reading.
-        TenantReach::NoTenant => None,
-        TenantReach::Tenant { tenant_id, .. } => Some(tenant_id),
-    };
-    let Some(rows) = history.get_mut("maintenance").and_then(Value::as_array_mut) else {
-        return Ok(());
-    };
-    let table_of = |row: &Value| {
-        row.get("tableName")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned()
-    };
-    let claims = match tenant_id {
-        Some(tenant_id) => {
-            let mut tables: Vec<String> = rows.iter().map(table_of).collect();
-            tables.sort();
-            tables.dedup();
-            claims_on(state, tenant_id, &tables).await?
-        }
-        None => std::collections::HashMap::new(),
-    };
-    rows.retain(|row| {
-        tenant_id.is_some()
-            && claims
-                .get(&table_of(row))
-                .is_some_and(|claim| table_is_reachable(reach, *claim))
-    });
-    Ok(())
+    // The tool has no request headers of its own, so the reach is the
+    // person's own tenant's, the convention `list_quality_rules` follows.
+    response_to_value(
+        crate::routes::governance::read_kind(
+            state,
+            Some(principal),
+            &axum::http::HeaderMap::new(),
+            "maintenance",
+        )
+        .await,
+    )
+    .await
 }
 
 /// Builds the `POST /api/governance/policies` body from the tool's args,
