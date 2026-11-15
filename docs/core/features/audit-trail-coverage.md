@@ -13,7 +13,7 @@
 | Plan | Engineering plan kept by the planner |
 | Started | 2026-11-14 |
 | Shipped | |
-| Evidence | |
+| Evidence | PR #546 (part A: coverage, central writer, append-only trail, audit:read) |
 
 ## Problem
 
