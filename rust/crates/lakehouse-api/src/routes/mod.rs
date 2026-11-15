@@ -8,6 +8,7 @@
 pub(crate) mod agents;
 pub(crate) mod ai;
 mod alerts;
+mod audit_events;
 pub mod auth;
 // `DATA-42` D7: the `ClickHouse` registry fixture the readers' tests share
 // (`governance`, `overview`, `storage`, `lineage`, `catalog_profile`).
@@ -673,6 +674,15 @@ fn lakehouse_router() -> Router<AppState> {
 fn governance_static_router() -> Router<AppState> {
     Router::new()
         .route("/api/governance/lineage", get(governance::lineage))
+        // GOV-1 part B: the audit trail's search, one event and CSV export.
+        // Three or more segments after `/api/governance/`, so the `{kind}`
+        // capture below, which is one segment, never sees them.
+        .route("/api/governance/audit/events", get(audit_events::search))
+        .route("/api/governance/audit/events/{id}", get(audit_events::one))
+        .route(
+            "/api/governance/audit/export.csv",
+            get(audit_events::export),
+        )
         // DATA-13: column-level lineage. A static path ahead of the
         // `{kind}` capture like `lineage` above (and four segments deep).
         .route(

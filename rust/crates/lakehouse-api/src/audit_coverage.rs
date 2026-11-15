@@ -425,7 +425,7 @@ pub fn coverage_for(method: &str, pattern: &str) -> Option<Coverage> {
 }
 
 /// The class of a store error, for a log line: the variant, never its text.
-fn store_error_class(err: &StoreError) -> &'static str {
+pub(crate) fn store_error_class(err: &StoreError) -> &'static str {
     match err {
         StoreError::Conflict | StoreError::FieldConflict(_) => "conflict",
         StoreError::ForeignKeyViolation => "foreign_key",
