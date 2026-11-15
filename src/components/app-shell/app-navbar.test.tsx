@@ -20,7 +20,7 @@ import { AuthProvider } from "@/features/auth/auth-provider"
 import { CopilotProvider } from "@/features/copilot/use-copilot"
 import { SidebarProvider } from "@/components/ui/sidebar"
 import { notificationsService } from "@/services"
-import { AppNavbar, NavbarTitle } from "./app-navbar"
+import { AppNavbar } from "./app-navbar"
 import { UserMenu } from "./user-menu"
 import { CONSOLE_VERSION } from "@/features/version/console-version"
 
@@ -179,15 +179,5 @@ describe("AppNavbar AI Copilot entry", () => {
     expect(controls[controls.length - 1]).toBe(copilot)
     fireEvent.click(copilot)
     await waitFor(() => expect(screen.getByRole("button", { name: "Collapse AI Copilot" }).getAttribute("aria-pressed")).toBe("true"))
-  })
-})
-
-describe("NavbarTitle", () => {
-  it("draws the title, and nothing at all for null (owner QA 2026-11-15, conversation page)", () => {
-    const { container, rerender } = render(<NavbarTitle title="All Dashboards" />)
-    expect(screen.getByText("All Dashboards")).toBeTruthy()
-    rerender(<NavbarTitle title={null} />)
-    expect(screen.queryByText("All Dashboards")).toBeNull()
-    expect(container.innerHTML).toBe("")
   })
 })

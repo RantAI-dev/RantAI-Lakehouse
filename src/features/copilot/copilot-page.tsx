@@ -127,13 +127,10 @@ export function CopilotPage() {
       </React.Suspense>
 
       <div className="flex min-w-0 flex-1 flex-col">
-        {/* The title alone, on one line. The bar keeps the height it had when it held buttons
-            (their 28 px row and 8 px under it), so the chat does not move. */}
-        <div className="flex h-9 shrink-0 items-center pb-2">
-          <h1 title={activeTitle} className="min-w-0 truncate text-sm font-medium text-foreground">
-            {activeTitle}
-          </h1>
-        </div>
+        {/* Owner QA 2026-11-15: the thread's title is not drawn at the top of the chat (the sidebar
+            list and the navbar already name where you are). It stays as the page's heading for
+            screen readers, and the 36 px bar it sat in is gone, so the chat starts at the top. */}
+        <h1 className="sr-only">{activeTitle}</h1>
 
         <div className="mx-auto flex min-h-0 w-full max-w-3xl flex-1 flex-col">
           <div className="min-h-0 flex-1 overflow-y-auto py-6 pr-0.5">

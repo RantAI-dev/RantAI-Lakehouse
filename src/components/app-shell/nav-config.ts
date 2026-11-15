@@ -202,14 +202,12 @@ export function subNavItems(pathname: string): NavItem[] {
  * (for example Query Studio workspace tabs). They never appear in the sidebar;
  * the parent nav item stays highlighted while these titles win the lookup.
  */
-const SECONDARY_ROUTES: { title: string; href: string; hideNavbarTitle?: boolean }[] = [
+const SECONDARY_ROUTES: { title: string; href: string }[] = [
   { title: "Saved Queries", href: "/query-studio/saved" },
   { title: "All Dashboards", href: "/dashboards/browse" },
   // One conversation with Copilot. Not a sidebar entry: it is opened from
   // Home (a new one) or from the sidebar's chat list (an old one, `WEB-18`).
-  // `hideNavbarTitle`: the navbar draws no heading here (owner QA 2026-11-15); the page
-  // has its own <h1> (the chat's title). The title stays for the recents list.
-  { title: "Conversation", href: "/copilot", hideNavbarTitle: true },
+  { title: "Conversation", href: "/copilot" },
   // Table detail pages, opened from System status's maintenance runs or
   // an asset's Snapshots tab. Their nav entry was removed, so without this the
   // title would fall back to the product name.
@@ -244,24 +242,10 @@ export function activeNavHref(pathname: string): string | undefined {
  * Secondary routes win over their parent nav item. Falls back to "RantAI Lakehouse".
  */
 export function pageTitleFor(pathname: string): string {
-  return routeFor(pathname)?.title ?? "RantAI Lakehouse"
-}
-
-function routeFor(pathname: string) {
-  return bestMatch<{ title: string; href: string; hideNavbarTitle?: boolean }>(pathname, [
+  const match = bestMatch(pathname, [
     ...SECONDARY_ROUTES,
     ...ALL_NAV_ITEMS.map(({ title, href }) => ({ title, href })),
   ])
-}
-
-/**
- * The heading the top navbar draws, or null when that route shows none (owner QA
- * 2026-11-15: the conversation page). `pageTitleFor` still names the route for the
- * recents list and other labels.
- */
-export function navbarTitleFor(pathname: string): string | null {
-  const match = routeFor(pathname)
-  if (match?.hideNavbarTitle) return null
   return match?.title ?? "RantAI Lakehouse"
 }
 
