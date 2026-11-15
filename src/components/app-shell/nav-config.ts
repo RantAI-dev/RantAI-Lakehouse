@@ -163,8 +163,10 @@ export const NAV_GROUPS: NavGroup[] = [
       // redirect to `/health#<section>`.
       { title: "System status", href: "/health", icon: HeartPulse, requires: ["ops:read"] },
       { title: "Alerts", href: "/alerts", icon: BellRing, requires: ["alert:read", "alert:write"] },
-      // ADM-13 review round 1, S4: governance:read only
-      { title: "Audit Log", href: "/audit", icon: FileText, requires: ["governance:read"] },
+      // GOV-1 Decision 9: the API answers 403 on `GET /api/governance/audit`
+      // without `audit:read`, so the menu follows it (every role holds
+      // `governance:read`, only Governance Admin holds `audit:read`).
+      { title: "Audit Log", href: "/audit", icon: FileText, requires: ["audit:read"] },
     ],
   },
   {
@@ -338,8 +340,8 @@ export const ROUTE_ACCESS: readonly RouteAccessEntry[] = [
   // (`POST /api/governance/quality`).
   { pattern: "/governance/data-quality/rules/new", requires: ["governance:write"] },
   { pattern: "/governance/approvals", requires: ["access:approve", "agent:approve"] },
-  // ADM-13 review round 1, S4: governance:read only
-  { pattern: "/audit", requires: ["governance:read"] },
+  // GOV-1 Decision 9: same permission as the API's audit list.
+  { pattern: "/audit", requires: ["audit:read"] },
   { pattern: "/lineage", requires: ["lineage:read"] },
 
   // Monitoring
