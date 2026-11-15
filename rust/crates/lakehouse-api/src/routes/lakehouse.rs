@@ -606,10 +606,20 @@ pub struct NamespacesQuery {
 /// may read (see [`leave_out_tables_out_of_reach`]), so another tenant's
 /// upload table is not counted.
 ///
-/// `tableCount: null` has two causes for a caller whose roles hide no table:
-/// the namespace's tables could not be loaded in time, or none of them is in
-/// the caller's tenant's reach. The row is kept in both cases (it names no
-/// table); a caller whose roles do hide tables loses the row instead.
+/// `tableCount: null` means the count is unknown or zero. Four causes give it:
+///
+/// - the namespace's lookup did not finish within the two-second budget;
+/// - the catalog failed to list the namespace's tables, or the namespace name
+///   is not a valid identifier;
+/// - the claims that say which tables the caller's tenant may read could not
+///   be read, so [`leave_out_tables_out_of_reach`] failed;
+/// - no table is left to count after the tables the caller may not read are
+///   left out, for example because the namespace is empty or holds only
+///   other tenants' upload tables.
+///
+/// For a caller whose roles hide no table, the row is kept with `null` in
+/// every case, since it names no table. A caller whose roles do hide tables
+/// loses the row instead.
 ///
 /// # Errors
 /// 404 if `warehouse` names anything other than the configured warehouse, or
