@@ -276,8 +276,8 @@ pub(in crate::routes) async fn run_tool(
         }
         "list_iceberg_tables" => lakehouse::list_iceberg_tables(state, principal, args).await,
         "describe_iceberg_table" => lakehouse::describe_iceberg_table(state, principal, args).await,
-        "get_table_maintenance" => lakehouse::get_table_maintenance(state, args).await,
-        "set_table_maintenance" => lakehouse::set_table_maintenance(state, args).await,
+        "get_table_maintenance" => lakehouse::get_table_maintenance(state, principal, args).await,
+        "set_table_maintenance" => lakehouse::set_table_maintenance(state, principal, args).await,
         "get_capacity" => lakehouse::get_capacity(state).await,
         other => {
             unreachable!(
