@@ -1,3 +1,4 @@
+import type { ChartKind } from "@/lib/dashboard-specs"
 import type { FilterDef } from "../clients/bi-store"
 import type { TileLimit } from "./settings"
 
@@ -169,6 +170,13 @@ export type DashboardService = {
   setEmbedFilterModes(board: string, modes: Record<string, FilterMode>, signal?: AbortSignal): Promise<void>
   /** `BI-26`: the charts of a dashboard, for the chart picker of the embed section. */
   listBoardCharts(board: string, signal?: AbortSignal): Promise<BoardChart[]>
+  /**
+   * `BI-59` (decision P3): every stored chart the caller can see, reduced to
+   * what a picture of its dashboard needs (which board, which kind, how
+   * wide). One read of `GET /api/dashboard/specs` for the whole Dashboards
+   * page; it runs no query.
+   */
+  listChartOutlines(signal?: AbortSignal): Promise<ChartOutline[]>
   /** `BI-19` part A. Needs `dashboard:write`. */
   getPublicLink(board: string, signal?: AbortSignal): Promise<PublicLinkState>
   /** Make a link or change its expiry or password; refusals carry the server's sentence. */
@@ -355,6 +363,13 @@ export type FilterMode = "locked" | "editable" | "hidden"
 /** A chart of a dashboard, for the embed chart picker. */
 /** `kind` lets a picker leave out the tiles that carry no data (`BI-18` part D). */
 export type BoardChart = { id: string; title: string; kind?: string }
+
+/**
+ * A stored chart as the Dashboards page draws it (`BI-59`, P3): its board,
+ * its kind (`| string`: a kind this console does not know is drawn as a
+ * neutral tile, not dropped) and its width (`span: 2` is the full row).
+ */
+export type ChartOutline = { id: string; board: string; kind: ChartKind | string; span?: 1 | 2 }
 
 /**
  * One stored chart, as `GET /api/dashboard/specs` answers it (`WEB-7` D6).
