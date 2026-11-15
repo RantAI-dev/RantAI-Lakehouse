@@ -87,6 +87,20 @@ enum Kind {
 }
 
 impl Kind {
+    /// `SEC-20` (plan 95, plan 96): the list a kind answers with table names,
+    /// and the field of each row that holds the table, for the kinds a
+    /// caller's reach narrows ([`retain_rows_in_reach`]). The match has no
+    /// wildcard, so a kind added later must decide whether its rows name tables.
+    fn reach_rows(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::Classification => Some(("classifications", "asset")),
+            Self::Maintenance => Some(("maintenance", "tableName")),
+            Self::Quality | Self::Audit | Self::Residency | Self::Replication | Self::Unknown => {
+                None
+            }
+        }
+    }
+
     fn parse(kind: &str) -> Self {
         match kind {
             "quality" => Self::Quality,
@@ -142,9 +156,10 @@ const AUDIT_READ_DENIED: &str = "reading the audit trail needs the audit:read pe
 /// table. A maintenance history is narrowed by the caller's reach over
 /// tables (`SEC-20`, plan 95), because every row names a table and the
 /// history names upload tables of every tenant: see
-/// [`retain_runs_in_reach`]. The other kinds are not narrowed by this
-/// change — classification rows do name tables, but narrowing them is a
-/// separate item. No principal is a system call and is not narrowed, which
+/// [`retain_rows_in_reach`]. The classification list is narrowed the same way
+/// (`SEC-20`, plan 96), by each row's `asset`: it names the tables of the
+/// shared catalog and the upload tables of every tenant. The other kinds are
+/// not narrowed. No principal is a system call and is not narrowed, which
 /// [`crate::routes::quality::quality_table_access`] documents.
 pub(crate) async fn read_kind(
     state: &AppState,
@@ -178,13 +193,14 @@ pub(crate) async fn read_kind(
     } else {
         None
     };
-    // `SEC-20` (plan 95): the reach is resolved here for the same reason, so
-    // a header naming a tenant the caller does not belong to is the 404 every
-    // route answers, and causes no `ClickHouse` query. It is not a refusal of
-    // the whole list: a caller the shared catalog is closed to still reads
-    // the runs of the upload tables its own tenant holds.
-    let maintenance_reach = match principal {
-        Some(principal) if parsed == Kind::Maintenance => {
+    // `SEC-20` (plan 95, plan 96 for the classification list): the reach is
+    // resolved here for the same reason, so a header naming a tenant the caller
+    // does not belong to is the 404 every route answers, and causes no
+    // `ClickHouse` query. It is not a refusal of the whole list: a caller the
+    // shared catalog is closed to still reads the rows of the upload tables its
+    // own tenant holds.
+    let row_reach = match principal {
+        Some(principal) if parsed.reach_rows().is_some() => {
             match crate::routes::query::resolve_reach(state, principal, headers).await {
                 Ok(reach) => Some(reach),
                 Err(err) => return ApiRejection(err).into_response(),
@@ -203,8 +219,10 @@ pub(crate) async fn read_kind(
                 if let Some(access) = narrowing {
                     retain_readable_rules(&access, &mut body);
                 }
-                if let Some(reach) = maintenance_reach
-                    && let Err(err) = retain_runs_in_reach(state, reach, &mut body).await
+                if let Some(reach) = row_reach
+                    && let Some((rows, table)) = parsed.reach_rows()
+                    && let Err(err) =
+                        retain_rows_in_reach(state, reach, &mut body, rows, table).await
                 {
                     return ApiRejection(err).into_response();
                 }
@@ -262,39 +280,46 @@ fn retain_readable_rules(access: &crate::table_access::TableAccess, body: &mut V
     }
 }
 
-/// `SEC-20` (plan 95): drops, in place, the maintenance runs of the tables
-/// `reach` does not cover.
+/// `SEC-20` (plan 95, plan 96): drops, in place, the rows of `body[rows_key]`
+/// whose table, read from the `table_key` string of the row, `reach` does not
+/// cover.
 ///
-/// The history names every table the Bronze job ever compacted, upload
-/// tables included, so a person reads the rows of the tables in their reach
-/// by the rule Query Studio keeps ([`crate::routes::query::reachable_names`]):
+/// The maintenance history names every table the Bronze job ever compacted and
+/// the classification list names every table the registry holds, upload tables
+/// included, so a person reads the rows of the tables in their reach by the
+/// rule Query Studio keeps ([`crate::routes::query::reachable_names`]):
 /// another tenant's upload table is left out even for the tenant that owns the
-/// shared catalog. The claims are read once for the distinct tables, because
-/// the history holds every run and a table appears many times. A row always
-/// carries a `tableName` string ([`maintenance_run_row_json`] writes one even
-/// when the column is empty), and an empty name is an unclaimable name: it is
-/// kept only where an unclaimed table is, for a reach that is everything and
-/// for the tenant that owns the shared catalog. A row with no string at all is
-/// left out of a narrowed answer. An answer with no `maintenance` list is left
-/// as it is.
+/// shared catalog, and the shared catalog's tables are left out for a tenant
+/// that does not own it. The claims are read once for the distinct tables,
+/// because the history holds every run and a table appears many times. A
+/// maintenance row always carries a `tableName` string
+/// ([`maintenance_run_row_json`] writes one even when the column is empty),
+/// and an empty name is an unclaimable name: it is kept only where an
+/// unclaimed table is, for a reach that is everything and for the tenant that
+/// owns the shared catalog. So is a classification `asset` that is a dataset
+/// slug or an authored rule's own text, which no upload can claim. A row with
+/// no string at all is left out of a narrowed answer. An answer with no
+/// `rows_key` list is left as it is.
 ///
 /// # Errors
 ///
 /// The 503 of [`crate::routes::query::claims_on`] when the claims cannot be
 /// read; the response carries its fixed sentence, never the cause.
-async fn retain_runs_in_reach(
+async fn retain_rows_in_reach(
     state: &AppState,
     reach: crate::routes::query::TenantReach,
     body: &mut Value,
+    rows_key: &str,
+    table_key: &str,
 ) -> Result<(), ApiError> {
     if reach == crate::routes::query::TenantReach::All {
         return Ok(());
     }
-    let Some(rows) = body.get_mut("maintenance").and_then(Value::as_array_mut) else {
+    let Some(rows) = body.get_mut(rows_key).and_then(Value::as_array_mut) else {
         return Ok(());
     };
     let table_of = |row: &Value| {
-        row.get("tableName")
+        row.get(table_key)
             .and_then(Value::as_str)
             .map(str::to_owned)
     };
@@ -1001,7 +1026,8 @@ pub async fn lineage(
 /// (`DATA-13`): the columns a column comes from, or the columns (and saved
 /// charts, with their dashboards) built from it, following recorded mappings
 /// up to ten hops. Same permission and tenant rules as [`lineage`]; charts
-/// and dashboards are listed only to a caller with `dashboard:read`.
+/// and dashboards are listed only to a caller with `dashboard:read` whom the
+/// shared catalog is open to (`SEC-20`, plan 96).
 ///
 /// # Errors
 ///

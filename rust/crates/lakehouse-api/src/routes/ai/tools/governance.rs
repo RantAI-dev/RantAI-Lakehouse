@@ -33,7 +33,8 @@ async fn governance_kind(state: &AppState, kind: &str) -> Value {
     // No principal: this is the headless path, and it does not narrow the
     // rows it reads. A call with no person is not narrowed, the convention
     // `ensure_rule_table` has (`GOV-15` D7). A person's maintenance history is
-    // narrowed by `read_kind` when `get_maintenance_metrics` passes the principal.
+    // narrowed by `read_kind` when `get_maintenance_metrics` or
+    // `list_classification_rules` passes the principal.
     response_to_value(
         crate::routes::governance::read_kind(state, None, &axum::http::HeaderMap::new(), kind)
             .await,
@@ -45,8 +46,31 @@ pub(super) async fn get_audit_history(state: &AppState) -> Value {
     governance_kind(state, "audit").await
 }
 
-pub(super) async fn list_classification_rules(state: &AppState) -> Value {
-    governance_kind(state, "classification").await
+/// `SEC-20` (plan 96): the classification list, as the person behind the chat
+/// may read it. The rows name the tables of the shared catalog and the upload
+/// tables of every tenant, so a person's list is narrowed to the tables in
+/// their reach by [`crate::routes::governance::read_kind`], the rule
+/// `GET /api/governance/classification` applies. The tool has no request
+/// headers, so the reach is the person's own tenant's, the convention
+/// `get_maintenance_metrics` follows. No principal is a headless run and is not
+/// narrowed, exactly as it was.
+pub(super) async fn list_classification_rules(
+    state: &AppState,
+    principal: Option<&Principal>,
+) -> Value {
+    let Some(principal) = principal else {
+        return governance_kind(state, "classification").await;
+    };
+    response_to_value(
+        crate::routes::governance::read_kind(
+            state,
+            Some(principal),
+            &axum::http::HeaderMap::new(),
+            "classification",
+        )
+        .await,
+    )
+    .await
 }
 
 pub(super) async fn list_quality_rules(state: &AppState, principal: Option<&Principal>) -> Value {
