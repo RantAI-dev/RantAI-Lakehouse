@@ -1400,6 +1400,9 @@ pub fn router(state: AppState) -> Router {
                 .delete(alerts::delete),
         )
         .route("/api/alerts/status", get(alerts::status))
+        // `BI-43` D1: a person's own alerts on one chart, for the chart's alert
+        // dialog; `GET /api/alerts` itself still needs `alert:read`.
+        .route("/api/alerts/mine", get(alerts::mine))
         // `BI-40` D1: a person's door for one rule, next to the scheduler's
         // (`/api/alerts/run`, unchanged, still behind `check_run_token`).
         .route("/api/alerts/test", post(alerts::test_one))

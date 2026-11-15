@@ -80,6 +80,68 @@ pub async fn list(
     Ok(ApiJson(json!({ "rules": rules })))
 }
 
+/// Query parameters for `GET /api/alerts/mine` (`?chart=`).
+#[derive(Debug, Deserialize)]
+pub struct MineQuery {
+    chart: Option<String>,
+}
+
+/// `GET /api/alerts/mine?chart=` — the signed-in person's own alerts on one
+/// chart (`BI-43`, decision D1 of
+/// `docs/superpowers/plans/2026-11-13-bi-follow-ups.md`).
+///
+/// `GET /api/alerts` needs `alert:read` since `ADM-13`, and Dashboard Viewer
+/// does not hold it, while `BI-19` C3 lets anybody who can view a chart save an
+/// alert on it. This is the door that closes the gap: it answers only rules
+/// the caller owns (`owner_id` is theirs), of the alert kind, on that chart, so
+/// it needs nothing beyond a session. The caller owns each rule listed, so
+/// [`rule_json_for`] keeps the target in (the same [`chart_alerts::may_manage`]
+/// test as the write routes). Removing one is the existing
+/// `DELETE /api/alerts?id=`, which already lets a person remove their own chart
+/// alert.
+///
+/// # Errors
+///
+/// 401 with no principal; 400 when `chart` is missing or empty; a fixed 500
+/// when the rules cannot be read or serialized.
+pub async fn mine(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    Query(query): Query<MineQuery>,
+) -> ApiResult<ApiJson<Value>> {
+    let Some(Extension(principal)) = principal else {
+        return Err(ApiError::unauthorized().into());
+    };
+    let chart = query
+        .chart
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("chart is required".to_owned()))?;
+    let me = principal.id.uuid().to_string();
+    let rules = lakehouse_alerts::list_rules(&state.clickhouse)
+        .await
+        .map_err(|err| {
+            upstream_error::ch_error_as(
+                &upstream_error::DATABASE,
+                &err,
+                upstream_error::FailedAs::Internal,
+            )
+        })?;
+    let mut out = Vec::new();
+    for rule in rules.iter().filter(|r| {
+        r.kind == AlertKind::Alert
+            && r.chart.as_deref() == Some(chart)
+            && r.owner_id.as_deref() == Some(me.as_str())
+    }) {
+        out.push(rule_json_for(Some(&principal), rule).map_err(|err| {
+            tracing::warn!(%err, rule_id = %rule.id, "an alert rule could not be serialized");
+            ApiError::Internal("the alert rules could not be listed".to_owned())
+        })?);
+    }
+    Ok(ApiJson(json!({ "rules": out })))
+}
+
 /// What a chart rule's row says about the chart it watches (`BI-39` D8), read
 /// live: the title is never stored, so a rename shows at once and a chart the
 /// caller lost access to stops naming itself (the same reason the bell is built

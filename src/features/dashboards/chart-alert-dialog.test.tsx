@@ -7,9 +7,19 @@ import { ChartAlertDialog, NO_LATEST_POINT_SENTENCE, OWN_ADDRESS_SENTENCE } from
 const originalFetch = global.fetch
 type Call = { url: string; method: string; body: Record<string, unknown> | undefined }
 
-function mockApi(status = 200, body: unknown = { ok: true, rule: { id: "al_1" } }) {
+const mineRule = { id: "al_9", name: "Alert: Visitors", type: "alert", chart: "c1", condition: "above", threshold: 100, channel: "email", target: "me@company.example", enabled: true }
+
+/**
+ * Records the writes (`calls`). The dialog's own read of `/api/alerts/mine` is
+ * answered with `mine` and kept out of `calls`, so each test counts only what
+ * it saves or removes (BI-43).
+ */
+function mockApi(status = 200, body: unknown = { ok: true, rule: { id: "al_1" } }, mine: unknown[] = []) {
   const calls: Call[] = []
   global.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (String(input).startsWith("/api/alerts/mine")) {
+      return new Response(JSON.stringify({ rules: mine }), { status: 200, headers: { "Content-Type": "application/json" } })
+    }
     calls.push({ url: String(input), method: init?.method ?? "GET", body: init?.body ? JSON.parse(String(init.body)) : undefined })
     return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } })
   }) as unknown as typeof fetch
@@ -137,5 +147,27 @@ describe("ChartAlertDialog", () => {
     fireEvent.change(screen.getByLabelText("Line"), { target: { value: "1" } })
     fireEvent.click(screen.getByRole("button", { name: "Save alert" }))
     expect(await screen.findByText(/no single number/)).toBeTruthy()
+  })
+
+  it("lists the person's own alerts on the chart and removes one only after a confirmation", async () => {
+    // BI-43 D1
+    const calls = mockApi(200, { ok: true }, [mineRule])
+    open()
+    expect(await screen.findByText("Your alerts on this chart")).toBeTruthy()
+    expect(screen.getByText(/above 100 · me@company.example/)).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }))
+    expect(calls.length).toBe(0)
+    expect(await screen.findByText("Remove alert?")).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Remove alert" }))
+    await waitFor(() => expect(calls.length).toBe(1))
+    expect(calls[0].method).toBe("DELETE")
+    expect(calls[0].url).toBe("/api/alerts?id=al_9")
+  })
+
+  it("shows no section when the person has no alert on the chart", async () => {
+    mockApi()
+    open()
+    await waitFor(() => expect(screen.getByLabelText("Name")).toBeTruthy())
+    expect(screen.queryByText("Your alerts on this chart")).toBeNull()
   })
 })

@@ -7,11 +7,12 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { useServiceAction } from "@/hooks/use-service";
+import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
+import { useService, useServiceAction } from "@/hooks/use-service";
 import { readableErrorMessage } from "@/lib/notify-message";
 import { notifySuccess } from "@/lib/notify";
 import { alertRuleService } from "@/services";
-import type { AlertCondition } from "@/services/contracts/alerts";
+import type { AlertCondition, AlertRule } from "@/services/contracts/alerts";
 import { displayColumn } from "@/lib/chart-joins";
 import { OTHER_FLAG } from "@/lib/chart-shape";
 import { alertNumberShape } from "./chart-alert";
@@ -50,6 +51,15 @@ export type AlertChart = {
 export const NO_LATEST_POINT_SENTENCE =
   "This chart is sorted by value, so it has no latest point to compare; it can only alert when it returns rows.";
 
+/** One line about a saved alert: what it watches for, and where it sends. */
+function alertSummary(rule: AlertRule): string {
+  const when =
+    rule.condition === "any_rows" ? "returns any rows"
+    : rule.condition === "below" ? `below ${rule.threshold}`
+    : `above ${rule.threshold}`;
+  return rule.target ? `${when} · ${rule.target}` : when;
+}
+
 /**
  * A chart's ⋯ > "Alert me…": a condition on the chart's number, the line, the
  * series (for a line or bar), the dashboard filters now on screen, and where to
@@ -80,6 +90,28 @@ export function ChartAlertDialog({
   const [problem, setProblem] = React.useState<string | null>(null);
   const save = useServiceAction((signal, input: Parameters<typeof alertRuleService.createRule>[0]) =>
     alertRuleService.createRule(input, signal));
+
+  // BI-43 D1: the person's own alerts on this chart, with remove. A failed
+  // read leaves the section out; it never blocks saving a new alert.
+  const mine = useService((signal) => alertRuleService.listMine(chart.id, signal), [chart.id]);
+  const [removing, setRemoving] = React.useState<AlertRule | null>(null);
+  const remove = useServiceAction((signal, id: string) => alertRuleService.deleteRule(id, signal));
+  const [removeProblem, setRemoveProblem] = React.useState<string | null>(null);
+  const ownAlerts = mine.status === "success" ? mine.data : [];
+
+  async function confirmRemove() {
+    if (!removing) return;
+    setRemoveProblem(null);
+    const done = await remove.run(removing.id);
+    if (done !== null) {
+      notifySuccess("Alert removed");
+      setRemoving(null);
+      mine.reload();
+    } else {
+      setRemoving(null);
+      setRemoveProblem("The alert could not be removed. Try again.");
+    }
+  }
 
   const needsLine = condition !== "any_rows";
   const isWebhook = /^https?:\/\//i.test(target.trim());
@@ -112,10 +144,27 @@ export function ChartAlertDialog({
   }
 
   return (
+    <>
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader><DialogTitle>Alert me · {chart.title}</DialogTitle></DialogHeader>
         <div className="grid gap-3">
+          {ownAlerts.length > 0 ? (
+            <section aria-label="Your alerts on this chart" className="grid gap-1.5">
+              <h3 className="text-sm font-medium">Your alerts on this chart</h3>
+              <ul className="grid gap-1">
+                {ownAlerts.map((rule) => (
+                  <li key={rule.id} className="flex items-center gap-2 rounded-lg bg-muted/50 py-1 pl-3 pr-1">
+                    <span className="min-w-0 flex-1 truncate text-sm">
+                      {rule.name} <span className="text-muted-foreground">· {alertSummary(rule)}</span>
+                    </span>
+                    <Button variant="ghost" size="sm" onClick={() => setRemoving(rule)}>Remove</Button>
+                  </li>
+                ))}
+              </ul>
+              {removeProblem ? <p role="alert" className="text-sm text-destructive">{removeProblem}</p> : null}
+            </section>
+          ) : null}
           <div className="grid gap-1.5">
             <Label htmlFor="chart-alert-name">Name</Label>
             <Input id="chart-alert-name" value={name} onChange={(e) => setName(e.target.value)} />
@@ -174,5 +223,16 @@ export function ChartAlertDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+      <ConfirmActionDialog
+        open={removing !== null}
+        onOpenChange={(o) => { if (!o) setRemoving(null); }}
+        title="Remove alert?"
+        description={`"${removing?.name ?? ""}" stops watching this chart and sends nothing more.`}
+        confirmLabel="Remove alert"
+        destructive
+        confirming={remove.status === "pending"}
+        onConfirm={() => void confirmRemove()}
+      />
+    </>
   );
 }
