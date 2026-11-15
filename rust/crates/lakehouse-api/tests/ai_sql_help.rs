@@ -19,8 +19,9 @@ use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{
-    TestApp, create_assistant_principal, session_cookie_for_seeded_user, session_cookie_for_user,
-    spin_up_with_env,
+    CLICKHOUSE_UNKNOWN_IDENTIFIER, COLUMN_DOES_NOT_EXIST, TestApp, create_assistant_principal,
+    mock_clickhouse_refusing, model_tool_result, session_cookie_for_seeded_user,
+    session_cookie_for_user, spin_up_with_env,
 };
 
 /// One model round: the given text and tool calls, as an OpenAI-compatible
@@ -176,70 +177,8 @@ const FIX_MESSAGE: &str = "Why does this query fail? Fix it.\n\nEngine: clickhou
 const WRONG_PROPOSAL: &str = r#"{"sql":"SELECT no_such_col FROM silver.orders","reason":"Used the wrong column.","engine":"clickhouse"}"#;
 const RIGHT_PROPOSAL: &str = r#"{"sql":"SELECT order_id FROM silver.orders","reason":"The column is order_id, not no_such_col.","engine":"clickhouse"}"#;
 
-/// The fixed sentence `ClickHouse`'s code 47 (`UNKNOWN_IDENTIFIER`) gets, and
-/// so the browser's copy of a statement failure (owner 2026-11-12,
-/// LH-QS-2-08): the person reads this sentence and a reference, never the
-/// engine's own text.
-const COLUMN_DOES_NOT_EXIST: &str = "This query names a column that does not exist.";
-
-/// The engine's own answer for a statement that names a column that does not
-/// exist: code 47, `DB::Exception`, the identifier and the server version.
-const CLICKHOUSE_UNKNOWN_IDENTIFIER: &str = "Code: 47. DB::Exception: Unknown expression identifier 'pengunjungg' in scope. (UNKNOWN_IDENTIFIER) (version 26.8.1)";
-
 /// A `run_sql` call whose statement the engine refuses.
 const RUN_SQL_FAILING: &str = r#"{"sql":"SELECT pengunjungg FROM silver.orders"}"#;
-
-/// `ClickHouse` for a `run_sql` whose statement the engine answers with
-/// `answer`: the dry run (`EXPLAIN AST`) confirms a `SELECT`, the statement
-/// itself gets the engine's own answer.
-///
-/// The mocks are mounted in that order because `wiremock` answers with the
-/// FIRST matching mock in mount order: the dry run's body carries the
-/// statement too, so its mock has to come first to keep the statement's own
-/// answer out of the dry run.
-async fn mock_clickhouse_refusing(failing: &str, answer: ResponseTemplate) -> MockServer {
-    let ch = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(body_string_contains("EXPLAIN AST"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string("SelectWithUnionQuery (children 1)\n ExpressionList ...\n"),
-        )
-        .mount(&ch)
-        .await;
-    Mock::given(method("POST"))
-        .and(body_string_contains(failing))
-        .respond_with(answer)
-        .mount(&ch)
-        .await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "meta": [{"name": "n", "type": "UInt64"}],
-            "data": [{"n": 5}],
-            "rows": 1,
-        })))
-        .mount(&ch)
-        .await;
-    ch
-}
-
-/// The tool result the model read in the round at `index` (`0` is the first
-/// round), as the model received it: the tool's own result, with the
-/// model's copy of the failure in `error`.
-async fn model_tool_result(llm: &MockServer, index: usize) -> Value {
-    let requests = llm.received_requests().await.expect("recording is on");
-    let request: Value =
-        serde_json::from_slice(&requests[index].body).expect("a JSON model request");
-    let message = request["messages"]
-        .as_array()
-        .expect("messages are a list")
-        .iter()
-        .rev()
-        .find(|m| m["role"] == "tool")
-        .unwrap_or_else(|| panic!("the model read a tool result: {request}"));
-    serde_json::from_str(message["content"].as_str().unwrap_or_default())
-        .expect("the tool result is a JSON object")
-}
 
 #[tokio::test]
 async fn an_allowlist_naming_propose_sql_offers_it_with_the_rules() {

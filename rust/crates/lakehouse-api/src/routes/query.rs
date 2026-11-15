@@ -691,7 +691,7 @@ pub(crate) const JOB_NEEDS_CATALOG_TENANT: &str = "This job reads the shared cat
 /// table is looked at, so "may this caller read that table" is asked
 /// once and answered the same way for every table and every route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TenantReach {
+pub(crate) enum TenantReach {
     /// Nothing is out of reach: a principal holding every permission
     /// (`"*:*"`), or a deployment with one tenant (or none) — there is no
     /// other tenant's table to reach, so the gate changes nothing.
@@ -754,7 +754,7 @@ const LISTING_NOT_AVAILABLE: &str = crate::policy_engine::LISTING_NOT_AVAILABLE;
 /// [`ApiError::NotFound`] when `X-Tenant` names a tenant the caller does
 /// not belong to — the same fail-closed 404 the tenant scope answers
 /// everywhere else, never a 403 that would confirm the tenant exists.
-async fn resolve_reach(
+pub(crate) async fn resolve_reach(
     state: &AppState,
     principal: &Principal,
     headers: &HeaderMap,
@@ -969,7 +969,7 @@ async fn deployment_tenant_count(state: &AppState) -> Result<Option<i64>, ApiErr
 /// - [`TableClaim::Unclaimed`]: nobody holds it — a table no upload
 ///   claimed, or a shared table — and it is reachable only by the
 ///   catalog's own tenant.
-fn table_is_reachable(reach: TenantReach, claim: TableClaim) -> bool {
+pub(crate) fn table_is_reachable(reach: TenantReach, claim: TableClaim) -> bool {
     match reach {
         TenantReach::All => true,
         TenantReach::NoTenant => false,
@@ -1014,7 +1014,11 @@ fn raw_table_name(table: &str) -> Option<&str> {
 /// 503 when the claim cannot be read: the store's own fixed message and
 /// a reference id, through [`upstream_error`] (the raw error text never
 /// reaches the response, `AGENTS.md` principle 4).
-async fn claim_on(state: &AppState, tenant_id: Uuid, table: &str) -> Result<TableClaim, ApiError> {
+pub(crate) async fn claim_on(
+    state: &AppState,
+    tenant_id: Uuid,
+    table: &str,
+) -> Result<TableClaim, ApiError> {
     let Some(raw) = raw_table_name(table) else {
         return Ok(TableClaim::Unclaimed);
     };
@@ -1045,7 +1049,7 @@ async fn claim_on(state: &AppState, tenant_id: Uuid, table: &str) -> Result<Tabl
 ///
 /// 404 with the fixed sentence of [`table_not_available`] for the first
 /// table out of reach; 503 when a claim cannot be read.
-async fn check_tables_against_reach(
+pub(crate) async fn check_tables_against_reach(
     state: &AppState,
     reach: TenantReach,
     tables: &[String],

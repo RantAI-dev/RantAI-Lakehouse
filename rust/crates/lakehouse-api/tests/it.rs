@@ -118,6 +118,7 @@ mod identity_table_access;
 mod identity_user_tenants;
 mod ingest_run;
 mod lakehouse_maintenance;
+mod lakehouse_tenant_scope;
 mod login_throttle;
 mod maps_routes;
 mod ops_workloads;

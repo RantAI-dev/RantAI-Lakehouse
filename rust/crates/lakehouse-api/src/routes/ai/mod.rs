@@ -120,12 +120,14 @@ const MAX_ITER: u32 = 8;
 /// BOTH copies: the diagnosis in `error` (the model's copy) and the fixed
 /// sentence in this key (the browser's copy).
 ///
-/// The chat loop takes this key out before it builds either copy
-/// ([`take_browser_error`]), so it reaches neither the model nor the
-/// browser. The name is not part of the wire contract: no client reads
-/// it, and it is gone from every payload a browser reads — the chat
-/// loop's trace, `POST /api/ai/tool`'s answer, and an agent run's step
-/// and outcome detail ([`without_browser_error`]).
+/// Every caller that hands a tool's result to a model or to a browser takes
+/// this key out first: the model gets the result without it, and the browser
+/// gets the same result with `error` replaced by the key's text. So the key
+/// reaches neither of them, and the name is not part of the wire contract:
+/// no client reads it. The chat loop splits the two copies itself, with
+/// [`take_browser_error`] and [`browser_copy`], for its trace. The other
+/// three callers go through [`split_tool_result`]: `POST /api/ai/tool`'s
+/// answer, an agent run's step, and an agent run's approval outcome.
 pub(in crate::routes) const BROWSER_ERROR_KEY: &str = "_browserError";
 
 /// Puts a tool's browser copy of an engine failure next to its error, in
@@ -154,12 +156,28 @@ fn take_browser_error(result: Value) -> (Value, Option<String>) {
     (Value::Object(map), browser)
 }
 
-/// A tool's result with the browser's copy of an engine failure taken out:
-/// for a caller that hands the result to a browser and has no use for the
-/// copy (a run's step detail, a run's outcome detail). The key is the
-/// server's own ([`BROWSER_ERROR_KEY`]), so it never reaches a browser.
-pub(in crate::routes) fn without_browser_error(result: Value) -> Value {
-    take_browser_error(result).0
+/// Splits a tool's result into the two copies a caller hands out: the
+/// model's copy and the browser's copy (LH-QS-2-08, owner 2026-11-12).
+///
+/// The model's copy is the result without [`BROWSER_ERROR_KEY`], so `error`
+/// keeps the engine's trimmed diagnosis. The browser's copy is the same
+/// result with `error` replaced by the fixed sentence and the reference
+/// ([`browser_copy`]). A result with no browser text (a success, or a
+/// failure whose message is already fixed) has one copy: both are the
+/// result as the tool returned it.
+///
+/// A caller that shows a tool's result to a person uses the browser's copy,
+/// and a caller that feeds it to the model uses the model's. No caller keeps
+/// the server-only key in what it hands out. The chat loop does not call
+/// this function: it splits the copies with [`take_browser_error`] and
+/// [`browser_copy`].
+pub(in crate::routes) fn split_tool_result(result: Value) -> (Value, Value) {
+    let (model, browser) = take_browser_error(result);
+    let shown = match browser {
+        Some(text) => browser_copy(&model, &text),
+        None => model.clone(),
+    };
+    (model, shown)
 }
 
 /// The browser's copy of a tool's failure: the tool's result with its
@@ -1733,11 +1751,12 @@ pub async fn tool_call(
         let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
         (result, if ok { "executed" } else { "failed" }, None, None)
     };
-    // LH-QS-2-08: the tool's browser copy of an engine failure lives in the
-    // one key only the server reads, so it is taken out here as well: this
-    // route answers a browser caller, and the key is not part of the wire
-    // contract. What the caller sees is the tool's own result, unchanged.
-    let (result, _) = take_browser_error(result);
+    // LH-QS-2-08 (owner 2026-11-12): this route answers a browser caller, so
+    // the answer carries the browser's copy of an engine failure (a fixed
+    // sentence and a reference), never the engine's own text. Only a model
+    // reads the diagnosis (the chat loop's or an agent run's), and it does
+    // not come through here.
+    let (result, shown) = split_tool_result(result);
     let (resource_kind, resource_id) = audit::resource_for(&parsed.tool, &parsed.args, &result);
     audit::record(
         state.pg.as_deref(),
@@ -1756,7 +1775,7 @@ pub async fn tool_call(
 
     (
         StatusCode::OK,
-        ApiJson(json!({ "tool": parsed.tool, "outcome": outcome, "result": result })),
+        ApiJson(json!({ "tool": parsed.tool, "outcome": outcome, "result": shown })),
     )
         .into_response()
 }
