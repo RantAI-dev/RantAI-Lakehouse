@@ -358,3 +358,23 @@ describe("a refusal reads as the sentence that names the permission (WEB-12)", (
     })
   })
 })
+
+describe("the Dashboards page's chart outlines (BI-59, P3)", () => {
+  it("reads the specs list once and keeps the board, the kind and a full-row span", async () => {
+    const calls = stubFetch(() =>
+      json({
+        charts: [
+          { id: "u1", board: "b_1", kind: "bar", span: 1, title: "A", def: { kind: "bar" } },
+          { id: "u2", board: "b_1", span: 2, def: { kind: "line" } },
+          { id: "u3", kind: "kpi" },
+        ],
+      }),
+    )
+    expect(await clickhouseDashboardService.listChartOutlines()).toEqual([
+      { id: "u1", board: "b_1", kind: "bar" },
+      { id: "u2", board: "b_1", kind: "line", span: 2 },
+      { id: "u3", board: "default", kind: "kpi" },
+    ])
+    expect(calls.map((c) => c.url)).toEqual(["/api/dashboard/specs"])
+  })
+})
