@@ -175,7 +175,7 @@ hands-on testing.
 | Share by link and embed in other sites | **Partial.** Public links never expire; embed tokens can lack an expiry | Yes; often a paid extra | `BI-19`, `BI-26`, `SEC-12` |
 | Alerts on a threshold | **Partial.** Email and webhook; one aggregate per table, re-fires every check | Yes | `BI-19` |
 | Scheduled reports with PDF or spreadsheet attached | **Built, in acceptance** (#204, 2026-10-26). Email on a schedule with the dashboard as PDF and charts as Excel or CSV; needs SMTP and the PDF settings below. The assistant can set one up (`AI-10`) | Yes, all three BI tools | `RPT-1`, `BI-35` |
-| Export to PDF or spreadsheet | **Built, in acceptance** (#204, 2026-10-26). A server-made PDF of every tab (Gotenberg), chart data as Excel or CSV up to 1,000,000 rows, a chart as PNG (`BI-37`); the assistant gives the same links (`AI-10`). Off until `CONSOLE_INTERNAL_URL` is set (`docs/OPERATIONS.md`, `REL-18`); image and web cards and uploaded maps do not print yet | Yes | `BI-1`, `BI-36`, `BI-42`, `REL-18` |
+| Export to PDF or spreadsheet | **Built, in acceptance** (#204, 2026-10-26). A server-made PDF of every tab (Gotenberg), chart data as Excel or CSV up to 1,000,000 rows, a chart as PNG (`BI-37`); the assistant gives the same links (`AI-10`). Off until `CONSOLE_INTERNAL_URL` is set (`docs/OPERATIONS.md`, `REL-18`); image cards print from the content sites; web cards do not (`BI-42`) | Yes | `BI-1`, `BI-36`, `BI-42`, `REL-18` |
 | Shared business definitions (a governed metrics layer) | **Partial.** Built-in dashboard cards are defined once in code; users cannot define and reuse their own metrics | Yes, all three BI tools | User-defined metrics |
 | Mobile app | **Missing** | Tableau and Power BI | Decide if wanted |
 | Import dashboards from another BI tool | **Missing** | Databricks imports Tableau and Power BI | Helps switching |
@@ -270,7 +270,7 @@ in `docs/KNOWN-LIMITATIONS.md` (moved from the README, 2026-11-05).
   saved query is limited to 2,000 rows and 30 seconds.
 - PDF export and scheduled reports are built but in acceptance, and off on a
   fresh install until `CONSOLE_INTERNAL_URL` is set (`REL-18`). A PDF has no
-  image or web cards (`BI-42`) and may miss an uploaded map (`BI-36`).
+  web cards (`BI-42`).
 
 **AI**
 - Needs a model endpoint. Works over tables, not documents.

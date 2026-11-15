@@ -107,6 +107,10 @@ const PDF_BUSY: &str = "The PDF service was busy; the next run will try again.";
 const PDF_TIMEOUT: &str = "The PDF took too long to make.";
 const PDF_UNREACHABLE: &str = "The PDF service is not reachable.";
 const PDF_FAILED: &str = "The PDF could not be made.";
+/// What a "Send now" that ran past its time budget records (`BI-35`): the run
+/// was stopped part-way, so it cannot say whether the email left.
+pub const RUN_TOO_LONG: &str =
+    "The report took longer than the time allowed and was stopped. It may not have been sent.";
 /// Paused after the fifth failure in a row (feature decision 7).
 pub const PAUSED_AFTER_FAILURES: &str =
     "Paused after 5 failed sends in a row. Fix the cause, then resume it.";
@@ -365,6 +369,56 @@ pub async fn run_subscription(
         tell_owner(state, mailer, sub, reason, paused_now).await;
     } else if !manual {
         subscriptions::note_outcome(pool, sub.id, outcome.status(), PAUSED_AFTER_FAILURES).await?;
+    }
+    Ok(delivery)
+}
+
+/// Record a "Send now" that was stopped at its time budget (`BI-35`): a failed
+/// manual delivery with [`RUN_TOO_LONG`], and an audit row with outcome
+/// `failed`, so the run history and the trail both say what happened instead of
+/// the request ending in a bare timeout with nothing written. Never counted
+/// toward the five failures, like any manual send. The audit row is best effort:
+/// a trail that cannot be written is logged, and the delivery is still recorded.
+///
+/// # Errors
+///
+/// [`StoreError`] when the delivery record cannot be written.
+pub async fn record_cut_run(
+    state: &AppState,
+    principal: &Principal,
+    sub: &Subscription,
+    started_at: OffsetDateTime,
+) -> Result<Delivery, StoreError> {
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(StoreError::Unavailable);
+    };
+    let delivery = subscriptions::record_delivery(
+        pool,
+        &NewDelivery {
+            subscription_id: sub.id,
+            started_at,
+            finished_at: OffsetDateTime::now_utc(),
+            status: DeliveryStatus::Failed,
+            manual: true,
+            recipient_count: 0,
+            reason: Some(RUN_TOO_LONG.to_owned()),
+        },
+    )
+    .await?;
+    let event = lakehouse_store::audit::NewAuditEvent {
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        action: "report.send_now".to_owned(),
+        resource_kind: Some("dashboard".to_owned()),
+        resource_id: Some(sub.board.clone()),
+        args: Some(json!({ "subscription": sub.id, "board": sub.board, "origin": "manual" })),
+        outcome: "failed".to_owned(),
+        detail: Some(RUN_TOO_LONG.to_owned()),
+        ..lakehouse_store::audit::NewAuditEvent::default()
+    };
+    if let Err(err) = lakehouse_store::audit::insert(pool, event).await {
+        tracing::warn!(%err, subscription = %sub.id, "a stopped report's audit row was not written");
     }
     Ok(delivery)
 }

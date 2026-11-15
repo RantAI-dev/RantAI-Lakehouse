@@ -583,6 +583,81 @@ async fn send_now_records_a_delivery_and_says_why_when_it_cannot_send() {
     );
 }
 
+/// `BI-35`: a second "Send now" on the same subscription inside the interval is
+/// refused with 429 and a `Retry-After`, another subscription is not held back,
+/// and the first press recorded one delivery only.
+#[tokio::test]
+async fn a_second_send_now_inside_the_interval_is_refused_with_a_retry_after() {
+    let f = fixture(&[]).await;
+    let colleague = user_id(&f.app.pool, "Colleague", "active").await;
+    let recipients = json!([{ "userId": colleague.to_string() }]);
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let (_, made) = call(
+            &f,
+            "POST",
+            SUBS,
+            &f.owner_cookie,
+            Some(body(recipients.clone())),
+        )
+        .await;
+        ids.push(format!("{SUBS}/{}", made["id"].as_str().unwrap()));
+    }
+    let (status, first) = call(
+        &f,
+        "POST",
+        &format!("{}/send", ids[0]),
+        &f.owner_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+
+    let resp = f
+        .app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("{}/send", ids[0]))
+                .header("cookie", &f.owner_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let wait: u64 = resp
+        .headers()
+        .get("retry-after")
+        .expect("a Retry-After header")
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=61).contains(&wait), "{wait}");
+
+    let (_, history) = call(
+        &f,
+        "GET",
+        &format!("{}/deliveries", ids[0]),
+        &f.owner_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(history["items"].as_array().unwrap().len(), 1);
+    let (status, other) = call(
+        &f,
+        "POST",
+        &format!("{}/send", ids[1]),
+        &f.owner_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{other}");
+}
+
 #[tokio::test]
 async fn send_now_to_an_unreachable_mail_server_gives_the_fixed_reason_only() {
     // Nothing listens on this port; the driver's error must not reach the record.
