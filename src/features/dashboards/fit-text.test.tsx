@@ -1,28 +1,26 @@
 import { cleanup, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
+import { stubClientWidth, stubRectWidth, stubResizeObserver } from "@/lib/test-layout"
 import { KpiValue } from "./fit-text"
 
 // Owner QA 2026-11-15: a KPI number is never cut; too wide even when smaller, it turns compact
 // and gives the full value to the tooltip and to screen readers.
-const realRect = Element.prototype.getBoundingClientRect
-const realClient = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientWidth")
+// CI full run 2026-11-15: widths are set on every prototype that could answer (`test-layout.ts`),
+// so a spy another file left on `HTMLElement.prototype` cannot hide them, and undone after each test.
+let undo: (() => void)[] = []
 
 /** Every text is 20 px a character at the base size; the number's box is `room` px wide. */
 function atRoom(room: number) {
-  Element.prototype.getBoundingClientRect = function (this: Element) {
-    const width = (this.textContent ?? "").length * 20
-    return { width, height: 0, top: 0, left: 0, right: width, bottom: 0, x: 0, y: 0, toJSON: () => ({}) } as DOMRect
-  }
-  Object.defineProperty(HTMLElement.prototype, "clientWidth", { configurable: true, get: () => room })
+  undo.push(stubRectWidth((el) => (el.textContent ?? "").length * 20), stubClientWidth(() => room))
 }
 
 beforeEach(() => {
-  ;(globalThis as { ResizeObserver?: unknown }).ResizeObserver ??= class { observe() {} disconnect() {} unobserve() {} }
+  undo.push(stubResizeObserver())
 })
 afterEach(() => {
   cleanup()
-  Element.prototype.getBoundingClientRect = realRect
-  if (realClient) Object.defineProperty(HTMLElement.prototype, "clientWidth", realClient)
+  for (const u of undo.reverse()) u()
+  undo = []
 })
 
 describe("KpiValue", () => {

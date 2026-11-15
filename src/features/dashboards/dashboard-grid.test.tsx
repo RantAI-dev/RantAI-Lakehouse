@@ -2,21 +2,26 @@ import * as React from "react"
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
 import type { BoardTab, LayoutMap } from "@/services"
+import { stubRectWidth, stubResizeObserver } from "@/lib/test-layout"
 import { DashboardGrid, type GridItem } from "./dashboard-grid"
 
 afterEach(cleanup)
 
-const realRect = Element.prototype.getBoundingClientRect
+// CI full run 2026-11-15: the canvas width is set here on every prototype that could answer
+// (`stubRectWidth`), not on `Element.prototype` alone, which a spy left over by another file in the
+// same bun process (copilot-dock.test.tsx) shadowed; and undone after each test.
+let undo: (() => void)[] = []
 function atWidth(width: number) {
-  Element.prototype.getBoundingClientRect = function () {
-    return { width, height: 0, top: 0, left: 0, right: width, bottom: 0, x: 0, y: 0, toJSON: () => ({}) } as DOMRect
-  }
+  undo.push(stubRectWidth(() => width))
 }
 beforeEach(() => {
-  ;(globalThis as { ResizeObserver?: unknown }).ResizeObserver ??= class { observe() {} disconnect() {} unobserve() {} }
+  undo.push(stubResizeObserver())
   try { window.localStorage.clear() } catch { /* no storage */ }
 })
-afterEach(() => { Element.prototype.getBoundingClientRect = realRect })
+afterEach(() => {
+  for (const u of undo.reverse()) u()
+  undo = []
+})
 
 const item = (id: string, title: string, kind?: string): GridItem => ({ id, kind, title, body: <p>{`body of ${title}`}</p> })
 const items = [item("a", "Alpha"), item("b", "Bravo"), item("s", "Region details", "section"), item("c", "Charlie"), item("h", "A heading", "heading")]

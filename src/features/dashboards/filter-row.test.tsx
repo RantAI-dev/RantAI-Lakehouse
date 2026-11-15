@@ -1,18 +1,19 @@
 import { cleanup, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it } from "bun:test"
 
+import { stubRectWidth, stubResizeObserver } from "@/lib/test-layout"
 import { FilterRow } from "./filter-row"
 
-const realRect = Element.prototype.getBoundingClientRect
+// CI full run 2026-11-15: the width is set on every prototype that could answer (`test-layout.ts`),
+// so a spy another file left on `HTMLElement.prototype` cannot hide it, and undone after each test.
+let undo: (() => void)[] = []
 function atWidth(width: number) {
-  Element.prototype.getBoundingClientRect = function () {
-    return { width, height: 0, top: 0, left: 0, right: width, bottom: 0, x: 0, y: 0, toJSON: () => ({}) } as DOMRect
-  }
-  ;(globalThis as { ResizeObserver?: unknown }).ResizeObserver ??= class { observe() {} disconnect() {} unobserve() {} }
+  undo.push(stubRectWidth(() => width), stubResizeObserver())
 }
 
 afterEach(() => {
-  Element.prototype.getBoundingClientRect = realRect
+  for (const u of undo.reverse()) u()
+  undo = []
   cleanup()
 })
 
