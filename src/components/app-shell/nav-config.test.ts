@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test"
 import * as fs from "node:fs"
 import * as path from "node:path"
-import { activeNavHref, canOpen, NAV_GROUPS, ROUTE_ACCESS, routeMatches } from "./nav-config"
+import { activeNavHref, canOpen, NAV_GROUPS, navbarTitleFor, pageTitleFor, ROUTE_ACCESS, routeMatches } from "./nav-config"
 
 /**
  * Normalizes a file path from `src/app` into its App Router route pattern:
@@ -226,5 +226,19 @@ describe("WEB-18: no History page", () => {
     expect(redirects).toContainEqual({ source: "/copilot/history", destination: "/copilot?open=latest", permanent: false })
     expect(fs.existsSync("src/app/copilot/history/page.tsx")).toBe(false)
     expect(ROUTE_ACCESS.some((e) => e.pattern === "/copilot/history")).toBe(false)
+  })
+})
+
+// Owner QA 2026-11-15: the navbar draws no title on the conversation page, but the route keeps
+// its name for the recents list and other labels.
+describe("WEB-18: navbar title on the conversation page", () => {
+  it("draws none on /copilot and below, and keeps the route's name", () => {
+    expect(navbarTitleFor("/copilot")).toBeNull()
+    expect(navbarTitleFor("/copilot/abc")).toBeNull()
+    expect(pageTitleFor("/copilot")).toBe("Conversation")
+  })
+
+  it("still draws the title on other pages", () => {
+    expect(navbarTitleFor("/dashboards/browse")).toBe("All Dashboards")
   })
 })

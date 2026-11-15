@@ -31,7 +31,7 @@ import {
   SIDEBAR_SUB_CLASS,
 } from "./sidebar-classes";
 import { NAVBAR_CLASS, NAVBAR_GRID_CLASS, NAVBAR_TRIGGER_CLASS, NavbarSearch, NavbarTitle } from "./app-navbar";
-import { NAV_GROUPS, activeNavHref, pageTitleFor } from "./nav-config";
+import { NAV_GROUPS, activeNavHref, navbarTitleFor } from "./nav-config";
 import { SidebarChatsSkeleton } from "./chat-list-skeleton";
 import { sidebarPlaceholderFor } from "./shell-placeholder";
 import { ShellMainPlaceholder } from "./shell-main-placeholder";
@@ -96,7 +96,7 @@ export function AppShellSkeleton({ pathname }: { pathname: string }) {
           <div className={NAVBAR_GRID_CLASS}>
             <div className="flex min-w-0 items-center gap-2">
               <SidebarTrigger variant="ghost" size="icon" className={NAVBAR_TRIGGER_CLASS} />
-              <NavbarTitle title={pageTitleFor(pathname)} />
+              <NavbarTitle title={navbarTitleFor(pathname)} />
             </div>
             <NavbarSearch />
             <div className="flex min-w-0 items-center justify-end gap-1" aria-hidden>
