@@ -304,4 +304,40 @@ describe("AuditPage: search, paging, deep link and export", () => {
     expect(screen.getAllByText("dashboard.share").length).toBeGreaterThan(0)
     expect(screen.queryByText("Something went wrong")).toBeNull()
   })
+
+  // GOV-1 review T-2: only a 404 means "no such event". A 500 says nothing
+  // about the id, so the page shows the server's message and keeps the list.
+  it("shows the error, not the no-such-event sentence, when the linked event cannot be read", async () => {
+    search = new URLSearchParams("event=audit-9")
+    stubApi((path) =>
+      path === `${SEARCH}/audit-9`
+        ? json({ error: "The audit trail could not be read." }, 500)
+        : json({ events: [row("a1", "dashboard.share")], nextCursor: null }),
+    )
+    renderPage()
+
+    expect(await screen.findByText("The audit trail could not be read.")).toBeDefined()
+    expect(document.body.textContent ?? "").not.toContain("No audit event has the id")
+    expect(screen.getAllByText("dashboard.share").length).toBeGreaterThan(0)
+  })
+
+  // GOV-1 review T-3: the server sends no total, so the footer must not
+  // print one; "Showing 1 of 1" next to a Load more button is a made-up count.
+  it("names no total in the footer while more events can be loaded, and says so at the end", async () => {
+    stubApi((_path, params) =>
+      params.get("cursor") === "next-1"
+        ? json({ events: [row("a2", "catalog.grant")], nextCursor: null })
+        : json({ events: [row("a1", "dashboard.share")], nextCursor: "next-1" }),
+    )
+    renderPage()
+    await waitFor(() => expect(screen.getAllByText("dashboard.share").length).toBeGreaterThan(0))
+    expect(document.body.textContent ?? "").not.toMatch(/\d+ of \d+/)
+    expect(screen.getByText("Showing 1 so far")).toBeDefined()
+
+    fireEvent.click(screen.getByRole("button", { name: "Load more" }))
+
+    await waitFor(() => expect(screen.getAllByText("catalog.grant").length).toBeGreaterThan(0))
+    expect(document.body.textContent ?? "").not.toMatch(/\d+ of \d+/)
+    expect(screen.getByText("Showing 2 · End of list")).toBeDefined()
+  })
 })

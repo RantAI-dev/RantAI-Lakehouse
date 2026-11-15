@@ -242,6 +242,11 @@ pub async fn one(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<ApiJson<Value>> {
+    // GOV-1 review R-2: Postgres TEXT cannot hold a NUL byte (`%00` in the
+    // path), so no event can have such an id; answer before the query.
+    if id.contains('\0') {
+        return Err(ApiError::NotFound(NO_SUCH_EVENT.to_owned()).into());
+    }
     let event = audit::get(pool(&state)?, &id)
         .await?
         .ok_or_else(|| ApiError::NotFound(NO_SUCH_EVENT.to_owned()))?;

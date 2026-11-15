@@ -353,18 +353,29 @@ impl AuditCursor {
     ///
     /// Returns [`AuditCursorError`] for anything [`encode`](Self::encode) could
     /// not have produced: bad base64, text that is not UTF-8, no `:`, a
-    /// microsecond count that is not a number or that no timestamp can
-    /// hold, an empty id.
+    /// microsecond count that is not a number or is outside years 1 to 9999,
+    /// an empty id, an id with a NUL byte.
     pub fn decode(text: &str) -> Result<Self, AuditCursorError> {
         let bytes = URL_SAFE_NO_PAD.decode(text).map_err(|_| AuditCursorError)?;
         let text = String::from_utf8(bytes).map_err(|_| AuditCursorError)?;
         let (micros, id) = text.split_once(':').ok_or(AuditCursorError)?;
         let at_micros: i64 = micros.parse().map_err(|_| AuditCursorError)?;
-        if id.is_empty() || micros_to_time(at_micros).is_none() {
+        // GOV-1 review R-1: both checks keep a hand-made cursor away from
+        // Postgres, which would otherwise refuse the bound value and turn a
+        // bad request into a 500. A TEXT value cannot hold a NUL byte.
+        if id.is_empty() || id.contains('\0') || !micros_in_audit_range(at_micros) {
             return Err(AuditCursorError);
         }
         Ok(Self::from_parts(at_micros, id))
     }
+}
+
+/// Years 1 to 9999. Postgres `timestamptz` reaches from 4713 BC to 294276 AD
+/// and the `time` crate from year -9999 to 9999, so `time` alone accepts the
+/// years from -9999 to 4714 BC that Postgres refuses. Years 1 to 9999 are
+/// inside both, and any real audit row falls inside them.
+fn micros_in_audit_range(micros: i64) -> bool {
+    micros_to_time(micros).is_some_and(|at| (1..=9999).contains(&at.year()))
 }
 
 fn micros_to_time(micros: i64) -> Option<OffsetDateTime> {

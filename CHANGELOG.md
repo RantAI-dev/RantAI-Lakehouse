@@ -70,6 +70,7 @@ once a first release is tagged.
 - Query Studio shows a fixed sentence and a reference for an engine failure, on a run and on the cost estimate, in place of the engine's own text (backlog `QS-2`, `QS-1`; feature page `docs/core/features/no-raw-upstream-errors.md`). The raw text goes to the log under the same reference. The assistant's tools are unchanged, but **Fix with AI** now sends the model only the sentence and the reference.
 - Refusals of the policy engine are in English everywhere they are shown: Query Studio, the assistant's tools and the layers rewrite. Each refusal has its own sentence, and the same queries are refused as before (backlog `QS-14`). Before, these were in Indonesian.
 - The read-only refusal in Query Studio says which of three causes applies (backlog `QS-14`). A curly quote or a `$$` sequence gets a sentence that asks for straight quotes. A first word that is not SELECT, WITH, SHOW, DESCRIBE or EXPLAIN gets a sentence that asks the person to check it for a typo. A write keeps the sentence it had. The queries refused stay the same.
+- The audit page lists audit events only. The last 50 pipeline runs that it used to merge into the list no longer appear there and stay on the pipeline run pages.
 
 ### Fixed
 

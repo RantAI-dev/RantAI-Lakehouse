@@ -249,17 +249,21 @@ export function AuditPage() {
     [url.event, needsFetch]
   )
   const selected = onPage ?? (needsFetch ? linked.data : null)
-  // A link to an event the server does not have (or will not show) opens
-  // nothing; the page says so and keeps the list.
+  // A link to an event the server does not have opens nothing; the page says
+  // so and keeps the list. GOV-1 review T-2: only a 404 (the client returns
+  // `null`) says that. Any other failure says what failed, because it tells
+  // nothing about whether the event exists.
   const linkedGone =
-    needsFetch &&
-    (linked.status === "error" ||
-      (linked.status === "success" && linked.data === null))
+    needsFetch && linked.status === "success" && linked.data === null
+  const linkedError =
+    needsFetch && linked.status === "error"
+      ? toServiceError(linked.error).message
+      : null
 
   const columns = React.useMemo(
     () => getAuditColumns({ onSelect: (e) => void setUrl({ event: e.id }) }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    []
+    // GOV-1 review T-1: `setUrl` is stable, so this still builds once.
+    [setUrl]
   )
 
   const { table } = useDataTable({
@@ -450,6 +454,11 @@ export function AuditPage() {
           No audit event has the id {url.event}.
         </p>
       ) : null}
+      {linkedError ? (
+        <p role="alert" className="rounded-md border bg-muted/40 px-3 py-2 text-sm">
+          {linkedError}
+        </p>
+      ) : null}
       {first.status === "loading" ? <LoadingSkeleton /> : null}
       {first.status === "error" ? (
         <ErrorState error={first.error} onRetry={first.reload} />
@@ -463,7 +472,7 @@ export function AuditPage() {
               onLoadMore: () => {},
               hasNextPage: cursor !== null,
               isFetchingNextPage: loadingMore,
-              totalItems: events.length,
+              // GOV-1 review T-3: the server gives no total, so none is passed.
               loadedCount: events.length,
             }}
           />

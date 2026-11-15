@@ -869,6 +869,17 @@ fn a_malformed_cursor_is_rejected_without_a_panic() {
         // A microsecond count no timestamp can hold.
         b64(format!("{}:e-1", i64::MAX).as_bytes()),
         b64(format!("{}:e-1", i64::MIN).as_bytes()),
+        // GOV-1 review R-1: `time` takes these but Postgres `timestamptz`
+        // refuses them (before 4713 BC), so the read would answer 500.
+        b64(b"-300000000000000000:e-1"),
+        // The first microsecond before year 1 is outside the range the
+        // decoder accepts (years 1 to 9999).
+        b64(b"-62135596800000001:e-1"),
+        // The first microsecond after year 9999.
+        b64(b"253402300800000000:e-1"),
+        // Postgres TEXT refuses a NUL byte, so a cursor id with one never
+        // reaches the database.
+        b64(b"1772359200000100:e\x00-1"),
     ] {
         assert!(AuditCursor::decode(&bad).is_err(), "accepted {bad:?}");
     }

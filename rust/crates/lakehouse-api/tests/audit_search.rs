@@ -436,7 +436,7 @@ async fn a_bad_search_query_gets_a_fixed_sentence_that_does_not_echo_the_value()
     let cursor = "The cursor is not valid.";
     let range = "from must be before to.";
     let unreadable = "The query string could not be read.";
-    let cases: [(&str, &str, &str); 12] = [
+    let cases: [(&str, &str, &str); 14] = [
         ("from=sneaky-date", time, "sneaky-date"),
         ("to=2026-13-45T00:00:00Z", time, "2026-13-45"),
         ("outcome=sneaky_outcome", outcome, "sneaky_outcome"),
@@ -445,6 +445,12 @@ async fn a_bad_search_query_gets_a_fixed_sentence_that_does_not_echo_the_value()
         ("limit=-1", limit, "-1"),
         ("limit=sneaky-limit", limit, "sneaky-limit"),
         ("cursor=sneaky!cursor", cursor, "sneaky!cursor"),
+        // GOV-1 review R-1: well-formed base64 that Postgres would refuse.
+        // `-300000000000000000:x` is a time before 4713 BC, and the second
+        // is `1772359200000100:a<NUL>b`, an id Postgres TEXT cannot hold.
+        // Without the checks these reach the database and answer 500.
+        ("cursor=LTMwMDAwMDAwMDAwMDAwMDAwMDp4", cursor, "LTMwMDAw"),
+        ("cursor=MTc3MjM1OTIwMDAwMDEwMDphAGI", cursor, "MTc3MjM1"),
         (
             "from=2026-02-01T00:00:00Z&to=2026-01-01T00:00:00Z",
             range,
@@ -495,19 +501,23 @@ async fn one_event_is_found_by_id_and_an_unknown_id_is_a_fixed_not_found() {
     assert_eq!(body["event"]["id"], "audit-one");
     assert_eq!(body["event"]["actor"], "Rina");
 
-    let (status, body) = get_text(
-        &router,
-        "/api/governance/audit/events/sneaky-missing-id",
-        &cookie,
-    )
-    .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    let parsed: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(parsed["error"], "No audit event has that id.");
-    assert!(
-        !body.contains("sneaky-missing-id"),
-        "the id is not echoed: {body}"
-    );
+    // GOV-1 review R-2: `%00` decodes to a NUL byte, which Postgres TEXT
+    // refuses; without the check in the handler that read answers 500.
+    for missing in ["sneaky-missing-id", "sneaky%00id"] {
+        let (status, body) = get_text(
+            &router,
+            &format!("/api/governance/audit/events/{missing}"),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{missing}: {body}");
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["error"], "No audit event has that id.", "{missing}");
+        assert!(
+            !body.contains("sneaky"),
+            "{missing}: the id is not echoed: {body}"
+        );
+    }
 }
 
 // ── Export ────────────────────────────────────────────────────────────────
