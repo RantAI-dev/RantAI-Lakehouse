@@ -348,10 +348,13 @@ async fn image_card_allowed(
 
 /// Fetch `src` under the rules of [`image`] and answer with the picture.
 async fn fetch_image(state: &AppState, src: &str) -> Response {
-    let failed = |what: &str| {
+    // The error itself goes to `upstream_error`, which logs its text under a
+    // reference id and answers with the fixed sentence (SEC-11); a reason of
+    // this function's own is passed the same way.
+    let failed = |cause: &dyn std::fmt::Display| {
         crate::error::ApiRejection(upstream_error::internal_error(
             &upstream_error::SERVICE,
-            &what,
+            cause,
         ))
         .into_response()
     };
@@ -363,7 +366,7 @@ async fn fetch_image(state: &AppState, src: &str) -> Response {
     };
     let Ok(checked) = crate::connector_probe::resolve_checked(host, port, &internal_hosts).await
     else {
-        return failed("the image host was refused or did not resolve");
+        return failed(&"the image host was refused or did not resolve");
     };
     let Ok(client) = reqwest::Client::builder()
         .timeout(IMAGE_TIMEOUT)
@@ -371,12 +374,12 @@ async fn fetch_image(state: &AppState, src: &str) -> Response {
         .resolve_to_addrs(host, checked.all())
         .build()
     else {
-        return failed("the image client could not be built");
+        return failed(&"the image client could not be built");
     };
     let mut response = match client.get(src).send().await {
         Ok(response) if response.status().is_success() => response,
-        Ok(_) => return failed("the image host did not answer with the image"),
-        Err(err) => return failed(&err.to_string()),
+        Ok(_) => return failed(&"the image host did not answer with the image"),
+        Err(err) => return failed(&err),
     };
     if response
         .content_length()
@@ -394,7 +397,7 @@ async fn fetch_image(state: &AppState, src: &str) -> Response {
                 body.extend_from_slice(&chunk);
             }
             Ok(None) => break,
-            Err(err) => return failed(&err.to_string()),
+            Err(err) => return failed(&err),
         }
     }
     let Some(media_type) = sniff_image(&body) else {
