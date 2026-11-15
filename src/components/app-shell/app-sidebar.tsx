@@ -47,8 +47,9 @@ export const SIDEBAR_GROUP_CLASS = "gap-0 px-2 py-2"
 export const SIDEBAR_MENU_CLASS = "mt-0 flex flex-col gap-0.5"
 export const SIDEBAR_FOOTER_CLASS = "border-t border-sidebar-border p-2"
 // One compact row (Claude's footer): a 24 px avatar, the name and role, a chevron, 32 px tall.
-// Collapsed, it is the avatar alone, centred in the 32 px icon column.
-export const ACCOUNT_CARD_CLASS = "h-8 gap-2 rounded-lg px-1.5 group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:p-0!"
+// Collapsed, it is the avatar alone, centred in the 32 px icon column by 4 px of padding: the faded name and chevron
+// still take room, so centring with justify-center would push the avatar out of the button's overflow-hidden box.
+export const ACCOUNT_CARD_CLASS = "h-8 gap-2 rounded-lg px-1.5 group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:justify-start group-data-[collapsible=icon]:p-1!"
 export const ACCOUNT_AVATAR_CLASS =
   "flex size-6 shrink-0 items-center justify-center rounded-full bg-primary/12 text-[10px] font-semibold text-primary"
 
