@@ -96,13 +96,13 @@ function TileMenu({ item, triggerClassName }: { item: GridItem; triggerClassName
 
 /*
  * The soft tile's three boxes (`BI-61` T4): a soft fill with no border, the
- * 40 px header the title sits in, and the body under it. Exported for the
+ * header the title sits in (at least 40 px; the title's top is fixed, so a description line only grows it downward), and the body under it. Exported for the
  * dashboard's loading placeholder (`dashboard-skeleton.tsx`), which draws the
  * same boxes with grey shapes inside, so a tile fills in place instead of a
  * differently drawn card being swapped for it (owner QA 2026-11-14).
  */
 export const SOFT_TILE_FRAME = "group/tile flex h-full flex-col overflow-hidden rounded-2xl bg-muted/45 dark:bg-card";
-export const SOFT_TILE_HEADER = "flex h-10 shrink-0 items-center gap-1.5 pl-4 pr-2 pt-1";
+export const SOFT_TILE_HEADER = "flex min-h-10 shrink-0 items-start gap-1.5 pl-4 pr-2 pt-1";
 export const SOFT_TILE_BODY = "tile-body-fill min-h-0 flex-1 px-2 pb-2";
 
 /**
@@ -141,15 +141,15 @@ export function TileCard({
           style={handle ? { touchAction: "none" } : undefined}
           onPointerDown={handle ? onHeaderPointerDown : undefined}
         >
-          {handle ? <GripVertical className="size-4 shrink-0 text-muted-foreground" aria-hidden /> : null}
-          <div className="min-w-0 flex-1">
+          {handle ? <GripVertical className="mt-2.5 size-4 shrink-0 text-muted-foreground" aria-hidden /> : null}
+          <div className="min-w-0 flex-1 pt-[9px]">
             <p className="flex items-center gap-1.5 truncate text-sm font-medium leading-tight">
               <span className="truncate">{item.title}</span>
               {item.hint}
             </p>
             {item.subtitle ? <p className="truncate text-[11px] text-muted-foreground">{item.subtitle}</p> : null}
           </div>
-          <span className="relative flex shrink-0 items-center">
+          <span className="relative mt-1 flex shrink-0 items-center">
             {item.dataFrom ? (
               <span
                 data-slot="tile-data-from"
