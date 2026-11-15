@@ -9,7 +9,9 @@ const real = await import("echarts")
 const setOption = mock(() => {})
 const fake = { setOption, on: () => {}, resize: () => {}, dispose: () => {}, getOption: () => ({}) }
 mock.module("echarts", () => ({ ...real, init: () => fake }))
-const { EChart } = await import("./echart")
+// A query makes a fresh copy of the module, so another test file that loaded ./echart with the real echarts first does not leak in.
+const echartPath = "./echart.tsx?bi32"
+const { EChart } = (await import(echartPath)) as typeof import("./echart")
 
 ;(globalThis as { ResizeObserver?: unknown }).ResizeObserver ??= class { observe() {} disconnect() {} unobserve() {} }
 afterEach(() => { cleanup(); setOption.mockClear() })
@@ -34,6 +36,17 @@ describe("EChart applies an option only when it changed", () => {
   it("applies again when the chart really changes", () => {
     const { rerender } = render(<Tile target={1500000} tick={0} />)
     rerender(<Tile target={2000000} tick={1} />)
+    expect(setOption).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe("EChart optionDeps", () => {
+  it("applies again when only what the formatters close over changed", () => {
+    const { rerender } = render(<EChart option={build(1) as never} optionDeps={{ decimals: 0 }} />)
+    expect(setOption).toHaveBeenCalledTimes(1)
+    rerender(<EChart option={build(1) as never} optionDeps={{ decimals: 0 }} />)
+    expect(setOption).toHaveBeenCalledTimes(1)
+    rerender(<EChart option={build(1) as never} optionDeps={{ decimals: 2 }} />)
     expect(setOption).toHaveBeenCalledTimes(2)
   })
 })

@@ -28,6 +28,7 @@ export function EChart({
   onDataClick,
   keepView,
   onChart,
+  optionDeps,
 }: {
   option: echarts.EChartsOption;
   height?: number | string;
@@ -47,6 +48,13 @@ export function EChart({
   keepView?: boolean;
   /** Receives the ECharts instance once created (and `null` on dispose), for zoom controls. */
   onChart?: (chart: echarts.ECharts | null) => void;
+  /**
+   * BI-32 review: what the option's formatter functions close over (number
+   * format, locale, decimals, theme…). Functions are compared by source, so
+   * the same code over other values would look unchanged; pass those values
+   * here and a change of them applies the option again.
+   */
+  optionDeps?: unknown;
 }) {
   const elRef = React.useRef<HTMLDivElement>(null);
   const chartRef = React.useRef<echarts.ECharts | null>(null);
@@ -114,7 +122,7 @@ export function EChart({
     // identity. `setOption(…, true)` replays the entrance animation (a
     // reference line redrawn from the left), so an option that says the same
     // as the one on screen is not applied again.
-    const key = `${keepView ? "v" : ""}${renderMode ? "r" : ""}${optionKey(option)}`;
+    const key = `${keepView ? "v" : ""}${renderMode ? "r" : ""}${optionKey(optionDeps)}|${optionKey(option)}`;
     if (appliedKey.current === key) return;
     appliedKey.current = key;
     // The first option has no view to keep (getOption would be empty).
@@ -123,7 +131,7 @@ export function EChart({
     // notMerge=true so theme/option changes are clean (no stacking of old series).
     chart.setOption(next, true);
     hasOption.current = true;
-  }, [option, keepView, renderMode]);
+  }, [option, optionDeps, keepView, renderMode]);
 
   return <div ref={elRef} style={{ width: "100%", height, cursor: onDataClick ? "pointer" : "default" }} />;
 }
