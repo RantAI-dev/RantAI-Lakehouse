@@ -133,3 +133,29 @@ console's own origin instead.
   the placeholder on error.
 - `docs/core/features/export-pdf-excel.md`: decision 3 gains one line saying images on the board's content
   sites reach the PDF through this route; web cards do not.
+
+## Handoff, BI-42 (developer, 2026-11-15, after D6b)
+
+Commit: see `git log` (`BI-42 feat(render): image cards reach a PDF through the API, web cards stay a placeholder`).
+
+- **Route** `GET /api/render/image?token=&src=` in `routes/render.rs` (`image`, `image_card_allowed`,
+  `fetch_image`, `sniff_image`), registered in `routes/mod.rs`, `POLICY_TABLE` (public count 17), and
+  walked in `route_auth.rs`. `embed::board_cards` is now `pub(crate)`. Pinned client:
+  `connector_probe::parse_endpoint_host_port` + `resolve_checked` + `resolve_to_addrs`, no redirects,
+  10 s, 5 MiB read in chunks (also refused on `Content-Length`). Failures log under a reference
+  (`upstream_error::internal_error`); refusals are fixed sentences (404, 413, 415).
+- **Print view:** `PrintImage` in `render-view.tsx` (eager, waited for, 12 s limit, placeholder on
+  error); web cards unchanged. The parked `/api/render/frame` and `/render/*` policy change were dropped.
+- **Tests:** Rust `render_data.rs` (card not listed, other address, not https, other board: 404; bad
+  token 401; missing params 400; a card on a listed site reaches the fetch and a loopback host is refused
+  with a fixed 500) and a unit test of the magic-number check. TS `render-view.test.tsx` (route URL with
+  the token, waiting, placeholder on error, web card placeholder). Docs: `export-pdf-excel.md` decision 3
+  and limits, `PRODUCT.md`.
+- **Commands:** `bun test src/features/dashboards/render-view.test.tsx` 14 pass, 0 fail; `bun run typecheck`
+  clean; `npx eslint` on the two files clean; `cargo fmt --check` clean; `check_test_modules.sh` passed.
+- **Not verified:** no Rust compiled or run. The success path (a real https fetch, a body over the cap, an
+  SVG body, the headers) has no integration test: the resolver refuses loopback and the tests have no
+  https server, so only `sniff_image` is unit tested. The loopback-refusal test assumes the test config
+  does not allow internal hosts (it still ends in a 500 if it does, as the connection fails). No browser
+  check of a real PDF with Gotenberg.
+
