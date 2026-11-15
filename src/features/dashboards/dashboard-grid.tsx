@@ -85,9 +85,11 @@ type Drag = { id: string; mode: "move" | "resize"; px: number; py: number; box: 
  * than 640 px, or one in `phoneEdit`, is drawn as one full-width column
  * (`PhoneStack`) in the order of the phone layout, else the reading order.
  *
- * Between the two, a reading viewer whose canvas would draw a tile under
- * 240 px sees that row two tiles a row (`reflowNarrow`, owner QA 2026-11-15);
- * the saved layout is untouched and edit mode shows it as saved.
+ * Between the two, a reading viewer whose canvas squeezes a tile under 240 px
+ * (one that is wide enough on a 1200 px canvas) sees that row laid out again
+ * in balanced rows that never narrow a tile (`reflowNarrow`, owner QA
+ * 2026-11-15; BI-61 review, reflow SHOULD-FIX 1 and 2); the saved layout is
+ * untouched and edit mode shows it as saved.
  */
 export function DashboardGrid({
   items, layout, editable, onLayoutChange, tabs, tab, phone, phoneEdit, onPhoneChange, foldKey, look = "card",
@@ -149,8 +151,9 @@ export function DashboardGrid({
 
   const hiddenIds = folding && !stacked ? foldedTiles(kinds, view, folded) : new Set<string>();
   const drawn = hiddenIds.size ? collapseLayout(view, kinds, hiddenIds) : view;
-  // Owner QA 2026-11-15: reading, a row whose tiles would be drawn under 240 px goes two a row
-  // (`reflowNarrow`); edit mode draws the saved grid, so its author edits what is saved.
+  // Owner QA 2026-11-15: reading, a row with a tile the space squeezes under 240 px is laid out again
+  // (`reflowNarrow`, BI-61 review, reflow SHOULD-FIX 1 and 2); edit mode draws the saved grid, so its
+  // author edits what is saved.
   const laid = editable || stacked ? drawn : reflowNarrow(drawn, width, { cols: COLS, margin: MARGIN });
   const reflowKey = laid === drawn ? "" : Object.keys(laid).filter((id) => laid[id].w !== drawn[id]?.w || laid[id].x !== drawn[id]?.x).sort().join(" ");
   // A tile that changes row because of the reflow moves there at once: when a side panel opens,

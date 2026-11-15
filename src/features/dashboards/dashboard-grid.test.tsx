@@ -107,8 +107,9 @@ describe("dashboard grid with tabs and sections", () => {
   })
 })
 
-// Owner QA 2026-11-15: reading, a canvas that would draw tiles under 240 px lays that row out two a
-// row; edit mode keeps the saved grid.
+// Owner QA 2026-11-15: reading, a canvas that squeezes tiles under 240 px lays that row out again
+// (2 + 2 for four 3-column KPIs at 900 px); edit mode keeps the saved grid. Small-by-design tiles
+// stay as authored (BI-61 review, reflow SHOULD-FIX 1).
 describe("dashboard grid reflow on a narrow canvas", () => {
   const kpiItems = ["k1", "k2", "k3", "k4"].map((id) => item(id, id.toUpperCase()))
   const kpiLayout: LayoutMap = Object.fromEntries(
@@ -138,6 +139,14 @@ describe("dashboard grid reflow on a narrow canvas", () => {
     expect(boxOf("K2").left).toBe("228px")
     expect(boxOf("K3").top).toBe("0px")
     expect(boxOf("K3").width).toBe("216px")
+  })
+
+  it("keeps six 2-column KPIs as authored on a 1440 px canvas (small by design)", () => {
+    atWidth(1440)
+    const six = ["k1", "k2", "k3", "k4", "k5", "k6"].map((id) => item(id, id.toUpperCase()))
+    const sixLayout: LayoutMap = Object.fromEntries(six.map((it, i) => [it.id, { x: i * 2, y: 0, w: 2, h: 3 }]))
+    render(<DashboardGrid items={six} layout={sixLayout} editable={false} onLayoutChange={() => {}} />)
+    for (const t of ["K1", "K6"]) expect(boxOf(t).top).toBe("0px")
   })
 
   it("keeps the saved grid when every tile is wide enough", () => {
