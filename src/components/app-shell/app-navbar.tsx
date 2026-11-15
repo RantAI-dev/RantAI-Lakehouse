@@ -18,7 +18,7 @@ import {
 import { cn } from "@/lib/utils"
 import { formatRelativeTime } from "@/lib/format"
 import { useMentionsRead } from "@/lib/mention-events"
-import { navbarTitleFor } from "./nav-config"
+import { pageTitleFor } from "./nav-config"
 import { openCommandPalette } from "@/components/command-palette"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService } from "@/hooks/use-service"
@@ -42,10 +42,7 @@ export const NAVBAR_GRID_CLASS =
 export const NAVBAR_TRIGGER_CLASS = "size-8 shrink-0 rounded-lg"
 
 /** The page's title at the navbar's left, from the nav config (never from the session). */
-export function NavbarTitle({ title }: { readonly title: string | null }) {
-  // Null: the route shows no title (owner QA 2026-11-15, the conversation page). Nothing
-  // follows the title in its column, so the toggle and the rest of the bar stay put.
-  if (title === null) return null
+export function NavbarTitle({ title }: { readonly title: string }) {
   return (
     <div className="hidden min-w-0 sm:block">
       <p className="truncate text-sm font-semibold text-foreground">{title}</p>
@@ -133,7 +130,7 @@ export function CopilotButton({ open, onToggle }: { readonly open: boolean; read
  */
 export function AppNavbar() {
   const pathname = usePathname()
-  const pageTitle = navbarTitleFor(pathname)
+  const pageTitle = pageTitleFor(pathname)
   const router = useRouter()
   const { user, activeTenantId, setActiveTenant, hasPermission } = useAuth()
   const copilot = useCopilot()
