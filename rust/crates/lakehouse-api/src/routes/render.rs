@@ -242,19 +242,23 @@ const IMAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// sentence, so the route is no oracle for what a board holds.
 const IMAGE_NOT_AVAILABLE: &str = "image is not available";
 
-/// What the route says for a body that is not a PNG, JPEG, GIF or WebP.
+/// What the route says for a body that is not a PNG, JPEG, GIF or `WebP`.
 const IMAGE_NOT_SUPPORTED: &str = "the address does not give a supported image";
 
 /// What the route says for a picture over [`IMAGE_MAX_BYTES`].
 const IMAGE_TOO_LARGE: &str = "the image is too large to print";
 
+/// The query of `GET /api/render/image`. Both fields are optional so a missing
+/// one is the route's own 400, not the extractor's plain-text rejection.
 #[derive(Debug, Deserialize)]
-struct ImageQuery {
-    token: Option<String>,
-    src: Option<String>,
+pub struct ImageQuery {
+    /// The render token the print view was opened with.
+    pub token: Option<String>,
+    /// The address saved on the image card.
+    pub src: Option<String>,
 }
 
-/// The media type of `bytes` by its magic numbers: PNG, JPEG, GIF or WebP.
+/// The media type of `bytes` by its magic numbers: PNG, JPEG, GIF or `WebP`.
 /// SVG, and anything else, is `None`, whatever the server's header said.
 fn sniff_image(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
@@ -286,7 +290,7 @@ fn image_refusal(status: StatusCode, sentence: &'static str) -> Response {
 /// fetch is `https` only, through a client pinned to the addresses
 /// [`crate::connector_probe::resolve_checked`] approved (so a name that
 /// resolves inside the deployment's network is refused), follows no redirect,
-/// stops at 10 seconds and reads at most 5 MiB. Only PNG, JPEG, GIF and WebP
+/// stops at 10 seconds and reads at most 5 MiB. Only PNG, JPEG, GIF and `WebP`
 /// pass, judged by the first bytes; SVG never does. Upstream error text never
 /// reaches the answer (`upstream_error`).
 ///
@@ -376,7 +380,7 @@ async fn fetch_image(state: &AppState, src: &str) -> Response {
     };
     if response
         .content_length()
-        .is_some_and(|n| n > IMAGE_MAX_BYTES as u64)
+        .is_some_and(|n| n > u64::try_from(IMAGE_MAX_BYTES).unwrap_or(u64::MAX))
     {
         return image_refusal(StatusCode::PAYLOAD_TOO_LARGE, IMAGE_TOO_LARGE);
     }
