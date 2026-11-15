@@ -25,7 +25,7 @@ const sub: ReportSubscription = {
   canEdit: true,
 }
 
-function mockApi(opts: { items?: ReportSubscription[]; emailSetUp?: boolean; pdfSupported?: boolean; createStatus?: number; createBody?: unknown } = {}) {
+function mockApi(opts: { items?: ReportSubscription[]; emailSetUp?: boolean; pdfSupported?: boolean; createStatus?: number; createBody?: unknown; sendStatus?: number; sendBody?: unknown } = {}) {
   const calls: Call[] = []
   global.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
@@ -36,6 +36,7 @@ function mockApi(opts: { items?: ReportSubscription[]; emailSetUp?: boolean; pdf
     }
     if (url.startsWith("/api/reports/recipients")) return json({ items: [{ id: "u9", name: "Dewi", email: "dewi@company.example" }] })
     if (url === "/api/reports/subscriptions" && method === "POST") return json(opts.createBody ?? sub, opts.createStatus ?? 200)
+    if (url.endsWith("/send") && opts.sendStatus) return json(opts.sendBody ?? {}, opts.sendStatus)
     if (url.endsWith("/send")) return json({ id: "d", status: "failed", origin: "manual", recipientCount: 0, reason: EMAIL_NOT_SET_UP, startedAt: "", finishedAt: "" })
     return json({})
   }) as unknown as typeof fetch
@@ -184,6 +185,28 @@ describe("SubscriptionsDialog", () => {
     const put = calls.find((c) => c.method === "PUT")?.body as Record<string, unknown>
     // RPT-1 review fix (SHOULD-FIX) R4: only the flag is sent.
     expect(put).toEqual({ paused: true })
+  })
+
+  it("asks before deleting, names the subscription, and deletes only on the confirm (BI-35)", async () => {
+    const calls = mockApi({ items: [sub] })
+    render(<SubscriptionsDialog {...props} />)
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }))
+    expect(await screen.findByText("Delete this subscription?")).toBeDefined()
+    expect(screen.getByText(/Every Monday at 08:00 \(Asia\/Jakarta\) on Sales will stop/)).toBeDefined()
+    expect(calls.some((c) => c.method === "DELETE")).toBe(false)
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }))
+    await waitFor(() => expect(screen.queryByText("Delete this subscription?")).toBeNull())
+    expect(calls.some((c) => c.method === "DELETE")).toBe(false)
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }))
+    fireEvent.click(await screen.findByRole("button", { name: "Delete subscription" }))
+    await waitFor(() => expect(calls.some((c) => c.method === "DELETE" && c.url.endsWith("/s1"))).toBe(true))
+  })
+
+  it("shows the sentence of a send that was pressed again too soon (BI-35)", async () => {
+    mockApi({ items: [sub], sendStatus: 429, sendBody: { error: "This report was just sent. Wait a little before sending it again." } })
+    render(<SubscriptionsDialog {...props} />)
+    fireEvent.click(await screen.findByRole("button", { name: "Send now" }))
+    expect((await screen.findByRole("alert")).textContent).toBe("This report was just sent. Wait a little before sending it again.")
   })
 
   it("shows Sending… with a spinner on the row until the send answers, then the result (RPT-1 QA fix Q1)", async () => {

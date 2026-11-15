@@ -2,12 +2,13 @@
 
 import * as React from "react";
 import { Loader2 } from "lucide-react";
+import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
 import { SelectField } from "@/components/patterns/select-field";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { useService } from "@/hooks/use-service";
+import { useService, useServiceAction } from "@/hooks/use-service";
 import { normalizeFilters } from "@/lib/dashboard-filter-state";
 import { listTimeZones } from "@/lib/time-zones";
 import { reportService } from "@/services";
@@ -122,7 +123,7 @@ export function SubscriptionsDialog({
                 {list.data.items.length === 0 ? <p className="text-sm text-muted-foreground">No subscriptions on this dashboard yet.</p> : null}
                 <ul className="flex flex-col gap-2" aria-label="Subscriptions">
                   {list.data.items.map((s) => (
-                    <SubscriptionRow key={s.id} s={s} onEdit={() => setEditing(s)} onHistory={() => setHistory(s)} onChanged={reload} />
+                    <SubscriptionRow key={s.id} s={s} dashName={dashName} onEdit={() => setEditing(s)} onHistory={() => setHistory(s)} onChanged={reload} />
                   ))}
                 </ul>
               </>
@@ -139,29 +140,50 @@ export function SubscriptionsDialog({
 }
 
 function SubscriptionRow({
-  s, onEdit, onHistory, onChanged,
+  s, dashName, onEdit, onHistory, onChanged,
 }: {
   readonly s: ReportSubscription;
+  readonly dashName: string;
   readonly onEdit: () => void;
   readonly onHistory: () => void;
   readonly onChanged: () => void;
 }) {
-  const [busy, setBusy] = React.useState(false);
+  // BI-35: the three row actions go through `useServiceAction`, like the rest of
+  // the console, so a request is aborted when the dialog closes and an aborted
+  // call never shows as an error.
+  const sendAction = useServiceAction((signal, id: string) => reportService.sendNow(id, signal));
+  const pauseAction = useServiceAction((signal, id: string, paused: boolean) => reportService.setPaused(id, paused, signal));
+  const removeAction = useServiceAction((signal, id: string) => reportService.remove(id, signal));
+  const busy = [sendAction, pauseAction, removeAction].some((a) => a.status === "pending");
   // RPT-1 QA fix Q1: a send can take a minute with a PDF, so this row says it is
   // sending (not only greyed) until the answer arrives; other actions stay quiet.
-  const [sending, setSending] = React.useState(false);
+  const sending = sendAction.status === "pending";
   const [note, setNote] = React.useState<string | null>(null);
-  async function run(fn: () => Promise<string | void>) {
-    setBusy(true); setNote(null);
-    try {
-      const done = await fn();
-      if (done) setNote(done);
+  // BI-35: Delete asks first, naming the subscription.
+  const [confirmingDelete, setConfirmingDelete] = React.useState(false);
+  const failure = confirmingDelete ? null : (sendAction.error ?? pauseAction.error ?? removeAction.error);
+  function begin() {
+    setNote(null);
+    sendAction.reset(); pauseAction.reset(); removeAction.reset();
+  }
+  async function send() {
+    begin();
+    const d = await sendAction.run(s.id);
+    if (d) {
+      setNote(d.status === "sent" ? "Sent. Check the inbox." : d.status === "skipped" ? `Skipped. ${d.reason ?? ""}` : `Not sent. ${d.reason ?? ""}`);
+      // A failed delivery is recorded too, so the list is read again.
       onChanged();
-    } catch (e) {
-      setNote(e instanceof Error ? e.message : "That did not work.");
-    } finally {
-      setBusy(false);
     }
+  }
+  async function pause() {
+    begin();
+    // RPT-1 review fix (SHOULD-FIX) R4: pause and resume send only the flag.
+    if (await pauseAction.run(s.id, !s.paused)) onChanged();
+  }
+  async function remove() {
+    begin();
+    // The confirmation stays open on a failure and shows the reason.
+    if ((await removeAction.run(s.id)) !== null) onChanged();
   }
   const people = s.recipients.map((r) => r.name ?? r.email ?? "").filter(Boolean);
   // QA LH-RPT-1-06 (RPT-2, DEC-18): while e-mail is not set up, a failure for
@@ -185,25 +207,30 @@ function SubscriptionRow({
         <p role="status" className="flex items-center gap-1.5 text-xs text-muted-foreground">
           <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />Sending…
         </p>
-      ) : note ? <p role="status" className="text-xs">{note}</p> : null}
+      ) : failure ? <p role="alert" className="text-xs text-destructive">{failure.message}</p>
+        : note ? <p role="status" className="text-xs">{note}</p> : null}
       {s.canEdit !== false ? (
         <div className="flex flex-wrap gap-1.5 pt-1">
-          <Button variant="outline" size="xs" disabled={busy} onClick={() => { setSending(true); void run(async () => {
-            try {
-              const d = await reportService.sendNow(s.id);
-              return d.status === "sent" ? "Sent. Check the inbox." : d.status === "skipped" ? `Skipped. ${d.reason ?? ""}` : `Not sent. ${d.reason ?? ""}`;
-            } finally {
-              setSending(false);
-            }
-          }); }}>{sending ? "Sending…" : "Send now"}</Button>
-          <Button variant="outline" size="xs" disabled={busy} onClick={() => void run(async () => {
-            // RPT-1 review fix (SHOULD-FIX) R4: pause and resume send only the flag.
-            await reportService.setPaused(s.id, !s.paused);
-          })}>{s.paused ? "Resume" : "Pause"}</Button>
+          <Button variant="outline" size="xs" disabled={busy} onClick={() => void send()}>{sending ? "Sending…" : "Send now"}</Button>
+          <Button variant="outline" size="xs" disabled={busy} onClick={() => void pause()}>{s.paused ? "Resume" : "Pause"}</Button>
           <Button variant="outline" size="xs" disabled={busy} onClick={onEdit}>Edit</Button>
           <Button variant="outline" size="xs" disabled={busy} onClick={onHistory}>History</Button>
-          <Button variant="ghost" size="xs" disabled={busy} onClick={() => void run(() => reportService.remove(s.id))}>Delete</Button>
+          <Button variant="ghost" size="xs" disabled={busy} onClick={() => { begin(); setConfirmingDelete(true); }}>Delete</Button>
         </div>
+      ) : null}
+      {confirmingDelete ? (
+        <ConfirmActionDialog
+          open
+          onOpenChange={(open) => { if (!open && removeAction.status !== "pending") setConfirmingDelete(false); }}
+          title="Delete this subscription?"
+          description={`${describeSchedule(s.schedule, s.timeZone)} on ${dashName} will stop for everyone it goes to. Its send history is deleted too.`}
+          confirmLabel="Delete subscription"
+          confirming={removeAction.status === "pending"}
+          destructive
+          onConfirm={() => void remove()}
+        >
+          {removeAction.error ? <p role="alert" className="text-sm text-destructive">{removeAction.error.message}</p> : null}
+        </ConfirmActionDialog>
       ) : null}
     </li>
   );
@@ -269,8 +296,13 @@ function SubscriptionForm({
   const [address, setAddress] = React.useState("");
   const current = React.useMemo(() => normalizeFilters([...readState.filters]) as FilterDef[], [readState.filters]);
   const [filters, setFilters] = React.useState<unknown[] | null>(existing ? existing.filters : current);
-  const [busy, setBusy] = React.useState(false);
+  // BI-35: the save goes through `useServiceAction`; `error` holds only the
+  // form's own check ("Choose a time."), the route's sentence is the action's.
+  const saveAction = useServiceAction((signal, id: string | null, input: ReportSubscriptionInput) =>
+    id ? reportService.update(id, input, signal) : reportService.create({ ...input, board }, signal));
+  const busy = saveAction.status === "pending";
   const [error, setError] = React.useState<string | null>(null);
+  const shownError = error ?? saveAction.error?.message ?? null;
 
   React.useEffect(() => {
     if (!query.trim()) { setFound([]); return; }
@@ -310,17 +342,11 @@ function SubscriptionForm({
       skipWhenEmpty: skip,
       recipients: [...people.map((p) => ({ userId: p.userId })), ...addresses.map((email) => ({ email }))],
     };
-    setBusy(true); setError(null);
-    try {
-      if (existing) await reportService.update(existing.id, input);
-      else await reportService.create({ ...input, board });
-      onSaved();
-    } catch (e) {
-      // The route's own sentence: an outside domain not listed, 51 recipients, a user who is not active.
-      setError(e instanceof Error ? e.message : "The subscription could not be saved.");
-    } finally {
-      setBusy(false);
-    }
+    setError(null);
+    // The route's own sentence on a refusal: an outside domain not listed, 51
+    // recipients, a user who is not active. The form stays open.
+    const saved = await saveAction.run(existing?.id ?? null, input);
+    if (saved) onSaved();
   }
 
   // WEB-8 D8: the zone names the browser's own IANA list plus UTC and the
@@ -455,7 +481,7 @@ function SubscriptionForm({
         </div>
       </fieldset>
 
-      {error ? <p role="alert" className="text-sm text-destructive">{error}</p> : null}
+      {shownError ? <p role="alert" className="text-sm text-destructive">{shownError}</p> : null}
       <DialogFooter>
         <Button variant="ghost" size="sm" disabled={busy} onClick={onCancel}>Cancel</Button>
         <Button size="sm" disabled={busy} onClick={() => void save()}>{busy ? "Saving…" : existing ? "Save changes" : "Subscribe"}</Button>
