@@ -15,7 +15,7 @@ import { GeoChart } from "./geo-chart";
 import type { MapLoader } from "./echarts-maps";
 import { useReporting } from "./reporting-context";
 import { KpiCard } from "./kpi-card";
-import { KpiValue } from "./fit-text";
+import { KpiValue, OverflowText } from "./fit-text";
 import { compactKpiText } from "@/lib/kpi-fit";
 import { TileBodyPlaceholder } from "./dashboard-skeleton";
 import { PivotTable } from "./pivot-table";
@@ -150,7 +150,7 @@ function TileBodyOf({
           // Unformatted, the full value is `fmtInt`'s whole en-US number, so its compact form is too.
           compact={v === null ? null : kpiFormat ? compactKpiText(v, kpiFormat, reporting.numberLocale, decimalsFor([v])) : compactKpiText(Math.round(v), undefined, "en-US", 0)}
         />
-        {spec.caption ? <p className="mt-1 text-xs text-muted-foreground">{spec.caption}</p> : null}
+        {spec.caption ? <OverflowText as="p" lines={2} text={spec.caption} className="mt-1 text-xs text-muted-foreground" /> : null}
       </div>
     );
   }

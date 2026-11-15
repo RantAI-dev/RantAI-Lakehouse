@@ -18,6 +18,7 @@ import {
 import { cn } from "@/lib/utils";
 import type { GridItem, TileLook, TileMenuItem } from "./dashboard-grid";
 import { EASE } from "./dashboard-header";
+import { OverflowText } from "./fit-text";
 
 /** The kinds drawn without a card: they have no data (BI-18 part C). */
 export function isSectionKind(kind: string | undefined): kind is "heading" | "divider" | "section" {
@@ -100,18 +101,34 @@ function TileMenu({ item, triggerClassName }: { item: GridItem; triggerClassName
  * dashboard's loading placeholder (`dashboard-skeleton.tsx`), which draws the
  * same boxes with grey shapes inside, so a tile fills in place instead of a
  * differently drawn card being swapped for it (owner QA 2026-11-14).
+ *
+ * The frame is a size container (`@container/tile`): what its header shows
+ * follows the tile's own width, which a side panel changes without changing
+ * the window (owner QA 2026-11-15).
  */
-export const SOFT_TILE_FRAME = "group/tile flex h-full flex-col overflow-hidden rounded-2xl bg-muted/45 dark:bg-card";
+export const SOFT_TILE_FRAME = "@container/tile group/tile flex h-full flex-col overflow-hidden rounded-2xl bg-muted/45 dark:bg-card";
 export const SOFT_TILE_HEADER = "flex min-h-10 shrink-0 items-start gap-1.5 pl-4 pr-2 pt-1";
 export const SOFT_TILE_BODY = "tile-body-fill min-h-0 flex-1 px-2 pb-2";
+
+/** The "Data from" chip shows on hover or focus only on a tile at least 360 px (22.5rem) wide (see `TileCard`). */
+const DATA_FROM_SHOWN = "@min-[22.5rem]/tile:group-hover/tile:inline @min-[22.5rem]/tile:group-focus-within/tile:inline";
 
 /**
  * A tile: header (drag handle in edit mode, title, badge, ⋯ menu) over its body.
  *
  * `soft` (`BI-61` T4, the dashboard page): a soft fill with no border and no
- * badge. Its ⋯ and the quiet "Data from" line appear when the tile is hovered
- * or the menu is focused, laid over the header's right side so they never
- * push the title into "…"; on a touch screen, which cannot hover, the ⋯ stays.
+ * badge. Its ⋯ and the quiet "Data from" chip appear when the tile is hovered
+ * or the menu is focused; on a touch screen, which cannot hover, the ⋯ stays.
+ *
+ * Owner QA 2026-11-15 ("Data from 18:59" covered a narrow tile's title, and a
+ * cut title could not be read): the title has priority. The hover tools sit
+ * beside it, not over it, and take only their own width, so the title ends in
+ * "…" before them; a cut title or description reads in full in a tooltip. The
+ * chip shows only on a tile at least 360 px wide: the header's fixed
+ * parts (16 px left and 8 px right padding, the 6 px gap, the chip at about
+ * 100 px, its 4 px gap and the 28 px ⋯) take about 160 px, which leaves a
+ * narrower tile under 200 px of title. A narrow tile still says when its data
+ * is from: the page header does, and the first line of its ⋯.
  */
 export function TileCard({
   item, editable, dragging, onHeaderPointerDown, look = "card",
@@ -144,19 +161,20 @@ export function TileCard({
           {handle ? <GripVertical className="mt-2.5 size-4 shrink-0 text-muted-foreground" aria-hidden /> : null}
           <div className="min-w-0 flex-1 pt-[9px]">
             <p className="flex items-center gap-1.5 truncate text-sm font-medium leading-tight">
-              <span className="truncate">{item.title}</span>
+              <OverflowText text={item.title} className="min-w-0" />
               {item.hint}
             </p>
-            {item.subtitle ? <p className="truncate text-[11px] text-muted-foreground">{item.subtitle}</p> : null}
+            {item.subtitle ? <OverflowText as="p" text={item.subtitle} className="text-[11px] text-muted-foreground" /> : null}
           </div>
-          <span className="relative mt-1 flex shrink-0 items-center">
+          <span className="mt-1 flex shrink-0 items-center gap-1">
             {item.dataFrom ? (
               <span
                 data-slot="tile-data-from"
                 className={cn(
-                  "pointer-events-none absolute right-8 hidden whitespace-nowrap rounded-full bg-muted/90 px-2 py-0.5 text-[11px] text-muted-foreground tabular-nums opacity-0 lg:inline dark:bg-card",
-                  "group-hover/tile:opacity-100 group-focus-within/tile:opacity-100",
-                  EASE,
+                  "pointer-events-none hidden whitespace-nowrap rounded-full bg-muted/90 px-2 py-0.5 text-[11px] text-muted-foreground tabular-nums dark:bg-card",
+                  DATA_FROM_SHOWN,
+                  // It fades in as it takes its place (`@starting-style`); leaving, it goes at once.
+                  "transition-opacity duration-150 ease-ui starting:opacity-0",
                 )}
               >
                 {item.dataFrom}

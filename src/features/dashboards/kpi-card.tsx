@@ -9,7 +9,7 @@ import { decimalsFor } from "@/lib/chart-axis";
 import type { StyleFields } from "@/lib/chart-style";
 import { formatValue } from "@/lib/value-format";
 import { compactKpiText } from "@/lib/kpi-fit";
-import { KpiValue } from "./fit-text";
+import { KpiValue, OverflowText } from "./fit-text";
 import { conditionalCss } from "./table-cell";
 import { useReporting } from "./reporting-context";
 import type { Rows } from "./tile-dialogs";
@@ -76,7 +76,7 @@ export function KpiCard({ def, cell, caption }: { readonly def: TableDefFields &
           <polyline points={sparklinePoints(r.series, 120, 28)} fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" strokeLinecap="round" />
         </svg>
       ) : null}
-      {caption ? <p className="mt-1 text-xs text-muted-foreground">{caption}</p> : null}
+      {caption ? <OverflowText as="p" lines={2} text={caption} className="mt-1 text-xs text-muted-foreground" /> : null}
     </div>
   );
 }

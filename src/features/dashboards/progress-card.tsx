@@ -6,7 +6,7 @@ import { progressView, type TypeDefFields } from "@/lib/type-b";
 import { cn } from "@/lib/utils";
 import { formatValue } from "@/lib/value-format";
 import { compactKpiText } from "@/lib/kpi-fit";
-import { KpiValue } from "./fit-text";
+import { KpiValue, OverflowText } from "./fit-text";
 import { useReporting } from "./reporting-context";
 import type { Rows } from "./tile-dialogs";
 
@@ -62,9 +62,10 @@ export function ProgressCard({
     <div className="grid h-full content-center gap-2 px-3">
       <div className="flex items-baseline justify-between gap-2">
         <p className="text-3xl font-semibold tabular-nums">{percent}</p>
-        <p className="truncate text-sm tabular-nums text-muted-foreground">
-          {formatValue(view.value, fmt, numberLocale, dec)} of {formatValue(view.goal, fmt, numberLocale, dec)}
-        </p>
+        <OverflowText
+          as="p" className="min-w-0 text-sm tabular-nums text-muted-foreground"
+          text={`${formatValue(view.value, fmt, numberLocale, dec)} of ${formatValue(view.goal, fmt, numberLocale, dec)}`}
+        />
       </div>
       <div
         role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(view.fill * 100)}
@@ -74,7 +75,7 @@ export function ProgressCard({
         <div className={cn("h-full rounded-full", over ? "bg-emerald-600 dark:bg-emerald-500" : "bg-primary")} style={{ width: `${view.fill * 100}%` }} />
       </div>
       {over ? <p className="text-xs text-muted-foreground">Above the goal</p> : null}
-      {caption ? <p className="text-xs text-muted-foreground">{caption}</p> : null}
+      {caption ? <OverflowText as="p" lines={2} text={caption} className="text-xs text-muted-foreground" /> : null}
     </div>
   );
 }
