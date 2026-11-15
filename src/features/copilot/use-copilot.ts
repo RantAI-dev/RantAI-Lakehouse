@@ -718,13 +718,36 @@ export type CopilotStreamValue = ReturnType<typeof useCopilotState>["stream"];
 const CopilotContext = React.createContext<CopilotValue | null>(null);
 const CopilotStreamContext = React.createContext<CopilotStreamValue | null>(null);
 
+/**
+ * BI-32 review: the same value as a store, so a page can read one derived
+ * piece of it (`useCopilotSelect`) and re-render only when that piece
+ * changes, not on every new message or step.
+ */
+type CopilotStore = { value: CopilotValue; listeners: Set<() => void>; set: (v: CopilotValue) => void };
+function makeStore(value: CopilotValue): CopilotStore {
+  const store: CopilotStore = {
+    value, listeners: new Set(),
+    set: (v) => { store.value = v; store.listeners.forEach((l) => l()); },
+  };
+  return store;
+}
+const CopilotStoreContext = React.createContext<CopilotStore | null>(null);
+
 /** A single provider — wraps the app so dock/page/sidebar share one conversation. */
 export function CopilotProvider({ children }: { children: React.ReactNode }) {
   const { main, stream } = useCopilotState();
+  const [store] = React.useState<CopilotStore>(() => makeStore(main));
+  React.useLayoutEffect(() => {
+    store.set(main);
+  }, [main, store]);
   return React.createElement(
-    CopilotContext.Provider,
-    { value: main },
-    React.createElement(CopilotStreamContext.Provider, { value: stream }, children),
+    CopilotStoreContext.Provider,
+    { value: store },
+    React.createElement(
+      CopilotContext.Provider,
+      { value: main },
+      React.createElement(CopilotStreamContext.Provider, { value: stream }, children),
+    ),
   );
 }
 
@@ -786,6 +809,26 @@ const NOOP_STREAM: CopilotStreamValue = {
 export function useCopilot(): CopilotValue {
   const ctx = React.useContext(CopilotContext);
   return ctx ?? NOOP_COPILOT;
+}
+
+const NOOP_STORE: CopilotStore = makeStore(NOOP_COPILOT);
+
+/**
+ * BI-32 review: read a derived part of the Copilot without subscribing to all
+ * of it. The component re-renders only when `select` returns a different
+ * value (`Object.is`), so return a primitive or a stable function; streaming,
+ * new messages and tool steps that leave it alone do not reach the caller.
+ */
+export function useCopilotSelect<T>(select: (c: CopilotValue) => T): T {
+  const store = React.useContext(CopilotStoreContext) ?? NOOP_STORE;
+  return React.useSyncExternalStore(
+    (cb) => {
+      store.listeners.add(cb);
+      return () => { store.listeners.delete(cb); };
+    },
+    () => select(store.value),
+    () => select(store.value),
+  );
 }
 
 /**

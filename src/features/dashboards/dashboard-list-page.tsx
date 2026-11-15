@@ -825,7 +825,9 @@ export function DashboardListPage() {
           const target = deletingReport
           if (!target) return
           void (async () => {
-            await deleteReportAction.run(target.id)
+            const done = await deleteReportAction.run(target.id)
+            // BI-61 T11 (from the old report list): the sidebar's Dashboards row must not open a deleted report.
+            if (done !== null) forgetRow({ kind: "report", id: target.id })
             setDeletingReport(null)
             reloadReports()
           })()

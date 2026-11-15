@@ -6,12 +6,12 @@
 | Backlog | `QS-3` |
 | Kind | Feature |
 | Spec | `docs/core/specs/qs-3.md` |
-| Status | In Acceptance |
+| Status | Released: accepted by the product owner on 2026-11-14 (every row Pass; AC2 with findings; AC7 passed: the refusal part on 2026-11-12, the database part via the API on 2026-11-14; the owner's NUL-byte exception was not needed, because the failure could be triggered and answered `database error` with no Postgres or sqlx text) |
 | Priority | P2 |
 | Owner | Held in the base. |
 | Acceptor | Held in the base. |
 | Started | 2026-10-30; also in `BACKLOG.md` Dates |
-| Shipped | Not yet |
+| Shipped | API 2026-11-03 (#361); console 2026-11-05 (#389); move fix 2026-11-06 (#393); #409 2026-11-07; folder sharing warning 2026-11-07 (#416); Bronze link and the review fixes 2026-11-08 (#437) |
 | Evidence | API in #361 (2026-11-03) and its review fixes in #382 (2026-11-05); console in #389 (2026-11-05), with moving a folder needing manage on everything in it in #393 (2026-11-06) and sharing a folder needing the same in #409, and a folder naming who it is shared with before a save or a move in #416: the folder tree with the personal and the shared space, server-side search, the level-gated row and folder actions, the move dialog, the trash with restore at edit, version history with revert behind a confirmation, the share panel for queries and folders at manage, with the grantees' names, and the studio saving back into the query it came from; TypeScript suite 3449 pass / 1 skip / 0 fail on #389's head; every refusal surfaces the server's own sentence through the standard renderer, and the console writes none of its own. |
 | Plan | Plan files are not kept in the repository. |
 
@@ -98,23 +98,25 @@ Run on a running console by the product owner. A step not performed is never a p
 
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| `QS-3-AC1` | Share a query at view with a second user; as that user, run it, then try to save a change | The run works; the change is refused | Not run |
-| `QS-3-AC2` | Change a query four times, open its history, go back to version 3 | The SQL is version 3's, and the history shows "Restored version 3" on top | Not run |
-| `QS-3-AC3` | Delete a query, open the trash, restore it | It is back in its folder with its history | Not run |
-| `QS-3-AC4` | Save a query without picking a folder; as a second user of the same organisation, search for it | Not found | Not run |
-| `QS-3-AC5` | Share a folder with a role; as a user of that role, open a query inside it | Visible at the folder's level | Not run |
-| `QS-3-AC6` | In the chat, as the second user, ask for the saved queries | The private query is not listed | Not run |
-| `QS-3-AC7` | A user without `query:read` opens the saved queries, and an edit fails on the database | Refused; the failure shows a fixed message (principles 2 and 4) | Not run |
-| `QS-3-AC8` | As a user with edit on a shared folder, pick that folder in the save sheet, then in the move dialog | Both name who the folder is shared with, without you, before you confirm | Not run |
+| `QS-3-AC1` | Share a query at view with a second user; as that user, run it, then try to save a change | The run works; the change is refused | Pass (2026-11-12, 273d89e6, no case) |
+| `QS-3-AC2` | Change a query four times, open its history, go back to version 3 | The SQL is version 3's, and the history shows "Restored version 3" on top | Pass with findings (2026-11-12, 3cdd8332, no case). One save of version 4 failed silently; the history once showed "Query failed (500)" |
+| `QS-3-AC3` | Delete a query, open the trash, restore it | It is back in its folder with its history | Pass (2026-11-12, 3cdd8332, no case) |
+| `QS-3-AC4` | Save a query without picking a folder; as a second user of the same organisation, search for it | Not found | Pass (2026-11-12, 3cdd8332, no case) |
+| `QS-3-AC5` | Share a folder with a role; as a user of that role, open a query inside it | Visible at the folder's level | Pass (2026-11-12, 273d89e6, no case) |
+| `QS-3-AC6` | In the chat, as the second user, ask for the saved queries | The private query is not listed | Pass (2026-11-13, 80fb2f68, no case) |
+| `QS-3-AC7` | A user without `query:read` opens the saved queries, and an edit fails on the database | Refused; the failure shows a fixed message (principles 2 and 4) | Pass (2026-11-14, 240d2e62, no case). Refusal part (2026-11-12, 3cdd8332): the page says "You don't have access". Database part, through the API: a PATCH with a NUL byte in the title, and separately in the SQL, returned 500 `{"error":"database error"}` both times, with no Postgres or sqlx text; the query stayed at one version; the throwaway query was deleted |
+| `QS-3-AC8` | As a user with edit on a shared folder, pick that folder in the save sheet, then in the move dialog | Both name who the folder is shared with, without you, before you confirm | Pass (2026-11-12, 3cdd8332, no case) |
 
-**Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
+**Acceptor** (not the Owner): product owner (recorded in the base) **Date:** 2026-11-14 **Build:** 240d2e62
 
 Exceptions, each with an owner and a date:
+
+- `QS-3-AC7`, owner 2026-11-14: the auditor tries a NUL byte (`\u0000`) in an edit's SQL or title through the API; if no database failure can be triggered, the code path (`saved_queries.rs:658` to `From<StoreError>`, `lakehouse-store/src/error.rs:169`) and the unit test `internal_message_never_leaks_source_error_text` are accepted as an exception. The exception was not needed: the database failure could be triggered, and the API answered `database error` with no Postgres or sqlx text (see the row above).
 
 ## After acceptance
 
 - [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
-- [ ] `BACKLOG.md` Dates has the Shipped date
-- [ ] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base
+- [x] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
+- [x] `BACKLOG.md` Dates has the Shipped date
+- [x] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base (done by the auditor)
 - [ ] `CHANGELOG.md` entry a customer can read

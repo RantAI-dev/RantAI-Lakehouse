@@ -85,6 +85,19 @@ fn required(field: &str, value: &str) -> Result<String, ApiError> {
     Ok(trimmed.to_owned())
 }
 
+/// The detail a run's step, or a run's outcome, keeps of a tool's result.
+///
+/// A run's detail is read by a browser on the run page, so it takes the
+/// browser's copy of the result (`crate::routes::ai::split_tool_result`,
+/// owner rule LH-QS-2-08, 2026-11-12): an engine failure is stored as a fixed
+/// sentence and a reference, never as the engine's own text. The model that
+/// drives the run reads the model's copy, which keeps the engine's
+/// diagnosis, and that copy is never stored. A result with no engine failure
+/// is stored as the tool returned it.
+fn stored_tool_detail(shown: &Value) -> String {
+    serde_json::to_string(shown).unwrap_or_default()
+}
+
 const VALID_AUTONOMY: [&str; 4] = ["L1", "L2", "L3", "L4"];
 
 /// `agent_employee.mode`'s `CHECK` constraint values
@@ -769,6 +782,10 @@ pub async fn decide_approval(
         return Err(ApiError::PermissionDenied(detail).into());
     }
     let result = ai_tools::run_tool(&state, Some(&principal), &pending.tool, &args).await;
+    // LH-QS-2-08 (owner 2026-11-12): this run's outcome is read by a browser,
+    // and so is this route's answer, so both carry the browser's copy of an
+    // engine failure. No model reads the result here.
+    let (result, shown) = crate::routes::ai::split_tool_result(result);
     let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
     let status = if ok { "succeeded" } else { "failed" };
     if let Err(err) = agents::record_run_outcome(
@@ -776,7 +793,7 @@ pub async fn decide_approval(
         &run_id,
         status,
         "Executed after approval",
-        &serde_json::to_string(&result).unwrap_or_default(),
+        &stored_tool_detail(&shown),
     )
     .await
     {
@@ -798,7 +815,7 @@ pub async fn decide_approval(
     .await;
 
     Ok(ApiJson(
-        json!({ "approval": approval, "executed": true, "result": result }),
+        json!({ "approval": approval, "executed": true, "result": shown }),
     ))
 }
 
@@ -1611,6 +1628,11 @@ async fn run_headless_loop_inner(
             // requiring tool (`run_saved_query`) is responsible for
             // refusing `None` with a named reason rather than a bare 401.
             let result = ai_tools::run_tool(state, principal, &call.function.name, &args).await;
+            // LH-QS-2-08 (owner 2026-11-12): the step's detail is read by a
+            // browser, so it stores the browser's copy of an engine failure
+            // (`shown`), while the model that drives this run is fed the
+            // model's copy (`result`), which keeps the engine's diagnosis.
+            let (result, shown) = crate::routes::ai::split_tool_result(result);
             let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
             let (resource_kind, resource_id) =
                 ai_audit::resource_for(&call.function.name, &args, &result);
@@ -1620,7 +1642,7 @@ async fn run_headless_loop_inner(
                 &format!("step-{step_no}"),
                 &call.function.name,
                 if ok { "succeeded" } else { "failed" },
-                &serde_json::to_string(&result).unwrap_or_default(),
+                &stored_tool_detail(&shown),
             )
             .await;
             write_headless_audit(
@@ -1946,6 +1968,58 @@ mod tests {
             comment: None,
         };
         assert!(!matches!(body.decision.as_str(), "approved" | "rejected"));
+    }
+
+    /// A run's step detail is read by a browser, so for an engine failure it
+    /// holds the fixed sentence and the reference (LH-QS-2-08), never the
+    /// engine's diagnosis, which only the model reads. The server-only key
+    /// the browser's copy travelled in is gone from it too.
+    #[test]
+    fn a_stored_tool_detail_holds_the_fixed_sentence_and_not_the_engine_diagnosis() {
+        let result = json!({
+            "error": "Unknown expression identifier 'pengunjungg' in scope. (UNKNOWN_IDENTIFIER) Reference: dc51a4b585",
+            "_browserError": "This query names a column that does not exist. Reference: dc51a4b585",
+        });
+
+        let (model, shown) = crate::routes::ai::split_tool_result(result);
+        let detail = stored_tool_detail(&shown);
+
+        let stored: Value = serde_json::from_str(&detail).expect("the detail is JSON");
+        assert_eq!(
+            stored["error"],
+            json!("This query names a column that does not exist. Reference: dc51a4b585"),
+        );
+        for text in [
+            "UNKNOWN_IDENTIFIER",
+            "Code:",
+            "pengunjungg",
+            "_browserError",
+        ] {
+            assert!(!detail.contains(text), "{text} in {detail}");
+        }
+        // The model's copy keeps the diagnosis, with the same reference.
+        assert!(
+            model["error"]
+                .as_str()
+                .is_some_and(|text| text.contains("UNKNOWN_IDENTIFIER")
+                    && text.ends_with("Reference: dc51a4b585")),
+            "{model}"
+        );
+    }
+
+    /// A result with no browser copy (a success, or a failure whose message
+    /// is already fixed) is stored as the tool returned it.
+    #[test]
+    fn a_stored_tool_detail_of_a_result_without_a_browser_copy_is_the_result() {
+        for result in [
+            json!({ "columns": ["n"], "rows": [[5]], "rowCount": 1 }),
+            json!({ "error": "The database request failed. Reference: ab12cd34ef" }),
+        ] {
+            let (_, shown) = crate::routes::ai::split_tool_result(result.clone());
+            let stored: Value =
+                serde_json::from_str(&stored_tool_detail(&shown)).expect("the detail is JSON");
+            assert_eq!(stored, result);
+        }
     }
 
     /// A logged-in human principal — `PrincipalId::User`. Mirrors
