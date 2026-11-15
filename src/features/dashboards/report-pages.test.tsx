@@ -220,11 +220,15 @@ describe("ReportEditorPage (BI-62)", () => {
     expect(screen.queryByText("Paragraph")).toBeNull()
   })
 
-  it("saves what was written as blocks, marks as the inline subset, and opens the new report", async () => {
+  it("autosaves what was written as blocks, marks as the inline subset, and makes the report once", async () => {
     const calls = serve(["dashboard:read", "dashboard:write"], {
       ...catalogue,
       "POST /api/dashboard/reports": (call) =>
         json({ ok: true, report: { id: "r2", ...(call.body as object), createdBy: "", createdAt: "", updatedBy: "", updatedAt: "" } }),
+    })
+    const addresses: string[] = []
+    spyOn(window.history, "replaceState").mockImplementation((_state, _unused, url) => {
+      addresses.push(String(url))
     })
     const { container } = render(<AuthProvider><ReportEditorPage /></AuthProvider>)
     const editor = await pageEditor(container)
@@ -237,7 +241,9 @@ describe("ReportEditorPage (BI-62)", () => {
         { type: "chart", attrs: { chart: "c_one", width: "wide" } },
       ],
     })
-    fireEvent.click(await screen.findByRole("button", { name: "Save" }))
+    // No Save button: leaving the page saves at once (the timer would, a second later).
+    expect(screen.queryByRole("button", { name: "Save" })).toBeNull()
+    window.dispatchEvent(new Event("pagehide"))
     await waitFor(() => expect(calls.some((c) => c.method === "POST")).toBe(true))
     const posted = calls.find((c) => c.method === "POST")!.body as { title: string; folderId: string; blocks: unknown[] }
     expect(posted.title).toBe("New one")
@@ -247,7 +253,28 @@ describe("ReportEditorPage (BI-62)", () => {
       { type: "paragraph", text: "<b>as typed</b> **bold**" },
       { type: "chart", chart: "c_one", width: "wide" },
     ])
-    await waitFor(() => expect(pushed).toContain("/dashboards/reports/r2"))
+    // The address becomes the edit address with no navigation, and the status says Saved.
+    await waitFor(() => expect(addresses).toEqual(["/dashboards/reports/r2/edit"]))
+    expect(pushed).toHaveLength(0)
+    expect(await screen.findByText("Saved")).toBeTruthy()
+    // The next change updates the report the first save made.
+    editor.commands.insertContentAt(editor.state.doc.content.size, { type: "paragraph", content: [{ type: "text", text: "more" }] })
+    window.dispatchEvent(new Event("pagehide"))
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT" && c.url.endsWith("/api/dashboard/reports/r2"))).toBe(true))
+    expect(calls.filter((c) => c.method === "POST")).toHaveLength(1)
+  })
+
+  it("saves nothing when a report is only opened, and an untouched new report is never made", async () => {
+    const calls = serve(["dashboard:read", "dashboard:write"], { ...catalogue, "GET /api/dashboard/reports/r1": () => json(view("edit")) })
+    const { container, unmount } = render(<AuthProvider><ReportEditorPage id="r1" /></AuthProvider>)
+    await pageEditor(container)
+    window.dispatchEvent(new Event("pagehide"))
+    unmount()
+    const fresh = render(<AuthProvider><ReportEditorPage /></AuthProvider>)
+    await pageEditor(fresh.container)
+    window.dispatchEvent(new Event("pagehide"))
+    await new Promise((r) => setTimeout(r, 50))
+    expect(calls.filter((c) => c.method === "POST" || c.method === "PUT")).toHaveLength(0)
   })
 
   it("opens a report made before BI-62 with its link block as a link in a paragraph", async () => {
@@ -258,26 +285,39 @@ describe("ReportEditorPage (BI-62)", () => {
       "PUT /api/dashboard/reports/r1": (call) => json({ ok: true, report: { ...view("edit").report, ...(call.body as object) } }),
     })
     const { container } = render(<AuthProvider><ReportEditorPage id="r1" /></AuthProvider>)
-    await pageEditor(container)
+    const editor = await pageEditor(container)
     expect(container.querySelector(".ProseMirror p a")?.getAttribute("href")).toBe("https://example.com/m")
-    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    // Opening it saves nothing; the first change saves the link as a paragraph holding it.
+    editor.commands.insertContentAt(1, " ")
+    editor.commands.deleteRange({ from: 1, to: 2 })
+    editor.commands.insertContentAt(editor.state.doc.content.size, { type: "paragraph", content: [{ type: "text", text: "Next" }] })
+    window.dispatchEvent(new Event("pagehide"))
     await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
     expect((calls.find((c) => c.method === "PUT")!.body as { blocks: unknown[] }).blocks).toEqual([
       { type: "paragraph", text: "[Method](https://example.com/m)" },
+      { type: "paragraph", text: "Next" },
     ])
   })
 
-  it("shows the server's refusal as it comes and keeps the page", async () => {
-    serve(["dashboard:read", "dashboard:write"], {
+  it("shows the server's refusal beside the status, keeps the text, and Retry tries again", async () => {
+    let refuse = true
+    const calls = serve(["dashboard:read", "dashboard:write"], {
       ...catalogue,
       "GET /api/dashboard/reports/r1": () => json(view("edit")),
-      "PUT /api/dashboard/reports/r1": () => json({ error: "A report holds at most 30 charts." }, 400),
+      "PUT /api/dashboard/reports/r1": (call) =>
+        refuse ? json({ error: "A report holds at most 30 charts." }, 400) : json({ ok: true, report: { ...view("edit").report, ...(call.body as object) } }),
     })
     const { container } = render(<AuthProvider><ReportEditorPage id="r1" /></AuthProvider>)
-    await pageEditor(container)
-    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    const editor = await pageEditor(container)
+    editor.commands.insertContentAt(editor.state.doc.content.size, { type: "paragraph", content: [{ type: "text", text: "kept" }] })
+    window.dispatchEvent(new Event("pagehide"))
     expect((await screen.findByRole("alert")).textContent).toBe("A report holds at most 30 charts.")
-    expect(pushed).toHaveLength(0)
+    expect(screen.getByText("Couldn't save")).toBeTruthy()
+    expect(container.querySelector(".ProseMirror")?.textContent).toContain("kept")
+    refuse = false
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }))
+    expect(await screen.findByText("Saved")).toBeTruthy()
+    expect(calls.filter((c) => c.method === "PUT")).toHaveLength(2)
   })
 
   it("Preview draws the reader's view with the reader's renderer", async () => {

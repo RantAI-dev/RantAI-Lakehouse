@@ -12,6 +12,12 @@
  * - Charts are picked from live pictures grouped by dashboard, at most 30
  *   (`BI-18` R4; the server refuses a 31st with its own sentence).
  * - Preview shows the reader's view, drawn by the reader's own renderer.
+ * - No Save button (D4): changes save about a second after typing stops and
+ *   at once on blur, on leaving the page and when the tab is hidden
+ *   (`src/lib/report-autosave.ts`); the header says Saving…, Saved, or
+ *   Couldn't save with Retry, and the server's sentence when it refused. A
+ *   new report is made on its first change that holds something, and the
+ *   address becomes its edit address without a reload.
  *
  * The document is a view of the report's blocks (plan D3): it is made from
  * the blocks on load and turned back into blocks to save
@@ -21,11 +27,10 @@
  */
 import * as React from "react"
 import Link from "next/link"
-import { useRouter } from "next/navigation"
 import type { Editor } from "@tiptap/core"
 import { EditorContent, useEditor } from "@tiptap/react"
 import { useTheme } from "next-themes"
-import { ArrowLeft, ChartColumn, ChevronRight, Eye, FileDown, Heading1, Heading2, List, ListOrdered, Minus, TextQuote, Type } from "lucide-react"
+import { ArrowLeft, ChartColumn, Check, ChevronRight, CircleAlert, Eye, FileDown, Heading1, Heading2, List, ListOrdered, Loader2, Minus, TextQuote, Type } from "lucide-react"
 
 import { EmptyState, ErrorState } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
@@ -34,6 +39,7 @@ import { useService } from "@/hooks/use-service"
 import { useAuth } from "@/features/auth/auth-provider"
 import { folderChoices, folderOptionText, labelledFolders } from "@/lib/dashboard-organise"
 import { notifyError, notifySuccess } from "@/lib/notify"
+import { Autosave, type AutosaveState } from "@/lib/report-autosave"
 import { MAX_REPORT_CHARTS, blocksForSave } from "@/lib/report-blocks"
 import { SLASH_ITEMS, blocksToDoc, docToBlocks, nearChartLimit, type DocNode, type SlashItemId } from "@/lib/report-doc"
 import { cn } from "@/lib/utils"
@@ -129,6 +135,9 @@ function docInfo(editor: Editor): DocInfo {
  */
 class LiveBox {
   count = 0
+  setCount(n: number) {
+    this.count = n
+  }
   private insert: (id: string, pos?: number) => void = () => {}
   setInsert(fn: (id: string, pos?: number) => void) {
     this.insert = fn
@@ -140,8 +149,15 @@ class LiveBox {
 
 export type ReportSaveInput = { title: string; folderId: string; blocks: ReportBlock[] }
 
+/** What a report with no title yet is saved as: the placeholder the page shows. */
+export const UNTITLED_REPORT = "Untitled report"
+
+function saveReport(input: ReportSaveInput, id: string | null) {
+  const body = { ...input, title: input.title.trim() || UNTITLED_REPORT }
+  return id ? dashboardReportService.updateReport(id, body) : dashboardReportService.createReport(body)
+}
+
 function ReportEditor({ view }: { view: ReportView | null }) {
-  const router = useRouter()
   const auth = useAuth()
   const me = auth.user?.id
   const foldersState = useService((s) => dashboardService.listFolders(s), [])
@@ -150,8 +166,6 @@ function ReportEditor({ view }: { view: ReportView | null }) {
   const [info, setInfo] = React.useState<DocInfo>({ title: view?.report.title ?? "", count: 0, used: new Set() })
   const [preview, setPreview] = React.useState(false)
   const [picker, setPicker] = React.useState<PickerRequest | null>(null)
-  const [saving, setSaving] = React.useState(false)
-  const [refusal, setRefusal] = React.useState<string | null>(null)
   const slash = React.useMemo(() => new SlashStore(), [])
   const live = React.useMemo(() => new LiveBox(), [])
   const linkRef = React.useRef<LinkOpener | null>(null)
@@ -188,19 +202,37 @@ function ReportEditor({ view }: { view: ReportView | null }) {
     )
   }, [live])
 
-  const extensions = React.useMemo(
-    () =>
-      reportExtensions({
-        chartNode: ChartNode,
-        slash: { store: slash, items },
-        onShelfDrop: (id, pos) => live.insertChart(id, pos),
-        onLinkKey: () => linkRef.current?.open(),
-      }),
-    [slash, items, live],
+  // Made once for the page's life: the plugins read what changes through `live` and `linkRef`.
+  const [extensions] = React.useState(() =>
+    reportExtensions({
+      chartNode: ChartNode,
+      slash: { store: slash, items },
+      onShelfDrop: (id, pos) => live.insertChart(id, pos),
+      onLinkKey: () => linkRef.current?.open(),
+    }),
   )
 
   // The document is made once from what was loaded; after that the editor owns it.
   const [initial] = React.useState(() => blocksToDoc(view?.report.title ?? "", view?.report.blocks ?? []))
+
+  // D4: one autosave for the page's life. It starts from the page as loaded,
+  // so opening a report (an old one with a link block included) saves nothing.
+  const [autosave] = React.useState(() => {
+    const loaded = docToBlocks(initial)
+    return new Autosave<ReportSaveInput>({
+      id: view?.report.id ?? null,
+      initial: view ? { title: loaded.title, folderId: view.report.folderId, blocks: blocksForSave(loaded.blocks) } : undefined,
+      isEmpty: (input) => !input.title.trim() && input.blocks.length === 0,
+      save: saveReport,
+      onCreated: (made) => {
+        // The address becomes the edit address with no navigation, so the editor and its focus stay.
+        window.history.replaceState(window.history.state, "", `/dashboards/reports/${encodeURIComponent(made)}/edit`)
+      },
+    })
+  })
+  const saveState = React.useSyncExternalStore(autosave.subscribe, autosave.get, autosave.get)
+  // The editor's onUpdate is bound once; it reaches the newest snapshot through this.
+  const changed = React.useRef<(() => void) | null>(null)
 
   const editor = useEditor(
     {
@@ -211,16 +243,19 @@ function ReportEditor({ view }: { view: ReportView | null }) {
       editorProps: { attributes: { class: "rd-doc", "aria-label": "Report", spellcheck: "true" } },
       onCreate: ({ editor: e }) => {
         const next = docInfo(e)
-        live.count = next.count
+        live.setCount(next.count)
         setInfo(next)
         // A new report starts in its title.
         if (!reportId) e.commands.focus("start")
       },
       onUpdate: ({ editor: e }) => {
         const next = docInfo(e)
-        live.count = next.count
+        live.setCount(next.count)
         setInfo(next)
-        setRefusal(null)
+        changed.current?.()
+      },
+      onBlur: () => {
+        void autosave.flush()
       },
     },
     [extensions],
@@ -269,26 +304,46 @@ function ReportEditor({ view }: { view: ReportView | null }) {
     return { title, folderId: folderId === NO_FOLDER ? "" : folderId, blocks: blocksForSave(blocks) }
   }, [editor, folderId])
 
-  async function save() {
-    const input = snapshot()
-    if (!input) return
-    setRefusal(null)
-    setSaving(true)
-    try {
-      const saved = reportId ? await dashboardReportService.updateReport(reportId, input) : await dashboardReportService.createReport(input)
-      notifySuccess("Report saved")
-      if (!reportId) router.push(`/dashboards/reports/${encodeURIComponent(saved.id)}`)
-    } catch (err) {
-      // The server's refusal is one of its fixed sentences (`ReportRule::message`).
-      setRefusal(err instanceof Error ? err.message : "The report could not be saved.")
-    } finally {
-      setSaving(false)
+  React.useEffect(() => {
+    changed.current = () => {
+      const input = snapshot()
+      if (input) autosave.change(input)
     }
-  }
+    // A folder change is a change too (a no-op when it is the loaded one).
+    changed.current()
+  }, [snapshot, autosave])
+
+  // Leaving: a route change unmounts the page; hiding or closing the tab fires pagehide or
+  // beforeunload. Each saves at once (best effort: a closing tab may cut the request), and
+  // closing with something not yet saved asks the browser to confirm, so nothing is lost.
+  React.useEffect(() => {
+    const flush = () => {
+      void autosave.flush()
+    }
+    const beforeUnload = (e: BeforeUnloadEvent) => {
+      if (!autosave.pending) return
+      void autosave.flush()
+      e.preventDefault()
+    }
+    const hidden = () => {
+      if (document.visibilityState === "hidden") flush()
+    }
+    window.addEventListener("pagehide", flush)
+    window.addEventListener("beforeunload", beforeUnload)
+    document.addEventListener("visibilitychange", hidden)
+    return () => {
+      window.removeEventListener("pagehide", flush)
+      window.removeEventListener("beforeunload", beforeUnload)
+      document.removeEventListener("visibilitychange", hidden)
+      flush()
+      autosave.dispose()
+    }
+  }, [autosave])
 
   const ui = React.useMemo<ReportEditorUi>(() => ({ readOnly: preview, openPicker: setPicker }), [preview])
   const pdf = Boolean(view?.pdfSupported && view.canDownload && reportId)
-  const backHref = reportId ? `/dashboards/reports/${encodeURIComponent(reportId)}` : REPORTS_TAB_HREF
+  const savedId = saveState.id
+  const backHref = savedId ? `/dashboards/reports/${encodeURIComponent(savedId)}` : REPORTS_TAB_HREF
 
   return (
     <ReportEditorUiContext.Provider value={ui}>
@@ -314,18 +369,7 @@ function ReportEditor({ view }: { view: ReportView | null }) {
           preview={preview}
           onPreview={() => setPreview((p) => !p)}
           pdf={pdf && reportId ? () => void downloadPdf(reportId) : undefined}
-          status={
-            <>
-              {refusal ? (
-                <span role="alert" className="max-w-[40ch] truncate text-xs text-destructive" title={refusal}>
-                  {refusal}
-                </span>
-              ) : null}
-              <Button size="sm" disabled={saving || !info.title.trim()} onClick={() => void save()}>
-                {saving ? "Saving…" : "Save"}
-              </Button>
-            </>
-          }
+          status={<SaveStatus state={saveState} onRetry={() => void autosave.retry()} />}
         />
         <div className="px-0 pt-6 sm:px-10 sm:pt-10">
           {preview ? (
@@ -361,6 +405,50 @@ function ReportEditor({ view }: { view: ReportView | null }) {
         />
       </div>
     </ReportEditorUiContext.Provider>
+  )
+}
+
+/**
+ * The one status line (DESIGN.md §3): Saving…, Saved, or Couldn't save with
+ * Retry, and the server's sentence beside it when it refused. On a phone the
+ * words are for screen readers and the icon shows.
+ */
+function SaveStatus({ state, onRetry }: { readonly state: AutosaveState; readonly onRetry: () => void }) {
+  if (state.status === "idle") return null
+  if (state.status === "error") {
+    return (
+      <span className="inline-flex min-w-0 items-center gap-1.5 text-xs">
+        {state.refusal ? (
+          <span role="alert" className="min-w-0 truncate text-destructive max-sm:sr-only" title={state.refusal}>
+            {state.refusal}
+          </span>
+        ) : null}
+        <span role={state.refusal ? undefined : "alert"} className="inline-flex shrink-0 items-center gap-1 text-destructive">
+          <CircleAlert className="size-3.5" aria-hidden />
+          <span className="max-sm:sr-only">Couldn&apos;t save</span>
+        </span>
+        <span aria-hidden className="text-muted-foreground max-sm:hidden">·</span>
+        <button type="button" onClick={onRetry} className={cn("shrink-0 rounded-sm font-medium text-primary hover:underline dark:text-sky-300", FOCUS)}>
+          Retry
+        </button>
+      </span>
+    )
+  }
+  const saving = state.status === "dirty" || state.status === "saving"
+  return (
+    <span aria-live="polite" className="inline-flex h-8 shrink-0 items-center gap-1.5 px-1 text-xs text-muted-foreground">
+      {saving ? (
+        <>
+          <Loader2 className="size-3.5 animate-spin motion-reduce:animate-none" aria-hidden />
+          <span className="max-sm:sr-only">Saving…</span>
+        </>
+      ) : (
+        <>
+          <Check className="size-3.5" aria-hidden />
+          <span className="max-sm:sr-only">Saved</span>
+        </>
+      )}
+    </span>
   )
 }
 
