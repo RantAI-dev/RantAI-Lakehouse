@@ -31,6 +31,7 @@ once a first release is tagged.
 
 ### Security
 
+- The Iceberg table pages, the table listing, the maintenance routes and the assistant's Iceberg tools no longer show another organisation's upload tables (backlog `SEC-20`). A table no upload claimed, such as a Silver or Gold table, is now shown only to the organisation that owns the shared catalog, as in Query Studio, so a person in another organisation gets "not found" for its page and its maintenance.
 - Editing or deleting a data-quality rule, setting or resetting its schedule, and resolving its incident check the catalog's tenant and the person's table access first (backlog `GOV-15`). A person outside the organisation that owns the catalog was refused on none of these, and a rule or an incident on a table their role does not read could be edited, deleted or resolved. Both are now refused before anything is read, measured or written, with the same answer for a table that is not there and one they may not read; the rule list, in the console and in the assistant's `list_quality_rules`, shows only the rules on tables the person may read. Scheduled and on-load checks are unchanged.
 - A file load is not re-run from the Pipelines page (backlog `DATA-61`). Re-running an upload's run executed its old config around every check the upload route makes — whether the table's name is free, the dropped-table refusal of `DATA-55`, and the claim that marks the upload as loading — so it is now refused with one sentence, whatever the strategy, before the body is read or anything is launched. Load the file again from the "Uploaded files" tab of Sources, which checks the table first.
 - `quinn-udp` 0.5.16 (backlog `SEC-74`) fixes `RUSTSEC-2026-0538`, a receive loop that can spin after a truncated datagram. It is a lockfile bump with no waiver.
@@ -64,6 +65,8 @@ once a first release is tagged.
 - A run ended with Stop shows as Stopped in History (backlog `QS-2`, `QS-4`). The status `stopped` is a filter value in place of `cancelled`, and migration `0127` moves the rows already stored. The History page pages by number: `GET /api/query/history` takes `page` instead of `before` and answers `runs`, `total`, `page` and `pageSize`, 50 runs per page, and the pills read Completed, Failed, Stopped and Refused.
 - The revert confirmation button reads "Restore version N" (backlog `QS-3`), and the folder access list answers at edit with a sentence that says only someone who can edit the folder can see who it is shared with (backlog `QS-3`).
 - Query Studio shows a fixed sentence and a reference for an engine failure, on a run and on the cost estimate, in place of the engine's own text (backlog `QS-2`, `QS-1`; feature page `docs/core/features/no-raw-upstream-errors.md`). The raw text goes to the log under the same reference. The assistant's tools are unchanged, but **Fix with AI** now sends the model only the sentence and the reference.
+- Refusals of the policy engine are in English everywhere they are shown: Query Studio, the assistant's tools and the layers rewrite. Each refusal has its own sentence, and the same queries are refused as before (backlog `QS-14`). Before, these were in Indonesian.
+- The read-only refusal in Query Studio says which of three causes applies (backlog `QS-14`). A curly quote or a `$$` sequence gets a sentence that asks for straight quotes. A first word that is not SELECT, WITH, SHOW, DESCRIBE or EXPLAIN gets a sentence that asks the person to check it for a typo. A write keeps the sentence it had. The queries refused stay the same.
 
 ### Fixed
 
@@ -120,6 +123,8 @@ once a first release is tagged.
 - The catalog's "Open in Query Studio" and snapshot links for a Bronze table open the Trino tab only when the Bronze table's Iceberg table exists, and the ClickHouse link otherwise (backlog `QS-3`).
 - Saving a query in update mode always states the parameter definitions it wants, so a statement without a placeholder clears them; the editor's list after `{{` holds the tab's defined names and nothing else, and offers none inside a comment or a quoted run; a dropdown can be set back to "no value" (backlog `QS-5`).
 - In Ask mode the assistant narrows the dashboard's view instead of drafting a new chart: a request to see only some of the data on the page, for example "show only 2026" or "only Bali", sets the person's own filters on the page for this visit only. Nothing is saved, so the board's default filters and every other viewer's view stay as they are; saving the board's default filters is a separate tool (`save_board_filters`) and stays in the Dashboard Builder (backlog `AI-2`).
+- The assistant's tool steps in a chat response show an engine failure as a fixed sentence and a reference, while the model still reads the engine's diagnosis (LH-QS-2-08).
+- An agent run's steps and its outcome after approval, and a direct call to `POST /api/ai/tool`, show an engine failure as a fixed sentence and a reference instead of the engine's own text, while the model that drives the run still reads the engine's diagnosis (LH-QS-2-08). The approval answer carries the same fixed sentence.
 
 ## [0.2.1] - 2026-11-04
 

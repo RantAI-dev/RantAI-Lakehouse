@@ -420,8 +420,7 @@ mod recording {
         "Table not found or not available to your organisation: bronze.group_orders";
     /// The policy refusal's fixed sentence, as `policy_engine::refusal_message`
     /// words the rewrite's sensitive-system-table rule.
-    const POLICY_REFUSAL: &str =
-        "Tabel sistem ini tidak bisa dibaca dari sini; gunakan halaman Audit.";
+    const POLICY_REFUSAL: &str = "This system table cannot be read from here. Use the Audit page.";
     /// Text only the fake engine's failure body carries. It must appear in
     /// neither the response nor the history row.
     const ENGINE_MARKER: &str = "TANGERINE-PANEL-NINE";
@@ -889,6 +888,38 @@ mod recording {
             tables_read.is_empty(),
             "a refused write is not a query, so it names no table: {tables_read:?}"
         );
+    }
+
+    /// QS-14: a typo in the first word and a curly quote are refused
+    /// with a sentence of their own, and the History row carries the same
+    /// sentence the caller was told.
+    #[tokio::test]
+    async fn a_typo_or_a_curly_quote_records_blocked_with_its_own_sentence() {
+        for (sql, sentence) in [
+            (
+                "SELEC 1",
+                "Query Studio runs only statements that start with SELECT, WITH, SHOW, DESCRIBE or EXPLAIN. Check the first word for a typo.",
+            ),
+            (
+                "\u{2018}SELECT\u{2019} 1",
+                "The query has a character Query Studio cannot read safely, such as a curly quote (\u{2018} \u{2019} \u{201C} \u{201D}) or a `$$` sequence. Type straight quotes (' or \") and run it again.",
+            ),
+            ("DROP TABLE t", READ_ONLY_REFUSAL),
+        ] {
+            let ch = MockServer::start().await;
+            let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+            let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+            let (status, body) = post_sql(&router, &cookie, sql).await;
+
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{sql}: {body}");
+            assert_eq!(body["error"], sentence, "{sql}: {body}");
+            assert_eq!(engine_requests(&ch).await, 0, "{sql}");
+            let (recorded_status, message, _) =
+                the_recorded_run(&pool, "rina@meridian.example").await;
+            assert_eq!(recorded_status, "blocked", "{sql}");
+            assert_eq!(message.as_deref(), Some(sentence), "{sql}");
+        }
     }
 
     /// A past version by its id runs on `Trino` now (`DATA-21` D4), so

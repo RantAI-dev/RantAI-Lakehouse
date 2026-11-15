@@ -59,7 +59,14 @@ pub(super) async fn propose_sql(
     };
     match crate::routes::query::check_statement_would_run(state, principal, &sql, &engine).await {
         Ok(()) => json!({ "proposed": true, "sql": sql, "reason": reason, "engine": engine }),
-        Err(message) => json!({ "error": clean_sql_error(&message) }),
+        Err(failure) => {
+            // LH-QS-2-08 (owner 2026-11-12): the model's copy in `error`
+            // (the engine's trimmed diagnosis, so the model can correct its
+            // SQL) and the browser's copy next to it — a fixed sentence and
+            // the same reference, never the engine's own text.
+            let result = json!({ "error": clean_sql_error(&failure.model()) });
+            crate::routes::ai::with_browser_error(result, &failure.browser)
+        }
     }
 }
 
