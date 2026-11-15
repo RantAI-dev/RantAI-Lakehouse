@@ -63,6 +63,11 @@ No new assistant work. Its tool calls are already recorded.
 - The scheduler's alert tick (`POST /api/alerts/run`) writes one row per tick.
 - Writes through the Iceberg REST door are refused by that door and are not in the trail.
 - The assistant's own reads of the trail are not narrowed by `audit:read` yet. Its audit tool (`get_audit_history`) needs only `governance:read`.
+- The Overview page's activity feed (`POST /api/overview`) shows the 20 newest audit rows to every signed-in person: who acted, the action, the object and the outcome. `audit:read` does not narrow it.
+- An asset page's change history shows up to 50 audit rows about that asset to anyone who can open the asset. `audit:read` does not narrow it either.
+- Machine callbacks are not audited. The pipeline run events, the schema and capture observations and the connector run reports accept a service identity or an unrestricted administrator account. A person who calls one of these routes by hand with an unrestricted account leaves no row. A pipeline run started from the console is audited as `pipeline.trigger`.
+- Marking a dashboard comment mention as read is not recorded. It counts as personal UI state, like favourites.
+- Each failed sign-in that reaches the password check adds one row with outcome `refused`. The row holds no email, no password and no identifier. An unknown email adds the same row, so a visitor who tries many different identifiers adds a row for each try. A try refused because that identifier is locked adds no row. Nothing removes these rows and there is no retention setting yet, so the growth is permanent. A rate limit or retention rule is a follow-up.
 
 ## Acceptance checklist
 
