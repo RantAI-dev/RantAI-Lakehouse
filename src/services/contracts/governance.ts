@@ -279,6 +279,47 @@ export type AuditEvent = {
   detail?: string
 }
 
+/**
+ * What the audit search narrows by (`GET /api/governance/audit/events`, `GOV-1`).
+ * Every field is optional and an empty one means no filter. `actor` is a
+ * principal id; `action` is the whole action, or a family when it ends in
+ * `.` (`dashboard.`); `outcome` is a stored outcome (`allowed`, `executed`,
+ * `refused`, `needs_confirmation`, `needs_approval`, `approved`, `rejected`,
+ * `failed`); `from` is inclusive and `to` exclusive, both RFC 3339. `limit` is
+ * 1 to 500 (the server's default is 100); `cursor` is the `nextCursor` of the
+ * page before. The export takes the same filters and ignores `limit` and
+ * `cursor`.
+ */
+export type AuditSearchQuery = {
+  actor?: string
+  action?: string
+  resourceKind?: string
+  resourceId?: string
+  outcome?: "allowed" | "executed" | "refused" | "needs_confirmation" | "needs_approval" | "approved" | "rejected" | "failed" | string
+  from?: string
+  to?: string
+  limit?: number
+  cursor?: string
+}
+
+/** One page of the audit search, newest first; `nextCursor` is `null` on the last page. */
+export type AuditPage = {
+  events: AuditEvent[]
+  nextCursor: string | null
+}
+
+/**
+ * The audit trail as a CSV file. The server holds at most the newest 100,000
+ * events in one file; when more match it says so, and `total` is how many did.
+ */
+export type AuditExport = {
+  blob: Blob
+  fileName: string
+  truncated: boolean
+  /** How many events matched, known only when the file was cut. */
+  total: number | null
+}
+
 export type CreatePolicyInput = {
   name: string
   kind: string
@@ -400,7 +441,18 @@ export interface GovernanceService {
     direction: "up" | "down",
     signal?: AbortSignal
   ): Promise<ColumnLineage>
-  listAudit(signal?: AbortSignal): Promise<AuditEvent[]>
+  /**
+   * Search the audit trail on the server, of any age, newest first
+   * (`GET /api/governance/audit/events`); needs `audit:read`.
+   */
+  searchAudit(query: AuditSearchQuery, signal?: AbortSignal): Promise<AuditPage>
+  /** One audit event by id, or `null` when no event has it; needs `audit:read`. */
+  getAuditEvent(id: string, signal?: AbortSignal): Promise<AuditEvent | null>
+  /**
+   * The events a search picks as a CSV file (`GET /api/governance/audit/export.csv`);
+   * needs `audit:read`. The caller saves `blob`.
+   */
+  exportAuditCsv(query: AuditSearchQuery, signal?: AbortSignal): Promise<AuditExport>
   /** Bronze Iceberg maintenance runs (P4/P6) — `GET /api/governance/maintenance`. */
   listMaintenanceRuns(signal?: AbortSignal): Promise<MaintenanceRun[]>
   /** CDC replication slot health (P5/P6) — `GET /api/governance/replication`. */
