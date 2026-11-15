@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 
+use crate::audit_coverage;
 use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
 use crate::routes::catalog::NOT_IN_PRIMARY;
@@ -128,6 +129,10 @@ pub async fn get(
     read_kind(&state, Some(&principal), &headers, &kind).await
 }
 
+/// The refusal for the audit list read without `audit:read` (`GOV-1`
+/// Decision 9): a fixed sentence that names the permission to ask for.
+const AUDIT_READ_DENIED: &str = "reading the audit trail needs the audit:read permission";
+
 /// The `{kind}` dispatch as one person reads it.
 ///
 /// The route is one caller; the assistant's tools are the other, with the
@@ -146,6 +151,21 @@ pub(crate) async fn read_kind(
     kind: &str,
 ) -> Response {
     let parsed = Kind::parse(kind);
+    // `GOV-1` (feature page Decision 9): every role holds `governance:read`,
+    // which opens this route, so the audit list needs `audit:read` as well.
+    // No principal is an in-process call (the assistant's
+    // `get_audit_history` tool, `routes/ai/tools/governance.rs`), which this
+    // check leaves as it was, like the quality list's narrowing: that tool
+    // is registered with `governance:read` only, so it still shows the trail
+    // to a person without `audit:read`, until the assistant's registry asks
+    // for the new permission too.
+    if parsed == Kind::Audit
+        && let Some(principal) = principal
+        && !principal.has("audit:read")
+    {
+        return ApiRejection(ApiError::PermissionDenied(AUDIT_READ_DENIED.to_owned()))
+            .into_response();
+    }
     // The gate runs before `run`, so a caller the catalog refuses causes no
     // `ClickHouse` query at all (`GOV-15` D8).
     let narrowing = if parsed == Kind::Quality {
@@ -1103,15 +1123,12 @@ pub(crate) async fn audit_table_change(
     action: &str,
     args: Value,
 ) {
-    let Some(pg) = state.pg.as_deref() else {
-        return;
-    };
     let table = table.trim().to_lowercase();
     if table.is_empty() {
         return;
     }
-    let _ = lakehouse_store::audit::insert(
-        pg,
+    audit_coverage::record_best_effort(
+        state,
         lakehouse_store::audit::NewAuditEvent {
             principal_id: actor.map(|p| p.id.uuid().to_string()),
             principal_kind: actor.map(|_| "user".to_owned()),
@@ -1464,19 +1481,36 @@ pub async fn create_policy_route(
 ) -> ApiResult<(StatusCode, ApiJson<PolicyView>)> {
     let created = create_policy(State(state.clone()), body).await?;
     let policy = &created.1.0.policy;
-    if let Some(cond) =
-        crate::policy_engine::PolicyCondition::parse_opt(policy.conditions.as_deref())
-    {
-        audit_table_change(
-            &state,
-            principal.as_ref().map(|Extension(p)| p),
-            &cond.table,
-            "policy.create",
-            json!({ "name": policy.name }),
-        )
-        .await;
-    }
+    // A policy that binds no table is recorded on the policy itself
+    // (`audit_policy_change`): it used to leave no row at all (`GOV-1`).
+    audit_policy_change(
+        &state,
+        principal.as_ref().map(|Extension(p)| p),
+        policy,
+        "policy.create",
+        policy_definition_args(policy, json!({ "newStatus": policy.status })),
+    )
+    .await;
     Ok(created)
+}
+
+/// What a policy was or became, for the audit row of its creation or its
+/// deletion (`GOV-1` Decision 3): the definition fields, never `conditions`
+/// (the authored obligation can name columns and filter literals). The
+/// assistant's redaction runs over it as over every audit `args`: a key
+/// naming a secret is replaced and a long string is cut.
+fn policy_definition_args(policy: &Policy, extra: Value) -> Value {
+    let mut args = json!({
+        "name": policy.name,
+        "kind": policy.kind,
+        "effect": policy.effect,
+        "subjects": policy.subjects,
+        "resources": policy.resources,
+    });
+    if let (Some(args), Value::Object(extra)) = (args.as_object_mut(), extra) {
+        args.extend(extra);
+    }
+    super::ai::audit::redact(&args)
 }
 
 /// Records a change to a policy in the audit trail: on the table its
@@ -1496,11 +1530,8 @@ async fn audit_policy_change(
         audit_table_change(state, actor, &cond.table, action, args).await;
         return;
     }
-    let Some(pg) = state.pg.as_deref() else {
-        return;
-    };
-    let _ = lakehouse_store::audit::insert(
-        pg,
+    audit_coverage::record_best_effort(
+        state,
         lakehouse_store::audit::NewAuditEvent {
             principal_id: actor.map(|p| p.id.uuid().to_string()),
             principal_kind: actor.map(|_| "user".to_owned()),
@@ -1569,7 +1600,11 @@ pub async fn set_policy_status(
             principal.as_ref().map(|Extension(p)| p),
             &policy,
             action,
-            json!({ "name": policy.name }),
+            json!({
+                "name": policy.name,
+                "oldStatus": before.status,
+                "newStatus": policy.status,
+            }),
         )
         .await;
     }
@@ -1597,7 +1632,10 @@ pub async fn delete_policy(
         principal.as_ref().map(|Extension(p)| p),
         &policy,
         "policy.delete",
-        json!({ "name": policy.name, "enforced": policy.status == "ready" }),
+        policy_definition_args(
+            &policy,
+            json!({ "enforced": policy.status == "ready", "oldStatus": policy.status }),
+        ),
     )
     .await;
     Ok(ApiJson(json!({ "ok": true, "id": policy.id })))
@@ -2046,11 +2084,8 @@ fn tag_key_json(row: &lakehouse_store::governed_tag::TagKeyRow) -> Value {
 /// not a catalog table, so it has no Change history to join). Best-effort
 /// like every audit write here: it never fails the change it records.
 async fn audit_tag_key(state: &AppState, actor: &Principal, key: &str, action: &str, args: Value) {
-    let Some(pg) = state.pg.as_deref() else {
-        return;
-    };
-    let _ = lakehouse_store::audit::insert(
-        pg,
+    audit_coverage::record_best_effort(
+        state,
         lakehouse_store::audit::NewAuditEvent {
             principal_id: Some(actor.id.uuid().to_string()),
             principal_kind: Some("user".to_owned()),

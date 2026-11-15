@@ -1842,6 +1842,36 @@ async fn governance_write_only_principal_may_put_but_not_get_sla() {
     );
 }
 
+// ── Who reads the audit trail (`GOV-1`, feature page Decision 9) ─────────
+
+/// Every role holds `governance:read`, so that permission alone must not open
+/// the audit trail list: `Kind::Audit` also needs `audit:read`, with a fixed
+/// sentence that names it.
+#[tokio::test]
+async fn the_audit_list_needs_audit_read_and_a_governance_reader_without_it_is_refused() {
+    let TestApp { router, pool } = spin_up().await;
+    let analyst = create_principal_with_permissions(&pool, "query:read,governance:read").await;
+    let cookie = session_cookie_for_user(&pool, analyst).await;
+    let resp = request_with_cookie(&router, "GET", "/api/governance/audit", &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8_lossy(&bytes).into_owned();
+    assert!(
+        body.contains("audit:read"),
+        "the refusal names the permission: {body}"
+    );
+
+    let auditor = create_principal_with_permissions(&pool, "governance:read,audit:read").await;
+    let cookie = session_cookie_for_user(&pool, auditor).await;
+    let resp = request_with_cookie(&router, "GET", "/api/governance/audit", &cookie).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The other kinds keep `governance:read` alone.
+    let cookie = session_cookie_for_user(&pool, analyst).await;
+    let resp = request_with_cookie(&router, "GET", "/api/governance/residency", &cookie).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
 /// `WEB-8` S2 T8 (D8): `GET /api/governance/row-filter-grammar` needs
 /// `policy:read` and nothing less, asserted both ways: no session is 401, a
 /// principal with another permission is 403, and a `policy:read` holder gets

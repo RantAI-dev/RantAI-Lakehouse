@@ -5,7 +5,7 @@
 //! dashboard, ...), and — new in Phase 2 — the Postgres-backed `identity`
 //! domain under `/api/identity/*`.
 
-mod agents;
+pub(crate) mod agents;
 pub(crate) mod ai;
 mod alerts;
 pub mod auth;
@@ -1832,7 +1832,7 @@ pub fn router(state: AppState) -> Router {
 /// answers what no route serves (QA `LH-BI-13-02`, `LH-BLD-2-03`,
 /// `LH-DATA-14-04`, `LH-RPT-1-11`; `SEC-72`, decision `DEC-19`).
 ///
-/// # Why the order of these six calls is the fix
+/// # Why the order of these seven calls is the fix
 ///
 /// `.layer(auth_gate)` wraps every method handler of a path *and* the path's
 /// own "no handler for this method" fallback, which is why a request for a
@@ -1850,6 +1850,14 @@ pub fn router(state: AppState) -> Router {
 /// path registered with `axum::routing::any` (the `Iceberg` door) has a
 /// fallback of its own, which is not the default one, so it is not replaced
 /// and stays behind the gate. Do not reorder these calls.
+///
+/// `GOV-1`: `audit_gate` sits between the query scope and `auth_gate`. It
+/// needs the principal `auth_gate` puts in the request, so it must be inside
+/// it; it writes the audit row of a `Central` route after the handler answers
+/// (`crate::audit_coverage`), so it must wrap the handler, and a layer added
+/// before it (the query scope) would run per query inside the handler's
+/// response instead. Like the gate, it is added before the two fallbacks, so
+/// a `404` or `405` writes nothing.
 fn gated(routes: Router<AppState>, state: AppState) -> Router {
     routes
         // Task 3.2: the one authorization gate every route (bar the four
@@ -1866,12 +1874,34 @@ fn gated(routes: Router<AppState>, state: AppState) -> Router {
             state.clone(),
             crate::query_limits::scope_middleware,
         ))
+        // `GOV-1`: the central audit writer, inside `auth_gate` so the
+        // principal is already in the request.
+        .layer(from_fn_with_state(
+            state.clone(),
+            crate::audit_coverage::audit_gate,
+        ))
         .layer(from_fn_with_state(state.clone(), auth_gate))
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(no_such_address)
         .layer(from_fn_with_state(state.clone(), timeout_middleware))
         .with_state(state)
 }
+
+/// The name `crate::audit_coverage::AUDIT_TABLE` gives `POST /api/ai/tool`,
+/// and the action of the `refused` row `auth_gate` writes when it turns the
+/// call away (`GOV-1`). The handler writes one row per tool call under the
+/// tool's own name, through the assistant's own gate, so the table's name is
+/// only the label of a refusal at the gate. It lives here, outside
+/// `routes::ai`, because the table's guard test looks for each `Handler`
+/// action as a literal in `src/routes/`, and the tool names that are already
+/// literals there (`create_chart`) would make a refused call read as a
+/// refused tool.
+pub(crate) const ASSISTANT_TOOL_ACTION: &str = "assistant.tool";
+
+/// The name `crate::audit_coverage::AUDIT_TABLE` gives `POST /api/ai/chat`;
+/// see [`ASSISTANT_TOOL_ACTION`]. A chat turn writes its rows per tool call
+/// under each tool's own name.
+pub(crate) const ASSISTANT_CHAT_ACTION: &str = "assistant.chat";
 
 /// The sentence a request for a method no route serves is told (`SEC-72`,
 /// decision `DEC-19`; QA `LH-BI-13-02`, `LH-BLD-2-03`, `LH-DATA-14-04`,
