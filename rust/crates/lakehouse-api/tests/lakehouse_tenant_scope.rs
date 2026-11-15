@@ -1268,12 +1268,17 @@ async fn the_policy_list_stays_whole_for_the_service_identity_dagster_reads_it_w
 /// by, and the table it names.
 const GROUP_SLUG: &str = "ds_group_orders";
 const RETAIL_SLUG: &str = "ds_retail_orders";
+/// A dataset whose registry row records no table name.
+const KEYLESS_SLUG: &str = "ds_no_table";
 
 /// `ClickHouse` as the Bronze registry holds two upload datasets, one on the
 /// owning tenant's table and one on the other tenant's, both readable
 /// through the Iceberg query database. Every other query answers no rows.
 #[derive(Clone, Default)]
-struct RegistryFake;
+struct RegistryFake {
+    /// Also registers a dataset whose row names no table.
+    keyless: bool,
+}
 
 fn ch_rows(meta: &[&str], data: &[Value]) -> ResponseTemplate {
     let count = data.len();
@@ -1297,7 +1302,11 @@ impl wiremock::Respond for RegistryFake {
         let sql = String::from_utf8_lossy(&request.body).into_owned();
         // The list: both registry rows.
         if sql.starts_with("SELECT slug, title, description, tier, updated_at, table_name") {
-            let rows: Vec<Value> = [(GROUP_SLUG, GROUP_TABLE), (RETAIL_SLUG, RETAIL_TABLE)]
+            let mut registered = vec![(GROUP_SLUG, GROUP_TABLE), (RETAIL_SLUG, RETAIL_TABLE)];
+            if self.keyless {
+                registered.push((KEYLESS_SLUG, ""));
+            }
+            let rows: Vec<Value> = registered
                 .into_iter()
                 .map(|(slug, table)| {
                     json!({
@@ -1352,17 +1361,26 @@ impl wiremock::Respond for RegistryFake {
 }
 
 /// The deployment of the catalog routes: Meridian Group owns the shared
-/// catalog, and the registry holds the two upload datasets.
-async fn spin_up_with_registry(ch: &MockServer) -> TestApp {
+/// catalog, `fake` is its `ClickHouse`, and `iceberg` says whether the
+/// deployment has an Iceberg query database to read the upload tables
+/// through.
+async fn start_registry_app(ch: &MockServer, fake: RegistryFake, iceberg: bool) -> TestApp {
     Mock::given(method("POST"))
-        .respond_with(RegistryFake)
+        .respond_with(fake)
         .mount(ch)
         .await;
     let mut env = HashMap::new();
     env.insert("CH_URL".to_owned(), ch.uri());
     env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
-    env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
+    if iceberg {
+        env.insert("ICEBERG_QUERY_DB".to_owned(), "icecat_api".to_owned());
+    }
     spin_up_with_env(&env).await
+}
+
+/// The registry holds the two upload datasets, and both are readable.
+async fn spin_up_with_registry(ch: &MockServer) -> TestApp {
+    start_registry_app(ch, RegistryFake { keyless: false }, true).await
 }
 
 /// The ids of the assets a catalog list or page answered.
@@ -1444,10 +1462,14 @@ async fn the_paged_catalog_query_leaves_out_another_tenants_upload_asset_for_the
 
 /// The read at `/api/catalog/{slug}{suffix}`, as the owning tenant makes it:
 /// the other tenant's upload answers the 404 an unknown id answers, byte for
-/// byte, and the owning tenant's own upload still opens.
-async fn assert_the_other_tenants_upload_is_the_unknown_404(suffix: &str) {
+/// byte, and the owning tenant's own upload still opens. With `iceberg` unset
+/// no upload table is readable, so the sample and the profile have no source
+/// to read and the check cannot rest on one: the owner's own upload then
+/// answers its "nothing to read" 200 instead.
+async fn assert_the_other_tenants_upload_is_the_unknown_404(suffix: &str, iceberg: bool) {
     let ch = MockServer::start().await;
-    let TestApp { router, pool } = spin_up_with_registry(&ch).await;
+    let TestApp { router, pool } =
+        start_registry_app(&ch, RegistryFake { keyless: false }, iceberg).await;
     claim_the_uploads(&pool).await;
     let owner = cookie_in_tenant(&pool, CATALOG_READER_WITH_SAMPLES, CATALOG_TENANT).await;
 
@@ -1482,15 +1504,47 @@ async fn assert_the_other_tenants_upload_is_the_unknown_404(suffix: &str) {
 
 #[tokio::test]
 async fn the_page_of_another_tenants_upload_asset_is_the_unknown_404_for_the_owning_tenant() {
-    assert_the_other_tenants_upload_is_the_unknown_404("").await;
+    assert_the_other_tenants_upload_is_the_unknown_404("", true).await;
 }
 
 #[tokio::test]
 async fn the_sample_of_another_tenants_upload_asset_is_the_unknown_404_for_the_owning_tenant() {
-    assert_the_other_tenants_upload_is_the_unknown_404("/sample").await;
+    assert_the_other_tenants_upload_is_the_unknown_404("/sample", true).await;
 }
 
 #[tokio::test]
 async fn the_profile_of_another_tenants_upload_asset_is_the_unknown_404_for_the_owning_tenant() {
-    assert_the_other_tenants_upload_is_the_unknown_404("/profile").await;
+    assert_the_other_tenants_upload_is_the_unknown_404("/profile", true).await;
+}
+
+#[tokio::test]
+async fn the_sample_of_another_tenants_upload_asset_is_the_unknown_404_when_no_table_can_be_read() {
+    assert_the_other_tenants_upload_is_the_unknown_404("/sample", false).await;
+}
+
+#[tokio::test]
+async fn the_profile_of_another_tenants_upload_asset_is_the_unknown_404_when_no_table_can_be_read()
+{
+    assert_the_other_tenants_upload_is_the_unknown_404("/profile", false).await;
+}
+
+#[tokio::test]
+async fn an_asset_that_names_no_table_stays_in_the_lists_of_the_owning_tenant() {
+    let ch = MockServer::start().await;
+    let TestApp { router, pool } =
+        start_registry_app(&ch, RegistryFake { keyless: true }, true).await;
+    claim_the_uploads(&pool).await;
+    let owner = cookie_in_tenant(&pool, "catalog:read", CATALOG_TENANT).await;
+    let expected = vec![GROUP_SLUG.to_owned(), KEYLESS_SLUG.to_owned()];
+
+    // The owner holds the shared catalog, and an asset with no table is the
+    // catalog's own, not another tenant's upload.
+    let (status, body) = get(&router, "/api/catalog", &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(asset_ids(&body, "assets"), expected, "{body}");
+
+    let (status, body) = get(&router, "/api/catalog/query", &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(asset_ids(&body, "items"), expected, "{body}");
+    assert_no_trace_of_the_retail_upload("/api/catalog/query", &body);
 }

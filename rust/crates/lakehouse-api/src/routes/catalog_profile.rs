@@ -353,6 +353,12 @@ pub async fn profile(
     if let Some(reason) = catalog_tenant_refusal(&state, &principal, &headers).await? {
         return Ok(unsupported(reason));
     }
+    // `SEC-20` (plan 95): an upload another tenant holds answers the same 404
+    // an unknown id answers, decided from the registry's own key before a
+    // source is resolved, so a deployment where no table is readable behind it
+    // does not answer "no readable table" for it and "not found" for an
+    // unknown id.
+    crate::routes::catalog::ensure_asset_in_reach(&state, &principal, &headers, &id).await?;
     let Some(source) = resolve_source(&state, &id).await? else {
         return Ok(unsupported(
             "No readable table backs this asset yet: no ClickHouse table, and no Iceberg \
@@ -363,11 +369,6 @@ pub async fn profile(
     // asset answers.
     let access = crate::routes::catalog::table_access_for(&state, &principal).await?;
     crate::routes::catalog::ensure_key_readable_with(&access, &source.policy_key)?;
-    // `SEC-20` (plan 95): an upload another tenant holds answers the same 404.
-    // The rewrite below refuses it too, but with Query Studio's sentence,
-    // which names the table and so tells the asset exists.
-    crate::routes::catalog::ensure_key_in_reach(&state, &principal, &headers, &source.policy_key)
-        .await?;
     // Underscore-prefixed columns are loader bookkeeping, hidden from the
     // detail schema and sample too.
     let all: Vec<(String, String)> = source

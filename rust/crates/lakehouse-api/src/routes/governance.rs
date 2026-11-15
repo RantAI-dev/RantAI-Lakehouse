@@ -270,9 +270,13 @@ fn retain_readable_rules(access: &crate::table_access::TableAccess, body: &mut V
 /// by the rule Query Studio keeps ([`crate::routes::query::reachable_names`]):
 /// another tenant's upload table is left out even for the tenant that owns the
 /// shared catalog. The claims are read once for the distinct tables, because
-/// the history holds every run and a table appears many times. A row with no
-/// `tableName` is left out of a narrowed answer (fail closed). An answer with
-/// no `maintenance` list is left as it is.
+/// the history holds every run and a table appears many times. A row always
+/// carries a `tableName` string ([`maintenance_run_row_json`] writes one even
+/// when the column is empty), and an empty name is an unclaimable name: it is
+/// kept only where an unclaimed table is, for a reach that is everything and
+/// for the tenant that owns the shared catalog. A row with no string at all is
+/// left out of a narrowed answer. An answer with no `maintenance` list is left
+/// as it is.
 ///
 /// # Errors
 ///
