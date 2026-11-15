@@ -99,3 +99,37 @@ Decision needed from the planner and owner:
 - Nothing was run in a browser (no dev server by rule): the Delete confirmation inside the subscriptions
   dialog (a dialog over a dialog) has only the jsdom-style test.
 - The full `bun run test` and `bun run lint` were not run (rule); CI runs them.
+
+## Planner decision for BI-42 (owner, 2026-11-15): D6b, images through the API
+
+The owner chose: **image cards print; web cards keep the "Shown in the console only" placeholder.**
+Feature decision 3 stays: Gotenberg's Chromium still opens only the console. The image reaches it from the
+console's own origin instead.
+
+- **Route.** `GET /api/render/image?token=<render token>&src=<url>` (public in `POLICY_TABLE`, like the other
+  render routes; asserted both ways in `route_auth.rs`). It goes through `render::admit` and reads the board
+  as the token's person.
+- **What it will fetch.** Only an `src` that is **exactly** the URL of an image card on the token's board (the
+  saved board, not anything from the request), and only when that URL's site is in the board's content
+  sites at the time of the request. Anything else answers 404 with a fixed sentence. Web cards are never
+  fetched.
+- **How it fetches.** `https` only, through the pinned client of SEC-15's allowlisted resolver
+  (`connector_probe::resolve_checked`, as `runtime_settings::pinned_client` does), so a name that resolves
+  inside the deployment's network is refused. No redirects followed. Timeout 10 s; body capped at 5 MiB
+  (read in a bounded way, refused past the cap). Only `image/png`, `image/jpeg`, `image/gif` and `image/webp`
+  are passed on, checked against the response's bytes (magic numbers), not only its header; SVG is refused.
+  The response is sent with the checked `Content-Type`, `X-Content-Type-Options: nosniff` and
+  `Cache-Control: private, max-age=300`. Upstream error text never reaches the response (`upstream_error`).
+- **Print view.** `render-view.tsx` draws an image card's `<img>` with `src` pointing at this route
+  (eager loading, waited for like a chart, with a timeout so a slow image cannot hold the PDF). If the image
+  fails, the card shows the existing placeholder. Web cards keep the placeholder.
+- **Not needed now:** the parked `POST /api/render/frame` and the `/render/*` policy change from the WIP
+  patch, because the image comes from the console's own origin. Reuse only the print-view card drawing
+  from that patch.
+- **Tests.** Rust: a URL that is not one of the board's image cards is 404; a card URL whose site left the
+  content sites is 404; a bad or expired token is refused; a non-image or SVG body is refused; an over-cap
+  body is refused (use a local test server only where the resolver allows it in tests, as existing
+  resolver tests do). TS: the print view points an image card at the route with the token and falls back to
+  the placeholder on error.
+- `docs/core/features/export-pdf-excel.md`: decision 3 gains one line saying images on the board's content
+  sites reach the PDF through this route; web cards do not.
