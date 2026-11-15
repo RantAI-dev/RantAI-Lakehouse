@@ -292,40 +292,41 @@ const ESCAPABLE: [char; 6] = ['\\', '*', '[', ']', '(', ')'];
 fn inline_links_safe(text: &str) -> bool {
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
-    // `escaped[i]`: character `i` is taken literally because a `\` before it
-    // escapes it; `escaper[i]`: character `i` is that `\` and is not shown.
-    let mut escaped = vec![false; len];
-    let mut escaper = vec![false; len];
+    // `literal[i]`: character `i` is taken literally because a `\` before it
+    // escapes it; `backslash[i]`: character `i` is that `\` and is not shown.
+    // PR #545 CI: two names one letter apart failed `clippy::similar_names`.
+    let mut literal = vec![false; len];
+    let mut backslash = vec![false; len];
     let mut i = 0;
     while i < len {
         if chars[i] == '\\' && chars.get(i + 1).is_some_and(|c| ESCAPABLE.contains(c)) {
-            escaper[i] = true;
-            escaped[i + 1] = true;
+            backslash[i] = true;
+            literal[i + 1] = true;
             i += 2;
         } else {
             i += 1;
         }
     }
-    let unescaped = |at: usize, want: char| chars.get(at) == Some(&want) && !escaped[at];
+    let unescaped = |at: usize, want: char| chars.get(at) == Some(&want) && !literal[at];
     // `next(p)[i]`: the first position at or after `i` where `p` holds; one
     // longer than the text, so `next(p)[len]` is `None`.
     let next = |holds: &dyn Fn(usize) -> bool| {
-        let mut next = vec![None; len + 1];
+        let mut first = vec![None; len + 1];
         let mut seen = None;
-        for (at, slot) in next.iter_mut().enumerate().take(len).rev() {
+        for (at, slot) in first.iter_mut().enumerate().take(len).rev() {
             if holds(at) {
                 seen = Some(at);
             }
             *slot = seen;
         }
-        next
+        first
     };
     let next_close = next(&|at| unescaped(at, ']'));
     let next_end = next(&|at| unescaped(at, ')'));
-    let next_solid = next(&|at| !escaper[at] && !chars[at].is_whitespace());
-    // `shown[i]`: how many characters before `i` are shown (not a `\` escaper).
+    let next_solid = next(&|at| !backslash[at] && !chars[at].is_whitespace());
+    // `shown[i]`: how many characters before `i` are shown (not an escaping `\`).
     let shown: Vec<usize> = std::iter::once(0)
-        .chain(escaper.iter().scan(0, |n, &hidden| {
+        .chain(backslash.iter().scan(0, |n, &hidden| {
             *n += usize::from(!hidden);
             Some(*n)
         }))
@@ -353,7 +354,7 @@ fn inline_links_safe(text: &str) -> bool {
         // The address trimmed at the front; only its first characters decide.
         let head: String = match next_solid[start] {
             Some(from) if from < end => (from..end)
-                .filter(|&at| !escaper[at])
+                .filter(|&at| !backslash[at])
                 .take(16)
                 .map(|at| chars[at])
                 .collect(),
