@@ -121,7 +121,7 @@ export type ChatComposerHandle = {
  */
 export function ChatComposer({
   ref, mode, setMode, onSend, onStop, busy, placeholder, autoFocus, rows = 2,
-  enabledCaps, toggleCap, onFocus, glass, compact, solid, examples, footer,
+  enabledCaps, toggleCap, onFocus, glass, compact, solid, examples, footer, value, onValueChange,
 }: {
   ref?: React.Ref<ChatComposerHandle>;
   mode: Mode;
@@ -158,8 +158,17 @@ export function ChatComposer({
    * context strip (what Ask can read, what Build may change). Full style only.
    */
   footer?: React.ReactNode;
+  /**
+   * The draft, when the caller owns it. The floating dock swaps the
+   * collapsed pill and the open composer (two mounts of this component), and
+   * a draft kept here would be lost at every open and close.
+   */
+  value?: string;
+  onValueChange?: (text: string) => void;
 }) {
-  const [input, setInput] = React.useState("");
+  const [ownInput, setOwnInput] = React.useState("");
+  const input = value ?? ownInput;
+  const setInput = onValueChange ?? setOwnInput;
   const area = React.useRef<HTMLTextAreaElement>(null);
   // Micro-interaction audit 2026-11-14 (emil; WEB-17 "Ask why"): text put in from elsewhere arrives with
   // a short cue, the box's edge lighting up and easing back, so the eye goes to it before Enter.
@@ -186,7 +195,7 @@ export function ChatComposer({
       // After React has put the text in, so the caret lands after it.
       requestAnimationFrame(() => el.setSelectionRange(text.length, text.length));
     },
-  }), [reduce]);
+  }), [reduce, setInput]);
   const [exampleIndex, setExampleIndex] = React.useState(0);
   const cycling = Boolean(examples?.length) && !input;
   React.useEffect(() => {
@@ -209,7 +218,9 @@ export function ChatComposer({
   // COMPACT — single-line pill (input + send). Focus/typing expands via onFocus.
   if (compact) {
     return (
-      <div className={cn("flex items-center gap-2 rounded-full border py-2 pl-4 pr-2 transition-all", glassCls)}>
+      // `data-slot` lets the dock animate this surface itself: an opacity or
+      // clip on a wrapper would cut the glass's backdrop blur off.
+      <div data-slot="chat-composer" className={cn("flex items-center gap-2 rounded-full border py-2 pl-4 pr-2", glassCls)}>
         <input
           value={input}
           onChange={(e) => setInput(e.target.value)}
@@ -319,8 +330,9 @@ export function ChatComposer({
   );
 
   return (
-    <div data-filled={filled ? "" : undefined} className={cn(
-      // Named properties (was `transition-all`), on the console's ease-out.
+    // Owner QA 2026-11-15: `transition-all` also tweened size and radius
+    // whenever the box changed shape; only the focus colours fade now.
+    <div data-slot="chat-composer" data-filled={filled ? "" : undefined} className={cn(
       "rounded-2xl border p-1.5 transition-[border-color,background-color,box-shadow] duration-200 ease-ui",
       "data-filled:border-primary/50 data-filled:ring-3 data-filled:ring-primary/15",
       solid

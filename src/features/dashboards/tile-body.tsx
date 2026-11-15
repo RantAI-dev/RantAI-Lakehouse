@@ -16,6 +16,8 @@ import { GeoChart } from "./geo-chart";
 import type { MapLoader } from "./echarts-maps";
 import { useReporting } from "./reporting-context";
 import { KpiCard } from "./kpi-card";
+import { KpiValue, OverflowText } from "./fit-text";
+import { compactKpiText } from "@/lib/kpi-fit";
 import { TileBodyPlaceholder } from "./dashboard-skeleton";
 import { PivotTable } from "./pivot-table";
 import { RawTable } from "./raw-table";
@@ -160,9 +162,15 @@ function TileBodyOf({
     // BI-17: the KPI's number format, and the colour a rule gives its value ("green above the goal").
     const paint = v === null ? undefined : conditionalCss(def?.conditional, null, v);
     return (
-      <div className="grid h-full place-content-center px-2 text-center">
-        <p className="text-4xl font-semibold tabular-nums text-foreground" style={paint && { color: paint.color, backgroundColor: paint.backgroundColor }}>{v === null ? "—" : kpiFormat ? formatValue(v, kpiFormat, reporting.numberLocale, decimalsFor([v])) : fmtInt(v)}</p>
-        {spec.caption ? <p className="mt-1 text-xs text-muted-foreground">{spec.caption}</p> : null}
+      // Owner QA 2026-11-15: the number always fits the tile and the caption stops at two lines (`KpiCard`).
+      <div className="grid h-full grid-cols-[minmax(0,1fr)] content-center px-2 text-center">
+        <KpiValue
+          className="text-4xl font-semibold tabular-nums text-foreground" style={paint && { color: paint.color, backgroundColor: paint.backgroundColor }}
+          full={v === null ? "—" : kpiFormat ? formatValue(v, kpiFormat, reporting.numberLocale, decimalsFor([v])) : fmtInt(v)}
+          // Unformatted, the full value is `fmtInt`'s whole en-US number, so its compact form is too.
+          compact={v === null ? null : kpiFormat ? compactKpiText(v, kpiFormat, reporting.numberLocale, decimalsFor([v])) : compactKpiText(Math.round(v), undefined, "en-US", 0)}
+        />
+        {spec.caption ? <OverflowText as="p" lines={2} text={spec.caption} className="mt-1 text-xs text-muted-foreground" /> : null}
       </div>
     );
   }

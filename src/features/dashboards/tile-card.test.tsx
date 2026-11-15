@@ -33,11 +33,39 @@ describe("TileCard, the dashboard page's soft look (BI-61 T4)", () => {
     expect(screen.queryByText("Manual")).toBeNull()
   })
 
-  it("keeps the data time for the hover line", () => {
+  // Owner QA 2026-11-15: the chip covered a narrow tile's title. It now sits beside the title (in the
+  // header's flow, not laid over it) and shows on hover only on a tile at least 360 px wide (a
+  // container query on the tile, so a side panel narrowing the page counts). Was: an absolute chip
+  // faded in over the title on any tile from the `lg` window width.
+  it("keeps the data time for the hover chip, beside the title and only on a wide enough tile", () => {
     render(<TileCard item={item()} editable={false} look="soft" />)
+    const tile = document.querySelector("[data-slot='tile']") as HTMLElement
+    expect(tile.className).toContain("@container/tile")
     const line = document.querySelector("[data-slot='tile-data-from']") as HTMLElement
     expect(line.textContent).toBe("Data from 12:47")
-    expect(line.className).toContain("group-hover/tile:opacity-100")
+    expect(line.className).not.toContain("absolute")
+    expect(line.className).toMatch(/(^|\s)hidden(\s|$)/)
+    expect(line.className).toContain("@min-[22.5rem]/tile:group-hover/tile:inline")
+    expect(line.className).toContain("@min-[22.5rem]/tile:group-focus-within/tile:inline")
+  })
+
+  it("gives a cut title and description a tooltip and a tab stop, and a title that fits neither", () => {
+    const realScroll = Object.getOwnPropertyDescriptor(Element.prototype, "scrollWidth")
+    const realClient = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientWidth")
+    try {
+      // Every line is cut: 300 px of text in 100 px.
+      Object.defineProperty(Element.prototype, "scrollWidth", { configurable: true, get: () => 300 })
+      Object.defineProperty(HTMLElement.prototype, "clientWidth", { configurable: true, get: () => 100 })
+      render(<TileCard item={item({ subtitle: "Foreign visitors by year since 2015" })} editable={false} look="soft" />)
+      expect(screen.getByText("Visitors per year").getAttribute("tabindex")).toBe("0")
+      expect(screen.getByText("Foreign visitors by year since 2015").getAttribute("tabindex")).toBe("0")
+    } finally {
+      if (realScroll) Object.defineProperty(Element.prototype, "scrollWidth", realScroll)
+      if (realClient) Object.defineProperty(HTMLElement.prototype, "clientWidth", realClient)
+    }
+    cleanup()
+    render(<TileCard item={item()} editable={false} look="soft" />)
+    expect(screen.getByText("Visitors per year").getAttribute("tabindex")).toBeNull()
   })
 
   // BI-61 review round 1, SHOULD-FIX 3: one short line that never wraps, the full sentence as its tooltip.

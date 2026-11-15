@@ -46,6 +46,8 @@ import { DashboardHeader, EASE, EditPencil, FOCUS, ShareButton } from "./dashboa
 import type { ChartDef } from "./chart-builder";
 import { chartEditHref, chartNewHref } from "./chart-page";
 import { fmtInt } from "./chart-option";
+import { KpiValue, OverflowText } from "./fit-text";
+import { compactKpiText } from "@/lib/kpi-fit";
 import { DashboardActionsMenu, NewChartButton, RenameDashboardDialog } from "./dashboard-actions";
 import { SaveTemplateDialog } from "./template-dialogs";
 import { chartWriteItems } from "./tile-write-items";
@@ -1482,8 +1484,10 @@ export function DashboardPage({ boardId }: { boardId: string }) {
             {phoneEdit && phone?.length ? <Button variant="ghost" size="sm" onClick={() => void resetPhone()}>Use the computed order</Button> : null}
           </div>
         ) : undefined}
-        onComments={isDefault ? undefined : () => openSide("comments")}
-        onDetails={isDefault ? undefined : () => openSide("details")}
+        // Owner QA 2026-11-15: the side panel has no close button; pressing the
+        // one that opened it again closes it.
+        onComments={isDefault ? undefined : () => sidePanel.toggle("comments")}
+        onDetails={isDefault ? undefined : () => sidePanel.toggle("details")}
         actions={
           <>
             {fullscreen ? (
@@ -1595,9 +1599,16 @@ export function DashboardPage({ boardId }: { boardId: string }) {
               const v = hasRows(cell) ? Number(cell.rows[0]?.v ?? 0) : null;
               return (
                 <div key={k.id} className="rounded-2xl bg-muted/45 p-4 dark:bg-card">
-                  <p className="text-xs font-medium text-muted-foreground">{k.title}</p>
-                  {loading && v === null ? <div className="mt-2 h-7 w-24 animate-pulse rounded bg-muted" /> : <p className="mt-1 text-2xl font-semibold tabular-nums text-foreground">{v === null ? "—" : fmtInt(v)}</p>}
-                  {k.caption ? <p className="mt-1 text-[11px] text-muted-foreground">{k.caption}</p> : null}
+                  {/* Owner QA 2026-11-15: one line, the full title in a tooltip when it is cut. */}
+                  <OverflowText as="p" text={k.title} className="text-xs font-medium text-muted-foreground" />
+                  {loading && v === null ? <div className="mt-2 h-7 w-24 animate-pulse rounded bg-muted" /> : (
+                    // Owner QA 2026-11-15: the number fits its card (`KpiValue`), compact only when even 60% of its size is too wide.
+                    <KpiValue
+                      className="mt-1 text-2xl font-semibold tabular-nums text-foreground"
+                      full={v === null ? "—" : fmtInt(v)} compact={v === null ? null : compactKpiText(Math.round(v), undefined, "en-US", 0)}
+                    />
+                  )}
+                  {k.caption ? <OverflowText as="p" lines={2} text={k.caption} className="mt-1 text-[11px] text-muted-foreground" /> : null}
                 </div>
               );
             })}

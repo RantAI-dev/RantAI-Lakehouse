@@ -32,7 +32,7 @@ export function DashboardTilesSkeleton({ tiles = 4 }: { tiles?: number }) {
       {Array.from({ length: tiles }).map((_, i) => (
         <div key={i} aria-hidden className={cn(SOFT_TILE_FRAME, "h-[324px]")} data-slot="tile-placeholder">
           <div className={SOFT_TILE_HEADER}>
-            <Skeleton className="h-3.5" style={{ width: TITLE_WIDTHS[i % TITLE_WIDTHS.length] }} />
+            <Skeleton className="mt-[11px] h-3.5" style={{ width: TITLE_WIDTHS[i % TITLE_WIDTHS.length] }} />
           </div>
           <div className={SOFT_TILE_BODY}>
             <TileBodyPlaceholder />
