@@ -11,6 +11,8 @@
  * - ⋮⋮ drags a block, + inserts under it, Alt+↑ ↓ moves it.
  * - Charts are picked from live pictures grouped by dashboard, at most 30
  *   (`BI-18` R4; the server refuses a 31st with its own sentence).
+ * - The Charts tab of the one side panel (D6) holds every dashboard's charts
+ *   as pictures to drag in or click in at the cursor.
  * - Preview shows the reader's view, drawn by the reader's own renderer.
  * - No Save button (D4): changes save about a second after typing stops and
  *   at once on blur, on leaving the page and when the tab is hidden
@@ -50,6 +52,7 @@ import { rememberRow } from "./dashboards-row"
 import { FolderOptions } from "./folder-options"
 import { ReportBlocks } from "./report-blocks"
 import { ReportChartPicker } from "./report-chart-picker"
+import { ChartShelfPortal, useReportChartsTab } from "./report-chart-shelf"
 import { ReportChartsProvider, useReportCharts, type ReportChartChoice } from "./report-charts"
 import { ChartNode, ReportEditorUiContext, type PickerRequest, type ReportEditorUi } from "./report-editor-chart"
 import { SlashStore, insertBlock, reportExtensions, type SlashItem } from "./report-editor-extensions"
@@ -341,6 +344,8 @@ function ReportEditor({ view }: { view: ReportView | null }) {
   }, [autosave])
 
   const ui = React.useMemo<ReportEditorUi>(() => ({ readOnly: preview, openPicker: setPicker }), [preview])
+  // D6: Charts opens on a wide screen for an empty report, else as it was left.
+  const chartsTab = useReportChartsTab({ ready: editor !== null, empty: !view || view.report.blocks.length === 0 })
   const pdf = Boolean(view?.pdfSupported && view.canDownload && reportId)
   const savedId = saveState.id
   const backHref = savedId ? `/dashboards/reports/${encodeURIComponent(savedId)}` : REPORTS_TAB_HREF
@@ -366,6 +371,7 @@ function ReportEditor({ view }: { view: ReportView | null }) {
             </Select>
           }
           count={info.count}
+          extra={<ToggleButton on={chartsTab.shown} icon={ChartColumn} label="Charts" onClick={chartsTab.toggle} />}
           preview={preview}
           onPreview={() => setPreview((p) => !p)}
           pdf={pdf && reportId ? () => void downloadPdf(reportId) : undefined}
@@ -389,6 +395,7 @@ function ReportEditor({ view }: { view: ReportView | null }) {
           )}
         </div>
         <SlashMenu store={slash} icons={ICONS} />
+        <ChartShelfPortal host={chartsTab.host} shown={chartsTab.shown} used={info.used} count={info.count} onPick={(c) => insertChart(c.id)} />
         <ReportChartPicker
           open={picker !== null}
           onOpenChange={(o) => {
