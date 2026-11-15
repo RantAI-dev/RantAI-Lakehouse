@@ -28,7 +28,16 @@ type SidePanelValue = {
   /** Where the active tab's content goes (`createPortal`); null until the panel has drawn its body. */
   readonly host: HTMLElement | null;
   readonly open: (id: string) => void;
+  /** Shows `id`, or closes the panel when `id` is what it already shows: the page's own Comments and Details buttons. */
+  readonly toggle: (id: string) => void;
+  /** Takes the page tab off the panel; the Copilot shows again if it is docked there and open. */
   readonly close: () => void;
+  /**
+   * Closes the whole panel: the page tab, and the Copilot too when it is
+   * docked there (owner QA 2026-11-15: the panel has no close button, so its
+   * page buttons, Escape and a click on its edge do this).
+   */
+  readonly dismiss: () => void;
   /** For the panel: the element its body is. */
   readonly setHost: (el: HTMLElement | null) => void;
   /** For `useSidePanelTabs`. */
@@ -42,7 +51,9 @@ const NOOP: SidePanelValue = {
   active: null,
   host: null,
   open: () => {},
+  toggle: () => {},
   close: () => {},
+  dismiss: () => {},
   setHost: () => {},
   setTabs: () => {},
 };
@@ -62,6 +73,14 @@ export function SidePanelProvider({ children }: { readonly children: React.React
     if (dockPosition === "bottom" && expanded) setExpanded(false);
   }, [dockPosition, expanded, setExpanded]);
   const close = React.useCallback(() => setActive(null), []);
+  const dismiss = React.useCallback(() => {
+    setActive(null);
+    if (dockPosition === "right" && expanded) setExpanded(false);
+  }, [dockPosition, expanded, setExpanded]);
+  const toggle = React.useCallback((id: string) => {
+    if (active === id) dismiss();
+    else open(id);
+  }, [active, dismiss, open]);
   const setTabs = React.useCallback((next: readonly SidePanelTab[]) => {
     setTabsState(next.length ? next : NO_TABS);
     // A page that leaves takes its tabs, and the panel showing one of them, with it.
@@ -74,8 +93,8 @@ export function SidePanelProvider({ children }: { readonly children: React.React
     wasExpanded.current = expanded;
   }, [expanded]);
   const value = React.useMemo(
-    () => ({ tabs, active, host, open, close, setHost, setTabs }),
-    [tabs, active, host, open, close, setTabs],
+    () => ({ tabs, active, host, open, toggle, close, dismiss, setHost, setTabs }),
+    [tabs, active, host, open, toggle, close, dismiss, setTabs],
   );
   return <SidePanelContext.Provider value={value}>{children}</SidePanelContext.Provider>;
 }

@@ -36,15 +36,16 @@ function ThemeIcon({
 }
 
 /**
- * The menu header's role line: separators become spaces and the first letter is capital
- * (`platform_admin` is "Platform admin"; a name already written "Platform Admin" stays so).
+ * The menu header's role line: separators become spaces and every word is capitalised
+ * (owner decision 2026-11-15: every word capitalised; `platform_admin` is "Platform Admin",
+ * `data_analyst` is "Data Analyst"; a name already written "Platform Admin" stays so).
  * Several roles: the first two, then "+N". Empty when there are none.
  */
 export function roleLine(roles: readonly string[] | undefined): string {
   const names = (roles ?? [])
     .map((r) => r.replace(/[_-]+/g, " ").trim())
     .filter(Boolean)
-    .map((r) => r.charAt(0).toUpperCase() + r.slice(1))
+    .map((r) => r.replace(/(^|\s)(\S)/g, (_, sp: string, c: string) => sp + c.toUpperCase()))
   if (names.length === 0) return ""
   const rest = names.length - 2
   return names.slice(0, 2).join(", ") + (rest > 0 ? ` +${rest}` : "")

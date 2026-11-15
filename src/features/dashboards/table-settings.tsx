@@ -270,7 +270,9 @@ export function KpiCompareSection({ draft, onChange, columns, metric }: {
 }) {
   const kinds = { none: "No comparison", previous: "Previous period", last_year: "Same period last year", goal: "Goal" };
   const byPeriod = draft.compareKind === "previous" || draft.compareKind === "last_year";
-  const defaultNote = metric?.timeColumn ? `${metric.timeColumn}, ${metric.grain ?? "month"} (from ${metric.label})` : "";
+  // `BI-58` T6 (QA 2026-11-14): short enough for the select ("start_date, by month"); the metric it
+  // comes from is named on its own line under the field, so nothing is cut off.
+  const defaultNote = metric?.timeColumn ? `${metric.timeColumn}, by ${metric.grain ?? "month"}` : "";
   return (
     <div className="grid gap-3">
       <div className="grid gap-1.5">
@@ -283,13 +285,14 @@ export function KpiCompareSection({ draft, onChange, columns, metric }: {
         </Select>
       </div>
       {byPeriod ? (
-        <div className="grid grid-cols-2 items-start gap-3">
+        <div className="grid grid-cols-1 items-start gap-3 @md:grid-cols-2">
           <div className="grid gap-1.5">
             <Label>Date column {defaultNote ? null : <span aria-hidden className="text-destructive">*</span>}</Label>
             <Select value={draft.compareColumn} onValueChange={(v) => onChange({ ...draft, compareColumn: v ?? "" })}>
               <SelectTrigger className="w-full" aria-label="Date column"><SelectValue placeholder={defaultNote || (columns.dates.length ? "pick a column" : "no date column")} /></SelectTrigger>
               <SelectContent>{columns.dates.map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
             </Select>
+            {defaultNote && !draft.compareColumn ? <p className="text-xs text-muted-foreground">From the metric {metric?.label}</p> : null}
           </div>
           <div className="grid gap-1.5">
             <Label>Period</Label>

@@ -114,8 +114,8 @@ export const dashboardService = clickhouseDashboardService
  * (`PR #199 review M SHOULD-FIX BI-16 7`).
  */
 export type {
-  AccessKind, AccessLevel, Board, BoardChart, BoardTab, CommentInput, CommentList, CommentPerson, DashboardComment, EmbedInfo, FilterMode, GranteeMatches, InheritedGrantee, ItemAccess,
-  ItemAccessInput, LayoutMap, MoveEffect, PhoneTile, PublicLink, PublicLinkState, TileBox,
+  AccessKind, AccessLevel, Board, BoardChart, BoardTab, ChartOutline, CommentInput, CommentList, CommentPerson, DashboardComment, EmbedInfo, FilterMode, GranteeMatches, InheritedGrantee, ItemAccess,
+  ItemAccessInput, LayoutMap, MoveEffect, PhoneTile, PublicLink, PublicLinkState, ShortcutItem, TileBox,
 } from "./contracts/dashboards"
 // Reports (BI-18 part D): written pages with live charts, in Postgres over
 // `/api/dashboard/reports`. Real from the start: no mock ever existed.
