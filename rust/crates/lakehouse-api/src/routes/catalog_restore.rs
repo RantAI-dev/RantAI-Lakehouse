@@ -546,7 +546,7 @@ impl RestoreJob {
                 // the table is back.
                 other => return self.settle_unknown_undrop(&other).await,
             };
-            audit_after(&self.pool, self.event("failed", Some(detail))).await;
+            audit_after(&self.state, self.event("failed", Some(detail))).await;
             return Err(refusal);
         }
         self.finish_restore().await;
@@ -568,7 +568,7 @@ impl RestoreJob {
             return Ok(json!({ "ok": true }));
         }
         audit_after(
-            &self.pool,
+            &self.state,
             self.event("failed", Some("the catalog did not answer")),
         )
         .await;
@@ -603,7 +603,7 @@ impl RestoreJob {
                 "restore: no record of the drop was read, so this restore clears none; the next read heals a leftover"
             );
         }
-        audit_after(&self.pool, self.event("executed", None)).await;
+        audit_after(&self.state, self.event("executed", None)).await;
     }
 
     /// The audit record of this restore, with this restore's own fields.

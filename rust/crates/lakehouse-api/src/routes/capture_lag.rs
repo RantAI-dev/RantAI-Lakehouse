@@ -35,7 +35,6 @@ use axum::extract::{Path, State};
 use lakehouse_alerts::AlertKind;
 use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
-use lakehouse_store::audit as store_audit;
 use lakehouse_store::capture_lag as store;
 use lakehouse_store::connectors;
 use serde::{Deserialize, Serialize};
@@ -44,6 +43,7 @@ use sqlx::PgPool;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use crate::audit_coverage;
 use crate::capture_lag::{
     LagAlert, TableLag, alert_step, back_under_text, crossed_text, tables_lag, worst,
 };
@@ -329,9 +329,7 @@ pub async fn set_limit(
         json!({ "minutes": minutes }),
         "executed",
     );
-    if let Err(err) = store_audit::insert(pool, event).await {
-        tracing::warn!(%err, connector_id = %id, "failed to record connector.lag_limit audit event");
-    }
+    audit_coverage::record_best_effort(&state, event).await;
     Ok(ApiJson(LagLimitResponse { minutes }))
 }
 

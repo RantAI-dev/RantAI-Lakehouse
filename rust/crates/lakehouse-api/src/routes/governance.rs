@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 
+use crate::audit_coverage;
 use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
 use crate::routes::catalog::NOT_IN_PRIMARY;
@@ -1120,15 +1121,12 @@ pub(crate) async fn audit_table_change(
     action: &str,
     args: Value,
 ) {
-    let Some(pg) = state.pg.as_deref() else {
-        return;
-    };
     let table = table.trim().to_lowercase();
     if table.is_empty() {
         return;
     }
-    let _ = lakehouse_store::audit::insert(
-        pg,
+    audit_coverage::record_best_effort(
+        state,
         lakehouse_store::audit::NewAuditEvent {
             principal_id: actor.map(|p| p.id.uuid().to_string()),
             principal_kind: actor.map(|_| "user".to_owned()),
@@ -1530,11 +1528,8 @@ async fn audit_policy_change(
         audit_table_change(state, actor, &cond.table, action, args).await;
         return;
     }
-    let Some(pg) = state.pg.as_deref() else {
-        return;
-    };
-    let _ = lakehouse_store::audit::insert(
-        pg,
+    audit_coverage::record_best_effort(
+        state,
         lakehouse_store::audit::NewAuditEvent {
             principal_id: actor.map(|p| p.id.uuid().to_string()),
             principal_kind: actor.map(|_| "user".to_owned()),
@@ -2087,11 +2082,8 @@ fn tag_key_json(row: &lakehouse_store::governed_tag::TagKeyRow) -> Value {
 /// not a catalog table, so it has no Change history to join). Best-effort
 /// like every audit write here: it never fails the change it records.
 async fn audit_tag_key(state: &AppState, actor: &Principal, key: &str, action: &str, args: Value) {
-    let Some(pg) = state.pg.as_deref() else {
-        return;
-    };
-    let _ = lakehouse_store::audit::insert(
-        pg,
+    audit_coverage::record_best_effort(
+        state,
         lakehouse_store::audit::NewAuditEvent {
             principal_id: Some(actor.id.uuid().to_string()),
             principal_kind: Some("user".to_owned()),

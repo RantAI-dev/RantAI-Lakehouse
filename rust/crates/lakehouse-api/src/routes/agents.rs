@@ -49,11 +49,12 @@ use lakehouse_store::agents::{
     self, AgentRun, AgentWorkflow, ApprovalItem, CreateEmployeeInput, CreateWorkflowInput,
     Decision, DigitalEmployee, LinkedApprovalRequest, RunStep,
 };
-use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
+use lakehouse_store::audit::NewAuditEvent;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
+use crate::audit_coverage;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::ai::{
@@ -692,14 +693,7 @@ pub async fn decide_approval(
         decide_outcome,
         approval.run_id.as_deref(),
     );
-    if let Err(err) = store_audit::insert(pg, decide_audit_event).await {
-        tracing::warn!(
-            %err,
-            action = %approval.action,
-            outcome = decide_outcome,
-            "failed to record approval-decision audit event"
-        );
-    }
+    audit_coverage::record_best_effort(&state, decide_audit_event).await;
 
     // Approvals the copilot creates always carry a `run_id` (see
     // `create_pending_approval`); one that doesn't (a manually-inserted or
@@ -1009,7 +1003,7 @@ async fn append_step(pg: &PgPool, run_id: &str, id: &str, label: &str, status: &
     reason = "one flat record of what happened, mirroring routes::ai::audit::record's own justification"
 )]
 async fn write_headless_audit(
-    pg: &PgPool,
+    state: &AppState,
     principal_id: Option<String>,
     principal_kind: &str,
     actor_label: &str,
@@ -1036,9 +1030,7 @@ async fn write_headless_audit(
         approval_id: approval_id.map(str::to_owned),
         session_id: None,
     };
-    if let Err(err) = store_audit::insert(pg, event).await {
-        tracing::warn!(%err, action, outcome, "headless run: failed to write audit_event");
-    }
+    audit_coverage::record_best_effort(state, event).await;
 }
 
 /// A short, deterministic system prompt for the headless loop — NOT a
@@ -1269,7 +1261,7 @@ async fn run_headless_loop_inner(
             )
             .await;
             write_headless_audit(
-                pg,
+                state,
                 principal_id.clone(),
                 principal_kind,
                 actor_label,
@@ -1343,7 +1335,7 @@ async fn run_headless_loop_inner(
                 )
                 .await;
                 write_headless_audit(
-                    pg,
+                    state,
                     principal_id.clone(),
                     principal_kind,
                     actor_label,
@@ -1376,7 +1368,7 @@ async fn run_headless_loop_inner(
             )
             .await;
             write_headless_audit(
-                pg,
+                state,
                 principal_id.clone(),
                 principal_kind,
                 actor_label,
@@ -1419,7 +1411,7 @@ async fn run_headless_loop_inner(
                 )
                 .await;
                 write_headless_audit(
-                    pg,
+                    state,
                     principal_id.clone(),
                     principal_kind,
                     actor_label,
@@ -1461,7 +1453,7 @@ async fn run_headless_loop_inner(
                 )
                 .await;
                 write_headless_audit(
-                    pg,
+                    state,
                     principal_id.clone(),
                     principal_kind,
                     actor_label,
@@ -1507,7 +1499,7 @@ async fn run_headless_loop_inner(
                 )
                 .await;
                 write_headless_audit(
-                    pg,
+                    state,
                     principal_id.clone(),
                     principal_kind,
                     actor_label,
@@ -1582,7 +1574,7 @@ async fn run_headless_loop_inner(
                             tracing::warn!(%err, run_id, "headless run: failed to mark waiting_approval");
                         }
                         write_headless_audit(
-                            pg,
+                            state,
                             principal_id.clone(),
                             principal_kind,
                             actor_label,
@@ -1604,7 +1596,7 @@ async fn run_headless_loop_inner(
                             "headless run: failed to create WriteHigh approval"
                         );
                         write_headless_audit(
-                            pg,
+                            state,
                             principal_id.clone(),
                             principal_kind,
                             actor_label,
@@ -1658,7 +1650,7 @@ async fn run_headless_loop_inner(
             )
             .await;
             write_headless_audit(
-                pg,
+                state,
                 principal_id.clone(),
                 principal_kind,
                 actor_label,

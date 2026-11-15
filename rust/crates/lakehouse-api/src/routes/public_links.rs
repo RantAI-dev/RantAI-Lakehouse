@@ -63,6 +63,7 @@ use serde_json::{Value, json};
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 
+use crate::audit_coverage;
 use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
 use crate::state::AppState;
@@ -412,16 +413,13 @@ pub async fn unlock(
         if attempt == LOCK_FAILURES {
             // The try that reached the limit set the lock. Best effort, like the
             // sign-in lock's record: the visitor's answer is the same either way.
-            if let Err(err) = record_link_event(
-                pool,
+            record_link_event(
+                &state,
                 &open.link.board_id,
                 "dashboard.public_link_locked",
                 "refused",
             )
-            .await
-            {
-                tracing::warn!(%err, "failed to record dashboard.public_link_locked");
-            }
+            .await;
             // The fifth wrong try is the one that locks the link: say so now.
             return locked();
         }
@@ -444,16 +442,13 @@ pub async fn unlock(
             // like the lock. Best effort, as the lock's record is: the
             // visitor's answer is the same either way. The row names the
             // dashboard and never the link's token, the password or the ticket.
-            if let Err(err) = record_link_event(
-                pool,
+            record_link_event(
+                &state,
                 &open.link.board_id,
                 "dashboard.public_link_unlocked",
                 "executed",
             )
-            .await
-            {
-                tracing::warn!(%err, "failed to record dashboard.public_link_unlocked");
-            }
+            .await;
             (
                 StatusCode::OK,
                 ApiJson(json!({ "ticket": ticket.expose(), "expiresAt": rfc3339(expires_at) })),
@@ -468,13 +463,11 @@ pub async fn unlock(
 }
 
 /// One audit row of a visitor's try on a link: the lock and the unlock. The
-/// resource is the dashboard's id, never the link's token (a secret).
-async fn record_link_event(
-    pool: &PgPool,
-    board_id: &str,
-    action: &str,
-    outcome: &str,
-) -> Result<(), lakehouse_store::StoreError> {
+/// resource is the dashboard's id, never the link's token (a secret). Best
+/// effort: a failed write is logged and counted
+/// ([`audit_coverage::record_best_effort`]) and never changes the visitor's
+/// answer.
+async fn record_link_event(state: &AppState, board_id: &str, action: &str, outcome: &str) {
     let event = lakehouse_store::audit::NewAuditEvent {
         action: action.to_owned(),
         outcome: outcome.to_owned(),
@@ -486,9 +479,7 @@ async fn record_link_event(
         actor_label: Some(lakehouse_store::audit::ACTOR_PUBLIC_LINK.to_owned()),
         ..Default::default()
     };
-    lakehouse_store::audit::insert(pool, event)
-        .await
-        .map(|_| ())
+    audit_coverage::record_best_effort(state, event).await;
 }
 
 // ── Managing a link (D5) ─────────────────────────────────────────────────

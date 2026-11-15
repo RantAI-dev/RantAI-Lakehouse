@@ -29,6 +29,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
+use crate::audit_coverage;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::QUERY_STRING_UNREADABLE;
@@ -2148,19 +2149,14 @@ async fn run_statement_with(
     // Record a real audit_event for this run — best-effort, the same
     // non-fatal posture as the history write just below: the query already
     // ran and the caller already has their result, so a failure here is
-    // logged and swallowed, never turned into an error response. Written
-    // via `lakehouse_store::audit::insert` directly (not
+    // logged, counted and swallowed, never turned into an error response.
+    // Written through `audit_coverage::record_best_effort`, not
     // `routes::ai::audit::record`, which hardcodes `principal_kind:
     // "copilot"` — wrong here, a query run is human- or service-triggered,
-    // never copilot-triggered). `resource_kind: "query_history"` paired
+    // never copilot-triggered. `resource_kind: "query_history"` paired
     // with this run's own `id` is the pairing WS1 T16's `LEFT JOIN`
     // resolves on read (WS5 Phase D preamble).
-    if let Some(pool) = state.pg.as_deref() {
-        let event = query_run_audit_event(p, &id, &rewritten);
-        if let Err(err) = lakehouse_store::audit::insert(pool, event).await {
-            tracing::warn!(%err, "failed to record query.run audit event (query itself succeeded)");
-        }
-    }
+    audit_coverage::record_best_effort(state, query_run_audit_event(p, &id, &rewritten)).await;
 
     // Record this execution in query history — best-effort. A history-write
     // failure (no Postgres pool configured, Postgres down, ...) must never

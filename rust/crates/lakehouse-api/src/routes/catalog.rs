@@ -51,6 +51,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::time::Instant;
 
+use crate::audit_coverage;
 use crate::bounded;
 use crate::bronze_stats_cache::{BronzeStatsCache, CachedTableStats};
 use crate::error::{ApiRejection, ApiResult};
@@ -3812,8 +3813,8 @@ pub async fn put_annotation(
     // audit write here: it never fails the edit it records. A save that
     // changed nothing records nothing.
     if !changed.is_empty() {
-        let _ = lakehouse_store::audit::insert(
-            pool,
+        audit_coverage::record_best_effort(
+            &state,
             lakehouse_store::audit::NewAuditEvent {
                 principal_id: Some(principal.id.uuid().to_string()),
                 principal_kind: Some("user".to_owned()),
@@ -4096,8 +4097,8 @@ pub async fn put_certification(
     };
     state.catalog_search_cache.invalidate().await;
     if let Some(action) = action {
-        let _ = lakehouse_store::audit::insert(
-            pool,
+        audit_coverage::record_best_effort(
+            &state,
             lakehouse_store::audit::NewAuditEvent {
                 principal_id: Some(principal.id.uuid().to_string()),
                 principal_kind: Some("user".to_owned()),
@@ -4178,8 +4179,8 @@ pub async fn access_request(
     .await?;
     // Best-effort, matching WS5 item D1's own posture: an audit-write
     // failure never fails the request that triggered it.
-    let _ = lakehouse_store::audit::insert(
-        pool,
+    audit_coverage::record_best_effort(
+        &state,
         lakehouse_store::audit::NewAuditEvent {
             principal_id: Some(principal.id.uuid().to_string()),
             principal_kind: Some("user".to_owned()),
@@ -4361,8 +4362,8 @@ pub async fn decide_access_request(
         lakehouse_store::agents::Decision::Rejected => "rejected",
     };
     // Best-effort, matching WS5 item D1's own posture.
-    let _ = lakehouse_store::audit::insert(
-        pool,
+    audit_coverage::record_best_effort(
+        &state,
         lakehouse_store::audit::NewAuditEvent {
             principal_id: Some(principal.id.uuid().to_string()),
             principal_kind: Some("user".to_owned()),

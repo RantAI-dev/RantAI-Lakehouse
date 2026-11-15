@@ -33,7 +33,7 @@ use lakehouse_core::ApiError;
 use lakehouse_core::secret::{SecretError, SecretValue};
 use lakehouse_dagster::{DgConfiguredRun, map_run_status};
 use lakehouse_store::PgPool;
-use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
+use lakehouse_store::audit::NewAuditEvent;
 use lakehouse_store::cdc::ConnectorSlug;
 use lakehouse_store::connector_probe_result::{self, ConnectorProbeResult};
 use lakehouse_store::connector_run;
@@ -46,6 +46,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::audit_coverage;
 use crate::connector_deprovision::{self, DeprovisionError, Deprovisioned, PgTarget};
 use crate::connector_probe;
 use crate::error::ApiResult;
@@ -512,9 +513,7 @@ pub async fn update(
         json!({ "fields": fields }),
         "executed",
     );
-    if let Err(err) = store_audit::insert(pool(&state)?, event).await {
-        tracing::warn!(%err, connector_id = %id, "failed to record connector.update audit event");
-    }
+    audit_coverage::record_best_effort(&state, event).await;
     Ok(ApiJson(updated))
 }
 
@@ -939,9 +938,7 @@ pub async fn create(
         }),
         "executed",
     );
-    if let Err(err) = store_audit::insert(pool(&state)?, event).await {
-        tracing::warn!(%err, connector_id = %created.id, "failed to record connector.create audit event");
-    }
+    audit_coverage::record_best_effort(&state, event).await;
     Ok((
         StatusCode::CREATED,
         ApiJson(CreateConnectorResponse {
@@ -1288,9 +1285,7 @@ pub(super) async fn record_test_outcome(
                 json!({ "supported": result.supported, "ok": result.ok }),
                 "executed",
             );
-            if let Err(err) = store_audit::insert(pool(state)?, event).await {
-                tracing::warn!(%err, connector_id = %id, "failed to record connector.test audit event");
-            }
+            audit_coverage::record_best_effort(state, event).await;
             Ok(result)
         }
         Err(lakehouse_store::StoreError::NotFound) => {
@@ -1327,9 +1322,7 @@ async fn start_orchestrator_test(
         json!({ "supported": true, "pending": true }),
         "executed",
     );
-    if let Err(err) = store_audit::insert(pool(state)?, event).await {
-        tracing::warn!(%err, connector_id = %id, "failed to record connector.test audit event");
-    }
+    audit_coverage::record_best_effort(state, event).await;
     Ok(connectors::ConnectorTestResult::pending(
         ORCHESTRATOR_TEST_RUNNING,
     ))
@@ -1629,9 +1622,7 @@ pub async fn rotate_secret(
         json!({ "slot": body.slot.as_str(), "probeOk": true }),
         "executed",
     );
-    if let Err(err) = store_audit::insert(pool(&state)?, event).await {
-        tracing::warn!(%err, connector_id = %id, "failed to record connector.secret_rotate audit event");
-    }
+    audit_coverage::record_best_effort(&state, event).await;
 
     Ok(ApiJson(RotateSecretResponse {
         rotated: true,
@@ -2503,9 +2494,7 @@ pub async fn set_credential(
         ),
         "executed",
     );
-    if let Err(err) = store_audit::insert(pool(&state)?, event).await {
-        tracing::warn!(%err, connector_id = %id, "failed to record connector.credential_set audit event");
-    }
+    audit_coverage::record_best_effort(&state, event).await;
 
     Ok(ApiJson(SetCredentialResponse {
         saved: true,
@@ -3055,9 +3044,7 @@ pub async fn delete(
         delete_details,
         "executed",
     );
-    if let Err(err) = store_audit::insert(pool(&state)?, event).await {
-        tracing::warn!(%err, connector_id = %id, "failed to record connector.delete audit event");
-    }
+    audit_coverage::record_best_effort(&state, event).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3540,7 +3527,7 @@ async fn record_spec_save(
     id: &str,
     repoint: bool,
 ) {
-    let (Some(Extension(principal)), Some(pool)) = (principal, state.pg.as_deref()) else {
+    let Some(Extension(principal)) = principal else {
         return;
     };
     let event = connector_audit_event(
@@ -3554,9 +3541,7 @@ async fn record_spec_save(
         json!({ "fields": INGEST_SPEC_FIELDS }),
         "executed",
     );
-    if let Err(err) = store_audit::insert(pool, event).await {
-        tracing::warn!(%err, connector_id = %id, "failed to record the connector ingest spec audit event");
-    }
+    audit_coverage::record_best_effort(state, event).await;
 }
 
 /// The save behind [`ingest_spec_put`]; see its doc for the order of the answers.
@@ -3818,9 +3803,7 @@ async fn save_with_credentials(
         ),
         "executed",
     );
-    if let Err(err) = store_audit::insert(pool(state)?, event).await {
-        tracing::warn!(%err, connector_id = %id, "failed to record the connector credential audit event");
-    }
+    audit_coverage::record_best_effort(state, event).await;
     Ok(ApiJson(IngestSpecResponse::new(
         spec,
         time::OffsetDateTime::now_utc(),
@@ -4200,9 +4183,7 @@ async fn launch_ingest(
                     ),
                 };
                 let event = connector_audit_event(principal, &action, &id, args, "executed");
-                if let Err(err) = store_audit::insert(pool(&state)?, event).await {
-                    tracing::warn!(%err, connector_id = %id, "failed to record the connector ingest run audit event");
-                }
+                audit_coverage::record_best_effort(&state, event).await;
             }
             Ok(ApiJson(json!({ "runId": outcome.run_id })))
         }

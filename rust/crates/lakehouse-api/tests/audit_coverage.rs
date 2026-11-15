@@ -221,6 +221,84 @@ fn central_actions_are_module_verb_unique_and_read_their_id_from_the_path_or_the
     }
 }
 
+/// `(file under src/routes, direct writes allowed, why)`. A route writes its
+/// audit row through `audit_coverage::record_best_effort`, which counts a
+/// failed write (feature page Decision 4). A file listed here keeps its
+/// direct `audit::insert(` calls for the reason given. `routes/ai/` is the
+/// assistant's own writer and is not scanned. An entry whose count no longer
+/// matches fails too, so the list cannot go stale and quietly cover a new
+/// direct write.
+const DIRECT_AUDIT_INSERTS: &[(&str, usize, &str)] = &[
+    (
+        "catalog_drop.rs",
+        1,
+        "audit_first fails closed: a drop or restore with no `allowed` row is refused",
+    ),
+    (
+        "dashboard.rs",
+        1,
+        "record_download_audit fails closed: a download that cannot be recorded is not handed over",
+    ),
+];
+
+/// No route outside `routes/ai/` calls `audit::insert(` except the entries of
+/// [`DIRECT_AUDIT_INSERTS`]: a direct call is how a failed audit write used
+/// to be logged or ignored and counted by nothing.
+#[test]
+fn a_route_writes_its_audit_row_through_the_counted_writer() {
+    let mut files = Vec::new();
+    rust_files(&routes_dir(), &mut files);
+    let mut found: BTreeMap<String, usize> = BTreeMap::new();
+    for path in files {
+        let relative = path
+            .strip_prefix(routes_dir())
+            .expect("a file under src/routes")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if relative.starts_with("ai/") {
+            continue;
+        }
+        let source = fs::read_to_string(&path).expect("read a route source");
+        // Tests sit at the end of a file, below the first `#[cfg(test)]`.
+        let production = source.split("#[cfg(test)]").next().unwrap_or("");
+        let count = production
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .filter(|line| line.contains("audit::insert("))
+            .count();
+        if count > 0 {
+            found.insert(relative, count);
+        }
+    }
+    let allowed: BTreeMap<&str, usize> = DIRECT_AUDIT_INSERTS
+        .iter()
+        .map(|(file, count, reason)| {
+            assert!(!reason.is_empty(), "{file}: an entry needs its reason");
+            (*file, *count)
+        })
+        .collect();
+    let mut offenders = Vec::new();
+    for (file, count) in &found {
+        match allowed.get(file.as_str()) {
+            Some(expected) if expected == count => {}
+            Some(expected) => offenders.push(format!(
+                "{file}: {count} direct audit::insert( call(s), the allowlist says {expected}"
+            )),
+            None => offenders.push(format!(
+                "{file}: {count} direct audit::insert( call(s); use audit_coverage::record_best_effort"
+            )),
+        }
+    }
+    for (file, expected) in &allowed {
+        if !found.contains_key(*file) {
+            offenders.push(format!(
+                "{file}: allowlisted for {expected} call(s) but has none; remove the entry"
+            ));
+        }
+    }
+    assert!(offenders.is_empty(), "{}", offenders.join("\n"));
+}
+
 // ── The central writer, through the router ─────────────────────────────────
 
 /// One request against the router; the answer is the status and the JSON

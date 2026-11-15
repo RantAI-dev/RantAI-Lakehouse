@@ -41,7 +41,7 @@ use lakehouse_auth::{
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::StoreError;
-use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
+use lakehouse_store::audit::NewAuditEvent;
 use lakehouse_store::identity;
 use lakehouse_store::sessions::SessionRow;
 use serde::{Deserialize, Serialize};
@@ -49,6 +49,7 @@ use sha2::Digest as _;
 use time::Duration;
 use uuid::Uuid;
 
+use crate::audit_coverage;
 use crate::auth::{AuthenticatedPrincipal, SESSION_COOKIE_NAME, session_cookie_from_headers};
 use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
@@ -94,18 +95,6 @@ fn cleared_session_cookie_header(is_dev: bool) -> HeaderValue {
     session_cookie_header(is_dev, "", Duration::ZERO)
 }
 
-/// Write one audit row for an auth route, best effort: a failed write is
-/// logged and swallowed, so the response on the wire is always the route's
-/// own and never the audit's. Every audit write in this file goes through
-/// here, so the day a failed write must be counted or surfaced, that is one
-/// change.
-async fn record_audit(pool: &PgPool, event: NewAuditEvent) {
-    let action = event.action.clone();
-    if let Err(err) = store_audit::insert(pool, event).await {
-        tracing::warn!(%err, action, "failed to record an audit event");
-    }
-}
-
 /// An event caused by a person who is signed in: the principal and its name.
 fn principal_audit_event(principal: &Principal, action: &str, outcome: &str) -> NewAuditEvent {
     NewAuditEvent {
@@ -132,7 +121,7 @@ fn sign_in_executed_event(user_id: Uuid, principal_kind: &str) -> NewAuditEvent 
         outcome: "executed".to_owned(),
         principal_id: Some(user_id.to_string()),
         principal_kind: Some(principal_kind.to_owned()),
-        actor_label: Some(store_audit::ACTOR_SIGN_IN_FORM.to_owned()),
+        actor_label: Some(lakehouse_store::audit::ACTOR_SIGN_IN_FORM.to_owned()),
         resource_kind: Some("user".to_owned()),
         resource_id: Some(user_id.to_string()),
         ..Default::default()
@@ -150,7 +139,7 @@ fn sign_in_refused_event(key: &str) -> NewAuditEvent {
         outcome: "refused".to_owned(),
         resource_kind: Some("login_key".to_owned()),
         resource_id: Some(key[..12].to_owned()),
-        actor_label: Some(store_audit::ACTOR_SIGN_IN_FORM.to_owned()),
+        actor_label: Some(lakehouse_store::audit::ACTOR_SIGN_IN_FORM.to_owned()),
         detail: Some(SIGN_IN_REFUSED_DETAIL.to_owned()),
         ..Default::default()
     }
@@ -347,7 +336,11 @@ pub async fn login(
             // when the form was submitted, so the actor is the form, and the
             // principal is set only because the password verified. Nothing the
             // visitor typed goes in: not the email, not the password.
-            record_audit(pool, sign_in_executed_event(user_id, principal_kind)).await;
+            audit_coverage::record_best_effort(
+                &state,
+                sign_in_executed_event(user_id, principal_kind),
+            )
+            .await;
             let mut response = (StatusCode::OK, ApiJson(body)).into_response();
             response.headers_mut().append(
                 header::SET_COOKIE,
@@ -381,7 +374,7 @@ pub async fn login(
                     actor_label: Some(lakehouse_store::audit::ACTOR_SIGN_IN_FORM.to_owned()),
                     ..Default::default()
                 };
-                record_audit(pool, event).await;
+                audit_coverage::record_best_effort(&state, event).await;
             }
             // `GOV-1`: every refused sign-in is on the audit trail, with no
             // principal (nobody proved who they were). The resource is the
@@ -389,7 +382,7 @@ pub async fn login(
             // tries against one account can be told from tries against
             // another without the row holding the email. An unknown email
             // writes the identical row: the trail is not an account oracle.
-            record_audit(pool, sign_in_refused_event(&key)).await;
+            audit_coverage::record_best_effort(&state, sign_in_refused_event(&key)).await;
             tracing::warn!("login failed");
             Err(ApiError::Unauthorized("Invalid username/email or password.".to_owned()).into())
         }
@@ -429,8 +422,8 @@ pub async fn logout(
         // call has nothing to end. The row names the person, never the
         // cookie. (`auth.session.revoke` is the row of ending another
         // session by id, `DELETE /api/auth/sessions/{id}`.)
-        record_audit(
-            pool,
+        audit_coverage::record_best_effort(
+            &state,
             principal_audit_event(&principal, "auth.logout", "executed"),
         )
         .await;
@@ -679,7 +672,8 @@ pub async fn revoke_session(
     // write is logged and swallowed, never propagated, so the response
     // code on the wire is always the underlying revoke's, not the
     // audit's.
-    record_audit(pool, session_revoke_audit_event(&principal, session_id)).await;
+    audit_coverage::record_best_effort(&state, session_revoke_audit_event(&principal, session_id))
+        .await;
 
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -745,8 +739,8 @@ pub async fn change_password(
             // `GOV-1`: a wrong current password is a refused change. A storage
             // error is not, and leaves no row for a change nobody refused.
             if matches!(err, AuthError::InvalidCredentials) {
-                record_audit(
-                    pool,
+                audit_coverage::record_best_effort(
+                    &state,
                     password_change_event(&principal, user_id, Some(PASSWORD_CHANGE_WRONG_CURRENT)),
                 )
                 .await;
@@ -758,8 +752,8 @@ pub async fn change_password(
     let user = identity::get_user(pool, &user_id.to_string()).await?;
     let rules = password::check_rules(&new_password, Some(&user.username), user.email.as_deref());
     if rules.is_err() {
-        record_audit(
-            pool,
+        audit_coverage::record_best_effort(
+            &state,
             password_change_event(&principal, user_id, Some(PASSWORD_CHANGE_BREAKS_RULES)),
         )
         .await;
@@ -768,7 +762,8 @@ pub async fn change_password(
 
     password::change_password(pool, user_id, &Secret::new(new_password)).await?;
     session::revoke_all_sessions_for_user(pool, user_id).await?;
-    record_audit(pool, password_change_event(&principal, user_id, None)).await;
+    audit_coverage::record_best_effort(&state, password_change_event(&principal, user_id, None))
+        .await;
 
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -1335,7 +1330,8 @@ pub async fn oidc_callback(
     // carries `principal_id`. Best-effort: a failed audit write is
     // logged and swallowed, never propagated, so the response on the
     // wire is always the underlying login's, not the audit's.
-    record_audit(pool, oidc_login_audit_event(&login.principal, user_id)).await;
+    audit_coverage::record_best_effort(&state, oidc_login_audit_event(&login.principal, user_id))
+        .await;
 
     let mut response = (StatusCode::FOUND, ()).into_response();
     // `flow.next` was already validated by `is_safe_relative_path` inside
@@ -1496,6 +1492,7 @@ fn oidc_login_audit_event(principal: &Principal, user_id: Uuid) -> NewAuditEvent
 /// the audit. The sentence in `result.error` is fixed by the caller; nothing
 /// the provider said is in it.
 async fn store_sso_test_result(
+    state: &AppState,
     pool: &PgPool,
     test_run_id: Uuid,
     created_by: Uuid,
@@ -1507,7 +1504,7 @@ async fn store_sso_test_result(
     } else {
         "failed"
     };
-    audit_sso_test(pool, created_by, outcome, &result).await;
+    audit_sso_test(state, created_by, outcome, &result).await;
 }
 
 /// The second half of a test sign-in (`ADM-12` D8): exchange the code and
@@ -1578,6 +1575,7 @@ async fn handle_oidc_test_callback(
     let (Some(code), Some(returned_state)) = (query.code, query.state) else {
         tracing::warn!("oidc test callback: missing code or state");
         store_sso_test_result(
+            &state,
             pool,
             test_run_id,
             created_by,
@@ -1595,6 +1593,7 @@ async fn handle_oidc_test_callback(
     if !state_matches {
         tracing::warn!("oidc test callback: state mismatch");
         store_sso_test_result(
+            &state,
             pool,
             test_run_id,
             created_by,
@@ -1621,6 +1620,7 @@ async fn handle_oidc_test_callback(
             .not_ready_reason()
             .unwrap_or("The draft connection cannot be used to test a sign-in.");
         store_sso_test_result(
+            &state,
             pool,
             test_run_id,
             created_by,
@@ -1635,6 +1635,7 @@ async fn handle_oidc_test_callback(
         runtime.settings.client_id.as_deref(),
     ) else {
         store_sso_test_result(
+            &state,
             pool,
             test_run_id,
             created_by,
@@ -1664,6 +1665,7 @@ async fn handle_oidc_test_callback(
             let Some(opened) = opened else {
                 tracing::warn!("oidc test callback: the run's sealed secret could not be opened");
                 store_sso_test_result(
+                    &state,
                     pool,
                     test_run_id,
                     created_by,
@@ -1693,6 +1695,7 @@ async fn handle_oidc_test_callback(
         Ok(id_token) => id_token,
         Err(failure) => {
             store_sso_test_result(
+                &state,
                 pool,
                 test_run_id,
                 created_by,
@@ -1711,6 +1714,7 @@ async fn handle_oidc_test_callback(
             // S2: `emailVerified` and `overage` are part of what an
             // administrator sees (`SEC-65` will need the former).
             store_sso_test_result(
+                &state,
                 pool,
                 test_run_id,
                 created_by,
@@ -1729,6 +1733,7 @@ async fn handle_oidc_test_callback(
         Err(err) => {
             tracing::warn!(error = %err, "oidc test callback: id token validation failed");
             store_sso_test_result(
+                &state,
                 pool,
                 test_run_id,
                 created_by,
@@ -1745,7 +1750,7 @@ async fn handle_oidc_test_callback(
 }
 
 pub(crate) async fn audit_sso_test(
-    pool: &PgPool,
+    state: &AppState,
     created_by: Uuid,
     outcome: &str,
     result: &serde_json::Value,
@@ -1764,7 +1769,7 @@ pub(crate) async fn audit_sso_test(
         approval_id: None,
         session_id: None,
     };
-    record_audit(pool, event).await;
+    audit_coverage::record_best_effort(state, event).await;
 }
 
 /// Build the `NewAuditEvent` for a successful session revoke — same
