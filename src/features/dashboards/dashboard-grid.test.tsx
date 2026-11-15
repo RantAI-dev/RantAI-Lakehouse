@@ -106,3 +106,43 @@ describe("dashboard grid with tabs and sections", () => {
     expect(saved.find((p) => p.id === "a")?.h).toBe(5)
   })
 })
+
+// Owner QA 2026-11-15: reading, a canvas that would draw tiles under 240 px lays that row out two a
+// row; edit mode keeps the saved grid.
+describe("dashboard grid reflow on a narrow canvas", () => {
+  const kpiItems = ["k1", "k2", "k3", "k4"].map((id) => item(id, id.toUpperCase()))
+  const kpiLayout: LayoutMap = Object.fromEntries(
+    ["k1", "k2", "k3", "k4"].map((id, i) => [id, { x: i * 3, y: 0, w: 3, h: 3 }]),
+  )
+  const boxOf = (title: string) => {
+    let el: HTMLElement | null = screen.getByText(`body of ${title}`)
+    while (el && !el.classList.contains("dash-tile")) el = el.parentElement
+    return el!.style
+  }
+
+  it("draws a row of four three-column tiles two a row at 900 px, without saving anything", () => {
+    atWidth(900)
+    let saved = false
+    render(<DashboardGrid items={kpiItems} layout={kpiLayout} editable={false} onLayoutChange={() => { saved = true }} />)
+    // 900 px: a column is 64 px, so half the canvas is 6 columns (444 px) and a row is 56 px.
+    expect(boxOf("K1").left).toBe("0px")
+    expect(boxOf("K2").left).toBe("456px")
+    expect(boxOf("K3").top).toBe("168px")
+    expect(boxOf("K3").width).toBe("444px")
+    expect(saved).toBe(false)
+  })
+
+  it("keeps the saved grid in edit mode", () => {
+    atWidth(900)
+    render(<DashboardGrid items={kpiItems} layout={kpiLayout} editable onLayoutChange={() => {}} />)
+    expect(boxOf("K2").left).toBe("228px")
+    expect(boxOf("K3").top).toBe("0px")
+    expect(boxOf("K3").width).toBe("216px")
+  })
+
+  it("keeps the saved grid when every tile is wide enough", () => {
+    atWidth(1350)
+    render(<DashboardGrid items={kpiItems} layout={kpiLayout} editable={false} onLayoutChange={() => {}} />)
+    expect(boxOf("K4").top).toBe("0px")
+  })
+})
