@@ -10,7 +10,7 @@ import type { StyleFields } from "@/lib/chart-style";
 import { domainsOf } from "@/lib/conditional-format";
 import type { ColumnSetting, TableDefFields } from "@/lib/table-types";
 import { cn } from "@/lib/utils";
-import type { FilterDef } from "@/services/clients/bi-store";
+import type { FilterDef } from "@/services";
 import { SkippedFiltersMarker } from "./filters/skipped-marker";
 import { cellClass, CellValue, columnStyle, conditionalCss } from "./table-cell";
 import type { Rows } from "./tile-dialogs";
