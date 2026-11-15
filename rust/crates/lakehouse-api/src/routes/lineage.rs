@@ -583,6 +583,49 @@ async fn assemble(
     Ok(Assembled { g, tenant, shared })
 }
 
+/// `SEC-20`, plan 95: which of `tables` are Bronze tables an upload of
+/// another tenant holds, for a caller whose reach is `reach`. One claim read
+/// for all of them ([`crate::routes::query::claims_on`]).
+///
+/// Only the claim [`lakehouse_store::uploads::TableClaim::Theirs`] is acted
+/// on, not the whole of `table_is_reachable`: a Bronze table no upload claimed
+/// (one a connector ingests into) is unclaimed and the caller's own, and the
+/// lineage page draws it. "Another tenant holds it" is the arm that rule
+/// never reaches for anybody (`table_is_reachable`'s own doc comment).
+///
+/// A caller with no tenant owns no upload, so any claim is another's: it is
+/// asked as the nil tenant, which holds none. The shared-catalog rule admits
+/// such a caller only when a tenant appeared since it last counted, and the
+/// answer then fails closed.
+///
+/// # Errors
+///
+/// 503 when the claims cannot be read.
+async fn held_by_others(
+    state: &AppState,
+    reach: crate::routes::query::TenantReach,
+    tables: &[String],
+) -> Result<BTreeSet<String>, ApiError> {
+    use crate::routes::query::TenantReach;
+
+    let asking = match reach {
+        TenantReach::All => return Ok(BTreeSet::new()),
+        TenantReach::Tenant { tenant_id, .. } => tenant_id,
+        TenantReach::NoTenant => uuid::Uuid::nil(),
+    };
+    let bronze: Vec<String> = tables
+        .iter()
+        .filter(|table| table.starts_with("bronze."))
+        .cloned()
+        .collect();
+    let claims = crate::routes::query::claims_on(state, asking, &bronze).await?;
+    Ok(claims
+        .into_iter()
+        .filter(|(_, claim)| *claim == lakehouse_store::uploads::TableClaim::Theirs)
+        .map(|(table, _)| table)
+        .collect())
+}
+
 /// The recorded lineage around `focus` for `principal` (see the module
 /// doc). An empty or unknown focus returns an empty graph with a note, so
 /// the response never depends on which data a deployment holds.
@@ -591,8 +634,8 @@ async fn assemble(
 ///
 /// [`ApiError::NotFound`] when `X-Tenant` names a tenant the caller does
 /// not belong to, and [`ApiError::Unavailable`] when the shared-catalog
-/// rule cannot be evaluated: both from the same helpers the catalog and
-/// connector routes use.
+/// rule cannot be evaluated or an upload table's claim cannot be read: all
+/// from the same helpers the catalog and connector routes use.
 pub(crate) async fn build(
     state: &AppState,
     principal: &Principal,
@@ -642,6 +685,15 @@ pub(crate) async fn build(
             keep.remove(&id);
         }
     }
+    // SEC-20, plan 95: a Bronze node for an upload table another tenant holds
+    // is not drawn either, and neither are the edges that touch it, even for
+    // the tenant that owns the shared catalog. A tenant's own records name
+    // only its own claims, but an authored pipeline can name any table as an
+    // input.
+    let reach = crate::routes::query::resolve_reach(state, principal, headers).await?;
+    let in_graph: Vec<String> = keep.iter().filter_map(|id| node_table_key(id)).collect();
+    let held = held_by_others(state, reach, &in_graph).await?;
+    keep.retain(|id| node_table_key(id).is_none_or(|key| !held.contains(&key)));
     let nodes: Vec<Value> = g
         .nodes
         .iter()
@@ -664,8 +716,27 @@ pub(crate) async fn build(
     // DATA-13 (F1): the recorded column mappings that touch the focus, in the
     // row shape `GET /api/governance/lineage/columns` answers, under the same
     // tenant rules as the graph above.
-    body["columnMappings"] =
-        columns::mappings_touching(state, principal, tenant, shared, &start).await;
+    //
+    // SEC-20, plan 95: a mapping that names a table another tenant holds is
+    // left out, as the node is, whichever end it is on: a focus on such a
+    // table has only mappings that name it, so it gets none. The tables are
+    // only known once the mappings are read, so the claims are read again for
+    // them (one read).
+    let mut mappings = columns::mappings_touching(state, principal, tenant, shared, &start).await;
+    if let Some(rows) = mappings.as_array_mut() {
+        let named: Vec<String> = rows
+            .iter()
+            .flat_map(|row| [&row["from"]["table"], &row["to"]["table"]])
+            .filter_map(|table| table.as_str().map(str::to_owned))
+            .collect();
+        let held = held_by_others(state, reach, &named).await?;
+        rows.retain(|row| {
+            [&row["from"]["table"], &row["to"]["table"]]
+                .iter()
+                .all(|table| table.as_str().is_none_or(|table| !held.contains(table)))
+        });
+    }
+    body["columnMappings"] = mappings;
     body["nodes"] = json!(nodes);
     body["edges"] = json!(edges);
     body["coverage"] = json!(g.coverage);
@@ -910,6 +981,61 @@ mod tests {
         env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
         let config = Config::from_map(&env)?;
         Ok(AppState::new(config))
+    }
+
+    /// SEC-20, plan 95: which Bronze tables a caller must not be shown, for
+    /// each reach. A tenant is told of the uploads another tenant holds, never
+    /// of its own or of an unclaimed table; a caller with no tenant is told of
+    /// every claimed one (fail closed); an unrestricted reach is told of none.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn held_by_others_names_the_bronze_tables_another_tenant_holds(
+        pool: lakehouse_store::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::routes::query::TenantReach;
+
+        let state = state_for(&pool)?;
+        let (mine, theirs) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+        for (id, name) in [(mine, "mine"), (theirs, "theirs")] {
+            sqlx::query(
+                "INSERT INTO tenant (id, name, slug, plan, residency) \
+                 VALUES ($1, $2, $2, 'Standard', 'US')",
+            )
+            .bind(id)
+            .bind(name)
+            .execute(&pool)
+            .await?;
+        }
+        assert!(lakehouse_store::uploads::claim_table(&pool, mine, "mine_raw", "u1").await?);
+        assert!(lakehouse_store::uploads::claim_table(&pool, theirs, "theirs_raw", "u2").await?);
+        let tables: Vec<String> = [
+            "bronze.mine_raw",
+            "bronze.theirs_raw",
+            "bronze.free_raw",
+            "silver.theirs_raw",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let set = |names: &[&str]| -> BTreeSet<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
+        };
+
+        let as_tenant = TenantReach::Tenant {
+            tenant_id: mine,
+            owns_catalog: true,
+        };
+        assert_eq!(
+            held_by_others(&state, as_tenant, &tables).await?,
+            set(&["bronze.theirs_raw"])
+        );
+        assert_eq!(
+            held_by_others(&state, TenantReach::NoTenant, &tables).await?,
+            set(&["bronze.mine_raw", "bronze.theirs_raw"])
+        );
+        assert_eq!(
+            held_by_others(&state, TenantReach::All, &tables).await?,
+            set(&[])
+        );
+        Ok(())
     }
 
     fn restricted_principal() -> Principal {

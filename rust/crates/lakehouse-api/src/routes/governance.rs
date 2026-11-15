@@ -926,7 +926,9 @@ pub struct LineageQuery {
 /// # Errors
 ///
 /// 404 when `X-Tenant` names a tenant the caller does not belong to; 503
-/// when the shared-catalog rule cannot be evaluated.
+/// when the shared-catalog rule cannot be evaluated, when the deployment's
+/// tenant count cannot be read, or when an upload table's claim cannot be
+/// read.
 pub async fn lineage(
     State(state): State<AppState>,
     axum::Extension(principal): axum::Extension<lakehouse_auth::Principal>,
