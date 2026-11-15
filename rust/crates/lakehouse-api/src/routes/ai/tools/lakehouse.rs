@@ -9,7 +9,7 @@
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::Uri;
+use axum::http::{HeaderMap, Uri};
 use lakehouse_auth::Principal;
 use serde_json::{Map, Value, json};
 
@@ -40,6 +40,9 @@ async fn tables_in(state: &AppState, principal: &Principal, namespace: &str) -> 
         crate::routes::lakehouse::tables(
             State(state.clone()),
             axum::Extension(principal.clone()),
+            // No `X-Tenant` header reaches a tool call, so the route resolves
+            // the caller's first tenant, as `run_sql` does.
+            HeaderMap::new(),
             query,
         )
         .await,
@@ -125,6 +128,7 @@ pub(super) async fn describe_iceberg_table(
         crate::routes::lakehouse::table_detail(
             State(state.clone()),
             axum::Extension(principal.clone()),
+            HeaderMap::new(),
             Path((namespace, table)),
         )
         .await,
@@ -143,18 +147,41 @@ pub(super) async fn describe_iceberg_table(
     detail
 }
 
-pub(super) async fn get_table_maintenance(state: &AppState, args: &Map<String, Value>) -> Value {
+pub(super) async fn get_table_maintenance(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
+    // `SEC-20`: the route decides by the caller's tenant, so a call with
+    // nobody attached has nothing to decide by and is refused.
+    let Some(principal) = principal else {
+        return json!({ "error": "reading a table's maintenance needs a signed-in user" });
+    };
     let (namespace, table) = match (ident_arg(args, "namespace"), ident_arg(args, "table")) {
         (Ok(ns), Ok(t)) => (ns, t),
         (Err(err), _) | (_, Err(err)) => return err,
     };
     api_result_to_value(
-        crate::routes::lakehouse::maintenance(State(state.clone()), Path((namespace, table))).await,
+        crate::routes::lakehouse::maintenance(
+            State(state.clone()),
+            axum::Extension(principal.clone()),
+            HeaderMap::new(),
+            Path((namespace, table)),
+        )
+        .await,
     )
     .await
 }
 
-pub(super) async fn set_table_maintenance(state: &AppState, args: &Map<String, Value>) -> Value {
+pub(super) async fn set_table_maintenance(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
+    // `SEC-20`: see `get_table_maintenance`.
+    let Some(principal) = principal else {
+        return json!({ "error": "setting a table's maintenance needs a signed-in user" });
+    };
     let (namespace, table) = match (ident_arg(args, "namespace"), ident_arg(args, "table")) {
         (Ok(ns), Ok(t)) => (ns, t),
         (Err(err), _) | (_, Err(err)) => return err,
@@ -174,6 +201,8 @@ pub(super) async fn set_table_maintenance(state: &AppState, args: &Map<String, V
     api_result_to_value(
         crate::routes::lakehouse::set_maintenance_policy(
             State(state.clone()),
+            axum::Extension(principal.clone()),
+            HeaderMap::new(),
             Path((namespace, table)),
             Bytes::from(Value::Object(body).to_string()),
         )
