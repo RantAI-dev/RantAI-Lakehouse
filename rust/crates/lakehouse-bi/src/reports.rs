@@ -11,12 +11,26 @@
 //! # Text is text (R1)
 //!
 //! A text block holds plain structured text: a heading, a paragraph, the items
-//! of a list, a link's words and address. Nothing here parses markup, and no
-//! block carries HTML: the console renders every string as text, so `<script>`
-//! typed into a paragraph is shown as those eight characters. A link's address
-//! must be `https://`, `http://`, `mailto:` or a path on this console
-//! (`/...`); anything else (`javascript:`, `data:`) is refused, so a link
-//! cannot run code when someone clicks it.
+//! of a list, a quote, a link's words and address. No block carries HTML: the
+//! console renders every string as text, so `<script>` typed into a paragraph
+//! is shown as those eight characters. A link's address must be `https://`,
+//! `http://`, `mailto:` or a path on this console (`/...`); anything else
+//! (`javascript:`, `data:`) is refused, so a link cannot run code when someone
+//! clicks it.
+//!
+//! # Inline marks (`BI-62`, decision D3)
+//!
+//! The text of a heading, a paragraph, a list item and a quote may carry a
+//! small Markdown subset: `**bold**`, `*italic*` and `[words](address)`, with
+//! `\` escaping `\ * [ ] ( )`. The text stays one string, so plain text reads
+//! the same and every reader (the console, the PDF view, the assistant's
+//! tools) keeps one field per block. The console parses it
+//! (`src/lib/report-inline.ts`) into React nodes, never HTML. The only part
+//! this module reads is the link address: [`check_blocks`] finds every
+//! address the console could open, a superset of the links it draws, and
+//! refuses a report holding one that a link block would refuse
+//! ([`ReportRule::BadInlineLink`]). Bold and italic cannot run anything, so
+//! they are not checked.
 //!
 //! # A chart is a reference (R1)
 //!
@@ -64,7 +78,8 @@ const MAX_CHART_ID_CHARS: usize = 64;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum Block {
-    /// A section heading. `level` is 1, 2 or 3.
+    /// A section heading. `level` is 1, 2 or 3; the editor writes 1 and 2
+    /// (`BI-62`), and 3 still reads.
     Heading {
         /// The heading's words.
         text: String,
@@ -85,7 +100,16 @@ pub enum Block {
         #[serde(default)]
         ordered: bool,
     },
-    /// A link: the words shown and the address opened.
+    /// A quoted passage (`BI-62`).
+    Quote {
+        /// The quote's words.
+        text: String,
+    },
+    /// A line between two parts of the page (`BI-62`). No fields.
+    Divider {},
+    /// A link: the words shown and the address opened. Kept so a report made
+    /// before `BI-62` reads as it did; the editor saves a link inside a
+    /// paragraph's text instead.
     Link {
         /// The words shown; the address when empty.
         #[serde(default)]
@@ -100,7 +124,35 @@ pub enum Block {
         /// The dashboard the chart is on. Set by the server on save.
         #[serde(default)]
         board: String,
+        /// How wide the chart is drawn (`BI-62`); the text column when absent.
+        /// Not written when it is the text column, so a report saved before
+        /// `BI-62` and saved again keeps its stored shape.
+        #[serde(default, skip_serializing_if = "ChartWidth::is_text")]
+        width: ChartWidth,
     },
+}
+
+/// How wide a chart block is drawn (`BI-62`, decision D3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChartWidth {
+    /// As wide as the text column.
+    #[default]
+    Text,
+    /// Wider than the text column.
+    Wide,
+}
+
+impl ChartWidth {
+    /// Whether this is the default width, which is not written.
+    #[must_use]
+    #[allow(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde's skip_serializing_if passes the field by reference"
+    )]
+    pub const fn is_text(&self) -> bool {
+        matches!(self, Self::Text)
+    }
 }
 
 const fn default_level() -> u8 {
@@ -127,7 +179,7 @@ pub enum ReportRule {
     TitleRequired,
     /// The title is over [`MAX_TITLE_CHARS`].
     TitleTooLong,
-    /// `blocks` is not a list of the five block kinds.
+    /// `blocks` is not a list of the seven block kinds.
     NotBlocks,
     /// More than [`MAX_BLOCKS`] blocks.
     TooManyBlocks,
@@ -141,6 +193,9 @@ pub enum ReportRule {
     TooManyItems,
     /// A link whose address is not one a reader may safely open.
     BadLink,
+    /// A link inside a text (`[words](address)`, `BI-62`) whose address is not
+    /// one a reader may safely open.
+    BadInlineLink,
     /// A chart block with no chart id, or one too long to be an id.
     ChartRequired,
 }
@@ -153,7 +208,7 @@ impl ReportRule {
             Self::TitleRequired => "A report needs a title.",
             Self::TitleTooLong => "A report title is at most 200 characters.",
             Self::NotBlocks => {
-                "blocks must be a list of heading, paragraph, list, link and chart blocks."
+                "blocks must be a list of heading, paragraph, list, quote, divider, link and chart blocks."
             }
             Self::TooManyBlocks => "A report holds at most 300 blocks.",
             Self::TooManyCharts => "A report holds at most 30 charts.",
@@ -162,6 +217,9 @@ impl ReportRule {
             Self::TooManyItems => "A list holds at most 100 items.",
             Self::BadLink => {
                 "A link must start with https://, http://, mailto: or / (a page of this console)."
+            }
+            Self::BadInlineLink => {
+                "A link in the text must start with https://, http://, mailto: or / (a page of this console)."
             }
             Self::ChartRequired => "A chart block needs the id of a chart.",
         }
@@ -172,7 +230,7 @@ impl ReportRule {
 ///
 /// # Errors
 ///
-/// [`ReportRule::NotBlocks`] when it is not a list of the five block kinds
+/// [`ReportRule::NotBlocks`] when it is not a list of the seven block kinds
 /// (an unknown kind or field included), [`ReportRule::TooManyBlocks`] before
 /// it is parsed when the list is too long.
 pub fn parse_blocks(raw: Value) -> Result<Vec<Block>, ReportRule> {
@@ -212,8 +270,117 @@ fn long(text: &str) -> bool {
     text.chars().count() > MAX_TEXT_CHARS
 }
 
+/// The characters a `\` escapes in the inline subset (decision D3).
+const ESCAPABLE: [char; 6] = ['\\', '*', '[', ']', '(', ')'];
+
+/// Whether every link the console could open in `text` is one a reader may
+/// open, by the rule of a link block: [`safe_url`] on the address trimmed (as
+/// the console's `safeReportUrl` checks it), at most [`MAX_URL_CHARS`] long.
+///
+/// The console (`src/lib/report-inline.ts`, `parseInline`) makes a link at an
+/// unescaped `[` from the first unescaped `]` after it, an `(` right after that,
+/// and the first unescaped `)` after the `(`. This applies the same rule at
+/// *every* unescaped `[`, including one inside another candidate, so what it
+/// checks is a superset of the links the console draws, whatever the console
+/// decides about bold and italic around them. A `\` escapes the next
+/// character only when that character is one of [`ESCAPABLE`]; otherwise it is
+/// itself.
+///
+/// Linear in the text: a text of ten thousand `[` is a hostile input, so each
+/// candidate is checked from precomputed positions (its length and its first
+/// non-blank character) instead of being copied out.
+fn inline_links_safe(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    // `escaped[i]`: character `i` is taken literally because a `\` before it
+    // escapes it; `escaper[i]`: character `i` is that `\` and is not shown.
+    let mut escaped = vec![false; len];
+    let mut escaper = vec![false; len];
+    let mut i = 0;
+    while i < len {
+        if chars[i] == '\\' && chars.get(i + 1).is_some_and(|c| ESCAPABLE.contains(c)) {
+            escaper[i] = true;
+            escaped[i + 1] = true;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    let unescaped = |at: usize, want: char| chars.get(at) == Some(&want) && !escaped[at];
+    // `next(p)[i]`: the first position at or after `i` where `p` holds; one
+    // longer than the text, so `next(p)[len]` is `None`.
+    let next = |holds: &dyn Fn(usize) -> bool| {
+        let mut next = vec![None; len + 1];
+        let mut seen = None;
+        for (at, slot) in next.iter_mut().enumerate().take(len).rev() {
+            if holds(at) {
+                seen = Some(at);
+            }
+            *slot = seen;
+        }
+        next
+    };
+    let next_close = next(&|at| unescaped(at, ']'));
+    let next_end = next(&|at| unescaped(at, ')'));
+    let next_solid = next(&|at| !escaper[at] && !chars[at].is_whitespace());
+    // `shown[i]`: how many characters before `i` are shown (not a `\` escaper).
+    let shown: Vec<usize> = std::iter::once(0)
+        .chain(escaper.iter().scan(0, |n, &hidden| {
+            *n += usize::from(!hidden);
+            Some(*n)
+        }))
+        .collect();
+    let mut last_close = None;
+    for open in (0..len).filter(|&at| unescaped(at, '[')) {
+        let Some(close) = next_close[open + 1] else {
+            continue;
+        };
+        // Every `[` before the same `]` names the same address.
+        if last_close == Some(close) {
+            continue;
+        }
+        last_close = Some(close);
+        if !unescaped(close + 1, '(') {
+            continue;
+        }
+        let Some(end) = next_end.get(close + 2).copied().flatten() else {
+            continue;
+        };
+        let start = close + 2;
+        if shown[end] - shown[start] > MAX_URL_CHARS {
+            return false;
+        }
+        // The address trimmed at the front; only its first characters decide.
+        let head: String = match next_solid[start] {
+            Some(from) if from < end => (from..end)
+                .filter(|&at| !escaper[at])
+                .take(16)
+                .map(|at| chars[at])
+                .collect(),
+            _ => String::new(),
+        };
+        if !safe_url(head.trim_end()) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The rule a marked-up text breaks, if any: too long, or an unsafe link.
+fn check_text(text: &str) -> Result<(), ReportRule> {
+    if long(text) {
+        return Err(ReportRule::TextTooLong);
+    }
+    if !inline_links_safe(text) {
+        return Err(ReportRule::BadInlineLink);
+    }
+    Ok(())
+}
+
 /// Check the blocks against every limit and tidy them: a link address is
-/// trimmed, a chart id is trimmed.
+/// trimmed, a chart id is trimmed. The text of a heading, paragraph, list item
+/// or quote is never changed; a link inside it is checked
+/// ([`ReportRule::BadInlineLink`]).
 ///
 /// # Errors
 ///
@@ -234,15 +401,11 @@ pub fn check_blocks(blocks: Vec<Block>) -> Result<Vec<Block>, ReportRule> {
                 if !(1..=3).contains(&level) {
                     return Err(ReportRule::BadHeadingLevel);
                 }
-                if long(&text) {
-                    return Err(ReportRule::TextTooLong);
-                }
+                check_text(&text)?;
                 Block::Heading { text, level }
             }
             Block::Paragraph { text } => {
-                if long(&text) {
-                    return Err(ReportRule::TextTooLong);
-                }
+                check_text(&text)?;
                 Block::Paragraph { text }
             }
             Block::List { items, ordered } => {
@@ -252,8 +415,16 @@ pub fn check_blocks(blocks: Vec<Block>) -> Result<Vec<Block>, ReportRule> {
                 if items.iter().any(|i| long(i)) {
                     return Err(ReportRule::TextTooLong);
                 }
+                if !items.iter().all(|i| inline_links_safe(i)) {
+                    return Err(ReportRule::BadInlineLink);
+                }
                 Block::List { items, ordered }
             }
+            Block::Quote { text } => {
+                check_text(&text)?;
+                Block::Quote { text }
+            }
+            Block::Divider {} => Block::Divider {},
             Block::Link { text, url } => {
                 let url = url.trim().to_owned();
                 if url.chars().count() > MAX_URL_CHARS || !safe_url(&url) {
@@ -264,12 +435,20 @@ pub fn check_blocks(blocks: Vec<Block>) -> Result<Vec<Block>, ReportRule> {
                 }
                 Block::Link { text, url }
             }
-            Block::Chart { chart, board } => {
+            Block::Chart {
+                chart,
+                board,
+                width,
+            } => {
                 let chart = chart.trim().to_owned();
                 if chart.is_empty() || chart.chars().count() > MAX_CHART_ID_CHARS {
                     return Err(ReportRule::ChartRequired);
                 }
-                Block::Chart { chart, board }
+                Block::Chart {
+                    chart,
+                    board,
+                    width,
+                }
             }
         };
         out.push(block);
@@ -436,6 +615,182 @@ mod tests {
         assert_eq!(
             check_title(&"x".repeat(MAX_TITLE_CHARS + 1)),
             Err(ReportRule::TitleTooLong)
+        );
+    }
+
+    /// `BI-62` (D3): a report saved before the editor changed reads and writes
+    /// back in exactly its stored shape; a chart without a width is not given one.
+    #[test]
+    fn a_report_saved_before_bi_62_reads_and_writes_back_unchanged() {
+        let old = json!([
+            { "type": "heading", "text": "Visitors", "level": 3 },
+            { "type": "paragraph", "text": "Up this quarter." },
+            { "type": "list", "items": ["a", "b"], "ordered": false },
+            { "type": "link", "text": "Source", "url": "https://example.com/x" },
+            { "type": "chart", "chart": "c_1", "board": "b_1" },
+        ]);
+        let blocks = check_blocks(parse_blocks(old.clone()).unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(&blocks).unwrap(), old);
+        assert_eq!(
+            blocks[4],
+            Block::Chart {
+                chart: "c_1".to_owned(),
+                board: "b_1".to_owned(),
+                width: ChartWidth::Text
+            }
+        );
+    }
+
+    /// `BI-62` (D3): a quote, a divider and a wide chart read and write back.
+    #[test]
+    fn a_quote_a_divider_and_a_wide_chart_read_and_write_back() {
+        let new = json!([
+            { "type": "quote", "text": "Numbers *rose* in **June**." },
+            { "type": "divider" },
+            { "type": "chart", "chart": "c_1", "board": "", "width": "wide" },
+            { "type": "chart", "chart": "c_2", "board": "", "width": "text" },
+        ]);
+        let blocks = check_blocks(parse_blocks(new).unwrap()).unwrap();
+        assert_eq!(
+            blocks[0],
+            Block::Quote {
+                text: "Numbers *rose* in **June**.".to_owned()
+            }
+        );
+        assert_eq!(blocks[1], Block::Divider {});
+        let back = serde_json::to_value(&blocks).unwrap();
+        assert_eq!(back[1], json!({ "type": "divider" }));
+        assert_eq!(
+            back[2],
+            json!({ "type": "chart", "chart": "c_1", "board": "", "width": "wide" })
+        );
+        // The text width is the default and is not written.
+        assert_eq!(
+            back[3],
+            json!({ "type": "chart", "chart": "c_2", "board": "" })
+        );
+    }
+
+    #[test]
+    fn a_divider_with_words_or_a_chart_of_another_width_is_not_a_block() {
+        for raw in [
+            json!([{ "type": "divider", "text": "x" }]),
+            json!([{ "type": "quote" }]),
+            json!([{ "type": "chart", "chart": "c_1", "width": "full" }]),
+            json!([{ "type": "paragraph", "text": "x", "width": "wide" }]),
+        ] {
+            assert_eq!(
+                parse_blocks(raw.clone()),
+                Err(ReportRule::NotBlocks),
+                "{raw}"
+            );
+        }
+    }
+
+    fn paragraph(text: &str) -> Result<Vec<Block>, ReportRule> {
+        check_blocks(parse_blocks(json!([{ "type": "paragraph", "text": text }])).unwrap())
+    }
+
+    /// `BI-62` (D3): a link inside a text is checked with the link block's rule,
+    /// in every block kind that carries marked-up text.
+    #[test]
+    fn an_inline_link_that_could_run_code_is_refused_in_every_text() {
+        for raw in [
+            json!([{ "type": "paragraph", "text": "See [this](javascript:alert(1))." }]),
+            json!([{ "type": "heading", "text": "[x](JavaScript:alert(1))", "level": 2 }]),
+            json!([{ "type": "list", "items": ["fine", "[x](data:text/html,x)"] }]),
+            json!([{ "type": "quote", "text": "[x](//elsewhere.example)" }]),
+        ] {
+            let err = check_blocks(parse_blocks(raw.clone()).unwrap()).unwrap_err();
+            assert_eq!(err, ReportRule::BadInlineLink, "{raw}");
+        }
+        assert!(
+            ReportRule::BadInlineLink
+                .message()
+                .starts_with("A link in the text must start with https://")
+        );
+        for text in [
+            "[x]( javascript:alert(1))",
+            "[x]()",
+            "**[x](javascript:alert(1))**",
+            "*[**x**](vbscript:x)*",
+            // The console may leave the first `[` unlinked because a bold
+            // closes inside it, then link the later one: both are checked.
+            "**[a**](https://a.example/[b](javascript:alert)",
+            "[a [b](javascript:x) c](https://a.example)",
+        ] {
+            assert_eq!(paragraph(text), Err(ReportRule::BadInlineLink), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_safe_inline_link_and_escaped_brackets_are_kept_as_written() {
+        for text in [
+            "See [the method](https://example.com/m) and [home](/dashboards/b_1).",
+            "Write to [us](mailto:a@b.example) or [read](  http://a.example  ).",
+            "[the **bold** words](https://a.example/\\(1\\))",
+            // Escaped brackets are text, not a link.
+            "\\[x\\](javascript:alert(1))",
+            "[x\\](javascript:alert(1))",
+            "[x]\\(javascript:alert(1)\\)",
+            // Brackets that never close are text.
+            "a [ b ( c ] d ) e",
+            "**bold** and *italic* and a \\* star",
+        ] {
+            let blocks = paragraph(text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+            assert_eq!(
+                blocks[0],
+                Block::Paragraph {
+                    text: text.to_owned()
+                }
+            );
+        }
+        // A `\` before a letter is itself, so it does not hide the `[`.
+        assert_eq!(
+            paragraph("\\x[x](javascript:1)"),
+            Err(ReportRule::BadInlineLink)
+        );
+        // A `\\` is one literal backslash, so the `[` after it opens a link.
+        assert_eq!(
+            paragraph("\\\\[x](javascript:1)"),
+            Err(ReportRule::BadInlineLink)
+        );
+    }
+
+    /// A hostile text of brackets is checked in one pass, and an address over
+    /// the link block's length limit is refused.
+    #[test]
+    fn a_text_of_brackets_is_checked_and_a_long_inline_address_is_refused() {
+        assert!(paragraph(&"[".repeat(MAX_TEXT_CHARS)).is_ok());
+        assert!(paragraph(&"[](/".repeat(MAX_TEXT_CHARS / 4)).is_ok());
+        assert_eq!(
+            paragraph(&format!("{})", "[](".repeat(MAX_TEXT_CHARS / 4))),
+            Err(ReportRule::BadInlineLink)
+        );
+        let long_url = format!("[x](https://a.example/{})", "a".repeat(MAX_URL_CHARS));
+        assert_eq!(paragraph(&long_url), Err(ReportRule::BadInlineLink));
+    }
+
+    /// `BI-62` changes no limit.
+    #[test]
+    fn the_limits_are_unchanged_by_the_new_blocks() {
+        assert_eq!(
+            (MAX_CHARTS, MAX_BLOCKS, MAX_TEXT_CHARS, MAX_LIST_ITEMS),
+            (30, 300, 10_000, 100)
+        );
+        let long_text = "x".repeat(MAX_TEXT_CHARS + 1);
+        let blocks = parse_blocks(json!([{ "type": "quote", "text": long_text }])).unwrap();
+        assert_eq!(check_blocks(blocks), Err(ReportRule::TextTooLong));
+        let many: Vec<Value> = (0..=MAX_BLOCKS)
+            .map(|_| json!({ "type": "divider" }))
+            .collect();
+        assert_eq!(parse_blocks(json!(many)), Err(ReportRule::TooManyBlocks));
+        let wide: Vec<Value> = (0..=MAX_CHARTS)
+            .map(|i| json!({ "type": "chart", "chart": format!("c_{i}"), "width": "wide" }))
+            .collect();
+        assert_eq!(
+            check_blocks(parse_blocks(json!(wide)).unwrap()),
+            Err(ReportRule::TooManyCharts)
         );
     }
 

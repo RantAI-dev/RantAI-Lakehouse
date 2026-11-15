@@ -297,12 +297,13 @@ async fn resolve_blocks(
     blocks
         .into_iter()
         .map(|block| match block {
-            Block::Chart { chart, .. } => match charts.get(&chart) {
+            Block::Chart { chart, width, .. } => match charts.get(&chart) {
                 None => Err(ApiError::BadRequest(CHART_NOT_YOURS.to_owned())),
                 Some((_, true)) => Err(ApiError::BadRequest(NOT_A_CHART.to_owned())),
                 Some((board, false)) => Ok(Block::Chart {
                     chart,
                     board: board.clone(),
+                    width,
                 }),
             },
             other => Ok(other),
