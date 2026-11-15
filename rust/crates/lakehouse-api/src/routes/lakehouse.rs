@@ -120,29 +120,15 @@ async fn leave_out_tables_out_of_reach(
     namespace: &str,
     idents: Vec<TableIdent>,
 ) -> Result<Vec<TableIdent>, ApiError> {
-    use crate::routes::query::{TenantReach, claims_on, table_is_reachable};
-
-    let tenant_id = match reach {
-        TenantReach::All => return Ok(idents),
-        // `table_is_reachable` answers `false` for this reach whatever the
-        // claim is, so no claim needs reading.
-        TenantReach::NoTenant => return Ok(Vec::new()),
-        TenantReach::Tenant { tenant_id, .. } => tenant_id,
-    };
     let names: Vec<String> = idents
         .iter()
         .map(|ident| format!("{namespace}.{}", ident.name()))
         .collect();
-    let claims = claims_on(state, tenant_id, &names).await?;
+    let reachable = crate::routes::query::reachable_names(state, reach, &names).await?;
     Ok(idents
         .into_iter()
         .zip(names)
-        .filter(|(_, name)| {
-            // `claims_on` holds an entry for every name it was asked about.
-            claims
-                .get(name)
-                .is_some_and(|claim| table_is_reachable(reach, *claim))
-        })
+        .filter(|(_, name)| reachable.contains(name))
         .map(|(ident, _)| ident)
         .collect())
 }
@@ -998,7 +984,7 @@ pub async fn set_maintenance_policy(
 }
 
 /// `GET /api/lakehouse/maintenance-policies` — every configured table
-/// maintenance policy.
+/// maintenance policy the caller may read.
 ///
 /// Read by `dagster/dispar_orchestrate/maintenance.py` using the
 /// scope-less `lakehouse-maintenance-policy-reader` service identity
@@ -1007,11 +993,45 @@ pub async fn set_maintenance_policy(
 /// secret, only per-table retention/compaction settings, and the
 /// maintenance service identity holds no scopes to check against.
 ///
+/// # Tenant scoping
+///
+/// The list names the upload tables of every tenant, so a person
+/// ([`lakehouse_auth::PrincipalId::User`]) reads only the policies of the
+/// tables in their reach (`SEC-20`, plan 95): the rule Query Studio keeps,
+/// through [`crate::routes::query::reachable_names`].
+///
+/// A service identity ([`lakehouse_auth::PrincipalId::Service`]) reads the
+/// whole list. The maintenance job runs the policy of every table, so a list
+/// narrowed to a tenant would silently leave the other tenants' tables
+/// unmaintained. A service identity belongs to no tenant and its token is
+/// the credential of a job, never of a person, so there is no reach to
+/// narrow it by.
+///
 /// # Errors
 ///
-/// 503 if no Postgres pool is configured.
-pub async fn list_maintenance_policies(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
+/// 503 if no Postgres pool is configured, or the claims cannot be read; 404
+/// if `X-Tenant` names a tenant the caller does not belong to.
+pub async fn list_maintenance_policies(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+) -> ApiResult<ApiJson<Value>> {
     let rows = maintenance_policy::list_all_policies(pool(&state)?).await?;
+    let rows = if matches!(principal.id, lakehouse_auth::PrincipalId::Service(_)) {
+        rows
+    } else {
+        let reach = crate::routes::query::resolve_reach(&state, &principal, &headers).await?;
+        let names: Vec<String> = rows
+            .iter()
+            .map(|r| format!("{}.{}", r.namespace, r.table_name))
+            .collect();
+        let reachable = crate::routes::query::reachable_names(&state, reach, &names).await?;
+        rows.into_iter()
+            .zip(names)
+            .filter(|(_, name)| reachable.contains(name))
+            .map(|(row, _)| row)
+            .collect()
+    };
     Ok(ApiJson(json!({
         "policies": rows.iter().map(|r| json!({
             "namespace": r.namespace,
