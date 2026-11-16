@@ -12,7 +12,7 @@
 //! `POST /api/overview/alerts/{id}/silence`.
 
 use serde::Serialize;
-use sqlx::FromRow;
+use sqlx::{FromRow, Postgres, QueryBuilder};
 use time::OffsetDateTime;
 
 use crate::{PgPool, StoreError};
@@ -614,17 +614,37 @@ impl From<ActivityRow> for ActivityItem {
 
 /// The most recent audited actions, newest first.
 ///
+/// `only_principal` narrows the feed to the rows whose `principal_id` is that
+/// value (the audit writers store the principal's id as text); `None` reads
+/// the rows of everyone. The value is bound, never formatted into the
+/// statement.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
-pub async fn recent_activity(pool: &PgPool, limit: i64) -> Result<Vec<ActivityItem>, StoreError> {
-    let rows: Vec<ActivityRow> = sqlx::query_as(
+pub async fn recent_activity(
+    pool: &PgPool,
+    limit: i64,
+    only_principal: Option<&str>,
+) -> Result<Vec<ActivityItem>, StoreError> {
+    // The principal clause is added only when a filter is given, instead of
+    // `($2::text IS NULL OR principal_id = $2)`: after five executions of a
+    // prepared statement Postgres may pick a generic plan, which cannot use
+    // `audit_event_principal_idx` as an index condition and would scan
+    // `audit_event_at_idx` with a filter over a trail that is never pruned
+    // (`audit::build_filtered` adds its filters the same way, and migration
+    // 0143's EXPLAIN evidence for `audit_event_principal_idx` is for a plain
+    // `principal_id = value` clause).
+    let mut qb = QueryBuilder::<Postgres>::new(
         "SELECT id, at, principal_kind, actor_label, action, resource_kind, resource_id, outcome \
-         FROM audit_event ORDER BY at DESC LIMIT $1",
-    )
-    .bind(limit.clamp(1, 200))
-    .fetch_all(pool)
-    .await?;
+         FROM audit_event",
+    );
+    if let Some(principal) = only_principal {
+        qb.push(" WHERE principal_id = ").push_bind(principal);
+    }
+    qb.push(" ORDER BY at DESC LIMIT ")
+        .push_bind(limit.clamp(1, 200));
+    let rows: Vec<ActivityRow> = qb.build_query_as().fetch_all(pool).await?;
     Ok(rows.into_iter().map(ActivityItem::from).collect())
 }
 

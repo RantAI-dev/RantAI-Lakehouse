@@ -56,7 +56,7 @@ cities on the same chart.
 - `BI-10-AC3` With a hierarchy province > city > place, clicking a province shows its cities, clicking a city its places, and the trail climbs back.
 - `BI-10-AC4` A grid map at 1 degree shows one mark per cell and the marks' values add up to the total.
 - `BI-10-AC5` A user without `dashboard:write` cannot define a group or a hierarchy; a failure shows a plain message.
-- `AI-6-AC1` (the `BI-10` part) "visitors per place in bins of 500" is built by the assistant.
+- `AI-6-AC1` (the `BI-10` part) "visitors per place in bins of 500" is built by the assistant. Accepted by the AI owner, 2026-11-14 (staging `240d2e62`)
 
 ## QA-1 decisions (product owner, 2026-11-02)
 

@@ -11,6 +11,8 @@ import type { UsedBy,
   LineageGraph,
   ColumnLineage,
   AuditEvent,
+  AuditPage,
+  AuditSearchQuery,
   ClassificationRule,
   MaintenanceRun,
   ReplicationSlot,
@@ -22,6 +24,7 @@ import type { UsedBy,
   RowFilterGrammar,
 } from "../contracts/governance";
 import { apiFetch } from "../http";
+import { fileNameOf } from "@/lib/browser-file";
 import { ServiceError, deniedFor } from "../errors";
 
 /**
@@ -57,6 +60,27 @@ async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
   const json = await res.json().catch(() => null);
   if (!res.ok) throw errorFor(res.status, json, "Failed to load governance");
   return json as T;
+}
+
+/** The query string of an audit search: only the filters that hold a value. */
+function auditQueryString(query: AuditSearchQuery, withPaging: boolean): string {
+  const params = new URLSearchParams();
+  const set = (key: string, value: string | number | undefined) => {
+    if (value !== undefined && value !== "") params.set(key, String(value));
+  };
+  set("actor", query.actor);
+  set("action", query.action);
+  set("resourceKind", query.resourceKind);
+  set("resourceId", query.resourceId);
+  set("outcome", query.outcome);
+  set("from", query.from);
+  set("to", query.to);
+  if (withPaging) {
+    set("limit", query.limit);
+    set("cursor", query.cursor);
+  }
+  const text = params.toString();
+  return text ? `?${text}` : "";
 }
 
 async function post<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
@@ -99,8 +123,34 @@ export const clickhouseGovernanceService: GovernanceService = {
   async listQuality(signal) {
     return (await get<{ quality: QualityRule[] }>("/api/governance/quality", signal)).quality;
   },
-  async listAudit(signal) {
-    return (await get<{ audit: AuditEvent[] }>("/api/governance/audit", signal)).audit;
+  async searchAudit(query, signal) {
+    return get<AuditPage>(`/api/governance/audit/events${auditQueryString(query, true)}`, signal);
+  },
+  async getAuditEvent(id, signal) {
+    const res = await apiFetch(`/api/governance/audit/events/${encodeURIComponent(id)}`, { signal });
+    const json = await res.json().catch(() => null);
+    // A 404 is an answer ("no event has that id"), not a failure: a link to an
+    // event that is gone shows nothing, and the page says so.
+    if (res.status === 404) return null;
+    if (!res.ok) throw errorFor(res.status, json, "Failed to load governance");
+    return (json as { event: AuditEvent }).event;
+  },
+  async exportAuditCsv(query, signal) {
+    const res = await apiFetch(`/api/governance/audit/export.csv${auditQueryString(query, false)}`, {
+      signal,
+      cache: "no-store",
+    });
+    if (!res.ok) {
+      const json = await res.json().catch(() => null);
+      throw errorFor(res.status, json, "The export failed.");
+    }
+    const total = Number(res.headers.get("x-audit-export-total"));
+    return {
+      blob: await res.blob(),
+      fileName: fileNameOf(res.headers.get("content-disposition"), "audit-events.csv"),
+      truncated: res.headers.get("x-audit-export-truncated") === "true",
+      total: Number.isFinite(total) && res.headers.has("x-audit-export-total") ? total : null,
+    };
   },
   async getLineage(focusId, signal) {
     return get<LineageGraph>(`/api/governance/lineage?focus=${encodeURIComponent(focusId)}`, signal);

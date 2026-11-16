@@ -67,7 +67,7 @@ let answers: Record<string, () => Response> = {}
 
 function defaultAnswers(): Record<string, () => Response> {
   return {
-    "/api/ops/services": () => json({ services: SERVICES }),
+    "/api/ops/services": () => json({ services: SERVICES, auditWriteFailures: 0 }),
     "/api/overview/alerts": () =>
       json([
         { id: "a1", status: "open" },
@@ -119,6 +119,29 @@ describe("the System status page", () => {
 
     expect(await screen.findByText("The one probed service is up.")).toBeTruthy()
     expect(screen.getByText("Not probed, so not counted: Trino.")).toBeTruthy()
+  })
+
+  // GOV-1 Decision 4: a failed audit write is counted since the process
+  // started; the line shows when the count is 0 too.
+  it("says how many audit writes failed since the service started", async () => {
+    answers["/api/ops/services"] = () => json({ services: SERVICES, auditWriteFailures: 7 })
+    render(<SystemStatusPage />)
+
+    expect(
+      await within(sectionById("services")).findByText(
+        "Audit writes failed since the service started: 7"
+      )
+    ).toBeTruthy()
+  })
+
+  it("shows the audit write line with 0 when none failed", async () => {
+    render(<SystemStatusPage />)
+
+    expect(
+      await within(sectionById("services")).findByText(
+        "Audit writes failed since the service started: 0"
+      )
+    ).toBeTruthy()
   })
 
   it("counts only open alerts, and links them to Alerts", async () => {

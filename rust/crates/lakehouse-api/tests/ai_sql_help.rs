@@ -621,8 +621,18 @@ const OFFERED_WITHOUT_ALLOWLIST: &[&str] = &[
 // gives the previous pin `a3836866...2a09`). The offered-tool list above is
 // untouched, because the test's turn ("berapa tamu bulan ini?") holds no word
 // of the new domain. The AI team reviews the sentence (Assistant parity).
+//
+// Updated by hand for `AI-7`: the Ask suffix gained the named-metrics rule
+// (`named_metrics_first!`, the opening and closing words Build already had):
+// call `list_metrics` before writing a query, use `query_metric` for a match
+// and name the metric in the answer, and say so when none matches. This chat
+// sends no mode, so it runs in Ask and the rule reaches its prompt. The new
+// bytes are the old bytes plus exactly that rule (a space and its three
+// sentences), placed at the end of the Ask suffix, and the Build prompt's
+// bytes are unchanged. (Before: `bdb95459...f810`.) The AI team reviews the
+// sentence (Assistant parity).
 const SYSTEM_SHA256_WITHOUT_ALLOWLIST: &str =
-    "bdb95459f2cb24d2754c555dc908beb2428489eadac1918551b98010ead5f810";
+    "f77c95e5d54877e61a80a4ef1dee442a31e92a5ecda832d3f803148f762ae1ed";
 
 fn sha256_hex(text: &str) -> String {
     use std::fmt::Write as _;

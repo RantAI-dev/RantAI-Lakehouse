@@ -69,4 +69,4 @@ Part 2:
 - `BI-6-AC3` A user without `dashboard:write` cannot save it; a failure shows a plain message.
 - `BI-6-AC4` Top 5 with "Other": the bars add up to the table's own total, and an average measure's "Other" equals the average of the remaining rows.
 - `BI-6-AC5` The chart's own filter still applies when the dashboard has a filter on the same column, and the record list of a clicked bar honours both.
-- `AI-6-AC1` (the `BI-6` part) "Visitors by province and month, one category only, top 10" is built by the assistant in one go.
+- `AI-6-AC1` (the `BI-6` part) "Visitors by province and month, one category only, top 10" is built by the assistant in one go. Accepted by the AI owner, 2026-11-14 (staging `240d2e62`)
