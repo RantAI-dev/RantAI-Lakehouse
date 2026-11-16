@@ -220,13 +220,24 @@ pub struct CreateEmployeeBody {
 /// exactly the gap [`VALID_MODE`] closes here, the same way [`VALID_AUTONOMY`]
 /// already does for `autonomy`.
 ///
+/// # The permissions never exceed the creator's (`SEC-20`, plan 97)
+///
+/// A scheduled run takes its [`PermissionSet`] from the employee's own
+/// `permissions` column and needs no `agent:manage`, so an employee holding
+/// more than its creator would let the creator read what their own roles do
+/// not allow. The route needs `agent:manage` (`POLICY_TABLE`), and
+/// [`check_permission_ceiling`] refuses every permission the creator does not
+/// hold, `*:*` included.
+///
 /// # Errors
 ///
 /// 400 on a malformed body, a blank required field, an unrecognized
-/// `autonomy`, or an unrecognized `mode`; 409 if the name is taken;
-/// 503/500 as above.
+/// `autonomy`, an unrecognized `mode`, or a `permissions` token that is not
+/// `resource:action`; 403 when `permissions` names one the creator does not
+/// hold; 409 if the name is taken; 503/500 as above.
 pub async fn create_employee(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<DigitalEmployee>)> {
     let body: CreateEmployeeBody = parse_body(&body)?;
@@ -245,6 +256,7 @@ pub async fn create_employee(
         ))
         .into());
     }
+    check_permission_ceiling(&principal, body.permissions.as_deref())?;
     let input = CreateEmployeeInput {
         name: required("name", &body.name)?,
         purpose: required("purpose", &body.purpose)?,
@@ -260,6 +272,41 @@ pub async fn create_employee(
     };
     let created = agents::create_employee(pool(&state)?, &input).await?;
     Ok((StatusCode::CREATED, ApiJson(created)))
+}
+
+/// `SEC-20`, plan 97: refuses a `permissions` value that grants more than
+/// `creator` holds.
+///
+/// Walks the tokens [`PermissionSet::parse`] yields, because a run parses the
+/// stored column the same way. A non-blank token that does not parse as
+/// `resource:action` would grant nothing when parsed and so slip past this
+/// check unseen; it is refused with a 400 instead of being stored, which keeps
+/// the stored string equal to what was checked. [`PermissionSet::has`] answers
+/// per token, so `*:*` and `resource:*` pass only for a creator whose own
+/// grant is as wide.
+///
+/// # Errors
+///
+/// 400 for a token that is not `resource:action`; 403 naming the first
+/// permission `creator` does not hold. The name comes from the request.
+fn check_permission_ceiling(creator: &Principal, asked: Option<&str>) -> Result<(), ApiError> {
+    for token in asked.unwrap_or("").split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let Some(permission) = PermissionSet::parse(token).as_strings().pop() else {
+            return Err(ApiError::BadRequest(
+                "permissions must be comma-separated resource:action pairs".to_owned(),
+            ));
+        };
+        if !creator.permissions.has(&permission) {
+            return Err(ApiError::PermissionDenied(format!(
+                "you cannot give an employee the permission {permission}, which you do not hold"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn map_transition_result(

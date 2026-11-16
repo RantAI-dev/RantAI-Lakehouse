@@ -611,6 +611,16 @@ async fn system_prompt(
                 }
                 None => crate::table_access::TableAccess::All,
             };
+            // `SEC-20`, plan 97: the closing line of the map names registry
+            // datasets, which another tenant's upload is one of. The reach is
+            // the request's own (`X-Tenant`); a reach that cannot be resolved
+            // covers nothing.
+            let reach = match principal {
+                Some(principal) => tools::data::RegistryReach::of(state, principal, headers)
+                    .await
+                    .unwrap_or_else(|_| tools::data::RegistryReach::nothing(state)),
+                None => tools::data::RegistryReach::nothing(state),
+            };
             data_map::data_map(
                 &state.clickhouse,
                 withheld,
@@ -618,6 +628,7 @@ async fn system_prompt(
                 &query_words,
                 state.config.ai_relevant_tables,
                 &access,
+                Some(&reach),
             )
             .await
         }
@@ -3295,22 +3306,21 @@ mod tests {
         let viewer = system(analyst(1)).await;
         assert!(
             viewer.contains(
-                "Your account cannot change dashboards; ask an editor or an administrator."
+                "Your account does not have the dashboard:write permission, so it cannot change dashboards; ask an editor or an administrator."
             ),
             "{viewer}"
         );
         assert!(
-            viewer.find("Your account cannot change dashboards")
-                < viewer.find(&prompt::closing("Move the map charts to a new tab.", None)),
+            viewer.find(
+                "Your account does not have the dashboard:write permission, so it cannot change dashboards"
+            ) < viewer.find(&prompt::closing("Move the map charts to a new tab.", None)),
             "the sentence comes before the language line"
         );
         let mut editor = analyst(2);
         editor.permissions = lakehouse_auth::PermissionSet::parse("dashboard:write, query:read");
-        assert!(
-            !system(editor)
-                .await
-                .contains("Your account cannot change dashboards")
-        );
+        assert!(!system(editor).await.contains(
+            "does not have the dashboard:write permission, so it cannot change dashboards"
+        ));
     }
 
     #[tokio::test]
