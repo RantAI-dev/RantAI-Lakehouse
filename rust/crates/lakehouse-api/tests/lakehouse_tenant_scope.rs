@@ -318,7 +318,19 @@ const LINEAGE_READER: &str = "assistant:use, assistant:ask, lineage:read, dashbo
 /// The deployment: Meridian Group owns the shared catalog, the catalog is
 /// the mock above, and `ClickHouse` has no history.
 async fn spin_up_with_catalog(catalog: &MockServer, ch: &MockServer) -> TestApp {
+    spin_up_with_catalog_and_llm(catalog, ch, None).await
+}
+
+/// [`spin_up_with_catalog`] with the model at `llm` (`None` for no model).
+async fn spin_up_with_catalog_and_llm(
+    catalog: &MockServer,
+    ch: &MockServer,
+    llm: Option<&MockServer>,
+) -> TestApp {
     let mut env = HashMap::new();
+    if let Some(llm) = llm {
+        env.insert("LLM_URL".to_owned(), llm.uri());
+    }
     env.insert("CH_URL".to_owned(), ch.uri());
     env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT.to_owned());
     env.insert("LAKEKEEPER_CATALOG_URI".to_owned(), catalog.uri());
@@ -814,6 +826,227 @@ async fn the_owning_tenant_still_lists_and_describes_its_datasets() {
         json!(DATASET_TITLE),
         "{described}"
     );
+}
+
+// `SEC-20`, plan 97: the shared registry also holds a row for an upload
+// another tenant made (its `bronze.<table_name>` is that tenant's claim). The
+// tenant that owns the catalog passes the shared-catalog rule and still must
+// not read that row's slug, title, description or columns.
+
+/// The registry row of the upload the other tenant holds.
+const FOREIGN_SLUG: &str = "retail-orders-sheet";
+const FOREIGN_TITLE: &str = "Retail Orders Sheet";
+const FOREIGN_DESCRIPTION: &str = "orders only the retail tenant uploaded";
+
+fn registry_row(slug: &str, title: &str, description: &str, table: &str) -> Value {
+    json!({
+        "slug": slug,
+        "title": title,
+        "description": description,
+        "tier": "primer",
+        "table_name": table,
+    })
+}
+
+/// The group's own registry row and the row of the other tenant's upload.
+fn both_registry_rows() -> Vec<Value> {
+    vec![
+        registry_row(
+            DATASET_SLUG,
+            DATASET_TITLE,
+            "every sale the group booked",
+            DATASET_TABLE,
+        ),
+        registry_row(
+            FOREIGN_SLUG,
+            FOREIGN_TITLE,
+            FOREIGN_DESCRIPTION,
+            RETAIL_TABLE,
+        ),
+    ]
+}
+
+/// `ClickHouse` whose registry holds `rows` and nothing else.
+async fn mount_registry(server: &MockServer, rows: Vec<Value>) {
+    mount_empty_clickhouse(server).await;
+    clickhouse_rows(server, "bronze_meta.dataset_catalog", rows).await;
+}
+
+/// Nothing of the other tenant's registry row may appear in `answer`.
+fn assert_none_of_the_foreign_dataset(answer: &Value) {
+    let text = answer.to_string();
+    for secret in [
+        FOREIGN_SLUG,
+        FOREIGN_TITLE,
+        FOREIGN_DESCRIPTION,
+        RETAIL_TABLE,
+    ] {
+        assert!(!text.contains(secret), "{secret} must not appear: {answer}");
+    }
+}
+
+#[tokio::test]
+async fn listing_datasets_leaves_out_another_tenants_upload_for_the_owning_tenant() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_registry(&ch, both_registry_rows()).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let owner = cookie_in_tenant(&pool, CATALOG_READER, CATALOG_TENANT).await;
+    let operator = operator_cookie(&pool).await;
+
+    let listed = call_tool(&router, &owner, "list_datasets", json!({})).await;
+    assert_eq!(listed["result"]["total"], json!(1), "{listed}");
+    assert_eq!(
+        listed["result"]["datasets"][0]["slug"],
+        json!(DATASET_SLUG),
+        "{listed}"
+    );
+    assert_none_of_the_foreign_dataset(&listed);
+
+    // An operator's reach is everything: nothing is left out.
+    let listed = call_tool(&router, &operator, "list_datasets", json!({})).await;
+    assert_eq!(listed["result"]["total"], json!(2), "{listed}");
+}
+
+#[tokio::test]
+async fn describing_another_tenants_upload_is_refused_for_the_owning_tenant() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_registry(
+        &ch,
+        vec![registry_row(
+            FOREIGN_SLUG,
+            FOREIGN_TITLE,
+            FOREIGN_DESCRIPTION,
+            RETAIL_TABLE,
+        )],
+    )
+    .await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let owner = cookie_in_tenant(&pool, CATALOG_READER, CATALOG_TENANT).await;
+    let operator = operator_cookie(&pool).await;
+    let args = json!({ "slug": FOREIGN_SLUG });
+
+    let described = call_tool(&router, &owner, "describe_dataset", args.clone()).await;
+    // The sentence names the slug the caller asked for, never the registry's
+    // own table name, which is the other tenant's upload id.
+    assert_eq!(
+        described["result"],
+        json!({ "error": format!(
+            "Table not found or not available to your organisation: {FOREIGN_SLUG}"
+        ) }),
+        "{described}"
+    );
+    assert!(
+        !described.to_string().contains(RETAIL_TABLE),
+        "the other tenant's table is named nowhere: {described}"
+    );
+
+    // An operator's reach is everything.
+    let described = call_tool(&router, &operator, "describe_dataset", args).await;
+    assert_eq!(
+        described["result"]["title"],
+        json!(FOREIGN_TITLE),
+        "{described}"
+    );
+}
+
+#[tokio::test]
+async fn the_lakehouse_overview_leaves_out_another_tenants_upload_for_the_owning_tenant() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_registry(&ch, both_registry_rows()).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let owner = cookie_in_tenant(&pool, CATALOG_READER, CATALOG_TENANT).await;
+    let operator = operator_cookie(&pool).await;
+
+    let overview = call_tool(&router, &owner, "lakehouse_overview", json!({})).await;
+    let slugs: Vec<&str> = overview["result"]["bronze"]["datasets"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a list of datasets: {overview}"))
+        .iter()
+        .filter_map(|d| d["slug"].as_str())
+        .collect();
+    assert_eq!(slugs, vec![DATASET_SLUG], "{overview}");
+    assert_none_of_the_foreign_dataset(&overview);
+
+    let overview = call_tool(&router, &operator, "lakehouse_overview", json!({})).await;
+    assert_eq!(
+        overview["result"]["bronze"]["datasets"]
+            .as_array()
+            .map(Vec::len),
+        Some(2),
+        "{overview}"
+    );
+}
+
+/// The system prompt the model receives for `permissions` in `tenant`, with
+/// `rows` in the registry and one served Gold table, so the map has a table
+/// and writes its closing line about registry datasets with no Gold table.
+async fn the_prompt_for(rows: Vec<Value>, permissions: &str, tenant: &str) -> String {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_registry(&ch, rows).await;
+    clickhouse_rows(
+        &ch,
+        "FROM system.tables",
+        vec![json!({ "database": "serving", "name": "mart_ok", "total_rows": "5" })],
+    )
+    .await;
+    let llm = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{ "message": { "role": "assistant", "content": "Hi." } }]
+        })))
+        .mount(&llm)
+        .await;
+    let TestApp { router, pool } = spin_up_with_catalog_and_llm(&catalog, &ch, Some(&llm)).await;
+    claim_the_uploads(&pool).await;
+    let cookie = cookie_in_tenant(&pool, permissions, tenant).await;
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/api/ai/chat",
+        &cookie,
+        None,
+        Some(json!({ "messages": [{ "role": "user", "content": "berapa tamu bulan ini?" }] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let requests = llm.received_requests().await.expect("recording is on");
+    let first: Value = serde_json::from_slice(&requests[0].body).expect("a JSON request");
+    first["messages"][0]["content"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// `assistant:use` and `catalog:read` open the map without `query:read`, so it
+/// is built for this request alone and never shared through the cache.
+const MAP_READER: &str = "assistant:use, catalog:read";
+
+#[tokio::test]
+async fn the_data_map_leaves_out_another_tenants_upload_for_the_owning_tenant() {
+    let prompt = the_prompt_for(both_registry_rows(), MAP_READER, CATALOG_TENANT).await;
+
+    assert!(
+        prompt.contains("Catalog datasets with no Gold table: group-sales-ledger ("),
+        "the owner's own unserved dataset stays: {prompt}"
+    );
+    for secret in [FOREIGN_SLUG, FOREIGN_TITLE, RETAIL_TABLE] {
+        assert!(
+            !prompt.contains(secret),
+            "{secret} must not appear: {prompt}"
+        );
+    }
 }
 
 #[tokio::test]

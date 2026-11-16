@@ -954,6 +954,45 @@ mod tests {
         assert_eq!(narrowed["classifications"], json!([]), "{narrowed}");
     }
 
+    /// `SEC-20`, plan 97: a scheduled run holds no principal, and the three
+    /// tools that read table metadata used to read every tenant's for it.
+    /// Each one now refuses with a fixed sentence and asks nothing of the
+    /// engine (the mock would count the request) or the database.
+    #[tokio::test]
+    async fn the_table_metadata_tools_refuse_a_run_with_no_principal_and_read_nothing() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [],
+                "rows": 1,
+                "data": [{ "slug": "ds_a", "title": "A", "table_name": "orders_a", "tier": "bronze" }],
+            })))
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let mut args = Map::new();
+        args.insert("slug".to_owned(), json!("ds_a"));
+
+        for (tool, sentence) in [
+            ("list_datasets", "reading datasets needs a signed-in user"),
+            (
+                "describe_dataset",
+                "reading datasets needs a signed-in user",
+            ),
+            (
+                "get_maintenance_metrics",
+                "reading the maintenance history needs a signed-in user",
+            ),
+        ] {
+            let reply = run_tool(&state, None, tool, &args).await;
+            assert_eq!(reply, json!({ "error": sentence }), "{tool}");
+        }
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "a refused call must not have asked the engine anything"
+        );
+    }
+
     /// The draft of a chart call gets the save's answer, whole: the same value
     /// `run_tool` gives, and no draft (`PR #391 review`, `PR #402 review`).
     async fn assert_the_draft_is_refused_as_the_save_is(
