@@ -227,7 +227,7 @@ estimate (S, M, L), which the base has no field for.
 | `VER-1` | Task | Verify SFTP, Google Sheets and Oracle sources end to end; test row filters. The connector half is now `SRC-9`; row filters stay here | Data | P2 | Todo |  | PRODUCT §2 |
 | `BI-2` | Feature | Metrics users can define once and reuse across dashboards (a semantic layer). **Blocked by `DATA-12` (certified metrics part)** | Dashboards | P2 | In Acceptance | [#160](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/160) | PRODUCT §2; `reference/competitive-comparison.md` (BI matrix) |
 | `DATA-9` | Feature | Upload a file from the console | Data | P2 | In Acceptance | #71, #73 | `features/upload-file.md` |
-| `OPS-8` | Feature | Usage and cost view | Operations | P2 | Idea |  | PRODUCT §2 |
+| `OPS-8` | Feature | Usage and cost view | Operations | P2 | Building | #553 | PRODUCT §2; [spec](specs/ops-8.md); `features/usage-and-cost-view.md` |
 | `SEC-2` | Feature | Sign-in lockout per account after repeated wrong passwords: not rate limiting by network address, and single sign-on is not affected | Administration & Security | P2 | In Acceptance | #67 | `features/login-protection-and-session-cleanup.md` |
 | `SEC-3` | Task | Test single sign-on against a real identity provider; correct `README.md`, which says it is unbuilt | Administration & Security | P2 | Done | #181 | PRODUCT §2 |
 | `SEC-40` | Task | Sign in once through Microsoft Entra ID and once through Google with a test app registration and test user each, following `docs/OPERATIONS.md` (single sign-on), and record the date, settings (no secrets) and outcome in `docs/plans/SEC-3-RESULT.md` (`SEC-3-AC2`, `SEC-3-AC3`). Product owner's test, later | Administration & Security | P3 | Todo |  | `SEC-3` (#181) |
@@ -505,7 +505,7 @@ parity), built after it.
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-10`, `ADM-1`, `ADM-2`, `ADM-5`, `AI-21`, `AI-26`, `AI-27`, `AI-28`, `AI-29`, `AI-30`, `AI-31`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BI-3`, `BI-42`, `BI-43`, `BI-44`, `BI-45`, `BI-46`, `BI-47`, `BI-48`, `BI-49`, `BI-50`, `BI-51`, `BI-52`, `BI-53`, `BI-54`, `BI-55`, `BIZ-1`, `BIZ-2`, `BLD-11`, `BLD-14`, `DATA-20`, `DATA-22`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-30`, `DATA-43`, `DATA-44`, `DATA-45`, `DATA-46`, `DATA-4`, `DATA-55`, `DATA-6`, `DATA-8`, `GOV-12`, `GOV-1`, `GOV-3`, `INT-2`, `OPS-17`, `OPS-18`, `OPS-20`, `OPS-21`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-2`, `QRY-1`, `QS-10`, `QS-11`, `QS-12`, `REL-12`, `REL-13`, `REL-14`, `REL-15`, `REL-16`, `REL-17`, `SEC-40`, `SEC-54`, `SEC-58`, `SEC-59`, `SEC-60`, `SEC-64`, `SEC-65`, `SEC-66`, `SEC-67`, `SRC-15`, `SRC-18`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-2`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-43`, `SRC-4`, `SRC-5`, `VER-1`, `WEB-11`, `WEB-4`, `WEB-6`, `WEB-7`, `WEB-8`
+`ADM-10`, `ADM-1`, `ADM-2`, `ADM-5`, `AI-21`, `AI-26`, `AI-27`, `AI-28`, `AI-29`, `AI-30`, `AI-31`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-34`, `BI-35`, `BI-36`, `BI-3`, `BI-42`, `BI-43`, `BI-44`, `BI-45`, `BI-46`, `BI-47`, `BI-48`, `BI-49`, `BI-50`, `BI-51`, `BI-52`, `BI-53`, `BI-54`, `BI-55`, `BIZ-1`, `BIZ-2`, `BLD-11`, `BLD-14`, `DATA-20`, `DATA-22`, `DATA-26`, `DATA-27`, `DATA-28`, `DATA-30`, `DATA-43`, `DATA-44`, `DATA-45`, `DATA-46`, `DATA-4`, `DATA-55`, `DATA-6`, `DATA-8`, `GOV-12`, `GOV-1`, `GOV-3`, `INT-2`, `OPS-17`, `OPS-18`, `OPS-20`, `OPS-21`, `OPS-2`, `OPS-3`, `OPS-6`, `QA-2`, `QRY-1`, `QS-10`, `QS-11`, `QS-12`, `REL-12`, `REL-13`, `REL-14`, `REL-15`, `REL-16`, `REL-17`, `SEC-40`, `SEC-54`, `SEC-58`, `SEC-59`, `SEC-60`, `SEC-64`, `SEC-65`, `SEC-66`, `SEC-67`, `SRC-15`, `SRC-18`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-2`, `SRC-30`, `SRC-31`, `SRC-33`, `SRC-34`, `SRC-43`, `SRC-4`, `SRC-5`, `VER-1`, `WEB-11`, `WEB-4`, `WEB-6`, `WEB-7`, `WEB-8`
 
 ## Dates
 
@@ -515,6 +515,7 @@ set by the product owner and are left empty until they are.
 
 | ID | Started | Shipped | Due |
 | --- | --- | --- | --- |
+| `OPS-8` | 2026-11-16 | | |
 | `QS-14` | 2026-11-14 | 2026-11-14 (#532) | |
 | `GOV-1` | 2026-11-14 | 2026-11-15 (#546, #549) | |
 | `GOV-6` | | | |
