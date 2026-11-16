@@ -133,6 +133,24 @@ pub(crate) struct Pieces {
     tables: Vec<TablePiece>,
     /// `"\nCatalog datasets with no Gold table: …\n"`, or `""`.
     unserved: String,
+    /// The entries `unserved` is written from, each with the registry's
+    /// `table_name` it was built for. A caller's tenant reach drops the
+    /// entries whose Bronze table another tenant holds and writes the line
+    /// again from the rest (`SEC-20`, plan 97); the cache keeps them all.
+    unserved_rows: Vec<(String, String)>,
+}
+
+/// The closing line about catalog datasets with no Gold table, from `entries`
+/// (`""` for none). The one place the line's words are written.
+fn render_unserved<'e>(entries: impl ExactSizeIterator<Item = &'e str>) -> String {
+    if entries.len() == 0 {
+        String::new()
+    } else {
+        format!(
+            "\nCatalog datasets with no Gold table: {}.\n",
+            entries.collect::<Vec<_>>().join(", ")
+        )
+    }
 }
 
 /// The cached pieces, with the row-filtered tables they were built without
@@ -199,6 +217,7 @@ pub(crate) async fn data_map(
     query_words: &HashSet<String>,
     relevant_enabled: bool,
     access: &crate::table_access::TableAccess,
+    reach: Option<&super::tools::data::RegistryReach<'_>>,
 ) -> String {
     let cacheable = withheld.is_some_and(|w| w.masked.is_empty());
     let mut guard = CACHE.lock().await;
@@ -221,6 +240,7 @@ pub(crate) async fn data_map(
     // `GOV-7` D6: the cache stays whole and shared; what one caller's roles
     // hide is dropped here, before any of it reaches the model.
     let pieces = visible_pieces(&pieces, access);
+    let pieces = entries_in_reach(pieces, reach).await;
     assemble(&pieces, query_words, relevant_enabled, MAX_CHARS)
 }
 
@@ -246,6 +266,52 @@ pub(crate) fn visible_pieces(
             .cloned()
             .collect(),
         unserved: String::new(),
+        unserved_rows: Vec::new(),
+    })
+}
+
+/// `SEC-20`, plan 97: `pieces` without the closing-line entries whose Bronze
+/// table another tenant holds, for a caller whose `reach` is narrower than
+/// everything.
+///
+/// The registry is shared and its rows name the upload another tenant made
+/// (slug, title, table). The rule is
+/// [`super::tools::data::RegistryReach::bronze_in_reach`], one claims read
+/// for the whole line; nothing is read when the line is empty or the reach
+/// is everything, and `pieces` is returned untouched (byte for byte) when
+/// every entry is in reach. A claim that cannot be read drops every entry
+/// (fail closed).
+async fn entries_in_reach(
+    pieces: Arc<Pieces>,
+    reach: Option<&super::tools::data::RegistryReach<'_>>,
+) -> Arc<Pieces> {
+    let Some(reach) = reach else {
+        return pieces;
+    };
+    if pieces.unserved_rows.is_empty() {
+        return pieces;
+    }
+    let in_reach = match reach
+        .bronze_in_reach(pieces.unserved_rows.iter().map(|(table, _)| table.as_str()))
+        .await
+    {
+        Ok(None) => return pieces,
+        Ok(Some(in_reach)) => in_reach,
+        Err(_) => HashSet::new(),
+    };
+    let kept: Vec<(String, String)> = pieces
+        .unserved_rows
+        .iter()
+        .filter(|(table, _)| in_reach.contains(table))
+        .cloned()
+        .collect();
+    if kept.len() == pieces.unserved_rows.len() {
+        return pieces;
+    }
+    Arc::new(Pieces {
+        tables: pieces.tables.clone(),
+        unserved: render_unserved(kept.iter().map(|(_, entry)| entry.as_str())),
+        unserved_rows: kept,
     })
 }
 
@@ -267,6 +333,7 @@ pub(crate) async fn seed_cache_for_test() {
     let pieces = Pieces {
         tables: Vec::new(),
         unserved: "DATA MAP text".to_owned(),
+        ..Pieces::default()
     };
     *CACHE.lock().await = Some((Instant::now(), HashSet::new(), Arc::new(pieces)));
 }
@@ -1263,7 +1330,7 @@ fn pieces_from(live: &Live, stats: &[Stats], notes: &Notes, withheld: Option<&Wi
             words: table_words(table, dataset, &live.descriptions, stats, notes, withheld),
         });
     }
-    let unserved: Vec<String> = live
+    let unserved_rows: Vec<(String, String)> = live
         .datasets
         .iter()
         .filter(|(table, _)| {
@@ -1273,22 +1340,19 @@ fn pieces_from(live: &Live, stats: &[Stats], notes: &Notes, withheld: Option<&Wi
                 .any(|t| t.db == "serving" && &t.name == *table)
         })
         .map(|(table, d)| {
-            format!(
-                "{} (\"{}\", expected at serving.{table}, not found)",
-                d.slug, d.title
+            (
+                table.clone(),
+                format!(
+                    "{} (\"{}\", expected at serving.{table}, not found)",
+                    d.slug, d.title
+                ),
             )
         })
         .collect();
     Pieces {
         tables,
-        unserved: if unserved.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "\nCatalog datasets with no Gold table: {}.\n",
-                unserved.join(", ")
-            )
-        },
+        unserved: render_unserved(unserved_rows.iter().map(|(_, entry)| entry.as_str())),
+        unserved_rows,
     }
 }
 
@@ -1716,6 +1780,7 @@ mod tests {
         let pieces = Pieces {
             tables: Vec::new(),
             unserved: "map".to_owned(),
+            ..Pieces::default()
         };
         (
             built,
@@ -2979,6 +3044,7 @@ mod tests {
                 &query(words),
                 true,
                 &crate::table_access::TableAccess::All,
+                None,
             )
             .await
         };
@@ -3224,6 +3290,7 @@ mod tests {
             unserved: "\nCatalog datasets with no Gold table: secret_dataset (\"Secret\", \
                        expected at serving.secret_dataset, not found).\n"
                 .to_owned(),
+            ..Pieces::default()
         });
         let access = crate::table_access::TableAccess::Listed(
             std::collections::HashSet::from([("serving".to_owned(), "mart_ok".to_owned())]),

@@ -153,14 +153,15 @@ fn latest_per_slot(result: Value) -> Value {
 /// [`crate::routes::governance::read_kind`], and this tool reads through it,
 /// so the two cannot disagree.
 ///
-/// No principal is a headless run: it is not narrowed, the convention
-/// `list_datasets` and `draft_quality_rule` have.
+/// No principal is a scheduled run, which has no person whose reach to read
+/// the history through, so it is refused and reads nothing (`SEC-20`, plan 97;
+/// it used to read the whole history).
 pub(super) async fn get_maintenance_metrics(
     state: &AppState,
     principal: Option<&Principal>,
 ) -> Value {
     let Some(principal) = principal else {
-        return governance_kind(state, "maintenance").await;
+        return json!({ "error": "reading the maintenance history needs a signed-in user" });
     };
     if let Some(refusal) = super::data::shared_catalog_refusal(state, principal).await {
         return refusal;
