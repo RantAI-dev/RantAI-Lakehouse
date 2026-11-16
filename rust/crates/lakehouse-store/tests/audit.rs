@@ -19,9 +19,14 @@
 use lakehouse_test_support as _;
 
 use lakehouse_store::StoreError;
-use lakehouse_store::audit::{AuditFilter, NewAuditEvent, insert, list, list_for_resources};
+use lakehouse_store::audit::{
+    AuditCursor, AuditFilter, NewAuditEvent, count_matching, explain_search, get, insert, list,
+    list_for_resources, search,
+};
 use serde_json::json;
 use sqlx::PgPool;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 fn sample(action: &str) -> NewAuditEvent {
     NewAuditEvent {
@@ -215,6 +220,144 @@ async fn deleting_referenced_approval_nulls_out_approval_id(pool: PgPool) -> sql
     Ok(())
 }
 
+/// Asserts that a statement was refused by the append-only trigger of
+/// `audit_event` (migration `0142_audit_event_append_only.sql`), not by some
+/// other error such as a typo in the SQL.
+fn assert_refused_as_append_only(result: Result<sqlx::postgres::PgQueryResult, sqlx::Error>) {
+    let err = result.unwrap_err();
+    let message = err
+        .as_database_error()
+        .map(|db| db.message().to_owned())
+        .unwrap_or_default();
+    assert!(
+        message.contains("audit_event is append-only"),
+        "expected the append-only trigger to refuse the statement, got: {err}"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn deleting_an_audit_event_is_refused(pool: PgPool) -> sqlx::Result<()> {
+    let written = insert(&pool, sample("query_sql")).await.unwrap();
+
+    assert_refused_as_append_only(
+        sqlx::query("DELETE FROM audit_event WHERE id = $1")
+            .bind(&written.id)
+            .execute(&pool)
+            .await,
+    );
+
+    let events = list(&pool, AuditFilter::default()).await.unwrap();
+    assert_eq!(events.len(), 1);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn truncating_audit_event_is_refused(pool: PgPool) -> sqlx::Result<()> {
+    insert(&pool, sample("query_sql")).await.unwrap();
+
+    assert_refused_as_append_only(sqlx::query("TRUNCATE audit_event").execute(&pool).await);
+
+    let events = list(&pool, AuditFilter::default()).await.unwrap();
+    assert_eq!(events.len(), 1);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn updating_any_other_column_of_an_audit_event_is_refused(pool: PgPool) -> sqlx::Result<()> {
+    let written = insert(&pool, sample("query_sql")).await.unwrap();
+
+    for statement in [
+        "UPDATE audit_event SET outcome = 'failed' WHERE id = $1",
+        "UPDATE audit_event SET action = 'rewritten' WHERE id = $1",
+        "UPDATE audit_event SET args = '{\"foo\": \"changed\"}'::jsonb WHERE id = $1",
+        "UPDATE audit_event SET detail = 'edited afterwards' WHERE id = $1",
+        "UPDATE audit_event SET actor_label = 'someone else' WHERE id = $1",
+        "UPDATE audit_event SET at = now() + interval '1 day' WHERE id = $1",
+    ] {
+        assert_refused_as_append_only(
+            sqlx::query(statement)
+                .bind(&written.id)
+                .execute(&pool)
+                .await,
+        );
+    }
+
+    // A change to a link column rides along with a forbidden change: the
+    // whole statement is refused, the link is not nulled as a side effect.
+    sqlx::query(
+        "INSERT INTO agent_run (id, employee_id, status, trigger, actor, steps) \
+         VALUES ('run-append-only', 'emp-inventory', 'running', 'test', 'test-actor', \
+         '[]'::jsonb)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut linked = sample("run_tool");
+    linked.run_id = Some("run-append-only".to_owned());
+    let linked = insert(&pool, linked).await.unwrap();
+    assert_refused_as_append_only(
+        sqlx::query("UPDATE audit_event SET run_id = NULL, outcome = 'failed' WHERE id = $1")
+            .bind(&linked.id)
+            .execute(&pool)
+            .await,
+    );
+
+    let events = list(&pool, AuditFilter::default()).await.unwrap();
+    let row = events.iter().find(|e| e.id == written.id).unwrap();
+    assert_eq!(row, &written);
+    let row = events.iter().find(|e| e.id == linked.id).unwrap();
+    assert_eq!(row, &linked);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_audit_event_link_can_be_cleared_but_never_pointed_elsewhere(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    for id in ["run-link-a", "run-link-b"] {
+        sqlx::query(
+            "INSERT INTO agent_run (id, employee_id, status, trigger, actor, steps) \
+             VALUES ($1, 'emp-inventory', 'running', 'test', 'test-actor', '[]'::jsonb)",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let mut event = sample("run_tool");
+    event.run_id = Some("run-link-a".to_owned());
+    let written = insert(&pool, event).await.unwrap();
+
+    assert_refused_as_append_only(
+        sqlx::query("UPDATE audit_event SET run_id = 'run-link-b' WHERE id = $1")
+            .bind(&written.id)
+            .execute(&pool)
+            .await,
+    );
+    // Attaching a link to a row that has none is a change too, not a clearing.
+    let unlinked = insert(&pool, sample("query_sql")).await.unwrap();
+    assert_refused_as_append_only(
+        sqlx::query("UPDATE audit_event SET run_id = 'run-link-b' WHERE id = $1")
+            .bind(&unlinked.id)
+            .execute(&pool)
+            .await,
+    );
+
+    sqlx::query("UPDATE audit_event SET run_id = NULL WHERE id = $1")
+        .bind(&written.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let events = list(&pool, AuditFilter::default()).await.unwrap();
+    let row = events.iter().find(|e| e.id == written.id).unwrap();
+    assert_eq!(row.run_id, None);
+    assert_eq!(row.action, "run_tool");
+    let row = events.iter().find(|e| e.id == unlinked.id).unwrap();
+    assert_eq!(row.run_id, None);
+    Ok(())
+}
+
 /// An unknown `run_id` is a foreign-key violation, not a silent insert.
 #[sqlx::test(migrations = "../../migrations")]
 async fn insert_with_unknown_run_id_is_a_foreign_key_violation(pool: PgPool) -> sqlx::Result<()> {
@@ -262,6 +405,813 @@ async fn list_for_resources_gathers_one_kind_across_several_ids(pool: PgPool) ->
     assert_eq!(
         list_for_resources(&pool, "catalog", &[], 50).await.unwrap(),
         [] as [lakehouse_store::audit::AuditEvent; 0]
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Search: filters, keyset paging, count, one event by id (GOV-1 part B).
+// ---------------------------------------------------------------------------
+
+fn ts(rfc3339: &str) -> OffsetDateTime {
+    OffsetDateTime::parse(rfc3339, &Rfc3339).unwrap()
+}
+
+/// One row to seed with an explicit id and `at`. `insert` generates both, and
+/// a search test needs to pin them: equal timestamps, microsecond gaps, a
+/// boundary exactly on a filter's edge.
+struct Seed<'a> {
+    id: &'a str,
+    at: &'a str,
+    principal: Option<&'a str>,
+    action: &'a str,
+    outcome: &'a str,
+    resource: Option<(&'a str, &'a str)>,
+}
+
+impl<'a> Seed<'a> {
+    fn new(id: &'a str, at: &'a str, action: &'a str) -> Self {
+        Self {
+            id,
+            at,
+            principal: None,
+            action,
+            outcome: "executed",
+            resource: None,
+        }
+    }
+}
+
+async fn seed(pool: &PgPool, rows: &[Seed<'_>]) {
+    for row in rows {
+        sqlx::query(
+            "INSERT INTO audit_event (id, at, principal_id, action, outcome, resource_kind, \
+             resource_id) VALUES ($1, $2::timestamptz, $3, $4, $5, $6, $7)",
+        )
+        .bind(row.id)
+        .bind(row.at)
+        .bind(row.principal)
+        .bind(row.action)
+        .bind(row.outcome)
+        .bind(row.resource.map(|(kind, _)| kind))
+        .bind(row.resource.map(|(_, id)| id))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+}
+
+fn ids(page: &lakehouse_store::audit::AuditPage) -> Vec<&str> {
+    page.events.iter().map(|e| e.id.as_str()).collect()
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn search_by_actor_returns_only_that_persons_events(pool: PgPool) -> sqlx::Result<()> {
+    let mut a = Seed::new("e-a", "2026-03-01 10:00:00+00", "dashboard.update");
+    a.principal = Some("user-1");
+    let mut b = Seed::new("e-b", "2026-03-01 11:00:00+00", "dashboard.update");
+    b.principal = Some("user-2");
+    seed(
+        &pool,
+        &[a, b, Seed::new("e-c", "2026-03-01 12:00:00+00", "x")],
+    )
+    .await;
+
+    let page = search(
+        &pool,
+        &AuditFilter {
+            principal_id: Some("user-2".to_owned()),
+            ..AuditFilter::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&page), ["e-b"]);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn search_by_action_without_a_trailing_dot_matches_that_action_exactly(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    seed(
+        &pool,
+        &[
+            Seed::new("e-1", "2026-03-01 10:00:00+00", "dashboard.update"),
+            Seed::new("e-2", "2026-03-01 11:00:00+00", "dashboard.update.bulk"),
+            Seed::new("e-3", "2026-03-01 12:00:00+00", "dashboard"),
+            Seed::new("e-4", "2026-03-01 13:00:00+00", "query.update"),
+        ],
+    )
+    .await;
+
+    let page = search(
+        &pool,
+        &AuditFilter {
+            action: Some("dashboard.update".to_owned()),
+            ..AuditFilter::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&page), ["e-1"]);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn search_by_action_ending_in_a_dot_matches_every_action_with_that_prefix(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    seed(
+        &pool,
+        &[
+            Seed::new("e-1", "2026-03-01 10:00:00+00", "dashboard.update"),
+            Seed::new("e-2", "2026-03-01 11:00:00+00", "dashboard.share.create"),
+            Seed::new("e-3", "2026-03-01 12:00:00+00", "dashboardx.update"),
+            Seed::new("e-4", "2026-03-01 13:00:00+00", "query.update"),
+        ],
+    )
+    .await;
+
+    let page = search(
+        &pool,
+        &AuditFilter {
+            action: Some("dashboard.".to_owned()),
+            ..AuditFilter::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&page), ["e-2", "e-1"]);
+    Ok(())
+}
+
+/// `_` and `%` are `LIKE` wildcards. A prefix typed by a person must match
+/// them literally, or `a_b.` would also find `axb.create`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn search_by_action_prefix_treats_like_wildcards_as_plain_characters(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    seed(
+        &pool,
+        &[
+            Seed::new("e-1", "2026-03-01 10:00:00+00", "a_b.create"),
+            Seed::new("e-2", "2026-03-01 11:00:00+00", "axb.create"),
+            Seed::new("e-3", "2026-03-01 12:00:00+00", "100%.done"),
+            Seed::new("e-4", "2026-03-01 13:00:00+00", "100x.done"),
+            Seed::new("e-5", "2026-03-01 14:00:00+00", "back\\slash.run"),
+        ],
+    )
+    .await;
+
+    for (prefix, expected) in [
+        ("a_b.", vec!["e-1"]),
+        ("100%.", vec!["e-3"]),
+        ("back\\slash.", vec!["e-5"]),
+        ("%.", vec![]),
+    ] {
+        let page = search(
+            &pool,
+            &AuditFilter {
+                action: Some(prefix.to_owned()),
+                ..AuditFilter::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(ids(&page), expected, "prefix {prefix:?}");
+    }
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn search_by_outcome_returns_only_that_outcome(pool: PgPool) -> sqlx::Result<()> {
+    let mut refused = Seed::new("e-1", "2026-03-01 10:00:00+00", "role.update");
+    refused.outcome = "refused";
+    seed(
+        &pool,
+        &[
+            refused,
+            Seed::new("e-2", "2026-03-01 11:00:00+00", "role.update"),
+        ],
+    )
+    .await;
+
+    let page = search(
+        &pool,
+        &AuditFilter {
+            outcome: Some("refused".to_owned()),
+            ..AuditFilter::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&page), ["e-1"]);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn search_by_resource_kind_and_id_returns_events_about_that_object(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let mut a = Seed::new("e-1", "2026-03-01 10:00:00+00", "dashboard.update");
+    a.resource = Some(("dashboard", "d-1"));
+    let mut b = Seed::new("e-2", "2026-03-01 11:00:00+00", "dashboard.update");
+    b.resource = Some(("dashboard", "d-2"));
+    let mut c = Seed::new("e-3", "2026-03-01 12:00:00+00", "query.update");
+    c.resource = Some(("query", "d-1"));
+    seed(&pool, &[a, b, c]).await;
+
+    let by_kind = search(
+        &pool,
+        &AuditFilter {
+            resource_kind: Some("dashboard".to_owned()),
+            ..AuditFilter::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&by_kind), ["e-2", "e-1"]);
+
+    let by_both = search(
+        &pool,
+        &AuditFilter {
+            resource_kind: Some("dashboard".to_owned()),
+            resource_id: Some("d-1".to_owned()),
+            ..AuditFilter::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&by_both), ["e-1"]);
+    Ok(())
+}
+
+/// `since` keeps the row that sits exactly on it; `until` drops the row that
+/// sits exactly on it. A date range in the console reads "from this
+/// instant, up to but not including that one", so two adjacent ranges never
+/// show the same event twice nor skip one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn search_since_is_inclusive_and_until_is_exclusive(pool: PgPool) -> sqlx::Result<()> {
+    seed(
+        &pool,
+        &[
+            Seed::new("e-1", "2026-03-01 09:59:59.999999+00", "a.b"),
+            Seed::new("e-2", "2026-03-01 10:00:00+00", "a.b"),
+            Seed::new("e-3", "2026-03-01 11:00:00+00", "a.b"),
+            Seed::new("e-4", "2026-03-01 12:00:00+00", "a.b"),
+        ],
+    )
+    .await;
+
+    let page = search(
+        &pool,
+        &AuditFilter {
+            since: Some(ts("2026-03-01T10:00:00Z")),
+            until: Some(ts("2026-03-01T12:00:00Z")),
+            ..AuditFilter::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&page), ["e-3", "e-2"]);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn search_combines_every_filter_with_and(pool: PgPool) -> sqlx::Result<()> {
+    let mut hit = Seed::new("e-hit", "2026-03-01 10:30:00+00", "dashboard.update");
+    hit.principal = Some("user-1");
+    hit.outcome = "refused";
+    hit.resource = Some(("dashboard", "d-1"));
+
+    // Each of these misses on exactly one filter.
+    let mut wrong_actor = Seed::new("e-1", "2026-03-01 10:30:00+00", "dashboard.update");
+    wrong_actor.principal = Some("user-2");
+    wrong_actor.outcome = "refused";
+    wrong_actor.resource = Some(("dashboard", "d-1"));
+    let mut wrong_action = Seed::new("e-2", "2026-03-01 10:30:00+00", "query.update");
+    wrong_action.principal = Some("user-1");
+    wrong_action.outcome = "refused";
+    wrong_action.resource = Some(("dashboard", "d-1"));
+    let mut wrong_outcome = Seed::new("e-3", "2026-03-01 10:30:00+00", "dashboard.update");
+    wrong_outcome.principal = Some("user-1");
+    wrong_outcome.resource = Some(("dashboard", "d-1"));
+    let mut wrong_resource = Seed::new("e-4", "2026-03-01 10:30:00+00", "dashboard.update");
+    wrong_resource.principal = Some("user-1");
+    wrong_resource.outcome = "refused";
+    wrong_resource.resource = Some(("dashboard", "d-2"));
+    let mut too_old = Seed::new("e-5", "2026-03-01 09:00:00+00", "dashboard.update");
+    too_old.principal = Some("user-1");
+    too_old.outcome = "refused";
+    too_old.resource = Some(("dashboard", "d-1"));
+    let mut too_new = Seed::new("e-6", "2026-03-01 11:00:00+00", "dashboard.update");
+    too_new.principal = Some("user-1");
+    too_new.outcome = "refused";
+    too_new.resource = Some(("dashboard", "d-1"));
+    seed(
+        &pool,
+        &[
+            hit,
+            wrong_actor,
+            wrong_action,
+            wrong_outcome,
+            wrong_resource,
+            too_old,
+            too_new,
+        ],
+    )
+    .await;
+
+    let page = search(
+        &pool,
+        &AuditFilter {
+            principal_id: Some("user-1".to_owned()),
+            action: Some("dashboard.".to_owned()),
+            outcome: Some("refused".to_owned()),
+            resource_kind: Some("dashboard".to_owned()),
+            resource_id: Some("d-1".to_owned()),
+            since: Some(ts("2026-03-01T10:00:00Z")),
+            until: Some(ts("2026-03-01T11:00:00Z")),
+            ..AuditFilter::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&page), ["e-hit"]);
+    Ok(())
+}
+
+/// Seven rows. `e-c`, `e-b`, `e-a` share one `at`. `e-d` and `e-e` share
+/// another that is 100 microseconds later: the same millisecond, so a cursor
+/// built from the JSON row's millisecond `at` would skip them. Newest first,
+/// ties broken by id descending.
+async fn seed_ties(pool: &PgPool) -> Vec<&'static str> {
+    seed(
+        pool,
+        &[
+            Seed::new("e-a", "2026-03-01 10:00:00.000100+00", "a.b"),
+            Seed::new("e-b", "2026-03-01 10:00:00.000100+00", "a.b"),
+            Seed::new("e-c", "2026-03-01 10:00:00.000100+00", "a.b"),
+            Seed::new("e-d", "2026-03-01 10:00:00.000200+00", "a.b"),
+            Seed::new("e-e", "2026-03-01 10:00:00.000200+00", "a.b"),
+            Seed::new("e-f", "2026-03-01 10:00:01+00", "a.b"),
+            Seed::new("e-g", "2026-03-01 09:59:59+00", "a.b"),
+        ],
+    )
+    .await;
+    vec!["e-f", "e-e", "e-d", "e-c", "e-b", "e-a", "e-g"]
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn paging_through_rows_that_share_a_timestamp_shows_each_row_once_in_order(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let expected = seed_ties(&pool).await;
+
+    for page_size in [1_i64, 2, 3, 6, 7] {
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<AuditCursor> = None;
+        let mut pages = 0;
+        loop {
+            let page = search(
+                &pool,
+                &AuditFilter {
+                    limit: page_size,
+                    cursor: cursor.clone(),
+                    ..AuditFilter::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert!(i64::try_from(page.events.len()).unwrap() <= page_size);
+            seen.extend(page.events.iter().map(|e| e.id.clone()));
+            pages += 1;
+            assert!(pages <= 10, "paging does not end");
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(seen, expected, "page size {page_size}");
+    }
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_page_that_ends_exactly_at_the_last_row_has_no_next_cursor(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    seed_ties(&pool).await;
+
+    let exact = search(
+        &pool,
+        &AuditFilter {
+            limit: 7,
+            ..AuditFilter::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(exact.events.len(), 7);
+    assert!(exact.next_cursor.is_none());
+
+    let short = search(
+        &pool,
+        &AuditFilter {
+            limit: 6,
+            ..AuditFilter::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(short.events.len(), 6);
+    assert!(short.next_cursor.is_some());
+    Ok(())
+}
+
+#[test]
+fn a_cursor_survives_encode_and_decode() {
+    let cursor = AuditCursor::decode(
+        &AuditCursor::from_parts(1_772_359_200_000_100, "audit-x:y.z").encode(),
+    )
+    .unwrap();
+    assert_eq!(
+        cursor,
+        AuditCursor::from_parts(1_772_359_200_000_100, "audit-x:y.z")
+    );
+    // Negative microseconds (before 1970) round trip as well.
+    let before = AuditCursor::from_parts(-5, "e-1");
+    assert_eq!(AuditCursor::decode(&before.encode()).unwrap(), before);
+    // The text is url-safe: it goes in a query string as it is.
+    assert!(
+        cursor
+            .encode()
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    );
+}
+
+#[test]
+fn a_malformed_cursor_is_rejected_without_a_panic() {
+    use base64::Engine as _;
+    let b64 = |text: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text);
+    for bad in [
+        String::new(),
+        "!!!not base64!!!".to_owned(),
+        "a b".to_owned(),
+        // Valid base64 whose text is not `<microseconds>:<id>`.
+        b64(b"no-colon-here"),
+        b64(b"abc:e-1"),
+        b64(b":e-1"),
+        b64(b"1772359200000100:"),
+        b64(&[0xff, 0xfe, 0x3a, 0x31]),
+        // A microsecond count no timestamp can hold.
+        b64(format!("{}:e-1", i64::MAX).as_bytes()),
+        b64(format!("{}:e-1", i64::MIN).as_bytes()),
+        // GOV-1 review R-1: `time` takes these but Postgres `timestamptz`
+        // refuses them (before 4713 BC), so the read would answer 500.
+        b64(b"-300000000000000000:e-1"),
+        // The first microsecond before year 1 is outside the range the
+        // decoder accepts (years 1 to 9999).
+        b64(b"-62135596800000001:e-1"),
+        // The first microsecond after year 9999.
+        b64(b"253402300800000000:e-1"),
+        // Postgres TEXT refuses a NUL byte, so a cursor id with one never
+        // reaches the database.
+        b64(b"1772359200000100:e\x00-1"),
+    ] {
+        assert!(AuditCursor::decode(&bad).is_err(), "accepted {bad:?}");
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn count_matching_ignores_the_limit_and_the_cursor(pool: PgPool) -> sqlx::Result<()> {
+    seed_ties(&pool).await;
+    let first = search(
+        &pool,
+        &AuditFilter {
+            limit: 2,
+            ..AuditFilter::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let all = count_matching(
+        &pool,
+        &AuditFilter {
+            limit: 2,
+            cursor: first.next_cursor.clone(),
+            ..AuditFilter::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(all, 7);
+
+    // It still honours the narrowing filters.
+    let narrowed = count_matching(
+        &pool,
+        &AuditFilter {
+            since: Some(ts("2026-03-01T10:00:00Z")),
+            limit: 1,
+            ..AuditFilter::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(narrowed, 6);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_returns_one_event_and_none_for_an_unknown_id(pool: PgPool) -> sqlx::Result<()> {
+    let written = insert(&pool, sample("query_sql")).await.unwrap();
+
+    let found = get(&pool, &written.id).await.unwrap();
+    assert_eq!(found, Some(written));
+    assert_eq!(get(&pool, "audit-no-such-id").await.unwrap(), None);
+    Ok(())
+}
+
+/// 600 rows, so both the default (100) and the cap (500) are visible.
+async fn seed_many(pool: &PgPool, rows: i32) {
+    sqlx::query(
+        "INSERT INTO audit_event (id, at, action, outcome) \
+         SELECT 'bulk-' || g, timestamptz '2026-01-01 00:00:00+00' + g * interval '1 second', \
+         'a.b', 'executed' FROM generate_series(1, $1) g",
+    )
+    .bind(rows)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn search_uses_a_default_limit_of_100_and_caps_the_limit_at_500(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    seed_many(&pool, 600).await;
+
+    for unset in [0_i64, -3] {
+        let page = search(
+            &pool,
+            &AuditFilter {
+                limit: unset,
+                ..AuditFilter::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.events.len(), 100, "limit {unset}");
+        assert!(page.next_cursor.is_some());
+    }
+
+    let capped = search(
+        &pool,
+        &AuditFilter {
+            limit: 10_000,
+            ..AuditFilter::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(capped.events.len(), 500);
+    assert!(capped.next_cursor.is_some());
+
+    let exact = search(
+        &pool,
+        &AuditFilter {
+            limit: 25,
+            ..AuditFilter::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(exact.events.len(), 25);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Indexes: which index serves each search shape on a table of realistic size.
+// ---------------------------------------------------------------------------
+
+/// 50,000 rows: about 50 people, 40 actions under 8 prefixes, the 8 outcomes
+/// skewed toward `executed`, `at` spread over a year, 2,000 resources. Columns
+/// come from a hash of the row number so that no column follows another (a
+/// modulus of one number would tie principal, action and outcome together and
+/// flatter an index). Insert only: migration 0142 refuses UPDATE and DELETE.
+async fn seed_realistic_table(pool: &PgPool) {
+    sqlx::query(
+        "INSERT INTO audit_event (id, at, principal_id, principal_kind, action, resource_kind, \
+         resource_id, outcome) \
+         SELECT 'seed-' || g, \
+                timestamptz '2026-01-01 00:00:00+00' + (g * 631) * interval '1 second', \
+                'user-' || (abs(hashtext('p' || g)::bigint) % 50), \
+                'user', \
+                (ARRAY['dashboard','query','pipeline','connector','alert','identity','policy','audit'])[1 + abs(hashtext('a' || g)::bigint) % 8] \
+                  || '.' || \
+                (ARRAY['create','update','delete','run','share'])[1 + abs(hashtext('b' || g)::bigint) % 5], \
+                (ARRAY['dashboard','query','pipeline','connector','alert','table'])[1 + abs(hashtext('k' || g)::bigint) % 6], \
+                'res-' || (abs(hashtext('r' || g)::bigint) % 2000), \
+                CASE WHEN abs(hashtext('o' || g)::bigint) % 100 < 70 THEN 'executed' \
+                     WHEN abs(hashtext('o' || g)::bigint) % 100 < 85 THEN 'allowed' \
+                     WHEN abs(hashtext('o' || g)::bigint) % 100 < 93 THEN 'refused' \
+                     WHEN abs(hashtext('o' || g)::bigint) % 100 < 97 THEN 'failed' \
+                     WHEN abs(hashtext('o' || g)::bigint) % 100 < 98 THEN 'approved' \
+                     WHEN abs(hashtext('o' || g)::bigint) % 100 < 99 THEN 'rejected' \
+                     WHEN abs(hashtext('o' || g)::bigint) % 200 < 199 THEN 'needs_confirmation' \
+                     ELSE 'needs_approval' END \
+         FROM generate_series(1, 50000) g",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    // The long tail: a person with 25 events in the whole year and an action
+    // that happened 12 times. A filter on a rare value finds fewer rows than
+    // one page holds, so a plan that walks `audit_event_at_idx` and discards
+    // non-matches reads the whole index before it can stop.
+    sqlx::query(
+        "INSERT INTO audit_event (id, at, principal_id, principal_kind, action, outcome) \
+         SELECT 'rare-p-' || g, timestamptz '2026-01-01 00:00:00+00' + g * interval '14 days', \
+                'user-rare', 'user', 'dashboard.update', 'executed' \
+         FROM generate_series(1, 25) g",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO audit_event (id, at, principal_id, principal_kind, action, outcome) \
+         SELECT 'rare-a-' || g, timestamptz '2026-01-01 00:00:00+00' + g * interval '29 days', \
+                'user-3', 'user', 'billing.invoice', 'executed' \
+         FROM generate_series(1, 12) g",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("ANALYZE audit_event")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_search_shape_is_served_by_an_index_on_a_large_table(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    seed_realistic_table(&pool).await;
+
+    let first_page = search(
+        &pool,
+        &AuditFilter {
+            limit: 100,
+            ..AuditFilter::default()
+        },
+    )
+    .await
+    .unwrap();
+    let cursor = first_page.next_cursor;
+
+    // `Some(index)`: the plan must use that index. `None`: either the new
+    // index or `audit_event_at_idx` serves the shape and the planner's pick
+    // between them depends on the statistics sample, so only the absence of a
+    // sequential scan is asserted.
+    let shapes: Vec<(&str, AuditFilter, Option<&str>)> = vec![
+        (
+            "newest page, no filter",
+            AuditFilter::default(),
+            Some("audit_event_at_idx"),
+        ),
+        (
+            "second page, no filter",
+            AuditFilter {
+                cursor,
+                ..AuditFilter::default()
+            },
+            Some("audit_event_at_idx"),
+        ),
+        (
+            "by person",
+            AuditFilter {
+                principal_id: Some("user-7".to_owned()),
+                ..AuditFilter::default()
+            },
+            None,
+        ),
+        (
+            "by a person with few events",
+            AuditFilter {
+                principal_id: Some("user-rare".to_owned()),
+                ..AuditFilter::default()
+            },
+            Some("audit_event_principal_idx"),
+        ),
+        (
+            "by a rare exact action",
+            AuditFilter {
+                action: Some("billing.invoice".to_owned()),
+                ..AuditFilter::default()
+            },
+            Some("audit_event_action_idx"),
+        ),
+        (
+            "by a rare action prefix",
+            AuditFilter {
+                action: Some("billing.".to_owned()),
+                ..AuditFilter::default()
+            },
+            Some("audit_event_action_idx"),
+        ),
+        (
+            "by exact action",
+            AuditFilter {
+                action: Some("dashboard.update".to_owned()),
+                ..AuditFilter::default()
+            },
+            None,
+        ),
+        (
+            "by action prefix",
+            AuditFilter {
+                action: Some("dashboard.".to_owned()),
+                ..AuditFilter::default()
+            },
+            None,
+        ),
+        (
+            "by outcome, 1 event in 12",
+            AuditFilter {
+                outcome: Some("refused".to_owned()),
+                ..AuditFilter::default()
+            },
+            None,
+        ),
+        (
+            "by outcome, 1 event in 100",
+            AuditFilter {
+                outcome: Some("rejected".to_owned()),
+                ..AuditFilter::default()
+            },
+            None,
+        ),
+        (
+            "by outcome, 1 event in 200",
+            AuditFilter {
+                outcome: Some("needs_approval".to_owned()),
+                ..AuditFilter::default()
+            },
+            Some("audit_event_outcome_idx"),
+        ),
+        (
+            "by one day",
+            AuditFilter {
+                since: Some(ts("2026-06-10T00:00:00Z")),
+                until: Some(ts("2026-06-11T00:00:00Z")),
+                ..AuditFilter::default()
+            },
+            Some("audit_event_at_idx"),
+        ),
+        (
+            "by object",
+            AuditFilter {
+                resource_kind: Some("dashboard".to_owned()),
+                resource_id: Some("res-17".to_owned()),
+                ..AuditFilter::default()
+            },
+            Some("audit_event_resource_idx"),
+        ),
+        (
+            "by person and one month",
+            AuditFilter {
+                principal_id: Some("user-7".to_owned()),
+                since: Some(ts("2026-06-01T00:00:00Z")),
+                until: Some(ts("2026-07-01T00:00:00Z")),
+                ..AuditFilter::default()
+            },
+            None,
+        ),
+    ];
+
+    let mut wrong = Vec::new();
+    for (label, filter, index) in &shapes {
+        let plan = explain_search(&pool, filter, false)
+            .await
+            .unwrap()
+            .join("\n");
+        let ran = explain_search(&pool, filter, true)
+            .await
+            .unwrap()
+            .join("\n");
+        println!("--- {label} (want {index:?})\n{plan}\n--- executed\n{ran}\n");
+        let served = index.is_none_or(|name| plan.contains(name));
+        if plan.contains("Seq Scan on audit_event") || !served {
+            wrong.push(*label);
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "a sequential scan, or not the expected index, for: {wrong:?}"
     );
     Ok(())
 }

@@ -48,4 +48,4 @@ drawn on one chart.
 - `BI-13-AC1` Visitors (bars) and a rate from a second table (line, right axis) by month on one chart; each series equals its own single chart.
 - `BI-13-AC2` A user without `dashboard:write` cannot save it; a question the viewer may not read shows its reason while the others draw.
 - `BI-13-AC3` Clicking a bar lists rows from the first table; clicking a point of the line lists rows from the second.
-- `AI-6-AC1` (the `BI-13` part) "visitors by month next to rooms" is built by the assistant.
+- `AI-6-AC1` (the `BI-13` part) "visitors by month next to rooms" is built by the assistant. Accepted by the AI owner, 2026-11-14 (staging `240d2e62`)

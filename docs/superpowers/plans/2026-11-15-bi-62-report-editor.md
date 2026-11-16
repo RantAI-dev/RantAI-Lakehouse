@@ -12,6 +12,8 @@
 
 ## 1. Decisions already made
 
+- **Owner QA 2026-11-16: no Preview button** — the editor already shows the reader's view.
+
 - **D1, layout = mockup D (owner, 2026-11-15, "aku suka yang D ini, gaskan kita implementasikan").**
   The reference is the local branch `design/chart-builder-mockups` (worktree
   `/home/hv/mtharreq/lakehouse-mockups`), route `/mockups/report-editor/d`, code in
@@ -64,7 +66,7 @@
   thumbnail into the document or click to insert at the cursor. On a wide screen the panel opens
   on Charts for an empty report; otherwise it keeps its last state. On a phone it is a sheet.
   DESIGN.md: one side panel at a time, one header, close by divider click / dock / Esc.
-- **D7, the reader page, Preview and the PDF use one renderer** (`report-blocks.tsx`): marks,
+- **D7, the reader page, the editor and the PDF use one renderer** (`report-blocks.tsx`): marks,
   quote, divider and chart width render the same everywhere; marks are built as React nodes
   (never `dangerouslySetInnerHTML`), links only through `safeReportUrl`.
 - **D8, the assistant in the page (PR B).** "Ask AI to write…" (first item of `/`) and
@@ -100,11 +102,11 @@ PR A (editor, storage, reader, PDF, Charts tab, assistant tools):
    `safeReportUrl` on links; round-trip tests incl. hostile input (`[x](javascript:…)`,
    unbalanced `**`, nested marks, backslashes). *Check:* scoped `bun test`, typecheck.
 3. **T3 One renderer.** `report-blocks.tsx` renders marks, quote, divider, chart width; reader
-   page, Preview and `report-render-view.tsx` (PDF) use it. *Check:* render tests for each kind.
+   page, the editor and `report-render-view.tsx` (PDF) use it. *Check:* render tests for each kind.
 4. **T4 The editor.** Replace `report-editor-page.tsx`'s form with the D editor: title line,
    `/` menu (grouped, height-capped with edge fade, keyboard), Markdown shortcuts, bubble menu
    (bold, italic, link with `safeReportUrl`), ⋮⋮ and + handles, Alt+↑/↓, chart node (D5), picker,
-   Preview, Download PDF, N-of-30 near the limit, old link blocks mapped (D3). The editor converts
+   Download PDF, N-of-30 near the limit, old link blocks mapped (D3). The editor converts
    blocks → document on load and document → blocks on save (pure functions, unit-tested
    round trip on every block kind). *Check:* tests for slash filtering, shortcut mapping,
    conversion round trip.

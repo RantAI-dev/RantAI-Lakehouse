@@ -28,7 +28,7 @@
 6. Ask the assistant to write a paragraph, or to **Describe** a chart; read the draft as it
    streams, then Accept (Enter) or Discard (Esc). The same exchange appears in the AI Copilot tab.
 7. Never press Save: the page says Saving…, Saved, or Couldn't save · Retry.
-8. Preview the reader's view in place, and Download PDF; both match the editor.
+8. Download PDF; it matches the editor.
 
 ## Decisions
 
@@ -47,7 +47,7 @@ See the plan, section 1. The owner signed the layout (mockup D, 2026-11-15).
 | `BI-62-AC1` | New → Report, type a title, `## Arrivals`, a paragraph with one bold word, one italic word and a link, a bulleted and a numbered list, a quote and a divider | Each turns into its block as typed; refresh shows the same page; no Save was pressed | Not run |
 | `BI-62-AC2` | Add three charts: one dragged from the Charts tab, one clicked in, one from `/` → Chart; make one wide | All three draw live; the wide one spans past the text column; Alt+↑/↓ and ⋮⋮ move them | Not run |
 | `BI-62-AC3` | Open an existing report made before this change (with a Link block) | It opens and reads the same; the link sits on its own line as before | Not run |
-| `BI-62-AC4` | Preview, then Download PDF | Marks, lists, quote, divider and chart widths match the editor | Not run |
+| `BI-62-AC4` | Download PDF | Marks, lists, quote, divider and chart widths match the editor | Not run |
 | `BI-62-AC5` | Turn the network off, type, turn it on | "Couldn't save · Retry" shows; Retry saves; nothing typed is lost | Not run |
 | `BI-62-AC6` | "Ask AI to write…" a paragraph about the first chart; then Describe the second chart | Drafts stream, Accept inserts them, Discard leaves nothing; the AI Copilot tab shows both exchanges | Not run |
 | `BI-62-AC7` | As a reader with only `dashboard:read`, open the report | It reads with the reader's own data; no editing controls | Not run |

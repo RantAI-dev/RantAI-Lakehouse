@@ -43,7 +43,6 @@ use axum::extract::{Path, State};
 use lakehouse_alerts::AlertKind;
 use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
-use lakehouse_store::audit as store_audit;
 use lakehouse_store::connectors as store_connectors;
 use lakehouse_store::ingest_spec::{dedup_keys, default_bronze_target};
 use lakehouse_store::schema_change::{
@@ -56,6 +55,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::OffsetDateTime;
 
+use crate::audit_coverage;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::connectors::{connector_audit_event, parse_body, pool};
@@ -713,9 +713,7 @@ pub async fn approve(
         }),
         "executed",
     );
-    if let Err(err) = store_audit::insert(pool, event).await {
-        tracing::warn!(%err, connector_id = %id, "failed to record connector.schema_change.approve audit event");
-    }
+    audit_coverage::record_best_effort(&state, event).await;
     Ok(ApiJson(ApproveResponse {
         object: req.object,
         approved: approval.approved,

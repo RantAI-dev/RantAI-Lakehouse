@@ -13,7 +13,6 @@
  *   (`BI-18` R4; the server refuses a 31st with its own sentence).
  * - The Charts tab of the one side panel (D6) holds every dashboard's charts
  *   as pictures to drag in or click in at the cursor.
- * - Preview shows the reader's view, drawn by the reader's own renderer.
  * - No Save button (D4): changes save about a second after typing stops and
  *   at once on blur, on leaving the page and when the tab is hidden
  *   (`src/lib/report-autosave.ts`); the header says Saving…, Saved, or
@@ -31,8 +30,7 @@ import * as React from "react"
 import Link from "next/link"
 import type { Editor } from "@tiptap/core"
 import { EditorContent, useEditor } from "@tiptap/react"
-import { useTheme } from "next-themes"
-import { ArrowLeft, ChartColumn, Check, ChevronRight, CircleAlert, Eye, FileDown, Heading1, Heading2, List, ListOrdered, Loader2, Minus, TextQuote, Type } from "lucide-react"
+import { ArrowLeft, ChartColumn, Check, ChevronRight, CircleAlert, FileDown, Heading1, Heading2, List, ListOrdered, Loader2, Minus, TextQuote, Type } from "lucide-react"
 
 import { EmptyState, ErrorState } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
@@ -46,14 +44,13 @@ import { MAX_REPORT_CHARTS, blocksForSave } from "@/lib/report-blocks"
 import { SLASH_ITEMS, blocksToDoc, docToBlocks, nearChartLimit, type DocNode, type SlashItemId } from "@/lib/report-doc"
 import { cn } from "@/lib/utils"
 import { dashboardReportService, dashboardService } from "@/services"
-import type { ReportBlock, ReportChartEntry, ReportView } from "@/services"
+import type { ReportBlock, ReportView } from "@/services"
 import { downloadReportPdf } from "./chart-download"
 import { rememberRow } from "./dashboards-row"
 import { FolderOptions } from "./folder-options"
-import { ReportBlocks } from "./report-blocks"
 import { ReportChartPicker } from "./report-chart-picker"
 import { ChartShelfPortal, useReportChartsTab } from "./report-chart-shelf"
-import { ReportChartsProvider, useReportCharts, type ReportChartChoice } from "./report-charts"
+import { ReportChartsProvider, type ReportChartChoice } from "./report-charts"
 import { ChartNode, ReportEditorUiContext, type PickerRequest, type ReportEditorUi } from "./report-editor-chart"
 import { SlashStore, insertBlock, reportExtensions, type SlashItem } from "./report-editor-extensions"
 import { BlockHandles, SelectionToolbar, SlashMenu, type LinkOpener, type SlashIcon } from "./report-editor-menus"
@@ -167,7 +164,6 @@ function ReportEditor({ view }: { view: ReportView | null }) {
   const folders = React.useMemo(() => folderChoices(labelledFolders(foldersState.data ?? [], me), me), [foldersState.data, me])
   const [folderId, setFolderId] = React.useState(view?.report.folderId || NO_FOLDER)
   const [info, setInfo] = React.useState<DocInfo>({ title: view?.report.title ?? "", count: 0, used: new Set() })
-  const [preview, setPreview] = React.useState(false)
   const [picker, setPicker] = React.useState<PickerRequest | null>(null)
   const slash = React.useMemo(() => new SlashStore(), [])
   const live = React.useMemo(() => new LiveBox(), [])
@@ -264,10 +260,6 @@ function ReportEditor({ view }: { view: ReportView | null }) {
     [extensions],
   )
 
-  React.useEffect(() => {
-    editor?.setEditable(!preview, false)
-  }, [editor, preview])
-
   const insertChart = React.useCallback(
     (id: string, pos?: number) => {
       if (!editor || live.count >= MAX_REPORT_CHARTS) return
@@ -343,7 +335,7 @@ function ReportEditor({ view }: { view: ReportView | null }) {
     }
   }, [autosave])
 
-  const ui = React.useMemo<ReportEditorUi>(() => ({ readOnly: preview, openPicker: setPicker }), [preview])
+  const ui = React.useMemo<ReportEditorUi>(() => ({ readOnly: false, openPicker: setPicker }), [])
   // D6: Charts opens on a wide screen for an empty report, else as it was left.
   const chartsTab = useReportChartsTab({ ready: editor !== null, empty: !view || view.report.blocks.length === 0 })
   const pdf = Boolean(view?.pdfSupported && view.canDownload && reportId)
@@ -372,27 +364,21 @@ function ReportEditor({ view }: { view: ReportView | null }) {
           }
           count={info.count}
           extra={<ToggleButton on={chartsTab.shown} icon={ChartColumn} label="Charts" onClick={chartsTab.toggle} />}
-          preview={preview}
-          onPreview={() => setPreview((p) => !p)}
           pdf={pdf && reportId ? () => void downloadPdf(reportId) : undefined}
           status={<SaveStatus state={saveState} onRetry={() => void autosave.retry()} />}
         />
         <div className="px-0 pt-6 sm:px-10 sm:pt-10">
-          {preview ? (
-            <PreviewDoc editor={editor} />
-          ) : (
-            <div ref={wrap} className="relative mx-auto w-full max-w-[720px]">
-              {editor ? (
-                <>
-                  <EditorContent editor={editor} />
-                  <SelectionToolbar editor={editor} linkRef={linkRef} />
-                  <BlockHandles editor={editor} area={area} wrap={wrap} />
-                </>
-              ) : (
-                <DocLines />
-              )}
-            </div>
-          )}
+          <div ref={wrap} className="relative mx-auto w-full max-w-[720px]">
+            {editor ? (
+              <>
+                <EditorContent editor={editor} />
+                <SelectionToolbar editor={editor} linkRef={linkRef} />
+                <BlockHandles editor={editor} area={area} wrap={wrap} />
+              </>
+            ) : (
+              <DocLines />
+            )}
+          </div>
         </div>
         <SlashMenu store={slash} icons={ICONS} />
         <ChartShelfPortal host={chartsTab.host} shown={chartsTab.shown} used={info.used} count={info.count} onPick={(c) => insertChart(c.id)} />
@@ -468,25 +454,6 @@ async function downloadPdf(id: string) {
   }
 }
 
-/** Preview: the reader's view, drawn by the reader's own renderer from what would be saved now. */
-function PreviewDoc({ editor }: { editor: Editor | null }) {
-  const charts = useReportCharts()
-  const { resolvedTheme } = useTheme()
-  if (!editor) return null
-  const { title, blocks } = docToBlocks(editor.getJSON() as DocNode)
-  const entries: Record<string, ReportChartEntry> = {}
-  for (const b of blocks) {
-    if (b.type !== "chart") continue
-    const e = charts.entry(b.chart)
-    if (e) entries[b.chart] = e
-  }
-  return (
-    <article aria-label={title || "Untitled report"} className="mx-auto w-full max-w-[720px] pb-16">
-      <ReportBlocks title={title} blocks={blocks} charts={entries} dark={resolvedTheme === "dark"} />
-    </article>
-  )
-}
-
 const ICON_BTN = cn("grid size-8 shrink-0 place-items-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground active:scale-[0.97]", EASE, FOCUS)
 
 /** A toggle is never solid blue (DESIGN.md §3): an outline when off, a soft fill when on, the same width both ways. */
@@ -521,7 +488,7 @@ export function ToggleButton({
 
 /**
  * The page's one row (DESIGN.md §3): back, where the report lives and its
- * title, then the save state, the chart count near the limit, Preview and
+ * title, then the save state, the chart count near the limit, the Charts toggle and
  * Download PDF. Sticky under the navbar, with a line once the page scrolls.
  */
 function EditorHeader({
@@ -529,8 +496,6 @@ function EditorHeader({
   backHref,
   folder,
   count,
-  preview,
-  onPreview,
   pdf,
   status,
   extra,
@@ -539,8 +504,6 @@ function EditorHeader({
   readonly backHref: string
   readonly folder: React.ReactNode
   readonly count: number
-  readonly preview: boolean
-  readonly onPreview: () => void
   readonly pdf?: () => void
   readonly status: React.ReactNode
   readonly extra?: React.ReactNode
@@ -587,7 +550,6 @@ function EditorHeader({
         </span>
       ) : null}
       {extra}
-      <ToggleButton on={preview} icon={Eye} label="Preview" onClick={onPreview} />
       {pdf ? (
         <IconTip label="Download PDF">
           <button type="button" aria-label="Download PDF" onClick={pdf} className={ICON_BTN}>

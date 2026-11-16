@@ -22,6 +22,7 @@ import { REFRESH_OPTIONS, effectiveRefresh, canSaveRefresh as refreshIsSaveable,
 import { enterFullscreen, leaveFullscreen, readFullscreenDark, writeFullscreenDark } from "@/lib/dashboard-fullscreen";
 import { notifyFailure, notifyInfo, notifySuccess } from "@/lib/notify";
 import { dataFromLabel } from "@/lib/result-cache";
+import { tileFreshness } from "./tile-freshness";
 import { readableErrorMessage } from "@/lib/notify-message";
 import { buildDashboardPageContext, summarizeFilters, summarizeFilterJson, summarizeGrain, summarizeParams, summarizeTabs, summarizeTiles } from "@/lib/page-context-summary";
 import { FILTER_PARAM, decodeFilters, dropInertFilters, enforceRequired, filtersEqual, filtersToParam, normalizeFilters, toggleValue } from "@/lib/dashboard-filter-state";
@@ -1306,18 +1307,11 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     // remembered. Reads mart_wisman.") is its tooltip and accessible name. The
     // dashboard's auto-refresh is the header's, not a tile's, and who made the
     // chart is the mark beside an AI-made tile's title.
-    const tileFrom = hasRows(cell) ? dataFromLabel(cell.computedAt, data?.reporting?.timeZone, cell.remembered) : null;
-    const tileClock = tileFrom?.replace(/^Data from /, "").replace(/ · remembered$/, "");
     const reads = spec.sqlSource ? "SQL source" : spec.mart || null;
-    const menuNote = tileClock || reads
-      ? {
-          label: [tileClock, reads].filter(Boolean).join(" · "),
-          detail: [
-            tileClock ? `Data from ${tileClock}${hasRows(cell) && cell.remembered ? ", remembered" : ""}.` : null,
-            reads ? `Reads ${spec.sqlSource ? "a SQL source" : reads}.` : null,
-          ].filter(Boolean).join(" "),
-        }
-      : undefined;
+    const { dataFrom: tileFrom, menuNote } = tileFreshness(
+      hasRows(cell) ? cell.computedAt : undefined, data?.reporting?.timeZone, hasRows(cell) ? cell.remembered : undefined,
+      reads, reads ? `Reads ${spec.sqlSource ? "a SQL source" : reads}.` : null,
+    );
     return {
       id: spec.id,
       span: spec.span,
@@ -1367,7 +1361,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       ),
       // BI-61 T3: no badge on the tile face; its facts are in `menuNote`.
       menuNote,
-      dataFrom: tileFrom?.replace(/ · remembered$/, ""),
+      dataFrom: tileFrom,
       menu,
       body: drilled ? (
         <div className="flex h-full min-h-0 flex-col">

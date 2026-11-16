@@ -25,7 +25,7 @@ use lakehouse_test_support as _;
 
 use lakehouse_store::overview::{
     DeliveryRecord, FiredRule, insert_from_fired_rule, insert_from_fired_rule_with_delivery,
-    is_rule_silenced, list_alerts, silence_alert,
+    is_rule_silenced, list_alerts, recent_activity, silence_alert,
 };
 use sqlx::PgPool;
 use time::{Duration, OffsetDateTime};
@@ -252,5 +252,44 @@ async fn an_instance_records_whether_its_delivery_arrived(pool: PgPool) -> sqlx:
     assert_eq!(find(&bad.id).delivery_reason.as_deref(), Some(reason));
     assert_eq!(find(&good.id).delivered, Some(true));
     assert_eq!(find(&unknown.id).delivered, None);
+    Ok(())
+}
+
+/// `GOV-1` Decision 9: `only_principal` narrows the activity feed to the rows
+/// that principal wrote, and `None` keeps every row. The rows sit in 2099 so
+/// they are the newest in the table whatever else a migration seeded.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recent_activity_narrows_to_one_principal_when_asked(pool: PgPool) -> sqlx::Result<()> {
+    for (id, at, principal) in [
+        ("feed-a1", "2099-01-01T00:00:00Z", "principal-a"),
+        ("feed-b1", "2099-01-02T00:00:00Z", "principal-b"),
+        ("feed-a2", "2099-01-03T00:00:00Z", "principal-a"),
+    ] {
+        sqlx::query(
+            "INSERT INTO audit_event (id, at, principal_id, principal_kind, action, outcome) \
+             VALUES ($1, $2::timestamptz, $3, 'user', 'dashboard.update', 'executed')",
+        )
+        .bind(id)
+        .bind(at)
+        .bind(principal)
+        .execute(&pool)
+        .await?;
+    }
+    let ids = |items: Vec<lakehouse_store::overview::ActivityItem>| -> Vec<String> {
+        items.into_iter().map(|i| i.id).collect()
+    };
+
+    let own = recent_activity(&pool, 20, Some("principal-a"))
+        .await
+        .unwrap();
+    assert_eq!(ids(own), ["feed-a2", "feed-a1"]);
+
+    let stranger = recent_activity(&pool, 20, Some("principal-none"))
+        .await
+        .unwrap();
+    assert_eq!(ids(stranger), Vec::<String>::new());
+
+    let everyone = recent_activity(&pool, 20, None).await.unwrap();
+    assert_eq!(ids(everyone)[..3], ["feed-a2", "feed-b1", "feed-a1"]);
     Ok(())
 }

@@ -168,7 +168,7 @@ pub const PERMISSIONS: &[PermissionInfo] = &[
     PermissionInfo {
         name: "audit:read",
         area: "Governance",
-        description: "Query the sensitive system tables an audit needs.",
+        description: "Read the audit trail list and query the sensitive system tables an audit needs.",
     },
     // ── Administration ───────────────────────────────────────────────────
     PermissionInfo {
