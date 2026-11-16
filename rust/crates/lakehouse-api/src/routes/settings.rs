@@ -3100,7 +3100,7 @@ pub async fn get_branding_image(
             (header::CONTENT_TYPE, image.content_type.clone()),
             (header::ETAG, etag),
             (header::CACHE_CONTROL, cache.to_owned()),
-            (header::X_CONTENT_TYPE_OPTIONS, "sniff".to_owned()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_owned()),
             (
                 header::CONTENT_SECURITY_POLICY,
                 "default-src 'none'; sandbox".to_owned(),

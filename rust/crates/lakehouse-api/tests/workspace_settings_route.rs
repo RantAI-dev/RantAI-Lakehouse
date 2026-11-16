@@ -208,7 +208,7 @@ async fn a_png_a_jpeg_and_a_webp_logo_are_served_back_with_their_type() {
         )
         .await;
         assert_eq!(unchanged.status, StatusCode::NOT_MODIFIED, "{media_type}");
-        assert!(unchanged.body.is_empty());
+        assert_eq!(unchanged.body, Vec::<u8>::new(), "{media_type}");
         assert_eq!(unchanged.header("etag"), etag);
     }
 }
@@ -661,9 +661,9 @@ async fn a_refused_upload_leaves_no_audit_row() {
     let app = common::spin_up().await;
     let cookie = admin(&app).await;
     put_image(&app, &cookie, "icon", &file(JPEG_HEAD, 50)).await;
-    assert!(
-        audit_rows(&app.pool, "settings.general.image_upload")
-            .await
-            .is_empty()
+    assert_eq!(
+        audit_rows(&app.pool, "settings.general.image_upload").await,
+        Vec::<Value>::new(),
+        "settings.general.image_upload leaves no row for a refused upload"
     );
 }
