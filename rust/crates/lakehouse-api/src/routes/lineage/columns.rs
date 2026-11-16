@@ -514,7 +514,12 @@ pub(crate) async fn read(
         "coverage": coverage,
     });
     if direction == Direction::Down {
-        if principal.has("dashboard:read") {
+        // SEC-20, plan 96: a chart has no tenant, so it belongs to the shared
+        // catalog, and a caller the shared-catalog rule refuses (`refusal`) has
+        // them hidden as a caller without `dashboard:read` has. The starting
+        // column is the caller's own input, so it could name a column of a
+        // chart the caller may not see.
+        if principal.has("dashboard:read") && refusal.is_none() {
             let mut reached: HashSet<(String, String)> = rows
                 .iter()
                 .map(|r| (r.to_table.clone(), r.to_column.clone()))

@@ -381,7 +381,13 @@ async fn services(state: &AppState) -> Result<Value, OpsError> {
         .iter()
         .map(|h| platform_service_row(h, deps_for(h.id)))
         .collect();
-    Ok(json!({ "services": services }))
+    // `GOV-1` Decision 4: the audit rows this process could not write, shown
+    // on the Operations page beside the probes. It rides on this answer so the
+    // console makes no second request, and it counts since the start.
+    Ok(json!({
+        "services": services,
+        "auditWriteFailures": state.audit_write_failure_count(),
+    }))
 }
 
 /// `Math.round((Number(p.elapsed) || 0) * 1000)`.
@@ -854,6 +860,31 @@ mod tests {
             );
             assert_eq!(row["checked"], false);
         }
+    }
+
+    /// `GOV-1` Decision 4: the Operations page shows how many audit rows could
+    /// not be written since the process started, as a sibling of `services`.
+    /// A state with no database fails every audit write, so one best-effort
+    /// write moves the counter from 0 to 1 and the response follows it.
+    #[tokio::test]
+    async fn services_reports_the_failed_audit_write_count() {
+        let state = AppState::without_a_database();
+        let body = services(&state).await.unwrap();
+        assert_eq!(body["auditWriteFailures"], 0);
+
+        crate::audit_coverage::record_best_effort(
+            &state,
+            lakehouse_store::audit::NewAuditEvent {
+                action: "saved_query.update".to_owned(),
+                outcome: "executed".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let body = services(&state).await.unwrap();
+        assert_eq!(body["auditWriteFailures"], 1);
+        assert!(body["services"].is_array(), "the rows stay as they were");
     }
 
     #[test]

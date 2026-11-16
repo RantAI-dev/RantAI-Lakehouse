@@ -97,6 +97,7 @@ async fn record_history_round_trips_through_list(pool: PgPool) -> sqlx::Result<(
             cache_assisted: false,
             tables_read: &[],
             message: None,
+            tenant_id: None,
         },
     )
     .await
@@ -122,6 +123,114 @@ async fn record_history_round_trips_through_list(pool: PgPool) -> sqlx::Result<(
     Ok(())
 }
 
+/// `OPS-8`: the tenant a run acted as is stored with it, so a usage view
+/// can sum per tenant. The tenant is one the seeded identity migration
+/// creates, because `query_history.tenant_id` references `tenant(id)`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn record_history_stores_the_tenant_the_run_acted_as(pool: PgPool) -> sqlx::Result<()> {
+    let tenant = Uuid::parse_str("11111111-1111-4111-8111-000000000002").unwrap();
+    record_history(
+        &pool,
+        &RecordHistoryInput {
+            id: "q-tenant",
+            sql: "SELECT 1",
+            user: "Bootstrap Admin",
+            owner_id: Some(Uuid::new_v4()),
+            status: "completed",
+            duration_ms: 1,
+            scanned_bytes: 1,
+            cost_units: 0.1,
+            workload_class: "hot-analytics",
+            engine: "clickhouse",
+            cache_assisted: false,
+            tables_read: &[],
+            message: None,
+            tenant_id: Some(tenant),
+        },
+    )
+    .await
+    .unwrap();
+
+    let stored: Option<Uuid> =
+        sqlx::query_scalar("SELECT tenant_id FROM query_history WHERE id = 'q-tenant'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(stored, Some(tenant));
+    Ok(())
+}
+
+/// `OPS-8`, migration `0144`: a caller with no tenant (a service identity)
+/// records `NULL`, and a row inserted the way every row was before the
+/// column existed (no `tenant_id` in the statement) reads back `NULL` too,
+/// not a guessed tenant. The column and its index exist.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_history_row_with_no_tenant_reads_back_null_and_the_column_has_its_index(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO query_history \
+         (id, sql, user_name, status, duration_ms, scanned_bytes, cost_units, \
+          workload_class, engine, cache_assisted) \
+         VALUES ('q-old', 'SELECT 1', 'someone', 'completed', 1, 1, 0.1, \
+                 'hot-analytics', 'hot-store', false)",
+    )
+    .execute(&pool)
+    .await?;
+    record_history(
+        &pool,
+        &RecordHistoryInput {
+            id: "q-service",
+            sql: "SELECT 1",
+            user: "gold-export-scheduler",
+            owner_id: Some(Uuid::new_v4()),
+            status: "completed",
+            duration_ms: 1,
+            scanned_bytes: 1,
+            cost_units: 0.1,
+            workload_class: "hot-analytics",
+            engine: "clickhouse",
+            cache_assisted: false,
+            tables_read: &[],
+            message: None,
+            tenant_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let unattributed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM query_history \
+         WHERE id IN ('q-old', 'q-service') AND tenant_id IS NULL",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(unattributed, 2, "no row is attributed to a guessed tenant");
+
+    let column: Option<String> = sqlx::query_scalar(
+        "SELECT is_nullable FROM information_schema.columns \
+         WHERE table_name = 'query_history' AND column_name = 'tenant_id'",
+    )
+    .fetch_optional(&pool)
+    .await?;
+    assert_eq!(
+        column.as_deref(),
+        Some("YES"),
+        "a nullable tenant_id column"
+    );
+    let index: Option<String> = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes \
+         WHERE tablename = 'query_history' AND indexname = 'query_history_tenant_at_idx'",
+    )
+    .fetch_optional(&pool)
+    .await?;
+    let definition = index.expect("the (tenant_id, at DESC) index exists");
+    assert!(
+        definition.contains("(tenant_id, at DESC)"),
+        "the index is per tenant, newest first: {definition}"
+    );
+    Ok(())
+}
+
 /// Recording the same id twice must not fail or duplicate the row — a
 /// caller retrying, or a genuinely reused id, degrades to a no-op rather
 /// than a 500 that would (per `routes::query::run`'s contract) still not
@@ -143,6 +252,7 @@ async fn record_history_is_idempotent_per_id(pool: PgPool) -> sqlx::Result<()> {
         cache_assisted: false,
         tables_read: &[],
         message: None,
+        tenant_id: None,
     };
     record_history(&pool, &input).await.unwrap();
     record_history(&pool, &input).await.unwrap();
@@ -189,6 +299,7 @@ async fn history_item_has_no_audit_id_without_a_real_event(pool: PgPool) -> sqlx
             cache_assisted: false,
             tables_read: &[],
             message: None,
+            tenant_id: None,
         },
     )
     .await
@@ -224,6 +335,7 @@ async fn history_item_resolves_the_real_audit_event_id(pool: PgPool) -> sqlx::Re
             cache_assisted: false,
             tables_read: &[],
             message: None,
+            tenant_id: None,
         },
     )
     .await
@@ -289,6 +401,7 @@ async fn history_item_uses_the_newest_of_several_events_without_duplicating_the_
             cache_assisted: false,
             tables_read: &[],
             message: None,
+            tenant_id: None,
         },
     )
     .await
@@ -342,6 +455,7 @@ async fn record_history_carries_the_real_engine_and_is_scoped_by_owner_id(
             cache_assisted: false,
             tables_read: &[],
             message: None,
+            tenant_id: None,
         },
     )
     .await
@@ -376,6 +490,7 @@ async fn get_history_item_fetches_one_row_by_id(pool: PgPool) -> sqlx::Result<()
             cache_assisted: false,
             tables_read: &[],
             message: None,
+            tenant_id: None,
         },
     )
     .await
@@ -432,6 +547,7 @@ async fn history_mentioning_finds_queries_by_substring_across_users(
                     cache_assisted: false,
                     tables_read: &[],
                     message: None,
+                    tenant_id: None,
                 },
             )
             .await
@@ -510,6 +626,7 @@ async fn history_recent_is_newest_first_and_respects_days_and_limit(
                 cache_assisted: false,
                 tables_read: &[],
                 message: None,
+                tenant_id: None,
             },
         )
         .await
@@ -698,6 +815,7 @@ async fn insert_history_row(
             cache_assisted: false,
             tables_read: &tables,
             message,
+            tenant_id: None,
         },
     )
     .await
@@ -729,6 +847,7 @@ async fn insert_history_row_at(pool: &PgPool, id: &str, owner: Uuid, at: OffsetD
             cache_assisted: false,
             tables_read: &[],
             message: None,
+            tenant_id: None,
         },
     )
     .await

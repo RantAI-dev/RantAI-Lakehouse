@@ -144,7 +144,7 @@ use lakehouse_clickhouse::ChError;
 use lakehouse_core::ApiError;
 use lakehouse_dagster::map_run_status;
 use lakehouse_store::PgPool;
-use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
+use lakehouse_store::audit::NewAuditEvent;
 use lakehouse_store::connectors;
 use lakehouse_store::upload_folders;
 use lakehouse_store::uploads::{
@@ -162,6 +162,7 @@ use super::catalog::registered_slug;
 use super::catalog_source::{PresenceUnknown, iceberg_table_presence};
 use super::governance::{IngestRunRow, ingest_runs_or_empty};
 use super::lakehouse::is_unknown_table_or_database_error;
+use crate::audit_coverage;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::QUERY_STRING_UNREADABLE;
@@ -1337,7 +1338,7 @@ pub async fn create(
         json!({ "fileName": row.original_filename, "sizeBytes": row.size_bytes }),
         "executed",
     );
-    record_audit(pool, event).await;
+    audit_coverage::record_best_effort(&state, event).await;
     Ok((
         StatusCode::CREATED,
         ApiJson(CreateResponse {
@@ -2754,15 +2755,6 @@ fn upload_audit_event(
     }
 }
 
-/// Best effort: a failed audit write never fails, or undoes, the action it
-/// records.
-async fn record_audit(pool: &PgPool, event: NewAuditEvent) {
-    let action = event.action.clone();
-    if let Err(err) = store_audit::insert(pool, event).await {
-        tracing::warn!(%err, action, "failed to record an upload audit event");
-    }
-}
-
 /// Who a load is recorded as in the table's own history (`DATA-52`, QA
 /// `LH-DATA-15-08`): the display name of the person who pressed Load, and
 /// ` (file upload)` after it, so a version written by an upload says how it was
@@ -3426,7 +3418,7 @@ pub async fn ingest(
     let author = load_author(&principal.display_name);
     let run_id = launch(&state, pool, &claimed, &request, &load_keys, kind, &author).await?;
     let attached = finish_launch_and_audit(
-        pool,
+        &state,
         &principal,
         &claimed,
         run_id.clone(),
@@ -3452,7 +3444,7 @@ pub async fn ingest(
 /// way this happens is a row settled or was deleted between the launch and
 /// the attach — a logged error, not a panic).
 async fn finish_launch_and_audit(
-    pool: &PgPool,
+    state: &AppState,
     principal: &Principal,
     claimed: &Upload,
     run_id: String,
@@ -3460,6 +3452,7 @@ async fn finish_launch_and_audit(
     converted: Option<&Converted>,
     conversion: Option<Conversion>,
 ) -> ApiResult<Upload> {
+    let pool = pool(state)?;
     let Some(attached) = uploads::attach_run(pool, &claimed.id, &run_id).await? else {
         // Not reachable through this API: only an `ingesting` row with no run
         // takes a run, and nothing settles or deletes the claim in the
@@ -3499,7 +3492,7 @@ async fn finish_launch_and_audit(
         }
     }
     let event = upload_audit_event(principal, "upload.ingest", &attached.id, args, "executed");
-    record_audit(pool, event).await;
+    audit_coverage::record_best_effort(state, event).await;
     Ok(attached)
 }
 
@@ -3598,7 +3591,7 @@ pub async fn delete(
         map.insert("table".to_owned(), json!(table));
     }
     let event = upload_audit_event(&principal, "upload.delete", &row.id, args, "executed");
-    record_audit(pool, event).await;
+    audit_coverage::record_best_effort(&state, event).await;
     Ok(StatusCode::NO_CONTENT)
 }
 

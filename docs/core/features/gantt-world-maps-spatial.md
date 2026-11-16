@@ -76,4 +76,4 @@ Run by the product owner on a running console. A step not performed is never a p
 - `BI-16-AC4` An uploaded province boundary file colours a region map. (C2)
 - `BI-16-AC8` *(proposed)* A calculated field `RegionOf` on store points, grouped by region, colours the uploaded map (a spatial join); `Distance` between two points matches a known distance within 1 %. (C3)
 - `BI-16-AC6` A user without `settings:write` cannot upload or delete a map, a malformed file is refused with a plain sentence, and a failure shows an honest message.
-- `AI-5-AC2` Each part's pull request includes the assistant schema change; "Show the project plan as a Gantt chart" makes one.
+- `AI-5-AC2` Each part's pull request includes the assistant schema change; "Show the project plan as a Gantt chart" makes one. Accepted by the AI owner, 2026-11-13 (checked against #104, #199 and #246).

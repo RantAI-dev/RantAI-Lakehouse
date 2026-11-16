@@ -175,6 +175,29 @@ describe("ADM-13 D7: nav-config access map and drift tests", () => {
       expect(canOpen("/query-studio/save-source", queryReader)).toBe(false)
     })
 
+    // GOV-1 Decision 9: `GET /api/governance/audit` answers 403 without
+    // `audit:read`, so the menu entry and the route follow that permission.
+    // `governance:read` (every role holds it) no longer opens the audit page.
+    it("shows the Audit Log entry and opens /audit only with audit:read", () => {
+      const menuEntries = (hasPermission: (p: string) => boolean) =>
+        NAV_GROUPS.flatMap((g) => g.items)
+          .filter((it) => canOpen(it.href, hasPermission))
+          .map((it) => it.title)
+      const analyst = (p: string) => p === "governance:read"
+      const auditor = (p: string) => p === "governance:read" || p === "audit:read"
+
+      expect(menuEntries(analyst)).not.toContain("Audit Log")
+      expect(canOpen("/audit", analyst)).toBe(false)
+
+      expect(menuEntries(auditor)).toContain("Audit Log")
+      expect(canOpen("/audit", auditor)).toBe(true)
+    })
+
+    it("lists the Audit Log menu item under audit:read", () => {
+      const item = NAV_GROUPS.flatMap((g) => g.items).find((it) => it.href === "/audit")
+      expect(item?.requires).toEqual(["audit:read"])
+    })
+
     it("supports any-of permission checks", () => {
       const hasAlertWrite = (p: string) => p === "alert:write"
       const hasAlertRead = (p: string) => p === "alert:read"

@@ -1,5 +1,5 @@
 //! Dashboard templates: saved copies of a dashboard's definition to start new
-//! dashboards from (`BI-18` part D, migration `0143`, plan
+//! dashboards from (`BI-18` part D, migration `0146`, plan
 //! `docs/superpowers/plans/2026-11-13-bi-18d-reports-templates.md` T3; feature
 //! page `docs/core/features/reports-and-templates.md`, decisions T1 to T4).
 //!

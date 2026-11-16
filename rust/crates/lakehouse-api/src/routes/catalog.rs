@@ -51,6 +51,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::time::Instant;
 
+use crate::audit_coverage;
 use crate::bounded;
 use crate::bronze_stats_cache::{BronzeStatsCache, CachedTableStats};
 use crate::error::{ApiRejection, ApiResult};
@@ -293,17 +294,28 @@ pub async fn list(
         Ok(access) => access,
         Err(err) => return ApiRejection(err).into_response(),
     };
+    // `SEC-20` (plan 95): the reach over upload tables, resolved before the
+    // snapshot is read, so a caller that holds the shared catalog still does
+    // not list another tenant's upload.
+    let reach = match crate::routes::query::resolve_reach(&state, &principal, &headers).await {
+        Ok(reach) => reach,
+        Err(err) => return ApiRejection(err).into_response(),
+    };
+    let unnarrowed = access.is_all() && reach == crate::routes::query::TenantReach::All;
     if let Some(term) = params.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
         return match search_snapshot(&state).await {
             Ok(snapshot) => {
                 // A narrowed caller's count must be of the tables it may see,
                 // so it searches the whole ranked list and counts after the
                 // filter; an unrestricted caller keeps the limit in the index.
-                let search_limit = if access.is_all() { limit } else { None };
+                let search_limit = if unnarrowed { limit } else { None };
                 let outcome =
                     catalog_search::search(&snapshot.index, &snapshot.usage, term, search_limit);
                 let mut assets = outcome.assets;
                 retain_visible(&access, &mut assets);
+                if let Err(err) = retain_in_reach(&state, reach, &mut assets).await {
+                    return ApiRejection(err).into_response();
+                }
                 let mut body = json!({
                     "assets": assets,
                     "namespaces": build_namespaces(&assets),
@@ -314,7 +326,7 @@ pub async fn list(
                 // index applied the limit after ranking); a narrowed one's is
                 // the visible matches it filtered above.
                 if let Some(limit) = limit {
-                    let total = if access.is_all() {
+                    let total = if unnarrowed {
                         outcome.total
                     } else {
                         assets.len()
@@ -341,6 +353,9 @@ pub async fn list(
                 .cloned()
                 .unwrap_or_default();
             retain_visible(&access, &mut assets);
+            if let Err(err) = retain_in_reach(&state, reach, &mut assets).await {
+                return ApiRejection(err).into_response();
+            }
             if let Some(limit) = limit {
                 let total = assets.len();
                 assets.truncate(limit);
@@ -523,6 +538,8 @@ pub async fn query(
     // before anything is counted or paged, so a hidden table is never in the
     // answer or its `totalItems`.
     retain_visible(&table_access_for(&state, &principal).await?, &mut filtered);
+    // `SEC-20` (plan 95): the same, for the reach over upload tables.
+    retain_in_callers_reach(&state, &principal, &headers, &mut filtered).await?;
     order_results(&mut filtered, term.is_some(), &sort);
     // `DATA-41` D6: with no filters the rows are not copied at all.
     catalog_query::apply_filters(&mut filtered, &filters, join);
@@ -1791,7 +1808,14 @@ pub async fn detail(
         // A Bronze id is a registry slug; the body names the table it serves
         // (`tableKey`), so the registry answers the question, not a guess.
         match bronze_asset_detail_body(&state, &principal, &headers, &id).await {
-            Ok(Some(body)) if asset_visible(&access, &body) => body,
+            // `SEC-20` (plan 95): the table the body names, not the slug in
+            // `id`, is what an upload's claim is held under. A body that
+            // names none is not an upload, and stays only where an unclaimed
+            // table does.
+            Ok(Some(body)) if asset_visible(&access, &body) => {
+                ensure_key_in_reach(&state, &principal, &headers, asset_table_key(&body)).await?;
+                body
+            }
             Ok(_) => return Err(not_found()),
             // `catch (e) { return NextResponse.json({ error: String(e) }, {
             // status: 503 }); }` in `catalog/[id]/route.ts`.
@@ -2408,6 +2432,12 @@ pub async fn sample(
         .limit
         .unwrap_or(DETAIL_SAMPLE_ROWS)
         .clamp(1, SAMPLE_MAX_ROWS);
+    // `SEC-20` (plan 95): an upload another tenant holds answers the same 404
+    // an unknown id answers, and it is decided from the registry's own key
+    // before a source is resolved. After it, a deployment where no table is
+    // readable behind the asset would answer an empty 200 for another tenant's
+    // upload and a 404 for an unknown id, which tells the upload exists.
+    ensure_asset_in_reach(&state, &principal, &headers, &id).await?;
     let source = super::catalog_profile::resolve_source(&state, &id).await?;
     // GOV-7 D6: the asset's own table is hidden from this principal, so the
     // sample does not exist for it either (the same 404 as an unknown id).
@@ -3256,6 +3286,142 @@ pub(crate) fn retain_visible(access: &crate::table_access::TableAccess, assets: 
     assets.retain(|asset| asset_visible(access, asset));
 }
 
+/// `SEC-20` (plan 95): drop every asset of `assets` whose table is out of the
+/// caller's reach, in place.
+///
+/// The role's table access ([`retain_visible`]) says which tables a role may
+/// read; the reach says which tenant's tables the caller may read at all.
+/// The catalog is shared, so the tenant that owns it passes
+/// [`catalog_tenant_refusal`] and would otherwise list an upload another
+/// tenant made: the registry row's `tableKey` is `bronze.<table_name>`, the
+/// key the claim is held under. The rule is
+/// [`crate::routes::query::reachable_names`], read once for the whole list.
+/// An asset that names no table cannot be claimed, so it stays only where an
+/// unclaimed table does ([`asset_in_reach`]).
+///
+/// # Errors
+///
+/// The 503 of [`crate::routes::query::claims_on`] when the claims cannot be
+/// read.
+pub(crate) async fn retain_in_reach(
+    state: &AppState,
+    reach: crate::routes::query::TenantReach,
+    assets: &mut Vec<Value>,
+) -> Result<(), ApiError> {
+    if reach == crate::routes::query::TenantReach::All {
+        return Ok(());
+    }
+    let keys: Vec<String> = assets
+        .iter()
+        .filter_map(|asset| asset_table_key(asset))
+        .map(str::to_owned)
+        .collect();
+    let reachable = crate::routes::query::reachable_names(state, reach, &keys).await?;
+    assets.retain(|asset| asset_in_reach(reach, asset_table_key(asset), &reachable));
+    Ok(())
+}
+
+/// `SEC-20` (plan 95): whether an asset stays in a list, given its table key
+/// and the names `reach` covers.
+///
+/// An asset that names no table has no claim to look up, so it is an
+/// unclaimable name: covered by the rule's own answer for a table nobody
+/// holds ([`crate::routes::query::table_is_reachable`]), which is `true` only
+/// for a reach that is everything and for the tenant that owns the shared
+/// catalog. It is never kept for a narrower reach (fail closed), the same way
+/// [`asset_visible`] hides an asset with no name from a narrowed role.
+fn asset_in_reach(
+    reach: crate::routes::query::TenantReach,
+    key: Option<&str>,
+    reachable: &HashSet<String>,
+) -> bool {
+    match key {
+        Some(key) => reachable.contains(key),
+        None => crate::routes::query::table_is_reachable(
+            reach,
+            lakehouse_store::uploads::TableClaim::Unclaimed,
+        ),
+    }
+}
+
+/// `SEC-20` (plan 95): [`retain_in_reach`] for a route that has no use for the
+/// reach itself.
+///
+/// # Errors
+///
+/// 404 for an `X-Tenant` header that names a tenant the caller does not
+/// belong to; 503 when the claims cannot be read.
+async fn retain_in_callers_reach(
+    state: &AppState,
+    principal: &Principal,
+    headers: &HeaderMap,
+    assets: &mut Vec<Value>,
+) -> Result<(), ApiError> {
+    let reach = crate::routes::query::resolve_reach(state, principal, headers).await?;
+    retain_in_reach(state, reach, assets).await
+}
+
+/// `SEC-20` (plan 95): refuses a read of one asset whose table `key` is out of
+/// the caller's reach, with the 404 an unknown id answers.
+///
+/// [`retain_in_reach`] for a read that names one asset. The answer is
+/// [`asset_not_found`], not Query Studio's sentence, so the refusal does not
+/// say whether the asset exists: an asset out of reach and an id no asset
+/// has read the same. `None` is an asset that names no table, which stays only
+/// where an unclaimed table does ([`asset_in_reach`]).
+///
+/// # Errors
+///
+/// 404 [`asset_not_found`] for a table out of reach; the 404 of
+/// [`crate::routes::query::resolve_reach`] (`tenant not found`) for an
+/// `X-Tenant` header that names a tenant the caller does not belong to, which
+/// [`catalog_tenant_refusal`] has already answered first on the catalog
+/// routes; 503 when the claim cannot be read.
+pub(crate) async fn ensure_key_in_reach(
+    state: &AppState,
+    principal: &Principal,
+    headers: &HeaderMap,
+    key: Option<&str>,
+) -> Result<(), ApiError> {
+    let reach = crate::routes::query::resolve_reach(state, principal, headers).await?;
+    let names: Vec<String> = key.map(str::to_owned).into_iter().collect();
+    let reachable = crate::routes::query::reachable_names(state, reach, &names).await?;
+    if asset_in_reach(reach, key, &reachable) {
+        Ok(())
+    } else {
+        Err(asset_not_found())
+    }
+}
+
+/// `SEC-20` (plan 95): [`ensure_key_in_reach`] for the asset an id names,
+/// before anything about its table is read.
+///
+/// A Silver or Gold id is its own key. A Bronze id is a registry slug, and
+/// the registry's own `bronze.<table_name>` is the key an upload's claim is
+/// held under ([`bronze_table_key`]), so it is read from the registry, not
+/// from whatever table a read resolves later. An id the registry does not hold
+/// is the 404 [`super::catalog_profile::bronze_table_name`] gives, the one an
+/// asset out of reach gives too, so the refusal holds on every path, whether
+/// or not a table is readable behind the asset.
+///
+/// # Errors
+///
+/// The same as [`ensure_key_in_reach`], plus the registry's own 404 for an
+/// unknown slug and its classified 503.
+pub(crate) async fn ensure_asset_in_reach(
+    state: &AppState,
+    principal: &Principal,
+    headers: &HeaderMap,
+    id: &str,
+) -> Result<(), ApiError> {
+    if id.starts_with("silver.") || id.starts_with("serving.") {
+        return ensure_key_in_reach(state, principal, headers, Some(id)).await;
+    }
+    let table_name = super::catalog_profile::bronze_table_name(state, id).await?;
+    let key = bronze_table_key(&table_name);
+    ensure_key_in_reach(state, principal, headers, key.as_deref()).await
+}
+
 /// The names of the tables among `ids` that `access` may read, in the order
 /// of `ids`: an id the catalog does not hold, or one the access hides, names
 /// nothing. An asset with no name is named by its id. Used by the refusal to
@@ -3812,8 +3978,8 @@ pub async fn put_annotation(
     // audit write here: it never fails the edit it records. A save that
     // changed nothing records nothing.
     if !changed.is_empty() {
-        let _ = lakehouse_store::audit::insert(
-            pool,
+        audit_coverage::record_best_effort(
+            &state,
             lakehouse_store::audit::NewAuditEvent {
                 principal_id: Some(principal.id.uuid().to_string()),
                 principal_kind: Some("user".to_owned()),
@@ -4096,8 +4262,8 @@ pub async fn put_certification(
     };
     state.catalog_search_cache.invalidate().await;
     if let Some(action) = action {
-        let _ = lakehouse_store::audit::insert(
-            pool,
+        audit_coverage::record_best_effort(
+            &state,
             lakehouse_store::audit::NewAuditEvent {
                 principal_id: Some(principal.id.uuid().to_string()),
                 principal_kind: Some("user".to_owned()),
@@ -4178,8 +4344,8 @@ pub async fn access_request(
     .await?;
     // Best-effort, matching WS5 item D1's own posture: an audit-write
     // failure never fails the request that triggered it.
-    let _ = lakehouse_store::audit::insert(
-        pool,
+    audit_coverage::record_best_effort(
+        &state,
         lakehouse_store::audit::NewAuditEvent {
             principal_id: Some(principal.id.uuid().to_string()),
             principal_kind: Some("user".to_owned()),
@@ -4227,6 +4393,29 @@ pub async fn access_request(
 /// (`lakehouse_store::agents::decide_access_request_approved_creates_a_time_bounded_grant`)
 /// exercises.
 pub(crate) const GRANT_DAYS: i64 = 30;
+
+/// The name `crate::audit_coverage::AUDIT_TABLE` gives `POST
+/// /api/catalog/access-requests/{id}/decide`, and the action of the `refused`
+/// row `auth_gate` writes when it turns the call away (`GOV-1`). The row a
+/// decision itself writes carries the request's own action (an `access:`
+/// permission), which is chosen at run time and so cannot be the table's name.
+pub(crate) const ACCESS_DECIDE_ACTION: &str = "catalog.access_decide";
+
+/// `args` of an access decision's audit row: the comment, and for an approval
+/// the grant it made: who received which permission until when (`GOV-1`
+/// Decision 3). A rejection grants nothing, so it names no grantee.
+fn decision_args(
+    comment: Option<&str>,
+    grant: Option<&lakehouse_store::agents::AccessGrant>,
+) -> Value {
+    let mut args = json!({ "comment": comment });
+    if let (Some(args), Some(grant)) = (args.as_object_mut(), grant) {
+        args.insert("permission".to_owned(), json!(grant.permission));
+        args.insert("grantee".to_owned(), json!(grant.user_id.to_string()));
+        args.insert("expiresAt".to_owned(), json!(grant.expires_at));
+    }
+    args
+}
 
 /// See [`DecideAccessRequestBody`]'s doc comment — reuses
 /// `routes::agents::DecideApprovalBody`'s exact shape (WS7 item E3, N1),
@@ -4338,8 +4527,8 @@ pub async fn decide_access_request(
         lakehouse_store::agents::Decision::Rejected => "rejected",
     };
     // Best-effort, matching WS5 item D1's own posture.
-    let _ = lakehouse_store::audit::insert(
-        pool,
+    audit_coverage::record_best_effort(
+        &state,
         lakehouse_store::audit::NewAuditEvent {
             principal_id: Some(principal.id.uuid().to_string()),
             principal_kind: Some("user".to_owned()),
@@ -4347,7 +4536,7 @@ pub async fn decide_access_request(
             action: existing.action.clone(),
             resource_kind: Some("approval".to_owned()),
             resource_id: Some(id.clone()),
-            args: Some(json!({ "comment": body.comment })),
+            args: Some(decision_args(body.comment.as_deref(), grant.as_ref())),
             outcome: decide_outcome.to_owned(),
             approval_id: Some(id.clone()),
             ..Default::default()
@@ -4367,6 +4556,47 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// `SEC-20` (plan 95): an asset that names no table cannot be claimed, so
+    /// it is covered exactly as a table nobody claimed is: only for the tenant
+    /// that owns the shared catalog, and for a reach that is everything. The
+    /// tests ask the filter's predicate, because the router cannot reach it
+    /// with a caller whose reach is narrower than the shared catalog's own
+    /// (such a caller is refused before the list is read).
+    #[test]
+    fn an_asset_with_no_table_key_stays_only_for_the_owner_and_for_everything() {
+        use crate::routes::query::TenantReach;
+        let tenant_id = uuid::Uuid::from_u128(7);
+        let none = HashSet::new();
+        let owner = TenantReach::Tenant {
+            tenant_id,
+            owns_catalog: true,
+        };
+        let other = TenantReach::Tenant {
+            tenant_id,
+            owns_catalog: false,
+        };
+
+        assert!(asset_in_reach(TenantReach::All, None, &none));
+        assert!(asset_in_reach(owner, None, &none));
+        assert!(!asset_in_reach(other, None, &none));
+        assert!(!asset_in_reach(TenantReach::NoTenant, None, &none));
+    }
+
+    /// A keyed asset stays when its table is among the names the reach covers,
+    /// and only then, whoever owns the catalog.
+    #[test]
+    fn an_asset_with_a_table_key_stays_only_when_the_reach_covers_the_table() {
+        use crate::routes::query::TenantReach;
+        let covered: HashSet<String> = HashSet::from(["bronze.mine".to_owned()]);
+        let owner = TenantReach::Tenant {
+            tenant_id: uuid::Uuid::from_u128(7),
+            owns_catalog: true,
+        };
+
+        assert!(asset_in_reach(owner, Some("bronze.mine"), &covered));
+        assert!(!asset_in_reach(owner, Some("bronze.theirs"), &covered));
+    }
 
     #[test]
     fn split_db_table_parses_silver_id() {
