@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
 import { chooseOption } from "@/components/patterns/select-field.testing"
 import { alertNumberShape, chartHasLatestPoint } from "./chart-alert"
-import { ChartAlertDialog, NO_LATEST_POINT_SENTENCE, OWN_ADDRESS_SENTENCE } from "./chart-alert-dialog"
+import { ChartAlertDialog, NO_LATEST_POINT_SENTENCE, NO_SINGLE_NUMBER_SENTENCE, OWN_ADDRESS_SENTENCE, READ_AS_YOU_SENTENCE } from "./chart-alert-dialog"
 
 const originalFetch = global.fetch
 type Call = { url: string; method: string; body: Record<string, unknown> | undefined }
@@ -83,7 +83,10 @@ describe("ChartAlertDialog", () => {
     expect(when.textContent).toContain("the chart returns any rows")
     fireEvent.click(when)
     expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual(["the chart returns any rows"])
-    expect(screen.getByText(NO_LATEST_POINT_SENTENCE)).toBeTruthy()
+    // Owner QA 2026-11-16: one short line, the reason behind its ⓘ (named by it, shown on a press).
+    expect(screen.getByText(/Only “returns any rows” for this chart/)).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: NO_LATEST_POINT_SENTENCE }))
+    expect(await screen.findByText(NO_LATEST_POINT_SENTENCE)).toBeTruthy()
     expect(screen.queryByRole("combobox", { name: /Series/ })).toBeNull()
     fireEvent.click(screen.getByRole("button", { name: "Save alert" }))
     await waitFor(() => expect(calls.length).toBe(1))
@@ -95,7 +98,8 @@ describe("ChartAlertDialog", () => {
     const calls = mockApi()
     open(kpi, { filters: [{ column: "region", values: ["Bali"] }] })
     fireEvent.change(screen.getByLabelText("Line"), { target: { value: "100" } })
-    expect(screen.getByText(/Read with the 1 dashboard filter on screen now/)).toBeTruthy()
+    expect(screen.getByText("Read as you, with the 1 dashboard filter on screen now")).toBeTruthy()
+    expect(screen.getByRole("button", { name: READ_AS_YOU_SENTENCE })).toBeTruthy()
     fireEvent.click(screen.getByRole("button", { name: "Save alert" }))
     await waitFor(() => expect(calls.length).toBe(1))
     expect(calls[0].method).toBe("POST")
@@ -121,7 +125,8 @@ describe("ChartAlertDialog", () => {
     const calls = mockApi()
     open(pie)
     expect(screen.queryByLabelText("Line")).toBeNull()
-    expect(screen.getByText(/can only ask whether it returns any rows/)).toBeTruthy()
+    expect(screen.getByText(/Only “returns any rows” for this chart/)).toBeTruthy()
+    expect(screen.getByRole("button", { name: NO_SINGLE_NUMBER_SENTENCE })).toBeTruthy()
     fireEvent.click(screen.getByRole("button", { name: "Save alert" }))
     await waitFor(() => expect(calls.length).toBe(1))
     expect(calls[0].body).toMatchObject({ chart: "c3", condition: "any_rows" })
@@ -132,10 +137,12 @@ describe("ChartAlertDialog", () => {
     open()
     const target = screen.getByLabelText("Send to") as HTMLInputElement
     expect(target.readOnly).toBe(true)
-    expect(screen.getByText(OWN_ADDRESS_SENTENCE)).toBeTruthy()
+    expect(screen.getByText(/Only your own address/)).toBeTruthy()
+    expect(screen.getByRole("button", { name: OWN_ADDRESS_SENTENCE })).toBeTruthy()
     cleanup()
     open(kpi, { canWriteAlerts: true })
     expect((screen.getByLabelText("Send to") as HTMLInputElement).readOnly).toBe(false)
+    expect(screen.queryByRole("button", { name: OWN_ADDRESS_SENTENCE })).toBeNull()
   })
 
   it("refuses a missing line before sending, and shows the server's sentence when it refuses", async () => {
@@ -154,8 +161,10 @@ describe("ChartAlertDialog", () => {
     const calls = mockApi(200, { ok: true }, [mineRule])
     open()
     expect(await screen.findByText("Your alerts on this chart")).toBeTruthy()
-    expect(screen.getByText(/above 100 · me@company.example/)).toBeTruthy()
-    fireEvent.click(screen.getByRole("button", { name: "Remove" }))
+    // Owner QA 2026-11-16: the person's own address is not repeated on the row.
+    expect(screen.getByText(/· above 100$/)).toBeTruthy()
+    expect(screen.queryByText(/me@company\.example/)).toBeNull()
+    fireEvent.click(screen.getByRole("button", { name: "Remove Alert: Visitors" }))
     expect(calls.length).toBe(0)
     expect(await screen.findByText("Remove alert?")).toBeTruthy()
     fireEvent.click(screen.getByRole("button", { name: "Remove alert" }))
@@ -164,10 +173,33 @@ describe("ChartAlertDialog", () => {
     expect(calls[0].url).toBe("/api/alerts?id=al_9")
   })
 
+  it("names an alert's other address on its row, with the line in thousands", async () => {
+    mockApi(200, { ok: true }, [{ ...mineRule, threshold: 1250000, target: "ops@company.example" }])
+    open()
+    expect(await screen.findByText(/· above 1,250,000 · to ops@company\.example$/)).toBeTruthy()
+    expect(screen.getByText("New alert")).toBeTruthy()
+  })
+
+  it("has one way to close: no Cancel next to the dialog's own close", () => {
+    // Owner QA 2026-11-16: X and Cancel both closed the dialog.
+    mockApi()
+    open()
+    expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull()
+    expect(screen.getByRole("button", { name: "Close" })).toBeTruthy()
+    expect(screen.getByText("Read as you")).toBeTruthy()
+  })
+
+  it("gives the When and Series choices the full width of the dialog, like the other fields", () => {
+    mockApi()
+    open(line)
+    for (const name of ["When", /Series/]) expect(screen.getByRole("combobox", { name }).className).toContain("w-full")
+  })
+
   it("shows no section when the person has no alert on the chart", async () => {
     mockApi()
     open()
     await waitFor(() => expect(screen.getByLabelText("Name")).toBeTruthy())
     expect(screen.queryByText("Your alerts on this chart")).toBeNull()
+    expect(screen.queryByText("New alert")).toBeNull()
   })
 })
