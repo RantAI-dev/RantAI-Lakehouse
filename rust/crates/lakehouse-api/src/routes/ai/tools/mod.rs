@@ -248,10 +248,12 @@ pub(in crate::routes) async fn run_tool(
         "list_saved_queries" => queries::list_saved_queries(state, principal).await,
         "run_saved_query" => queries::run_saved_query(state, principal, args).await,
         "get_audit_history" => governance::get_audit_history(state).await,
-        "list_classification_rules" => governance::list_classification_rules(state).await,
+        "list_classification_rules" => {
+            governance::list_classification_rules(state, principal).await
+        }
         "list_quality_rules" => governance::list_quality_rules(state, principal).await,
         "get_cdc_health" => governance::get_cdc_health(state).await,
-        "get_maintenance_metrics" => governance::get_maintenance_metrics(state).await,
+        "get_maintenance_metrics" => governance::get_maintenance_metrics(state, principal).await,
         "run_bronze_maintenance" => pipelines::run_bronze_maintenance(&state.dagster).await,
         "list_workloads" => ops::list_workloads(state).await,
         "kill_query" => ops::kill_query(state, args).await,
@@ -919,6 +921,41 @@ mod tests {
             assert!(reply["error"].is_string(), "{tool}: {reply}");
             assert!(reply.get("created").is_none() && reply.get("updated").is_none());
         }
+    }
+
+    /// `SEC-20`, plan 96: the classification list names tables, so a person's
+    /// list is narrowed to the tables in their reach (here there is no
+    /// database to read a reach from, so none is), and a headless run (a
+    /// scheduled agent, no person) reads the list whole, as it always has.
+    #[tokio::test]
+    async fn the_classification_list_is_narrowed_for_a_person_and_whole_for_a_headless_run() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [],
+                "rows": 2,
+                "data": [
+                    { "slug": "ds_a", "table_name": "orders_a", "tier": "confidential" },
+                    { "slug": "ds_b", "table_name": "orders_b", "tier": "restricted" },
+                ],
+            })))
+            .mount(&server)
+            .await;
+        let state = state_over_two_boards(&server.uri());
+        let args = Map::new();
+
+        let headless = run_tool(&state, None, "list_classification_rules", &args).await;
+        let assets: Vec<&str> = headless["classifications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row["asset"].as_str())
+            .collect();
+        assert_eq!(assets, ["bronze.orders_a", "bronze.orders_b"], "{headless}");
+
+        let person = caller_with("governance:read");
+        let narrowed = run_tool(&state, Some(&person), "list_classification_rules", &args).await;
+        assert_eq!(narrowed["classifications"], json!([]), "{narrowed}");
     }
 
     /// The draft of a chart call gets the save's answer, whole: the same value

@@ -94,6 +94,7 @@ mod filters {
                 cache_assisted: false,
                 tables_read: &tables,
                 message,
+                tenant_id: None,
             },
         )
         .await
@@ -1400,6 +1401,7 @@ mod migration {
                 cache_assisted: false,
                 tables_read: &[],
                 message,
+                tenant_id: None,
             },
         )
         .await

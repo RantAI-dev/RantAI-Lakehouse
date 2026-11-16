@@ -48,13 +48,14 @@ use lakehouse_bi::store;
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::StoreError;
-use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
+use lakehouse_store::audit::NewAuditEvent;
 use lakehouse_store::geo_map::{self, GeoMap, NewGeoMap};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
+use crate::audit_coverage;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
@@ -117,7 +118,7 @@ fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
 /// `BI-16` review SHOULD-FIX S1: one audit event per map write, with the map's
 /// id and name and never the file. Best effort, like the upload events: a
 /// failed audit write never fails, or undoes, the write it records.
-async fn audit(pool: &PgPool, principal: &Principal, action: &str, id: &str, name: &str) {
+async fn audit(state: &AppState, principal: &Principal, action: &str, id: &str, name: &str) {
     let event = NewAuditEvent {
         principal_id: Some(principal.id.uuid().to_string()),
         principal_kind: Some(principal.kind_for_audit().to_owned()),
@@ -132,9 +133,7 @@ async fn audit(pool: &PgPool, principal: &Principal, action: &str, id: &str, nam
         approval_id: None,
         session_id: None,
     };
-    if let Err(err) = store_audit::insert(pool, event).await {
-        tracing::warn!(%err, action, "failed to record a map audit event");
-    }
+    audit_coverage::record_best_effort(state, event).await;
 }
 
 fn store_failed(err: &dyn std::fmt::Display) -> ApiError {
@@ -311,7 +310,7 @@ pub async fn create(
         StoreError::Conflict => ApiError::Conflict(NAME_TAKEN.to_owned()),
         other => store_failed(&other),
     })?;
-    audit(pool, &principal, "map_upload", &created.id, &created.name).await;
+    audit(&state, &principal, "map_upload", &created.id, &created.name).await;
     // BI-16 part C3 (D8): the region lookup is set up after the map is saved
     // and never fails the upload; without it the map still draws and
     // `RegionOf` says it is not available for this map.
@@ -517,7 +516,7 @@ pub async fn rename(
             other => store_failed(&other),
         })?
         .ok_or_else(|| ApiError::NotFound(NOT_FOUND.to_owned()))?;
-    audit(pool, &principal, "map_rename", &renamed.id, &renamed.name).await;
+    audit(&state, &principal, "map_rename", &renamed.id, &renamed.name).await;
     Ok(ApiJson(MapViewOut(MapView::from_row(renamed))))
 }
 
@@ -624,7 +623,7 @@ pub async fn delete(
     geo_map::delete(pool, &id)
         .await
         .map_err(|err| store_failed(&err))?;
-    audit(pool, &principal, "map_delete", &id, &existing.name).await;
+    audit(&state, &principal, "map_delete", &id, &existing.name).await;
     remove_region_lookup(&state, &id).await;
     Ok((StatusCode::OK, ApiJson(json!({ "ok": true }))))
 }

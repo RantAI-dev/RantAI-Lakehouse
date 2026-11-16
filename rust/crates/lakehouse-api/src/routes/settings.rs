@@ -68,13 +68,13 @@ use lakehouse_bi::formatting::{COMPANY_PALETTE_LEN, NUMBER_LOCALES, SHIPPED_FONT
 use lakehouse_bi::grain::{TimeContext, WeekStart};
 use lakehouse_core::ApiError;
 use lakehouse_core::ident::SqlLiteral;
-use lakehouse_store::PgPool;
-use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
+use lakehouse_store::audit::NewAuditEvent;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::Digest as _;
 use uuid::Uuid;
 
+use crate::audit_coverage;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::runtime_settings::{
@@ -1229,7 +1229,14 @@ pub async fn put_email(
     // The save is visible to the next send on this process at once (D3).
     state.email_settings_cache.clear().await;
     // One audit row for the save, naming the fields that changed (D6).
-    audit_settings_update(pool, &principal, "settings.email.update", "email", &changed).await;
+    audit_settings_update(
+        &state,
+        &principal,
+        "settings.email.update",
+        "email",
+        &changed,
+    )
+    .await;
 
     let effective = crate::runtime_settings::email_or_fail(&state)
         .await
@@ -1591,7 +1598,7 @@ pub async fn put_sign_in(
     state.sign_in_settings_cache.clear().await;
     // One audit row for the save, naming the fields that changed (D6).
     audit_settings_update(
-        pool,
+        &state,
         &principal,
         "settings.sign_in.update",
         "sign-in",
@@ -1872,7 +1879,7 @@ pub async fn put_assistant(
     state.assistant_settings_cache.clear().await;
     // One audit row for the save, naming the fields that changed (D6).
     audit_settings_update(
-        pool,
+        &state,
         &principal,
         "settings.assistant.update",
         "assistant",
@@ -1938,9 +1945,10 @@ pub async fn post_assistant_test(State(state): State<AppState>) -> ApiResult<Api
 /// the NAMES of the fields that changed, never a value and never a secret.
 ///
 /// Best effort, like every other audit write: a failed audit write never
-/// fails, or undoes, the save it records.
+/// fails, or undoes, the save it records, and is counted
+/// ([`audit_coverage::record_best_effort`]).
 async fn audit_settings_update(
-    pool: &PgPool,
+    state: &AppState,
     principal: &Principal,
     action: &str,
     resource: &str,
@@ -1960,9 +1968,7 @@ async fn audit_settings_update(
         approval_id: None,
         session_id: None,
     };
-    if let Err(err) = store_audit::insert(pool, event).await {
-        tracing::warn!(%err, action, "failed to record the settings audit event");
-    }
+    audit_coverage::record_best_effort(state, event).await;
 }
 
 // ── Single Sign-On / OIDC (`ADM-12`) ─────────────────────────────────────
@@ -2305,7 +2311,7 @@ pub async fn put_sso(
     state.sso_settings_cache.clear().await;
     *state.oidc.write().await = None;
 
-    audit_settings_update(pool, &principal, "settings.sso.update", "sso", &changed).await;
+    audit_settings_update(&state, &principal, "settings.sso.update", "sso", &changed).await;
 
     // `ADM-12` D10: `PUT` saves even when the connection cannot be used
     // yet; the answer says whether it can, and why not.
@@ -2834,6 +2840,26 @@ mod tests {
             must_change_password: false,
             role_names: roles.iter().map(|r| (*r).to_owned()).collect(),
         }
+    }
+
+    /// `GOV-1` Decision 4: a settings save whose audit row cannot be written
+    /// still succeeds and the failed write is counted. A state with no
+    /// database fails every audit write without a container.
+    #[tokio::test]
+    async fn a_failed_settings_audit_write_is_counted() {
+        let state = AppState::without_a_database();
+        assert_eq!(state.audit_write_failure_count(), 0);
+
+        audit_settings_update(
+            &state,
+            &person(&[]),
+            "settings.email.update",
+            "email",
+            &["host"],
+        )
+        .await;
+
+        assert_eq!(state.audit_write_failure_count(), 1);
     }
 
     #[test]

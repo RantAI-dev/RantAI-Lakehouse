@@ -11,7 +11,7 @@
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |
 | Started | 2026-10-13; also in `BACKLOG.md` Dates |
-| Shipped | Not yet |
+| Shipped | 2026-10-13 (#127, #128) |
 | Evidence | |
 | Plan | Plan files are not kept in the repository. |
 
@@ -68,7 +68,7 @@ Run on a running deployment. Mark each Pass, Fail, or Not run with the reason. A
 
 | # | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| 1 | In Query Studio's SQL tab, run on ClickHouse a statement against a `silver` table that fails on a misspelled column, then press "Fix with AI". | The page shows one sentence on what was wrong and a line diff that names the right column. Nothing runs, so the editor holds the statement that failed until Accept. | Accepted by the AI owner, 2026-11-13 (staging `80fb2f68`) |
+| 1 | In Query Studio's SQL tab, run on ClickHouse a statement against a `silver` table that fails on a misspelled column, then press "Fix with AI". | The page shows one sentence on what was wrong and a line diff that names the right column. Nothing runs, so the editor holds the statement that failed until Accept. | Pass — Accepted by the AI owner, 2026-11-13 (staging `80fb2f68`) |
 | 2 | With a ClickHouse statement in the editor, press "Explain". | The page explains the statement in plain words, and no query runs. | |
 | 3 | With a Trino statement in the editor, press "Explain". | The page explains the statement in plain words, and no query runs. | |
 | 4 | After a proposal is shown, press Reject. | The proposal closes and the editor holds the statement it held before. | |

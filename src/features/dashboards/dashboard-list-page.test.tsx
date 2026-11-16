@@ -485,6 +485,11 @@ describe("at phone width (BI-59 T6)", () => {
         "GET /api/dashboard/folders": () => json({ folders: FOLDERS }),
       })
       renderPage()
+      // The folder name in a row's facts comes from the folder list, which can
+      // arrive after the rows: wait for the full facts line before reading the
+      // rows (flaky in CI, where the row first read "Report · 2 charts · Bima ·
+      // 20h ago"). The assertions below are the same as before the wait.
+      await screen.findByText(/^Report · 2 charts · Tourism · Bima · .+ ago$/)
       const list = await screen.findByRole("list", { name: "Dashboards, reports and templates" })
       expect(document.querySelector("table")).toBeNull()
       const row = within(list).getByText("Wisman 2020-2024").closest("li")

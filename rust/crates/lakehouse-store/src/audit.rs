@@ -21,10 +21,12 @@
 //! a [`NewAuditEvent`]: never pass a `secretRef`'s resolved plaintext,
 //! never pass raw SQL result rows, only the shape of what was asked for.
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Serialize;
 use serde_json::Value;
-use sqlx::FromRow;
 use sqlx::types::Json;
+use sqlx::{FromRow, Postgres, QueryBuilder};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -247,11 +249,12 @@ pub async fn insert(pool: &PgPool, event: NewAuditEvent) -> Result<AuditEvent, S
     Ok(row.into())
 }
 
-/// Filters accepted by [`list`]. All fields are optional narrowing; `limit`
-/// always applies.
+/// Filters accepted by [`list`], [`search`] and [`count_matching`]. Every
+/// field but `limit` narrows the result when set; the narrowings combine
+/// with AND.
 #[derive(Debug, Clone)]
 pub struct AuditFilter {
-    /// Maximum number of rows to return.
+    /// Maximum number of rows to return. [`search`] clamps it, see there.
     pub limit: i64,
     /// Restrict to this resource kind, if given.
     pub resource_kind: Option<String>,
@@ -261,8 +264,21 @@ pub struct AuditFilter {
     pub resource_id: Option<String>,
     /// Restrict to this principal id, if given.
     pub principal_id: Option<String>,
-    /// Restrict to events at or after this time, if given.
+    /// Restrict to events at or after this time, if given (inclusive).
     pub since: Option<OffsetDateTime>,
+    /// Restrict to events before this time, if given (exclusive, so two
+    /// adjacent ranges never share an event).
+    pub until: Option<OffsetDateTime>,
+    /// Restrict to this action. A value that ends in `.` is a prefix
+    /// (`dashboard.` matches `dashboard.update`); any other value must
+    /// match the whole action. Never interpreted as a pattern: `_` and `%`
+    /// in it match themselves.
+    pub action: Option<String>,
+    /// Restrict to this outcome, if given.
+    pub outcome: Option<String>,
+    /// Continue after the row this cursor names, newest first. [`count_matching`]
+    /// ignores it.
+    pub cursor: Option<AuditCursor>,
 }
 
 impl Default for AuditFilter {
@@ -275,35 +291,284 @@ impl Default for AuditFilter {
             resource_id: None,
             principal_id: None,
             since: None,
+            until: None,
+            action: None,
+            outcome: None,
+            cursor: None,
         }
     }
 }
 
-/// List audit events, newest first, narrowed by `filter`.
+/// The page size [`search`] uses when the filter's `limit` is below 1.
+pub const SEARCH_DEFAULT_LIMIT: i64 = 100;
+
+/// The largest page [`search`] returns, whatever `limit` asks for.
+pub const SEARCH_MAX_LIMIT: i64 = 500;
+
+/// The spot in the newest-first order that a page ended at: the `at` of the
+/// last row at full precision, and its id.
+///
+/// `at` is a `TIMESTAMPTZ`, which keeps microseconds, while an event shown
+/// to a caller carries `at` as an ISO string cut to milliseconds. A cursor
+/// built from that string would sit before every other row of the same
+/// millisecond and skip them, so the cursor comes from the stored value,
+/// never from [`AuditEvent::at`]. The id breaks ties between rows with the
+/// same `at`: the order is `(at DESC, id DESC)`, and the next page is the
+/// rows strictly after `(at, id)` in it.
+///
+/// Opaque to callers: they hold it and pass it back as [`encode`](Self::encode)d
+/// text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditCursor {
+    at_micros: i64,
+    id: String,
+}
+
+/// Text that is not a cursor [`AuditCursor::encode`] wrote. The message is a
+/// fixed sentence, safe to show a caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the cursor is not valid")]
+pub struct AuditCursorError;
+
+impl AuditCursor {
+    /// A cursor at `at_micros` microseconds since the Unix epoch and `id`.
+    #[must_use]
+    pub fn from_parts(at_micros: i64, id: impl Into<String>) -> Self {
+        Self {
+            at_micros,
+            id: id.into(),
+        }
+    }
+
+    /// The cursor as url-safe text: base64 of `<microseconds>:<id>`. The id
+    /// may itself hold a `:`, so [`decode`](Self::decode) splits at the first one.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        URL_SAFE_NO_PAD.encode(format!("{}:{}", self.at_micros, self.id))
+    }
+
+    /// Read a cursor back from [`encode`](Self::encode)'s text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditCursorError`] for anything [`encode`](Self::encode) could
+    /// not have produced: bad base64, text that is not UTF-8, no `:`, a
+    /// microsecond count that is not a number or is outside years 1 to 9999,
+    /// an empty id, an id with a NUL byte.
+    pub fn decode(text: &str) -> Result<Self, AuditCursorError> {
+        let bytes = URL_SAFE_NO_PAD.decode(text).map_err(|_| AuditCursorError)?;
+        let text = String::from_utf8(bytes).map_err(|_| AuditCursorError)?;
+        let (micros, id) = text.split_once(':').ok_or(AuditCursorError)?;
+        let at_micros: i64 = micros.parse().map_err(|_| AuditCursorError)?;
+        // GOV-1 review R-1: both checks keep a hand-made cursor away from
+        // Postgres, which would otherwise refuse the bound value and turn a
+        // bad request into a 500. A TEXT value cannot hold a NUL byte.
+        if id.is_empty() || id.contains('\0') || !micros_in_audit_range(at_micros) {
+            return Err(AuditCursorError);
+        }
+        Ok(Self::from_parts(at_micros, id))
+    }
+}
+
+/// Years 1 to 9999. Postgres `timestamptz` reaches from 4713 BC to 294276 AD
+/// and the `time` crate from year -9999 to 9999, so `time` alone accepts the
+/// years from -9999 to 4714 BC that Postgres refuses. Years 1 to 9999 are
+/// inside both, and any real audit row falls inside them.
+fn micros_in_audit_range(micros: i64) -> bool {
+    micros_to_time(micros).is_some_and(|at| (1..=9999).contains(&at.year()))
+}
+
+fn micros_to_time(micros: i64) -> Option<OffsetDateTime> {
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(micros) * 1_000).ok()
+}
+
+fn time_to_micros(at: OffsetDateTime) -> Option<i64> {
+    i64::try_from(at.unix_timestamp_nanos().div_euclid(1_000)).ok()
+}
+
+/// One page of [`search`] results.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuditPage {
+    /// Up to the requested number of events, newest first.
+    pub events: Vec<AuditEvent>,
+    /// Where the next page starts, or `None` when this page holds the last
+    /// of the matching events.
+    pub next_cursor: Option<AuditCursor>,
+}
+
+/// Builds `<head> WHERE ...` for a filter. `page_limit` adds the keyset
+/// order and `LIMIT`, and with it the cursor condition; without it (a
+/// count) the cursor is ignored too.
+///
+/// Only constant fragments are formatted in. Every value, including the
+/// `LIKE` pattern of an action prefix, goes through `push_bind`.
+fn build_filtered(
+    head: &str,
+    filter: &AuditFilter,
+    page_limit: Option<i64>,
+) -> Result<QueryBuilder<Postgres>, StoreError> {
+    let mut qb = QueryBuilder::new(head);
+    qb.push(" WHERE true");
+    if let Some(kind) = &filter.resource_kind {
+        qb.push(" AND resource_kind = ").push_bind(kind.clone());
+    }
+    if let Some(id) = &filter.resource_id {
+        qb.push(" AND resource_id = ").push_bind(id.clone());
+    }
+    if let Some(principal) = &filter.principal_id {
+        qb.push(" AND principal_id = ").push_bind(principal.clone());
+    }
+    if let Some(since) = filter.since {
+        qb.push(" AND at >= ").push_bind(since);
+    }
+    if let Some(until) = filter.until {
+        qb.push(" AND at < ").push_bind(until);
+    }
+    if let Some(action) = &filter.action {
+        if action.ends_with('.') {
+            // A prefix is a LIKE pattern with the caller's own `\`, `%` and
+            // `_` escaped, so it can only ever match what was typed.
+            let mut pattern = String::with_capacity(action.len() + 1);
+            for ch in action.chars() {
+                if matches!(ch, '\\' | '%' | '_') {
+                    pattern.push('\\');
+                }
+                pattern.push(ch);
+            }
+            pattern.push('%');
+            qb.push(" AND action LIKE ")
+                .push_bind(pattern)
+                .push(" ESCAPE '\\'");
+        } else {
+            qb.push(" AND action = ").push_bind(action.clone());
+        }
+    }
+    if let Some(outcome) = &filter.outcome {
+        qb.push(" AND outcome = ").push_bind(outcome.clone());
+    }
+    if let Some(limit) = page_limit {
+        if let Some(cursor) = &filter.cursor {
+            let at = micros_to_time(cursor.at_micros)
+                .ok_or_else(|| StoreError::Validation("the cursor is not valid".to_owned()))?;
+            qb.push(" AND (at, id) < (")
+                .push_bind(at)
+                .push(", ")
+                .push_bind(cursor.id.clone())
+                .push(")");
+        }
+        qb.push(" ORDER BY at DESC, id DESC LIMIT ")
+            .push_bind(limit);
+    }
+    Ok(qb)
+}
+
+fn select_head() -> String {
+    format!("SELECT {AUDIT_COLUMNS} FROM audit_event")
+}
+
+/// List audit events, newest first, narrowed by `filter`. `filter.limit` is
+/// used as given; [`search`] is the bounded, paged form.
 ///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn list(pool: &PgPool, filter: AuditFilter) -> Result<Vec<AuditEvent>, StoreError> {
-    let sql = format!(
-        "SELECT {AUDIT_COLUMNS} FROM audit_event \
-         WHERE ($1::text IS NULL OR resource_kind = $1) \
-         AND ($2::text IS NULL OR resource_id = $2) \
-         AND ($3::text IS NULL OR principal_id = $3) \
-         AND ($4::timestamptz IS NULL OR at >= $4) \
-         ORDER BY at DESC \
-         LIMIT $5"
-    );
-    // safe: only the constant `AUDIT_COLUMNS` is formatted in; values are bound.
-    let rows: Vec<AuditRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
-        .bind(&filter.resource_kind)
-        .bind(&filter.resource_id)
-        .bind(&filter.principal_id)
-        .bind(filter.since)
-        .bind(filter.limit)
-        .fetch_all(pool)
-        .await?;
+    let mut qb = build_filtered(&select_head(), &filter, Some(filter.limit))?;
+    let rows: Vec<AuditRow> = qb.build_query_as().fetch_all(pool).await?;
     Ok(rows.into_iter().map(AuditEvent::from).collect())
+}
+
+/// One page of events, newest first, narrowed by `filter` and continuing
+/// after `filter.cursor`.
+///
+/// The order is `(at DESC, id DESC)`, so a page boundary that falls between
+/// rows of one `at` loses and repeats nothing. `filter.limit` below 1 means
+/// [`SEARCH_DEFAULT_LIMIT`]; above [`SEARCH_MAX_LIMIT`] it is cut to that.
+/// One row more than the page is read to learn whether another page
+/// exists.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails, and
+/// [`StoreError::Validation`] if the cursor holds a time no timestamp can.
+pub async fn search(pool: &PgPool, filter: &AuditFilter) -> Result<AuditPage, StoreError> {
+    let page_size = if filter.limit < 1 {
+        SEARCH_DEFAULT_LIMIT
+    } else {
+        filter.limit.min(SEARCH_MAX_LIMIT)
+    };
+    let mut qb = build_filtered(&select_head(), filter, Some(page_size + 1))?;
+    let mut rows: Vec<AuditRow> = qb.build_query_as().fetch_all(pool).await?;
+    let page_len = usize::try_from(page_size).unwrap_or(usize::MAX);
+    let has_more = rows.len() > page_len;
+    rows.truncate(page_len);
+    let next_cursor = match rows.last() {
+        Some(last) if has_more => {
+            let micros = time_to_micros(last.at).ok_or_else(|| {
+                StoreError::Validation("an event time is out of range".to_owned())
+            })?;
+            Some(AuditCursor::from_parts(micros, last.id.clone()))
+        }
+        _ => None,
+    };
+    Ok(AuditPage {
+        events: rows.into_iter().map(AuditEvent::from).collect(),
+        next_cursor,
+    })
+}
+
+/// How many events match `filter`, ignoring its `limit` and `cursor`. The
+/// export uses it to say how many events match when the file holds fewer.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn count_matching(pool: &PgPool, filter: &AuditFilter) -> Result<i64, StoreError> {
+    let mut qb = build_filtered("SELECT count(*) FROM audit_event", filter, None)?;
+    let count: i64 = qb.build_query_scalar().fetch_one(pool).await?;
+    Ok(count)
+}
+
+/// One event by id, or `None` when no event has that id.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn get(pool: &PgPool, id: &str) -> Result<Option<AuditEvent>, StoreError> {
+    let sql = format!("SELECT {AUDIT_COLUMNS} FROM audit_event WHERE id = $1");
+    // safe: only the constant `AUDIT_COLUMNS` is formatted in; the id is bound.
+    let row: Option<AuditRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(AuditEvent::from))
+}
+
+/// The database's plan for the statement [`search`] runs for `filter`, one
+/// line per element. With `analyze` the statement is executed and the lines
+/// carry real row counts and timings.
+///
+/// This exists so a test can pin which index serves each filter shape. It
+/// shares [`search`]'s statement builder, so the plan it returns is the plan
+/// of the real query.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn explain_search(
+    pool: &PgPool,
+    filter: &AuditFilter,
+    analyze: bool,
+) -> Result<Vec<String>, StoreError> {
+    let explain = if analyze {
+        "EXPLAIN (ANALYZE, BUFFERS) "
+    } else {
+        "EXPLAIN "
+    };
+    let head = format!("{explain}{}", select_head());
+    let mut qb = build_filtered(&head, filter, Some(SEARCH_DEFAULT_LIMIT + 1))?;
+    let lines: Vec<String> = qb.build_query_scalar().fetch_all(pool).await?;
+    Ok(lines)
 }
 
 /// List the audit events about any of several resources of one kind,
@@ -352,5 +617,9 @@ mod tests {
         assert!(filter.resource_id.is_none());
         assert!(filter.principal_id.is_none());
         assert!(filter.since.is_none());
+        assert!(filter.until.is_none());
+        assert!(filter.action.is_none());
+        assert!(filter.outcome.is_none());
+        assert!(filter.cursor.is_none());
     }
 }

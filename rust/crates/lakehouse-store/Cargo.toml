@@ -23,6 +23,8 @@ serde_json = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }
 time = { workspace = true }
+# The audit search cursor is url-safe base64 text (`audit::AuditCursor`).
+base64 = { workspace = true }
 jiff = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
