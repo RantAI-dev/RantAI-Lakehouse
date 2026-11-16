@@ -27,11 +27,12 @@
 //!
 //! Connectors, authored pipelines and uploaded tables are read for the
 //! caller's own tenant only (`tenant_scope::resolve`), exactly like their
-//! list routes. The catalog, the `ClickHouse` tables and the Gold export
-//! history are one per
+//! list routes. The catalog, the `ClickHouse` tables, the Gold export
+//! history and the dashboard charts are one per
 //! deployment with no tenant column; they are included only when
 //! `catalog::catalog_tenant_refusal` allows this caller to read the shared
-//! catalog, the same single rule the catalog route applies.
+//! catalog, the same single rule the catalog route applies (`SEC-20`, plan
+//! 96: the charts too, on every route that draws them).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 

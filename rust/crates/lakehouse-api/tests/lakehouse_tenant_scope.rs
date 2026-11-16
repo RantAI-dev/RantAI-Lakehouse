@@ -1548,3 +1548,328 @@ async fn an_asset_that_names_no_table_stays_in_the_lists_of_the_owning_tenant() 
     assert_eq!(asset_ids(&body, "items"), expected, "{body}");
     assert_no_trace_of_the_retail_upload("/api/catalog/query", &body);
 }
+
+// ── Plan 96: the console's lineage routes and the classification list ───
+//
+// Plan 95 put the shared-catalog rule in the assistant's `get_lineage` tool
+// only. The console routes draw the same dashboard charts, and a tenant that
+// does not own the shared catalog must not read them there either. A dashboard
+// chart carries no tenant, so it belongs to the shared catalog's owner.
+
+/// What a lineage reader holds, to open the console routes (`lineage:read`)
+/// and name charts (`dashboard:read`).
+const LINEAGE_ROUTE_READER: &str = "lineage:read, dashboard:read";
+
+/// The lineage graph's nodes and edges are empty.
+fn assert_an_empty_graph(body: &Value) {
+    assert_eq!(body["supported"], json!(true), "{body}");
+    assert_eq!(node_ids(body), Vec::<String>::new(), "{body}");
+    assert_eq!(body["edges"], json!([]), "{body}");
+    assert_eq!(body["columnMappings"], json!([]), "{body}");
+}
+
+#[tokio::test]
+async fn the_lineage_page_draws_no_dashboard_chart_for_a_tenant_that_does_not_own_the_shared_catalog()
+ {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_clickhouse_with_data(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let other = cookie_in_tenant(&pool, LINEAGE_ROUTE_READER, OTHER_TENANT).await;
+
+    // By the table the chart reads, by the chart's id, and by its title.
+    for focus in [
+        format!("serving.{CHART_MART}"),
+        format!("chart:{CHART_ID}"),
+        CHART_TITLE.to_owned(),
+    ] {
+        let (status, body) = get(
+            &router,
+            &format!(
+                "/api/governance/lineage?focus={}",
+                focus.replace(' ', "%20")
+            ),
+            &other,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_an_empty_graph(&body);
+    }
+}
+
+#[tokio::test]
+async fn the_lineage_page_still_draws_the_dashboard_charts_for_the_tenant_that_owns_the_shared_catalog()
+ {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_clickhouse_with_data(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let owner = cookie_in_tenant(&pool, LINEAGE_ROUTE_READER, CATALOG_TENANT).await;
+    let operator = operator_cookie(&pool).await;
+
+    for cookie in [&owner, &operator] {
+        let (status, body) = get(
+            &router,
+            &format!("/api/governance/lineage?focus=serving.{CHART_MART}"),
+            cookie,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ids = node_ids(&body);
+        assert!(
+            ids.contains(&format!("chart:{CHART_ID}")),
+            "the chart is drawn: {ids:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_chart_lineage_route_answers_the_unknown_404_to_a_tenant_that_does_not_own_the_shared_catalog()
+ {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_clickhouse_with_data(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let owner = cookie_in_tenant(&pool, LINEAGE_ROUTE_READER, CATALOG_TENANT).await;
+    let other = cookie_in_tenant(&pool, LINEAGE_ROUTE_READER, OTHER_TENANT).await;
+
+    // The answer an id nobody has gets, from the owner.
+    let (status, unknown) = get(
+        &router,
+        "/api/dashboard/charts/chart_no_such/lineage",
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{unknown}");
+
+    // Another tenant asking for the owner's chart gets the same answer, byte
+    // for byte: no title, no table, and nothing that says the chart exists.
+    let (status, refused) = get(
+        &router,
+        &format!("/api/dashboard/charts/{CHART_ID}/lineage"),
+        &other,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
+    assert_eq!(refused, unknown, "a refusal is no oracle");
+    assert_none_of_the_groups_data(&refused);
+}
+
+#[tokio::test]
+async fn the_chart_lineage_route_still_answers_the_tenant_that_owns_the_shared_catalog() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_clickhouse_with_data(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let owner = cookie_in_tenant(&pool, LINEAGE_ROUTE_READER, CATALOG_TENANT).await;
+    let operator = operator_cookie(&pool).await;
+
+    for cookie in [&owner, &operator] {
+        let (status, body) = get(
+            &router,
+            &format!("/api/dashboard/charts/{CHART_ID}/lineage"),
+            cookie,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["chart"]["title"], json!(CHART_TITLE), "{body}");
+    }
+}
+
+#[tokio::test]
+async fn the_used_by_list_names_no_chart_to_a_tenant_that_does_not_own_the_shared_catalog() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_clickhouse_with_data(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let owner = cookie_in_tenant(&pool, LINEAGE_ROUTE_READER, CATALOG_TENANT).await;
+    let other = cookie_in_tenant(&pool, LINEAGE_ROUTE_READER, OTHER_TENANT).await;
+    let uri = format!("/api/governance/lineage/used-by?table=serving.{CHART_MART}");
+
+    // The owner lists its chart.
+    let (status, body) = get(&router, &uri, &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["charts"][0]["chartId"], json!(CHART_ID), "{body}");
+    assert_eq!(
+        body["charts"][0]["chartTitle"],
+        json!(CHART_TITLE),
+        "{body}"
+    );
+
+    // Another tenant gets the shared catalog's own refusal: no chart and no
+    // count, so the answer cannot be read as "no chart reads this table". It
+    // is the same sentence for every table, so it is no oracle.
+    let reason = the_rules_reason(&router, &pool).await;
+    let (status, body) = get(&router, &uri, &other, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["supported"], json!(false), "{body}");
+    assert_eq!(body["reason"], json!(reason), "{body}");
+    assert!(body.get("charts").is_none(), "{body}");
+    assert!(body.get("hiddenCount").is_none(), "{body}");
+    assert_none_of_the_groups_data(&body);
+    let other_table = "/api/governance/lineage/used-by?table=serving.mart_no_such";
+    let (_, elsewhere) = get(&router, other_table, &other, None).await;
+    assert_eq!(elsewhere, body, "the same answer for every table");
+}
+
+#[tokio::test]
+async fn the_column_lineage_route_names_no_dependent_chart_to_a_tenant_that_does_not_own_the_shared_catalog()
+ {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_clickhouse_with_data(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let owner = cookie_in_tenant(&pool, LINEAGE_ROUTE_READER, CATALOG_TENANT).await;
+    let other = cookie_in_tenant(&pool, LINEAGE_ROUTE_READER, OTHER_TENANT).await;
+    // The caller names the starting column, and a chart may read that column.
+    let uri = format!(
+        "/api/governance/lineage/columns?table=serving.{CHART_MART}&column=visitors&direction=down"
+    );
+
+    // The owner is told which chart reads the column.
+    let (status, body) = get(&router, &uri, &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["charts"][0]["chartId"], json!(CHART_ID), "{body}");
+
+    // Another tenant is told of no chart: they are hidden, as they are from a
+    // caller without `dashboard:read`.
+    let (status, body) = get(&router, &uri, &other, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.get("charts").is_none(), "{body}");
+    assert_eq!(body["chartsHidden"], json!(true), "{body}");
+    assert!(!body.to_string().contains(CHART_TITLE), "{body}");
+}
+
+// The classification list.
+
+const GOVERNANCE_READER: &str = "governance:read";
+const CHAT_AND_GOVERNANCE_READ: &str = "assistant:use, assistant:ask, governance:read";
+
+/// `ClickHouse` whose Bronze registry classifies the owner's upload, the
+/// other tenant's upload, and one table of the shared catalog.
+async fn mount_classified_registry(server: &MockServer) {
+    mount_empty_clickhouse(server).await;
+    let row = |slug: &str, table: &str, tier: &str| json!({ "slug": slug, "table_name": table, "tier": tier });
+    clickhouse_rows(
+        server,
+        "bronze_meta.dataset_catalog",
+        vec![
+            row(GROUP_SLUG, GROUP_TABLE, "confidential"),
+            row(RETAIL_SLUG, RETAIL_TABLE, "restricted"),
+            row(DATASET_SLUG, DATASET_TABLE, "internal"),
+        ],
+    )
+    .await;
+}
+
+/// The Bronze tables a classification answer names, sorted.
+fn classified_bronze_assets(body: &Value) -> Vec<String> {
+    let mut assets: Vec<String> = body["classifications"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a list of classifications: {body}"))
+        .iter()
+        .filter_map(|row| row["asset"].as_str())
+        .filter(|asset| asset.starts_with("bronze."))
+        .map(str::to_owned)
+        .collect();
+    assets.sort();
+    assets
+}
+
+#[tokio::test]
+async fn the_classification_list_holds_only_the_tables_the_caller_may_read() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_classified_registry(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let uri = "/api/governance/classification";
+    let owner = cookie_in_tenant(&pool, GOVERNANCE_READER, CATALOG_TENANT).await;
+    let other = cookie_in_tenant(&pool, GOVERNANCE_READER, OTHER_TENANT).await;
+    let operator = operator_cookie(&pool).await;
+
+    // The owning tenant: its own upload and the shared catalog's table, never
+    // the upload the other tenant holds.
+    let (status, body) = get(&router, uri, &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        classified_bronze_assets(&body),
+        vec![
+            format!("bronze.{GROUP_TABLE}"),
+            format!("bronze.{DATASET_TABLE}")
+        ],
+        "{body}"
+    );
+    assert_no_trace_of_the_retail_upload(uri, &body);
+
+    // Another tenant: its own upload only. Neither the shared catalog's table
+    // nor the owning tenant's upload is named.
+    let (status, body) = get(&router, uri, &other, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        classified_bronze_assets(&body),
+        vec![format!("bronze.{RETAIL_TABLE}")],
+        "{body}"
+    );
+    let text = body.to_string();
+    for hidden in [GROUP_TABLE, GROUP_SLUG, DATASET_TABLE, DATASET_SLUG] {
+        assert!(!text.contains(hidden), "{hidden} must not appear: {body}");
+    }
+
+    // An operator reaches all three.
+    let (status, body) = get(&router, uri, &operator, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(classified_bronze_assets(&body).len(), 3, "{body}");
+}
+
+#[tokio::test]
+async fn the_classification_tool_holds_only_the_tables_the_person_may_read() {
+    let catalog = MockServer::start().await;
+    mount_catalog(&catalog).await;
+    let ch = MockServer::start().await;
+    mount_classified_registry(&ch).await;
+    let TestApp { router, pool } = spin_up_with_catalog(&catalog, &ch).await;
+    claim_the_uploads(&pool).await;
+    let owner = cookie_in_tenant(&pool, CHAT_AND_GOVERNANCE_READ, CATALOG_TENANT).await;
+    let other = cookie_in_tenant(&pool, CHAT_AND_GOVERNANCE_READ, OTHER_TENANT).await;
+
+    let listed = call_tool(&router, &owner, "list_classification_rules", json!({})).await;
+    assert_eq!(
+        classified_bronze_assets(&listed["result"]),
+        vec![
+            format!("bronze.{GROUP_TABLE}"),
+            format!("bronze.{DATASET_TABLE}")
+        ],
+        "{listed}"
+    );
+    assert_no_trace_of_the_retail_upload("list_classification_rules", &listed);
+
+    let listed = call_tool(&router, &other, "list_classification_rules", json!({})).await;
+    assert_eq!(
+        classified_bronze_assets(&listed["result"]),
+        vec![format!("bronze.{RETAIL_TABLE}")],
+        "{listed}"
+    );
+    let text = listed.to_string();
+    for hidden in [GROUP_TABLE, GROUP_SLUG, DATASET_TABLE, DATASET_SLUG] {
+        assert!(!text.contains(hidden), "{hidden} must not appear: {listed}");
+    }
+}
