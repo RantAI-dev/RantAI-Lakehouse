@@ -3295,22 +3295,21 @@ mod tests {
         let viewer = system(analyst(1)).await;
         assert!(
             viewer.contains(
-                "Your account cannot change dashboards; ask an editor or an administrator."
+                "Your account does not have the dashboard:write permission, so it cannot change dashboards; ask an editor or an administrator."
             ),
             "{viewer}"
         );
         assert!(
-            viewer.find("Your account cannot change dashboards")
-                < viewer.find(&prompt::closing("Move the map charts to a new tab.", None)),
+            viewer.find(
+                "Your account does not have the dashboard:write permission, so it cannot change dashboards"
+            ) < viewer.find(&prompt::closing("Move the map charts to a new tab.", None)),
             "the sentence comes before the language line"
         );
         let mut editor = analyst(2);
         editor.permissions = lakehouse_auth::PermissionSet::parse("dashboard:write, query:read");
-        assert!(
-            !system(editor)
-                .await
-                .contains("Your account cannot change dashboards")
-        );
+        assert!(!system(editor).await.contains(
+            "does not have the dashboard:write permission, so it cannot change dashboards"
+        ));
     }
 
     #[tokio::test]
