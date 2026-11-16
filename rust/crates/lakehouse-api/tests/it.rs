@@ -123,6 +123,7 @@ mod lakehouse_tenant_scope;
 mod login_throttle;
 mod maps_routes;
 mod ops_workloads;
+mod overview_feed;
 mod pdf_export;
 mod pdf_real_gotenberg;
 mod permission_catalog;

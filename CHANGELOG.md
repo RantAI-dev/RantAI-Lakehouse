@@ -76,6 +76,7 @@ once a first release is tagged.
 
 ### Fixed
 
+- The Overview activity feed shows everyone's actions only to people who may read the audit trail; others see their own (backlog `GOV-1`).
 - The approval card for deleting a chart says the chart goes to the trash and can be restored for 30 days, instead of saying the action cannot be undone (backlog `AI-1`).
 - The approval card for deleting a board says the board and its charts go to the trash and can be restored for 30 days, instead of saying the action cannot be undone (backlog `AI-1`).
 - Numbers and labels on charts (backlog `BI-55`): an average, a minimum and a maximum keep up to six decimals instead of being rounded to a whole number (a chart saved before keeps whole numbers until it is saved again, unless a dashboard filter applies); a donut's legend pages instead of being cut off; the Rows tables read "(No value)" and "(Empty)" as the chart does; the records panel of a chart with several questions names the question; a joined column reads `table.column` in the record list and in a downloaded header; a rupiah amount reads "Rp" in the English number locale too, and "Currency, compact" is a choice of its own.
