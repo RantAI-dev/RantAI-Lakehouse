@@ -51,3 +51,13 @@ visitors to revenue without an editor making a second chart.
 - `BI-11-AC3` A parameter as top-N changes how many bars show; a reference line follows a parameter.
 - `BI-11-AC4` A user without `dashboard:write` cannot define a parameter; a value outside its range or list is refused with a plain message.
 - `AI-6-AC1` (the `BI-11` part) "add a target parameter of 20,000 and draw it as a line on this chart" works. Accepted by the AI owner, 2026-11-14 (staging `240d2e62`)
+
+## Acceptance run (2026-11-16)
+
+Run on the QA stack (main `0ea686e5` plus the open console pull requests) by browser automation and the API, with evidence kept by the planner. Accepted by the product owner on 2026-11-16.
+
+- `BI-11-AC1`: pass.
+- `BI-11-AC2`: pass.
+- `BI-11-AC3`: pass.
+- `BI-11-AC4`: pass.
+- `AI-6-AC1` (BI-11 part): pass.

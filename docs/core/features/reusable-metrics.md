@@ -58,3 +58,15 @@ definition for.
 - `BI-2-AC5` A user without `metric:write` cannot define a metric; a failure shows a plain message.
 - `BI-2-AC6` An alert rule "total visitors greater than 100,000" on the metric fires when the metric is above it and not when it is below; if the metric is deleted or cannot be read the rule is reported as failed with a reason, and a metric a rule watches cannot be deleted.
 - `AI-7-AC1` Asked for a number a metric defines, the assistant uses the metric and says which.
+
+## Acceptance run (2026-11-16)
+
+Run on the QA stack (main `0ea686e5` plus the open console pull requests) by browser automation and the API, with evidence kept by the planner. Accepted by the product owner on 2026-11-16.
+
+- `BI-2-AC1`: pass.
+- `BI-2-AC2`: pass.
+- `BI-2-AC3`: pass.
+- `BI-2-AC4`: pass.
+- `BI-2-AC5`: pass.
+- `BI-2-AC6`: pass.
+- `AI-7-AC1`: pass.

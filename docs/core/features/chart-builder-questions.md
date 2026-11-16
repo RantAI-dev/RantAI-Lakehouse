@@ -70,3 +70,14 @@ Part 2:
 - `BI-6-AC4` Top 5 with "Other": the bars add up to the table's own total, and an average measure's "Other" equals the average of the remaining rows.
 - `BI-6-AC5` The chart's own filter still applies when the dashboard has a filter on the same column, and the record list of a clicked bar honours both.
 - `AI-6-AC1` (the `BI-6` part) "Visitors by province and month, one category only, top 10" is built by the assistant in one go. Accepted by the AI owner, 2026-11-14 (staging `240d2e62`)
+
+## Acceptance run (2026-11-16)
+
+Run on the QA stack (main `0ea686e5` plus the open console pull requests) by browser automation and the API, with evidence kept by the planner. Accepted by the product owner on 2026-11-16.
+
+- `BI-6-AC1`: pass.
+- `BI-6-AC2`: pass.
+- `BI-6-AC3`: pass.
+- `BI-6-AC4`: pass.
+- `BI-6-AC5`: pass.
+- `AI-6-AC1` (BI-6 part): partial: the chart was built and matched SQL only with explicit wording; a natural request hit the tool-call limit and described a chart that was not built (follow-up item).
