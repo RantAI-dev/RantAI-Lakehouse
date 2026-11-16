@@ -1358,10 +1358,13 @@ fn pieces_from(live: &Live, stats: &[Stats], notes: &Notes, withheld: Option<&Wi
 
 /// The words of a question: the user's last [`QUESTION_MESSAGES`] messages
 /// (`user_messages` holds every user message, oldest first), lower-cased, without
-/// words shorter than [`MIN_QUESTION_WORD_CHARS`] and without the function
-/// words of [`super::prompt::reply_language`]'s two lists. A stored term of
-/// the caller's `terms` that the question uses (see [`term_is_used`]) also
-/// brings the words of its meaning, with the same filters.
+/// words shorter than [`MIN_QUESTION_WORD_CHARS`] and without the words of
+/// [`super::prompt::reply_language`]'s two lists: the Indonesian and English
+/// function words and the Indonesian command words of a dashboard request
+/// (`AI-1`, plan 91), so a question that uses one loses that word from the
+/// matching set. A stored term of the caller's `terms` that the question uses
+/// (see [`term_is_used`]) also brings the words of its meaning, with the same
+/// filters.
 ///
 /// The terms are the caller's own, read for this request. This runs per
 /// request and its result is never stored in the shared cache.
