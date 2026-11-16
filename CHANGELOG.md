@@ -11,6 +11,7 @@ once a first release is tagged.
 
 ### Added
 
+- The Usage page, under Monitoring (backlog `OPS-8`, part B; feature page `docs/core/features/usage-and-cost-view.md`). It adds up the recorded query runs per day, per person and per engine for the chosen period (up to 366 days): queries, scanned bytes and engine time, which is the wall-clock time of the query. An administrator enters rates per TB scanned and per engine hour, each from a start day, and the page then shows an estimate in money, marked as an estimate. The period exports as CSV, and an export is recorded as `usage.export`. The page and its routes (`GET /api/usage/queries`, `/queries/export`, `/rates`) need the permission `usage:read`; `POST /api/usage/rates` needs `settings:write`. A tenant administrator sees only their tenant, and the all-tenant administrator can group by tenant. Storage per layer is not shown yet.
 - Every change made in the console writes an audit row, refused changes included; the database refuses to edit or delete an audit row.
 - The Operations page shows how many audit rows the service could not write since it started.
 - The audit page searches events of any age on the server by person, action, object, outcome and time range, pages through them and exports them as CSV (up to 100,000 rows per file); an export is itself recorded as `audit.export`.
