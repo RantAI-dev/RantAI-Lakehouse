@@ -283,6 +283,7 @@ async fn a_seeded_analyst_is_denied_the_four_hardened_permission_families() {
     for (method, path) in [
         ("POST", "/api/identity/roles"),
         ("POST", "/api/agents/employees/x/suspend"),
+        ("POST", "/api/agents/employees"),
         ("POST", "/api/storage/restore"),
     ] {
         let resp = request_with_cookie(&router, method, path, &cookie).await;
@@ -292,6 +293,32 @@ async fn a_seeded_analyst_is_denied_the_four_hardened_permission_families() {
             "{method} {path}: a seeded Analyst must be denied"
         );
     }
+}
+
+/// `SEC-20`, plan 97: `POST /api/agents/employees` needs `agent:manage`, both
+/// directions with real principals. A principal holding another permission is
+/// refused at the router; one holding `agent:manage` alone is let past it, so
+/// the empty body reaches the handler and is refused as a 400, not a 401 or 403.
+#[tokio::test]
+async fn creating_an_employee_needs_agent_manage_both_ways() {
+    let TestApp { router, pool } = spin_up().await;
+    let other = create_principal_with_permissions(&pool, "agent:approve").await;
+    let manager = create_principal_with_permissions(&pool, "agent:manage").await;
+
+    let cookie = session_cookie_for_user(&pool, other).await;
+    let denied = request_with_cookie(&router, "POST", "/api/agents/employees", &cookie).await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let cookie = session_cookie_for_user(&pool, manager).await;
+    let allowed = request_with_cookie_and_body(
+        &router,
+        "POST",
+        "/api/agents/employees",
+        &cookie,
+        b"{}".to_vec(),
+    )
+    .await;
+    assert_eq!(allowed.status(), StatusCode::BAD_REQUEST);
 }
 
 /// `GOV-7` D7: a role's table access is read with `identity:read` and changed

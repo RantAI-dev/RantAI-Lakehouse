@@ -611,6 +611,16 @@ async fn system_prompt(
                 }
                 None => crate::table_access::TableAccess::All,
             };
+            // `SEC-20`, plan 97: the closing line of the map names registry
+            // datasets, which another tenant's upload is one of. The reach is
+            // the request's own (`X-Tenant`); a reach that cannot be resolved
+            // covers nothing.
+            let reach = match principal {
+                Some(principal) => tools::data::RegistryReach::of(state, principal, headers)
+                    .await
+                    .unwrap_or_else(|_| tools::data::RegistryReach::nothing(state)),
+                None => tools::data::RegistryReach::nothing(state),
+            };
             data_map::data_map(
                 &state.clickhouse,
                 withheld,
@@ -618,6 +628,7 @@ async fn system_prompt(
                 &query_words,
                 state.config.ai_relevant_tables,
                 &access,
+                Some(&reach),
             )
             .await
         }
