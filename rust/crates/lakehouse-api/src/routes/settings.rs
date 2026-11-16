@@ -1229,7 +1229,7 @@ pub async fn put_email(
         .await
         .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
     // The save is visible to the next send on this process at once (D3).
-    state.email_settings_cache.clear().await;
+    state.settings_caches.email.clear().await;
     // One audit row for the save, naming the fields that changed (D6).
     audit_settings_update(
         &state,
@@ -1597,7 +1597,7 @@ pub async fn put_sign_in(
         .await
         .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
     // The save is visible to the next sign-in on this process at once (D3).
-    state.sign_in_settings_cache.clear().await;
+    state.settings_caches.sign_in.clear().await;
     // One audit row for the save, naming the fields that changed (D6).
     audit_settings_update(
         &state,
@@ -1878,7 +1878,7 @@ pub async fn put_assistant(
     .await
     .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
     // The save is visible to the next message on this process at once (D3).
-    state.assistant_settings_cache.clear().await;
+    state.settings_caches.assistant.clear().await;
     // One audit row for the save, naming the fields that changed (D6).
     audit_settings_update(
         &state,
@@ -2330,7 +2330,7 @@ pub async fn put_sso(
 
     // Clear runtime settings cache and swappable OIDC authenticator so the next request
     // picks up the changes immediately.
-    state.sso_settings_cache.clear().await;
+    state.settings_caches.sso.clear().await;
     *state.oidc.write().await = None;
 
     audit_settings_update(&state, &principal, "settings.sso.update", "sso", &changed).await;
@@ -2889,7 +2889,7 @@ pub async fn put_general(
             .await
             .map_err(|err| workspace_store_failed(&err))?;
     // The save is visible to the next reader on this process at once (decision 6).
-    state.workspace_settings_cache.clear().await;
+    state.settings_caches.workspace.clear().await;
     let fields: &[&str] = if changed { &["workspaceName"] } else { &[] };
     audit_settings_update(
         &state,
@@ -2936,7 +2936,7 @@ pub async fn put_general_image(
     )
     .await
     .map_err(|err| workspace_store_failed(&err))?;
-    state.workspace_settings_cache.clear().await;
+    state.settings_caches.workspace.clear().await;
     // The kind, the type and the size, never the picture.
     audit_settings_event(
         &state,
@@ -2983,7 +2983,7 @@ pub async fn delete_general_image(
     let saved = workspace_settings::clear_image(pool, kind, &principal.id.uuid().to_string())
         .await
         .map_err(|err| workspace_store_failed(&err))?;
-    state.workspace_settings_cache.clear().await;
+    state.settings_caches.workspace.clear().await;
     audit_settings_event(
         &state,
         &principal,
@@ -3012,7 +3012,7 @@ pub async fn delete_general(
     workspace_settings::reset(pool)
         .await
         .map_err(|err| workspace_store_failed(&err))?;
-    state.workspace_settings_cache.clear().await;
+    state.settings_caches.workspace.clear().await;
     audit_settings_event(
         &state,
         &principal,
