@@ -34,6 +34,7 @@ use std::collections::HashMap;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
+use lakehouse_auth::Secret;
 use lakehouse_store::queries::{RecordHistoryInput, record_history};
 use lakehouse_store::uploads::claim_table;
 use serde_json::{Value, json};
@@ -79,6 +80,23 @@ async fn spin_up_with_clickhouse(ch_uri: &str) -> TestApp {
 /// Answers the column lookup the rewrite prefetches with an empty table, and
 /// any other statement with one `JSON` row.
 async fn mount_engine(ch: &MockServer) {
+    mount_columns_lookup(ch).await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [
+                {"name": "database", "type": "String"},
+                {"name": "table", "type": "String"},
+                {"name": "rows", "type": "UInt64"},
+            ],
+            "data": [{"database": "bronze", "table": "group_orders", "rows": 10}],
+            "rows": 1,
+        })))
+        .mount(ch)
+        .await;
+}
+
+/// Answers the column lookup the rewrite prefetches with an empty table.
+async fn mount_columns_lookup(ch: &MockServer) {
     Mock::given(method("POST"))
         .and(body_string_contains("system.columns"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -90,18 +108,6 @@ async fn mount_engine(ch: &MockServer) {
             ],
             "data": [],
             "rows": 0,
-        })))
-        .mount(ch)
-        .await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "meta": [
-                {"name": "database", "type": "String"},
-                {"name": "table", "type": "String"},
-                {"name": "rows", "type": "UInt64"},
-            ],
-            "data": [{"database": "bronze", "table": "group_orders", "rows": 10}],
-            "rows": 1,
         })))
         .mount(ch)
         .await;
@@ -358,6 +364,7 @@ async fn insert_history_row(pool: &PgPool, id: &str, sql: &str, owner: Uuid) {
         cache_assisted: false,
         tables_read: &[],
         message: None,
+        tenant_id: None,
     };
     record_history(pool, &input)
         .await
@@ -400,6 +407,49 @@ async fn leave_one_tenant(pool: &PgPool, caller: Uuid) {
         .execute(pool)
         .await
         .expect("add the caller to the one tenant that is left");
+}
+
+/// The tenant a run was recorded under, found by the statement it ran. Every
+/// statement in these tests is unique, so it names one row.
+async fn history_tenant_of(pool: &PgPool, sql: &str) -> Option<Uuid> {
+    sqlx::query_scalar("SELECT tenant_id FROM query_history WHERE sql = $1")
+        .bind(sql)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| panic!("the run of `{sql}` must be in the history: {e}"))
+}
+
+/// The status a run was recorded with, found by the statement it ran.
+async fn history_status_of(pool: &PgPool, sql: &str) -> String {
+    sqlx::query_scalar("SELECT status FROM query_history WHERE sql = $1")
+        .bind(sql)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| panic!("the run of `{sql}` must be in the history: {e}"))
+}
+
+/// A tenant id as the tests write it.
+fn tenant(id: &str) -> Uuid {
+    id.parse().expect("a seeded tenant id")
+}
+
+/// A request carrying a service identity's token, the way a scheduler sends
+/// it.
+async fn post_sql_as_service(router: &axum::Router, token: &str, sql: &str) -> StatusCode {
+    router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/query/run")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "sql": sql }).to_string()))
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright")
+        .status()
 }
 
 #[tokio::test]
@@ -859,4 +909,256 @@ async fn a_saved_query_of_another_tenant_is_not_listed_and_cannot_be_run() {
         listed.len() > 1,
         "the rows that belong to no tenant are the catalog's own: {body}"
     );
+}
+
+// ---------------------------------------------------------------------
+// `OPS-8`: every run records the tenant it acted as, so a usage view can
+// sum per tenant without showing one organisation to another.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_run_records_the_tenant_of_the_user_who_ran_it() {
+    let ch = MockServer::start().await;
+    mount_engine(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    let rina = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+    let sari = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    let (status, body) = post_sql(&router, &rina, "/api/query/run", "SELECT 101").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post_sql(&router, &sari, "/api/query/run", "SELECT 102").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_eq!(
+        history_tenant_of(&pool, "SELECT 101").await,
+        Some(tenant(OWNER_TENANT)),
+        "a user of Meridian Group writes Meridian Group"
+    );
+    assert_eq!(
+        history_tenant_of(&pool, "SELECT 102").await,
+        Some(tenant(OTHER_TENANT)),
+        "a user of Meridian Retail writes Meridian Retail"
+    );
+}
+
+#[tokio::test]
+async fn the_x_tenant_header_selects_the_tenant_a_run_is_recorded_under() {
+    let ch = MockServer::start().await;
+    mount_engine(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    let rina = user_id(&pool, "rina@meridian.example").await;
+    belong_to(&pool, rina, [OWNER_TENANT, OTHER_TENANT]).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+    let (status, body) = post_sql(&router, &cookie, "/api/query/run", "SELECT 111").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post_sql_for_tenant(
+        &router,
+        &cookie,
+        "/api/query/run",
+        "SELECT 112",
+        OTHER_TENANT,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_eq!(
+        history_tenant_of(&pool, "SELECT 111").await,
+        Some(tenant(OWNER_TENANT)),
+        "with no header the caller's first tenant is written"
+    );
+    assert_eq!(
+        history_tenant_of(&pool, "SELECT 112").await,
+        Some(tenant(OTHER_TENANT)),
+        "the header names the caller's second tenant, and that one is written"
+    );
+}
+
+#[tokio::test]
+async fn a_blocked_run_records_the_tenant() {
+    let ch = MockServer::start().await;
+    mount_engine(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    // Refused by the read-only guard, before any principal work.
+    let (status, body) = post_sql(&router, &cookie, "/api/query/run", "DROP TABLE t121").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    // Refused by the shared rewrite: a statement that lists without naming a
+    // table, for a tenant that does not own the catalog.
+    let (status, body) = post_sql(&router, &cookie, "/api/query/run", "SHOW DATABASES").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    for sql in ["DROP TABLE t121", "SHOW DATABASES"] {
+        assert_eq!(history_status_of(&pool, sql).await, "blocked", "{sql}");
+        assert_eq!(
+            history_tenant_of(&pool, sql).await,
+            Some(tenant(OTHER_TENANT)),
+            "a blocked run is attributed to the tenant it was refused under: {sql}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_failed_run_records_the_tenant() {
+    let ch = MockServer::start().await;
+    mount_columns_lookup(&ch).await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("Code: 62. DB::Exception: boom"))
+        .mount(&ch)
+        .await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    let (status, body) = post_sql(&router, &cookie, "/api/query/run", "SELECT 131").await;
+    assert!(!status.is_success(), "the engine refused the run: {body}");
+
+    assert_eq!(history_status_of(&pool, "SELECT 131").await, "failed");
+    assert_eq!(
+        history_tenant_of(&pool, "SELECT 131").await,
+        Some(tenant(OTHER_TENANT)),
+        "a failed run is attributed to the tenant it ran under"
+    );
+}
+
+#[tokio::test]
+async fn a_run_naming_a_tenant_the_caller_is_not_in_records_no_tenant_never_the_header() {
+    let ch = MockServer::start().await;
+    mount_engine(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    claim_the_owned_table(&pool).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+    // A real tenant the caller does not belong to, and a value that is no
+    // tenant id at all: the gate refuses both with the same 404 once the
+    // statement names a table.
+    for (sql, header) in [
+        (
+            "SELECT 141 FROM bronze.group_orders",
+            SEEDED_OTHER_TENANTS[0],
+        ),
+        ("SELECT 142 FROM bronze.group_orders", "not-a-tenant"),
+    ] {
+        let (status, body) =
+            post_sql_for_tenant(&router, &cookie, "/api/query/run", sql, header).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{sql}: {body}");
+
+        assert_eq!(history_status_of(&pool, sql).await, "blocked", "{sql}");
+        assert_eq!(
+            history_tenant_of(&pool, sql).await,
+            None,
+            "the header's value is the caller's claim, not a tenant it is in: {sql}"
+        );
+    }
+    assert_eq!(
+        engine_requests(&ch).await,
+        0,
+        "the refusals precede the engine: nothing may be asked"
+    );
+}
+
+#[tokio::test]
+async fn a_run_that_names_no_table_and_a_foreign_x_tenant_still_records_no_tenant() {
+    let ch = MockServer::start().await;
+    mount_engine(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+    // A statement that names no table meets no tenant gate, so it runs.
+    // The row must not carry the tenant the header claimed.
+    let (status, body) = post_sql_for_tenant(
+        &router,
+        &cookie,
+        "/api/query/run",
+        "SELECT 143",
+        SEEDED_OTHER_TENANTS[0],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_eq!(history_status_of(&pool, "SELECT 143").await, "completed");
+    assert_eq!(history_tenant_of(&pool, "SELECT 143").await, None);
+}
+
+#[tokio::test]
+async fn the_assistants_runs_record_the_callers_first_tenant() {
+    let ch = MockServer::start().await;
+    // `run_sql` dry-runs the statement with `EXPLAIN AST` first.
+    Mock::given(method("POST"))
+        .and(body_string_contains("EXPLAIN AST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string("SelectWithUnionQuery (children 1)"),
+        )
+        .mount(&ch)
+        .await;
+    mount_engine(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    let ran = call_tool(&router, &cookie, "run_sql", json!({ "sql": "SELECT 151" })).await;
+    assert_ne!(ran["outcome"], json!("failed"), "{ran}");
+
+    let (status, body) = post_saved(&router, &cookie, "Retail check", "SELECT 152").await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let saved_id = body["id"]
+        .as_str()
+        .expect("the saved query's id")
+        .to_owned();
+    let ran = call_tool(
+        &router,
+        &cookie,
+        "run_saved_query",
+        json!({ "id": saved_id }),
+    )
+    .await;
+    assert_ne!(ran["outcome"], json!("failed"), "{ran}");
+
+    for sql in ["SELECT 151", "SELECT 152"] {
+        assert_eq!(
+            history_tenant_of(&pool, sql).await,
+            Some(tenant(OTHER_TENANT)),
+            "the chat sends no header, so the caller's first tenant is written: {sql}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_service_identity_run_records_no_tenant() {
+    const TOKEN: &str = "query-history-service-fixture-token";
+    let ch = MockServer::start().await;
+    mount_engine(&ch).await;
+    let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
+    let identity = lakehouse_store::identity::create_service_identity(
+        &pool,
+        &lakehouse_store::identity::CreateServiceIdentityInput {
+            name: "history-fixture".to_owned(),
+            scopes: vec!["query:read".to_owned()],
+            environment: "test".to_owned(),
+        },
+    )
+    .await
+    .expect("seed a service identity that may run queries");
+    let identity_id: Uuid = identity.id.parse().expect("a UUID identity id");
+    lakehouse_auth::service_token::ensure_service_credential(
+        &pool,
+        identity_id,
+        &Secret::new(TOKEN.to_owned()),
+    )
+    .await
+    .expect("seed the service credential");
+
+    let status = post_sql_as_service(&router, TOKEN, "SELECT 161").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (owner, tenant_id): (Option<Uuid>, Option<Uuid>) =
+        sqlx::query_as("SELECT owner_id, tenant_id FROM query_history WHERE sql = 'SELECT 161'")
+            .fetch_one(&pool)
+            .await
+            .expect("the service identity's run is in the history");
+    assert_eq!(
+        owner,
+        Some(identity_id),
+        "the row is the service identity's"
+    );
+    assert_eq!(tenant_id, None, "a service identity belongs to no tenant");
 }

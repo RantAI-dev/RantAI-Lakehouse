@@ -77,6 +77,7 @@ use super::catalog::validate_annotation_id;
 use super::catalog::{annotation_pool, catalog_tenant_refusal, ensure_asset_readable};
 use super::catalog_profile::bronze_table_name;
 use super::catalog_restore::BRONZE_NAMESPACE;
+use crate::audit_coverage;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::quality::count_rows;
@@ -426,12 +427,11 @@ pub(super) async fn audit_first(
 
 /// Write the outcome of a drop or a restore after the catalog answered (D8).
 /// Best effort: the `allowed` entry already names who, which table and its row
-/// count, so a failure here leaves the trail short one entry, not empty.
-pub(super) async fn audit_after(pool: &PgPool, event: NewAuditEvent) {
-    let action = event.action.clone();
-    if let Err(err) = lakehouse_store::audit::insert(pool, event).await {
-        tracing::warn!(?err, %action, "the outcome of a catalog action could not be audited");
-    }
+/// count, so a failure here leaves the trail short one entry, not empty. A
+/// failed write is logged and counted
+/// ([`audit_coverage::record_best_effort`]).
+pub(super) async fn audit_after(state: &AppState, event: NewAuditEvent) {
+    audit_coverage::record_best_effort(state, event).await;
 }
 
 /// `POST /api/catalog/{id}/drop` — drops the table, keeping it restorable for
@@ -599,7 +599,7 @@ impl DropJob {
             Err(err) => {
                 // `DATA-55` review R7: an `allowed` entry always has an ending.
                 audit_after(
-                    &self.pool,
+                    &self.state,
                     self.event("failed", Some("the drop could not be recorded")),
                 )
                 .await;
@@ -607,7 +607,7 @@ impl DropJob {
             }
         };
         let Some(record) = record else {
-            audit_after(&self.pool, self.event("refused", Some("already dropped"))).await;
+            audit_after(&self.state, self.event("refused", Some("already dropped"))).await;
             return Err(ApiError::Conflict(ALREADY_DROPPED.to_owned()));
         };
         // `DATA-55` review R3: the record is written first, and the load check
@@ -649,7 +649,7 @@ impl DropJob {
                     );
                 }
                 audit_after(
-                    &self.pool,
+                    &self.state,
                     self.event("failed", Some("a load started into the table")),
                 )
                 .await;
@@ -662,7 +662,7 @@ impl DropJob {
                     "drop: could not check the running loads once the record was written; the record stands"
                 );
                 audit_after(
-                    &self.pool,
+                    &self.state,
                     self.event(
                         "failed",
                         Some("the load into the table could not be checked"),
@@ -678,7 +678,7 @@ impl DropJob {
             .await
         {
             Ok(true) => {
-                audit_after(&self.pool, self.event("executed", None)).await;
+                audit_after(&self.state, self.event("executed", None)).await;
                 drop_answer(&record, self.rows)
             }
             other => self.settle_not_dropped(&record, other).await,
@@ -739,7 +739,7 @@ impl DropJob {
                 "drop: the record of a drop the catalog did not make could not be removed"
             );
         }
-        audit_after(&self.pool, self.event("failed", Some(detail))).await;
+        audit_after(&self.state, self.event("failed", Some(detail))).await;
         Err(error)
     }
 
@@ -778,7 +778,7 @@ impl DropJob {
         }
         // The drop happened: the catalog keeps it, so the caller is told the
         // drop succeeded and the record stays.
-        audit_after(&self.pool, self.event("executed", None)).await;
+        audit_after(&self.state, self.event("executed", None)).await;
         drop_answer(record, self.rows)
     }
 
@@ -817,7 +817,7 @@ impl DropJob {
     /// "not known" sentence.
     async fn keep_record_and_refuse(&self) -> ApiError {
         audit_after(
-            &self.pool,
+            &self.state,
             self.event("failed", Some("the outcome is not known")),
         )
         .await;
