@@ -1,0 +1,782 @@
+//! `OPS-8` part B: the Usage routes over two seeded tenants.
+//!
+//! These tests drive the real router and a per-test database: runs are
+//! inserted with the day a test wants (or made through `POST /api/query/run`
+//! for the freshness test), and every answer is read back over HTTP. They hold
+//! the tenant wall (a caller of one tenant sums none of the other's rows), the
+//! permissions, the estimate, the CSV file, the bad input and the audit rows.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use crate::common;
+
+use std::collections::HashMap;
+
+use axum::body::{Body, to_bytes};
+use axum::http::{HeaderMap, Request, StatusCode};
+use serde_json::{Value, json};
+use sqlx::PgPool;
+use tower::ServiceExt;
+use uuid::Uuid;
+use wiremock::matchers::{body_string_contains, method};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+use common::{
+    TestApp, audit_rows, create_principal_with_permissions, session_cookie_for_seeded_user,
+    session_cookie_for_user, spin_up, spin_up_with_env,
+};
+
+/// The tenant of the seeded `rina@meridian.example`, and another one.
+const TENANT_A: &str = "11111111-1111-4111-8111-000000000001";
+const TENANT_B: &str = "11111111-1111-4111-8111-000000000002";
+
+const PERIOD: &str = "from=2026-03-01&to=2026-03-31";
+
+struct Answer {
+    status: StatusCode,
+    headers: HeaderMap,
+    bytes: Vec<u8>,
+}
+
+impl Answer {
+    fn json(&self) -> Value {
+        serde_json::from_slice(&self.bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&self.bytes).into_owned()))
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes).into_owned()
+    }
+}
+
+async fn call(
+    router: &axum::Router,
+    cookie: &str,
+    method: &str,
+    uri: &str,
+    extra_header: Option<(&str, &str)>,
+    body: Option<Value>,
+) -> Answer {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("cookie", cookie);
+    if let Some((name, value)) = extra_header {
+        builder = builder.header(name, value);
+    }
+    let request = match body {
+        // The central audit writer reads the field names of a body only when
+        // the request declares its length, the way a browser's does.
+        Some(body) => {
+            let text = body.to_string();
+            builder
+                .header("content-type", "application/json")
+                .header("content-length", text.len())
+                .body(Body::from(text))
+        }
+        None => builder.body(Body::empty()),
+    }
+    .expect("build request");
+    let response = router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("router never fails a request outright");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body")
+        .to_vec();
+    Answer {
+        status,
+        headers,
+        bytes,
+    }
+}
+
+async fn get(router: &axum::Router, cookie: &str, uri: &str) -> Answer {
+    call(router, cookie, "GET", uri, None, None).await
+}
+
+async fn post_rate(router: &axum::Router, cookie: &str, body: Value) -> Answer {
+    call(router, cookie, "POST", "/api/usage/rates", None, Some(body)).await
+}
+
+/// A person holding exactly `permissions`, who belongs to `tenants`.
+async fn person(pool: &PgPool, permissions: &str, tenants: &[&str]) -> String {
+    let id = create_principal_with_permissions(pool, permissions).await;
+    for tenant in tenants {
+        sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+            .bind(id)
+            .bind(tenant.parse::<Uuid>().unwrap())
+            .execute(pool)
+            .await
+            .expect("add the membership");
+    }
+    session_cookie_for_user(pool, id).await
+}
+
+/// One run with the columns a sum reads.
+struct Run<'a> {
+    at: &'a str,
+    tenant: Option<&'a str>,
+    owner: Option<Uuid>,
+    user: &'a str,
+    status: &'a str,
+    scanned_bytes: i64,
+}
+
+impl<'a> Run<'a> {
+    fn new(at: &'a str, tenant: Option<&'a str>, user: &'a str) -> Self {
+        Self {
+            at,
+            tenant,
+            owner: None,
+            user,
+            status: "completed",
+            scanned_bytes: 0,
+        }
+    }
+}
+
+async fn insert(pool: &PgPool, run: &Run<'_>) {
+    sqlx::query(
+        "INSERT INTO query_history \
+         (id, sql, user_name, at, status, duration_ms, scanned_bytes, cost_units, \
+          workload_class, engine, owner_id, tenant_id) \
+         VALUES ($1, 'SELECT 1', $2, $3::timestamptz, $4, 10, $5, 0, 'hot-analytics', \
+                 'clickhouse', $6, $7)",
+    )
+    .bind(format!("q-{}", Uuid::new_v4()))
+    .bind(run.user)
+    .bind(run.at)
+    .bind(run.status)
+    .bind(run.scanned_bytes)
+    .bind(run.owner)
+    .bind(run.tenant.map(|t| t.parse::<Uuid>().unwrap()))
+    .execute(pool)
+    .await
+    .expect("insert a query_history row");
+}
+
+/// Three tenants' worth of runs: A's Alice, B's Bob and a run with no tenant.
+async fn seed_two_tenants(pool: &PgPool) {
+    let mut alice = Run::new("2026-03-02T10:00:00Z", Some(TENANT_A), "Alice of A");
+    alice.scanned_bytes = 100;
+    insert(pool, &alice).await;
+    let mut bob = Run::new("2026-03-02T11:00:00Z", Some(TENANT_B), "Bob of B");
+    bob.scanned_bytes = 7;
+    insert(pool, &bob).await;
+    let mut nobody = Run::new("2026-03-02T12:00:00Z", None, "Nobody");
+    nobody.scanned_bytes = 1000;
+    insert(pool, &nobody).await;
+}
+
+fn rows(answer: &Answer) -> Vec<Value> {
+    answer.json()["rows"].as_array().expect("rows").clone()
+}
+
+// ── (a) freshness ────────────────────────────────────────────────────────
+
+fn clickhouse_with_one_row() -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "meta": [{"name": "n", "type": "UInt8"}],
+        "data": [{"n": 1}],
+        "rows": 1,
+    }))
+}
+
+#[tokio::test]
+async fn a_run_shows_in_the_usage_of_its_tenant_at_once() {
+    let ch = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("system.columns"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [
+                {"name": "name", "type": "String"},
+                {"name": "type", "type": "String"},
+                {"name": "default_kind", "type": "String"},
+                {"name": "default_expression", "type": "String"},
+            ],
+            "data": [],
+            "rows": 0,
+        })))
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(clickhouse_with_one_row())
+        .mount(&ch)
+        .await;
+    let mut overrides = HashMap::new();
+    overrides.insert("CH_URL".to_owned(), ch.uri());
+    overrides.insert("CATALOG_TENANT_ID".to_owned(), TENANT_A.to_owned());
+    let TestApp { router, pool } = spin_up_with_env(&overrides).await;
+
+    let rina: Uuid = sqlx::query_scalar("SELECT id FROM app_user WHERE email = $1")
+        .bind("rina@meridian.example")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    // Rina may read the usage of her tenant: a role that grants only that.
+    let role = Uuid::new_v4();
+    sqlx::query("INSERT INTO role (id, name, permissions, description) VALUES ($1, 'Usage Reader', 'usage:read', 'test')")
+        .bind(role)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO app_user_role (user_id, role_id) VALUES ($1, $2)")
+        .bind(rina)
+        .bind(role)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
+
+    let before = get(&router, &cookie, "/api/usage/queries?group=person").await;
+    assert_eq!(before.status, StatusCode::OK, "{}", before.text());
+    assert_eq!(before.json()["totals"]["queries"], json!(0));
+
+    let ran = call(
+        &router,
+        &cookie,
+        "POST",
+        "/api/query/run",
+        None,
+        Some(json!({ "sql": "SELECT 1" })),
+    )
+    .await;
+    assert_eq!(ran.status, StatusCode::OK, "{}", ran.text());
+
+    // No wait, no job: the run is in the answer of the very next request.
+    let after = get(&router, &cookie, "/api/usage/queries?group=person").await;
+    assert_eq!(after.status, StatusCode::OK, "{}", after.text());
+    let body = after.json();
+    assert_eq!(body["totals"]["queries"], json!(1), "{body}");
+    assert_eq!(body["totals"]["completed"], json!(1), "{body}");
+    assert_eq!(body["rows"][0]["key"], json!(rina.to_string()), "{body}");
+    // Rina holds no `identity:read`: the row shows the id, not the name.
+    assert_eq!(body["rows"][0]["label"], json!(rina.to_string()), "{body}");
+}
+
+// ── (b) the tenant wall ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_caller_of_tenant_b_sums_none_of_tenant_as_rows() {
+    let TestApp { router, pool } = spin_up().await;
+    seed_two_tenants(&pool).await;
+    let bob = person(&pool, "usage:read", &[TENANT_B]).await;
+
+    for group in ["day", "person", "engine", "tenant"] {
+        let answer = get(
+            &router,
+            &bob,
+            &format!("/api/usage/queries?{PERIOD}&group={group}"),
+        )
+        .await;
+        assert_eq!(answer.status, StatusCode::OK, "{group}: {}", answer.text());
+        let body = answer.json();
+        assert_eq!(body["totals"]["queries"], json!(1), "{group}: {body}");
+        assert_eq!(body["totals"]["scannedBytes"], json!(7), "{group}: {body}");
+        let text = answer.text();
+        assert!(!text.contains("Alice of A"), "{group}: {text}");
+        assert!(!text.contains("Nobody"), "{group}: {text}");
+    }
+
+    // Naming A in `X-Tenant` does not widen anything: B's caller is not in A.
+    let forged = call(
+        &router,
+        &bob,
+        "GET",
+        &format!("/api/usage/queries?{PERIOD}"),
+        Some(("x-tenant", TENANT_A)),
+        None,
+    )
+    .await;
+    assert_eq!(forged.status, StatusCode::NOT_FOUND, "{}", forged.text());
+    assert!(!forged.text().contains("Alice"), "{}", forged.text());
+
+    // The same wall holds for the file.
+    let file = get(
+        &router,
+        &bob,
+        &format!("/api/usage/queries/export?{PERIOD}&group=person"),
+    )
+    .await;
+    assert_eq!(file.status, StatusCode::OK);
+    assert!(!file.text().contains("Alice of A"), "{}", file.text());
+}
+
+#[tokio::test]
+async fn a_caller_that_belongs_to_no_tenant_gets_an_empty_answer_not_every_tenant() {
+    let TestApp { router, pool } = spin_up().await;
+    seed_two_tenants(&pool).await;
+    let lonely = person(&pool, "usage:read", &[]).await;
+
+    let answer = get(
+        &router,
+        &lonely,
+        &format!("/api/usage/queries?{PERIOD}&group=person"),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    let body = answer.json();
+    assert_eq!(body["rows"], json!([]), "{body}");
+    assert_eq!(body["totals"]["queries"], json!(0), "{body}");
+    assert_eq!(body["scope"], json!("tenant"), "{body}");
+}
+
+// ── (c) everybody, and the rows with no tenant ───────────────────────────
+
+#[tokio::test]
+async fn the_unrestricted_caller_sees_every_tenant_and_no_tenant_only_when_it_asks_for_all() {
+    let TestApp { router, pool } = spin_up().await;
+    seed_two_tenants(&pool).await;
+    let admin = person(&pool, "*:*", &[TENANT_A]).await;
+
+    let all = get(
+        &router,
+        &admin,
+        &format!("/api/usage/queries?{PERIOD}&group=tenant&tenant=all"),
+    )
+    .await;
+    assert_eq!(all.status, StatusCode::OK, "{}", all.text());
+    let body = all.json();
+    assert_eq!(body["scope"], json!("all"), "{body}");
+    assert_eq!(body["totals"]["queries"], json!(3), "{body}");
+    let none = rows(&all)
+        .into_iter()
+        .find(|r| r["key"] == json!("none"))
+        .expect("the run with no tenant has a row");
+    assert_eq!(none["label"], json!("no tenant"), "{body}");
+    assert_eq!(none["scannedBytes"], json!(1000), "{body}");
+
+    // Without `tenant=all` it sees the tenant it acts as, like anyone.
+    let own = get(
+        &router,
+        &admin,
+        &format!("/api/usage/queries?{PERIOD}&group=tenant"),
+    )
+    .await;
+    let body = own.json();
+    assert_eq!(body["scope"], json!("tenant"), "{body}");
+    assert_eq!(body["totals"]["queries"], json!(1), "{body}");
+    assert_eq!(body["totals"]["scannedBytes"], json!(100), "{body}");
+}
+
+#[tokio::test]
+async fn a_caller_without_the_unrestricted_grant_may_not_ask_for_all_tenants() {
+    let TestApp { router, pool } = spin_up().await;
+    seed_two_tenants(&pool).await;
+    let reader = person(&pool, "usage:read", &[TENANT_A]).await;
+
+    let answer = get(
+        &router,
+        &reader,
+        &format!("/api/usage/queries?{PERIOD}&tenant=all"),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::FORBIDDEN, "{}", answer.text());
+    let answer = get(
+        &router,
+        &reader,
+        &format!("/api/usage/queries/export?{PERIOD}&tenant=all"),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::FORBIDDEN, "{}", answer.text());
+    assert!(
+        audit_rows(&pool, "usage.export").await.is_empty(),
+        "a refused export records nothing"
+    );
+}
+
+// ── (d) permissions ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn without_usage_read_every_usage_route_is_refused_and_a_rate_needs_settings_write() {
+    let TestApp { router, pool } = spin_up().await;
+    let nobody = person(&pool, "dashboard:read", &[TENANT_A]).await;
+    for uri in [
+        "/api/usage/queries",
+        "/api/usage/queries/export",
+        "/api/usage/rates",
+    ] {
+        let answer = get(&router, &nobody, uri).await;
+        assert_eq!(answer.status, StatusCode::FORBIDDEN, "{uri}");
+    }
+    let body =
+        json!({"kind": "scan_tb", "currency": "USD", "amount": "5", "effectiveFrom": "2026-03-01"});
+    let answer = post_rate(&router, &nobody, body.clone()).await;
+    assert_eq!(answer.status, StatusCode::FORBIDDEN);
+
+    // `usage:read` reads the rates and may not write them.
+    let reader = person(&pool, "usage:read", &[TENANT_A]).await;
+    assert_eq!(
+        get(&router, &reader, "/api/usage/rates").await.status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_rate(&router, &reader, body.clone()).await.status,
+        StatusCode::FORBIDDEN
+    );
+
+    // `settings:write` writes them and does not read the usage.
+    let writer = person(&pool, "settings:write", &[TENANT_A]).await;
+    assert_eq!(
+        get(&router, &writer, "/api/usage/queries").await.status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        post_rate(&router, &writer, body).await.status,
+        StatusCode::CREATED
+    );
+}
+
+// ── (e) rates and the estimate ───────────────────────────────────────────
+
+#[tokio::test]
+async fn the_estimate_is_null_without_a_rate_and_priced_by_the_rate_in_force() {
+    let TestApp { router, pool } = spin_up().await;
+    for at in ["2026-03-02T10:00:00Z", "2026-03-04T10:00:00Z"] {
+        let mut run = Run::new(at, Some(TENANT_A), "Alice");
+        run.scanned_bytes = 1_000_000_000_000;
+        insert(&pool, &run).await;
+    }
+    let reader = person(&pool, "usage:read,settings:write", &[TENANT_A]).await;
+    let uri = format!("/api/usage/queries?{PERIOD}&group=day");
+
+    let none = get(&router, &reader, &uri).await.json();
+    assert_eq!(none["totals"]["estimate"], Value::Null, "{none}");
+    assert_eq!(none["currency"], Value::Null, "{none}");
+
+    let first = post_rate(&router, &reader, json!({"kind": "scan_tb", "currency": "USD", "amount": "5.00", "effectiveFrom": "2026-03-01"})).await;
+    assert_eq!(first.status, StatusCode::CREATED, "{}", first.text());
+    assert_eq!(first.json()["amount"], json!("5.000000"));
+    let second = post_rate(
+        &router,
+        &reader,
+        json!({"kind": "scan_tb", "currency": "USD", "amount": 10, "effectiveFrom": "2026-03-03"}),
+    )
+    .await;
+    assert_eq!(second.status, StatusCode::CREATED, "{}", second.text());
+
+    let priced = get(&router, &reader, &uri).await.json();
+    let by_day: HashMap<String, Value> = priced["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["key"].as_str().unwrap().to_owned(), r["estimate"].clone()))
+        .collect();
+    assert_eq!(by_day["2026-03-02"], json!("5.000000"), "{priced}");
+    assert_eq!(by_day["2026-03-04"], json!("10.000000"), "{priced}");
+    assert_eq!(priced["totals"]["estimate"], json!("15.000000"), "{priced}");
+    assert_eq!(priced["currency"], json!("USD"), "{priced}");
+
+    let listed = get(&router, &reader, "/api/usage/rates").await.json();
+    assert_eq!(listed["currency"], json!("USD"));
+    assert_eq!(listed["rates"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        listed["rates"][0]["effectiveFrom"],
+        json!("2026-03-03"),
+        "newest first"
+    );
+}
+
+#[tokio::test]
+async fn a_bad_rate_is_a_400_with_a_fixed_sentence_and_adds_nothing() {
+    let TestApp { router, pool } = spin_up().await;
+    let admin = person(&pool, "usage:read,settings:write", &[TENANT_A]).await;
+    let good =
+        json!({"kind": "scan_tb", "currency": "USD", "amount": "5", "effectiveFrom": "2026-03-01"});
+    assert_eq!(
+        post_rate(&router, &admin, good.clone()).await.status,
+        StatusCode::CREATED
+    );
+
+    let cases = [
+        (
+            "a negative amount",
+            json!({"kind": "scan_tb", "currency": "USD", "amount": "-1", "effectiveFrom": "2026-03-01"}),
+        ),
+        (
+            "an exponent",
+            json!({"kind": "scan_tb", "currency": "USD", "amount": "1e3", "effectiveFrom": "2026-03-01"}),
+        ),
+        (
+            "seven decimals",
+            json!({"kind": "scan_tb", "currency": "USD", "amount": "0.1234567", "effectiveFrom": "2026-03-01"}),
+        ),
+        (
+            "no amount",
+            json!({"kind": "scan_tb", "currency": "USD", "effectiveFrom": "2026-03-01"}),
+        ),
+        (
+            "a four-letter currency",
+            json!({"kind": "scan_tb", "currency": "USDX", "amount": "1", "effectiveFrom": "2026-03-01"}),
+        ),
+        (
+            "a lower-case currency",
+            json!({"kind": "scan_tb", "currency": "usd", "amount": "1", "effectiveFrom": "2026-03-01"}),
+        ),
+        (
+            "an unknown kind",
+            json!({"kind": "per_query", "currency": "USD", "amount": "1", "effectiveFrom": "2026-03-01"}),
+        ),
+        (
+            "a bad date",
+            json!({"kind": "scan_tb", "currency": "USD", "amount": "1", "effectiveFrom": "2026-02-30"}),
+        ),
+        (
+            "an unknown field",
+            json!({"kind": "scan_tb", "currency": "USD", "amount": "1", "effectiveFrom": "2026-03-01", "extra": 1}),
+        ),
+        (
+            "another currency than the rates entered",
+            json!({"kind": "engine_hour", "currency": "IDR", "amount": "1", "effectiveFrom": "2026-03-01"}),
+        ),
+    ];
+    for (name, body) in cases {
+        let answer = post_rate(&router, &admin, body).await;
+        assert_eq!(
+            answer.status,
+            StatusCode::BAD_REQUEST,
+            "{name}: {}",
+            answer.text()
+        );
+        assert!(answer.json()["error"].is_string(), "{name}");
+    }
+    let listed = get(&router, &admin, "/api/usage/rates").await.json();
+    assert_eq!(listed["rates"].as_array().unwrap().len(), 1, "{listed}");
+}
+
+// ── (f) the file ─────────────────────────────────────────────────────────
+
+/// The cells of every line of a CSV file, the byte-order mark removed.
+fn csv_cells(file: &str) -> Vec<Vec<String>> {
+    file.trim_start_matches('\u{feff}')
+        .split("\r\n")
+        .filter(|line| !line.is_empty())
+        .map(|line| line.split(',').map(str::to_owned).collect())
+        .collect()
+}
+
+#[tokio::test]
+async fn the_file_holds_the_rows_and_totals_of_the_page_a_formula_neutralised_and_is_audited() {
+    let TestApp { router, pool } = spin_up().await;
+    let owner = Uuid::new_v4();
+    let mut a = Run::new("2026-03-02T10:00:00Z", Some(TENANT_A), "Rina");
+    a.owner = Some(owner);
+    a.scanned_bytes = 40;
+    insert(&pool, &a).await;
+    let mut b = Run::new("2026-03-03T10:00:00Z", Some(TENANT_A), "=HYPERLINK(1)");
+    b.status = "failed";
+    b.scanned_bytes = 2;
+    insert(&pool, &b).await;
+    // The names are the user list's: this caller may read it.
+    let admin = person(&pool, "usage:read,identity:read", &[TENANT_A]).await;
+    let uri = format!("{PERIOD}&group=person");
+
+    let page = get(&router, &admin, &format!("/api/usage/queries?{uri}"))
+        .await
+        .json();
+    let file = get(&router, &admin, &format!("/api/usage/queries/export?{uri}")).await;
+    assert_eq!(file.status, StatusCode::OK);
+    assert_eq!(file.headers["content-type"], "text/csv; charset=utf-8");
+    assert_eq!(
+        file.headers["content-disposition"],
+        "attachment; filename=\"usage-2026-03-01-2026-03-31.csv\""
+    );
+    assert_eq!(file.headers["cache-control"], "no-store");
+
+    let cells = csv_cells(&file.text());
+    assert_eq!(
+        cells[0],
+        [
+            "person",
+            "id",
+            "queries",
+            "completed",
+            "failed",
+            "blocked",
+            "cancelled",
+            "scanned_bytes",
+            "engine_ms",
+            "estimate",
+            "currency"
+        ]
+    );
+    // One line per row of the page, then the totals line.
+    let page_rows = page["rows"].as_array().unwrap();
+    assert_eq!(cells.len(), page_rows.len() + 2, "{cells:?}");
+    for (line, row) in cells[1..=page_rows.len()].iter().zip(page_rows) {
+        assert_eq!(
+            line[1].trim_start_matches('\''),
+            row["key"].as_str().unwrap()
+        );
+        assert_eq!(line[2], row["queries"].to_string());
+        assert_eq!(line[4], row["failed"].to_string());
+        assert_eq!(line[7], row["scannedBytes"].to_string());
+    }
+    let totals = cells.last().unwrap();
+    assert_eq!(totals[0], "Total");
+    assert_eq!(totals[2], page["totals"]["queries"].to_string());
+    assert_eq!(totals[7], page["totals"]["scannedBytes"].to_string());
+
+    // A name that starts with `=` is text in the file, not a formula.
+    let name_cells: Vec<&str> = cells[1..=page_rows.len()]
+        .iter()
+        .map(|l| l[0].as_str())
+        .collect();
+    assert!(name_cells.contains(&"'=HYPERLINK(1)"), "{name_cells:?}");
+    assert!(
+        !name_cells.iter().any(|c| c.starts_with('=')),
+        "{name_cells:?}"
+    );
+
+    let audit = audit_rows(&pool, "usage.export").await;
+    assert_eq!(audit.len(), 1, "one export, one row: {audit:?}");
+    assert_eq!(audit[0]["outcome"], json!("executed"));
+    assert_eq!(audit[0]["resource_kind"], json!("usage"));
+    assert_eq!(audit[0]["args"]["from"], json!("2026-03-01"));
+    assert_eq!(audit[0]["args"]["to"], json!("2026-03-31"));
+    assert_eq!(audit[0]["args"]["group"], json!("person"));
+    assert_eq!(audit[0]["args"]["tenant"], json!("tenant"));
+}
+
+#[tokio::test]
+async fn a_caller_without_identity_read_sees_a_persons_id_in_the_page_and_the_file() {
+    let TestApp { router, pool } = spin_up().await;
+    let owner = Uuid::new_v4();
+    let mut run = Run::new("2026-03-02T10:00:00Z", Some(TENANT_A), "Rina Wijaya");
+    run.owner = Some(owner);
+    insert(&pool, &run).await;
+    let with_names = person(&pool, "usage:read,identity:read", &[TENANT_A]).await;
+    let without = person(&pool, "usage:read", &[TENANT_A]).await;
+    let uri = format!("{PERIOD}&group=person");
+
+    let named = get(&router, &with_names, &format!("/api/usage/queries?{uri}")).await;
+    assert_eq!(named.json()["rows"][0]["label"], json!("Rina Wijaya"));
+    let plain = get(&router, &without, &format!("/api/usage/queries?{uri}")).await;
+    assert_eq!(plain.json()["rows"][0]["label"], json!(owner.to_string()));
+    let file = get(
+        &router,
+        &without,
+        &format!("/api/usage/queries/export?{uri}"),
+    )
+    .await;
+    assert!(!file.text().contains("Rina Wijaya"), "{}", file.text());
+}
+
+// ── (g) bad input ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_bad_period_group_or_tenant_is_a_400_with_a_fixed_sentence() {
+    let TestApp { router, pool } = spin_up().await;
+    let reader = person(&pool, "usage:read", &[TENANT_A]).await;
+    for uri in ["/api/usage/queries", "/api/usage/queries/export"] {
+        let cases = [
+            (
+                "367 days",
+                "from=2025-01-01&to=2026-01-02",
+                "A period is at most 366 days.",
+            ),
+            (
+                "from after to",
+                "from=2026-03-02&to=2026-03-01",
+                "from must not be after to.",
+            ),
+            (
+                "a bad date",
+                "from=yesterday",
+                "from and to must be days written YYYY-MM-DD.",
+            ),
+            (
+                "a day that does not exist",
+                "to=2026-02-30",
+                "from and to must be days written YYYY-MM-DD.",
+            ),
+            (
+                "a bad group",
+                "group=planet",
+                "group must be day, person, engine or tenant.",
+            ),
+            (
+                "a bad tenant",
+                "tenant=everyone",
+                "tenant must be all, or left out.",
+            ),
+            (
+                "a key sent twice",
+                "group=day&group=person",
+                "The query string could not be read.",
+            ),
+        ];
+        for (name, query, sentence) in cases {
+            let answer = get(&router, &reader, &format!("{uri}?{query}")).await;
+            assert_eq!(
+                answer.status,
+                StatusCode::BAD_REQUEST,
+                "{uri} {name}: {}",
+                answer.text()
+            );
+            assert_eq!(answer.json()["error"], json!(sentence), "{uri} {name}");
+        }
+    }
+    // 366 days is the longest that is accepted.
+    let longest = get(
+        &router,
+        &reader,
+        "/api/usage/queries?from=2025-01-01&to=2026-01-01",
+    )
+    .await;
+    assert_eq!(longest.status, StatusCode::OK, "{}", longest.text());
+    assert!(
+        audit_rows(&pool, "usage.export").await.is_empty(),
+        "a refused export records nothing"
+    );
+}
+
+#[tokio::test]
+async fn with_no_period_the_last_thirty_days_are_summed() {
+    let TestApp { router, pool } = spin_up().await;
+    let reader = person(&pool, "usage:read", &[TENANT_A]).await;
+    let body = get(&router, &reader, "/api/usage/queries").await.json();
+    let from = body["from"].as_str().unwrap();
+    let to = body["to"].as_str().unwrap();
+    assert_eq!(body["group"], json!("day"));
+    assert!(from < to, "{from} {to}");
+    assert_eq!(body["from"].as_str().unwrap().len(), 10);
+}
+
+// ── (h) audit ────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn adding_a_rate_writes_one_audit_row_and_a_refused_one_writes_a_refused_row() {
+    let TestApp { router, pool } = spin_up().await;
+    let admin = person(&pool, "settings:write", &[TENANT_A]).await;
+    let reader = person(&pool, "usage:read", &[TENANT_A]).await;
+    let body =
+        json!({"kind": "scan_tb", "currency": "USD", "amount": "5", "effectiveFrom": "2026-03-01"});
+
+    assert_eq!(
+        post_rate(&router, &admin, body.clone()).await.status,
+        StatusCode::CREATED
+    );
+    let rows = audit_rows(&pool, "usage.rate_create").await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["outcome"], json!("executed"));
+    assert_eq!(rows[0]["resource_kind"], json!("settings"));
+    // The central writer records the names of the body's fields, never a value.
+    assert_eq!(
+        rows[0]["args"],
+        json!({"fields": ["amount", "currency", "effectiveFrom", "kind"]})
+    );
+
+    assert_eq!(
+        post_rate(&router, &reader, body).await.status,
+        StatusCode::FORBIDDEN
+    );
+    let rows = audit_rows(&pool, "usage.rate_create").await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[1]["outcome"], json!("refused"));
+}
