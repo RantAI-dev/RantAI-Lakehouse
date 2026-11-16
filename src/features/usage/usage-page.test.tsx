@@ -71,7 +71,6 @@ const RATE = {
   currency: "USD",
   amount: "5.000000",
   effectiveFrom: "2026-10-01",
-  createdBy: "u9",
   createdAt: "2026-10-01T08:00:00Z",
 }
 
@@ -180,6 +179,49 @@ describe("UsagePage", () => {
     renderPage()
     expect(await screen.findByRole("columnheader", { name: "Estimate (USD)" })).toBeTruthy()
     expect(screen.getAllByText("12.50").length).toBeGreaterThan(0)
+  })
+
+  it("shows a rate to all its significant decimals, and an amount of 16 digits with every digit", async () => {
+    // PR review fix (SHOULD-FIX): both went through `Number`, which showed a rate of
+    // 0.000012 as 0.00 and rounded 1234567890123456.5 to a neighbouring double.
+    stubApi(["usage:read"], {
+      usage: () =>
+        json(
+          report({
+            currency: "USD",
+            rows: [{ ...ROW, estimate: "1234567890123456.500000" }],
+            totals: { ...TOTALS, estimate: "1234567890123456.500000" },
+          })
+        ),
+      rates: {
+        currency: "USD",
+        rates: [
+          { ...RATE, id: "r2", amount: "0.000012" },
+          { ...RATE, id: "r3", amount: "5.000000", effectiveFrom: "2026-09-01" },
+        ],
+      },
+    })
+    renderPage()
+    expect(await screen.findByText("0.000012 USD")).toBeTruthy()
+    expect(screen.getByText("5.00 USD")).toBeTruthy()
+    expect(screen.getAllByText("1,234,567,890,123,456.50").length).toBeGreaterThan(0)
+  })
+
+  it("rounds an estimate to four decimals from its digits, not from a float", async () => {
+    stubApi(["usage:read"], {
+      usage: () =>
+        json(
+          report({
+            currency: "USD",
+            rows: [{ ...ROW, estimate: "0.123450" }],
+            totals: { ...TOTALS, estimate: "999.999950" },
+          })
+        ),
+    })
+    renderPage()
+    // 0.123450 has four significant places after trimming; 999.99995 rounds up through the carry.
+    expect((await screen.findAllByText("0.1235")).length).toBeGreaterThan(0)
+    expect(screen.getAllByText("1,000.00").length).toBeGreaterThan(0)
   })
 
   it("says a row has no rate, and not zero, when a rate exists but none covers its runs", async () => {

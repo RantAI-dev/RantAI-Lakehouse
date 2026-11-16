@@ -98,12 +98,31 @@ function formatScanned(bytes: number): string {
   return `${text} ${units[unit]}`
 }
 
-/** A decimal string as money: at least two places, at most four. */
-function formatMoney(amount: string | null): string {
+/**
+ * A decimal string as money, worked on its digits and never through a float:
+ * at least two places, at most `maxDecimals` (rounded half up on the digits),
+ * and trailing zeros beyond the second dropped. A rate is shown with up to
+ * six places, the six it is stored with, so 0.000012 is not shown as 0.00; an
+ * estimate with up to four.
+ *
+ * PR review fix (SHOULD-FIX): this went through `Number`, which showed a rate
+ * of 0.000012 as 0.00 and lost the low digits of an amount of 16 digits.
+ */
+function formatMoney(amount: string | null, maxDecimals = 4): string {
   if (amount === null) return "No rate"
-  const value = Number(amount)
-  if (!Number.isFinite(value)) return "No rate"
-  return value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 4 })
+  const parts = /^(\d+)(?:\.(\d+))?$/.exec(amount)
+  if (!parts) return "No rate"
+  let whole = parts[1]
+  let fraction = parts[2] ?? ""
+  if (fraction.length > maxDecimals) {
+    const rounded =
+      BigInt(whole + fraction.slice(0, maxDecimals)) + BigInt(fraction.charCodeAt(maxDecimals) >= 53 ? 1 : 0)
+    const digits = rounded.toString().padStart(maxDecimals + 1, "0")
+    whole = digits.slice(0, digits.length - maxDecimals)
+    fraction = digits.slice(digits.length - maxDecimals)
+  }
+  fraction = fraction.replace(/0+$/, "").padEnd(2, "0")
+  return `${whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}.${fraction}`
 }
 
 const FIELD_LABEL = "flex flex-col gap-1 text-xs text-muted-foreground"
@@ -346,7 +365,7 @@ function RatesPanel({
               {state.data.rates.map((rate) => (
                 <TableRow key={rate.id}>
                   <TableCell>{RATE_KINDS.find((k) => k.value === rate.kind)?.label ?? rate.kind}</TableCell>
-                  <TableCell className="text-right tabular-nums">{`${formatMoney(rate.amount)} ${rate.currency}`}</TableCell>
+                  <TableCell className="text-right tabular-nums">{`${formatMoney(rate.amount, 6)} ${rate.currency}`}</TableCell>
                   <TableCell>{rate.effectiveFrom}</TableCell>
                 </TableRow>
               ))}

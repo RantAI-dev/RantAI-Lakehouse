@@ -384,6 +384,19 @@ const fn scope_word(scope: Option<TenantScope>) -> &'static str {
     }
 }
 
+/// Whose runs an export took out, for the audit row: the tenant's id, `all`,
+/// or `none` for a caller that belongs to no tenant.
+///
+/// PR review fix (SHOULD-FIX): the row said `tenant` for every caller, which
+/// does not tell an auditor which tenant's data left.
+fn audited_tenant(scope: Option<TenantScope>) -> String {
+    match scope {
+        Some(TenantScope::Everyone) => "all".to_owned(),
+        Some(TenantScope::Tenant(id)) => id.to_string(),
+        None => "none".to_owned(),
+    }
+}
+
 fn download_header(text: &str) -> Result<HeaderValue, ApiError> {
     HeaderValue::from_str(text)
         .map_err(|_| ApiError::Internal("a download header could not be built".to_owned()))
@@ -463,8 +476,9 @@ fn export_file(report: &UsageReport, group: Group, currency: &str) -> String {
 ///
 /// `AUDIT_TABLE` lists the changing methods, and this is a `GET`. It is still
 /// a copy of the usage data leaving the console, so the trail says who took
-/// it and for which period and group: one `usage.export` row, written after
-/// the parameters are accepted and before the sums are read.
+/// it and for which tenant (its id, or `all`), period and group: one
+/// `usage.export` row, written after the parameters are accepted and before
+/// the sums are read.
 ///
 /// # Errors
 ///
@@ -490,7 +504,7 @@ pub async fn export(
                 "from": day_text(request.from),
                 "to": day_text(request.to),
                 "group": group_word(request.group),
-                "tenant": scope_word(request.scope),
+                "tenant": audited_tenant(request.scope),
             })),
             outcome: "executed".to_owned(),
             ..NewAuditEvent::default()
@@ -521,7 +535,10 @@ pub async fn export(
     Ok((StatusCode::OK, response_headers, Body::from(file)).into_response())
 }
 
-/// One stored rate, as the console reads it.
+/// One stored rate, as the console reads it. The table also records who
+/// entered it (`created_by`, a principal id), but a tenant administrator with
+/// `usage:read` reads this answer too, so the id is not sent (PR review fix,
+/// SHOULD-FIX).
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RateBody {
@@ -531,7 +548,6 @@ pub struct RateBody {
     /// A decimal with six places.
     amount: String,
     effective_from: String,
-    created_by: String,
     created_at: String,
 }
 
@@ -543,7 +559,6 @@ impl From<UsageRate> for RateBody {
             currency: rate.currency,
             amount: rate.amount,
             effective_from: day_text(rate.effective_from),
-            created_by: rate.created_by,
             created_at: rate
                 .created_at
                 .format(&time::format_description::well_known::Rfc3339)

@@ -173,6 +173,69 @@ async fn a_rate_in_another_currency_than_the_ones_stored_is_not_added(pool: PgPo
     assert_eq!(rates[0].kind, "scan_tb");
 }
 
+/// PR review fix (BLOCKER): the check "no rate has another currency" and the
+/// insert used to be one statement without a lock, and under READ COMMITTED
+/// two writers on an empty table each saw no rival and both inserted. Eight
+/// writers alternate two currencies at once; exactly one currency may be
+/// stored afterwards, and every accepted rate must be of that currency. The
+/// table is append-only, so one attempt per database is all there is: whether
+/// the race fires without the lock depends on timing (see the report of the
+/// fix round for how often it did).
+#[sqlx::test(migrations = "../../migrations")]
+async fn concurrent_rates_of_two_currencies_leave_one_currency_stored(pool: PgPool) {
+    // Open four connections first and let every writer start together, so
+    // the statements overlap instead of queueing behind connection set-up.
+    let mut warm = Vec::new();
+    for _ in 0..4 {
+        warm.push(pool.acquire().await.unwrap());
+    }
+    drop(warm);
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+    let mut writers = tokio::task::JoinSet::new();
+    for n in 0..8_u8 {
+        let pool = pool.clone();
+        let start = std::sync::Arc::clone(&start);
+        writers.spawn(async move {
+            let currency = if n % 2 == 0 { "USD" } else { "IDR" };
+            start.wait().await;
+            usage::add_rate(
+                &pool,
+                &NewUsageRate {
+                    kind: "scan_tb",
+                    currency,
+                    amount: "1",
+                    effective_from: day(3, 1),
+                    created_by: "test",
+                },
+            )
+            .await
+            .unwrap()
+            .map(|stored| stored.currency)
+        });
+    }
+    let mut accepted: Vec<String> = Vec::new();
+    while let Some(done) = writers.join_next().await {
+        accepted.extend(done.unwrap());
+    }
+
+    let stored: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT currency FROM usage_rate ORDER BY currency")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored.len(), 1, "two currencies were stored: {stored:?}");
+    assert!(
+        !accepted.is_empty() && accepted.iter().all(|c| *c == stored[0]),
+        "every accepted rate is of the stored currency {stored:?}: {accepted:?}"
+    );
+    let rows = usage::list_rates(&pool).await.unwrap();
+    assert_eq!(
+        rows.len(),
+        accepted.len(),
+        "an accepted rate is a stored row"
+    );
+}
+
 // ── the sums (step 3) ────────────────────────────────────────────────────
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -457,7 +520,13 @@ async fn an_empty_period_has_a_zero_total_row_and_no_rows(pool: PgPool) {
 
 /// 50,000 runs of three tenants over 120 days, then the 90-day day-sum of one
 /// tenant. The plan must read `query_history_tenant_at_idx` and the call must
-/// finish in under two seconds.
+/// finish in under two seconds, also after the statement has run eight times
+/// on one connection (past the fifth, Postgres may switch a prepared
+/// statement to a generic plan) and when the plan is forced to be generic.
+///
+/// PR review fix (SHOULD-FIX): the statement used to carry
+/// `($4::boolean OR q.tenant_id = $3::uuid)`, which the index serves in a
+/// custom plan only.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_ninety_day_sum_of_one_tenant_uses_the_tenant_time_index_and_is_fast(pool: PgPool) {
     sqlx::query(
@@ -500,22 +569,48 @@ async fn the_ninety_day_sum_of_one_tenant_uses_the_tenant_time_index_and_is_fast
         "the 90-day day sum took {elapsed:?}"
     );
 
-    let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+    let custom: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "EXPLAIN {}",
-        usage::REPORT_SQL
+        usage::REPORT_TENANT_SQL
     )))
     .bind(q.from)
     .bind(q.to)
-    .bind(tenant(TENANT_A))
-    .bind(false)
     .bind("day")
+    .bind(tenant(TENANT_A))
     .fetch_all(&pool)
     .await
     .unwrap();
-    let plan = plan.join("\n");
-    println!("{plan}");
+    let custom = custom.join("\n");
+    println!("{custom}");
     assert!(
-        plan.contains("query_history_tenant_at_idx"),
-        "the plan must use the tenant/time index:\n{plan}"
+        custom.contains("query_history_tenant_at_idx"),
+        "the plan must use the tenant/time index:\n{custom}"
+    );
+
+    // PR review fix (SHOULD-FIX): after five runs of a named prepared statement
+    // Postgres may plan it once for all values, and then a tenant's period is
+    // read through `query_history_at_idx` with a filter. The store runs the sum
+    // unnamed, so every call is planned with its own values: eight calls on
+    // one connection leave no prepared statement behind, and the ninth is as
+    // fast as the first.
+    for _ in 0..8 {
+        usage::report(&pool, &q).await.unwrap();
+    }
+    let started = Instant::now();
+    usage::report(&pool, &q).await.unwrap();
+    let ninth = started.elapsed();
+    println!("the ninth run took {ninth:?}");
+    assert!(ninth.as_secs_f64() < 2.0, "the ninth run took {ninth:?}");
+    assert_eq!(pool.size(), 1, "the runs above shared one connection");
+    let mut conn = pool.acquire().await.unwrap();
+    let kept: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_prepared_statements WHERE statement LIKE '%rated AS MATERIALIZED%'",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        kept, 0,
+        "the sum must run as an unnamed statement, planned at every call"
     );
 }

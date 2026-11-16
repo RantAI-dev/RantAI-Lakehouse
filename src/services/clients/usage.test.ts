@@ -65,7 +65,6 @@ const RATE = {
   currency: "USD",
   amount: "5.000000",
   effectiveFrom: "2026-10-01",
-  createdBy: "u1",
   createdAt: "2026-10-01T08:00:00Z",
 }
 

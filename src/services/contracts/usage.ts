@@ -70,8 +70,6 @@ export type UsageRate = {
   amount: string
   /** The first `YYYY-MM-DD` day the rate applies on. */
   effectiveFrom: string
-  /** The id of whoever entered it. */
-  createdBy: string
   /** RFC 3339. */
   createdAt: string
 }

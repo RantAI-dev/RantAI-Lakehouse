@@ -143,18 +143,31 @@ pub struct UsageReport {
     pub totals: UsageRow,
 }
 
-/// The sum, as ONE constant statement: every value is bound (`$1` first day,
-/// `$2` last day, `$3` tenant, `$4` whether every tenant counts, `$5` the
-/// group). It is `pub` so the index test can `EXPLAIN` exactly the text the
-/// store runs.
-///
-/// `runs` reads the period through `query_history_tenant_at_idx`
-/// (`tenant_id`, `at`); `rated` is one row per day of the period with the
-/// rate of each kind in force on it, so a run is priced with its own day's
-/// rate. `MATERIALIZED` keeps the two rate lookups at one per day: inlined,
-/// the planner runs them once per run. `GROUPING SETS ((key), ())` returns the rows and the totals in one
-/// pass over the runs.
-pub const REPORT_SQL: &str = "\
+// The sum is TWO constant statements, one per `TenantScope`, built at compile
+// time from the same pieces so they cannot drift apart, and [`report`] runs
+// each as an unnamed statement (`persistent(false)`). PR review fix
+// (SHOULD-FIX): one statement with `($4::boolean OR q.tenant_id = $3::uuid)`
+// can use `query_history_tenant_at_idx` only in a custom plan, and after five
+// executions of a named prepared statement Postgres may switch to a generic
+// plan, in which the `OR` hides the tenant from the index and a tenant's
+// 90-day sum reads every tenant's rows. The split gives the tenant a plain
+// `q.tenant_id = $4` predicate. It is not enough alone: a generic plan has no
+// values for the dates, guesses that the period holds a handful of rows, and
+// picks `query_history_at_idx` with a filter on the tenant, which is the slow
+// way on a large table. An unnamed statement is planned at every call with
+// the values at hand, so the index is chosen on the real period. The sum runs
+// when a person opens or downloads the page, so skipping the cache costs one
+// parse per call.
+//
+// `macro_rules!` and not `const &str`: `concat!` takes literals only, and a
+// macro that expands to a literal is one.
+
+/// What is summed: the days of the period and the rate in force on each. `$1`
+/// is the first day and `$2` the last, bound as dates. Ends inside the `runs`
+/// CTE, in the middle of its `WHERE`, where the scope's predicate goes.
+macro_rules! report_head {
+    () => {
+        "\
 WITH rated AS MATERIALIZED ( \
     SELECT d.day, \
            (SELECT r.amount FROM usage_rate r \
@@ -170,16 +183,22 @@ WITH rated AS MATERIALIZED ( \
            q.owner_id, q.user_name, q.tenant_id, q.scanned_bytes, q.duration_ms \
       FROM query_history q \
      WHERE q.at >= ($1::date)::timestamp AT TIME ZONE 'UTC' \
-       AND q.at <  (($2::date) + 1)::timestamp AT TIME ZONE 'UTC' \
-       AND ($4::boolean OR q.tenant_id = $3::uuid) \
+       AND q.at <  (($2::date) + 1)::timestamp AT TIME ZONE 'UTC'"
+    };
+}
+
+/// The rest of the statement, from the end of `runs`. `$3` is the group word.
+macro_rules! report_tail {
+    () => {
+        " \
 ), keyed AS ( \
-    SELECT CASE $5::text \
+    SELECT CASE $3::text \
                WHEN 'day' THEN to_char(runs.day, 'YYYY-MM-DD') \
                WHEN 'person' THEN COALESCE(runs.owner_id::text, runs.user_name) \
                WHEN 'engine' THEN runs.engine \
                ELSE COALESCE(runs.tenant_id::text, 'none') \
            END AS key, \
-           CASE $5::text \
+           CASE $3::text \
                WHEN 'tenant' THEN COALESCE(t.name, 'no tenant') \
                WHEN 'person' THEN runs.user_name \
                ELSE '' \
@@ -194,7 +213,7 @@ WITH rated AS MATERIALIZED ( \
 SELECT GROUPING(k.key) = 1 AS is_total, \
        COALESCE(k.key, '') AS key, \
        CASE WHEN GROUPING(k.key) = 1 THEN '' \
-            WHEN $5::text IN ('person', 'tenant') THEN (array_agg(k.name ORDER BY k.at DESC))[1] \
+            WHEN $3::text IN ('person', 'tenant') THEN (array_agg(k.name ORDER BY k.at DESC))[1] \
             ELSE k.key END AS label, \
        count(*)::bigint AS queries, \
        (count(*) FILTER (WHERE k.status = 'completed'))::bigint AS completed, \
@@ -207,9 +226,34 @@ SELECT GROUPING(k.key) = 1 AS is_total, \
             ELSE round(COALESCE(sum(k.scan_part), 0) + COALESCE(sum(k.engine_part), 0), 6)::text \
        END AS estimate \
   FROM keyed k \
- GROUP BY GROUPING SETS ((k.key), ())";
+ GROUP BY GROUPING SETS ((k.key), ())"
+    };
+}
 
-/// A row of [`REPORT_SQL`]: the report's row and whether it is the totals.
+/// The sum of every run, the ones with no tenant included
+/// ([`TenantScope::Everyone`]): a constant statement, every value bound (`$1`
+/// first day, `$2` last day, `$3` the group). It is `pub` so the index test
+/// can `EXPLAIN` exactly the text the store runs.
+///
+/// `runs` reads the period through `query_history_tenant_at_idx`
+/// (`tenant_id`, `at`) in [`REPORT_TENANT_SQL`]; `rated` is one row per day of
+/// the period with the rate of each kind in force on it, so a run is priced
+/// with its own day's rate. `MATERIALIZED` keeps the two rate lookups at one
+/// per day: inlined, the planner runs them once per run. `GROUPING SETS
+/// ((key), ())` returns the rows and the totals in one pass over the runs.
+pub const REPORT_SQL: &str = concat!(report_head!(), report_tail!());
+
+/// The sum of one tenant's runs ([`TenantScope::Tenant`]): the statement of
+/// [`REPORT_SQL`] with the plain predicate `q.tenant_id = $4::uuid` added, so
+/// `$4` is the tenant, bound as a uuid. `pub` for the same reason.
+pub const REPORT_TENANT_SQL: &str = concat!(
+    report_head!(),
+    " AND q.tenant_id = $4::uuid",
+    report_tail!()
+);
+
+/// A row of [`REPORT_SQL`] and of [`REPORT_TENANT_SQL`]: the report's row and
+/// whether it is the totals.
 #[derive(sqlx::FromRow)]
 struct ReportRow {
     is_total: bool,
@@ -223,18 +267,27 @@ struct ReportRow {
 ///
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn report(pool: &PgPool, query: &UsageQuery) -> Result<UsageReport, StoreError> {
-    let (tenant, everyone) = match query.scope {
-        TenantScope::Tenant(id) => (Some(id), false),
-        TenantScope::Everyone => (None, true),
+    let fetched: Vec<ReportRow> = match query.scope {
+        TenantScope::Tenant(tenant) => {
+            sqlx::query_as(REPORT_TENANT_SQL)
+                .persistent(false)
+                .bind(query.from)
+                .bind(query.to)
+                .bind(query.group.as_str())
+                .bind(tenant)
+                .fetch_all(pool)
+                .await?
+        }
+        TenantScope::Everyone => {
+            sqlx::query_as(REPORT_SQL)
+                .persistent(false)
+                .bind(query.from)
+                .bind(query.to)
+                .bind(query.group.as_str())
+                .fetch_all(pool)
+                .await?
+        }
     };
-    let fetched: Vec<ReportRow> = sqlx::query_as(REPORT_SQL)
-        .bind(query.from)
-        .bind(query.to)
-        .bind(tenant)
-        .bind(everyone)
-        .bind(query.group.as_str())
-        .fetch_all(pool)
-        .await?;
     let mut rows = Vec::with_capacity(fetched.len());
     let mut totals = None;
     for fetched_row in fetched {
@@ -324,9 +377,18 @@ pub async fn list_rates(pool: &PgPool) -> Result<Vec<UsageRate>, StoreError> {
 }
 
 /// Add a rate. Returns `None`, and writes nothing, when another stored rate
-/// has a different currency: one estimate never adds two currencies. The
-/// check and the insert are one statement, so two concurrent writers cannot
-/// both pass it.
+/// has a different currency: one estimate never adds two currencies.
+///
+/// The check and the insert run in one transaction that first takes an
+/// advisory lock, so writers go one after another. One statement is not
+/// enough: under `READ COMMITTED` two writers on an empty table, one for USD
+/// and one for IDR, each see no rival row and both insert. An advisory lock
+/// and not `LOCK TABLE`: the repository's other check-then-write paths use one
+/// (`uploads::mark_group_within_limits`), it asks nothing of the table's
+/// privileges, and it blocks no reader. The table is tiny and written rarely,
+/// so the queue costs nothing. The lock ends with the transaction, and the
+/// next writer's statement takes its snapshot after that, so it sees the row
+/// that was just committed.
 ///
 /// # Errors
 ///
@@ -342,13 +404,21 @@ pub async fn add_rate(
           WHERE NOT EXISTS (SELECT 1 FROM usage_rate WHERE currency <> $2) \
          RETURNING {RATE_COLUMNS}"
     );
+    let mut tx = pool.begin().await?;
+    // `hashtext()` keys the lock on a constant string; the prefix keeps it
+    // apart from the other advisory locks keyed on bare strings.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('usage_rate:currency'))")
+        .execute(&mut *tx)
+        .await?;
     // safe: only the constant column list is formatted in; every value is bound.
-    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql))
+    let stored = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(rate.kind)
         .bind(rate.currency)
         .bind(rate.amount)
         .bind(rate.effective_from)
         .bind(rate.created_by)
-        .fetch_optional(pool)
-        .await?)
+        .fetch_optional(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(stored)
 }

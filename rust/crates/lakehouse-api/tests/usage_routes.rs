@@ -480,6 +480,21 @@ async fn the_estimate_is_null_without_a_rate_and_priced_by_the_rate_in_force() {
         json!("2026-03-03"),
         "newest first"
     );
+    // PR review fix (SHOULD-FIX): who entered a rate is a principal id of the
+    // deployment's administrator; a tenant administrator reading the rates does
+    // not get it, in the list or in the answer to the write.
+    for rate in listed["rates"].as_array().unwrap() {
+        assert!(rate.get("createdBy").is_none(), "{rate}");
+    }
+    assert!(first.json().get("createdBy").is_none(), "{}", first.text());
+    let stored_by: Vec<String> = sqlx::query_scalar("SELECT created_by FROM usage_rate")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(
+        stored_by.iter().all(|who| !who.is_empty()),
+        "the table still records who entered a rate"
+    );
 }
 
 #[tokio::test]
@@ -574,6 +589,15 @@ async fn the_file_holds_the_rows_and_totals_of_the_page_a_formula_neutralised_an
     insert(&pool, &b).await;
     // The names are the user list's: this caller may read it.
     let admin = person(&pool, "usage:read,identity:read", &[TENANT_A]).await;
+    // PR review fix (SHOULD-FIX): a period with a rate, so the file's estimate
+    // and currency columns are compared with the page's, not both empty.
+    sqlx::query(
+        "INSERT INTO usage_rate (kind, currency, amount, effective_from, created_by) \
+         VALUES ('scan_tb', 'USD', 5000000000, DATE '2026-03-01', 'test')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     let uri = format!("{PERIOD}&group=person");
 
     let page = get(&router, &admin, &format!("/api/usage/queries?{uri}"))
@@ -616,11 +640,17 @@ async fn the_file_holds_the_rows_and_totals_of_the_page_a_formula_neutralised_an
         assert_eq!(line[2], row["queries"].to_string());
         assert_eq!(line[4], row["failed"].to_string());
         assert_eq!(line[7], row["scannedBytes"].to_string());
+        assert_eq!(line[9], row["estimate"].as_str().unwrap(), "{line:?}");
+        assert_eq!(line[10], "USD");
     }
     let totals = cells.last().unwrap();
     assert_eq!(totals[0], "Total");
     assert_eq!(totals[2], page["totals"]["queries"].to_string());
     assert_eq!(totals[7], page["totals"]["scannedBytes"].to_string());
+    // 42 bytes x 5e9 per 10^12 bytes: the page's own sum, not a recomputation.
+    assert_eq!(page["totals"]["estimate"], json!("0.210000"), "{page}");
+    assert_eq!(totals[9], "0.210000");
+    assert_eq!(totals[10], "USD");
 
     // A name that starts with `=` is text in the file, not a formula.
     let name_cells: Vec<&str> = cells[1..=page_rows.len()]
@@ -640,7 +670,47 @@ async fn the_file_holds_the_rows_and_totals_of_the_page_a_formula_neutralised_an
     assert_eq!(audit[0]["args"]["from"], json!("2026-03-01"));
     assert_eq!(audit[0]["args"]["to"], json!("2026-03-31"));
     assert_eq!(audit[0]["args"]["group"], json!("person"));
-    assert_eq!(audit[0]["args"]["tenant"], json!("tenant"));
+    // PR review fix (SHOULD-FIX): the row used to say `"tenant"` for every
+    // caller; it names the tenant whose runs were taken out.
+    assert_eq!(audit[0]["args"]["tenant"], json!(TENANT_A));
+}
+
+#[tokio::test]
+async fn an_export_of_all_tenants_records_all_and_one_of_no_tenant_records_none() {
+    let TestApp { router, pool } = spin_up().await;
+    seed_two_tenants(&pool).await;
+    let root = person(&pool, "*:*", &[TENANT_A]).await;
+    let lonely = person(&pool, "usage:read", &[]).await;
+
+    let all = get(
+        &router,
+        &root,
+        &format!("/api/usage/queries/export?{PERIOD}&tenant=all"),
+    )
+    .await;
+    assert_eq!(all.status, StatusCode::OK, "{}", all.text());
+    let own = get(
+        &router,
+        &root,
+        &format!("/api/usage/queries/export?{PERIOD}"),
+    )
+    .await;
+    assert_eq!(own.status, StatusCode::OK, "{}", own.text());
+    let none = get(
+        &router,
+        &lonely,
+        &format!("/api/usage/queries/export?{PERIOD}"),
+    )
+    .await;
+    assert_eq!(none.status, StatusCode::OK, "{}", none.text());
+
+    let audit = audit_rows(&pool, "usage.export").await;
+    let tenants: Vec<&Value> = audit.iter().map(|row| &row["args"]["tenant"]).collect();
+    assert_eq!(
+        tenants,
+        [&json!("all"), &json!(TENANT_A), &json!("none")],
+        "{audit:?}"
+    );
 }
 
 #[tokio::test]
@@ -744,8 +814,29 @@ async fn with_no_period_the_last_thirty_days_are_summed() {
     let from = body["from"].as_str().unwrap();
     let to = body["to"].as_str().unwrap();
     assert_eq!(body["group"], json!("day"));
-    assert!(from < to, "{from} {to}");
-    assert_eq!(body["from"].as_str().unwrap().len(), 10);
+    // PR review fix (SHOULD-FIX): `from < to` held for a period of two days as
+    // well. Thirty UTC days, today included, are 29 days between the dates.
+    assert_eq!(
+        day_of(to) - day_of(from),
+        time::Duration::days(29),
+        "{from} {to}"
+    );
+    assert_eq!(
+        to,
+        time::OffsetDateTime::now_utc().date().to_string(),
+        "the period ends today in UTC"
+    );
+}
+
+/// `YYYY-MM-DD` as a date.
+fn day_of(text: &str) -> time::Date {
+    let number = |range: std::ops::Range<usize>| text[range].parse::<u8>().unwrap();
+    time::Date::from_calendar_date(
+        text[0..4].parse().unwrap(),
+        time::Month::try_from(number(5..7)).unwrap(),
+        number(8..10),
+    )
+    .unwrap()
 }
 
 // ── (h) audit ────────────────────────────────────────────────────────────

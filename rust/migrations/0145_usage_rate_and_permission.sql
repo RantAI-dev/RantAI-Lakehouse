@@ -26,7 +26,12 @@
 -- ONE CURRENCY: `currency` is a three-letter upper-case code (ISO 4217 shape;
 -- the list of codes is not checked here). The API refuses a rate whose
 -- currency differs from the ones already stored, so one estimate never adds
--- two currencies. Changing the deployment's currency is not offered.
+-- two currencies. The check is made by `lakehouse_store::usage::add_rate`, not
+-- by the table, under an advisory lock that makes writers go one after another
+-- (a lone `INSERT ... WHERE NOT EXISTS` lets two writers of different
+-- currencies both pass under READ COMMITTED); a writer that bypasses the store
+-- is held only by the `CHECK`s below. Changing the deployment's currency is
+-- not offered.
 -- `amount` is NUMERIC(18,6), never a float: it is money.
 --
 -- `created_by` is the principal id of whoever entered the rate.
