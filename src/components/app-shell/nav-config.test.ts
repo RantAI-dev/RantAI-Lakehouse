@@ -198,6 +198,30 @@ describe("ADM-13 D7: nav-config access map and drift tests", () => {
       expect(item?.requires).toEqual(["audit:read"])
     })
 
+    // OPS-8 part B: `GET /api/usage/queries` answers 403 without `usage:read`,
+    // so the menu entry and the route follow that permission.
+    it("shows the Usage entry and opens /usage only with usage:read", () => {
+      const menuEntries = (hasPermission: (p: string) => boolean) =>
+        NAV_GROUPS.flatMap((g) => g.items)
+          .filter((it) => canOpen(it.href, hasPermission))
+          .map((it) => it.title)
+      const analyst = (p: string) => p === "governance:read"
+      const reader = (p: string) => p === "governance:read" || p === "usage:read"
+
+      expect(menuEntries(analyst)).not.toContain("Usage")
+      expect(canOpen("/usage", analyst)).toBe(false)
+
+      expect(menuEntries(reader)).toContain("Usage")
+      expect(canOpen("/usage", reader)).toBe(true)
+    })
+
+    it("lists the Usage menu item in Monitoring under usage:read", () => {
+      const monitoring = NAV_GROUPS.find((g) => g.label === "Monitoring")
+      const item = monitoring?.items.find((it) => it.href === "/usage")
+      expect(item?.title).toBe("Usage")
+      expect(item?.requires).toEqual(["usage:read"])
+    })
+
     it("supports any-of permission checks", () => {
       const hasAlertWrite = (p: string) => p === "alert:write"
       const hasAlertRead = (p: string) => p === "alert:read"

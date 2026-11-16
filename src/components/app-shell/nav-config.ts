@@ -167,6 +167,8 @@ export const NAV_GROUPS: NavGroup[] = [
       // without `audit:read`, so the menu follows it (every role holds
       // `governance:read`, only Governance Admin holds `audit:read`).
       { title: "Audit Log", href: "/audit", icon: FileText, requires: ["audit:read"] },
+      // OPS-8 part B: `GET /api/usage/queries` answers 403 without `usage:read`.
+      { title: "Usage", href: "/usage", icon: BarChart3, requires: ["usage:read"] },
     ],
   },
   {
@@ -347,6 +349,8 @@ export const ROUTE_ACCESS: readonly RouteAccessEntry[] = [
   // Monitoring
   { pattern: "/health", requires: ["ops:read"] },
   { pattern: "/alerts", requires: ["alert:read", "alert:write"] },
+  // OPS-8 part B: same permission as the API's usage reads.
+  { pattern: "/usage", requires: ["usage:read"] },
   // WEB-7 D2/D7: the rule form left the list's dialog. `POST`/`PUT
   // /api/alerts` are `RequiresAuth` with the handler deciding (an owner's own
   // chart alert needs no `alert:write`, `policy.rs:424`); this page builds the
