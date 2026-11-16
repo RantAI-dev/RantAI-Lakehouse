@@ -203,8 +203,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/branding",                     Policy::Public),
     // Unauthenticated by necessity — the same page loads the pictures the
     // answer above points to. It serves one stored picture of a fixed kind
-    // (`logo`, `logo-dark` or `icon`, else 404), as an inert file: `nosniff`,
-    // a sandboxing CSP and `inline`. Nothing else is reachable through it.
+    // (`logo`, `logo-dark` or `icon`): a kind outside that list is a 400 and
+    // a kind inside it that was never set is a 404 (`routes::settings`).
+    // The picture is an inert file: `nosniff`, a sandboxing CSP and
+    // `inline`. Nothing else is reachable through it.
     ("GET",  "/api/branding/images/{kind}",       Policy::Public),
     // Redirect-only, grants nothing — it only ever
     // 302s to a fixed, config-sourced IdP URL and sets a single-use flow
