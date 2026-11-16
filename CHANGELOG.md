@@ -29,6 +29,7 @@ once a first release is tagged.
 - The saved-queries console (backlog `QS-3`): the saved-queries page gains folders with a personal and a shared space, server-side search over name and SQL, move, a trash with restore at edit, version history with revert, and sharing for queries and folders at view, edit and manage. The studio saves back into the saved query it came from at edit or manage, and a link to a query the caller may not see opens no tab.
 - The dashboard eval (backlog `AI-15`) leaves out the cases named in `--exclude id1,id2`. `run_dashboard_eval.sh` forwards the flag, an id that names no case exits with code 2, and the result document lists the excluded ids. The `mode_switch` case asks for a bar chart, so a line chart is no longer a failure. It adds two cases: `chart_top_n_claimed`, where a top 5 by country is saved with `limit` 5, and `chart_bin_text_column_asks`, where a bin on a text column is neither claimed nor saved.
 - In Ask mode the assistant explains a calculated field and finds one before saying it does not exist: a name `describe_mart` does not list may still be a calculated field, so a request like "explain the calculated field total_tamu" has it call `list_calculated_fields` for that mart or SQL source, which explains the formula in plain words, and it runs no SQL for that (backlog `AI-4`).
+- In Ask mode the assistant looks for a saved metric before it writes SQL, and names the metric when it uses it (backlog `AI-7`).
 
 ### Security
 
