@@ -1,6 +1,7 @@
 # ADR 0018: several organisations in one install
 
-- Status: **Proposed**. The product owner decides.
+- Status: **Accepted** by the product owner, 2026-11-16, as proposed. Slice (a), the
+  prototype tests, is deferred while `ADM-1` stays P3 (owner, same day).
 - Date: 2026-11-16
 - Backlog: `ADM-1` (P3). The owner decided on 2026-11-15 that research and this ADR come first,
   with no code, and that the build is blocked by `SEC-20`.
@@ -42,7 +43,7 @@ region and isolates by catalog and workspace. Fabric isolates by workspace on sh
 Metabase separates tenants by row rules on one database, or routes each tenant to its own
 database.
 
-## Decision (proposed)
+## Decision
 
 1. **An organisation is a tenant.** No new entity. The words "organisation" in the console and
    "tenant" in the code mean the same row.
