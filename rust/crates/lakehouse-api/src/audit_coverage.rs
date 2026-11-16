@@ -186,7 +186,7 @@ const EX_TEST_BUTTON: &str = "Decision 1: a connection, email or notification \"
 const EX_MACHINE: &str = "Decision 1: machine callback from an ingestion or orchestrator job; the console user's change it reports is audited where the job was started";
 const EX_PART: &str =
     "Decision 1: one part of a multipart upload; the finished upload is audited by `upload.create`";
-const EX_UI_STATE: &str = "Personal UI state: favourites, recent items, home layout, chat session create, rename and delete (Decision 1), and the read marks of mentions (`POST /api/dashboard/comments/mentions/read`), which are the same kind of state as favourites and which Decision 1 does not name yet";
+const EX_UI_STATE: &str = "Personal UI state: favourites, recent items, home layout, chat session create, rename and delete, and the read marks of mentions (`POST /api/dashboard/comments/mentions/read`) (Decision 1)";
 
 /// Every route of [`crate::policy::POLICY_TABLE`] that changes something, in
 /// the order of that table, with who writes its audit row. Keyed by the
