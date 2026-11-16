@@ -1,19 +1,22 @@
 "use client";
 
 import * as React from "react";
-import { Loader2 } from "lucide-react";
+import { ArrowLeft, CalendarClock, FileSpreadsheet, Loader2, X } from "lucide-react";
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
+import { FormField, FormGroup, FormHint, SwitchRow } from "@/components/patterns/form-fields";
+import { HelpHint } from "@/components/patterns/help-hint";
 import { SelectField } from "@/components/patterns/select-field";
 import { Button } from "@/components/ui/button";
+import {
+  Combobox, ComboboxContent, ComboboxEmpty, ComboboxInput, ComboboxItem, ComboboxList,
+} from "@/components/ui/combobox";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { useService, useServiceAction } from "@/hooks/use-service";
 import { normalizeFilters } from "@/lib/dashboard-filter-state";
-import { listTimeZones } from "@/lib/time-zones";
+import { cn } from "@/lib/utils";
 import { reportService } from "@/services";
 import type {
-  ReportPerson,
   ReportSchedule,
   ReportSubscription,
   ReportSubscriptionInput,
@@ -21,6 +24,8 @@ import type {
 import type { FilterDef } from "@/services/clients/bi-store";
 import type { ReadState } from "./chart-download";
 import { clock, describeAttachments, describeNotSent, describeSchedule, describeStatus, WEEKDAYS } from "./report-words";
+import { ReportRecipientsField, type ChosenRecipient } from "./report-recipients-field";
+import { TimeZoneSelect } from "./time-zone-select";
 
 /**
  * What a report is made as (feature decision 1). Shown above the recipient list
@@ -28,6 +33,10 @@ import { clock, describeAttachments, describeNotSent, describeSchedule, describe
  */
 export const AS_CREATOR_SENTENCE =
   "This report is made as you: every recipient, inside or outside the company, sees the data you are allowed to see, with your masking and row filters.";
+
+/** Next to "Skip when empty" on a dashboard that has only single-value charts (RPT-1 QA fix Q3). */
+export const ALWAYS_SENT_SENTENCE =
+  "This dashboard has no chart that groups or lists rows, so it is always sent: a single-value chart (a KPI, a progress bar, a gauge) always has a value.";
 
 /** Shown while the deployment has no `SMTP_HOST` (feature decision 9). */
 export const EMAIL_NOT_SET_UP = "Email is not set up on this deployment.";
@@ -57,11 +66,12 @@ const ORIENTATION_OPTIONS = [
   { value: "landscape", label: "Landscape" },
 ];
 
-const FILE_OPTIONS = [
-  { value: "none", label: "Not attached" },
+const FILE_FORMATS = [
   { value: "xlsx", label: "Excel" },
   { value: "csv", label: "CSV" },
-];
+] as const;
+
+type FileFormat = (typeof FILE_FORMATS)[number]["value"];
 
 const VALUES_OPTIONS = [
   { value: "formatted", label: "Values as on the chart" },
@@ -91,11 +101,34 @@ export function SubscriptionsDialog({
   const [editing, setEditing] = React.useState<ReportSubscription | "new" | null>(null);
   const [history, setHistory] = React.useState<ReportSubscription | null>(null);
   const reload = () => setVersion((v) => v + 1);
+  // Owner QA 2026-11-16 (one action, one button): the form has no Cancel; the
+  // back arrow, Esc and the dialog's X leave it, and leaving with changes not
+  // saved asks first (DESIGN.md §3 "Buang perubahan?").
+  const [dirty, setDirty] = React.useState(false);
+  const [leaving, setLeaving] = React.useState<(() => void) | null>(null);
+  function leave(then: () => void) {
+    if (editing && dirty) setLeaving(() => then);
+    else then();
+  }
+  function backToList() {
+    setEditing(null);
+    setHistory(null);
+    setDirty(false);
+  }
+  const title = editing === "new" ? "New subscription" : editing ? "Edit subscription" : history ? "Send history" : `Subscriptions · ${dashName}`;
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
-        <DialogHeader><DialogTitle>Subscriptions · {dashName}</DialogTitle></DialogHeader>
+    <>
+    <Dialog open={open} onOpenChange={(next) => { if (next) onOpenChange(true); else leave(() => { backToList(); onOpenChange(false); }); }}>
+      <DialogContent className="max-h-[85vh] gap-5 overflow-y-auto sm:max-w-xl">
+        <DialogHeader className="flex-row items-center gap-1.5">
+          {editing || history ? (
+            <Button variant="ghost" size="icon-sm" className="-ml-1.5 shrink-0" aria-label="Back to the subscriptions" onClick={() => leave(backToList)}>
+              <ArrowLeft aria-hidden />
+            </Button>
+          ) : null}
+          <DialogTitle className="min-w-0 truncate leading-snug" title={title}>{title}</DialogTitle>
+        </DialogHeader>
         {editing ? (
           <SubscriptionForm
             board={board}
@@ -104,11 +137,11 @@ export function SubscriptionsDialog({
             readState={readState}
             reportZone={reportZone}
             pdfSupported={list.status === "success" ? list.data.pdfSupported : true}
-            onCancel={() => setEditing(null)}
-            onSaved={() => { setEditing(null); reload(); }}
+            onDirtyChange={setDirty}
+            onSaved={() => { backToList(); reload(); }}
           />
         ) : history ? (
-          <History subscription={history} onBack={() => setHistory(null)} />
+          <History subscription={history} />
         ) : (
           <>
             {list.status === "loading" ? <p className="text-sm text-muted-foreground">Loading…</p> : null}
@@ -116,26 +149,37 @@ export function SubscriptionsDialog({
             {list.status === "success" ? (
               <>
                 {!list.data.emailSetUp ? (
-                  <p role="status" className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+                  <p role="status" className="rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
                     {EMAIL_NOT_SET_UP} A subscription can be saved, but nothing is sent until it is.
                   </p>
                 ) : null}
                 {list.data.items.length === 0 ? <p className="text-sm text-muted-foreground">No subscriptions on this dashboard yet.</p> : null}
-                <ul className="flex flex-col gap-2" aria-label="Subscriptions">
-                  {list.data.items.map((s) => (
-                    <SubscriptionRow key={s.id} s={s} dashName={dashName} onEdit={() => setEditing(s)} onHistory={() => setHistory(s)} onChanged={reload} />
-                  ))}
-                </ul>
+                {list.data.items.length > 0 ? (
+                  <ul className="flex min-w-0 flex-col gap-2" aria-label="Subscriptions">
+                    {list.data.items.map((s) => (
+                      <SubscriptionRow key={s.id} s={s} dashName={dashName} onEdit={() => setEditing(s)} onHistory={() => setHistory(s)} onChanged={reload} />
+                    ))}
+                  </ul>
+                ) : null}
               </>
             ) : null}
             <DialogFooter>
-              <Button variant="ghost" size="sm" onClick={() => onOpenChange(false)}>Close</Button>
               <Button size="sm" onClick={() => setEditing("new")}>New subscription</Button>
             </DialogFooter>
           </>
         )}
       </DialogContent>
     </Dialog>
+    <ConfirmActionDialog
+      open={leaving !== null}
+      onOpenChange={(o) => { if (!o) setLeaving(null); }}
+      title="Discard your changes?"
+      description="The subscription keeps what it had before; what you changed here is not saved."
+      confirmLabel="Discard changes"
+      destructive
+      onConfirm={() => { const then = leaving; setLeaving(null); then?.(); }}
+    />
+    </>
   );
 }
 
@@ -193,12 +237,13 @@ function SubscriptionRow({
   // its own line under it.
   const notSent = describeNotSent(s);
   return (
-    <li className="flex flex-col gap-1 rounded-lg border p-3 text-sm">
+    <li className="flex min-w-0 flex-col gap-1 rounded-lg bg-muted/40 p-3 text-sm">
       <div className="font-medium">{describeSchedule(s.schedule, s.timeZone)}</div>
-      <div className="text-xs text-muted-foreground">
-        {describeAttachments(s.attachments)} · to {people.length > 3 ? `${people.slice(0, 3).join(", ")} and ${people.length - 3} more` : people.join(", ")}
-        {s.skipWhenEmpty ? " · skipped when every chart is empty" : ""}
-      </div>
+      {/* Owner QA 2026-11-16: one line; the whole of it in the title. */}
+      {(() => {
+        const meta = `${describeAttachments(s.attachments)} · to ${people.length > 3 ? `${people.slice(0, 3).join(", ")} and ${people.length - 3} more` : people.join(", ")}${s.skipWhenEmpty ? " · skipped when every chart is empty" : ""}`;
+        return <div className="truncate text-xs text-muted-foreground" title={meta}>{meta}</div>;
+      })()}
       {notSent !== null ? (
         <p className="text-xs font-medium text-amber-700 dark:text-amber-400">{notSent}</p>
       ) : null}
@@ -210,12 +255,12 @@ function SubscriptionRow({
       ) : failure ? <p role="alert" className="text-xs text-destructive">{failure.message}</p>
         : note ? <p role="status" className="text-xs">{note}</p> : null}
       {s.canEdit !== false ? (
-        <div className="flex flex-wrap gap-1.5 pt-1">
-          <Button variant="outline" size="xs" disabled={busy} onClick={() => void send()}>{sending ? "Sending…" : "Send now"}</Button>
-          <Button variant="outline" size="xs" disabled={busy} onClick={() => void pause()}>{s.paused ? "Resume" : "Pause"}</Button>
-          <Button variant="outline" size="xs" disabled={busy} onClick={onEdit}>Edit</Button>
-          <Button variant="outline" size="xs" disabled={busy} onClick={onHistory}>History</Button>
-          <Button variant="ghost" size="xs" disabled={busy} onClick={() => { begin(); setConfirmingDelete(true); }}>Delete</Button>
+        <div className="-ml-2 flex flex-wrap gap-0.5 pt-1">
+          <Button variant="ghost" size="xs" disabled={busy} onClick={() => void send()}>{sending ? "Sending…" : "Send now"}</Button>
+          <Button variant="ghost" size="xs" disabled={busy} onClick={() => void pause()}>{s.paused ? "Resume" : "Pause"}</Button>
+          <Button variant="ghost" size="xs" disabled={busy} onClick={onEdit}>Edit</Button>
+          <Button variant="ghost" size="xs" disabled={busy} onClick={onHistory}>History</Button>
+          <Button variant="ghost" size="xs" disabled={busy} className="text-muted-foreground hover:text-destructive" onClick={() => { begin(); setConfirmingDelete(true); }}>Delete</Button>
         </div>
       ) : null}
       {confirmingDelete ? (
@@ -236,7 +281,7 @@ function SubscriptionRow({
   );
 }
 
-function History({ subscription, onBack }: { readonly subscription: ReportSubscription; readonly onBack: () => void }) {
+function History({ subscription }: { readonly subscription: ReportSubscription }) {
   const state = useService((signal) => reportService.deliveries(subscription.id, signal), [subscription.id]);
   return (
     <>
@@ -247,7 +292,7 @@ function History({ subscription, onBack }: { readonly subscription: ReportSubscr
       {state.status === "success" && state.data.length > 0 ? (
         <ul className="flex flex-col gap-1.5" aria-label="Deliveries">
           {state.data.map((d) => (
-            <li key={d.id} className="rounded-md border px-3 py-2 text-xs">
+            <li key={d.id} className="rounded-lg bg-muted/40 px-3 py-2 text-xs">
               <span className="font-medium capitalize">{d.status}</span>
               {d.origin === "manual" ? " (send now)" : ""} · {new Date(d.startedAt.replace(" ", "T")).toLocaleString() === "Invalid Date" ? d.startedAt : new Date(d.startedAt.replace(" ", "T")).toLocaleString()} · {d.recipientCount} {d.recipientCount === 1 ? "recipient" : "recipients"}
               {d.reason ? <div className="text-muted-foreground">{d.reason}</div> : null}
@@ -255,7 +300,6 @@ function History({ subscription, onBack }: { readonly subscription: ReportSubscr
           ))}
         </ul>
       ) : null}
-      <DialogFooter><Button variant="ghost" size="sm" onClick={onBack}>Back</Button></DialogFooter>
     </>
   );
 }
@@ -263,7 +307,7 @@ function History({ subscription, onBack }: { readonly subscription: ReportSubscr
 type Kind = ReportSchedule["kind"];
 
 function SubscriptionForm({
-  board, existing, charts, readState, reportZone, pdfSupported, onCancel, onSaved,
+  board, existing, charts, readState, reportZone, pdfSupported, onDirtyChange, onSaved,
 }: {
   readonly board: string;
   readonly existing: ReportSubscription | null;
@@ -271,7 +315,8 @@ function SubscriptionForm({
   readonly readState: ReadState;
   readonly reportZone: string;
   readonly pdfSupported: boolean;
-  readonly onCancel: () => void;
+  /** Whether the form holds changes not saved, so leaving it can ask first. */
+  readonly onDirtyChange: (dirty: boolean) => void;
   readonly onSaved: () => void;
 }) {
   const sched = existing?.schedule ?? null;
@@ -280,20 +325,23 @@ function SubscriptionForm({
   const [time, setTime] = React.useState(sched && "hour" in sched ? clock(sched.hour, sched.minute) : "08:00");
   const [weekday, setWeekday] = React.useState(sched?.kind === "weekly" ? sched.weekday : 1);
   const [monthDay, setMonthDay] = React.useState<number | "last">(sched?.kind === "monthly" ? sched.monthDay : 1);
+  // A new subscription starts in the deployment's report time zone (the
+  // `reportZone` prop, Admin > Settings); the picker offers the browser's own
+  // zone first. An existing one keeps the zone it was saved with.
   const [zone, setZone] = React.useState(existing?.timeZone ?? reportZone);
   const [pdf, setPdf] = React.useState(existing ? Boolean(existing.attachments.pdf) : pdfSupported);
   const [paper, setPaper] = React.useState(existing?.attachments.pdf?.paper ?? "a4");
   const [orientation, setOrientation] = React.useState(existing?.attachments.pdf?.orientation ?? "portrait");
-  const [files, setFiles] = React.useState<Record<string, "none" | "xlsx" | "csv">>(() =>
+  // The attached chart files, in the order chosen; a chart not attached has no entry.
+  const [files, setFiles] = React.useState<Record<string, FileFormat>>(() =>
     Object.fromEntries((existing?.attachments.charts ?? []).map((c) => [c.chart, c.format === "csv" ? "csv" : "xlsx"] as const)));
   const [values, setValues] = React.useState(existing?.attachments.charts[0]?.values ?? "formatted");
   const [skip, setSkip] = React.useState(existing?.skipWhenEmpty ?? false);
-  const [people, setPeople] = React.useState<{ userId: string; label: string }[]>(
-    () => (existing?.recipients ?? []).filter((r) => r.userId).map((r) => ({ userId: r.userId as string, label: r.name ?? r.email ?? "" })));
-  const [addresses, setAddresses] = React.useState<string[]>(() => (existing?.recipients ?? []).filter((r) => !r.userId && r.email).map((r) => r.email as string));
-  const [query, setQuery] = React.useState("");
-  const [found, setFound] = React.useState<ReportPerson[]>([]);
-  const [address, setAddress] = React.useState("");
+  const [recipients, setRecipients] = React.useState<ChosenRecipient[]>(() =>
+    (existing?.recipients ?? []).flatMap((r): ChosenRecipient[] =>
+      r.userId ? [{ key: `u:${r.userId}`, userId: r.userId, label: r.name ?? r.email ?? "", detail: r.email ?? null }]
+      : r.email ? [{ key: `e:${r.email}`, email: r.email, label: r.email }]
+      : []));
   const current = React.useMemo(() => normalizeFilters([...readState.filters]) as FilterDef[], [readState.filters]);
   const [filters, setFilters] = React.useState<unknown[] | null>(existing ? existing.filters : current);
   // BI-35: the save goes through `useServiceAction`; `error` holds only the
@@ -303,15 +351,7 @@ function SubscriptionForm({
   const busy = saveAction.status === "pending";
   const [error, setError] = React.useState<string | null>(null);
   const shownError = error ?? saveAction.error?.message ?? null;
-
-  React.useEffect(() => {
-    if (!query.trim()) { setFound([]); return; }
-    const controller = new AbortController();
-    const timer = setTimeout(() => {
-      reportService.people(query.trim(), controller.signal).then(setFound).catch(() => setFound([]));
-    }, 200);
-    return () => { clearTimeout(timer); controller.abort(); };
-  }, [query]);
+  const ids = React.useId();
 
   const [hh, mm] = time.split(":").map((n) => Number.parseInt(n, 10));
   const schedule: ReportSchedule | null = (() => {
@@ -321,26 +361,25 @@ function SubscriptionForm({
     if (kind === "weekly") return { kind, weekday, hour: hh, minute: mm };
     return { kind, monthDay, hour: hh, minute: mm };
   })();
+  const effectiveZone = zone.trim() || reportZone;
 
-  function addAddress() {
-    const a = address.trim().toLowerCase();
-    if (!/^[^\s@,;<>]+@[^\s@,;<>]+\.[^\s@,;<>]+$/.test(a) || addresses.includes(a)) return;
-    setAddresses([...addresses, a]);
-    setAddress("");
-  }
+  // What leaving would lose: the form's choices, compared with how it opened.
+  const snapshot = JSON.stringify([kind, minute, time, weekday, monthDay, effectiveZone, pdf, paper, orientation, files, values, skip, recipients.map((r) => r.key), filters]);
+  const opened = React.useRef(snapshot);
+  React.useEffect(() => { onDirtyChange(snapshot !== opened.current); }, [snapshot, onDirtyChange]);
 
   async function save() {
     if (!schedule) { setError("Choose a time."); return; }
-    const chosen = Object.entries(files).filter(([, f]) => f !== "none").map(([chart, format]) => ({ chart, format, values }));
+    const chosen = Object.entries(files).map(([chart, format]) => ({ chart, format, values }));
     const input: ReportSubscriptionInput = {
       schedule,
-      timeZone: zone.trim() || reportZone,
+      timeZone: effectiveZone,
       attachments: { pdf: pdf ? { paper, orientation } : null, charts: chosen },
       filters: filters && filters.length ? filters : null,
       params: existing ? existing.params : parseJson(readState.params),
       grain: existing ? existing.grain : (readState.grain ?? null),
       skipWhenEmpty: skip,
-      recipients: [...people.map((p) => ({ userId: p.userId })), ...addresses.map((email) => ({ email }))],
+      recipients: recipients.map((r) => (r.userId ? { userId: r.userId } : { email: r.email as string })),
     };
     setError(null);
     // The route's own sentence on a refusal: an outside domain not listed, 51
@@ -349,143 +388,227 @@ function SubscriptionForm({
     if (saved) onSaved();
   }
 
-  // WEB-8 D8: the zone names the browser's own IANA list plus UTC and the
-  // zone already held (`listTimeZones`), the same source the report settings
-  // page offers — a datalist, because a few hundred names are only usable
-  // as suggestions typed against. The server still checks the name.
-  const zones = React.useMemo(() => listTimeZones(zone.trim() || reportZone), [zone, reportZone]);
-
-  const summary = schedule ? describeSchedule(schedule, zone.trim() || reportZone) : "";
+  const summary = schedule ? describeSchedule(schedule, effectiveZone) : "";
+  const filterCount = filters?.length ?? 0;
+  // Owner QA 2026-11-16: the When fields sit in two even columns, labels on
+  // the left above their controls; with three fields the zone takes the row.
+  const whenFields = kind === "hourly" || kind === "daily" ? 3 : 4;
 
   return (
-    <div className="flex flex-col gap-4">
-      <fieldset className="flex flex-col gap-2">
-        <legend className="mb-1 text-sm font-medium">When</legend>
-        <div className="flex flex-wrap items-end gap-3">
-          <Label className="flex flex-col gap-1 text-xs font-normal">Repeat
-            <SelectField aria-label="Repeat" value={kind} options={REPEAT_OPTIONS}
+    <div className="flex min-w-0 flex-col gap-6">
+      <FormGroup title="When">
+        <div className="grid grid-cols-[minmax(0,1fr)] gap-3 sm:grid-cols-2">
+          <FormField id={`${ids}-repeat`} label="Repeat">
+            <SelectField id={`${ids}-repeat`} className="w-full" value={kind} options={REPEAT_OPTIONS}
               onValueChange={(next) => setKind(next as Kind)} />
-          </Label>
+          </FormField>
           {kind === "weekly" ? (
-            <Label className="flex flex-col gap-1 text-xs font-normal">On
-              <SelectField aria-label="Weekday" value={String(weekday)} options={WEEKDAY_OPTIONS}
+            <FormField id={`${ids}-weekday`} label="Day">
+              <SelectField id={`${ids}-weekday`} className="w-full" value={String(weekday)} options={WEEKDAY_OPTIONS}
                 onValueChange={(next) => setWeekday(Number(next))} />
-            </Label>
+            </FormField>
           ) : null}
           {kind === "monthly" ? (
-            <Label className="flex flex-col gap-1 text-xs font-normal">On day
-              <SelectField aria-label="Day of the month" value={String(monthDay)} options={MONTH_DAY_OPTIONS}
+            <FormField id={`${ids}-month-day`} label="Day of the month">
+              <SelectField id={`${ids}-month-day`} className="w-full" value={String(monthDay)} options={MONTH_DAY_OPTIONS}
                 onValueChange={(next) => setMonthDay(next === "last" ? "last" : Number(next))} />
-            </Label>
+            </FormField>
           ) : null}
           {kind === "hourly" ? (
-            <Label className="flex flex-col gap-1 text-xs font-normal">Minutes past the hour
-              <Input aria-label="Minute" type="number" min={0} max={59} value={minute} onChange={(e) => setMinute(Math.min(59, Math.max(0, Number(e.target.value) || 0)))} className="w-24" />
-            </Label>
+            <FormField id={`${ids}-minute`} label="Minutes past the hour">
+              <Input id={`${ids}-minute`} type="number" inputMode="numeric" min={0} max={59} value={minute}
+                onChange={(e) => setMinute(Math.min(59, Math.max(0, Number(e.target.value) || 0)))} className="tabular-nums" />
+            </FormField>
           ) : (
-            <Label className="flex flex-col gap-1 text-xs font-normal">At
-              <Input aria-label="Time" type="time" value={time} onChange={(e) => setTime(e.target.value)} className="w-28" />
-            </Label>
+            <FormField id={`${ids}-time`} label="Time">
+              <Input id={`${ids}-time`} type="time" value={time} onChange={(e) => setTime(e.target.value)} className="tabular-nums" />
+            </FormField>
           )}
-          <Label className="flex flex-col gap-1 text-xs font-normal">Time zone
-            <Input
-              aria-label="Time zone"
-              list="subscription-time-zones"
-              value={zone}
-              onChange={(e) => setZone(e.target.value)}
-              placeholder="Search a time zone"
-              autoComplete="off"
-              className="w-44"
-            />
-            <datalist id="subscription-time-zones">
-              {zones.map((name) => <option key={name} value={name} />)}
-            </datalist>
-          </Label>
+          <FormField id={`${ids}-zone`} label="Time zone" className={cn(whenFields === 3 && "sm:col-span-2")}>
+            <TimeZoneSelect id={`${ids}-zone`} value={effectiveZone} onValueChange={setZone} />
+          </FormField>
         </div>
-        <p className="text-xs text-muted-foreground" aria-live="polite">{summary}</p>
-      </fieldset>
+        {summary ? (
+          <p className="flex min-w-0 items-center gap-1.5 text-sm text-muted-foreground" aria-live="polite">
+            <CalendarClock className="size-4 shrink-0" aria-hidden />
+            <span className="min-w-0 truncate">{summary}</span>
+          </p>
+        ) : null}
+      </FormGroup>
 
-      <fieldset className="flex flex-col gap-1.5">
-        <legend className="mb-1 text-sm font-medium">What to send</legend>
-        <Label className="flex items-center gap-2 font-normal">
-          <input type="checkbox" checked={pdf} disabled={!pdfSupported} onChange={(e) => setPdf(e.target.checked)} />
-          The dashboard as a PDF
-        </Label>
-        {!pdfSupported ? <p className="text-xs text-muted-foreground">The PDF service is not set up on this deployment, so a PDF cannot be attached.</p> : null}
+      <FormGroup title="What to send">
+        <SwitchRow
+          label="The dashboard as a PDF"
+          hint={!pdfSupported ? "The PDF service is not set up on this deployment." : null}
+          checked={pdf}
+          disabled={!pdfSupported}
+          onCheckedChange={setPdf}
+        />
         {pdf ? (
-          <div className="ml-6 flex gap-3">
-            <SelectField aria-label="Paper" value={paper} options={PAPER_OPTIONS}
-              onValueChange={setPaper} />
-            <SelectField aria-label="Orientation" value={orientation} options={ORIENTATION_OPTIONS}
-              onValueChange={setOrientation} />
+          <div className="grid grid-cols-2 gap-3">
+            <FormField id={`${ids}-paper`} label="Paper">
+              <SelectField id={`${ids}-paper`} className="w-full" value={paper} options={PAPER_OPTIONS} onValueChange={setPaper} />
+            </FormField>
+            <FormField id={`${ids}-orientation`} label="Orientation">
+              <SelectField id={`${ids}-orientation`} className="w-full" value={orientation} options={ORIENTATION_OPTIONS} onValueChange={setOrientation} />
+            </FormField>
           </div>
         ) : null}
-        {charts.length ? <p className="pt-1 text-xs text-muted-foreground">Chart data (up to 10 files, 20 MB in all; a file that does not fit is left out and the email says so)</p> : null}
-        {charts.map((c) => (
-          <div key={c.id} className="flex items-center gap-2 text-sm">
-            <span className="min-w-0 flex-1 truncate">{c.title}</span>
-            <SelectField aria-label={`File for ${c.title}`} value={files[c.id] ?? "none"} options={FILE_OPTIONS}
-              onValueChange={(next) => setFiles({ ...files, [c.id]: next as "none" | "xlsx" | "csv" })} />
-          </div>
-        ))}
-        {Object.values(files).some((f) => f !== "none") ? (
-          <SelectField aria-label="Values" value={values} options={VALUES_OPTIONS} className="w-fit"
-            onValueChange={setValues} />
+        {charts.length > 0 || Object.keys(files).length > 0 ? (
+          <ChartFiles id={`${ids}-files`} charts={charts} files={files} onChange={setFiles} />
         ) : null}
-      </fieldset>
-
-      <fieldset className="flex flex-col gap-1.5">
-        <legend className="mb-1 text-sm font-medium">Filters</legend>
-        <p className="text-xs text-muted-foreground">
-          {filters && filters.length ? `${filters.length} ${filters.length === 1 ? "filter" : "filters"} will be applied to this report.` : "No filters: the dashboard's own."}
-          {" "}
-          <button type="button" className="underline" onClick={() => setFilters(current)}>Use the filters on screen</button>
-          {" · "}
-          <button type="button" className="underline" onClick={() => setFilters(null)}>Clear</button>
-        </p>
-        <Label className="flex items-center gap-2 font-normal">
-          <input type="checkbox" checked={skip} onChange={(e) => setSkip(e.target.checked)} />
-          Skip when empty: send nothing when every chart has no rows
-        </Label>
+        {Object.keys(files).length > 0 ? (
+          <FormField id={`${ids}-values`} label="Values in the files">
+            <SelectField id={`${ids}-values`} className="w-full" value={values} options={VALUES_OPTIONS} onValueChange={setValues} />
+          </FormField>
+        ) : null}
         {/* RPT-1 QA fix Q3: single-value tiles always have a value, so they are not judged. */}
-        {charts.some((c) => c.grouped) ? null : (
-          <p className="text-xs text-muted-foreground">This dashboard has no chart that groups or lists rows, so it is always sent: a single-value chart (a KPI, a progress bar, a gauge) always has a value.</p>
-        )}
-      </fieldset>
+        <SwitchRow
+          label="Skip when empty"
+          hint={charts.some((c) => c.grouped)
+            ? "Send nothing when every chart has no rows."
+            : <>Always sent: every chart here has a single value <HelpHint>{ALWAYS_SENT_SENTENCE}</HelpHint></>}
+          checked={skip}
+          onCheckedChange={setSkip}
+        />
+      </FormGroup>
 
-      <fieldset className="flex flex-col gap-2">
-        <legend className="mb-1 text-sm font-medium">Recipients</legend>
-        <p className="text-xs text-muted-foreground">{AS_CREATOR_SENTENCE}</p>
-        <ul className="flex flex-wrap gap-1.5" aria-label="Chosen recipients">
-          {people.map((p) => (
-            <li key={p.userId} className="flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs">{p.label}
-              <button type="button" aria-label={`Remove ${p.label}`} onClick={() => setPeople(people.filter((x) => x.userId !== p.userId))}>×</button></li>
-          ))}
-          {addresses.map((a) => (
-            <li key={a} className="flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs">{a}
-              <button type="button" aria-label={`Remove ${a}`} onClick={() => setAddresses(addresses.filter((x) => x !== a))}>×</button></li>
-          ))}
-        </ul>
-        <Input aria-label="Find a person" placeholder="Find a person by name or email" value={query} onChange={(e) => setQuery(e.target.value)} autoComplete="off" />
-        {found.length ? (
-          <ul className="flex flex-col gap-1" aria-label="People found">
-            {found.filter((f) => !people.some((p) => p.userId === f.id)).map((f) => (
-              <li key={f.id}><button type="button" className="text-left text-sm underline" onClick={() => { setPeople([...people, { userId: f.id, label: f.name }]); setQuery(""); }}>{f.name} <span className="text-muted-foreground">{f.email}</span></button></li>
-            ))}
-          </ul>
-        ) : null}
-        <div className="flex gap-2">
-          <Input aria-label="Outside address" placeholder="Outside email address (its domain must be allowed)" value={address} onChange={(e) => setAddress(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addAddress(); } }} autoComplete="off" />
-          <Button variant="outline" size="sm" onClick={addAddress}>Add address</Button>
+      <FormGroup title="Filters">
+        <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1.5">
+          <p className="min-w-0 flex-1 basis-56 text-sm">
+            {filterCount ? `${filterCount} ${filterCount === 1 ? "filter" : "filters"} will be applied to this report.` : "No filters: the dashboard's own."}
+          </p>
+          <div className="-mr-2 flex shrink-0 gap-0.5">
+            <Button variant="ghost" size="xs" disabled={current.length === 0} onClick={() => setFilters(current)}>Use the filters on screen</Button>
+            <Button variant="ghost" size="xs" disabled={filterCount === 0} onClick={() => setFilters(null)}>Clear</Button>
+          </div>
         </div>
-      </fieldset>
+      </FormGroup>
+
+      <FormGroup title="Recipients" headingId={`${ids}-recipients`}>
+        {/* Feature decision 1: said above the field, before anyone is added. */}
+        <FormHint className="-mt-1">
+          <span id={`${ids}-as-you`} className="min-w-0 truncate">Everyone sees the data as you see it</span>
+          <HelpHint>{AS_CREATOR_SENTENCE}</HelpHint>
+        </FormHint>
+        <ReportRecipientsField
+          id={`${ids}-recipient-input`}
+          labelledBy={`${ids}-recipients`}
+          describedBy={`${ids}-as-you`}
+          value={recipients}
+          onChange={setRecipients}
+        />
+      </FormGroup>
 
       {shownError ? <p role="alert" className="text-sm text-destructive">{shownError}</p> : null}
       <DialogFooter>
-        <Button variant="ghost" size="sm" disabled={busy} onClick={onCancel}>Cancel</Button>
-        <Button size="sm" disabled={busy} onClick={() => void save()}>{busy ? "Saving…" : existing ? "Save changes" : "Subscribe"}</Button>
+        <Button size="sm" disabled={busy} onClick={() => void save()}>
+          {busy ? <Loader2 className="size-3.5 animate-spin" aria-hidden /> : null}
+          {busy ? "Saving…" : existing ? "Save changes" : "Subscribe"}
+        </Button>
       </DialogFooter>
+    </div>
+  );
+}
+
+/**
+ * The chart files a report attaches (owner QA 2026-11-16: a select per chart,
+ * each saying "Not attached", was a heavy stack). One searchable field adds a
+ * chart's data; each chart added is a quiet row with its format and a remove.
+ * A chart the subscription attaches that is no longer on the dashboard keeps
+ * its row, so it can be seen and left out.
+ */
+function ChartFiles({ id, charts, files, onChange }: {
+  readonly id: string;
+  readonly charts: readonly DashboardChart[];
+  readonly files: Record<string, FileFormat>;
+  readonly onChange: (next: Record<string, FileFormat>) => void;
+}) {
+  const chosen = charts.filter((c) => c.id in files);
+  const gone = Object.keys(files).filter((chart) => !charts.some((c) => c.id === chart));
+  const rows = [...chosen.map((c) => ({ id: c.id, title: c.title })), ...gone.map((chart) => ({ id: chart, title: "A chart no longer on this dashboard" }))];
+  function setAttached(next: DashboardChart[]) {
+    const kept = Object.fromEntries(Object.entries(files).filter(([chart]) => gone.includes(chart) || next.some((c) => c.id === chart)));
+    for (const c of next) if (!(c.id in kept)) kept[c.id] = "xlsx";
+    onChange(kept);
+  }
+  return (
+    <FormField
+      id={id}
+      label="Chart data"
+      hint={<>Up to 10 files, 20 MB in all <HelpHint>A file that does not fit is left out, and the email says so.</HelpHint></>}
+    >
+      <Combobox
+        multiple
+        items={[...charts]}
+        value={chosen}
+        onValueChange={(next: DashboardChart[]) => setAttached(next)}
+        isItemEqualToValue={(a: DashboardChart, b: DashboardChart) => a.id === b.id}
+        itemToStringLabel={(c: DashboardChart) => c.title}
+      >
+        <ComboboxInput id={id} className="w-full" placeholder={chosen.length ? "Add another chart" : "Add a chart's data"} autoComplete="off" />
+        <ComboboxContent>
+          <ComboboxEmpty>No chart matches.</ComboboxEmpty>
+          <ComboboxList>
+            {(c: DashboardChart) => <ComboboxItem key={c.id} value={c}><span className="min-w-0 truncate">{c.title}</span></ComboboxItem>}
+          </ComboboxList>
+        </ComboboxContent>
+      </Combobox>
+      {rows.length ? (
+        <ul aria-label="Attached chart data" className="-mx-2 flex min-w-0 flex-col">
+          {rows.map((r) => (
+            <li key={r.id} className="flex h-9 min-w-0 items-center gap-2.5 rounded-lg pr-1 pl-2 transition-colors duration-150 ease-out hover:bg-muted/60 motion-reduce:transition-none">
+              <FileSpreadsheet className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+              <span className="min-w-0 flex-1 truncate text-sm" title={r.title}>{r.title}</span>
+              <FormatToggle label={`Format for ${r.title}`} value={files[r.id] ?? "xlsx"} onChange={(f) => onChange({ ...files, [r.id]: f })} />
+              <Button variant="ghost" size="icon-xs" aria-label={`Leave out ${r.title}`} className="text-muted-foreground"
+                onClick={() => onChange(Object.fromEntries(Object.entries(files).filter(([chart]) => chart !== r.id)))}>
+                <X aria-hidden />
+              </Button>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </FormField>
+  );
+}
+
+/** Excel or CSV for one attached chart: a two-choice radio group, the arrow keys move between them. */
+function FormatToggle({ label, value, onChange }: {
+  readonly label: string;
+  readonly value: FileFormat;
+  readonly onChange: (next: FileFormat) => void;
+}) {
+  const refs = React.useRef<(HTMLButtonElement | null)[]>([]);
+  return (
+    <div role="radiogroup" aria-label={label} className="flex shrink-0 rounded-md bg-muted p-0.5">
+      {FILE_FORMATS.map((f, i) => {
+        const on = f.value === value;
+        return (
+          <button
+            key={f.value}
+            ref={(el) => { refs.current[i] = el; }}
+            type="button"
+            role="radio"
+            aria-checked={on}
+            tabIndex={on ? 0 : -1}
+            onClick={() => onChange(f.value)}
+            onKeyDown={(e) => {
+              if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key)) return;
+              e.preventDefault();
+              const next = FILE_FORMATS[(i + 1) % FILE_FORMATS.length];
+              onChange(next.value);
+              refs.current[(i + 1) % FILE_FORMATS.length]?.focus();
+            }}
+            className={cn(
+              "h-6 rounded-[5px] px-2 text-xs font-medium outline-none transition-colors duration-150 ease-out focus-visible:ring-2 focus-visible:ring-ring motion-reduce:transition-none",
+              on ? "bg-background text-foreground shadow-sm dark:bg-input" : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {f.label}
+          </button>
+        );
+      })}
     </div>
   );
 }
