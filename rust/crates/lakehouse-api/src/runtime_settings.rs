@@ -63,6 +63,7 @@ use lakehouse_store::assistant_settings::AssistantSettings;
 use lakehouse_store::email_settings::EmailSettings;
 use lakehouse_store::sign_in_settings::SignInSettings;
 use lakehouse_store::sso_settings::SsoSettings;
+use lakehouse_store::workspace_settings::WorkspaceSettings;
 use lakehouse_store::{PgPool, StoreError};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
@@ -306,6 +307,12 @@ impl SettingsRow for EmailSettings {
 impl SettingsRow for SignInSettings {
     fn read(pool: &PgPool) -> impl Future<Output = Result<Option<Self>, StoreError>> + Send {
         lakehouse_store::sign_in_settings::get(pool)
+    }
+}
+
+impl SettingsRow for WorkspaceSettings {
+    fn read(pool: &PgPool) -> impl Future<Output = Result<Option<Self>, StoreError>> + Send {
+        lakehouse_store::workspace_settings::get(pool)
     }
 }
 
@@ -626,6 +633,15 @@ pub fn sign_in_cache() -> Arc<SettingsCache<SignInSettings>> {
     Arc::new(SettingsCache::new())
 }
 
+/// A fresh, empty workspace-settings cache as an [`Arc`] — the value
+/// [`crate::state::AppState`] holds. The public branding routes read through
+/// it, so a sign-in page that loads on every visit costs the database one
+/// read per [`SETTINGS_CACHE_TTL`] and not one per visit.
+#[must_use]
+pub fn workspace_settings_cache() -> Arc<SettingsCache<WorkspaceSettings>> {
+    Arc::new(SettingsCache::new())
+}
+
 /// A fresh, empty assistant cache as an [`Arc`] — the value
 /// [`crate::state::AppState`] holds.
 #[must_use]
@@ -763,6 +779,21 @@ pub fn resolve_sign_in(config: &Config, stored: Option<&SignInSettings>) -> Effe
 pub async fn sign_in_row(state: &AppState) -> Result<Option<SignInSettings>, StoreError> {
     match state.pg.as_deref() {
         Some(pool) => state.sign_in_settings_cache.row(pool).await,
+        None => Ok(None),
+    }
+}
+
+/// The saved workspace name and pictures for a request, or `None` when no
+/// Postgres pool is configured or nothing was saved.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] when the store read fails.
+pub async fn workspace_settings_row(
+    state: &AppState,
+) -> Result<Option<WorkspaceSettings>, StoreError> {
+    match state.pg.as_deref() {
+        Some(pool) => state.workspace_settings_cache.row(pool).await,
         None => Ok(None),
     }
 }

@@ -284,6 +284,16 @@ pub struct AppState {
     pub sign_in_settings_cache: Arc<
         crate::runtime_settings::SettingsCache<lakehouse_store::sign_in_settings::SignInSettings>,
     >,
+    /// The 30-second memo of the saved workspace name and pictures (`ADM-2`
+    /// decision 6), so the public branding routes do not read Postgres per
+    /// visit to the sign-in page. Every write to them clears it on this
+    /// process; another process sees the change within the TTL. Shared across
+    /// clones.
+    pub workspace_settings_cache: Arc<
+        crate::runtime_settings::SettingsCache<
+            lakehouse_store::workspace_settings::WorkspaceSettings,
+        >,
+    >,
     /// The 30-second memo of the saved assistant settings (`ADM-9` plan D3),
     /// so an assistant message does not read Postgres per round. The
     /// assistant `PUT` clears it on this process. Shared across clones.
@@ -910,6 +920,7 @@ impl AppState {
             query_limits: crate::query_limits::QueryLimitsMemo::default(),
             email_settings_cache: crate::runtime_settings::email_cache(),
             sign_in_settings_cache: crate::runtime_settings::sign_in_cache(),
+            workspace_settings_cache: crate::runtime_settings::workspace_settings_cache(),
             assistant_settings_cache: crate::runtime_settings::assistant_cache(),
             sso_settings_cache: crate::runtime_settings::sso_cache(),
             email_test_limiter: Arc::new(crate::runtime_settings::TestEmailLimiter::new()),

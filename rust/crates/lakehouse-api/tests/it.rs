@@ -172,3 +172,4 @@ mod tier2_writehigh_approval;
 mod upload_folder_routes;
 mod upload_routes;
 mod upstream_errors;
+mod workspace_settings_route;
