@@ -86,7 +86,8 @@
 //! alongside these table entries rather than gating them behind a token
 //! nothing can hold:
 //!
-//! * `agent:manage` (`/api/agents/employees/{id}/{suspend,resume,revoke}`)
+//! * `agent:manage` (`POST /api/agents/employees` and
+//!   `/api/agents/employees/{id}/{suspend,resume,revoke}`)
 //!   — same `agent` resource family as Approver's seeded `agent:approve`,
 //!   but a different action: lifecycle control of the employee identity
 //!   itself (a kill switch), not approving one action it proposed.
@@ -1172,7 +1173,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/agents/workflows",                Policy::RequiresAuth),
     ("POST", "/api/agents/workflows",                Policy::RequiresAuth),
     ("GET",  "/api/agents/employees",                Policy::RequiresAuth),
-    ("POST", "/api/agents/employees",                Policy::RequiresAuth),
+    // SEC-20, plan 97: a scheduled run takes its permissions from the
+    // employee's own column and needs no `agent:manage`, so creating one is
+    // the gate (the handler also caps its permissions at the creator's).
+    ("POST", "/api/agents/employees",                Policy::RequiresPermission("agent:manage")),
     ("GET",  "/api/agents/employees/{id}",           Policy::RequiresAuth),
     ("POST", "/api/agents/employees/{id}/suspend",   Policy::RequiresPermission("agent:manage")),
     ("POST", "/api/agents/employees/{id}/resume",    Policy::RequiresPermission("agent:manage")),
