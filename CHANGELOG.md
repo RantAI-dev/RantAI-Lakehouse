@@ -11,6 +11,7 @@ once a first release is tagged.
 
 ### Added
 
+- An administrator can set the workspace's name, logo, dark-mode logo and browser-tab icon in Settings → General (backlog `ADM-2`; feature page `docs/core/features/workspace-name-and-logo.md`; migration `0145`).
 - Every change made in the console writes an audit row, refused changes included; the database refuses to edit or delete an audit row.
 - The Operations page shows how many audit rows the service could not write since it started.
 - The audit page searches events of any age on the server by person, action, object, outcome and time range, pages through them and exports them as CSV (up to 100,000 rows per file); an export is itself recorded as `audit.export`.

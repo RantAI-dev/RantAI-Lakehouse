@@ -6,7 +6,7 @@
 | Backlog | `ADM-2` |
 | Status | Decisions signed by the product owner, 2026-11-15, as the planner proposed them |
 | Spec | [`specs/adm-2.md`](../specs/adm-2.md) |
-| Plan | Not written yet. Blocked by `BI-18` part D (#528), `BI-59` (#530) and `WEB-15` (#536) |
+| Plan | plan `adm-112` (slice A: the API and Settings → General, PR-NNN) and plan `adm-113` (slice B: the console shows the name and logo). `BI-18` part D (#528), `BI-59` (#530) and `WEB-15` (#536) change the same console files and merge later, so this page's text is read again when they land |
 
 ## Problem
 
@@ -19,9 +19,9 @@ dashboard it embeds elsewhere.
 1. As an administrator, open **Settings → General**, type the workspace's
    name, upload a logo, and optionally upload a second logo for dark mode
    and a browser-tab icon. Then save.
-2. Everyone sees that name and logo on the sign-in page, in the sidebar
-   header, in the browser tab, and as the footer of embedded dashboards, from their next
-   page load.
+2. After slice B (`adm-113`) merges, everyone sees that name and logo on
+   the sign-in page, in the sidebar header, in the browser tab, and as
+   the footer of embedded dashboards, from their next page load.
 3. Press **Reset** to go back to the product's own name, logo and icon.
 
 ## Decisions
@@ -51,5 +51,6 @@ dashboard it embeds elsewhere.
 
 ## Acceptance checklist (owner)
 
-The checklist is in the spec, `ADM-2-AC1` to `ADM-2-AC9`. Each step reads
-"Not run" until the owner runs it on a running console.
+The checklist is in the spec, `ADM-2-AC1` to `ADM-2-AC9`. It covers the
+whole item, so the owner runs it only after slice B (`adm-113`) merges;
+until then each step reads "Not run".
