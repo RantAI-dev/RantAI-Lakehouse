@@ -423,6 +423,75 @@ pub async fn mount_existing_iceberg_table(server: &wiremock::MockServer, table: 
         .await;
 }
 
+/// The fixed sentence `ClickHouse`'s code 47 (`UNKNOWN_IDENTIFIER`) gets, and
+/// so the browser's copy of a statement failure (owner 2026-11-12,
+/// LH-QS-2-08): the person reads this sentence and a reference, never the
+/// engine's own text.
+pub const COLUMN_DOES_NOT_EXIST: &str = "This query names a column that does not exist.";
+
+/// The engine's own answer for a statement that names a column that does not
+/// exist: code 47, `DB::Exception`, the identifier and the server version.
+pub const CLICKHOUSE_UNKNOWN_IDENTIFIER: &str = "Code: 47. DB::Exception: Unknown expression identifier 'pengunjungg' in scope. (UNKNOWN_IDENTIFIER) (version 26.8.1)";
+
+/// `ClickHouse` for a `run_sql` whose statement the engine answers with
+/// `answer`: the dry run (`EXPLAIN AST`) confirms a `SELECT`, a statement
+/// that contains `failing` gets the engine's own answer, and any other
+/// statement succeeds with one row.
+///
+/// The mocks are mounted in that order because `wiremock` answers with the
+/// FIRST matching mock in mount order: the dry run's body carries the
+/// statement too, so its mock has to come first to keep the statement's own
+/// answer out of the dry run.
+pub async fn mock_clickhouse_refusing(
+    failing: &str,
+    answer: wiremock::ResponseTemplate,
+) -> wiremock::MockServer {
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let ch = wiremock::MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("EXPLAIN AST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("SelectWithUnionQuery (children 1)\n ExpressionList ...\n"),
+        )
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(failing))
+        .respond_with(answer)
+        .mount(&ch)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "meta": [{"name": "n", "type": "UInt64"}],
+            "data": [{"n": 5}],
+            "rows": 1,
+        })))
+        .mount(&ch)
+        .await;
+    ch
+}
+
+/// The last tool result the model had in front of it in the request at
+/// `index` (`0` is the first request), exactly as the model received it: the
+/// tool's own result, with the model's copy of a failure in `error`.
+pub async fn model_tool_result(llm: &wiremock::MockServer, index: usize) -> serde_json::Value {
+    let requests = llm.received_requests().await.expect("recording is on");
+    let request: serde_json::Value =
+        serde_json::from_slice(&requests[index].body).expect("a JSON model request");
+    let message = request["messages"]
+        .as_array()
+        .expect("messages are a list")
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "tool")
+        .unwrap_or_else(|| panic!("the model read a tool result: {request}"));
+    serde_json::from_str(message["content"].as_str().unwrap_or_default())
+        .expect("the tool result is a JSON object")
+}
+
 /// Swaps the database name in `postgres://user:pass@host:port/dbname` for
 /// `new_db`, without pulling in a URL-parsing crate for one substitution.
 fn swap_database_name(url: &str, new_db: &str) -> String {
@@ -633,4 +702,16 @@ pub async fn create_principal_with_permissions(pool: &PgPool, permissions: &str)
         .expect("attach the single-permission role to the test user");
 
     user_id
+}
+
+/// Every `audit_event` row with this `action`, oldest first, each as the JSON
+/// of the whole row. A test that must prove a secret never reached the audit
+/// log checks `row.to_string()`, so a value in any column is caught, not only
+/// in `args`.
+pub async fn audit_rows(pool: &PgPool, action: &str) -> Vec<serde_json::Value> {
+    sqlx::query_scalar("SELECT to_jsonb(a) FROM audit_event a WHERE action = $1 ORDER BY at, id")
+        .bind(action)
+        .fetch_all(pool)
+        .await
+        .expect("read audit_event")
 }

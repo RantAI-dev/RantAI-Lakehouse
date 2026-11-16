@@ -128,18 +128,28 @@ pub(super) async fn run_sql(
     }
     // The final statement, so `run_statement` and not `run`: `run` would scan
     // it again and refuse a text value that reads `'{{x}}'`.
-    let result = api_result_to_value(
-        crate::routes::query::run_statement(
-            state,
-            Some(principal),
-            &axum::http::HeaderMap::new(),
-            &sql,
-            "clickhouse",
-        )
-        .await,
+    //
+    // LH-QS-2-08 (owner 2026-11-12): a failure comes in two copies — the
+    // model's copy (the engine's trimmed diagnosis, so the model can
+    // correct its SQL) and the browser's copy (a fixed sentence and the same
+    // reference). The model's copy goes in `error`, as it always did; the
+    // browser's copy goes next to it, in the one key only the server reads.
+    let (result, browser) = match crate::routes::query::run_statement(
+        state,
+        Some(principal),
+        &axum::http::HeaderMap::new(),
+        &sql,
+        "clickhouse",
     )
-    .await;
-    compact_query_result(result)
+    .await
+    {
+        Ok(ok) => (api_result_to_value(Ok(ok)).await, None),
+        Err(failure) => {
+            let failed: ApiResult<ApiJson<Value>> = Err(failure.response.into());
+            (api_result_to_value(failed).await, Some(failure.browser))
+        }
+    };
+    compact_query_result(result, browser)
 }
 
 /// Rows a `run_sql` result hands the model.
@@ -159,19 +169,29 @@ const MAX_RESULT_ROWS: usize = 100;
 /// that names the limit which cut it — the route names it in `cutBy` — so
 /// the model is never told the wrong limit did it.
 ///
+/// `browser` is the browser's copy of a failure (owner 2026-11-12,
+/// LH-QS-2-08): a fixed sentence and the reference, which the chat loop
+/// shows to the person instead of the engine's text. It travels next to the
+/// error, in the one key only the server reads
+/// (`routes::ai::BROWSER_ERROR_KEY`); the model's copy stays in `error`.
+///
 /// `DATA-29`: the cells are handed over as the route built them, so a
 /// `NULL` cell reaches the model as `null` and an empty cell as `""` — the
 /// two are told apart, and this tool does not flatten them again on the way
 /// to the model.
-fn compact_query_result(result: Value) -> Value {
+fn compact_query_result(result: Value, browser: Option<String>) -> Value {
     let Value::Object(mut body) = result else {
         return result;
     };
     if let Some(Value::String(err)) = body.get("error") {
-        return json!({
+        let mut compact = json!({
             "error": clean_sql_error(err),
             "hint": "Check table and column names against the DATA MAP and fix the query.",
         });
+        if let Some(browser) = browser {
+            compact = crate::routes::ai::with_browser_error(compact, &browser);
+        }
+        return compact;
     }
     let rows = match body.remove("rows") {
         Some(Value::Array(rows)) => rows,
@@ -394,6 +414,32 @@ async fn table_access(
     }
 }
 
+/// `SEC-20` (plan 95): the shared catalog's own rule, asked for a tool that
+/// answers from the shared catalog.
+///
+/// `None` when the caller may read it. Otherwise the answer the tool returns
+/// as it is: `supported: false` with the rule's own reason for a refused
+/// caller, or a fixed error when the rule cannot be evaluated (the cause is
+/// not forwarded, `AGENTS.md` principle 4). The tool has no request headers,
+/// so the rule reads the person's own tenant, as `run_sql` does. It is
+/// [`crate::routes::catalog::catalog_tenant_refusal`], never a second copy.
+pub(super) async fn shared_catalog_refusal(
+    state: &AppState,
+    principal: &Principal,
+) -> Option<Value> {
+    match crate::routes::catalog::catalog_tenant_refusal(
+        state,
+        principal,
+        &axum::http::HeaderMap::new(),
+    )
+    .await
+    {
+        Ok(None) => None,
+        Ok(Some(reason)) => Some(json!({ "supported": false, "reason": reason })),
+        Err(_) => Some(json!({ "error": "the shared-catalog rule could not be evaluated" })),
+    }
+}
+
 /// Whether the dataset behind Bronze table `table` is visible: any of its
 /// layers the caller may read makes the dataset itself visible (`GOV-7` D6).
 fn dataset_visible(access: &crate::table_access::TableAccess, table: &str) -> bool {
@@ -460,6 +506,14 @@ pub(super) async fn list_datasets(
     principal: Option<&Principal>,
     args: &Map<String, Value>,
 ) -> Value {
+    // SEC-20, plan 95: the registry is the shared catalog's, so a tenant that
+    // does not own it is refused before the registry is read. No principal is
+    // a headless run, which `table_access` also leaves unnarrowed.
+    if let Some(principal) = principal
+        && let Some(refusal) = shared_catalog_refusal(state, principal).await
+    {
+        return refusal;
+    }
     let access = match table_access(state, principal).await {
         Ok(access) => access,
         Err(sentence) => return json!({ "error": sentence }),
@@ -530,6 +584,12 @@ pub(super) async fn describe_dataset(
     principal: Option<&Principal>,
     args: &Map<String, Value>,
 ) -> Value {
+    // SEC-20, plan 95: as in `list_datasets`.
+    if let Some(principal) = principal
+        && let Some(refusal) = shared_catalog_refusal(state, principal).await
+    {
+        return refusal;
+    }
     let access = match table_access(state, principal).await {
         Ok(access) => access,
         Err(sentence) => return json!({ "error": sentence }),
@@ -631,16 +691,8 @@ pub(super) async fn lakehouse_overview(state: &AppState, principal: Option<&Prin
     let Some(principal) = principal else {
         return json!({ "error": "the lakehouse overview needs a signed-in user" });
     };
-    match crate::routes::catalog::catalog_tenant_refusal(
-        state,
-        principal,
-        &axum::http::HeaderMap::new(),
-    )
-    .await
-    {
-        Ok(None) => {}
-        Ok(Some(reason)) => return json!({ "supported": false, "reason": reason }),
-        Err(_) => return json!({ "error": "the shared-catalog rule could not be evaluated" }),
+    if let Some(refusal) = shared_catalog_refusal(state, principal).await {
+        return refusal;
     }
     let ch = &state.clickhouse;
     let access = match table_access(state, Some(principal)).await {
@@ -718,6 +770,14 @@ pub(super) async fn get_lineage(
     let Some(principal) = principal else {
         return json!({ "error": "lineage needs a signed-in user" });
     };
+    // SEC-20, plan 95: a caller the shared-catalog rule refuses gets no graph
+    // at all from the tool. (`GET /api/governance/lineage` keeps drawing the
+    // tenant's own records for such a caller, and since plan 96 its builder
+    // leaves the dashboard charts out for them, so this refusal is the tool's
+    // stricter answer, not the only gate.)
+    if let Some(refusal) = shared_catalog_refusal(state, principal).await {
+        return refusal;
+    }
     let Ok(graph) =
         crate::routes::lineage::build(state, principal, &axum::http::HeaderMap::new(), &focus)
             .await
@@ -1855,7 +1915,7 @@ mod truncated_note {
 
     /// The note of a cut result.
     fn note_for(body: Value) -> String {
-        let out = compact_query_result(body);
+        let out = compact_query_result(body, None);
         out["truncated"]
             .as_str()
             .expect("a cut result carries the note")
@@ -1893,13 +1953,13 @@ mod truncated_note {
 
     #[test]
     fn a_result_that_was_not_cut_carries_no_note() {
-        let out = compact_query_result(run_body(false, None));
+        let out = compact_query_result(run_body(false, None), None);
         assert!(out.get("truncated").is_none(), "{out}");
 
         // A response without the field at all is not cut either.
         let mut body = run_body(false, None);
         body.as_object_mut().expect("an object").remove("truncated");
-        let out = compact_query_result(body);
+        let out = compact_query_result(body, None);
         assert!(out.get("truncated").is_none(), "{out}");
     }
 }

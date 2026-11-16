@@ -73,4 +73,4 @@ And ask the assistant to put charts in a tab, or to start a dashboard from a tem
 - `BI-18C-AC6` A draft in the personal space is not visible to another non-administrator user.
 - `BI-18C-AC7` A dashboard started from a template has the template's tiles and is independent of it.
 - `BI-18C-AC8` A user without `dashboard:write` cannot change tabs, restore, or save templates; a failure shows a plain message.
-- `AI-9-AC1` "Put the map charts in a separate tab." works.
+- `AI-9-AC1` "Put the map charts in a separate tab." works. Accepted by the AI owner, 2026-11-08 (staging `80fb2f68`)

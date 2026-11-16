@@ -49,11 +49,12 @@ use lakehouse_store::agents::{
     self, AgentRun, AgentWorkflow, ApprovalItem, CreateEmployeeInput, CreateWorkflowInput,
     Decision, DigitalEmployee, LinkedApprovalRequest, RunStep,
 };
-use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
+use lakehouse_store::audit::NewAuditEvent;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
+use crate::audit_coverage;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::ai::{
@@ -83,6 +84,19 @@ fn required(field: &str, value: &str) -> Result<String, ApiError> {
         return Err(ApiError::BadRequest(format!("{field} is required")));
     }
     Ok(trimmed.to_owned())
+}
+
+/// The detail a run's step, or a run's outcome, keeps of a tool's result.
+///
+/// A run's detail is read by a browser on the run page, so it takes the
+/// browser's copy of the result (`crate::routes::ai::split_tool_result`,
+/// owner rule LH-QS-2-08, 2026-11-12): an engine failure is stored as a fixed
+/// sentence and a reference, never as the engine's own text. The model that
+/// drives the run reads the model's copy, which keeps the engine's
+/// diagnosis, and that copy is never stored. A result with no engine failure
+/// is stored as the tool returned it.
+fn stored_tool_detail(shown: &Value) -> String {
+    serde_json::to_string(shown).unwrap_or_default()
 }
 
 const VALID_AUTONOMY: [&str; 4] = ["L1", "L2", "L3", "L4"];
@@ -589,6 +603,14 @@ fn decide_approval_audit_event(
     )
 }
 
+/// The name `crate::audit_coverage::AUDIT_TABLE` gives `POST
+/// /api/agents/approvals/{id}/decide`, and the action of the `refused` row
+/// `auth_gate` writes when it turns the call away (`GOV-1`). The row a
+/// decision itself writes carries the approval's own action (the tool the
+/// approval is for), which is chosen at run time and so cannot be the table's
+/// name.
+pub(crate) const APPROVAL_DECIDE_ACTION: &str = "agent.approval_decide";
+
 #[allow(
     clippy::too_many_lines,
     reason = "one straight-line sequence of terminal outcomes (reject / \
@@ -669,14 +691,7 @@ pub async fn decide_approval(
         decide_outcome,
         approval.run_id.as_deref(),
     );
-    if let Err(err) = store_audit::insert(pg, decide_audit_event).await {
-        tracing::warn!(
-            %err,
-            action = %approval.action,
-            outcome = decide_outcome,
-            "failed to record approval-decision audit event"
-        );
-    }
+    audit_coverage::record_best_effort(&state, decide_audit_event).await;
 
     // Approvals the copilot creates always carry a `run_id` (see
     // `create_pending_approval`); one that doesn't (a manually-inserted or
@@ -769,6 +784,10 @@ pub async fn decide_approval(
         return Err(ApiError::PermissionDenied(detail).into());
     }
     let result = ai_tools::run_tool(&state, Some(&principal), &pending.tool, &args).await;
+    // LH-QS-2-08 (owner 2026-11-12): this run's outcome is read by a browser,
+    // and so is this route's answer, so both carry the browser's copy of an
+    // engine failure. No model reads the result here.
+    let (result, shown) = crate::routes::ai::split_tool_result(result);
     let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
     let status = if ok { "succeeded" } else { "failed" };
     if let Err(err) = agents::record_run_outcome(
@@ -776,7 +795,7 @@ pub async fn decide_approval(
         &run_id,
         status,
         "Executed after approval",
-        &serde_json::to_string(&result).unwrap_or_default(),
+        &stored_tool_detail(&shown),
     )
     .await
     {
@@ -798,7 +817,7 @@ pub async fn decide_approval(
     .await;
 
     Ok(ApiJson(
-        json!({ "approval": approval, "executed": true, "result": result }),
+        json!({ "approval": approval, "executed": true, "result": shown }),
     ))
 }
 
@@ -981,7 +1000,7 @@ async fn append_step(pg: &PgPool, run_id: &str, id: &str, label: &str, status: &
     reason = "one flat record of what happened, mirroring routes::ai::audit::record's own justification"
 )]
 async fn write_headless_audit(
-    pg: &PgPool,
+    state: &AppState,
     principal_id: Option<String>,
     principal_kind: &str,
     actor_label: &str,
@@ -1008,9 +1027,7 @@ async fn write_headless_audit(
         approval_id: approval_id.map(str::to_owned),
         session_id: None,
     };
-    if let Err(err) = store_audit::insert(pg, event).await {
-        tracing::warn!(%err, action, outcome, "headless run: failed to write audit_event");
-    }
+    audit_coverage::record_best_effort(state, event).await;
 }
 
 /// A short, deterministic system prompt for the headless loop — NOT a
@@ -1241,7 +1258,7 @@ async fn run_headless_loop_inner(
             )
             .await;
             write_headless_audit(
-                pg,
+                state,
                 principal_id.clone(),
                 principal_kind,
                 actor_label,
@@ -1315,7 +1332,7 @@ async fn run_headless_loop_inner(
                 )
                 .await;
                 write_headless_audit(
-                    pg,
+                    state,
                     principal_id.clone(),
                     principal_kind,
                     actor_label,
@@ -1348,7 +1365,7 @@ async fn run_headless_loop_inner(
             )
             .await;
             write_headless_audit(
-                pg,
+                state,
                 principal_id.clone(),
                 principal_kind,
                 actor_label,
@@ -1391,7 +1408,7 @@ async fn run_headless_loop_inner(
                 )
                 .await;
                 write_headless_audit(
-                    pg,
+                    state,
                     principal_id.clone(),
                     principal_kind,
                     actor_label,
@@ -1433,7 +1450,7 @@ async fn run_headless_loop_inner(
                 )
                 .await;
                 write_headless_audit(
-                    pg,
+                    state,
                     principal_id.clone(),
                     principal_kind,
                     actor_label,
@@ -1479,7 +1496,7 @@ async fn run_headless_loop_inner(
                 )
                 .await;
                 write_headless_audit(
-                    pg,
+                    state,
                     principal_id.clone(),
                     principal_kind,
                     actor_label,
@@ -1554,7 +1571,7 @@ async fn run_headless_loop_inner(
                             tracing::warn!(%err, run_id, "headless run: failed to mark waiting_approval");
                         }
                         write_headless_audit(
-                            pg,
+                            state,
                             principal_id.clone(),
                             principal_kind,
                             actor_label,
@@ -1576,7 +1593,7 @@ async fn run_headless_loop_inner(
                             "headless run: failed to create WriteHigh approval"
                         );
                         write_headless_audit(
-                            pg,
+                            state,
                             principal_id.clone(),
                             principal_kind,
                             actor_label,
@@ -1611,6 +1628,11 @@ async fn run_headless_loop_inner(
             // requiring tool (`run_saved_query`) is responsible for
             // refusing `None` with a named reason rather than a bare 401.
             let result = ai_tools::run_tool(state, principal, &call.function.name, &args).await;
+            // LH-QS-2-08 (owner 2026-11-12): the step's detail is read by a
+            // browser, so it stores the browser's copy of an engine failure
+            // (`shown`), while the model that drives this run is fed the
+            // model's copy (`result`), which keeps the engine's diagnosis.
+            let (result, shown) = crate::routes::ai::split_tool_result(result);
             let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
             let (resource_kind, resource_id) =
                 ai_audit::resource_for(&call.function.name, &args, &result);
@@ -1620,11 +1642,11 @@ async fn run_headless_loop_inner(
                 &format!("step-{step_no}"),
                 &call.function.name,
                 if ok { "succeeded" } else { "failed" },
-                &serde_json::to_string(&result).unwrap_or_default(),
+                &stored_tool_detail(&shown),
             )
             .await;
             write_headless_audit(
-                pg,
+                state,
                 principal_id.clone(),
                 principal_kind,
                 actor_label,
@@ -1946,6 +1968,58 @@ mod tests {
             comment: None,
         };
         assert!(!matches!(body.decision.as_str(), "approved" | "rejected"));
+    }
+
+    /// A run's step detail is read by a browser, so for an engine failure it
+    /// holds the fixed sentence and the reference (LH-QS-2-08), never the
+    /// engine's diagnosis, which only the model reads. The server-only key
+    /// the browser's copy travelled in is gone from it too.
+    #[test]
+    fn a_stored_tool_detail_holds_the_fixed_sentence_and_not_the_engine_diagnosis() {
+        let result = json!({
+            "error": "Unknown expression identifier 'pengunjungg' in scope. (UNKNOWN_IDENTIFIER) Reference: dc51a4b585",
+            "_browserError": "This query names a column that does not exist. Reference: dc51a4b585",
+        });
+
+        let (model, shown) = crate::routes::ai::split_tool_result(result);
+        let detail = stored_tool_detail(&shown);
+
+        let stored: Value = serde_json::from_str(&detail).expect("the detail is JSON");
+        assert_eq!(
+            stored["error"],
+            json!("This query names a column that does not exist. Reference: dc51a4b585"),
+        );
+        for text in [
+            "UNKNOWN_IDENTIFIER",
+            "Code:",
+            "pengunjungg",
+            "_browserError",
+        ] {
+            assert!(!detail.contains(text), "{text} in {detail}");
+        }
+        // The model's copy keeps the diagnosis, with the same reference.
+        assert!(
+            model["error"]
+                .as_str()
+                .is_some_and(|text| text.contains("UNKNOWN_IDENTIFIER")
+                    && text.ends_with("Reference: dc51a4b585")),
+            "{model}"
+        );
+    }
+
+    /// A result with no browser copy (a success, or a failure whose message
+    /// is already fixed) is stored as the tool returned it.
+    #[test]
+    fn a_stored_tool_detail_of_a_result_without_a_browser_copy_is_the_result() {
+        for result in [
+            json!({ "columns": ["n"], "rows": [[5]], "rowCount": 1 }),
+            json!({ "error": "The database request failed. Reference: ab12cd34ef" }),
+        ] {
+            let (_, shown) = crate::routes::ai::split_tool_result(result.clone());
+            let stored: Value =
+                serde_json::from_str(&stored_tool_detail(&shown)).expect("the detail is JSON");
+            assert_eq!(stored, result);
+        }
     }
 
     /// A logged-in human principal — `PrincipalId::User`. Mirrors

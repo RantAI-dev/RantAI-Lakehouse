@@ -29,14 +29,17 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
+use crate::audit_coverage;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::QUERY_STRING_UNREADABLE;
 use crate::routes::saved_queries::{
-    FolderField, NOT_READ_ONLY, SavedQueryListQuery, TITLE_AND_SQL_REQUIRED, parse_folder_filter,
-    parse_folder_reference, require_query_placement,
+    FolderField, SavedQueryListQuery, TITLE_AND_SQL_REQUIRED, parse_folder_filter,
+    parse_folder_reference, refuse_unless_storable, require_query_placement,
 };
-use crate::sql_guard::{is_read_only, is_trino_safe};
+use crate::sql_guard::{
+    ReadOnlyVerdict, is_read_only, is_trino_safe, not_read_only_message, read_only_verdict,
+};
 use crate::state::AppState;
 use crate::upstream_error;
 
@@ -688,7 +691,7 @@ pub(crate) const JOB_NEEDS_CATALOG_TENANT: &str = "This job reads the shared cat
 /// table is looked at, so "may this caller read that table" is asked
 /// once and answered the same way for every table and every route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TenantReach {
+pub(crate) enum TenantReach {
     /// Nothing is out of reach: a principal holding every permission
     /// (`"*:*"`), or a deployment with one tenant (or none) — there is no
     /// other tenant's table to reach, so the gate changes nothing.
@@ -751,7 +754,7 @@ const LISTING_NOT_AVAILABLE: &str = crate::policy_engine::LISTING_NOT_AVAILABLE;
 /// [`ApiError::NotFound`] when `X-Tenant` names a tenant the caller does
 /// not belong to — the same fail-closed 404 the tenant scope answers
 /// everywhere else, never a 403 that would confirm the tenant exists.
-async fn resolve_reach(
+pub(crate) async fn resolve_reach(
     state: &AppState,
     principal: &Principal,
     headers: &HeaderMap,
@@ -966,7 +969,7 @@ async fn deployment_tenant_count(state: &AppState) -> Result<Option<i64>, ApiErr
 /// - [`TableClaim::Unclaimed`]: nobody holds it — a table no upload
 ///   claimed, or a shared table — and it is reachable only by the
 ///   catalog's own tenant.
-fn table_is_reachable(reach: TenantReach, claim: TableClaim) -> bool {
+pub(crate) fn table_is_reachable(reach: TenantReach, claim: TableClaim) -> bool {
     match reach {
         TenantReach::All => true,
         TenantReach::NoTenant => false,
@@ -1011,7 +1014,11 @@ fn raw_table_name(table: &str) -> Option<&str> {
 /// 503 when the claim cannot be read: the store's own fixed message and
 /// a reference id, through [`upstream_error`] (the raw error text never
 /// reaches the response, `AGENTS.md` principle 4).
-async fn claim_on(state: &AppState, tenant_id: Uuid, table: &str) -> Result<TableClaim, ApiError> {
+pub(crate) async fn claim_on(
+    state: &AppState,
+    tenant_id: Uuid,
+    table: &str,
+) -> Result<TableClaim, ApiError> {
     let Some(raw) = raw_table_name(table) else {
         return Ok(TableClaim::Unclaimed);
     };
@@ -1024,6 +1031,89 @@ async fn claim_on(state: &AppState, tenant_id: Uuid, table: &str) -> Result<Tabl
             upstream_error::store(&upstream_error::STORE, &err)
                 .into_api_error(upstream_error::FailedAs::ServiceUnavailable)
         })
+}
+
+/// `SEC-20`: [`claim_on`] for a listing, in one read.
+///
+/// A namespace can hold hundreds of upload tables (498 measured in `bronze`
+/// on staging), and a query per table does not fit the two seconds a
+/// namespace count has. The answer for each name is [`claim_on`]'s: only a
+/// `bronze.<raw>` name can be claimed, every other name is
+/// [`TableClaim::Unclaimed`]. The map holds an entry for every name asked.
+///
+/// # Errors
+///
+/// 503 when the claims cannot be read: the store's own fixed message and a
+/// reference id, through [`upstream_error`] (the raw error text never
+/// reaches the response, `AGENTS.md` principle 4).
+pub(crate) async fn claims_on(
+    state: &AppState,
+    tenant_id: Uuid,
+    tables: &[String],
+) -> Result<std::collections::HashMap<String, TableClaim>, ApiError> {
+    let mut claims: std::collections::HashMap<String, TableClaim> = tables
+        .iter()
+        .map(|table| (table.clone(), TableClaim::Unclaimed))
+        .collect();
+    let Some(pool) = state.pg.as_deref() else {
+        return Ok(claims);
+    };
+    let raw: std::collections::BTreeSet<String> = tables
+        .iter()
+        .filter_map(|table| raw_table_name(table))
+        .map(str::to_owned)
+        .collect();
+    if raw.is_empty() {
+        return Ok(claims);
+    }
+    let raw: Vec<String> = raw.into_iter().collect();
+    let held = lakehouse_store::uploads::table_claims(pool, tenant_id, &raw)
+        .await
+        .map_err(|err| {
+            upstream_error::store(&upstream_error::STORE, &err)
+                .into_api_error(upstream_error::FailedAs::ServiceUnavailable)
+        })?;
+    for (table, claim) in &mut claims {
+        if let Some(held) = raw_table_name(table).and_then(|raw| held.get(raw)) {
+            *claim = *held;
+        }
+    }
+    Ok(claims)
+}
+
+/// `SEC-20` (plan 95): the names of `names` that `reach` covers, in one read.
+///
+/// The one place a reader that lists or counts tables asks "which of these
+/// may the caller read". It composes [`claims_on`] and [`table_is_reachable`]
+/// and adds no rule of its own, so the catalog routes, the maintenance
+/// readers and the assistant's tools cannot each keep a slightly different
+/// copy of the answer (`AGENTS.md` rule 4).
+///
+/// [`TenantReach::All`] covers every name and [`TenantReach::NoTenant`]
+/// covers none, so neither reads a claim: `table_is_reachable` answers both
+/// whatever the claim is. A name that is not `bronze.<raw>` cannot be
+/// claimed, so it is covered only for the tenant that owns the shared
+/// catalog.
+///
+/// # Errors
+///
+/// The 503 of [`claims_on`] when the claims cannot be read.
+pub(crate) async fn reachable_names(
+    state: &AppState,
+    reach: TenantReach,
+    names: &[String],
+) -> Result<std::collections::HashSet<String>, ApiError> {
+    let tenant_id = match reach {
+        TenantReach::All => return Ok(names.iter().cloned().collect()),
+        TenantReach::NoTenant => return Ok(std::collections::HashSet::new()),
+        TenantReach::Tenant { tenant_id, .. } => tenant_id,
+    };
+    let claims = claims_on(state, tenant_id, names).await?;
+    Ok(claims
+        .into_iter()
+        .filter(|(_, claim)| table_is_reachable(reach, *claim))
+        .map(|(name, _)| name)
+        .collect())
 }
 
 /// `SEC-50` slice 2 M1/M2: the tables a statement names, checked against a
@@ -1042,7 +1132,7 @@ async fn claim_on(state: &AppState, tenant_id: Uuid, table: &str) -> Result<Tabl
 ///
 /// 404 with the fixed sentence of [`table_not_available`] for the first
 /// table out of reach; 503 when a claim cannot be read.
-async fn check_tables_against_reach(
+pub(crate) async fn check_tables_against_reach(
     state: &AppState,
     reach: TenantReach,
     tables: &[String],
@@ -1499,6 +1589,83 @@ impl EngineFailure {
     }
 }
 
+/// A failure of the assistant's statement paths, in the two copies the
+/// owner's rule LH-QS-2-08 asks for.
+///
+/// The rule (owner 2026-11-12): an engine failure reaches a person as a
+/// fixed sentence and a reference, never as the engine's own text. The
+/// assistant's model still reads the engine's trimmed diagnosis (SEC-11, the
+/// query-author exception, product owner 2026-10-10), so the two copies
+/// differ — and they carry the SAME reference, which the log line holds.
+///
+/// The assistant's tools hand both copies back: the model's copy in the
+/// tool's `error`, the browser's copy next to it, in the one key only the
+/// server reads (`routes::ai::BROWSER_ERROR_KEY`).
+#[derive(Debug)]
+pub(crate) struct AssistantFailure {
+    /// The error the response carries: the model's copy for a statement the
+    /// engine refused, the fixed text for every other failure.
+    pub response: ApiError,
+    /// The browser's copy: the fixed sentence and the reference for a
+    /// statement the engine refused, the same text as `response` for every
+    /// other failure, because that text is this repository's own.
+    pub browser: String,
+}
+
+impl AssistantFailure {
+    /// A failure whose text is already fixed (a refusal, an unreachable
+    /// engine, a limit): the browser's copy is the text the response
+    /// carries.
+    fn fixed(response: ApiError) -> Self {
+        let browser = response.to_string();
+        Self { response, browser }
+    }
+
+    /// A statement the engine refused: the model's copy is the engine's
+    /// trimmed diagnosis and the reference, the browser's copy the fixed
+    /// sentence for the error code and the same reference.
+    fn statement(failure: upstream_error::StatementFailure) -> Self {
+        let browser = failure.recorded;
+        Self {
+            response: failure.response,
+            browser,
+        }
+    }
+
+    /// The two copies of an engine failure the run already classified: the
+    /// model's copy in `response`, the browser's copy in `message` (the
+    /// fixed sentence and the same reference).
+    fn from_engine(failure: EngineFailure) -> Self {
+        Self {
+            response: failure.response,
+            browser: failure.message,
+        }
+    }
+
+    /// The model's copy, as text.
+    pub fn model(&self) -> String {
+        self.response.to_string()
+    }
+}
+
+impl From<ApiError> for AssistantFailure {
+    /// A failure that was already an [`ApiError`]: a fixed text of this
+    /// repository's own, so both copies are the same.
+    fn from(failure: ApiError) -> Self {
+        Self::fixed(failure)
+    }
+}
+
+impl From<String> for AssistantFailure {
+    /// A refusal written as text (the policy's own message, the settings
+    /// rule's sentence): this repository's own text, so both copies are the
+    /// same. The status is the tool's business, never the caller's: the
+    /// tool's failure is text.
+    fn from(message: String) -> Self {
+        Self::fixed(ApiError::Unprocessable(message))
+    }
+}
+
 /// Runs the already-rewritten `sql` against whichever engine `engine`
 /// names, returning `(columns, rows, duration_ms, scanned_bytes)`. Split
 /// out of [`run`] purely to keep that function under
@@ -1612,17 +1779,20 @@ async fn execute_query_against_engine(
 ///
 /// # Errors
 ///
-/// Returns the message for the statement's author, as text. It is never an
-/// [`ApiError`] and reaches no HTTP response body from here; the caller
-/// hands it to a tool, which cleans it.
+/// Returns the failure as an [`AssistantFailure`]: the two copies the
+/// assistant's tools need. It is never an [`ApiError`] in a response body
+/// from here; the caller hands it to a tool, which cleans the model's copy
+/// and keeps the browser's copy for the server alone.
 /// - A statement that is not read-only: a fixed sentence naming that only
 ///   read statements can be proposed.
 /// - A statement the policy refuses: the policy's own non-leaking message,
 ///   from [`rewrite_sql_for_principal`].
 /// - A statement that names a setting other than `iceberg_snapshot_id`: the
 ///   settings rule's fixed sentence (`SEC-21`).
-/// - A statement `ClickHouse` cannot plan: its own SQL error text, which is
-///   the author's to see, the same text `run_sql` already treats as such.
+/// - A statement `ClickHouse` cannot plan: the model's copy is the engine's
+///   trimmed diagnosis and the reference (the author is the model, SEC-11),
+///   the browser's copy the fixed sentence for the error code and the same
+///   reference (owner 2026-11-12, LH-QS-2-08).
 /// - `engine` `"trino"`: a fixed "not supported yet" sentence. Plan 16
 ///   replaces this arm.
 pub(crate) async fn check_statement_would_run(
@@ -1630,19 +1800,21 @@ pub(crate) async fn check_statement_would_run(
     principal: &Principal,
     sql: &str,
     engine: &str,
-) -> Result<(), String> {
+) -> Result<(), AssistantFailure> {
     // The statement is read with the rules of the engine the request
     // names (`SEC-62`), as `run` reads it.
     if !is_read_only(sql, crate::sql_rewrite::Engine::from_name(engine)) {
-        return Err(
+        return Err(AssistantFailure::fixed(ApiError::Unprocessable(
             "Only read statements (SELECT/SHOW/DESCRIBE/EXPLAIN) can be proposed.".to_owned(),
-        );
+        )));
     }
     let rewritten = rewrite_sql_for_principal(state, sql, engine, principal)
         .await
         .map_err(|err| err.to_string())?;
     if is_trino_engine(engine) {
-        return Err("Checking a Trino statement is not supported yet.".to_owned());
+        return Err(AssistantFailure::fixed(ApiError::Unprocessable(
+            "Checking a Trino statement is not supported yet.".to_owned(),
+        )));
     }
     // SEC-21: the check sends the statement to the engine, so the proposal
     // must meet the settings rule a run applies, or the user would be shown a
@@ -1660,7 +1832,18 @@ pub(crate) async fn check_statement_would_run(
         // does (trimmed statement diagnosis so the model can correct its SQL;
         // an outage stays the fixed message with a reference id). The
         // console no longer gets it (owner 2026-11-12, LH-QS-2-08).
-        .map_err(|err| upstream_error::ch_message_for_author(&upstream_error::DATABASE, &err))
+        //
+        // LH-QS-2-08: the browser's copy of that failure is the fixed
+        // sentence and the reference, never the engine's text. Both copies
+        // come from ONE log line and ONE reference
+        // (`upstream_error::ch_failure_for_author`), so the sentence is not
+        // rebuilt here and the raw text is not logged twice.
+        .map_err(|err| {
+            AssistantFailure::statement(upstream_error::ch_failure_for_author(
+                &upstream_error::DATABASE,
+                &err,
+            ))
+        })
 }
 
 // The most rows one run hands back to the browser is the administrator's
@@ -1781,7 +1964,16 @@ pub async fn run(
             // No principal, no row.
             if let Some(p) = &principal {
                 let tables_read = referenced_table_names(&statement, is_trino_engine(&engine));
-                record_blocked(&state, p, &statement, &engine, &tables_read, &refusal).await;
+                record_blocked(
+                    &state,
+                    p,
+                    &headers,
+                    &statement,
+                    &engine,
+                    &tables_read,
+                    &refusal,
+                )
+                .await;
             }
             return Err(refusal.into());
         }
@@ -1795,6 +1987,10 @@ pub async fn run(
         FailureText::Console,
     )
     .await
+    // The console reads the response's copy only: its browser copy is the
+    // same text (owner 2026-11-12, LH-QS-2-08), so dropping it changes
+    // nothing the console sees.
+    .map_err(|failure| failure.response.into())
 }
 
 /// The run of a statement that is already final: every `{{name}}` in it is
@@ -1823,17 +2019,24 @@ pub async fn run(
 /// `run` answers a fixed sentence instead (owner 2026-11-12, LH-QS-2-08), see
 /// [`run_statement_with`].
 ///
+/// The failure comes in two copies (owner 2026-11-12, LH-QS-2-08): the
+/// model's copy in `response`, the browser's copy in `browser` — a fixed
+/// sentence and the same reference. The assistant's tools hand both to the
+/// chat loop, which shows the browser's copy to the person and the model's
+/// copy to the model.
+///
 /// # Errors
 ///
 /// The same as [`run`], less the 400s for the request body and the
-/// parameters.
+/// parameters. The failure is an [`AssistantFailure`], not an
+/// [`ApiRejection`]: the tools read both copies of it.
 pub(crate) async fn run_statement(
     state: &AppState,
     principal: Option<&Principal>,
     headers: &HeaderMap,
     statement: &str,
     engine: &str,
-) -> ApiResult<ApiJson<Value>> {
+) -> Result<ApiJson<Value>, AssistantFailure> {
     run_statement_with(
         state,
         principal,
@@ -1870,7 +2073,7 @@ async fn run_statement_with(
     statement: &str,
     engine: &str,
     text: FailureText,
-) -> ApiResult<ApiJson<Value>> {
+) -> Result<ApiJson<Value>, AssistantFailure> {
     // The statement's tables are parsed with the dialect of the engine it
     // names (the same parser the policy step uses), and the history row
     // records them whether the run completes, fails or is refused (`QS-4`,
@@ -1880,17 +2083,18 @@ async fn run_statement_with(
     // The statement is read with the rules of the engine that will run it
     // (`SEC-62`): a `Trino` statement is not `ClickHouse` text, and the
     // guard reads each one the way its own engine reads it.
-    if !is_read_only(statement, crate::sql_rewrite::Engine::from_name(engine)) {
-        let refusal = ApiError::Unprocessable(
-            "Only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) are allowed in Query Studio."
-                .to_owned(),
-        );
+    let verdict = read_only_verdict(statement, crate::sql_rewrite::Engine::from_name(engine));
+    if verdict != ReadOnlyVerdict::Read {
+        // The sentence names the cause (a curly quote, a typo in the first
+        // word, a write), and the History row below records the same one
+        // (QS-14).
+        let refusal = ApiError::Unprocessable(not_read_only_message(verdict).to_owned());
         // No principal, no row: nobody to record the refusal against
         // (`QS-4`, decision 3).
         if let Some(p) = principal {
-            record_blocked(state, p, statement, engine, &tables_read, &refusal).await;
+            record_blocked(state, p, headers, statement, engine, &tables_read, &refusal).await;
         }
-        return Err(refusal.into());
+        return Err(AssistantFailure::fixed(refusal));
     }
 
     // See this function's doc comment: there is no honest value left to
@@ -1898,7 +2102,7 @@ async fn run_statement_with(
     // unauthenticated caller, so every engine requires a principal now —
     // `"anonymous"` is never written to `query_history` again.
     let Some(p) = principal else {
-        return Err(ApiError::unauthorized().into());
+        return Err(AssistantFailure::fixed(ApiError::unauthorized()));
     };
     let user_id = p.id.uuid().to_string();
     // BI-5: this caller's limits and the run (`X-Run-Id`) the statement
@@ -1913,8 +2117,8 @@ async fn run_statement_with(
              keyword detected)."
                 .to_owned(),
         );
-        record_blocked(state, p, statement, engine, &tables_read, &refusal).await;
-        return Err(refusal.into());
+        record_blocked(state, p, headers, statement, engine, &tables_read, &refusal).await;
+        return Err(AssistantFailure::fixed(refusal));
     }
 
     // WS7 item C2: every ad hoc SQL surface is rewritten through the same
@@ -1944,7 +2148,7 @@ async fn run_statement_with(
                 };
                 record_uncompleted_run(
                     state,
-                    p,
+                    (p, headers),
                     statement,
                     engine,
                     status,
@@ -1953,7 +2157,7 @@ async fn run_statement_with(
                     0,
                 )
                 .await;
-                return Err(err.into());
+                return Err(AssistantFailure::fixed(err));
             }
         };
     // SEC-21: a statement's own `SETTINGS` would override the cap the run
@@ -1961,8 +2165,8 @@ async fn run_statement_with(
     if !is_trino_engine(engine)
         && let Err(refusal) = refuse_unlisted_settings(&rewritten)
     {
-        record_blocked(state, p, statement, engine, &tables_read, &refusal).await;
-        return Err(refusal.into());
+        record_blocked(state, p, headers, statement, engine, &tables_read, &refusal).await;
+        return Err(AssistantFailure::fixed(refusal));
     }
 
     let started = Instant::now();
@@ -1990,7 +2194,7 @@ async fn run_statement_with(
         Err(failure) => {
             record_uncompleted_run(
                 state,
-                p,
+                (p, headers),
                 statement,
                 engine,
                 failure.status,
@@ -1999,7 +2203,13 @@ async fn run_statement_with(
                 started.elapsed().as_millis(),
             )
             .await;
-            return Err(failure.response.into());
+            // LH-QS-2-08 (owner 2026-11-12): the failure comes in two
+            // copies — the model's copy (`failure.response`, the engine's
+            // trimmed diagnosis so the model can correct its SQL) and the
+            // browser's copy (`failure.message`, the fixed sentence and the
+            // same reference). The console's copy is the response's text
+            // already; the assistant's tools need both.
+            return Err(AssistantFailure::from_engine(failure));
         }
     };
 
@@ -2035,19 +2245,14 @@ async fn run_statement_with(
     // Record a real audit_event for this run — best-effort, the same
     // non-fatal posture as the history write just below: the query already
     // ran and the caller already has their result, so a failure here is
-    // logged and swallowed, never turned into an error response. Written
-    // via `lakehouse_store::audit::insert` directly (not
+    // logged, counted and swallowed, never turned into an error response.
+    // Written through `audit_coverage::record_best_effort`, not
     // `routes::ai::audit::record`, which hardcodes `principal_kind:
     // "copilot"` — wrong here, a query run is human- or service-triggered,
-    // never copilot-triggered). `resource_kind: "query_history"` paired
+    // never copilot-triggered. `resource_kind: "query_history"` paired
     // with this run's own `id` is the pairing WS1 T16's `LEFT JOIN`
     // resolves on read (WS5 Phase D preamble).
-    if let Some(pool) = state.pg.as_deref() {
-        let event = query_run_audit_event(p, &id, &rewritten);
-        if let Err(err) = lakehouse_store::audit::insert(pool, event).await {
-            tracing::warn!(%err, "failed to record query.run audit event (query itself succeeded)");
-        }
-    }
+    audit_coverage::record_best_effort(state, query_run_audit_event(p, &id, &rewritten)).await;
 
     // Record this execution in query history — best-effort. A history-write
     // failure (no Postgres pool configured, Postgres down, ...) must never
@@ -2079,6 +2284,7 @@ async fn run_statement_with(
             cache_assisted: false,
             tables_read: &tables_read,
             message: None,
+            tenant_id: history_tenant(p, headers),
         };
         if let Err(err) = queries::record_history(pool, &input).await {
             tracing::warn!(%err, "failed to record query history (query itself succeeded)");
@@ -2112,6 +2318,23 @@ async fn run_statement_with(
         map.insert("canDownload".to_owned(), Value::Bool(can_download));
     }
     Ok(ApiJson(body))
+}
+
+/// The tenant a run is recorded under in `query_history.tenant_id`
+/// (`OPS-8`, migration `0144`): the one the request runs under, which is
+/// [`crate::tenant_scope::resolve`]'s answer, the same one the policy
+/// rewrite acts as. No header means the caller's first tenant, and a
+/// caller in no tenant (a service identity) writes `None`.
+///
+/// A refused `X-Tenant` (not a UUID, or a tenant the caller is not in)
+/// writes `None`, never the header's value. A statement that names a table
+/// is refused with a 404 before the engine is asked, and one that names
+/// none still runs; either way there is no tenant the caller ran under, and
+/// a value it merely claimed must not become a tenant's usage.
+fn history_tenant(principal: &Principal, headers: &HeaderMap) -> Option<Uuid> {
+    crate::tenant_scope::resolve(principal, headers)
+        .ok()
+        .flatten()
 }
 
 /// `QS-4` (the history page, decision 3): the one place records a run
@@ -2148,7 +2371,7 @@ async fn run_statement_with(
 )]
 async fn record_uncompleted_run(
     state: &AppState,
-    principal: &Principal,
+    caller: (&Principal, &HeaderMap),
     statement: &str,
     engine: &str,
     status: &'static str,
@@ -2159,6 +2382,9 @@ async fn record_uncompleted_run(
     let Some(pool) = state.pg.as_deref() else {
         return;
     };
+    // The principal and the request's headers travel together: the tenant
+    // the run is recorded under is read from both (`history_tenant`).
+    let (principal, headers) = caller;
     let user_id = principal.id.uuid().to_string();
     let id = history_id(epoch_ms());
     let input = RecordHistoryInput {
@@ -2175,6 +2401,7 @@ async fn record_uncompleted_run(
         cache_assisted: false,
         tables_read,
         message: Some(message),
+        tenant_id: history_tenant(principal, headers),
     };
     if let Err(err) = queries::record_history(pool, &input).await {
         tracing::warn!(%err, "failed to record the refused or failed run");
@@ -2188,6 +2415,7 @@ async fn record_uncompleted_run(
 async fn record_blocked(
     state: &AppState,
     principal: &Principal,
+    headers: &HeaderMap,
     statement: &str,
     engine: &str,
     tables_read: &[String],
@@ -2195,7 +2423,7 @@ async fn record_blocked(
 ) {
     record_uncompleted_run(
         state,
-        principal,
+        (principal, headers),
         statement,
         engine,
         "blocked",
@@ -2566,12 +2794,9 @@ pub async fn estimate(
     // The guard reads the statement with the request's engine rules, as the
     // run does: a Trino statement that ClickHouse's dialect would misread is
     // refused by Trino's rule, not ClickHouse's.
-    if !is_read_only(&sql, crate::sql_rewrite::Engine::from_name(&engine)) {
-        return Err(ApiError::Unprocessable(
-            "Only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) are allowed in Query Studio."
-                .to_owned(),
-        )
-        .into());
+    let verdict = read_only_verdict(&sql, crate::sql_rewrite::Engine::from_name(&engine));
+    if verdict != ReadOnlyVerdict::Read {
+        return Err(ApiError::Unprocessable(not_read_only_message(verdict).to_owned()).into());
     }
     // QA `LH-QS-4-08` (`QS-6`), decision 7: estimating a Trino statement would
     // mean asking ClickHouse about Trino SQL — the bug this answers — and
@@ -3123,9 +3348,7 @@ pub async fn create_saved(
     // guard reads it with the `ClickHouse` rules, as it did before. A run
     // that names `Trino` reads the same statement with the `Trino` rules,
     // and may refuse what the save accepted.
-    if !is_read_only(&sql, crate::sql_rewrite::Engine::ClickHouse) {
-        return Err(ApiError::Unprocessable(NOT_READ_ONLY.to_owned()).into());
-    }
+    refuse_unless_storable(&sql)?;
     // `QS-5`: the definitions must fit the SQL they are saved with.
     let parameters = checked_saved_definitions(&sql, body.parameters)?;
     let principal = principal
@@ -4052,14 +4275,19 @@ mod settings_rule_tests {
         env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT_ID.to_owned());
         let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
 
+        // Both copies are the settings rule's own sentence: the model's copy
+        // and the browser's copy are the same text, because that text is
+        // this repository's own (owner 2026-11-12, LH-QS-2-08).
         let refused = check_statement_would_run(
             &state,
             &analyst(),
             "SELECT n FROM serving.t SETTINGS max_result_rows = 0",
             "clickhouse",
         )
-        .await;
-        assert_eq!(refused, Err(SETTINGS_REFUSAL_MESSAGE.to_owned()));
+        .await
+        .expect_err("the settings rule must refuse the statement");
+        assert_eq!(refused.model(), SETTINGS_REFUSAL_MESSAGE);
+        assert_eq!(refused.browser, SETTINGS_REFUSAL_MESSAGE);
 
         let leaked: Vec<String> = server
             .received_requests()
@@ -4081,7 +4309,10 @@ mod settings_rule_tests {
             "clickhouse",
         )
         .await;
-        assert_eq!(allowed, Ok(()));
+        assert!(
+            allowed.is_ok(),
+            "the listed setting may be proposed: {allowed:?}"
+        );
         Ok(())
     }
 }
@@ -4971,6 +5202,7 @@ mod tests {
 
         use super::*;
         use crate::config::Config;
+        use crate::routes::saved_queries::NOT_READ_ONLY;
 
         /// Builds `AppState` the way `routes::connectors::state_without_pool`
         /// does (`AppState::new(Config::from_map(..))`), overriding
@@ -5404,7 +5636,7 @@ mod tests {
             .await
             .expect_err("a Trino query error is a failed run");
 
-            let text = err.0.to_string();
+            let text = err.model();
             assert!(text.contains("line 1:1: mismatched input"), "{text}");
             assert!(text.contains(" Reference: "), "{text}");
             assert!(!text.contains("trino-1.internal"), "{text}");
@@ -5459,6 +5691,67 @@ mod tests {
                 failure.message
             );
             assert!(!failure.message.contains("mismatched input"));
+        }
+
+        /// The two copies of a `Trino` statement failure (owner 2026-11-12,
+        /// LH-QS-2-08): the browser's copy is the fixed sentence and the
+        /// reference, the model's copy keeps the engine's trimmed diagnosis
+        /// so the model can correct its SQL (SEC-11, the query-author
+        /// exception).
+        ///
+        /// `Trino` is the narrowest seam here: both assistant tools hardcode
+        /// `engine: "clickhouse"`, so no route test can reach this arm.
+        #[test]
+        fn a_trino_statement_failure_gives_the_browser_the_fixed_sentence_and_the_model_the_diagnosis()
+         {
+            let failure = AssistantFailure::from_engine(map_trino_error(
+                TrinoError::Query(
+                    "line 1:1: mismatched input 'x' at trino-1.internal:8080".to_owned(),
+                ),
+                FailureText::Assistant,
+            ));
+
+            // The browser's copy: the fixed sentence and a reference, never
+            // the engine's own text.
+            let browser = failure.browser.clone();
+            let reference = browser
+                .strip_prefix(&format!(
+                    "{} Reference: ",
+                    upstream_error::STATEMENT_FAILED_SENTENCE
+                ))
+                .unwrap_or_else(|| panic!("the fixed sentence and a reference: {browser}"));
+            assert_eq!(reference.len(), 10, "{browser}");
+            for engine_text in ["mismatched input", "trino-1.internal", "SYNTAX_ERROR"] {
+                assert!(!browser.contains(engine_text), "{engine_text} in {browser}");
+            }
+
+            // The model's copy: the trimmed diagnosis, with the SAME
+            // reference, so the two copies name one failure.
+            let model = failure.model();
+            assert!(model.contains("line 1:1: mismatched input"), "{model}");
+            assert!(
+                model.contains(&format!(" Reference: {reference}")),
+                "{model}"
+            );
+            assert!(!model.contains("trino-1.internal"), "{model}");
+        }
+
+        /// A failure that is not the statement's own (an unreachable engine,
+        /// a timeout): the text is this repository's own, so the browser's
+        /// copy and the model's copy are the same text.
+        #[test]
+        fn a_trino_failure_that_is_not_the_statements_own_gives_both_copies_the_same_text() {
+            let failure = AssistantFailure::from_engine(map_trino_error(
+                TrinoError::Timeout,
+                FailureText::Assistant,
+            ));
+
+            assert_eq!(failure.browser, failure.model());
+            assert!(
+                failure.browser.contains("trino query timed out"),
+                "{}",
+                failure.browser
+            );
         }
 
         #[test]
@@ -6303,7 +6596,9 @@ mod tests {
             let result =
                 check_statement_would_run(&state, &analyst_principal().0, "SELECT 1", "trino")
                     .await;
-            let message = result.expect_err("the Trino arm must not pass the check yet");
+            let message = result
+                .expect_err("the Trino arm must not pass the check yet")
+                .model();
             assert!(
                 message.contains("not supported yet"),
                 "the Trino arm must say it is not supported yet: {message}"
@@ -6635,7 +6930,11 @@ mod tests {
             let state = state_without_pool(&ch.uri(), "http://unused.invalid");
 
             // The statement does not start with a read keyword once the
-            // placeholder is filled, so the read-only guard refuses it.
+            // placeholder is filled, so the read-only guard refuses it. The
+            // value arrives as a quoted literal (`'DROP' TABLE t`), so no
+            // denied word is left in the code: the guard names the cause
+            // as a statement that starts with no read word, not as a write
+            // (QS-14).
             let (status, message) = refusal(
                 run_on_clickhouse(
                     state,
@@ -6648,7 +6947,10 @@ mod tests {
             );
 
             assert_eq!(status, 422);
-            assert!(message.starts_with("Only read queries"), "{message}");
+            assert!(
+                message.starts_with("Query Studio runs only statements that start with"),
+                "{message}"
+            );
             assert_eq!(received(&ch).await, Vec::<String>::new());
         }
 
@@ -7699,5 +8001,85 @@ mod history_query_tests {
             parse_history_query(&just_over).unwrap().page,
             super::HISTORY_MAX_PAGE
         );
+    }
+}
+
+#[cfg(test)]
+mod claim_reads_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use lakehouse_store::uploads::{TableClaim, claim_table};
+    use uuid::Uuid;
+
+    use super::{claim_on, claims_on};
+    use crate::config::Config;
+    use crate::state::AppState;
+
+    fn state_for(pool: &lakehouse_store::PgPool) -> AppState {
+        let options = pool.connect_options();
+        let url = format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options.get_database().unwrap_or_default(),
+        );
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), url);
+        AppState::new(Config::from_map(&env).unwrap())
+    }
+
+    async fn tenant(pool: &lakehouse_store::PgPool, n: u128) -> Uuid {
+        let id = Uuid::from_u128(n);
+        sqlx::query(
+            "INSERT INTO tenant (id, name, slug, plan, residency) \
+             VALUES ($1, $2, $3, 'Standard', 'US')",
+        )
+        .bind(id)
+        .bind(format!("Tenant {n}"))
+        .bind(format!("tenant-{n}"))
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// The listing read answers what the single read answers, for every kind
+    /// of name a listing holds: the asking tenant's upload, another tenant's,
+    /// a Bronze table nobody claimed, and tables outside `bronze`, which are
+    /// never claimable.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_listing_read_answers_what_the_single_read_answers(pool: lakehouse_store::PgPool) {
+        let (ours, theirs) = (tenant(&pool, 1).await, tenant(&pool, 2).await);
+        assert!(claim_table(&pool, ours, "mine", "up-1").await.unwrap());
+        assert!(claim_table(&pool, theirs, "theirs", "up-2").await.unwrap());
+        // A claim on a raw name must not make `silver.mine` claimable.
+        let names: Vec<String> = [
+            "bronze.mine",
+            "bronze.theirs",
+            "bronze.free",
+            "silver.mine",
+            "serving.theirs",
+            "orders",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let state = state_for(&pool);
+
+        let batch = claims_on(&state, ours, &names).await.unwrap();
+
+        assert_eq!(batch.len(), names.len(), "an entry for every name asked");
+        for name in &names {
+            assert_eq!(
+                batch[name],
+                claim_on(&state, ours, name).await.unwrap(),
+                "{name}"
+            );
+        }
+        assert_eq!(batch["bronze.mine"], TableClaim::Ours);
+        assert_eq!(batch["bronze.theirs"], TableClaim::Theirs);
+        assert_eq!(batch["silver.mine"], TableClaim::Unclaimed);
     }
 }

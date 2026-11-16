@@ -36,3 +36,18 @@ describe("ops refusals (WEB-12)", () => {
     })
   })
 })
+
+describe("ops service list", () => {
+  // GOV-1 Decision 4: the same answer carries the count of audit rows the API
+  // could not write since it started, so the page needs no second request.
+  it("returns the services and the failed audit write count from one request", async () => {
+    const service = { id: "clickhouse", name: "ClickHouse", health: "healthy" }
+    const calls = stubFetch(() => json({ services: [service], auditWriteFailures: 3 }))
+
+    const report = await clickhouseOpsService.listServices()
+
+    expect(report.auditWriteFailures).toBe(3)
+    expect(report.services.map((row) => row.id)).toEqual([service.id])
+    expect(calls.map((c) => c.url)).toEqual(["/api/ops/services"])
+  })
+})
