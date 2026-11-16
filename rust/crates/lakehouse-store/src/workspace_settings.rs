@@ -1,5 +1,5 @@
 //! The workspace's own name, logo, dark-mode logo and browser-tab icon, saved
-//! from Settings → General (`ADM-2`, migration `0145`).
+//! from Settings → General (`ADM-2`, migration `0147`).
 //!
 //! At most one row exists (`singleton`). No row is not an error: it means
 //! nothing was ever saved, and the console shows the product's own name and

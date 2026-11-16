@@ -5,7 +5,7 @@
 | Backlog | `ADM-2` in [BACKLOG.md](../BACKLOG.md) |
 | Module | Administration & Security |
 | Size | S to M (planner's estimate: S = days, M = one to two weeks) |
-| Blocked by | `BI-18` part D (#528) and `BI-59` (#530): both add migrations and `POLICY_TABLE` rows, and their migration numbers `0142`/`0143` already clash with `main`. `WEB-15` (#536): it redesigns the sign-in page, the sidebar header, `layout.tsx` and the embed frame, the four places this item changes |
+| Blocked by | `BI-18` part D (#528) and `BI-59` (#530): both add migrations and `POLICY_TABLE` rows, so this item's migration must be numbered above theirs; their branches hold `0145` and `0146`, and this branch's is `0147`. `WEB-15` (#536): it redesigns the sign-in page, the sidebar header, `layout.tsx` and the embed frame, the four places this item changes |
 | Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
 
 ## Why

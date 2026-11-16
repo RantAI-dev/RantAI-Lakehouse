@@ -2670,13 +2670,13 @@ const KIND_REFUSED: &str = "The picture must be logo, logo-dark or icon.";
 /// the default for it (`routes/mod.rs` sets it on this route only).
 pub const PICTURE_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 
-/// The longest logo, 512 KB (migration `0145`'s `CHECK` says the same).
+/// The longest logo, 512 KB (migration `0147`'s `CHECK` says the same).
 const LOGO_MAX_BYTES: usize = 524_288;
 
-/// The longest icon, 64 KB (migration `0145`'s `CHECK` says the same).
+/// The longest icon, 64 KB (migration `0147`'s `CHECK` says the same).
 const ICON_MAX_BYTES: usize = 65_536;
 
-/// The longest name, in characters (migration `0145`'s `CHECK` says the same).
+/// The longest name, in characters (migration `0147`'s `CHECK` says the same).
 const NAME_MAX_CHARS: usize = 60;
 
 /// The media type a file's first bytes say it is, from the three the console
