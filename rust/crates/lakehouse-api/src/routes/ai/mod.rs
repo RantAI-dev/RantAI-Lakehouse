@@ -3284,7 +3284,7 @@ mod tests {
     /// change dashboards says why the tools are withheld, ahead of the language
     /// line; a person who can gets no such sentence.
     ///
-    /// Plan ai-114 (Decision 5) changed the wording of the refusal: it is
+    /// The `AI-1-AC3` acceptance check changed the wording of the refusal: it is
     /// described, not quoted in English, so the model says it in the language of
     /// the person's message.
     #[tokio::test]

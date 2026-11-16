@@ -455,7 +455,7 @@ MODE: ASK (read-only). You can read and analyse anything, but you cannot change 
 /// the sentence and tells the model to say, in the language of the person's
 /// message, that the account does not have the `dashboard:write` permission,
 /// so it cannot change dashboards, and asks for an editor or an administrator
-/// (plan ai-114, Decision 5).
+/// (the `AI-1-AC3` acceptance check).
 pub(super) fn dashboard_permission_note(
     perms: Option<&lakehouse_auth::PermissionSet>,
 ) -> Option<&'static str> {
@@ -1890,7 +1890,7 @@ mod tests {
     /// permission, so the Auditor read "Your account cannot change dashboards"
     /// as the whole answer to a change request.
     ///
-    /// Plan ai-114 (Decision 5, 2026-11-16) changed this clause. The note
+    /// The `AI-1-AC3` acceptance check (2026-11-16) changed this clause. The note
     /// quoted the refusal in English and the model copied that quote word for
     /// word before translating it, so the note now DESCRIBES the sentence, puts
     /// the language of the answer before the content of the sentence, and
@@ -2059,7 +2059,7 @@ mod tests {
         );
         assert!(note.contains("calculated field"), "{note}");
         assert!(note.contains("metric"), "{note}");
-        // The refusal is described, not quoted (plan ai-114, Decision 5).
+        // The refusal is described, not quoted (`AI-1-AC3`).
         assert!(
             note.contains(
                 "tells the person, in the language of the person's message, that the account does not have the dashboard:write permission, so it cannot change dashboards, and asks for an editor or an administrator"
@@ -2095,7 +2095,7 @@ mod tests {
     /// PR #395 review: a person without `metric:write` cannot change a metric,
     /// a person with it can, and the note must not tell the second one no.
     ///
-    /// The refusal clause itself changed in plan ai-114 (Decision 5): it is
+    /// The refusal clause itself changed for the `AI-1-AC3` acceptance check: it is
     /// described now, not quoted, so the model gives it in the language of the
     /// person's message.
     #[test]
