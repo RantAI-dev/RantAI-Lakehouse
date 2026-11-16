@@ -65,7 +65,7 @@ use lakehouse_auth::session;
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::StoreError;
-use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
+use lakehouse_store::audit::NewAuditEvent;
 use lakehouse_store::governance;
 use lakehouse_store::identity::{
     self, CreateRoleInput, CreateServiceIdentityInput, CreateTenantInput, InviteUserInput, Role,
@@ -76,6 +76,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::audit_coverage;
 use crate::auth::AuthenticatedPrincipal;
 use crate::config::Config;
 use crate::error::ApiResult;
@@ -355,14 +356,7 @@ pub async fn create_user(
         password_mode_str,
         body.must_change_password,
     );
-    if let Err(err) = store_audit::insert(pool, audit_event).await {
-        tracing::warn!(
-            %err,
-            action = "identity.user.invite",
-            user_id = %user_id,
-            "failed to record user-invite audit event"
-        );
-    }
+    audit_coverage::record_best_effort(&state, audit_event).await;
 
     Ok((
         StatusCode::CREATED,
@@ -507,14 +501,7 @@ pub async fn reset_user_password(
     // ADM-3 D5: the audit row names the actor and the target user. Never
     // the password.
     let audit_event = user_password_reset_audit_event(&principal, user_id);
-    if let Err(err) = store_audit::insert(pool, audit_event).await {
-        tracing::warn!(
-            %err,
-            action = "identity.user.password_reset",
-            user_id = %user_id,
-            "failed to record password-reset audit event"
-        );
-    }
+    audit_coverage::record_best_effort(&state, audit_event).await;
 
     Ok(ApiJson(ResetPasswordResponse { temporary_password }))
 }
@@ -591,15 +578,7 @@ pub async fn add_user_to_tenant(
     let added = identity::add_user_to_tenant(pool, user_id, tenant_id).await?;
     if added {
         let audit_event = user_tenant_add_audit_event(&principal, user_id, tenant_id);
-        if let Err(err) = store_audit::insert(pool, audit_event).await {
-            tracing::warn!(
-                %err,
-                action = "identity.user.tenant.add",
-                user_id = %user_id,
-                tenant_id = %tenant_id,
-                "failed to record user-tenant-add audit event"
-            );
-        }
+        audit_coverage::record_best_effort(&state, audit_event).await;
     }
 
     Ok(ApiJson(
@@ -676,15 +655,7 @@ pub async fn remove_user_from_tenant(
 
     if removed {
         let audit_event = user_tenant_remove_audit_event(&principal, user_id, tenant_id);
-        if let Err(err) = store_audit::insert(pool, audit_event).await {
-            tracing::warn!(
-                %err,
-                action = "identity.user.tenant.remove",
-                user_id = %user_id,
-                tenant_id = %tenant_id,
-                "failed to record user-tenant-remove audit event"
-            );
-        }
+        audit_coverage::record_best_effort(&state, audit_event).await;
     }
 
     Ok(ApiJson(
@@ -878,14 +849,7 @@ pub async fn set_user_roles(
     // ADM-4 D6: the audit names the old AND the new role names, so an
     // operator can see what the change took away.
     let audit_event = user_roles_set_audit_event(&principal, &user, &old_roles, &requested);
-    if let Err(err) = store_audit::insert(pool, audit_event).await {
-        tracing::warn!(
-            %err,
-            action = "identity.user.roles.set",
-            user_id = %user_id,
-            "failed to record user-roles-set audit event"
-        );
-    }
+    audit_coverage::record_best_effort(&state, audit_event).await;
 
     Ok(ApiJson(user))
 }
@@ -1076,14 +1040,7 @@ async fn change_user_status(
     let user = identity::get_user(pool, &user_id.to_string()).await?;
 
     let audit_event = user_status_audit_event(principal, &user, action, status);
-    if let Err(err) = store_audit::insert(pool, audit_event).await {
-        tracing::warn!(
-            %err,
-            action = action,
-            user_id = %user_id,
-            "failed to record user-status audit event"
-        );
-    }
+    audit_coverage::record_best_effort(state, audit_event).await;
 
     Ok(ApiJson(user))
 }
@@ -1290,14 +1247,7 @@ pub async fn update_role(
     }
     let role = identity::update_role(pool, &id, &input).await?;
     let audit_event = role_update_audit_event(&principal, &before, &role);
-    if let Err(err) = store_audit::insert(pool, audit_event).await {
-        tracing::warn!(
-            %err,
-            action = "identity.role.update",
-            role_id = %role.id,
-            "failed to record role-update audit event"
-        );
-    }
+    audit_coverage::record_best_effort(&state, audit_event).await;
     Ok(ApiJson(role))
 }
 
@@ -1350,14 +1300,7 @@ pub async fn delete_role(
         &role.id,
         serde_json::json!({ "name": role.name, "permissions": role.permissions }),
     );
-    if let Err(err) = store_audit::insert(pool, audit_event).await {
-        tracing::warn!(
-            %err,
-            action = "identity.role.delete",
-            role_id = %role.id,
-            "failed to record role-delete audit event"
-        );
-    }
+    audit_coverage::record_best_effort(&state, audit_event).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1463,14 +1406,7 @@ pub async fn put_role_table_access(
     )
     .await?;
     let audit_event = role_table_access_audit_event(&principal, &role, &before, &after);
-    if let Err(err) = store_audit::insert(pool, audit_event).await {
-        tracing::warn!(
-            %err,
-            action = "identity.role.table_access.update",
-            role_id = %role.id,
-            "failed to record role table-access audit event"
-        );
-    }
+    audit_coverage::record_best_effort(&state, audit_event).await;
     Ok(ApiJson(after))
 }
 
@@ -1727,14 +1663,7 @@ pub async fn create_tenant(
     // the response code on the wire is always the underlying operation's,
     // not the audit's.
     let audit_event = tenant_create_audit_event(&principal, &tenant);
-    if let Err(err) = store_audit::insert(pool, audit_event).await {
-        tracing::warn!(
-            %err,
-            action = "identity.tenant.create",
-            tenant_id = %tenant.id,
-            "failed to record tenant-create audit event"
-        );
-    }
+    audit_coverage::record_best_effort(&state, audit_event).await;
 
     let Some(admin) = state.lakekeeper_admin.as_ref() else {
         // Provisioning is unreachable, not silently skipped — the tenant
@@ -2049,14 +1978,7 @@ pub async fn rotate_service_identity(
     .await?;
 
     let audit_event = rotate_service_identity_audit_event(&principal, identity_id);
-    if let Err(err) = store_audit::insert(pool, audit_event).await {
-        tracing::warn!(
-            %err,
-            action = "identity.service_identity.rotate",
-            identity_id = %identity_id,
-            "failed to record service-identity rotation audit event"
-        );
-    }
+    audit_coverage::record_best_effort(&state, audit_event).await;
 
     Ok(ApiJson(response))
 }
@@ -2177,14 +2099,7 @@ pub async fn update_user(
     let user = identity::update_user_identity(pool, user_id, new_username, new_email).await?;
 
     let audit_event = user_update_audit_event(&principal, user_id, &changed_fields);
-    if let Err(err) = store_audit::insert(pool, audit_event).await {
-        tracing::warn!(
-            %err,
-            action = "identity.user.update",
-            user_id = %user_id,
-            "failed to record user-update audit event"
-        );
-    }
+    audit_coverage::record_best_effort(&state, audit_event).await;
 
     Ok(ApiJson(user))
 }

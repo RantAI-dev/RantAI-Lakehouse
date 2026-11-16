@@ -30,11 +30,11 @@ use super::{api_result_to_value, arg_str, response_to_value};
 use crate::state::AppState;
 
 async fn governance_kind(state: &AppState, kind: &str) -> Value {
-    // No principal: this serves the kinds this change does not narrow —
-    // classification and maintenance rows do name tables, but the plan's
-    // scope is the quality rules (`GOV-15`), and narrowing those kinds is a
-    // separate item. A call with no person is not narrowed, the convention
-    // `ensure_rule_table` has (`GOV-15` D7).
+    // No principal: this is the headless path, and it does not narrow the
+    // rows it reads. A call with no person is not narrowed, the convention
+    // `ensure_rule_table` has (`GOV-15` D7). A person's maintenance history is
+    // narrowed by `read_kind` when `get_maintenance_metrics` or
+    // `list_classification_rules` passes the principal.
     response_to_value(
         crate::routes::governance::read_kind(state, None, &axum::http::HeaderMap::new(), kind)
             .await,
@@ -46,8 +46,31 @@ pub(super) async fn get_audit_history(state: &AppState) -> Value {
     governance_kind(state, "audit").await
 }
 
-pub(super) async fn list_classification_rules(state: &AppState) -> Value {
-    governance_kind(state, "classification").await
+/// `SEC-20` (plan 96): the classification list, as the person behind the chat
+/// may read it. The rows name the tables of the shared catalog and the upload
+/// tables of every tenant, so a person's list is narrowed to the tables in
+/// their reach by [`crate::routes::governance::read_kind`], the rule
+/// `GET /api/governance/classification` applies. The tool has no request
+/// headers, so the reach is the person's own tenant's, the convention
+/// `get_maintenance_metrics` follows. No principal is a headless run and is not
+/// narrowed, exactly as it was.
+pub(super) async fn list_classification_rules(
+    state: &AppState,
+    principal: Option<&Principal>,
+) -> Value {
+    let Some(principal) = principal else {
+        return governance_kind(state, "classification").await;
+    };
+    response_to_value(
+        crate::routes::governance::read_kind(
+            state,
+            Some(principal),
+            &axum::http::HeaderMap::new(),
+            "classification",
+        )
+        .await,
+    )
+    .await
 }
 
 pub(super) async fn list_quality_rules(state: &AppState, principal: Option<&Principal>) -> Value {
@@ -119,8 +142,41 @@ fn latest_per_slot(result: Value) -> Value {
     json!({ "slots": slots, "note": "each slot's most recent check" })
 }
 
-pub(super) async fn get_maintenance_metrics(state: &AppState) -> Value {
-    governance_kind(state, "maintenance").await
+/// `SEC-20` (plan 95): every table's maintenance history, as the person
+/// behind the chat may read it.
+///
+/// The history names every table the Bronze job ever compacted, upload
+/// tables included. A person the shared-catalog rule refuses gets that rule's
+/// answer and no row; a person it admits gets the rows of the tables in the
+/// caller's reach, by the rule Query Studio keeps. The route
+/// `GET /api/governance/maintenance` narrows its rows the same way, in
+/// [`crate::routes::governance::read_kind`], and this tool reads through it,
+/// so the two cannot disagree.
+///
+/// No principal is a headless run: it is not narrowed, the convention
+/// `list_datasets` and `draft_quality_rule` have.
+pub(super) async fn get_maintenance_metrics(
+    state: &AppState,
+    principal: Option<&Principal>,
+) -> Value {
+    let Some(principal) = principal else {
+        return governance_kind(state, "maintenance").await;
+    };
+    if let Some(refusal) = super::data::shared_catalog_refusal(state, principal).await {
+        return refusal;
+    }
+    // The tool has no request headers of its own, so the reach is the
+    // person's own tenant's, the convention `list_quality_rules` follows.
+    response_to_value(
+        crate::routes::governance::read_kind(
+            state,
+            Some(principal),
+            &axum::http::HeaderMap::new(),
+            "maintenance",
+        )
+        .await,
+    )
+    .await
 }
 
 /// Builds the `POST /api/governance/policies` body from the tool's args,
