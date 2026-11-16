@@ -770,10 +770,11 @@ pub(super) async fn get_lineage(
     let Some(principal) = principal else {
         return json!({ "error": "lineage needs a signed-in user" });
     };
-    // SEC-20, plan 95: the graph's dashboard charts are not tenant-scoped, so
-    // a caller the shared-catalog rule refuses gets no graph at all from the
-    // tool. (`GET /api/governance/lineage` keeps drawing the tenant's own
-    // records for such a caller.)
+    // SEC-20, plan 95: a caller the shared-catalog rule refuses gets no graph
+    // at all from the tool. (`GET /api/governance/lineage` keeps drawing the
+    // tenant's own records for such a caller, and since plan 96 its builder
+    // leaves the dashboard charts out for them, so this refusal is the tool's
+    // stricter answer, not the only gate.)
     if let Some(refusal) = shared_catalog_refusal(state, principal).await {
         return refusal;
     }

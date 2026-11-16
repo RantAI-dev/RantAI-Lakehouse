@@ -1964,7 +1964,16 @@ pub async fn run(
             // No principal, no row.
             if let Some(p) = &principal {
                 let tables_read = referenced_table_names(&statement, is_trino_engine(&engine));
-                record_blocked(&state, p, &statement, &engine, &tables_read, &refusal).await;
+                record_blocked(
+                    &state,
+                    p,
+                    &headers,
+                    &statement,
+                    &engine,
+                    &tables_read,
+                    &refusal,
+                )
+                .await;
             }
             return Err(refusal.into());
         }
@@ -2083,7 +2092,7 @@ async fn run_statement_with(
         // No principal, no row: nobody to record the refusal against
         // (`QS-4`, decision 3).
         if let Some(p) = principal {
-            record_blocked(state, p, statement, engine, &tables_read, &refusal).await;
+            record_blocked(state, p, headers, statement, engine, &tables_read, &refusal).await;
         }
         return Err(AssistantFailure::fixed(refusal));
     }
@@ -2108,7 +2117,7 @@ async fn run_statement_with(
              keyword detected)."
                 .to_owned(),
         );
-        record_blocked(state, p, statement, engine, &tables_read, &refusal).await;
+        record_blocked(state, p, headers, statement, engine, &tables_read, &refusal).await;
         return Err(AssistantFailure::fixed(refusal));
     }
 
@@ -2139,7 +2148,7 @@ async fn run_statement_with(
                 };
                 record_uncompleted_run(
                     state,
-                    p,
+                    (p, headers),
                     statement,
                     engine,
                     status,
@@ -2156,7 +2165,7 @@ async fn run_statement_with(
     if !is_trino_engine(engine)
         && let Err(refusal) = refuse_unlisted_settings(&rewritten)
     {
-        record_blocked(state, p, statement, engine, &tables_read, &refusal).await;
+        record_blocked(state, p, headers, statement, engine, &tables_read, &refusal).await;
         return Err(AssistantFailure::fixed(refusal));
     }
 
@@ -2185,7 +2194,7 @@ async fn run_statement_with(
         Err(failure) => {
             record_uncompleted_run(
                 state,
-                p,
+                (p, headers),
                 statement,
                 engine,
                 failure.status,
@@ -2275,6 +2284,7 @@ async fn run_statement_with(
             cache_assisted: false,
             tables_read: &tables_read,
             message: None,
+            tenant_id: history_tenant(p, headers),
         };
         if let Err(err) = queries::record_history(pool, &input).await {
             tracing::warn!(%err, "failed to record query history (query itself succeeded)");
@@ -2308,6 +2318,23 @@ async fn run_statement_with(
         map.insert("canDownload".to_owned(), Value::Bool(can_download));
     }
     Ok(ApiJson(body))
+}
+
+/// The tenant a run is recorded under in `query_history.tenant_id`
+/// (`OPS-8`, migration `0144`): the one the request runs under, which is
+/// [`crate::tenant_scope::resolve`]'s answer, the same one the policy
+/// rewrite acts as. No header means the caller's first tenant, and a
+/// caller in no tenant (a service identity) writes `None`.
+///
+/// A refused `X-Tenant` (not a UUID, or a tenant the caller is not in)
+/// writes `None`, never the header's value. A statement that names a table
+/// is refused with a 404 before the engine is asked, and one that names
+/// none still runs; either way there is no tenant the caller ran under, and
+/// a value it merely claimed must not become a tenant's usage.
+fn history_tenant(principal: &Principal, headers: &HeaderMap) -> Option<Uuid> {
+    crate::tenant_scope::resolve(principal, headers)
+        .ok()
+        .flatten()
 }
 
 /// `QS-4` (the history page, decision 3): the one place records a run
@@ -2344,7 +2371,7 @@ async fn run_statement_with(
 )]
 async fn record_uncompleted_run(
     state: &AppState,
-    principal: &Principal,
+    caller: (&Principal, &HeaderMap),
     statement: &str,
     engine: &str,
     status: &'static str,
@@ -2355,6 +2382,9 @@ async fn record_uncompleted_run(
     let Some(pool) = state.pg.as_deref() else {
         return;
     };
+    // The principal and the request's headers travel together: the tenant
+    // the run is recorded under is read from both (`history_tenant`).
+    let (principal, headers) = caller;
     let user_id = principal.id.uuid().to_string();
     let id = history_id(epoch_ms());
     let input = RecordHistoryInput {
@@ -2371,6 +2401,7 @@ async fn record_uncompleted_run(
         cache_assisted: false,
         tables_read,
         message: Some(message),
+        tenant_id: history_tenant(principal, headers),
     };
     if let Err(err) = queries::record_history(pool, &input).await {
         tracing::warn!(%err, "failed to record the refused or failed run");
@@ -2384,6 +2415,7 @@ async fn record_uncompleted_run(
 async fn record_blocked(
     state: &AppState,
     principal: &Principal,
+    headers: &HeaderMap,
     statement: &str,
     engine: &str,
     tables_read: &[String],
@@ -2391,7 +2423,7 @@ async fn record_blocked(
 ) {
     record_uncompleted_run(
         state,
-        principal,
+        (principal, headers),
         statement,
         engine,
         "blocked",
