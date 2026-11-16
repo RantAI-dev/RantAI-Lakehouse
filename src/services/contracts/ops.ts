@@ -19,6 +19,16 @@ export type PlatformService = {
   dependencies: string[]
 }
 
+/**
+ * `GET /api/ops/services`: the probe rows, and beside them how many audit
+ * rows the API could not write since the process started (`GOV-1`). The count
+ * rides on the services answer so the page makes no second request.
+ */
+export type ServicesReport = {
+  services: PlatformService[]
+  auditWriteFailures: number
+}
+
 export interface OpsService {
-  listServices(signal?: AbortSignal): Promise<PlatformService[]>
+  listServices(signal?: AbortSignal): Promise<ServicesReport>
 }

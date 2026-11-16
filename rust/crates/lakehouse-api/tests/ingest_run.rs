@@ -1924,7 +1924,8 @@ async fn a_run_of_one_table_sends_object_and_action_to_the_orchestrator_and_is_a
 }
 
 /// An empty body, and `{}`, are the run of every table: the config holds the
-/// connector id and nothing else, as before `SRC-10`, and nothing is audited.
+/// connector id and nothing else, as before `SRC-10`, and no table action is
+/// audited. The run itself is (`GOV-1`: see the test after this one).
 #[tokio::test]
 async fn a_run_without_a_body_sends_only_the_connector_id() {
     for body in [None, Some(""), Some("{}")] {
@@ -1943,12 +1944,126 @@ async fn a_run_without_a_body_sends_only_the_connector_id() {
         );
         let (events,): (i64,) = sqlx::query_as(
             "SELECT count(*) FROM audit_event WHERE resource_id = 'conn-all-tables' \
-             AND action LIKE 'connector.ingest.%'",
+             AND action LIKE 'connector.ingest.%' AND action <> 'connector.ingest.run'",
         )
         .fetch_one(&app.pool)
         .await
         .expect("audit rows");
         assert_eq!(events, 0, "{body:?}");
+    }
+}
+
+/// `GOV-1`: a plain "Run now" is on the audit trail as `connector.ingest.run`,
+/// naming the run the orchestrator started and nothing else.
+#[tokio::test]
+async fn a_plain_run_writes_one_connector_ingest_run_row_naming_the_run() {
+    let server = dagster_that_launches(json!([]), "run-plain").await;
+    let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+    seed_sql_connector(&app.pool, "conn-plain-run").await;
+
+    let (status, answer) = post_run(&app, &cookie, "conn-plain-run", None).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+
+    let rows = common::audit_rows(&app.pool, "connector.ingest.run").await;
+    assert_eq!(rows.len(), 1, "one run, one row: {rows:?}");
+    let row = &rows[0];
+    assert_eq!(row["outcome"], "executed");
+    assert_eq!(row["resource_kind"], "connector");
+    assert_eq!(row["resource_id"], "conn-plain-run");
+    assert_eq!(row["principal_kind"], "user");
+    assert_eq!(row["args"], json!({ "runId": "run-plain" }));
+}
+
+/// `GOV-1`: a run the orchestrator refused started nothing, so it is not
+/// audited as a run.
+#[tokio::test]
+async fn a_run_the_orchestrator_refuses_writes_no_connector_ingest_run_row() {
+    let server = MockServer::start().await;
+    mount_recent_runs(&server, json!([])).await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("launchRun"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "launchRun": { "__typename": "RunConfigValidationInvalid", "errors": [] } }
+        })))
+        .mount(&server)
+        .await;
+    let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+    seed_sql_connector(&app.pool, "conn-refused-run").await;
+
+    let (status, _) = post_run(&app, &cookie, "conn-refused-run", None).await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(
+        common::audit_rows(&app.pool, "connector.ingest.run").await,
+        Vec::<Value>::new()
+    );
+}
+
+/// `GOV-1`: saving a connector's ingest spec without a credential is on the
+/// audit trail too (before, only the credential-carrying save was). The row
+/// names the fields saved, never a value: not the host, not a table.
+#[tokio::test]
+async fn saving_the_ingest_spec_without_a_credential_writes_one_row_naming_fields_only() {
+    // The saved dial names a loopback address, which the save-time address
+    // check refuses unless the block is off; what is proved here is the row.
+    let app = spin_up_with_env(&HashMap::from([(
+        "CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS".to_owned(),
+        "true".to_owned(),
+    )]))
+    .await;
+    seed_sql_connector(&app.pool, "conn-spec-audit").await;
+    // The saved dial must equal the stored one, or the save is a re-point.
+    sqlx::query(
+        "UPDATE connector SET dial = \
+         '{\"driver\":\"postgres\",\"host\":\"127.0.0.1\",\"port\":5432,\"database\":\"d\",\"user\":\"u\"}'::jsonb \
+         WHERE id = 'conn-spec-audit'",
+    )
+    .execute(&app.pool)
+    .await
+    .expect("point the seeded dial at loopback");
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+
+    let body = json!({
+        "adapter": "sql",
+        "ingestMode": "batch",
+        "dial": { "driver": "postgres", "host": "127.0.0.1", "port": 5432, "database": "d", "user": "u" },
+        "sourceObjects": [{ "name": "public.orders", "target": "orders" }],
+    });
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/connectors/conn-spec-audit/ingest-spec")
+                .header("cookie", &cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let rows = common::audit_rows(&app.pool, "connector.update").await;
+    assert_eq!(rows.len(), 1, "one save, one row: {rows:?}");
+    let row = &rows[0];
+    assert_eq!(row["outcome"], "executed");
+    assert_eq!(row["resource_kind"], "connector");
+    assert_eq!(row["resource_id"], "conn-spec-audit");
+    assert_eq!(row["principal_kind"], "user");
+    assert_eq!(
+        row["args"],
+        json!({ "fields": ["adapter", "ingestMode", "dial", "sourceObjects", "scheduleCron"] })
+    );
+    let text = row.to_string();
+    for forbidden in ["127.0.0.1", "public.orders", "orders"] {
+        assert!(
+            !text.contains(forbidden),
+            "the row must not carry {forbidden}: {text}"
+        );
     }
 }
 
