@@ -189,8 +189,18 @@ describe("UsagePage", () => {
         json(
           report({
             currency: "USD",
-            rows: [{ ...ROW, estimate: "1234567890123456.500000" }],
-            totals: { ...TOTALS, estimate: "1234567890123456.500000" },
+            rows: [
+              { ...ROW, estimate: "1234567890123456.500000" },
+              // An amount of 16 digits with six places tells the two paths
+              // apart: from its digits the page shows 1,234,567,890,123,456.789
+              // (the digits it was given, rounded at the fourth), while a
+              // float cannot hold the low digits (the nearest double is
+              // 1234567890123456.75) and shows 1,234,567,890,123,456.80.
+              { ...ROW, key: "u2", label: "Budi", estimate: "1234567890123456.789012" },
+            ],
+            // The same amount in the totals, so the card and the row are
+            // both formatted from the digits.
+            totals: { ...TOTALS, estimate: "1234567890123456.789012" },
           })
         ),
       rates: {
@@ -205,6 +215,7 @@ describe("UsagePage", () => {
     expect(await screen.findByText("0.000012 USD")).toBeTruthy()
     expect(screen.getByText("5.00 USD")).toBeTruthy()
     expect(screen.getAllByText("1,234,567,890,123,456.50").length).toBeGreaterThan(0)
+    expect(screen.getAllByText("1,234,567,890,123,456.789").length).toBeGreaterThan(0)
   })
 
   it("rounds an estimate to four decimals from its digits, not from a float", async () => {
