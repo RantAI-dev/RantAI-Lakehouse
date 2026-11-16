@@ -560,6 +560,65 @@ async fn access_decide_route_allows_a_different_access_approve_holder_and_the_gr
     assert!(after.has("catalog:write"));
 }
 
+/// An approved access request writes a grant, and its audit row names who
+/// received which permission until when, not only that a request was decided.
+/// A rejection grants nothing, so its row names no grantee.
+#[tokio::test]
+async fn an_access_decision_row_names_the_grantee_the_permission_and_the_expiry() {
+    let TestApp { router, pool } = spin_up().await;
+    let approval_to_grant = create_pending_access_request(
+        &router,
+        &pool,
+        "sari@meridian.example",
+        "cat-1",
+        "catalog:write",
+    )
+    .await;
+    let approval_to_reject = create_pending_access_request(
+        &router,
+        &pool,
+        "sari@meridian.example",
+        "cat-2",
+        "catalog:write",
+    )
+    .await;
+    let decider = create_principal_with_permissions(&pool, "access:approve, catalog:write").await;
+    let cookie = session_cookie_for_user(&pool, decider).await;
+    for (id, decision) in [
+        (&approval_to_grant, "approved"),
+        (&approval_to_reject, "rejected"),
+    ] {
+        let resp = post(
+            &router,
+            &format!("/api/catalog/access-requests/{id}/decide"),
+            Some(&cookie),
+            json!({ "decision": decision }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    let (requester,): (uuid::Uuid,) = sqlx::query_as("SELECT id FROM app_user WHERE email = $1")
+        .bind("sari@meridian.example")
+        .fetch_one(&pool)
+        .await
+        .expect("seeded user");
+    let rows = common::audit_rows(&pool, "access:catalog:write").await;
+    let row_of = |id: &str| {
+        rows.iter()
+            .find(|row| row["resource_id"] == json!(id))
+            .unwrap_or_else(|| panic!("a decision row for {id}: {rows:#?}"))
+    };
+    let granted = row_of(&approval_to_grant);
+    assert_eq!(granted["outcome"], "approved");
+    assert_eq!(granted["args"]["permission"], "catalog:write");
+    assert_eq!(granted["args"]["grantee"], json!(requester.to_string()));
+    assert!(granted["args"]["expiresAt"].is_string(), "{granted}");
+    let rejection = row_of(&approval_to_reject);
+    assert_eq!(rejection["outcome"], "rejected");
+    assert!(rejection["args"].get("grantee").is_none(), "{rejection}");
+}
+
 // ── SEC-45: an approver may only approve a permission they hold ──────────
 //
 // `access:approve` says "you may decide access requests"; it does not say

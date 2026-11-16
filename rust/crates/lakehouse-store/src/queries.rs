@@ -1615,6 +1615,13 @@ pub struct RecordHistoryInput<'a> {
     /// caller's screen showed. `None` where there is nothing to say: a
     /// completed run, and every row recorded before the column existed.
     pub message: Option<&'a str>,
+    /// The tenant the run acted as: the one `X-Tenant` selected, or the
+    /// caller's first (`OPS-8`, migration `0144_query_history_tenant.sql`).
+    /// `None` for a caller that belongs to no tenant (a service identity)
+    /// and for every row recorded before the column existed, which
+    /// belonged to an unknown tenant. A reader that sums per tenant must
+    /// not treat a `None` row as any tenant's.
+    pub tenant_id: Option<Uuid>,
 }
 
 /// Record one query execution.
@@ -1644,8 +1651,9 @@ pub async fn record_history(
     sqlx::query(
         "INSERT INTO query_history \
          (id, sql, user_name, status, duration_ms, scanned_bytes, cost_units, \
-          workload_class, engine, cache_assisted, owner_id, tables_read, message) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+          workload_class, engine, cache_assisted, owner_id, tables_read, message, \
+          tenant_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(input.id)
@@ -1661,6 +1669,7 @@ pub async fn record_history(
     .bind(input.owner_id)
     .bind(input.tables_read)
     .bind(input.message)
+    .bind(input.tenant_id)
     .execute(pool)
     .await?;
     Ok(())
