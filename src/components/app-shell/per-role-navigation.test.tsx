@@ -54,22 +54,31 @@ function stubAuth(permissions: string[], roleName = "Viewer") {
   return requestedUrls
 }
 
+let restoreNotificationsSpies = () => {}
+
 beforeEach(() => {
   mockRouter.push.mockClear()
   mockRouter.replace.mockClear()
-  spyOn(notificationsService, "list").mockResolvedValue({
+  const listSpy = spyOn(notificationsService, "list").mockResolvedValue({
     supported: true,
     openAlerts: [],
     pendingApprovals: [],
     unreadMentions: [],
     unreadMentionsUnavailable: null,
   } as never)
-  spyOn(notificationsService, "markMentionsRead").mockResolvedValue(undefined as never)
+  const markReadSpy = spyOn(notificationsService, "markMentionsRead").mockResolvedValue(undefined as never)
+  restoreNotificationsSpies = () => {
+    listSpy.mockRestore()
+    markReadSpy.mockRestore()
+  }
 })
 
 afterEach(() => {
   cleanup()
   global.fetch = originalFetch
+  // The spies replace methods on the shared `notificationsService` singleton,
+  // which other test files in this process import; restore them so they do not leak.
+  restoreNotificationsSpies()
 })
 
 import { TooltipProvider } from "@/components/ui/tooltip"
