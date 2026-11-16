@@ -703,3 +703,15 @@ pub async fn create_principal_with_permissions(pool: &PgPool, permissions: &str)
 
     user_id
 }
+
+/// Every `audit_event` row with this `action`, oldest first, each as the JSON
+/// of the whole row. A test that must prove a secret never reached the audit
+/// log checks `row.to_string()`, so a value in any column is caught, not only
+/// in `args`.
+pub async fn audit_rows(pool: &PgPool, action: &str) -> Vec<serde_json::Value> {
+    sqlx::query_scalar("SELECT to_jsonb(a) FROM audit_event a WHERE action = $1 ORDER BY at, id")
+        .bind(action)
+        .fetch_all(pool)
+        .await
+        .expect("read audit_event")
+}

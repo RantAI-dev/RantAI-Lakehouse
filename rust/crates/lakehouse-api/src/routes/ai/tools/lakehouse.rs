@@ -76,6 +76,9 @@ pub(super) async fn list_iceberg_tables(
         crate::routes::lakehouse::namespaces(
             State(state.clone()),
             axum::Extension(principal.clone()),
+            // No `X-Tenant` header reaches a tool call, so the route resolves
+            // the caller's first tenant, as `tables_in` does.
+            HeaderMap::new(),
             query,
         )
         .await,
