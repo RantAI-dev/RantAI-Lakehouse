@@ -494,7 +494,7 @@ parity), built after it.
 | Item | Status | Blocked by | Blocks |
 | --- | --- | --- | --- |
 | `BI-18` | Building | — | `AI-2`, `AI-9` (templates part), `ADM-2` (part D) |
-| `ADM-2` | In Acceptance | — | — |
+| `ADM-2` | In Acceptance | `BI-18` (part D, #528), `BI-59` (#530), `WEB-15` (#536); build started early, by the owner's decision, before they merged | — |
 | `ADM-1` | Idea | `SEC-20` (build only; research and ADR may start) | — |
 | `SEC-20` | In Progress | — | `ADM-1` (build) |
 | `BI-14` | In Acceptance | — | `AI-13` |

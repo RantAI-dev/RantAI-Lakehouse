@@ -100,7 +100,7 @@ describe("a public link reads an uploaded map through its own token", () => {
 })
 
 describe("an embed reads an uploaded map through its own token", () => {
-  it("posts the signed token to the embed's own route and never reaches apiFetch", async () => {
+  it("posts the signed token to the embed's own route, and the only apiFetch call is the public branding one", async () => {
     serve("m_cc33dd44ee55")
     render(<EmbedView jwt="a.b.c" />)
     await waitFor(() => expect(drawn.length).toBeGreaterThan(0))

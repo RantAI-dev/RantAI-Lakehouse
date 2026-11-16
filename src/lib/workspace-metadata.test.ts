@@ -13,6 +13,11 @@
  * root layout and the route pages are Next.js modules whose metadata only a
  * running Next server exercises, so the guard reads the files a later pull
  * request would rewrite.
+ *
+ * A guard that reads a file has to hold for every spelling of the product's
+ * own name: `Rantai Lake` and `RantAI Lakehouse` are the same words written
+ * differently, and neither is a substring of the other, so a guard that
+ * looks for one alone misses the other.
  */
 import { afterEach, describe, expect, it, mock } from "bun:test"
 import { readFileSync } from "node:fs"
@@ -79,6 +84,29 @@ const TITLED_PAGES = [
   { file: "app/render/chart/[token]/page.tsx", title: "Chart image" },
   { file: "app/render/dashboard/[token]/page.tsx", title: "Dashboard PDF" },
 ]
+
+/**
+ * The product's own name, in the spellings the repository uses.
+ *
+ * `Rantai Lake` is the name the console falls back to when the branding
+ * answer holds none; `RantAI Lakehouse` is the spelling the sign-in redesign
+ * (`WEB-15`, PR #536) writes. A guard that looks for one alone misses the
+ * other, so a page or a layout that puts either back has to fail.
+ */
+const PRODUCT_NAME_SPELLINGS = ["Rantai Lake", "RantAI Lakehouse"]
+
+/**
+ * Whether `source` carries the product's own name.
+ *
+ * The comparison ignores the case: both spellings are the same words, and a
+ * title that writes them another way is just as fixed.
+ */
+function namesTheProduct(source: string): boolean {
+  const haystack = source.toLowerCase()
+  return PRODUCT_NAME_SPELLINGS.some((spelling) =>
+    haystack.includes(spelling.toLowerCase()),
+  )
+}
 
 describe("the browser tab title", () => {
   it("the browser tab shows the workspace name from settings, not a fixed product name", async () => {
@@ -189,11 +217,22 @@ describe("the source guards", () => {
 
     expect(source).toContain("export async function generateMetadata")
     expect(source).not.toContain('title: "Rantai Lake"')
+    // The layout's title comes from the branding answer, so the layout keeps
+    // calling the tested function: a fixed title, in the template form or in
+    // any spelling, is a layout that stopped asking.
+    expect(source).toContain("workspaceMetadata(")
+    // The product's name must not become the layout's own literal again,
+    // either spelling: the fallback belongs to `workspace-metadata.ts`, and a
+    // name written in the layout is a name no administrator can change. The
+    // layout's comment names the product, so this looks for a literal and not
+    // for the words.
+    expect(source).not.toContain('"Rantai Lake"')
+    expect(source).not.toContain('"RantAI Lakehouse"')
   })
 
   it("the pages with their own title keep only their own part", () => {
     const withTheProductName = TITLED_PAGES.filter((page) =>
-      readFileSync(join(SRC_DIR, page.file), "utf8").includes("Rantai Lake"),
+      namesTheProduct(readFileSync(join(SRC_DIR, page.file), "utf8")),
     ).map((page) => page.file)
 
     expect(withTheProductName).toEqual([])
