@@ -320,15 +320,12 @@ describe("ReportEditorPage (BI-62)", () => {
     expect(calls.filter((c) => c.method === "PUT")).toHaveLength(2)
   })
 
-  it("Preview draws the reader's view with the reader's renderer", async () => {
+  it("has no Preview button: the editor already shows the reader's view", async () => {
     serve(["dashboard:read", "dashboard:write"], { ...catalogue, "GET /api/dashboard/reports/r1": () => json(view("edit")) })
     const { container } = render(<AuthProvider><ReportEditorPage id="r1" /></AuthProvider>)
     await pageEditor(container)
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }))
-    expect(screen.getByRole("button", { name: "Preview" }).getAttribute("aria-pressed")).toBe("true")
-    const article = await screen.findByRole("article", { name: "Q3 visitors" })
-    expect(within(article).getByRole("heading", { level: 1, name: "Q3 visitors" })).toBeTruthy()
-    expect(within(article).getByTestId("tile-c_one")).toBeTruthy()
+    expect(screen.queryByRole("button", { name: "Preview" })).toBeNull()
+    expect(screen.getByRole("button", { name: "Charts" })).toBeTruthy()
   })
 })
 
