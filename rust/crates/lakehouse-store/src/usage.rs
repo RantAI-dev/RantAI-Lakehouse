@@ -1,6 +1,6 @@
 //! What the lakehouse was used for, summed from `query_history`, and the
 //! rates that turn the sums into an estimate in money (`OPS-8` part B,
-//! migration `0146_usage_rate_and_permission.sql`).
+//! migration `0148_usage_rate_and_permission.sql`).
 //!
 //! # What is summed
 //!

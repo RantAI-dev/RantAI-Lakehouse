@@ -1,4 +1,4 @@
-//! `OPS-8` part B: migration `0146_usage_rate_and_permission.sql` gives the
+//! `OPS-8` part B: migration `0148_usage_rate_and_permission.sql` gives the
 //! Governance Admin role `usage:read`, and gives it once.
 //!
 //! The migration file is run again over the migrated database, the whole file
@@ -11,7 +11,7 @@
 use lakehouse_test_support as _;
 use sqlx::PgPool;
 
-const MIGRATION_SQL: &str = include_str!("../../../migrations/0146_usage_rate_and_permission.sql");
+const MIGRATION_SQL: &str = include_str!("../../../migrations/0148_usage_rate_and_permission.sql");
 
 async fn permissions_of(pool: &PgPool, role: &str) -> String {
     sqlx::query_scalar("SELECT permissions FROM role WHERE name = $1")
