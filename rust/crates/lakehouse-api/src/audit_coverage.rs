@@ -199,6 +199,7 @@ pub const AUDIT_TABLE: &[(&str, &str, Coverage)] = &[
     ("POST", "/api/embed/values", Coverage::Excluded { reason: EX_PUBLIC }),
     ("POST", "/api/public/dashboard/{token}/unlock", Coverage::Handler { action: "dashboard.public_link_unlocked" }),
     ("POST", "/api/embed/maps/{id}/geojson", Coverage::Excluded { reason: EX_PUBLIC }),
+    ("POST", "/api/render/maps/{id}/geojson", Coverage::Excluded { reason: EX_PUBLIC }),
     ("POST", "/api/auth/login", Coverage::Handler { action: "auth.login" }),
     ("POST", "/api/auth/logout", Coverage::Handler { action: "auth.logout" }),
     ("POST", "/api/auth/change-password", Coverage::Handler { action: "auth.password_change" }),

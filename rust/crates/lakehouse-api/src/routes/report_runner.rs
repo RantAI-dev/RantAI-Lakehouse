@@ -417,9 +417,9 @@ pub async fn record_cut_run(
         detail: Some(RUN_TOO_LONG.to_owned()),
         ..lakehouse_store::audit::NewAuditEvent::default()
     };
-    if let Err(err) = lakehouse_store::audit::insert(pool, event).await {
-        tracing::warn!(%err, subscription = %sub.id, "a stopped report's audit row was not written");
-    }
+    // GOV-1: the counted writer, so a row that cannot be written is logged by
+    // class and counted, as for every route.
+    crate::audit_coverage::record_best_effort(state, event).await;
     Ok(delivery)
 }
 
