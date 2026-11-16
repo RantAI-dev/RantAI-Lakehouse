@@ -40,7 +40,7 @@ No new assistant work. Its tool calls are already recorded.
 
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
-| 1 | Excluded from the audit (each listed in the guard test with this reason): read-like POSTs (preview, validate, estimate, compile, lag-check, `check`, `compare`), connection and email "test" buttons, the public data and frame routes, machine callbacks from ingestion jobs, multipart upload parts, and personal UI state (favourites, recent, home layout, chat session create/rename/delete). Everything else is recorded | as written | Owner, 2026-11-14 |
+| 1 | Excluded from the audit (each listed in the guard test with this reason): read-like POSTs (preview, validate, estimate, compile, lag-check, `check`, `compare`), connection and email "test" buttons, the public data and frame routes, machine callbacks from ingestion jobs, multipart upload parts, and personal UI state (favourites, recent, home layout, chat session create/rename/delete, and the read marks of mentions, `POST /api/dashboard/comments/mentions/read`; owner, 2026-11-15). Everything else is recorded | as written | Owner, 2026-11-14 |
 | 2 | A refused change is recorded (outcome `refused`) for every covered route | yes | Owner, 2026-11-14 |
 | 3 | Old and new values only for roles, policies, table access and grants; other changes record the names of changed fields only; never a secret | as written | Owner, 2026-11-14 |
 | 4 | A failed audit write does not undo the change (as today); it is logged and counted on the Operations health page | as written | Owner, 2026-11-14 |
@@ -62,8 +62,8 @@ No new assistant work. Its tool calls are already recorded.
 - The row names the fields a change touched and never their values. The exceptions are the old and new values that the identity, policy, table-access and grant rows record.
 - The scheduler's alert tick (`POST /api/alerts/run`) writes one row per tick.
 - Writes through the Iceberg REST door are refused by that door and are not in the trail.
-- The assistant's own reads of the trail are not narrowed by `audit:read` yet. Its audit tool (`get_audit_history`) needs only `governance:read`.
-- The Overview page's activity feed (`POST /api/overview`) shows the 20 newest audit rows to every signed-in person: who acted, the action, the object and the outcome. `audit:read` does not narrow it.
+- The assistant's own reads of the trail are not narrowed by `audit:read` yet. Its audit tool (`get_audit_history`) needs only `governance:read`. The assistant's audit history tool is narrowed separately (follow-up owned by the AI team).
+- The Overview page's activity feed (`POST /api/overview`) shows the 20 newest audit rows of everyone only to a person with `audit:read`. Any other person sees only the 20 newest rows of their own actions, with the action, the object and the outcome.
 - An asset page's change history shows up to 50 audit rows about that asset to anyone who can open the asset. `audit:read` does not narrow it either.
 - Machine callbacks are not audited. The pipeline run events, the schema and capture observations and the connector run reports accept a service identity or an unrestricted administrator account. A person who calls one of these routes by hand with an unrestricted account leaves no row. A pipeline run started from the console is audited as `pipeline.trigger`. The orchestrator's lag call (`POST /api/pipelines/runnable/{id}/lag-check`) is also open to an unrestricted administrator account. It advances the pipeline's lag streak and can send the behind-target alert, and it writes no audit row.
 - Marking a dashboard comment mention as read is not recorded. It counts as personal UI state, like favourites.
