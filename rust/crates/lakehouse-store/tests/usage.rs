@@ -76,6 +76,21 @@ async fn insert(pool: &PgPool, run: &Run<'_>) {
     .expect("insert a query_history row");
 }
 
+/// The backend the pool hands out, so "the runs above shared one connection"
+/// is measured on the connection and not on the pool's bookkeeping.
+/// `Pool::size()` cannot say it: the test harness gives the test a pool with
+/// a one-second idle timeout (`sqlx-postgres-0.9.0/src/testing/mod.rs`), so
+/// the connection the seed insert above used is closed while it sat idle and
+/// the pool opens another one; the count is then two, although every run
+/// used one connection.
+async fn backend_pid(pool: &PgPool) -> i32 {
+    let mut conn = pool.acquire().await.unwrap();
+    sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap()
+}
+
 fn query(from: Date, to: Date, group: Group, scope: TenantScope) -> UsageQuery {
     UsageQuery {
         from,
@@ -593,22 +608,35 @@ async fn the_ninety_day_sum_of_one_tenant_uses_the_tenant_time_index_and_is_fast
     // unnamed, so every call is planned with its own values: eight calls on
     // one connection leave no prepared statement behind, and the ninth is as
     // fast as the first.
+    //
+    // The backend the runs below use, read right before them: the pool hands
+    // out the same connection every time, so the runs are on one backend and
+    // the pool's own bookkeeping (how many connections it holds) is not the
+    // claim.
+    let before = backend_pid(&pool).await;
     for _ in 0..8 {
         usage::report(&pool, &q).await.unwrap();
     }
     let started = Instant::now();
     usage::report(&pool, &q).await.unwrap();
     let ninth = started.elapsed();
+    let after = backend_pid(&pool).await;
     println!("the ninth run took {ninth:?}");
+    println!("the runs above used the backend {before}");
     assert!(ninth.as_secs_f64() < 2.0, "the ninth run took {ninth:?}");
-    assert_eq!(pool.size(), 1, "the runs above shared one connection");
+    assert_eq!(before, after, "the runs above shared one connection");
     let mut conn = pool.acquire().await.unwrap();
-    let kept: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM pg_prepared_statements WHERE statement LIKE '%rated AS MATERIALIZED%'",
-    )
-    .fetch_one(&mut *conn)
-    .await
-    .unwrap();
+    // The count asks for the sum's own text, bound: the statement of the sum
+    // is the one the claim is about. A `LIKE` on a fragment of the text
+    // counted the counting query itself (its own text carries the pattern)
+    // and the `EXPLAIN` above (its text carries the sum), so the count was
+    // never zero and the sum's own statement was not what was measured.
+    let kept: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM pg_prepared_statements WHERE statement = $1")
+            .bind(usage::REPORT_TENANT_SQL)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
     assert_eq!(
         kept, 0,
         "the sum must run as an unnamed statement, planned at every call"
