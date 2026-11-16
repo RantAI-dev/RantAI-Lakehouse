@@ -44,7 +44,9 @@ describe("the composer's reserve (owner QA 2026-11-14)", () => {
   })
 
   it("is set while the composer shows, from its measured height, and removed when it hides", () => {
-    const rect = spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({ height: 46, width: 460, top: 0, left: 0, right: 460, bottom: 46, x: 0, y: 0, toJSON: () => ({}) } as DOMRect)
+    // On `Element.prototype`, where the method lives: a spy on `HTMLElement.prototype` left an own copy
+    // there after `mockRestore()`, which hid later files' width stubs (CI full run 2026-11-15).
+    const rect = spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue({ height: 46, width: 460, top: 0, left: 0, right: 460, bottom: 46, x: 0, y: 0, toJSON: () => ({}) } as DOMRect)
     try {
       const { unmount } = render(<CopilotDock />)
       expect(reserve()).toBe("76px")
