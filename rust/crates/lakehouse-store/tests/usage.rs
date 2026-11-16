@@ -365,7 +365,10 @@ async fn with_no_rate_the_estimate_is_null_and_a_rate_applies_from_its_effective
         .await
         .unwrap();
     assert_eq!(none.totals.estimate, None);
-    assert!(none.rows.iter().all(|r| r.estimate.is_none()));
+    assert!(
+        none.rows.iter().all(|r| r.estimate.is_none()),
+        "with no rate configured, no row has an estimate"
+    );
 
     rate(&pool, "scan_tb", "5.00", day(3, 1)).await;
     rate(&pool, "scan_tb", "10.00", day(3, 3)).await;
@@ -441,7 +444,10 @@ async fn an_empty_period_has_a_zero_total_row_and_no_rows(pool: PgPool) {
     )
     .await
     .unwrap();
-    assert!(report.rows.is_empty());
+    assert!(
+        report.rows.is_empty(),
+        "a period with no usage returns no rows"
+    );
     assert_eq!(report.totals.queries, 0);
     assert_eq!(report.totals.scanned_bytes, 0);
     assert_eq!(report.totals.estimate, None);
