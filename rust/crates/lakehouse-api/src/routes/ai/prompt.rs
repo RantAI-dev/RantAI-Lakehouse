@@ -255,8 +255,9 @@ pub(super) fn contains_cjk(text: &str) -> bool {
     })
 }
 
-/// Everyday Indonesian function words: common in any Indonesian sentence,
-/// rare in English ones.
+/// Everyday Indonesian words: the function words common in any Indonesian
+/// sentence and rare in English ones, and the command words of a dashboard
+/// request, which are Indonesian only.
 pub(super) const INDONESIAN_WORDS: &[&str] = &[
     "yang",
     "dan",
@@ -296,6 +297,22 @@ pub(super) const INDONESIAN_WORDS: &[&str] = &[
     "belum",
     "bisa",
     "apakah",
+    // `AI-1` (plan 91): the command words of a dashboard request. They are
+    // Indonesian only, so an English request that names a dashboard stays
+    // English. "ganti nama" was read as undecided and the model answered an
+    // Indonesian request in English.
+    "ganti",
+    "ubah",
+    "hapus",
+    "pindahkan",
+    "pindah",
+    "nama",
+    "jadi",
+    "jadikan",
+    "atur",
+    "simpan",
+    "tambahkan",
+    "tambah",
 ];
 
 /// Common English function words, for the same test the other way.
@@ -452,7 +469,8 @@ from you because of that permission, not because they are unavailable or not set
 When asked to change ",
                 $changes,
                 ", your first sentence, before any analysis or other tool call, is: \"Your account \
-cannot change dashboards; ask an editor or an administrator.\" After that sentence, call \
+does not have the dashboard:write permission, so it cannot change dashboards; ask an editor or an \
+administrator.\" After that sentence, call \
 no tool for the change you refused; call a reading tool only when the person also asked a \
 question that needs it. ",
                 $metrics,
@@ -1700,6 +1718,27 @@ mod tests {
         assert_eq!(reply_language("berapa the total"), None);
     }
 
+    /// `AI-1` (plan 91, 2026-11-14): a dashboard request in Indonesian carried
+    /// only command words ("ganti", "nama", "jadi"), none of them listed, so
+    /// the language was undecided and the model answered in English.
+    #[test]
+    fn an_indonesian_dashboard_request_is_read_as_indonesian() {
+        assert_eq!(
+            reply_language("Ganti nama dashboard Main jadi 'Coba QA'."),
+            Some("Indonesian")
+        );
+    }
+
+    /// The command words are Indonesian only: an English request that names
+    /// the same dashboard is still read as English.
+    #[test]
+    fn an_english_dashboard_request_is_not_read_as_indonesian() {
+        assert_eq!(
+            reply_language("Rename the dashboard Main to 'QA'."),
+            Some("English")
+        );
+    }
+
     #[test]
     fn an_undecided_latin_script_message_is_never_answered_in_another_script() {
         for text in ["ok", "total revenue", "mart_wisman"] {
@@ -1816,7 +1855,7 @@ mod tests {
             "{note}"
         );
         assert!(
-            note.contains("Your account cannot change dashboards"),
+            note.contains("Your account does not have the dashboard:write permission"),
             "{note}"
         );
         assert!(note.contains("not because they are unavailable"), "{note}");
@@ -1832,6 +1871,26 @@ mod tests {
         );
         let editor = PermissionSet::parse("dashboard:write, dashboard:read");
         assert!(dashboard_permission_note(Some(&editor)).is_none());
+    }
+
+    /// `AI-1` (plan 91, 2026-11-14): the refusal named the fact but not the
+    /// permission, so the Auditor read "Your account cannot change dashboards"
+    /// as the whole answer to a change request.
+    #[test]
+    fn the_viewer_refusal_names_the_missing_permission() {
+        use lakehouse_auth::PermissionSet;
+        let viewer = PermissionSet::parse("dashboard:read");
+        let note = dashboard_permission_note(Some(&viewer)).unwrap_or_default();
+        assert!(
+            note.contains("dashboard:write permission, so it cannot change dashboards"),
+            "{note}"
+        );
+        assert!(
+            note.contains(
+                "Your account does not have the dashboard:write permission, so it cannot change dashboards; ask an editor or an administrator."
+            ),
+            "{note}"
+        );
     }
 
     /// A plain "map" by a region name is a region map, not a point map: on a
@@ -1970,7 +2029,7 @@ mod tests {
         // The sentence itself is unchanged.
         assert!(
             note.contains(
-                "\"Your account cannot change dashboards; ask an editor or an administrator.\""
+                "\"Your account does not have the dashboard:write permission, so it cannot change dashboards; ask an editor or an administrator.\""
             ),
             "{note}"
         );
@@ -2005,8 +2064,7 @@ mod tests {
     #[test]
     fn the_permission_note_names_metrics_as_unchangeable_only_without_metric_write() {
         use lakehouse_auth::PermissionSet;
-        const REFUSAL: &str =
-            "\"Your account cannot change dashboards; ask an editor or an administrator.\"";
+        const REFUSAL: &str = "\"Your account does not have the dashboard:write permission, so it cannot change dashboards; ask an editor or an administrator.\"";
         // What the refusal applies to: the text between these two markers.
         let refused = |note: &'static str| -> &'static str {
             let from = note.find("When asked to change ").unwrap_or_default() + 21;

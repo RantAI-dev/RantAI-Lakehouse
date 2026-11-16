@@ -77,6 +77,7 @@ once a first release is tagged.
 
 ### Fixed
 
+- A viewer who cannot change dashboards gets a refusal that names the missing permission (`dashboard:write`), and a short dashboard request written in Indonesian is answered in Indonesian (backlog `AI-1`).
 - The Overview activity feed shows everyone's actions only to people who may read the audit trail; others see their own (backlog `GOV-1`).
 - The approval card for deleting a chart says the chart goes to the trash and can be restored for 30 days, instead of saying the action cannot be undone (backlog `AI-1`).
 - The approval card for deleting a board says the board and its charts go to the trash and can be restored for 30 days, instead of saying the action cannot be undone (backlog `AI-1`).
