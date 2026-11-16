@@ -5,10 +5,12 @@
 //! `ClickHouse` aggregates with `Dagster` run history (`POST` is
 //! read-only despite the verb — it only lists recent runs).
 
+use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use lakehouse_auth::Principal;
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
@@ -370,17 +372,56 @@ async fn count_delayed_schedules(
 /// (every console and Copilot action lands there). Despite the verb this
 /// reads only; there is no request body and nothing is mutated.
 ///
+/// The route is open to every signed-in person (`Policy::RequiresAuth`), but
+/// the feed is a read of the audit trail, and only `audit:read` reads that
+/// (`GOV-1` Decision 9). A holder gets the newest rows of everyone; anybody
+/// else gets the newest rows of their own. The route is reachable only
+/// signed in and nothing calls this function in-process, so a principal is
+/// always present: there is no unnarrowed no-principal branch, unlike
+/// `governance::read_kind`.
+///
 /// `Dagster` run history is the fallback for deployments whose console
-/// Postgres is not configured.
-pub async fn refresh(State(state): State<AppState>) -> Response {
+/// Postgres is not configured. It lists the runs of every pipeline, not the
+/// person's own actions, so it is served to a holder of `audit:read` only.
+pub async fn refresh(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Response {
+    let reads_everyones = principal.has("audit:read");
+    // The audit writers store `principal.id.uuid().to_string()` in
+    // `audit_event.principal_id`, so that is the value that names "their own".
+    let own_id = principal.id.uuid().to_string();
+    let only_principal = (!reads_everyones).then_some(own_id.as_str());
     if let Some(pool) = state.pg.as_deref() {
-        match overview::recent_activity(pool, 20).await {
+        match overview::recent_activity(pool, 20, only_principal).await {
             Ok(activity) => {
                 return (StatusCode::OK, ApiJson(json!({ "activity": activity }))).into_response();
             }
             // Say so rather than silently falling back to the orchestrator.
-            Err(err) => tracing::warn!(error = %err, "audit activity read failed; trying Dagster"),
+            // A holder of `audit:read` goes on to the Dagster run list below;
+            // anybody else is answered right here.
+            Err(err) => {
+                tracing::warn!(error = %err, "audit activity read failed");
+                if !reads_everyones {
+                    // The run list is not theirs to read, and an empty 200
+                    // would read as "you have done nothing yet" when the
+                    // read failed. A fixed message: the database's own text
+                    // never reaches a response.
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        ApiJson(json!({ "activity": [], "error": "database error" })),
+                    )
+                        .into_response();
+                }
+            }
         }
+    }
+    // Only reached with no console Postgres (the audit read did not run, so
+    // there is no failure to report) or by a holder after a failed read. The
+    // run list below covers every pipeline, not the person's own actions, so
+    // a person without `audit:read` gets an empty feed instead of it.
+    if !reads_everyones {
+        return (StatusCode::OK, ApiJson(json!({ "activity": [] }))).into_response();
     }
     match state.dagster.list_runs(20).await {
         Ok(runs) => {
@@ -1106,5 +1147,149 @@ mod tests {
                 "one dataset in the warm tier: {row:?}"
             );
         }
+    }
+}
+
+/// `GOV-1` Decision 9: the Dagster run list that `POST /api/overview` falls
+/// back on (no console Postgres, or a failed audit read) shows orchestrator
+/// activity of every pipeline, so it is served only to a holder of
+/// `audit:read`, like the audit rows it stands in for.
+///
+/// The handler runs behind a one-route router with the principal as a layer,
+/// the way the real auth middleware hands it over, and a `wiremock` Dagster
+/// records what it was asked. No Postgres is needed; the audit-row half of
+/// the rule is in `tests/overview_feed.rs`.
+#[cfg(test)]
+mod feed_scope {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use axum::routing::post;
+    use lakehouse_auth::{PermissionSet, PrincipalId};
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::config::Config;
+
+    fn principal(permissions: &str) -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::new_v4()),
+            tenant_ids: Vec::new(),
+            display_name: "Test".to_owned(),
+            permissions: PermissionSet::parse(permissions),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    /// A Dagster that answers one run, and the state that points at it.
+    /// `pg` is `None` unless `unreachable_pg` is set, which gives the state a
+    /// pool whose every read fails.
+    async fn state_with_dagster(unreachable_pg: bool) -> (AppState, wiremock::MockServer) {
+        let server = wiremock::MockServer::start().await;
+        let body = json!({
+            "data": { "runsOrError": { "__typename": "Runs", "results": [{
+                "runId": "run-1",
+                "jobName": "orders_job",
+                "status": "SUCCESS",
+                "startTime": 1_700_000_000,
+                "endTime": Value::Null,
+            }] } }
+        });
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        let mut state = AppState::new(Config::from_map(&HashMap::new()).expect("a test Config"));
+        state.dagster = Arc::new(DgClient::new(server.uri()));
+        if unreachable_pg {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .acquire_timeout(Duration::from_secs(2))
+                .connect_lazy("postgres://nobody:nothing@127.0.0.1:1/none")
+                .expect("a parseable URL");
+            state.pg = Some(Arc::new(pool));
+        }
+        (state, server)
+    }
+
+    /// `POST /` through the handler as `who`: the status and the JSON body.
+    async fn post_as(state: AppState, who: Principal) -> (StatusCode, Value) {
+        let router = axum::Router::new()
+            .route("/", post(refresh))
+            .layer(Extension(who))
+            .with_state(state);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn without_a_console_database_a_person_without_audit_read_gets_an_empty_feed_and_dagster_is_not_asked()
+     {
+        let (state, dagster) = state_with_dagster(false).await;
+
+        let (status, body) = post_as(state, principal("governance:read")).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({ "activity": [] }));
+        assert!(
+            dagster.received_requests().await.unwrap().is_empty(),
+            "the run list of every pipeline was fetched for a person who may not read it"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_console_database_a_holder_of_audit_read_gets_the_dagster_run_list() {
+        let (state, _dagster) = state_with_dagster(false).await;
+
+        let (status, body) = post_as(state, principal("audit:read")).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["activity"][0]["target"], "orders_job");
+        assert_eq!(body["activity"][0]["actor"], "Dagster");
+    }
+
+    #[tokio::test]
+    async fn a_failed_audit_read_gives_a_person_without_audit_read_a_503_not_the_dagster_run_list()
+    {
+        let (state, dagster) = state_with_dagster(true).await;
+
+        let (status, body) = post_as(state, principal("governance:read")).await;
+
+        // An empty 200 would read as "you have done nothing yet"; the failure
+        // is said, with a fixed message (never the database's own text).
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, json!({ "activity": [], "error": "database error" }));
+        assert!(
+            dagster.received_requests().await.unwrap().is_empty(),
+            "a failed audit read fell through to the run list for a person who may not read it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_audit_read_still_falls_back_to_dagster_for_a_holder_of_audit_read() {
+        let (state, _dagster) = state_with_dagster(true).await;
+
+        let (status, body) = post_as(state, principal("audit:read")).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["activity"][0]["target"], "orders_job");
     }
 }
