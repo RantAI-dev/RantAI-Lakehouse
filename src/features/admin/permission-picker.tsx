@@ -199,13 +199,16 @@ export function PermissionPicker({
           <Badge
             key={token}
             variant="outline"
-            className="gap-1.5 border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400 py-1 px-2 font-mono text-xs"
+            // WEB-13: the base Badge is shrink-0/nowrap/h-5. A long unknown
+            // token is arbitrary old data, so let it wrap inside the chip and
+            // keep the remove control beside it at a narrow width.
+            className="h-auto max-w-full min-w-0 shrink gap-1.5 whitespace-normal border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400 py-1 px-2 font-mono text-xs"
           >
-            <span>{token}</span>
-            <span className="text-[10px] text-muted-foreground font-sans">(Not recognised)</span>
+            <span className="min-w-0 break-all leading-snug">{token}</span>
+            <span className="shrink-0 text-[10px] text-muted-foreground font-sans">(Not recognised)</span>
             <button
               type="button"
-              className="hover:text-foreground inline-flex items-center justify-center cursor-pointer"
+              className="hover:text-foreground inline-flex shrink-0 items-center justify-center cursor-pointer"
               onClick={() => handleRemoveUnknown(token)}
               aria-label={`Remove ${token}`}
               title={`Remove ${token}`}
@@ -326,16 +329,19 @@ export function PermissionPicker({
                           handleTokenToggle(perm.name, Boolean(checked))
                         }
                       />
-                      <div className="grid gap-0.5 leading-none">
-                        <div className="flex items-center gap-1.5 flex-wrap">
+                      {/* WEB-13: bound the grid child and its flex Label so a
+                          long known permission token wraps instead of
+                          widening the column; the checkbox stays fixed. */}
+                      <div className="grid min-w-0 flex-1 gap-0.5 leading-none">
+                        <div className="flex min-w-0 flex-wrap items-center gap-1.5">
                           <Label
                             htmlFor={permId}
                             className={cn(
-                              "text-xs font-mono font-medium cursor-pointer",
+                              "min-w-0 text-xs font-mono font-medium cursor-pointer",
                               isCovered && "text-muted-foreground"
                             )}
                           >
-                            {perm.name}
+                            <span className="min-w-0 break-all leading-snug">{perm.name}</span>
                           </Label>
                           {coveringWildcard && (
                             <span className="text-[10px] text-muted-foreground font-sans">
