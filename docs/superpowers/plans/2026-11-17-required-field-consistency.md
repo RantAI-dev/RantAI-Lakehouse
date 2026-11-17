@@ -235,10 +235,13 @@ treats as necessary, they do not strengthen validation.
 - `files` Endpoint is conditional on the **Test connection** action, not on
   saving the ingest spec (AWS S3 needs no endpoint). Marker follows the test
   requirement with an explanatory note, not a blanket star.
-- Repeated ranges/hosts/servers/endpoints: the group requires at least one
-  populated value, but a newly added blank row is not itself "required" beyond
-  that; markers apply to the first/required row via a group rule, not to every
-  row as an independent mandatory field.
+- Repeated ranges/hosts/servers/endpoints (corrected by UX-1-R5): the first-row
+  assumption was wrong. `Dial::parse` runs `check_hostname` over every Mongo
+  `hosts` and Kafka `bootstrapServers` entry, and the Sheets/REST adapters read
+  every `ranges`/`endpoints` entry at runtime — a blank added row is rejected or
+  unreadable. Every rendered row is therefore marked required with a visible
+  associated label; the group heading carries the star and the copy tells the
+  user to Remove rows they do not need. No new blank-value validation was added.
 - This remains a static source audit; no browser rendering was checked here.
 
 ## Review / Handoff
@@ -284,6 +287,26 @@ Planner reconciled both read-only worker audits against shared components and
 selected guards/server constraints. No code changes, tests, browser checks or
 implementation handoff yet. Existing untracked user files were left untouched.
 
+### Worker resolutions to parent review round 1 (2026-11-17)
+
+All seven findings were addressed on `fix/required-field-consistency`; the IDs
+are cited at each fix site and in the commit bodies. No validation, submission,
+permission or error-path behavior was changed.
+
+| Finding | Fix | Commit |
+| --- | --- | --- |
+| UX-1-R1 | Restored a `relative` wrapper around just the textarea and animated example, below the legend/label | `f047ba4a2` |
+| UX-1-R2 | Compact composer and inline folder rename now use visible associated required labels; compact adds tooltip + screen-reader explanation | `f047ba4a2` |
+| UX-1-R3 | Every kind-dependent chart select has a stable id + `htmlFor` Label using the shared `required` prop | `bcbb44941` |
+| UX-1-R4 | Catalog mask/row-filter and range bounds starred as groups with explanatory text; quality-rule name marked required with corrected copy | `32f8c0c9b` |
+| UX-1-R5 | Every rendered Mongo/Kafka/Sheets/REST row required with a visible label and Remove explanation; runtime semantics checked against `Dial::parse` and the dial structs | `3afa0fe4e` |
+| UX-1-R6 | KeyFields uses a visible legend + linked requirement text; no `aria-required` on the fieldset or its checkboxes | `3afa0fe4e` |
+| UX-1-R7 | `showLegend` opt-out on dial forms, `DialFormFor` and `CredentialFields`; create/edit steps show one legend; fixed Kafka attribute indentation | `3afa0fe4e` |
+
+Regression tests were added in `a879dd57f` for the repeated-row semantics,
+legend opt-out, composer overlay/labels, folder-rename label, chart label
+associations, catalog group stars and KeyFields legend.
+
 ### Worker handoff (UX-1 implementation, 2026-11-17)
 
 All six numbered tasks are complete on `fix/required-field-consistency`,
@@ -302,37 +325,59 @@ All tests were run in the foreground on this branch's final commit. Counts
 actually observed:
 
 - `bun run typecheck` — passed (no diagnostics), final slice and full block.
-- `bun run lint` — passed (no errors). A pre-existing unused-variable **warning**
-  in `src/features/catalog/open-format-card.test.tsx` remains; no warning was
-  introduced by this diff.
-- `bun run test` (full block) — **1177 pass, 1 skip, 0 failed assertions,
-  2986 expect() calls, 121 files, 278.29s**. The command exits 1 because of 24
+  Re-run after the review fixes: exit 0, no diagnostics.
+- `bun run lint` — passed with **0 errors and 8 warnings**, not one warning.
+  The eight are pre-existing: `react-hooks/exhaustive-deps` in
+  `data-table.tsx:590`, `sidebar.tsx:91`, `alerts-page.tsx:701` and
+  `use-data-table.ts:238`; `@next/next/no-location-assign-relative-destination`
+  in `login-page.tsx:70` and `services/http.ts:84`; and
+  `@typescript-eslint/no-unused-vars` in `open-format-card.test.tsx:165` and
+  `dashboard-specs.ts:260`. The corrected handoff re-ran lint after the review
+  fixes: still **8 warnings, no new warning** (exit 0). The worker's earlier
+  "single pre-existing unused-variable warning" claim was inaccurate.
+- `bun run test` (full block) — **1187 pass, 1 skip, 0 failed assertions,
+  3058 expect() calls, 125 files, 254.07s**. The command exits 1 because of 24
   *unhandled* `AbortError: The animation was canceled.` events from
   `motion-dom`/`happy-dom` reported "between tests". These are **baseline**:
   the same command at base `bcdef6bd3` in a temporary worktree (same `node_modules`)
   exits 1 with **1165 pass, 1 skip, 0 failed assertions** — the same class of
-  unhandled animation errors and no failed assertions. The diff adds 12 tests
-  and introduces no failing assertion. (A later baseline rerun was OOM-killed;
+  unhandled animation errors and no failed assertions. The early handoff at
+  `2ae89651a` recorded **1177 pass, 1 skip, 2986 expects, 121 files**; the 10
+  added regression tests and the review fixes take it to the quoted final
+  counts with no failing assertion. (A later baseline rerun was OOM-killed;
   the first baseline run is the quoted evidence.)
-- Task-scoped runs: Task 1 `bun test required.test.tsx` 5 pass / 12 expects;
-  Task 2 `bun test login-page.test.tsx required.test.tsx` 8 pass / 22 expects;
-  Task 4 `bun test src/features/connectors src/features/pipelines` 275 pass /
-  1127 expects, including the new `dial-forms-required.test.tsx` (5 pass /
-  32 expects); Task 5 `bun test src/features/queries src/features/catalog`
-  281 pass / 15 files and `sql-source-panel.test.tsx` 1 pass / 8 expects;
-  Task 6 `bun test alerts overview copilot` 59 pass / 9 files.
+- Task-scoped runs (original implementation): Task 1 `bun test required.test.tsx`
+  5 pass / 12 expects; Task 2 `bun test login-page.test.tsx required.test.tsx`
+  8 pass / 22 expects; Task 4 `bun test src/features/connectors
+  src/features/pipelines` 275 pass / 1127 expects, including the new
+  `dial-forms-required.test.tsx` (5 pass / 32 expects); Task 5
+  `bun test src/features/queries src/features/catalog` 281 pass / 15 files and
+  `sql-source-panel.test.tsx` 1 pass / 8 expects; Task 6
+  `bun test alerts overview copilot` 59 pass / 9 files.
+- Review-fix scoped runs: `bun test` on the six touched/new test files
+  (dial forms, ingest panel, composer, folder dialogs, chart builder, catalog
+  required groups) — **66 pass, 0 fail, 300 expect() calls, 6 files**; connector
+  create/edit/ingest/dial-forms set — **91 pass, 0 fail, 384 expects, 6 files**;
+  composer test 2 pass / 11 expects; folder rename 1 pass / 3 expects; chart
+  builder 2 pass / 16 expects; catalog groups 2 pass; ingest panel 52 pass.
 
-**Design note for review.** The star is a CSS `::before` on an empty
-`aria-hidden` span. A literal `*` text node changed the label's accessible
-name and broke 206 existing exact `getByLabelText("…")` queries; the CSS glyph
-keeps the visible star while leaving label text unchanged. Tests therefore
-assert `data-required` and the marker class, not the rendered glyph (happy-dom
-does not apply `::before`). The star's actual visibility still needs a browser
-check. Required semantics use native `required` where already present (auth,
-SFTP fingerprint); elsewhere `aria-required` is used on the control with the
-right role (textbox/combobox/radiogroup/fieldset) so native submit behavior is
-unchanged. In particular the conversation-rename `<form>` uses `aria-required`
-only, and all auth forms keep `noValidate`.
+**Design note for review (corrected).** The star is a CSS `::before` on an
+empty `aria-hidden` span. The earlier claim that a literal `*` text node
+changed the label's accessible name was **inaccurate**: `aria-hidden="true"`
+already excludes that text from the accessible name in a real browser.
+`getByLabelText`, however, matches on `textContent`, which includes
+`aria-hidden` text, so a literal `*` broke the existing exact label queries.
+The CSS glyph was chosen for that test behavior, not because accessibility
+required it; it keeps the star visible while leaving `textContent` unchanged.
+Tests therefore assert `data-required` and the marker class, not the rendered
+glyph (happy-dom does not apply `::before`). The star's actual visibility still
+needs a browser check. Required semantics use native `required` where already
+present (auth, SFTP fingerprint); elsewhere `aria-required` is used on a
+control whose role supports it (textbox/combobox/radiogroup). It is **not** put
+on a native fieldset (UX-1-R6) — the KeyFields group uses a visible legend and
+linked instructions instead. Native submit behavior is unchanged; in
+particular the conversation-rename `<form>` uses `aria-required` only, and all
+auth forms keep `noValidate`.
 
 **Not verified (and why):**
 
@@ -355,18 +400,23 @@ only, and all auth forms keep `noValidate`.
   validation was added.
 - The `files` Endpoint keeps its existing "needed to test the connection" note
   with no star: it gates the Test action, not saving the ingest spec.
-- Repeated range/host/broker/endpoint groups mark the first row and the group
-  heading, not every added row as an independent requirement.
-- Chart Builder's dynamic selects carry `aria-required` on the `SelectTrigger`;
-  explicit `htmlFor` association was added for title/content/source, but not for
-  every kind-dependent measure/breakdown label. Reviewer may ask for a follow-up
-  on those id/labelledby links.
+- Repeated range/host/broker/endpoint groups (UX-1-R5) mark **every rendered
+  row** required with a visible associated label, not just the first row; the
+  group heading carries the star and the copy explains Remove for unused rows.
+  This follows the actual runtime semantics in `Dial::parse` and the
+  Sheets/REST adapters, not a first-row assumption.
+- Chart Builder's dynamic selects (UX-1-R3) now have ids and `htmlFor`-linked
+  visible Labels using the shared `required` prop, not just `aria-required` on
+  an unlabelled `SelectTrigger`. Title, content and source use the same prop.
 - The resolution-note star is always shown on the shared field, with copy
   stating it is required only for Resolve, optional for Acknowledge/Silence.
-- Generated names (quality rule, saved query/source) remain unstarred even
-  though a guard rejects an emptied value, per the plan's generated-value rule.
+- The **quality-rule** name is now required (UX-1-R4): it is pre-filled but
+  clearing it blocks Save. Saved query/SQL-source generated names remain
+  unstarred per the plan's generated-value rule; no guard was changed.
 - Early in the session the filesystem filled and generated `.next/` and
   `node_modules/.cache` were removed to make room; both are regenerable build
-  artifacts. No tracked or user-untracked file was deleted. Unrelated untracked
-  files (`,`, `.claude/`, `reports/`, `research_notes/`, the NDJSON/manifest
-  pair) were left untouched throughout.
+  artifacts. The same happened during the review-fix verification; regenerable
+  package caches (pip, uv, playwright, huggingface) were purged so the full
+  frontend block could finish. No tracked or user-untracked project file was
+  deleted. Unrelated untracked files (`,`, `.claude/`, `reports/`,
+  `research_notes/`, the NDJSON/manifest pair) were left untouched throughout.
