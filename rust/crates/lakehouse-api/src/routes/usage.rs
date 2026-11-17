@@ -918,7 +918,7 @@ pub async fn storage(
     params: RawParams,
 ) -> ApiResult<ApiJson<StorageBody>> {
     if !catalog::is_unrestricted(&principal) {
-        return Err(ApiError::PermissionDenied(NOT_PLATFORM.to_owned()));
+        return Err(ApiError::PermissionDenied(NOT_PLATFORM.to_owned()).into());
     }
     let raw = read_params(params)?;
     let (from, to) = read_period(&raw)?;
