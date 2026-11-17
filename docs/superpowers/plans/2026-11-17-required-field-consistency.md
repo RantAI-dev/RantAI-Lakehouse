@@ -247,6 +247,39 @@ treats as necessary, they do not strengthen validation.
 
 ## Review / Handoff
 
+### Current-main review round 3 (head bb8861e8e)
+
+Not approved yet. Required-field coverage was lost when translating old forms.
+
+- **BLOCKER UX-1-R8:** Pipeline create is now a wrapper around
+  `pipeline-editor.tsx`, `pipeline-editor-panes.tsx`, `pipeline-pickers.tsx`
+  and `pipeline-transform-rows.tsx`. These DO contain Label/input layers;
+  the reconciliation handoff's claim otherwise is incorrect. Apply the agreed
+  shared convention to required name, input aliases/tables/zones, output and
+  per-operation fields using current guards. Do not alter the newer editor or
+  its detailed validation status. Optional/fixed/default values stay accurate.
+- **BLOCKER UX-1-R9:** New `alerts/alert-rule-page.tsx` marks only name.
+  Required delivery target, kind-specific mart/measure/metric/connector/dashboard/
+  table and other required inputs must retain the old slice's coverage, mapped
+  to current guards rather than blindly copied.
+- **BLOCKER UX-1-R10:** Replaced admin/quality forms carry stars without
+  required semantics on their inputs/selects. Add opt-in required semantics to
+  SelectField's actual trigger and appropriate input/group instructions in
+  PermissionPicker. Apply them to starred controls in tenant/service identity,
+  quality CheckFields and custom thresholds/dimensions. RoleFields is shared
+  by role-create/edit and needs a legend at the composed form. Invite username
+  OR email should have a starred group and linked requirement explanation.
+  A group must not falsely mark each member required.
+- **SHOULD-FIX UX-1-R11:** Rewritten ChartBuilder retained its duplicate Req
+  implementation. Make it delegate to RequiredMarker without altering its
+  many current chart rules. Its optional dimension branch needs the matching
+  ch-dimension id. Marking semantics in child chart-field components should
+  follow their existing required stars where applicable.
+
+No API/validation redesign is authorized. Correct these missing indicators and
+semantics, preserve all current-main behavior, add focused regression coverage,
+and rerun frontend checks. Parent re-review before push/merge remains required.
+
 ### Delivery update: current main reconciliation (2026-11-17)
 
 Owner requested push and merge if good. PR #568 is open. Fetched main is
