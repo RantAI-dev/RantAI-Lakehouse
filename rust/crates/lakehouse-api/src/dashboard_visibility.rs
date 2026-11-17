@@ -139,6 +139,19 @@ pub(crate) async fn resolve_visibility_for_roles(
         }
     }
 
+    // GOV-17 review R1: when Main is hidden for ANY reason — a denied built-in
+    // tile or a denied stored chart filed on it — its STORED tiles must also
+    // disappear from `list_stored_charts`, which `/api/dashboard/specs`,
+    // assistant list_charts, search and file export read directly without
+    // `get_body`'s built-in filter. `chart_owner_clause` filters the raw stored
+    // board column, so the `builtin_visible` flag alone cannot reach that SQL
+    // clause (or the in-memory `sees_board` predicate). Add both legacy
+    // spellings: they match no real board row and are deduplicated below.
+    if !builtin_visible {
+        hidden.push(String::new());
+        hidden.push(store::DEFAULT_BOARD_ID.to_owned());
+    }
+
     hidden.sort();
     hidden.dedup();
     if hidden.len() > MAX_SCOPE_IDS {

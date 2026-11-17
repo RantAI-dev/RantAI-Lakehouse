@@ -748,6 +748,54 @@ async fn the_board_list_omits_main_only_when_its_dependencies_are_denied() {
     );
 }
 
+/// Whether a statement is the stored-chart query carrying the Main dependency
+/// deny-list. The wiremock fixture answers every `bi_chart` query with all rows
+/// (it cannot evaluate SQL), so the guard is proven by the clause the route
+/// sends: a real engine honours it and returns no Main tiles.
+fn specs_main_filter(sql: &str) -> bool {
+    sql.contains("FROM console.bi_chart") && sql.contains("NOT IN ('', 'default')")
+}
+
+/// GOV-17 review R1: `/api/dashboard/specs` reads `list_stored_charts`
+/// directly and never runs `get_body`'s built-in filter. When Main is hidden by
+/// a denied dependency, BOTH legacy board spellings must be in the chart SQL
+/// deny-list so no Main tile metadata leaves; a caller whose grants cover Main
+/// sends no such list (positive control).
+#[tokio::test]
+async fn specs_apply_the_main_dependency_filter_to_the_chart_query() {
+    let fake = BoardFake::new();
+    let server = fake.serve().await;
+    let TestApp { router, pool } = app(&server).await;
+
+    let narrowed_user = narrowed(&pool, "dashboard:read", &[("serving", OK_MART)]).await;
+    let narrowed_cookie = session_cookie_for_user(&pool, narrowed_user).await;
+    let (status, body) = send_get(&router, &narrowed_cookie, "/api/dashboard/specs").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        fake.statements().iter().any(|sql| specs_main_filter(sql)),
+        "Main's stored tiles must be excluded in the specs chart SQL: {:?}",
+        fake.statements()
+    );
+
+    let before = fake.statements().len();
+    let allowed_user = narrowed(
+        &pool,
+        "dashboard:read",
+        &[("serving", OK_MART), ("serving", HIDDEN_MART)],
+    )
+    .await;
+    let allowed_cookie = session_cookie_for_user(&pool, allowed_user).await;
+    let (status, body) = send_get(&router, &allowed_cookie, "/api/dashboard/specs").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        fake.statements()[before..]
+            .iter()
+            .all(|sql| !specs_main_filter(sql)),
+        "a permitted Main sends no Main deny-list: {:?}",
+        &fake.statements()[before..]
+    );
+}
+
 // ── Combined charts: a question outside the viewer's access ─────────────
 
 /// QA `LH-BI-13-03` (`BI-51`, plan T7): a board with one bar question on

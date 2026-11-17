@@ -1177,6 +1177,27 @@ mod tests {
         assert_eq!(admin.chart_owner_clause(), " AND board NOT IN ('b_denied')");
     }
 
+    /// GOV-17 review R1: when built-in Main is hidden, both legacy spellings of
+    /// its board id must reach `chart_owner_clause` (which filters the raw
+    /// stored board column read directly by specs/tool/search/export) and the
+    /// in-memory `sees_board` predicate. The `builtin_visible` flag alone cannot
+    /// reach either.
+    #[test]
+    fn a_main_denial_hides_both_empty_and_default_board_spellings() {
+        let viewer = Viewer::user("u1", false)
+            .narrowed_by_tables(vec![String::new(), "default".to_owned()], false);
+        let clause = viewer.chart_owner_clause();
+        assert!(clause.contains("board NOT IN ('', 'default')"), "{clause}");
+        assert!(
+            !viewer.sees_board("", ""),
+            "legacy empty Main hidden in memory"
+        );
+        assert!(
+            !viewer.sees_board("default", ""),
+            "default Main hidden in memory"
+        );
+    }
+
     /// GOV-17: the built-in visibility flag is a separate, table-only narrow;
     /// it does not change the ACL-level `sees_builtin` decision.
     #[test]
