@@ -54,33 +54,6 @@ function stubAuth(permissions: string[], roleName = "Viewer") {
   return requestedUrls
 }
 
-let restoreNotificationsSpies = () => {}
-
-beforeEach(() => {
-  mockRouter.push.mockClear()
-  mockRouter.replace.mockClear()
-  const listSpy = spyOn(notificationsService, "list").mockResolvedValue({
-    supported: true,
-    openAlerts: [],
-    pendingApprovals: [],
-    unreadMentions: [],
-    unreadMentionsUnavailable: null,
-  } as never)
-  const markReadSpy = spyOn(notificationsService, "markMentionsRead").mockResolvedValue(undefined as never)
-  restoreNotificationsSpies = () => {
-    listSpy.mockRestore()
-    markReadSpy.mockRestore()
-  }
-})
-
-afterEach(() => {
-  cleanup()
-  global.fetch = originalFetch
-  // The spies replace methods on the shared `notificationsService` singleton,
-  // which other test files in this process import; restore them so they do not leak.
-  restoreNotificationsSpies()
-})
-
 import { TooltipProvider } from "@/components/ui/tooltip"
 
 function renderWithProviders(ui: React.ReactNode) {
@@ -94,6 +67,34 @@ function renderWithProviders(ui: React.ReactNode) {
 }
 
 describe("ADM-13 D8: per-role navigation and route guard", () => {
+  // These spies sit on the shared notificationsService singleton; restoring
+  // them keeps every other test file in the run seeing the real service,
+  // whatever order bun discovers the files in.
+  let restoreNotificationSpies: (() => void) | undefined
+
+  beforeEach(() => {
+    mockRouter.push.mockClear()
+    mockRouter.replace.mockClear()
+    const listSpy = spyOn(notificationsService, "list").mockResolvedValue({
+      supported: true,
+      openAlerts: [],
+      pendingApprovals: [],
+      unreadMentions: [],
+      unreadMentionsUnavailable: null,
+    } as never)
+    const markMentionsReadSpy = spyOn(notificationsService, "markMentionsRead").mockResolvedValue(undefined as never)
+    restoreNotificationSpies = () => {
+      listSpy.mockRestore()
+      markMentionsReadSpy.mockRestore()
+    }
+  })
+
+  afterEach(() => {
+    cleanup()
+    global.fetch = originalFetch
+    restoreNotificationSpies?.()
+  })
+
   it("1. Dashboard Viewer role sees only Dashboards in sidebar; no dock", async () => {
     currentPathname = "/dashboards"
     stubAuth(["dashboard:read"], "Dashboard Viewer")

@@ -809,6 +809,12 @@ async fn the_sign_in_and_assistant_settings_routes_are_refused_without_settings_
             "GET",
             "/api/settings/sso/test/00000000-0000-0000-0000-000000000001",
         ),
+        // `ADM-2`: the workspace's name and pictures, reading included.
+        ("GET", "/api/settings/general"),
+        ("PUT", "/api/settings/general"),
+        ("DELETE", "/api/settings/general"),
+        ("PUT", "/api/settings/general/images/logo"),
+        ("DELETE", "/api/settings/general/images/logo"),
     ] {
         let resp = request_with_cookie(&router, method, path, &analyst).await;
         assert_eq!(
@@ -838,6 +844,12 @@ async fn a_platform_admin_is_not_refused_the_sign_in_and_assistant_settings_rout
             "GET",
             "/api/settings/sso/test/00000000-0000-0000-0000-000000000001",
         ),
+        // `ADM-2`: the workspace's name and pictures, reading included.
+        ("GET", "/api/settings/general"),
+        ("PUT", "/api/settings/general"),
+        ("DELETE", "/api/settings/general"),
+        ("PUT", "/api/settings/general/images/logo"),
+        ("DELETE", "/api/settings/general/images/logo"),
     ] {
         let resp = request_with_cookie(&router, method, path, &admin).await;
         assert_ne!(resp.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
@@ -3802,6 +3814,52 @@ async fn the_embed_values_and_settings_routes_are_gated_in_both_directions() {
         "a writer got {}",
         resp.status()
     );
+}
+
+/// `ADM-2` (decision 5): the two branding routes are public, because the
+/// sign-in page shows the name and the logo before any session exists. With no
+/// session they answer, never 401 or 403, and the five routes that change
+/// them are not public.
+#[tokio::test]
+async fn the_two_branding_routes_are_public_and_the_five_that_change_them_are_not() {
+    let TestApp { router, .. } = spin_up().await;
+    let policy_of = |method: &str, path: &str| {
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == method && *p == path)
+            .map(|(_, _, policy)| *policy)
+    };
+    for (pattern, path) in [
+        ("/api/branding", "/api/branding"),
+        ("/api/branding/images/{kind}", "/api/branding/images/logo"),
+    ] {
+        assert_eq!(policy_of("GET", pattern), Some(Policy::Public), "{pattern}");
+        let resp = request_with_cookie(&router, "GET", path, "").await;
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED, "{path}");
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+    for (method, pattern) in [
+        ("GET", "/api/settings/general"),
+        ("PUT", "/api/settings/general"),
+        ("DELETE", "/api/settings/general"),
+        ("PUT", "/api/settings/general/images/{kind}"),
+        ("DELETE", "/api/settings/general/images/{kind}"),
+    ] {
+        assert_eq!(
+            policy_of(method, pattern),
+            Some(Policy::RequiresPermission("settings:write")),
+            "{method} {pattern}"
+        );
+    }
+    // With no session the five are refused at the gate.
+    for (method, path) in [
+        ("GET", "/api/settings/general"),
+        ("PUT", "/api/settings/general/images/logo"),
+        ("DELETE", "/api/settings/general"),
+    ] {
+        let resp = request_with_cookie(&router, method, path, "").await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+    }
 }
 
 /// BI-19 B1 review R2/R9: `POST /api/dashboard/specs/preview` is "signed in"
