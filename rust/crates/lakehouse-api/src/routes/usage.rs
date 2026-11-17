@@ -776,7 +776,7 @@ fn micro_units(amount: &str) -> Option<i128> {
         return None;
     }
     let whole: i128 = whole.parse().ok()?;
-    let padded = format!("{decimals:0<width$}", width = RATE_DECIMALS);
+    let padded = format!("{decimals:0<RATE_DECIMALS$}");
     let fraction: i128 = padded.parse().ok()?;
     whole.checked_mul(1_000_000)?.checked_add(fraction)
 }
