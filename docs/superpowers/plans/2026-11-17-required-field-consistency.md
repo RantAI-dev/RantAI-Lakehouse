@@ -344,7 +344,12 @@ checkbox.
   no client validation. The fixed, disabled edit-mode pipeline name is
   deliberately not starred (it cannot be cleared).
 - No new blank-value rejection was added anywhere; "required" markers follow
-  the current save guards, not a stronger validation policy. The catalog-backed
+  the current save guards, not a stronger validation policy. The quality-rule
+  Dimension input keeps the star it already carried and now has matching
+  `aria-required`; for a picked check a blank value falls back to the check
+  kind's dimension, so this is a deliberate pre-existing marker (the saved rule
+  always carries a dimension), not a new blank-value rule.
+- The catalog-backed
   `TablePicker` and `ColumnsField` use the group pattern on a button trigger,
   so the marker is paired with a visible sentence instead of `aria-required`.
 - Browser/AT verification and owner sign-off remain open; this is a source and
