@@ -107,7 +107,11 @@ and step 6 is a bundle inspection rather than a screenshot.
 - The provider's admin console (`{base}/admin`) is reachable from the LAN.
 - `--import-realm` fills only an **empty** realm: a realm an administrator
   has changed is not overwritten by a later deploy, and a realm that is
-  deleted is re-imported.
+  deleted is re-imported. A consequence worth stating: rotating
+  `STAGING_OIDC_CLIENT_SECRET` reaches the API but not the provider, so the
+  client's secret in the provider's admin console has to change too (or the
+  realm's database has to be dropped). The deployment and its realm would
+  then disagree at the token exchange ("invalid_client").
 - Changing `SSO_PUBLIC_BASE_URL` breaks every sign-in until the provider's
   hostname, the issuer and the registered callback move together.
 - The console's SSO form shows this connection as **set by the server** and

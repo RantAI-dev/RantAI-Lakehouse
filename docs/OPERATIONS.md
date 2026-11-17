@@ -2142,6 +2142,14 @@ every sign-in until the provider's own hostname, the issuer and the
 registered callback move together, which is one deploy's work: change the
 variable, redeploy, and the realm is imported into a fresh database.
 
+**Rotating a credential needs two changes.** The imported realm is not
+overwritten by a later deploy, so a new `STAGING_OIDC_CLIENT_SECRET` (or a
+new test user's password) reaches the API but **not** the provider: the
+client's secret in the provider's admin console has to be changed as well,
+or the realm's database dropped so the next start imports it again. A
+deployment whose secret and its realm disagree fails at the token exchange
+("invalid_client"), not at the login form.
+
 ### Microsoft Entra ID
 
 Register an application in the Entra admin center (App registrations → New
