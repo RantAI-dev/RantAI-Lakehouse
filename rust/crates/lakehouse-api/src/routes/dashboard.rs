@@ -437,7 +437,25 @@ async fn get_body(
     if is_builtin && !viewer.sees_builtin() {
         return Err(BodyError::NotFound);
     }
+    // GOV-17: the built-in "Main" board hides in full when any required
+    // built-in or stored data dependency is unreadable — not just the tile on
+    // that table. `all` keeps its visible stored boards; its built-in tiles are
+    // dropped below rather than hiding the whole aggregate.
+    if board == store::DEFAULT_BOARD_ID && !viewer.builtin_visible() {
+        return Err(BodyError::NotFound);
+    }
     if store_error.is_none() && !is_builtin && board_obj.is_none() {
+        return Err(BodyError::NotFound);
+    }
+    // GOV-17: the in-memory predicate agrees with the generated clause. A
+    // board hidden by an unreadable dependency is the same unknown board by
+    // id, even if a stale or cached store row still lists it.
+    if !is_builtin
+        && !viewer.sees_board(
+            &board,
+            board_obj.map_or("", |b| b.owner_id.as_deref().unwrap_or("")),
+        )
+    {
         return Err(BodyError::NotFound);
     }
     let layout = board_obj.and_then(|b| b.layout.clone()).unwrap_or_default();
@@ -511,9 +529,19 @@ async fn get_body(
     // stored chart. Nothing else of the read changes.
     let on_default = q.only.is_none()
         && (board == "default" || board == "all")
+        && viewer.builtin_visible()
         && (!KPIS.is_empty() || !CHARTS.is_empty());
     let mut stored_for_board: Vec<&StoredChartSpec> = if board == "all" {
-        stored.iter().collect()
+        // GOV-17: charts filed on Main travel with the built-in board. When
+        // Main is hidden by an unreadable dependency they must not reappear
+        // on the `all` aggregate through a different door.
+        stored
+            .iter()
+            .filter(|c| {
+                viewer.builtin_visible()
+                    || !(c.board.is_empty() || c.board == store::DEFAULT_BOARD_ID)
+            })
+            .collect()
     } else {
         stored
             .iter()

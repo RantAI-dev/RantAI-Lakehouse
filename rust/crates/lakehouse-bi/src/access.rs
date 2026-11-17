@@ -194,6 +194,22 @@ impl Scope {
     }
 }
 
+/// An `AND <column> NOT IN (...)` fragment for the GOV-17 dependency deny-list.
+/// Empty for no hidden boards. Ids are `SqlLiteral`-quoted, never interpolated
+/// raw, and the fragment is appended AFTER the ACL predicate, never instead of
+/// it.
+fn sql_id_list(ids: &[String], column: &str) -> String {
+    if ids.is_empty() {
+        return String::new();
+    }
+    let list = ids
+        .iter()
+        .map(|id| SqlLiteral::from(id.as_str()).to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(" AND {column} NOT IN ({list})")
+}
+
 /// Who is reading, as far as the personal space and the permissions are
 /// concerned.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,6 +218,16 @@ pub struct Viewer {
     all: bool,
     boards: Scope,
     folders: Scope,
+    /// GOV-17: dashboards whose required data dependency is not readable under
+    /// the caller's current table grants. Empty for [`Self::system`] and for a
+    /// caller no role narrowed. This field only ever REMOVES boards from what
+    /// the ACL fields above allow: it is never a second source of access.
+    hidden_boards: Vec<String>,
+    /// GOV-17: whether the built-in "Main" dashboard's data dependencies (its
+    /// built-in tiles and any stored chart filed on it) are all readable. A
+    /// narrowed caller with one denied built-in dependency loses the whole
+    /// built-in board, not just that tile's values.
+    builtin_visible: bool,
 }
 
 impl Viewer {
@@ -214,6 +240,8 @@ impl Viewer {
             all,
             boards: Scope::Unrestricted,
             folders: Scope::Unrestricted,
+            hidden_boards: Vec::new(),
+            builtin_visible: true,
         }
     }
 
@@ -226,6 +254,8 @@ impl Viewer {
             all: false,
             boards: Scope::Unrestricted,
             folders: Scope::Unrestricted,
+            hidden_boards: Vec::new(),
+            builtin_visible: true,
         }
     }
 
@@ -240,12 +270,16 @@ impl Viewer {
             all: false,
             boards: Scope::Only(Vec::new()),
             folders: Scope::Only(Vec::new()),
+            hidden_boards: Vec::new(),
+            builtin_visible: true,
         }
     }
 
     /// The server itself, for the work that must see every row: the
     /// version snapshot, the trash sweep, the cascade of a delete. Never built
-    /// from a request.
+    /// from a request. GOV-17: trusted collection only — a request handler must
+    /// never expose rows this viewer reads, which is why the API resolver
+    /// narrows request viewers and never this one.
     #[must_use]
     pub fn system() -> Self {
         Self {
@@ -253,7 +287,34 @@ impl Viewer {
             all: true,
             boards: Scope::Unrestricted,
             folders: Scope::Unrestricted,
+            hidden_boards: Vec::new(),
+            builtin_visible: true,
         }
+    }
+
+    /// GOV-17: narrow a REQUEST viewer by the boards whose data dependencies
+    /// are unreadable and by built-in dependency visibility. This only removes
+    /// visibility the ACL fields already decided; it cannot add a board, a
+    /// personal space or a folder. `system()` is deliberately never passed
+    /// here (trusted collection reads every row and no request sees its rows).
+    #[must_use]
+    pub fn narrowed_by_tables(mut self, hidden_boards: Vec<String>, builtin_visible: bool) -> Self {
+        self.hidden_boards = hidden_boards;
+        self.builtin_visible = builtin_visible;
+        self
+    }
+
+    /// The board ids hidden by table dependency (GOV-17). Empty for a caller no
+    /// role narrowed.
+    #[must_use]
+    pub fn hidden_board_ids(&self) -> &[String] {
+        &self.hidden_boards
+    }
+
+    /// Whether the built-in dashboard's dependencies are all readable (GOV-17).
+    #[must_use]
+    pub fn builtin_visible(&self) -> bool {
+        self.builtin_visible
     }
 
     /// The principal id, `""` for [`Self::anonymous`] and [`Self::system`].
@@ -279,7 +340,13 @@ impl Viewer {
     /// check every by-id read makes; [`Self::sees`] alone ignores the lists.
     #[must_use]
     pub fn sees_board(&self, id: &str, owner: &str) -> bool {
-        self.sees(owner) && (self.all || self.boards.allows(id))
+        self.sees(owner)
+            && (self.all || self.boards.allows(id))
+            // GOV-17: an unreadable dependency hides the whole board, not just
+            // its values. The check is independent of `all`, so an
+            // `identity:write` caller with narrowed table grants is narrowed
+            // too; only the trusted `system()` viewer is never narrowed.
+            && !self.hidden_boards.iter().any(|hidden| hidden == id)
     }
 
     /// Whether the built-in dashboard (and the built-in tiles on `board=all`)
@@ -301,10 +368,19 @@ impl Viewer {
     /// sees all.
     #[must_use]
     pub fn owner_clause(&self) -> String {
+        // GOV-17: the dependency deny-list applies even to an `all` viewer
+        // (identity:write with narrowed table grants), so it is appended on
+        // both branches. The ACL predicate is still the one that grants reach.
+        let hidden = sql_id_list(&self.hidden_boards, "id");
         if self.all {
-            return String::new();
+            return hidden;
         }
-        format!("{}{}", self.personal_clause(), self.boards.clause("id"))
+        format!(
+            "{}{}{}",
+            self.personal_clause(),
+            self.boards.clause("id"),
+            hidden
+        )
     }
 
     /// The same for `bi_folder` rows (the folder id list, not the dashboard
@@ -335,13 +411,17 @@ impl Viewer {
     /// private.
     #[must_use]
     pub fn chart_owner_clause(&self) -> String {
+        // GOV-17: a chart on a board hidden by table dependency must not be
+        // visible by id either, whatever the board's ACL branch says.
+        let hidden = sql_id_list(&self.hidden_boards, "board");
         if self.all {
-            return String::new();
+            return hidden;
         }
         format!(
-            " AND board NOT IN (SELECT id FROM console.bi_board FINAL WHERE owner_id != '' AND owner_id != {}){}",
+            " AND board NOT IN (SELECT id FROM console.bi_board FINAL WHERE owner_id != '' AND owner_id != {}){}{}",
             SqlLiteral::from(self.id.as_str()),
-            self.boards.clause("board")
+            self.boards.clause("board"),
+            hidden
         )
     }
 
@@ -1059,5 +1139,54 @@ mod tests {
         assert_eq!(viewer.level_at_root(), Some(Level::View));
         let admin = AccessMap::new("u1", true, None, &[], &[], &[]);
         assert_eq!(admin.level_at_root(), Some(Level::Manage));
+    }
+
+    /// GOV-17: the dependency overlay only removes boards the ACL already
+    /// grants, in both the in-memory predicate and the generated clauses.
+    #[test]
+    fn a_table_dependency_deny_list_hides_the_whole_board_even_for_an_all_viewer() {
+        let hidden = vec!["b_denied".to_owned()];
+        let viewer = Viewer::user("u1", false).narrowed_by_tables(hidden.clone(), true);
+        assert!(!viewer.sees_board("b_denied", ""));
+        assert!(viewer.sees_board("b_allowed", ""));
+        assert!(viewer.owner_clause().contains("AND id NOT IN ('b_denied')"));
+        assert!(
+            viewer
+                .chart_owner_clause()
+                .contains("AND board NOT IN ('b_denied')")
+        );
+        // The personal-space ACL predicate is still there; the overlay did not
+        // replace it.
+        assert!(viewer.owner_clause().contains("owner_id = ''"));
+
+        let admin = Viewer::user("u9", true).narrowed_by_tables(hidden, true);
+        assert!(
+            !admin.sees_board("b_denied", ""),
+            "identity:write is not a bypass"
+        );
+        assert_eq!(admin.owner_clause(), " AND id NOT IN ('b_denied')");
+        assert_eq!(admin.chart_owner_clause(), " AND board NOT IN ('b_denied')");
+    }
+
+    /// GOV-17: the built-in visibility flag is a separate, table-only narrow;
+    /// it does not change the ACL-level `sees_builtin` decision.
+    #[test]
+    fn built_in_dependency_visibility_only_changes_the_table_overlay() {
+        let viewer = Viewer::user("u1", false).narrowed_by_tables(Vec::new(), false);
+        assert!(!viewer.builtin_visible());
+        assert!(viewer.sees_builtin(), "the ACL decision is untouched");
+        assert_eq!(viewer.hidden_board_ids(), &[] as &[String]);
+        // A no-op narrow leaves every clause exactly as before.
+        let noop = Viewer::user("u1", false).narrowed_by_tables(Vec::new(), true);
+        assert_eq!(
+            noop.owner_clause(),
+            Viewer::user("u1", false).owner_clause()
+        );
+        assert_eq!(
+            noop.chart_owner_clause(),
+            Viewer::user("u1", false).chart_owner_clause()
+        );
+        // The server's own reader is never narrowed by a request.
+        assert!(Viewer::system().sees_board("b_denied", "someone"));
     }
 }

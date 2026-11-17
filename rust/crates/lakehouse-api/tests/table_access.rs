@@ -544,8 +544,14 @@ impl Respond for BoardFake {
     }
 }
 
+/// GOV-7 AC4 used to require this board to render the allowed tile while the
+/// tile on the hidden mart showed the tenant-gate 404 sentence. The owner
+/// superseded that decision on 2026-11-17 (GOV-17): a dashboard with ANY
+/// unreadable data dependency is hidden in full. The old result is preserved
+/// here as a superseded historical expectation, not rewritten as a new pass;
+/// the assertions below are the stronger whole-board guard.
 #[tokio::test]
-async fn a_dashboard_tile_on_a_hidden_table_is_not_found_while_the_other_tiles_render() {
+async fn a_dashboard_with_a_denied_dependency_is_hidden_entirely() {
     let fake = BoardFake::new();
     let server = fake.serve().await;
     let TestApp { router, pool } = app(&server).await;
@@ -563,25 +569,53 @@ async fn a_dashboard_tile_on_a_hidden_table_is_not_found_while_the_other_tiles_r
         )
         .await
         .expect("router never fails a request outright");
-    assert_eq!(resp.status(), StatusCode::OK);
+    // Unknown and hidden boards have the same fixed answer.
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
     let body: Value = serde_json::from_slice(&bytes).expect("a JSON body");
-
-    assert_eq!(
-        body["results"][HIDDEN_TILE]["error"],
-        format!("Table not found or not available to your organisation: serving.{HIDDEN_MART}"),
-        "{body}"
+    let text = body.to_string();
+    assert!(
+        !text.contains(HIDDEN_MART),
+        "no dependent table name: {text}"
     );
+    assert!(
+        !text.contains(OK_MART),
+        "no other tile's table name: {text}"
+    );
+    assert!(!text.contains("results"), "no tile metadata at all: {text}");
+    // Neither tile reaches the engine: hiding happens before any tile query.
+    let statements = fake.statements();
+    assert!(
+        statements.iter().all(|sql| !sql.contains("FROM serving.")),
+        "no data SQL is dispatched for a hidden board: {statements:?}"
+    );
+}
+
+/// GOV-17 positive control: the same board with every dependency granted is
+/// unchanged — both tiles still render, and the whole-board guard is not a
+/// blanket refusal of narrowed callers.
+#[tokio::test]
+async fn a_dashboard_with_all_dependencies_granted_renders_every_tile() {
+    let fake = BoardFake::new();
+    let server = fake.serve().await;
+    let TestApp { router, pool } = app(&server).await;
+    let user = narrowed(
+        &pool,
+        "dashboard:read",
+        &[("serving", OK_MART), ("serving", HIDDEN_MART)],
+    )
+    .await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let (status, body) = dashboard_as(&router, &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert!(
         body["results"][OK_TILE].get("rows").is_some(),
-        "the allowed tile still renders: {body}"
+        "the allowed tile renders: {body}"
     );
     assert!(
-        fake.statements()
-            .iter()
-            .all(|sql| !sql.contains(&format!("FROM serving.{HIDDEN_MART}"))),
-        "the hidden tile never reaches the engine: {:?}",
-        fake.statements()
+        body["results"][HIDDEN_TILE].get("rows").is_some(),
+        "the once-hidden tile renders when its table is granted: {body}"
     );
 }
 
@@ -772,11 +806,14 @@ async fn dashboard_as(router: &axum::Router, cookie: &str) -> (StatusCode, Value
     (status, body)
 }
 
-/// QA `LH-BI-13-03` (`BI-51`, D16, D18): a question on a table the viewer's
-/// role does not read is marked as access, without the gate's text, and that
-/// table is never read.
+/// QA `LH-BI-13-03` (`BI-51`, D16, D18) historically checked that a combined
+/// chart's question on an unreadable table was marked `access` while its base
+/// question still rendered. GOV-17's 2026-11-17 owner decision supersedes that
+/// partial result: a secondary/combined layer's table is a dependency of the
+/// WHOLE dashboard, so the board is hidden in full. The obligation that the
+/// denied engine read never happens is unchanged and is asserted below.
 #[tokio::test]
-async fn a_question_on_a_table_the_viewers_role_does_not_read_is_marked_as_access() {
+async fn a_combined_chart_with_a_denied_layer_hides_the_whole_dashboard() {
     let fake = LayerFake::new();
     let server = fake.serve().await;
     let TestApp { router, pool } = app(&server).await;
@@ -784,23 +821,15 @@ async fn a_question_on_a_table_the_viewers_role_does_not_read_is_marked_as_acces
     let cookie = session_cookie_for_user(&pool, user).await;
 
     let (status, body) = dashboard_as(&router, &cookie).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let tile = &body["results"][LAYER_TILE];
-    assert!(
-        tile.get("rows").is_some(),
-        "the base question renders: {body}"
-    );
-    let layer = &tile["layers"][0];
-    assert_eq!(layer["cause"], json!("access"), "{layer}");
-    assert_eq!(layer["error"], "Not available with your access.", "{layer}");
-    assert!(layer.get("errorId").is_none(), "{layer}");
-    let text = layer.to_string();
-    assert!(!text.contains("Table not found"), "{text}");
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let text = body.to_string();
+    assert!(!text.contains(LAYER_MART), "no denied table name: {text}");
+    assert!(!text.contains(LAYER_BASE), "no other table's name: {text}");
     assert!(
         fake.statements()
             .iter()
-            .all(|sql| !sql.contains(&format!("FROM serving.{LAYER_MART}"))),
-        "the hidden question never reaches the engine: {:?}",
+            .all(|sql| !sql.contains("FROM serving.")),
+        "no question reaches the engine for a hidden board: {:?}",
         fake.statements()
     );
 }

@@ -286,6 +286,10 @@ pub(crate) async fn scope_for_write(
             .map_err(|e| classify_ch_error(&e))?;
         map.viewer(&placements).map_err(too_many)?
     };
+    // GOV-17: writes use the same narrowed viewer as reads (duplicate, move,
+    // revert and the public-link/embed setup are reads in effect).
+    let visibility = crate::dashboard_visibility::resolve_visibility(state, principal).await?;
+    let viewer = crate::dashboard_visibility::narrow(viewer, &visibility)?;
     Ok(Scope { viewer, map })
 }
 
@@ -503,10 +507,14 @@ async fn resolve(
     if baseline.is_none() && grants.is_empty() {
         return Err(refused());
     }
-    // An administrator sees everything today, and keeps doing so; a person
-    // with a starting point and no marks anywhere has nothing taken away.
+    // An administrator sees everything the ACL says today, and keeps doing
+    // so; a person with a starting point and no marks has nothing taken away
+    // by the ACL. GOV-17 narrows BOTH cases by table dependencies below, so
+    // neither shortcut is a bypass of a narrowed role's grants.
     if principal.has("identity:write") || (baseline.is_some() && marks.is_empty()) {
-        return Ok(viewer_of(principal));
+        let viewer = viewer_of(principal);
+        let visibility = crate::dashboard_visibility::resolve_visibility(state, principal).await?;
+        return crate::dashboard_visibility::narrow(viewer, &visibility);
     }
     let ch = &state.clickhouse;
     let tree = folders::list_folders(ch, &Viewer::system())
@@ -515,7 +523,7 @@ async fn resolve(
     let placements = store::board_placements(ch)
         .await
         .map_err(|e| classify_ch_error(&e))?;
-    AccessMap::new(
+    let viewer = AccessMap::new(
         principal.id.uuid().to_string(),
         false,
         baseline,
@@ -524,7 +532,12 @@ async fn resolve(
         &marks,
     )
     .viewer(&placements)
-    .map_err(too_many)
+    .map_err(too_many)?;
+    // GOV-17: the ACL fast path above is NOT a table-grant bypass. Every
+    // request viewer is narrowed by the caller's current table dependencies,
+    // including `identity:write`; only `Viewer::system()` stays unfiltered.
+    let visibility = crate::dashboard_visibility::resolve_visibility(state, principal).await?;
+    crate::dashboard_visibility::narrow(viewer, &visibility)
 }
 
 /// Whether dashboard `board_id` is restricted ("only the people listed"):

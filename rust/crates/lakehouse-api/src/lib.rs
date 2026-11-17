@@ -27,6 +27,7 @@ pub mod connector_secret_store;
 pub mod crypto_provider;
 pub mod csv_export;
 pub mod csv_safe;
+mod dashboard_visibility;
 pub mod error;
 pub mod export;
 pub mod gold_export;
