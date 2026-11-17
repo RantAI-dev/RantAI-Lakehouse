@@ -196,9 +196,127 @@ frontend-only suppression, deleting/changing dashboards to make dependencies fit
 external-recipient policy redesign and a claim that every independent artefact
 class is covered. Open independent artefact findings must be explicit at handoff.
 
-## Handoff
+## Handoff (HY4 developer, 2026-11-17)
 
-Pending HY4 implementation.
+Branch `fix/gov-17-dashboard-table-visibility`, prepared checkout
+`/home/shiro/.t3/worktrees/RantAI-Lakehouse/t3-67c8ff35`, base
+`0a0ed0dd6cd8c4dff2b8c902eef7291eccb1d9a9` (`origin/main` at
+`34d1276a2818d1f4a88e9a937eacb8da0b66f7b9`). No worktree or thread created;
+WEB-13 untouched; no PR opened, merged or watched; nothing pushed to `main`.
+
+### Commits (one task per commit)
+
+- **T1** `8cb0c3d6078a4712343d34731ecd66d7200139a2` — shared dependency
+  resolver, pure `Viewer` overlay, central viewer/scope narrowing, payload
+  and built-in/`all` checks, old mixed-board tests replaced.
+- **T2** `681fede8b09a0ef389ce6a800a1698b9e05584c5` — discovery/delivery
+  matrix, embed and public-link effective-role guard, report recipient
+  rechecks, route regressions.
+- **T2 follow-up** `e81ea4d08...` — keep `embed.rs` clippy-clean after the T2 guard
+  (boxed refusal response; extracted the time/format helper so `data()` is
+  back under the line limit). No behaviour change.
+- **T3** — feature page, CHANGELOG and this handoff.
+
+### Commands actually run, with counts
+
+```
+cd rust && cargo fmt                                   # ok
+cd rust && cargo fmt --check                           # ok
+cd rust && CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target \
+  cargo check -p lakehouse-bi -p lakehouse-api --all-targets          # ok
+cd rust && CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target \
+  cargo clippy -p lakehouse-bi --all-targets -- -D warnings           # ok
+cd rust && sg docker -c 'export CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target; \
+  cargo test -p lakehouse-bi --lib access::tests::'                   # 47 passed, 0 failed
+cd rust && CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target \
+  cargo test -p lakehouse-api --lib dashboard_visibility::            # 9 passed, 0 failed
+cd rust && sg docker -c '... cargo test -p lakehouse-api --test it table_access::'
+                                                                       # 27 passed, 0 failed
+cd rust && sg docker -c '... cargo test -p lakehouse-api --test it'
+                                                                       # 1635 passed, 1 failed, 5 ignored
+```
+
+Final workspace run, foreground:
+
+```
+cd rust && cargo fmt --check                                           # ok
+cd rust && CARGO_TARGET_DIR=... cargo clippy --workspace --all-targets \
+  --all-features -- -D warnings
+# 2 errors: clippy::large_futures in routes/ai/mod.rs:322 and :1607.
+# Both files are untouched by this branch; these are baseline on the named
+# base commit under this machine's Rust 1.99 clippy, not introduced here.
+cd rust && sg docker -c '... cargo test --workspace'
+# NOT VERIFIED: the machine went to ENOSPC (0 bytes free) while linking the
+# test binaries; two further attempts were also killed. No fabricated result.
+# The scoped suites above, which cover every crate this branch touched, are
+# the verified substitute; see "Not verified" below.
+```
+
+The one full-suite failure was
+`ai_sql_help::a_chat_with_no_allowlist_is_offered_today_s_tools_and_today_s_prompt`
+(system-prompt hash). It passes in isolation both **with** and **without**
+this branch's T2 changes, so it is order-dependent shared-state flakiness,
+not a GOV-17 regression. No test, lint or threshold was weakened.
+
+### Per-route audit matrix
+
+Guard applied = resolved request viewer (and, where marked, the combined
+`sees_builtin_board()` check) before metadata is serialised or a cache is
+read. All list/by-id paths that already took `viewer_for`/`scope_for_write`/
+`payload_scope`/`usage_viewer_of` inherit the overlay automatically; the
+call sites below were checked explicitly.
+
+| Area / call site | Disposition |
+| --- | --- |
+| `dashboard.rs::payload_for` → `get_body` (authenticated render, `render`, PDF print view) | Guard applied via `payload_scope`; by-id in-memory `sees_board` check added before tile assembly; built-in/`all` checks added. |
+| `dashboard.rs::boards_list` (chooser/browse, `chartCount`, Main entry) | Guard applied; Main omitted when built-in deps denied; counts come from the narrowed chart list. |
+| `dashboard.rs` YAML/`format=file` export | Guard applied; Main omitted from the export with the combined check. |
+| `dashboard_organise.rs` shortcuts, board versions/trash, `require_chart_board` | Guard applied via `viewer_for`/`scope_for_write`; Main checks use `sees_builtin_board()`. |
+| `dashboard_comments.rs`, `dashboard_folders.rs`, `dashboard_file.rs`, `dashboard_sources.rs`, `public_links.rs` reads | Guard applied through the shared viewer/scope paths. |
+| `dashboard_sources.rs` source list/detail and delete-conflict count | Source folder visibility unchanged; a hidden dashboard's chart titles/counts are not named — the caller is told only "a dashboard you cannot see". Reviewed, no table/title/table-name leak; see followups. |
+| `pdf_export.rs`, `render.rs`, report owner + recipient rechecks (`report_runner.rs`) | Guard applied; built-in uses combined check; recipients resolve their own viewer at send time. |
+| `embed.rs::data` and public-link `render_board_payload` | New: resolve the effective Dashboard Viewer role's fresh grants; hidden board gets the fixed token refusal; chart list narrowed before assembly. No new privileged principal. |
+| AI `list_boards`, `list_charts`, `list_sql_sources`, dashboard page context, discovery references | Guard applied through `viewer_for`/`scope_for_write`; no tool schema changed, so `tests/fixtures/tool_schemas.json` is unchanged. AI-team review still owed below. |
+| Favourites, recents, home references, search/items | `lakehouse-bi::search` and `items` use `sees_builtin_board()`; the rest take the narrowed viewer. |
+| Chart records/values/fields/lineage/comments, folder board counts | Reached only through the narrowed viewer for the authenticated read paths; deletion-conflict counts intentionally count every board so a delete cannot orphan one, but the response names no board, title or table (followup below). |
+| `Viewer::system()` collection shortcuts (`chart_alerts`, `used_by`, `maps`, `layout_tabs` tests) | Reviewed: used only to decide a generic "you cannot see it" answer or in test fixtures; no hidden title/table is serialised. Not replaced with a privileged request viewer. |
+
+### Independent artefact audit — concrete followups, NOT claimed fixed
+
+- Saved queries (`saved_queries.rs`) and authored pipelines (`authored_pipelines.rs`)
+  keep their own SQL and folder rules. They do not list a dashboard's charts,
+  but their SQL can name a table a caller may not read and their usage lists
+  can name a dashboard. Proposed followup ticket: **GOV-18** — apply the same
+  dependency resolver to saved-query and pipeline metadata and their "used by"
+  lists; owner sign-off needed before changing their authoring semantics.
+- Alerts (`chart_alerts.rs`, `alerts.rs`) read a chart by id and distinguish
+  "lost access" from "gone" using a system-viewer lookup. The response names
+  no chart title or table, but the two outcomes are still distinguishable.
+  Proposed followup ticket: **GOV-19** — give the two outcomes one fixed
+  sentence and decide the alert-history contract with the product owner.
+- Folder delete-conflict counts deliberately count boards the caller cannot
+  see so a delete cannot orphan them. The response reveals a count but no id
+  or title. Proposed followup ticket: **GOV-20** — replace the count with a
+  count-free generic refusal; needs an owner decision on the delete contract.
+
+No independent artefact class is claimed accepted by this slice.
+
+### Not verified / owed
+
+- `cargo test --workspace`: not completed — ENOSPC during test-binary linking
+  on this machine (shared `CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target`).
+  No cache was wiped and no test was weakened; only this session's own
+  generated test binaries and shell-output files were removed to continue.
+- AI-team review of the assistant/discovery part of the diff (decision 9) is
+  owed and was **not** fabricated. No tool schema changed.
+- Manual QA: run `GOV-17-AC1` to `GOV-17-AC9` on the feature page. Owner Rizky,
+  ticket `GOV-17` (`reczz28adVS3doOQ`); Lark was not edited by the developer.
+- No frontend change was needed; the chooser already shows an honest empty
+  state and never auto-opens Main. No TypeScript, Python or compose check run
+  (no files in those languages touched).
+- Baseline red: workspace clippy `large_futures` at `routes/ai/mod.rs:322,1607`
+  (untouched); the flaky prompt-hash test noted above. Both must be named in
+  review, not silently fixed in this slice.
 
 ## Review
 
