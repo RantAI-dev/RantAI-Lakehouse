@@ -199,8 +199,58 @@ open a PR as part of this audit request.
 - Consistent error timing, disabled-button explanations and first-error focus
   across all forms; this is larger than required-label consistency.
 
+## Task 3 — Adapter field matrix (worker-documented, 2026-11-17)
+
+Built by reading all nine dial forms under `src/features/connectors/dial-forms/`
+against the server structs/validation in
+`rust/crates/lakehouse-store/src/ingest_spec.rs`. "Supplied" means the user
+must type a value; "Defaulted" means an option in a closed set already has a
+valid value; "Optional" means blank is accepted (often mapped to `null`);
+"Conditional" means required only under a selected auth/TLS/mode. This matrix
+is the basis for the Task 4 markers and adds **no** new blank-value rejection:
+native `required`/`aria-required` and stars expose what the form/server already
+treats as necessary, they do not strengthen validation.
+
+| Form | Supplied | Defaulted | Optional | Conditional / group |
+| --- | --- | --- | --- | --- |
+| `sql-dial-form` | Host, Port, Database, User | Driver (from connector type; asked only on mismatch) | SSL mode; SSL server cert DN | Oracle TLS DN required when SSL mode is set and not `disable` (`ingest_spec.rs:921-934`) |
+| `cdc-dial-form` | Host, Port, Database, User, Replication slot name, Publication name | Driver (as above) | Server id | Slot/publication are non-`Option` server fields (`ingest_spec.rs:112,114`) |
+| `oracle-dial-form` | Host, Port, Database (service name), User | Port 1521, driver fixed `oracle`, batch-only note | SSL mode | TLS server certificate DN required when SSL mode is set and not `disable` |
+| `files-dial-form` | Bucket / root | Protocol (read-only S3), Format (`csv`) | Prefix, Region | Endpoint blank accepted but "needed to test the connection" — conditional for the Test action, not a save requirement |
+| `rest-dial-form` | Base URL; per-endpoint Path (each row) | Auth type (`api_key`), Pagination (`none`) | Records path (per endpoint) | API-key Header name when `api_key`; Token URL when `oauth2_client_credentials`; bearer/basic carry no field; Page query parameter when `page`; Cursor field when `cursor` |
+| `sheets-dial-form` | Spreadsheet id; at least one Range | — | — | Repeated ranges: the group needs one value; additional ranges are optional until added |
+| `mongo-dial-form` | Seed host(s) (each), Database, Username | Direct connection fixed `true` | — | Repeated hosts: the group needs one value |
+| `kafka-dial-form` | Bootstrap server(s) (each), Topic, Consumer group id | Micro-batch cap 30, Auth type (`sasl_plain`) | — | SASL username when `sasl_plain`; `none` auth renders no credential field |
+| `sftp-dial-form` | Host, Port, User, Remote path, Host key fingerprint | Port 22, File format (`csv`), Auth type (`password`) | — | Fingerprint required unconditionally with no fallback (`ingest_spec.rs:392`); already native `required` in the form; public-key private key is the connector secretRef, not a dial field |
+
+**Disagreements / limits recorded, not silently resolved:**
+
+- Serde shape vs. meaningful value: a non-`Option` `String` (host, database,
+  user, bucket, topic, group id, per-row paths) is structurally required, but
+  the store does not reject every empty string for every field. The matrix
+  marks these "supplied" for the *indicator* because the form has no fallback
+  and the value is a mandatory part of the dial shape; no new nonblank check is
+  added. `validate_hostname`, the CDC pair, SFTP fingerprint and Oracle TLS DN
+  are the explicit enforced nonblank rules.
+- `files` Endpoint is conditional on the **Test connection** action, not on
+  saving the ingest spec (AWS S3 needs no endpoint). Marker follows the test
+  requirement with an explanatory note, not a blanket star.
+- Repeated ranges/hosts/servers/endpoints: the group requires at least one
+  populated value, but a newly added blank row is not itself "required" beyond
+  that; markers apply to the first/required row via a group rule, not to every
+  row as an independent mandatory field.
+- This remains a static source audit; no browser rendering was checked here.
+
 ## Review / Handoff
 
 Planner reconciled both read-only worker audits against shared components and
 selected guards/server constraints. No code changes, tests, browser checks or
 implementation handoff yet. Existing untracked user files were left untouched.
+
+### Worker handoff (UX-1 implementation)
+
+- Task 1 commit `13e7fd589` (amended to use CSS-rendered star) — shared
+  `RequiredMarker`, `Label`/`FieldLabel` `required` prop, `RequiredLegend`.
+- Task 2 commit `85a4f8686` — auth, admin, governance, employees.
+- Task 3 — this matrix (documentation only).
+- Tasks 4-6 — pending; the worker appends verification here as each slice lands.
