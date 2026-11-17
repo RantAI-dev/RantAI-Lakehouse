@@ -479,7 +479,7 @@ The single failure is the documented order-dependent flake
 `cargo test -p lakehouse-api --test it ai_sql_help::a_chat_with_no_allowlist...`
 = **1 passed, 0 failed**. It is a prompt-hash assertion, not a GOV-17 path.
 
-### Baseline evidence (reproducible, not assumed)
+### Developer baseline claim (superseded by independent review R9)
 
 - `rust/crates/lakehouse-api/src/routes/ai/mod.rs` producing both `large_futures`
   errors is byte-identical to BOTH `origin/main` and the reviewed base
@@ -508,8 +508,93 @@ The single failure is the documented order-dependent flake
   ticket `GOV-17`). No Lark edits by the developer.
 - **Independent artefacts** GOV-18/19/20 remain Todo with repo rows (filed by
   root in the base, preserved through the merge); not implemented here.
-- Baseline red lint and flaky prompt-hash test above must be named in review;
-  neither was introduced by this branch.
+- Independent review below supersedes the lint-baseline claim. A passing
+  isolated prompt-hash test alone does not establish that the full-suite
+  failure is pre-existing; its baseline attribution still needs evidence.
 - No TypeScript/Python/compose source was changed by this review repair, so no
   TS/Python/compose checks were run (the merge's TS files are main's own,
   already green on main).
+
+
+## Independent review — Codex, 2026-11-17 (repair head 80ab97527)
+
+R1–R4 repair paths were inspected against their original findings. Further
+small corrections made during review are recorded separately below; the
+developer's handoff is historical evidence, not an independent pass.
+
+- **BLOCKER R6 — SQL dependencies outside table factors.** A `dictGet` or
+  `joinGet` may read an ungranted object even when every FROM/JOIN table is
+  allowed. The resolver now reuses `sql_rewrite::reads_beyond_tables` and
+  hides unresolved dependencies. Regression covers both lookup families and
+  a clock-function allowed control. Verification pending.
+- **BLOCKER R7 — reused SQL source bypass.** The BI-side
+  `ensure_sources_visible` checked only folder access and exempted kept ids;
+  chart create/preview/update could bypass the API source-list predicate.
+  Fresh hidden-source denial now runs before the keep exemption. Regression
+  exercises a kept denied source without network access. Verification pending.
+- **BLOCKER R8 — hidden report existence oracle for non-owners.** HTTP and
+  assistant report ownership errors preceded current-board visibility,
+  distinguishing another person's hidden report from an unknown id. Board
+  visibility now precedes ownership; existing visible-board ownership errors
+  remain. The assistant audience/confirmation lookup now uses that same
+  guarded lookup, so an unconfirmed request cannot distinguish a hidden id
+  through a Confirm card. HTTP and assistant regressions include non-owner
+  controls; the assistant also compares hidden and unknown unconfirmed calls.
+  Verification pending.
+- **BLOCKER R9 — lint baseline evidence was insufficient.** An unchanged
+  `run_chat` call site does not prove its future size stayed unchanged: nested
+  callees affect that size. Independent clippy on the original reviewed tree
+  (`0a0ed0dd6`, same Rust as named base) passed. Current workspace clippy
+  reports two 16,560-byte futures. Boxing only the metadata resolver did not
+  reduce the maximum chat future (the scoped lint still failed), so that
+  attempt was removed. The two HTTP/streaming chat boundaries now heap-pin
+  `run_chat`, as clippy recommends, without suppressing the lint. Independent clippy
+  on merged main `42f71a893` also passed (`cargo clippy -p lakehouse-api --lib
+  --all-features -- -D warnings`, exit 0). This establishes the lint regression
+  and supersedes both handoffs' claims of proven baseline errors. Final lint
+  verification of the correction is pending.
+
+AI-team review remains pending under decision 9. Manual owner acceptance is
+not executed by these automated checks. No merge approval is recorded here.
+
+Verification bookkeeping: the first independent workspace test build was
+interrupted (exit 130) after finding the unconfirmed-call variant of R8. It
+is not a test pass or a test failure. Final verification was restarted with
+all R6–R9 changes and `CARGO_BUILD_JOBS=1`, preserving the shared target and
+all caches. No check command or lint threshold was weakened.
+
+The queued test build after the resolver-only attempt was interrupted
+(exit 130) when clippy proved R9 still open. A scoped library lint check now
+precedes the final full gate on the chat-boundary correction. Interrupted
+builds are not counted as test results.
+
+R9 also covers three `items_after_statements` errors in GOV-17's added
+`table_access` tests (at the reviewed tree's lines 667, 701 and 861). These
+were not accepted as baseline: one duplicate request helper was replaced by
+the existing shared helper and two local helpers were moved before setup.
+No test assertion changed. The full lint gate is rerun without any `-A`.
+
+The scoped library check initially loaded incompatible BI metadata from the
+shared target after the baseline comparison (methods existed in source but
+were missing from compiler metadata). Touching the BI crate root forced a
+current-source rebuild without deleting caches. The fresh scoped command
+`cargo clippy -p lakehouse-api --lib --all-features -- -D warnings` then
+passed, exit 0. This is the scoped result used by this review.
+
+### Independent final gate (current code; results updated as completed)
+
+Environment: shared `CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target`,
+`CARGO_INCREMENTAL=0`, `CARGO_BUILD_JOBS=1`; no cache deletion.
+
+- `cargo fmt --check`: exit 0.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+  **exit 0**, no lint allowances. This resolves R9's full-lint requirement;
+  both handoffs' contrary baseline attribution is superseded.
+- `sg docker -c 'cargo test --workspace'`: running; not yet verified.
+- Gitleaks 8.30.1 (same pinned release as CI), working-tree scan:
+  `gitleaks detect --no-git --source . --config .gitleaks.toml --redact`:
+  exit 0, no leaks found. Commit-range scan follows the review-fix commit.
+- `git diff --check`: exit 0.
+
+No TypeScript, Python or compose changes relative to merged main; their
+checks are not run for this Rust/docs slice.

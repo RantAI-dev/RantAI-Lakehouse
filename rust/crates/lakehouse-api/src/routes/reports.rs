@@ -566,14 +566,16 @@ async fn own_or_admin(
         .await
         .map_err(|e| store_failed(&e))?
         .ok_or_else(|| ApiError::NotFound(NO_SUCH_SUBSCRIPTION.to_owned()))?;
-    if sub.owner_id != principal.id.uuid() && !is_admin(principal) {
-        return Err(ApiError::PermissionDenied(NOT_YOURS.to_owned()));
-    }
     // GOV-17 review R4: the by-id metadata and history readers all go through
     // here. An unknown-equivalent 404 keeps a guessed id from confirming that a
     // hidden dashboard has a report.
     if !board_still_visible(state, principal, &sub.board).await? {
         return Err(ApiError::NotFound(NO_SUCH_SUBSCRIPTION.to_owned()));
+    }
+    // GOV-17 review R8: only a visible dashboard may reveal that a report is
+    // owned by someone else. Hidden reports have the unknown-id response.
+    if sub.owner_id != principal.id.uuid() && !is_admin(principal) {
+        return Err(ApiError::PermissionDenied(NOT_YOURS.to_owned()));
     }
     Ok(sub)
 }

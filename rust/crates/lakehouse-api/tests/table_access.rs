@@ -664,26 +664,12 @@ async fn a_hidden_board_and_an_unknown_board_have_the_same_answer() {
     let user = narrowed(&pool, "dashboard:read", &[("serving", OK_MART)]).await;
     let cookie = session_cookie_for_user(&pool, user).await;
 
-    async fn get(router: &axum::Router, cookie: &str, uri: &str) -> (StatusCode, Value) {
-        let resp = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(uri)
-                    .header("cookie", cookie)
-                    .body(Body::empty())
-                    .expect("build request"),
-            )
-            .await
-            .expect("router never fails a request outright");
-        let status = resp.status();
-        let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
-        (status, serde_json::from_slice(&bytes).expect("a JSON body"))
-    }
+    // GOV-17 review R9: reuse the shared request helper instead of declaring
+    // another helper after setup statements.
 
-    let (hidden_status, hidden) = get(&router, &cookie, "/api/dashboard").await;
+    let (hidden_status, hidden) = send_get(&router, &cookie, "/api/dashboard").await;
     let (unknown_status, unknown) =
-        get(&router, &cookie, "/api/dashboard?board=never-existed").await;
+        send_get(&router, &cookie, "/api/dashboard?board=never-existed").await;
     assert_eq!(hidden_status, StatusCode::NOT_FOUND);
     assert_eq!(unknown_status, StatusCode::NOT_FOUND);
     assert_eq!(hidden, unknown, "no oracle for a hidden board's id");
@@ -694,10 +680,7 @@ async fn a_hidden_board_and_an_unknown_board_have_the_same_answer() {
 /// cover every tile (the positive control).
 #[tokio::test]
 async fn the_board_list_omits_main_only_when_its_dependencies_are_denied() {
-    let fake = BoardFake::new();
-    let server = fake.serve().await;
-    let TestApp { router, pool } = app(&server).await;
-
+    // GOV-17 review R9: local items precede setup statements; no lint suppression.
     async fn list(router: &axum::Router, cookie: &str) -> Vec<String> {
         let resp = router
             .clone()
@@ -721,6 +704,10 @@ async fn the_board_list_omits_main_only_when_its_dependencies_are_denied() {
             })
             .unwrap_or_default()
     }
+
+    let fake = BoardFake::new();
+    let server = fake.serve().await;
+    let TestApp { router, pool } = app(&server).await;
 
     let narrowed_user = narrowed(&pool, "dashboard:read", &[("serving", OK_MART)]).await;
     let narrowed_cookie = session_cookie_for_user(&pool, narrowed_user).await;
@@ -851,13 +838,7 @@ impl Respond for SourceFake {
 /// assistant `list_sql_sources`.
 #[tokio::test]
 async fn a_root_sql_source_reading_a_denied_table_is_hidden_from_the_source_list() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(SourceFake)
-        .mount(&server)
-        .await;
-    let TestApp { router, pool } = app(&server).await;
-
+    // GOV-17 review R9: local items precede setup statements; no lint suppression.
     async fn source_ids(router: &axum::Router, cookie: &str) -> Vec<String> {
         let (status, body) = send_get(router, cookie, "/api/dashboard/sources").await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -870,6 +851,13 @@ async fn a_root_sql_source_reading_a_denied_table_is_hidden_from_the_source_list
             })
             .unwrap_or_default()
     }
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(SourceFake)
+        .mount(&server)
+        .await;
+    let TestApp { router, pool } = app(&server).await;
 
     let narrowed_user = narrowed(&pool, "dashboard:read", &[("serving", OK_MART)]).await;
     let cookie = session_cookie_for_user(&pool, narrowed_user).await;

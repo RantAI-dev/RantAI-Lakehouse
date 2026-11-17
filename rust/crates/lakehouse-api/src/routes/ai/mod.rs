@@ -319,7 +319,9 @@ pub async fn chat(
     if stream {
         return stream_chat(state, principal, run);
     }
-    match run_chat(&state, principal.as_ref(), run, None).await {
+    // GOV-17 review R9: table visibility adds state to nested tool futures.
+    // Heap-pin the chat state machine at the HTTP boundary to bound its stack.
+    match Box::pin(run_chat(&state, principal.as_ref(), run, None)).await {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         Err(err) => llm_unavailable(&err),
     }
@@ -1604,7 +1606,9 @@ fn stream_chat(state: AppState, principal: Option<Principal>, run: PreparedChat)
     // request's task, and handed to the spawned one.
     let query_run = crate::query_limits::QueryRun::current_or_detached();
     tokio::spawn(crate::query_limits::scope(query_run, async move {
-        let last = match run_chat(&state, principal.as_ref(), run, Some(&tx)).await {
+        // GOV-17 review R9: the streaming boundary needs the same bounded
+        // chat state machine as the ordinary HTTP path.
+        let last = match Box::pin(run_chat(&state, principal.as_ref(), run, Some(&tx))).await {
             Ok(body) => json!({ "type": "done", "body": body }),
             Err(err) => json!({
                 "type": "error",

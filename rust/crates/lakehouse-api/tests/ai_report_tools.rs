@@ -788,11 +788,52 @@ async fn report_tools_hide_a_report_when_the_owner_loses_table_access() {
 
     narrow(&f.app.pool, me, &[("serving", "other_mart")]).await;
 
+    // GOV-17 review R8: another person's hidden report is unknown too.
+    let outsider =
+        create_assistant_principal(&f.app.pool, "dashboard:read, assistant:use, assistant:ask")
+            .await;
+    let outsider_cookie = session_cookie_for_user(&f.app.pool, outsider).await;
+    let args = json!({ "tool": "update_report_subscription", "args": { "id": id, "paused": true, "confirmed": true }, "mode": "build" });
+    let before_other = post(&f, "/api/ai/tool", &outsider_cookie, args.clone()).await;
+    assert_eq!(
+        before_other["result"]["error"],
+        json!(
+            "Only the person who set this report up can change it from the assistant; an administrator can use the dashboard's Subscriptions."
+        )
+    );
+    narrow(&f.app.pool, outsider, &[("serving", "other_mart")]).await;
+    let hidden_other = post(&f, "/api/ai/tool", &outsider_cookie, args).await;
+    assert_eq!(
+        hidden_other["result"]["error"],
+        json!("That subscription does not exist.")
+    );
+
     let after = tool(&f, "list_report_subscriptions", json!({})).await;
     assert!(
         after["result"]["items"].as_array().unwrap().is_empty(),
         "a hidden board's report is omitted: {after}"
     );
+    // GOV-17 review R8: a hidden id must not yield a Confirm card while an
+    // unknown id is refused before approval, either.
+    let hidden_draft = tool(
+        &f,
+        "update_report_subscription",
+        json!({ "id": id, "paused": true }),
+    )
+    .await;
+    let unknown_draft = tool(
+        &f,
+        "update_report_subscription",
+        json!({ "id": Uuid::new_v4().to_string(), "paused": true }),
+    )
+    .await;
+    assert_eq!(hidden_draft["outcome"], unknown_draft["outcome"]);
+    assert_eq!(hidden_draft["result"], unknown_draft["result"]);
+    assert_eq!(
+        hidden_draft["result"]["error"],
+        json!("That subscription does not exist.")
+    );
+
     let updated = tool(
         &f,
         "update_report_subscription",

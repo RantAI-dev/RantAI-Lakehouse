@@ -355,13 +355,15 @@ async fn own(
         .await
         .map_err(|_| json!({ "error": FAILED }))?
         .ok_or_else(|| json!({ "error": NO_SUCH }))?;
-    if sub.owner_id != owner.id.uuid() && !owner.has("settings:write") {
-        return Err(json!({ "error": NOT_YOURS }));
-    }
     // GOV-17 review R4: ownership of the subscription is not a standing right
     // to its dashboard's configuration. The caller's current table grants must
     // still permit the board; a denied board is the unknown-subscription answer.
     match reports::board_still_visible(state, owner, &sub.board).await {
+        // GOV-17 review R8: do not confirm a hidden report's existence through
+        // the ownership error; preserve that error only for visible boards.
+        Ok(true) if sub.owner_id != owner.id.uuid() && !owner.has("settings:write") => {
+            Err(json!({ "error": NOT_YOURS }))
+        }
         Ok(true) => Ok(sub),
         Ok(false) => Err(json!({ "error": NO_SUCH })),
         Err(_) => Err(json!({ "error": FAILED })),
@@ -543,10 +545,11 @@ pub(in crate::routes) async fn report_audience(
     let (Some(me), Some(pool)) = (requester, state.pg.as_deref()) else {
         return Some(true);
     };
-    let Ok(id) = arg_str(args, "id").parse::<Uuid>() else {
-        return Some(true);
-    };
-    let Ok(Some(sub)) = subscriptions::get(pool, id).await else {
+    // GOV-17 review R8: the confirmation/approval decision must not reveal
+    // that a hidden report exists before the ordinary tool lookup runs.
+    // Treat every denied lookup like an unknown id; approval validation then
+    // returns the same refusal, including when `confirmed` is absent.
+    let Ok(sub) = own(state, me, args).await else {
         return Some(true);
     };
     let Ok(rows) = subscriptions::recipients(pool, sub.id).await else {

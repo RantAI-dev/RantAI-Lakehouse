@@ -303,6 +303,19 @@ async fn a_report_owner_whose_role_was_narrowed_after_creation_cannot_read_its_m
     assert_eq!(unknown_status, StatusCode::NOT_FOUND);
     assert_eq!(after, unknown, "a hidden report is the unknown report");
 
+    // GOV-17 review R8: a non-owner cannot use the ownership error to confirm
+    // that a report exists on a dashboard their table grants hide.
+    let outsider = create_principal_with_permissions(&f.app.pool, "dashboard:read").await;
+    let outsider_cookie = session_cookie_for_user(&f.app.pool, outsider).await;
+    let (visible_status, _) =
+        call(&f, "GET", &format!("{SUBS}/{id}"), &outsider_cookie, None).await;
+    assert_eq!(visible_status, StatusCode::FORBIDDEN);
+    narrow(&f.app.pool, outsider, &[("serving", "other_mart")]).await;
+    let (hidden_status, hidden_body) =
+        call(&f, "GET", &format!("{SUBS}/{id}"), &outsider_cookie, None).await;
+    assert_eq!(hidden_status, StatusCode::NOT_FOUND);
+    assert_eq!(hidden_body, unknown);
+
     // An administrator whose OWN grants are unrestricted keeps legitimate
     // management of the report; the narrowed owner's grants are not borrowed.
     let admin =

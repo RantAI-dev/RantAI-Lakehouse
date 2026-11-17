@@ -4352,6 +4352,15 @@ pub async fn ensure_sources_visible(
     keep: &[String],
 ) -> Result<(), BiError> {
     let named = sql_sources_named(input);
+    // GOV-17 review R7: chart create/preview/update use this BI-side guard,
+    // not the API's source-list predicate. Keeping an existing source may
+    // preserve its folder access, but must never override current table denial.
+    if let Some(id) = named
+        .iter()
+        .find(|id| viewer.hidden_source_ids().contains(id))
+    {
+        return Err(BiError::Validation(format!("SQL source '{id}' not found.")));
+    }
     for id in named.iter().filter(|id| !keep.contains(id)) {
         if let Some(found) = crate::sources::get_source(ch, id).await?
             && !found.folder_id.is_empty()
@@ -5933,6 +5942,26 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    /// GOV-17 review R7: the preserved-source exemption is for folder access,
+    /// never a bypass of the caller's fresh table dependency restriction.
+    #[tokio::test]
+    async fn keeping_a_source_does_not_override_its_table_visibility() {
+        let mut input = empty_chart_input();
+        input.sql_source = Some("s_hidden".to_owned());
+        let viewer = Viewer::user("u", false).with_hidden_sources(vec!["s_hidden".to_owned()]);
+        // Both the old keep exemption and the new denial return before any
+        // network read, so this regression needs no external source server.
+        let ch = ChClient::new(
+            "http://example.invalid".to_owned(),
+            "default".to_owned(),
+            String::new(),
+        );
+        let result = ensure_sources_visible(&ch, &input, &viewer, &["s_hidden".to_owned()]).await;
+        assert!(
+            matches!(result, Err(BiError::Validation(message)) if message == "SQL source 's_hidden' not found.")
+        );
+    }
 
     // BI-9: the builders take the time settings; the tests that predate it
     // call these shims, which pass the default context and no grain.

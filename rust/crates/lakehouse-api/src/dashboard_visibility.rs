@@ -314,7 +314,15 @@ fn source_tables(
 /// Parse a statement with the ONE parser the policy engine uses; `None` is
 /// "cannot prove this reads no governed table", i.e. fail closed.
 fn sql_tables(sql: &str) -> Result<Vec<String>, ()> {
-    crate::sql_rewrite::referenced_tables(sql, &ClickHouseDialect {}).ok_or(())
+    let dialect = ClickHouseDialect {};
+    // GOV-17 review R6: FROM/JOIN tables cannot prove the dependencies of
+    // dictionary/join lookups or IN <table>. Reuse the policy engine's
+    // classifier and hide unresolved metadata rather than treating it as a
+    // data-free source. Clock/random functions alone read no hidden table.
+    if crate::sql_rewrite::reads_beyond_tables(sql, &dialect).outside_from {
+        return Err(());
+    }
+    crate::sql_rewrite::referenced_tables(sql, &dialect).ok_or(())
 }
 
 /// Whether every required table key is readable. A key that does not
@@ -508,6 +516,27 @@ mod tests {
         assert!(source_readable(&narrowed, "SELECT 1 AS n"));
         let all = TableAccess::All;
         assert!(source_readable(&all, "SELECT * FROM serving.denied"));
+    }
+
+    /// GOV-17 review R6: an allowed FROM table must not disguise a lookup
+    /// whose actual dependency is outside the table-factor collector.
+    #[test]
+    fn metadata_hides_unresolved_dictionary_and_join_lookup_dependencies() {
+        let access = listed(&[("serving", "allowed")]);
+        for sql in [
+            "SELECT dictGet('serving.private_dict', 'value', toUInt64(1)) FROM serving.allowed",
+            "SELECT joinGet('serving.private_join', 'value', 1) FROM serving.allowed",
+        ] {
+            assert!(!source_readable(&access, sql), "{sql}");
+            assert!(
+                stored_chart_tables(&chart(sql, "allowed", ChartKind::Bar), &HashMap::new())
+                    .is_err()
+            );
+        }
+        assert!(source_readable(
+            &access,
+            "SELECT now() FROM serving.allowed"
+        ));
     }
 
     #[test]
