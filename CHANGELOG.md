@@ -68,6 +68,7 @@ once a first release is tagged.
 ### Changed
 
 - The sign-in page, the sidebar, the browser tab and the embed footer show the workspace's own name, logo and icon when an administrator has set them (backlog `ADM-2`; feature page `docs/core/features/workspace-name-and-logo.md`).
+- A public link page shows the workspace's own name and logo, with a small "Powered by RantAI Lakehouse" line.
 - Reading the audit trail list needs the `audit:read` permission, which the Governance Admin and Platform Admin roles hold; other roles no longer see the Audit Log page or its list. The other governance pages are unchanged.
 - The pipeline preview answers an engine failure with the fixed sentence for its cause and ` Reference: <id>`, as Query Studio does, and no longer shows the engine's own text (backlog `BLD-1`; `LH-QS-2-08`, owner 2026-11-12 and 2026-11-13). The engine's text goes to the log under that reference.
 - The pipeline page no longer shows Kind and Incremental column (backlog `BLD-1`, decision 18; `BLD-12`). Nothing read them: every run rebuilds the output table. Stored values are kept and sent back unchanged when a pipeline is edited.
