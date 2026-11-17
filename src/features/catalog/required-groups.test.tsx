@@ -126,6 +126,30 @@ describe("catalog group requirements (UX-1-R4)", () => {
     expect(document.querySelector('label[for="rule-max"]')?.getAttribute("data-required")).toBeNull()
   })
 
+  // UX-1-R10: the starred check arguments must carry matching semantics on
+  // the actual column picker / numeric input, in both the picker and typed
+  // fallback. The bounds group stays a group (neither endpoint required).
+  it("requires a check's column and numeric arguments where a star is shown", () => {
+    const { unmount } = render(
+      <CheckFields form={{ ...EMPTY_FORM, kind: "not-null" }} onChange={mock()} columns={["email"]} idPrefix="rq" />
+    )
+    expect(document.querySelector('label[for="rq-column"]')?.getAttribute("data-required")).toBe("")
+    expect(screen.getByRole("combobox", { name: "Column" }).getAttribute("aria-required")).toBe("true")
+    expect(document.querySelector('label[for="rq-percent"]')?.getAttribute("data-required")).toBe("")
+    expect(document.getElementById("rq-percent")?.getAttribute("aria-required")).toBe("true")
+    unmount()
+
+    render(
+      <CheckFields form={{ ...EMPTY_FORM, kind: "not-null" }} onChange={mock()} columns={null} idPrefix="rn" />
+    )
+    // With no known columns the column field falls back to a textbox.
+    expect(screen.getByLabelText("Column").getAttribute("aria-required")).toBe("true")
+    unmount()
+
+    render(<CheckFields form={{ ...EMPTY_FORM, kind: "rows" }} onChange={mock()} columns={null} idPrefix="rr" />)
+    expect(document.getElementById("rr-rows")?.getAttribute("aria-required")).toBe("true")
+  })
+
   it("marks the asset quality rule name required", async () => {
     stubFetch()
     render(

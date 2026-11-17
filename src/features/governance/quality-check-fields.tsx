@@ -46,6 +46,10 @@ const STAT_OPTIONS = [
  * `columns` is the table's column names where the table is known; `null`
  * where it is not (the Data Quality page names the table by hand), and the
  * column is typed instead.
+ *
+ * UX-1-R10: the fields already carry required stars; their controls now carry
+ * matching `aria-required` (UX-1-R10). The bounds fieldset is deliberately a
+ * group — at least one bound, but neither input required on its own.
  */
 export function CheckFields({
   form,
@@ -119,6 +123,7 @@ export function CheckFields({
                  `""`, so without this the trigger is an empty box that says
                  nothing about what to pick. */
               placeholder="Pick a column"
+              aria-required
               value={form.column}
               options={[
                 /* WEB-8 D8: a column the rule already names that this table
@@ -134,6 +139,7 @@ export function CheckFields({
           ) : (
             <Input
               id={id("column")}
+              aria-required
               className="font-mono"
               value={form.column}
               onChange={(e) => onChange({ column: e.target.value })}
@@ -148,6 +154,7 @@ export function CheckFields({
           <Label htmlFor={id("rows")} required>Minimum rows</Label>
           <Input
             id={id("rows")}
+            aria-required
             inputMode="numeric"
             value={form.rows}
             onChange={(e) => onChange({ rows: e.target.value })}
@@ -159,6 +166,7 @@ export function CheckFields({
           <Label htmlFor={id("percent")} required>Rows that must have a value (%)</Label>
           <Input
             id={id("percent")}
+            aria-required
             inputMode="decimal"
             value={form.percent}
             onChange={(e) => onChange({ percent: e.target.value })}

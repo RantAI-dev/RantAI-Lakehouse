@@ -367,3 +367,36 @@ describe("PermissionPicker long identifiers (WEB-13)", () => {
     expect(screen.getByText(`covered by ${wildcard}`)).toBeTruthy()
   })
 })
+
+/**
+ * UX-1-R10: a required permission picker is a named group with a linked
+ * requirement sentence. A group role has no supported aria-required, and no
+ * individual checkbox is required — one token satisfies the whole group.
+ */
+describe("PermissionPicker required group semantics (UX-1-R10)", () => {
+  it("names the group and links the requirement, without marking each checkbox", () => {
+    render(
+      <PermissionPicker
+        id="role-perms"
+        label="Permissions"
+        required
+        value=""
+        onChange={() => {}}
+        permissions={MOCK_PERMISSIONS}
+      />
+    )
+    const group = screen.getByRole("group", { name: "Permissions" })
+    expect(group.getAttribute("aria-describedby")).toBe("role-perms-required-help")
+    expect(screen.getByText("Select at least one permission.")).toBeTruthy()
+    // No false aria-required on the unsupported group role or on a checkbox.
+    expect(group.hasAttribute("aria-required")).toBe(false)
+    const checkbox = screen.getByRole("checkbox", { name: "catalog:read" })
+    expect(checkbox.hasAttribute("aria-required")).toBe(false)
+  })
+
+  it("leaves an optional picker unmarked", () => {
+    render(<PermissionPicker id="opt" value="" onChange={() => {}} permissions={MOCK_PERMISSIONS} />)
+    const group = screen.getByRole("group", { name: "Permissions" })
+    expect(group.hasAttribute("aria-describedby")).toBe(false)
+  })
+})

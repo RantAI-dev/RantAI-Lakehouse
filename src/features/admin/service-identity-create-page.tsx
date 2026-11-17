@@ -74,12 +74,13 @@ export function ServiceIdentityCreatePage() {
     >
       <RequiredLegend />
       <div className="space-y-1.5">
+        {/* UX-1-R10: star and semantics must agree on every marked input. */}
         <Label htmlFor="si-name" required>Name</Label>
-        <Input id="si-name" value={name} onChange={(e) => setName(e.target.value)} />
+        <Input id="si-name" aria-required value={name} onChange={(e) => setName(e.target.value)} />
       </div>
       <div className="space-y-1.5">
         <Label htmlFor="si-scopes" required>Scopes</Label>
-        <PermissionPicker id="si-scopes" value={scopes} onChange={setScopes} />
+        <PermissionPicker id="si-scopes" label="Scopes" required value={scopes} onChange={setScopes} />
         <p className="text-xs text-muted-foreground">
           <code>iceberg:read</code> lets an outside tool read published Gold tables at{" "}
           <code data-testid="outside-reader-address">{consoleOrigin}/api/iceberg</code>. Use Rotate
@@ -90,6 +91,7 @@ export function ServiceIdentityCreatePage() {
         <Label htmlFor="si-env" required>Environment</Label>
         <Input
           id="si-env"
+          aria-required
           value={environment}
           onChange={(e) => setEnvironment(e.target.value)}
           placeholder="production"

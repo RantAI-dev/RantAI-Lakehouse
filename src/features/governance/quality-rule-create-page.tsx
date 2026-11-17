@@ -105,8 +105,11 @@ export function QualityRuleCreatePage() {
       {typedThreshold ? (
         <div className="space-y-1.5">
           <Label htmlFor="qr-threshold" required>Threshold</Label>
+          {/* UX-1-R10: the star on a custom threshold/dimension must be
+              matched by required semantics on the input. */}
           <Input
             id="qr-threshold"
+            aria-required
             className="font-mono"
             value={threshold}
             onChange={(e) => setThreshold(e.target.value)}
@@ -149,6 +152,7 @@ export function QualityRuleCreatePage() {
         <Label htmlFor="qr-dim" required>Dimension</Label>
         <Input
           id="qr-dim"
+          aria-required
           value={formDimension}
           onChange={(e) => setFormDimension(e.target.value)}
           placeholder={typedThreshold ? "completeness" : KINDS[checkForm.kind].dimension}

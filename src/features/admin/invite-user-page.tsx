@@ -97,31 +97,42 @@ export function InviteUserPage() {
       onCancel={() => router.push(backHref)}
     >
       <RequiredLegend />
-      <p className="text-xs text-muted-foreground">
-        A username or an email is required to identify the new user.
-      </p>
       <div className="space-y-1.5">
         <Label htmlFor="user-name" required>Name</Label>
         <Input id="user-name" aria-required value={name} onChange={(e) => setName(e.target.value)} />
       </div>
-      <div className="space-y-1.5">
-        <Label htmlFor="user-username">Username</Label>
-        <Input
-          id="user-username"
-          value={username}
-          onChange={(e) => setUsername(e.target.value)}
-          placeholder="e.g. jdoe"
-        />
-      </div>
-      <div className="space-y-1.5">
-        <Label htmlFor="user-email">Email (optional)</Label>
-        <Input
-          id="user-email"
-          type="email"
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-          placeholder="jdoe@example.com"
-        />
+      {/* UX-1-R10: the guard needs one of the two, not both and not either
+          one alone. Star the group and link the explanation; neither member
+          carries aria-required, so each stays individually optional. */}
+      <div
+        role="group"
+        aria-labelledby="user-identity-label"
+        aria-describedby="user-identity-help"
+        className="space-y-1.5"
+      >
+        <Label id="user-identity-label" required>Username or email</Label>
+        <p id="user-identity-help" className="text-xs text-muted-foreground">
+          A username or an email is required to identify the new user.
+        </p>
+        <div className="space-y-1.5">
+          <Label htmlFor="user-username">Username</Label>
+          <Input
+            id="user-username"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            placeholder="e.g. jdoe"
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="user-email">Email (optional)</Label>
+          <Input
+            id="user-email"
+            type="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            placeholder="jdoe@example.com"
+          />
+        </div>
       </div>
       <div className="space-y-1.5">
         <Label>Roles</Label>
