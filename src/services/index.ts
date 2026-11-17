@@ -33,6 +33,7 @@ import { chatTermService as chatTermClientService } from "./clients/chat-terms"
 import { chatSessionService as chatSessionClientService } from "./clients/chat-sessions"
 import { semanticService as semanticClientService } from "./clients/semantic"
 import { tagKeysService as tagKeysClientService } from "./clients/tag-keys"
+import { usageService as usageClientService } from "./clients/usage"
 import { httpVersionService } from "./clients/version"
 import * as authClient from "./clients/auth"
 
@@ -254,6 +255,15 @@ export const semanticService = semanticClientService
 // The governed tag keys and their allowed values (`/api/governance/tag-keys`,
 // `DATA-12` part 2). Free tags are not part of this.
 export const tagKeysService = tagKeysClientService
+// The Usage page: the runs of a period summed per day, person, engine or
+// tenant, the same sums as a CSV file, and the rates behind the estimate in
+// money (`/api/usage/*`, `OPS-8` part B). No mock ever existed.
+export const usageService = usageClientService
+/** The usage shapes the Usage feature reads from `@/services`. */
+export type {
+  NewUsageRate, UsageExport, UsageGroup, UsageQuery, UsageRate, UsageRateKind, UsageRates,
+  UsageReport, UsageRow, UsageService,
+} from "./contracts/usage"
 // The server's own health answer (`/api/health` — the API's `/health`,
 // exposed through the console's rewrite), read for the version it runs so
 // the console can say when it and the server are not the same build

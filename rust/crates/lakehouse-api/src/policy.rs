@@ -354,6 +354,15 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/ops/{kind}",                    Policy::RequiresPermission("ops:read")),
     ("POST", "/api/ops/workloads/{id}/cancel",     Policy::RequiresPermission("workload:cancel")),
 
+    // ── Usage (OPS-8 part B): the sums of recorded runs, their CSV file and
+    //    the rates behind the estimate. `usage:read` opens every read;
+    //    entering a rate changes what every estimate says, so it is a
+    //    settings change (`settings:write`), like the reporting settings. ──
+    ("GET",  "/api/usage/queries",                 Policy::RequiresPermission("usage:read")),
+    ("GET",  "/api/usage/queries/export",          Policy::RequiresPermission("usage:read")),
+    ("GET",  "/api/usage/rates",                   Policy::RequiresPermission("usage:read")),
+    ("POST", "/api/usage/rates",                   Policy::RequiresPermission("settings:write")),
+
     // ── Governance: seeded `policy:*` / `lineage:read`. `{kind}` (quality,
     //    classification, audit, residency) has the same fan-out problem as
     //    ops — auth only for that one. ────────────────────────────────────
