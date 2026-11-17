@@ -6,7 +6,7 @@ const DESCRIPTION =
   "One lakehouse with dashboards built in. Bring every source in, keep it in open tables, and ask for answers in plain language.";
 
 export const metadata: Metadata = {
-  title: "RantAI Lakehouse — your data has a home",
+  title: { absolute: "RantAI Lakehouse — your data has a home" },
   description: DESCRIPTION,
   openGraph: {
     title: "RantAI Lakehouse — your data has a home",
