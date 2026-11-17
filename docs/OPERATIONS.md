@@ -1999,6 +1999,8 @@ For security, the console restricts `Issuer URL` to public `https://` endpoints 
 - Set `OIDC_ISSUER` (and endpoints such as `OIDC_AUTHORIZE_URL`, `OIDC_TOKEN_URL`, and `OIDC_JWKS_URL`) in `.env`.
 - Ensure `CONNECTOR_INTERNAL_HOSTS` includes the host name or IP of the internal IdP so the API's SSRF probe permits connections to it.
 
+The staging deployment does exactly this — see "Keycloak on the staging deployment" below.
+
 ### Keycloak
 
 Keycloak is the automated gate's provider: a real OIDC server, not the mock.
@@ -2039,6 +2041,106 @@ docker compose -p sso -f docker-compose.yml \
 docker compose -p sso -f docker-compose.yml \
   -f ops/sso/docker-compose.keycloak.override.yml --profile sso down -v
 ```
+
+#### Keycloak on the staging deployment
+
+The staging deployment signs people in through its **own** Keycloak, started
+by the same deploy that starts the rest of the stack:
+`ops/sso/docker-compose.staging-keycloak.override.yml` (profile `sso`) adds
+the provider, a one-shot database initialiser and a one-shot realm renderer
+next to the base `docker-compose.yml`. It is a second override file on
+purpose: the gate's own override (above) is a CI-only stack that publishes no
+host port and runs `start-dev` with an in-container H2 database, and the two
+contexts want opposite things.
+
+The staging provider differs from the gate's in four ways, and each is a
+decision, not an accident:
+
+| | Gate (`ops/sso/docker-compose.keycloak.override.yml`) | Staging (`ops/sso/docker-compose.staging-keycloak.override.yml`) |
+| --- | --- | --- |
+| Address | `http://keycloak:8080`, in the compose network only | a published host port, so a browser can reach it |
+| Database | in-container H2 (`start-dev`) | its own database on the `postgres` service (`start`) |
+| Realm | `ops/sso/realm.template.json`, `ops/sso/render_realm.py` | `ops/sso/staging-realm.template.json`, `ops/sso/render_staging_realm.py` |
+| Image | `quay.io/keycloak/keycloak:26.8.1` (pinned by digest) | the same image, the same pin |
+
+**Where the address comes from.** It is this deployment's own address, so it
+is not in the repository (`AGENTS.md` rule 12). The `staging` environment
+carries two variables (Settings → Environments → staging → Configuration
+variables):
+
+| Variable | What it is |
+| --- | --- |
+| `SSO_PUBLIC_BASE_URL` | the address the browser reaches the provider on, e.g. `http://<host>:<port>` |
+| `SSO_CONSOLE_URL` | the address of the console the browser comes back to; defaults to `SSO_PUBLIC_BASE_URL` |
+| `SSO_REALM` | the realm's name; defaults to `lakehouse` |
+
+The deploy workflow turns them into the whole connection and writes it into
+`.env`:
+
+| Setting | Value on staging |
+| --- | --- |
+| `OIDC_ISSUER` | `{SSO_PUBLIC_BASE_URL}/realms/{SSO_REALM}` |
+| `OIDC_CLIENT_ID` | `lakehouse` |
+| `OIDC_CLIENT_SECRET` | the `STAGING_OIDC_CLIENT_SECRET` repository secret |
+| `OIDC_AUTHORIZE_URL` / `OIDC_TOKEN_URL` | `{OIDC_ISSUER}/protocol/openid-connect/{auth,token}` |
+| `OIDC_JWKS_URL` | `{OIDC_ISSUER}/protocol/openid-connect/certs` (not `{issuer}/.well-known/jwks.json` — Keycloak publishes its keys here) |
+| `OIDC_REDIRECT_URI` | `{SSO_CONSOLE_URL}/api/auth/oidc/callback` |
+| `OIDC_PROVIDER_NAME` | `keycloak` |
+| `OIDC_GROUPS_CLAIM` | `groups` |
+| `OIDC_ROLE_MAP` | `analysts=Analyst,lakehouse-admins=Platform Admin` |
+| `OIDC_JIT_PROVISIONING` | `true` |
+| `OIDC_TRUST_EMAIL` | `false` |
+
+The credentials — the provider's bootstrap admin password, the confidential
+client's secret and the three test users' passwords — are repository secrets
+named `STAGING_KEYCLOAK_ADMIN_PASSWORD`, `STAGING_OIDC_CLIENT_SECRET` and
+`STAGING_SSO_USER_{A,B,C}_PASSWORD`. The secret the realm imports and the
+secret the API sends are the same value; the realm renderer
+(`ops/sso/render_staging_realm.py`) writes it into the realm file and fails
+closed when it is missing.
+
+**The callback returns to the console, not to the API.** The session cookie
+is set on the origin the browser signed in on, so the callback address is
+the console's own address; the console proxies `/api/*` to the API
+(`next.config.ts`'s rewrites), so the API receives the callback on the same
+origin the person came from. A callback pointing at the API's own address
+would set the cookie on a different origin, and the sign-in would end at a
+logged-out console.
+
+**The login button is a build-time flag.** The console renders "Continue with
+SSO" only when `NEXT_PUBLIC_SSO_ENABLED=true` was baked into the bundle
+(`src/features/auth/login-page.tsx`), so the staging deploy builds the
+frontend with that flag. Without it the backend is ready and the UI shows
+nothing — a build-time split, not a runtime one; "SSO is gated by a
+build-time flag" in `docs/KNOWN-LIMITATIONS.md` says why.
+
+**The realm.** `ops/sso/staging-realm.template.json` holds the realm with
+the client secret, the users' passwords and the callback address left empty;
+the renderer fills them in before the provider starts. The realm has the
+confidential client `lakehouse`, the groups `analysts` and
+`lakehouse-admins`, and three users — one in `analysts`, one in
+`lakehouse-admins`, one in no group (the case that must end with no
+permissions at all). The groups reach the token as bare names because the
+realm's mapper runs with `full.path=false`.
+
+**Verifying it.** Sign in through the console and read `GET /api/auth/me`:
+a user in `analysts` gets the Analyst role's permissions, a user in
+`lakehouse-admins` gets the admin wildcard, and a user in no group gets
+none. The provider's own admin console is at `{SSO_PUBLIC_BASE_URL}/admin`,
+with the bootstrap admin from the repository secret.
+
+**Limits, honestly.** The provider speaks plain HTTP on the office LAN
+(`KC_HTTP_ENABLED`), because the staging deployment has no TLS terminator;
+its issuer is therefore an `http://` address, which is exactly why the
+connection lives in `.env` and not in the console's own SSO form (the form
+refuses an issuer that is not `https://` or that resolves inside the
+deployment's network). The provider's admin console is reachable from the
+LAN. `--import-realm` only fills an **empty** realm, so a realm an
+administrator has changed is not overwritten by a later deploy — but a
+realm that is deleted is re-imported. Changing `SSO_PUBLIC_BASE_URL` breaks
+every sign-in until the provider's own hostname, the issuer and the
+registered callback move together, which is one deploy's work: change the
+variable, redeploy, and the realm is imported into a fresh database.
 
 ### Microsoft Entra ID
 
