@@ -321,3 +321,74 @@ No independent artefact class is claimed accepted by this slice.
 ## Review
 
 Pending independent Codex review and applicable AI-team review.
+
+### Codex review round 1 — 2026-11-17
+
+Reviewed developer head `fb27e7838f8c2c4a5347405865995de38d982bf3` against
+plan/base. **Changes requested; no PR/merge approval.**
+
+1. **BLOCKER R1 — hidden Main chart metadata still leaks.**
+   `dashboard_visibility.rs::hide_board` handles Main by setting only
+   builtin_visible=false; it adds neither default nor the raw empty-board
+   spelling to hidden_boards. `access.rs::chart_owner_clause` consults only
+   hidden_boards, so list_stored_charts still returns Main's stored tiles.
+   `/api/dashboard/specs`, assistant list_charts, search and file export consume
+   that result without get_body's special filter. Apply the built-in denial
+   consistently in SQL clauses and in-memory board predicates, including legacy
+   empty/default spellings. Add list/specs/tool/search/export negative tests for
+   denied Main with an allowed-board control; no denied chart metadata may leave.
+
+2. **BLOCKER R2 — SQL source metadata is not table-gated.**
+   `dashboard_sources.rs:195-241` is unchanged: source_visible returns true for
+   every root-folder source, and list serializes the full SqlSource (SQL and
+   columns). `ai/tools/dashboards.rs::list_sql_sources` uses that same predicate.
+   Narrowing a board does not narrow its sources. This violates plan T2's
+   explicit source-list/detail requirement and cannot be described as inherited
+   protection. Reuse the dependency resolver to hide denied/invalid sources in
+   HTTP and tool list/detail/fields/preview-read metadata paths, preserving
+   folder ACLs and fixed unknown responses. Add direct root-folder SQL-source
+   tests with denied table SQL and a permitted source as positive control.
+
+3. **BLOCKER R3 — permission/admin shortcuts ignore the overlay.**
+   `Scope::require_on_board` (`dashboard_access.rs:346-357`) checks only AccessMap
+   and never its narrowed viewer. require_board_level reads a row as system and
+   calls that method, so guards advertised as common board-level enforcement
+   can admit a table-hidden board. `Viewer::sees_all` remains true for narrowed
+   identity:write callers; `dashboard_organise::Seen::read:320` then copies all
+   system rows as visible. Ensure the common scope check and every all-reader
+   shortcut honour the overlay. Test narrowed identity:write without *:*, and
+   a valid explicit edit/manage grant on a board whose table is denied. The
+   table restriction must win without granting any new ACL capability.
+
+4. **BLOCKER R4 — report by-id metadata is not rechecked.**
+   `reports.rs::own_or_admin:530` checks only subscription ownership/admin. get
+   and deliveries serialize the subscription/history without current board
+   visibility. A report owner whose role was narrowed after subscription creation
+   still reads hidden dashboard configuration by known subscription id. Audit
+   HTTP and assistant report detail/history/recipient/output paths and enforce
+   the same current caller visibility before metadata/attachments. Test before/
+   after grant change and unknown-equivalent denied reads. Preserve documented
+   legitimate administrator/system management behavior only when that effective
+   caller's table rights actually permit the object; do not use the owner's
+   broader grants to expose it to a narrowed caller.
+
+5. **BLOCKER R5 — verification and audit claims are incomplete.**
+   The report says followups GOV-18/19/20 are filed, but plan calls them proposed
+   and none exists in this branch BACKLOG. Root will create actual Lark items;
+   add matching repo backlog entries once their approved definitions are supplied.
+   Correct the per-route matrix: source reads and report details above are not
+   protected merely by resolving a viewer elsewhere. Prove repaired call sites
+   with regressions, not inheritance assertions. Full workspace tests remain
+   unverified under disk pressure; baseline lint/flaky-test claims require
+   reproducible evidence before any merge. Scoped checks do not replace the
+   full mandatory gate. Applicable AI-team review remains owed.
+
+Independent reviewer checks so far: `git diff --check` clean;
+`cargo fmt --check --manifest-path rust/Cargo.toml` exit 0. No other reviewer
+check claimed passing. Disk snapshot: 242 MiB available; full workspace test
+linking is not safe to assume possible. No cache clean or test weakening.
+
+Current origin/main advanced to `cb855d5b9` (includes WEB-13 and staging Keycloak),
+so update the feature branch carefully after fixes and reverify the combined
+code. Do not cherry-pick another feature's product code or resolve whole files
+with ours/theirs.
