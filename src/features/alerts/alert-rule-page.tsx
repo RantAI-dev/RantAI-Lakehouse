@@ -231,12 +231,12 @@ function AlertConditionFields({
       {watching === "metric" ? (
         <div className="grid gap-1.5">
           {/* UX-1-R9: `save()` refuses an empty metric for a metric rule. */}
-          <Label required>Metric</Label>
+          <Label htmlFor="alert-rule-metric" required>Metric</Label>
           <Select
             value={f.metric ?? ""}
             onValueChange={(v) => setF((prev) => ({ ...prev, metric: v ?? "" }))}
           >
-            <SelectTrigger className="w-full" aria-label="Metric" aria-required>
+            <SelectTrigger id="alert-rule-metric" className="w-full" aria-label="Metric" aria-required>
               <SelectValue placeholder={metrics.length ? "pick a metric" : "no metrics yet"} />
             </SelectTrigger>
             <SelectContent>
@@ -254,7 +254,7 @@ function AlertConditionFields({
         <div className="grid gap-1.5">
           {/* UX-1-R9: a column-watch rule needs both a mart and a measure
               (the backend rejects an invalid/blank mart or measure). */}
-          <Label required>Mart (Gold)</Label>
+          <Label htmlFor="alert-rule-mart" required>Mart (Gold)</Label>
           <Select
             value={f.mart ?? ""}
             onValueChange={(v) => {
@@ -263,7 +263,7 @@ function AlertConditionFields({
               void loadFields(mart)
             }}
           >
-            <SelectTrigger className="w-full" aria-required>
+            <SelectTrigger id="alert-rule-mart" className="w-full" aria-required>
               <SelectValue placeholder="pick a mart" />
             </SelectTrigger>
             <SelectContent>
@@ -277,13 +277,13 @@ function AlertConditionFields({
           {martsError ? <p className="mt-1 text-xs text-destructive">{martsError}</p> : null}
         </div>
         <div className="grid gap-1.5">
-          <Label required>Measure</Label>
+          <Label htmlFor="alert-rule-measure" required>Measure</Label>
           <Select
             value={f.measure ?? ""}
             onValueChange={(v) => setF((prev) => ({ ...prev, measure: v ?? "" }))}
             disabled={fields.length === 0}
           >
-            <SelectTrigger className="w-full" aria-required>
+            <SelectTrigger id="alert-rule-measure" className="w-full" aria-required>
               <SelectValue placeholder={measurePlaceholder} />
             </SelectTrigger>
             <SelectContent>
@@ -363,12 +363,12 @@ function DigestConditionFields({ f, setF, boards, boardsError }: DigestCondition
   return (
     <div className="grid gap-1.5">
       {/* UX-1-R9: the backend refuses a digest rule with no board. */}
-      <Label required>Dashboard</Label>
+      <Label htmlFor="alert-rule-dashboard" required>Dashboard</Label>
       <Select
         value={f.board ?? ""}
         onValueChange={(v) => setF((prev) => ({ ...prev, board: v ?? "" }))}
       >
-        <SelectTrigger className="w-full" aria-required>
+        <SelectTrigger id="alert-rule-dashboard" className="w-full" aria-required>
           <SelectValue placeholder="pick a dashboard" />
         </SelectTrigger>
         <SelectContent>
@@ -668,12 +668,12 @@ export function AlertRulePage({ ruleId }: { ruleId?: string }) {
           {formFields.connector ? (
             <div className="grid gap-1.5">
               {/* UX-1-R9: `save()` refuses a connector rule with no connector. */}
-              <Label required>Connector</Label>
+              <Label htmlFor="alert-rule-connector" required>Connector</Label>
               <Select
                 value={f.connector ?? ""}
                 onValueChange={(v) => setF((prev) => ({ ...prev, connector: v ?? "" }))}
               >
-                <SelectTrigger aria-required>
+                <SelectTrigger id="alert-rule-connector" aria-required>
                   <SelectValue placeholder="pick a connector">
                     {f.connector === "*"
                       ? "All connectors"
