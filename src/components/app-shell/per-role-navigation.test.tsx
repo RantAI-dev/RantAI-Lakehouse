@@ -70,6 +70,11 @@ beforeEach(() => {
 afterEach(() => {
   cleanup()
   global.fetch = originalFetch
+  // OPS-33: `bun test` runs every file in one process, so the spies this file
+  // puts on the shared `notificationsService` outlive it. A file the runner
+  // loads later then calls the spy instead of the service, so put the service
+  // back before this file is done.
+  mock.restore()
 })
 
 import { TooltipProvider } from "@/components/ui/tooltip"
