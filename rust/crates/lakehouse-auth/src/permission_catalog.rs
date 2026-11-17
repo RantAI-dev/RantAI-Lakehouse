@@ -224,6 +224,11 @@ pub const PERMISSIONS: &[PermissionInfo] = &[
         description: "System status (/api/ops/{kind}, /api/ops/logs's floor).",
     },
     PermissionInfo {
+        name: "usage:read",
+        area: "Operations",
+        description: "The Usage page: queries, scanned bytes and engine time per day, person and engine, and the rates behind its estimate (GET /api/usage/*).",
+    },
+    PermissionInfo {
         name: "alert:read",
         area: "Operations",
         description: "The Alerts list (GET /api/alerts and its other GETs).",
@@ -343,6 +348,17 @@ mod tests {
                 p.name
             );
         }
+    }
+
+    /// `OPS-8`: `usage:read` is offered by the role picker, under Operations
+    /// next to `ops:read`, so an administrator can give it to a custom role.
+    #[test]
+    fn usage_read_is_listed_under_operations() {
+        let entry = PERMISSIONS
+            .iter()
+            .find(|p| p.name == "usage:read")
+            .expect("usage:read must be in the catalog");
+        assert_eq!(entry.area, "Operations");
     }
 
     /// `WEB-8` D1: the four strings seeded into built-in roles but never
