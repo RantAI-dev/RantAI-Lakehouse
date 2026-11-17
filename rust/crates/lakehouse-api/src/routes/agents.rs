@@ -857,7 +857,10 @@ pub async fn decide_approval(
         approval.resource.as_deref(),
         &json!({}),
         if ok { "executed" } else { "failed" },
-        None,
+        // The browser's copy of the failure, the fixed sentence and the
+        // reference (plan 111): the row says why the call failed, and the
+        // engine's own text stays out of the audit trail.
+        shown.get("error").and_then(Value::as_str),
         Some(&run_id),
         Some(&id),
     )
@@ -1702,7 +1705,11 @@ async fn run_headless_loop_inner(
                 resource_id.as_deref(),
                 &Value::Object(args.clone()),
                 if ok { "executed" } else { "failed" },
-                None,
+                // The browser's copy of the failure, the fixed sentence and
+                // the reference (plan 111): the row says why the call
+                // failed, and the engine's own text stays out of the audit
+                // trail.
+                shown.get("error").and_then(Value::as_str),
                 run_id,
                 None,
             )
