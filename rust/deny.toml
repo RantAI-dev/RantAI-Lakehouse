@@ -175,25 +175,26 @@ targets = []
 #   humantime <- object_store <- lakehouse-api, lakehouse-iceberg
 #   chrono <- arrow-arith, arrow-array, arrow-cast, iceberg,
 #     iceberg-catalog-rest, parquet, serde_with
-#   chrono <- object_store (its own `chrono` dependency, for `chrono/serde`)
+#   chrono <- object_store (its own `chrono` dependency, with the `clock` feature)
 #   chrono <- croner (its default datetime backend), tiberius (its `chrono` feature)
 #   chrono <- lakehouse-api directly (the cron round trip in `next_run`, the RFC
-#     3339 stamps in `connector_listing`, `routes/support` and `routes/settings`,
-#     and the `result_cache` clock)
+#     3339 stamps in `connector_listing` and `routes/support`, the report date in
+#     `routes/settings`, and the `result_cache` clock)
 #
 # crates.io offers no newer release of either crate: `cargo update -p chrono
 # --dry-run` and `cargo update -p humantime --dry-run` lock 0 packages, and
 # the advisory lists no patched version. The advisory names `jiff` and `time`
 # as alternatives, but dropping `chrono` means dropping `arrow` (hence
-# `iceberg` and `parquet`), `object_store`, `croner` and `tiberius`' `chrono`
-# feature with it, so there is no smaller fix here.
+# `iceberg` and `parquet`), `iceberg-catalog-rest`, `object_store`, `croner`
+# and `tiberius`' `chrono` feature with it, so there is no smaller fix here.
 #
 # Remove these two entries when `chrono` or `humantime` gets a maintained
 # release, or when the dependency paths that bring them in are gone:
-# `arrow` (hence `iceberg` and `parquet`), `croner`, `tiberius` and
-# `object_store` (through `lakehouse-iceberg`). Then replace the four
-# qualified `chrono::` call sites and the two `use chrono::` imports in
-# `lakehouse-api`, and update the lockfile.
+# `arrow` (hence `iceberg` and `parquet`), `iceberg-catalog-rest`, `croner`,
+# `tiberius` and `object_store` (taken directly by `lakehouse-api` and by
+# `lakehouse-iceberg`). Then replace the four qualified `chrono::` call sites
+# and the two `use chrono::` imports in `lakehouse-api`, and update the
+# lockfile.
 ignore = [
     "RUSTSEC-2023-0071",
     "RUSTSEC-2024-0436",
