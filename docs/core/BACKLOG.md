@@ -393,6 +393,9 @@ estimate (S, M, L), which the base has no field for.
 | `REL-27` | Task | A flaky Rust test: `lakehouse-api::upload_routes two_tenants_asking_for_one_new_name_at_the_same_moment_one_launches` (`left: 1, right: 2`, #486 run 43333004203). By reading, the second request can arrive after the first claimed the name and is refused before the registry lookup the test counts; the 500 ms stand-in delay does not make them simultaneous | Delivery | P3 | Todo |  | `OPS-22` plan, section 4 |
 | `GOV-16` | Task | Quality reads still not narrowed by role (after `GOV-15`): the incident list, the schedule list, a rule's run history, the learning state, the assistant's `get_quality`, and the classification kind of the governance list. Narrow each by the table access `GOV-15` uses, with the same answers for not there and not yours | Governance | P2 | Todo |  | #515 review, round 1 |
 | `GOV-17` | Task | A dashboard with any unreadable table dependency is hidden as a whole, including discovery, direct readers, assistant context and delivery paths; replaces mixed-tile rendering (owner 2026-11-17) | Governance | P1 | In Progress |  | `superpowers/plans/2026-11-17-gov-17-dashboard-table-visibility.md`; `GOV-7` |
+| `GOV-18` | Task | Hide saved-query and pipeline metadata whose table dependencies are unreadable | Governance | P1 | Todo |  | `GOV-17` audit; `superpowers/plans/2026-11-17-gov-17-dashboard-table-visibility.md` |
+| `GOV-19` | Task | Hidden chart alerts must not distinguish lost access from missing objects | Governance | P2 | Todo |  | `GOV-17` audit; `superpowers/plans/2026-11-17-gov-17-dashboard-table-visibility.md` |
+| `GOV-20` | Task | Folder delete refusal must not reveal counts of invisible dashboards | Governance | P2 | Todo |  | `GOV-17` audit; `superpowers/plans/2026-11-17-gov-17-dashboard-table-visibility.md` |
 
 ## Later (P3)
 

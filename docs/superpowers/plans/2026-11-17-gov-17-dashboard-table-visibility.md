@@ -286,17 +286,17 @@ call sites below were checked explicitly.
 - Saved queries (`saved_queries.rs`) and authored pipelines (`authored_pipelines.rs`)
   keep their own SQL and folder rules. They do not list a dashboard's charts,
   but their SQL can name a table a caller may not read and their usage lists
-  can name a dashboard. Proposed followup ticket: **GOV-18** — apply the same
+  can name a dashboard. Filed followup ticket: **GOV-18** — apply the same
   dependency resolver to saved-query and pipeline metadata and their "used by"
   lists; owner sign-off needed before changing their authoring semantics.
 - Alerts (`chart_alerts.rs`, `alerts.rs`) read a chart by id and distinguish
   "lost access" from "gone" using a system-viewer lookup. The response names
   no chart title or table, but the two outcomes are still distinguishable.
-  Proposed followup ticket: **GOV-19** — give the two outcomes one fixed
+  Filed followup ticket: **GOV-19** — give the two outcomes one fixed
   sentence and decide the alert-history contract with the product owner.
 - Folder delete-conflict counts deliberately count boards the caller cannot
   see so a delete cannot orphan them. The response reveals a count but no id
-  or title. Proposed followup ticket: **GOV-20** — replace the count with a
+  or title. Filed followup ticket: **GOV-20** — replace the count with a
   count-free generic refusal; needs an owner decision on the delete contract.
 
 No independent artefact class is claimed accepted by this slice.
@@ -392,3 +392,12 @@ Current origin/main advanced to `cb855d5b9` (includes WEB-13 and staging Keycloa
 so update the feature branch carefully after fixes and reverify the combined
 code. Do not cherry-pick another feature's product code or resolve whole files
 with ours/theirs.
+
+### Review bookkeeping correction — 2026-11-17
+
+Root created actual Lark Bug tasks GOV-18/GOV-19/GOV-20 (Todo) after verifying
+those IDs were unused, and added matching BACKLOG rows. They are assigned to
+the existing auth/governance QA owner for coordination. This corrects the
+handoff's earlier statement that proposed items were already filed; it does
+not claim any follow-up implementation or acceptance. R5's verification/audit
+and AI-review requirements remain open.
