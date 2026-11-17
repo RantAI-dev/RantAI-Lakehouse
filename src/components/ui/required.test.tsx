@@ -6,9 +6,12 @@ import { Label } from "./label"
 import { RequiredMarker } from "./required"
 import { RequiredLegend } from "@/components/patterns/required-legend"
 
-// The star is a CSS ::before on an empty aria-hidden span (UX-1), so it is
-// visible but never enters the label's accessible name. These tests assert
-// that invariant, not the glyph itself (happy-dom does not apply ::before).
+// The star is a CSS ::before on an empty aria-hidden span (UX-1). aria-hidden
+// would already keep a text glyph out of a browser's accessible name; the CSS
+// is chosen because testing-library matches labels on textContent, so a
+// literal `*` would break existing exact getByLabelText queries. These tests
+// assert that textContent/data-required invariant, not the glyph itself
+// (happy-dom does not apply ::before).
 const marker = (container: HTMLElement) => container.querySelector("span[aria-hidden='true'][class*=\"before:content-\"]")
 
 describe("required-field marker (UX-1)", () => {

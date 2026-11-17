@@ -644,6 +644,28 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     expect((screen.getByLabelText("Key columns for public.orders") as HTMLInputElement).value).toBe("id")
     expect(saveButton().disabled).toBe(true)
   })
+
+  // UX-1-R6: aria-required is unsupported on a native fieldset's implicit
+  // group role. The star belongs on a visible legend with linked instructions,
+  // and no individual checkbox should claim to be required.
+  it("uses a visible legend for the key group instead of aria-required on the fieldset", async () => {
+    stubFetch(SPEC, undefined, { discovered: FOUND })
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
+    fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
+    fireEvent.click(await screen.findByLabelText(/public\.orders/))
+    fireEvent.change(await modeOf("public.orders"), { target: { value: "incremental_dedup" } })
+
+    const checkbox = screen.getByLabelText("order_id is part of the key of public.orders")
+    const fieldset = checkbox.closest("fieldset") as HTMLFieldSetElement
+    expect(fieldset).not.toBeNull()
+    expect(fieldset.hasAttribute("aria-required")).toBe(false)
+    const legend = fieldset.querySelector("legend")
+    expect(legend?.textContent).toContain("Key")
+    expect(legend?.querySelector('span[aria-hidden="true"][class*="before:content-"]')).not.toBeNull()
+    const help = document.getElementById(fieldset.getAttribute("aria-describedby") ?? "")
+    expect(help?.textContent).toContain("at least one")
+    expect(checkbox.hasAttribute("aria-required")).toBe(false)
+  })
 })
 
 /**
