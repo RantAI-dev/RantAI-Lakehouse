@@ -664,3 +664,30 @@ Gitleaks 8.30.1 working-tree and pre-documentation commit-range scans both
 passed with no leaks (14 commits scanned in the latter). The final
 documentation commit is scanned again before push. Subsequent changes are
 documentation only; the Rust product tree is unchanged from `3bd28944e`.
+
+## Final branch-protection update — 2026-11-17
+
+The required-status-check policy has `strict: true`: the branch must contain
+current main before merge. After the documentation conflict was resolved,
+main `06c935fa2` was merged as `ef9c245f4` with no conflicts. This brings in
+main's unrelated usage/auth/store changes and migration `0148`; the GOV-17
+fix decisions and feature diff are unchanged. The earlier `3bd28944e` results
+above remain historical evidence, not a claim about this new combined tree.
+
+Independent verification is repeated on product tree `ef9c245f4` with the
+same shared target, `CARGO_INCREMENTAL=0` and one build worker:
+
+```text
+cargo fmt --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+sg docker -c 'cargo test --workspace --no-fail-fast'
+```
+
+`--no-fail-fast` retains every assertion and lets later crates and doctests
+finish even if the known OPS-36 snapshot fails. Results are pending at this
+entry; no new pass is claimed. The completed command/count record and final
+review disposition are maintained on PR #571:
+https://github.com/RantAI-dev/RantAI-Lakehouse/pull/571 . They will be copied
+into this plan with the required post-merge delivery-status update. The PR
+remains draft pending CI and the applicable AI-team review; manual owner
+acceptance remains Not run.
