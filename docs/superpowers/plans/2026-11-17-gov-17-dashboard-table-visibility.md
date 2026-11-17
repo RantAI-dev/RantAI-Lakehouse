@@ -323,7 +323,7 @@ No independent artefact class is claimed accepted by this slice.
 
 ## Review
 
-Pending independent Codex review and applicable AI-team review.
+Independent Codex review is recorded below; applicable AI-team review remains pending.
 
 ### Codex review round 1 — 2026-11-17
 
@@ -526,12 +526,12 @@ developer's handoff is historical evidence, not an independent pass.
   `joinGet` may read an ungranted object even when every FROM/JOIN table is
   allowed. The resolver now reuses `sql_rewrite::reads_beyond_tables` and
   hides unresolved dependencies. Regression covers both lookup families and
-  a clock-function allowed control. Verification pending.
+  a clock-function allowed control. Verified by the final runs recorded below.
 - **BLOCKER R7 — reused SQL source bypass.** The BI-side
   `ensure_sources_visible` checked only folder access and exempted kept ids;
   chart create/preview/update could bypass the API source-list predicate.
   Fresh hidden-source denial now runs before the keep exemption. Regression
-  exercises a kept denied source without network access. Verification pending.
+  exercises a kept denied source without network access. Verified by the final runs recorded below.
 - **BLOCKER R8 — hidden report existence oracle for non-owners.** HTTP and
   assistant report ownership errors preceded current-board visibility,
   distinguishing another person's hidden report from an unknown id. Board
@@ -540,7 +540,7 @@ developer's handoff is historical evidence, not an independent pass.
   guarded lookup, so an unconfirmed request cannot distinguish a hidden id
   through a Confirm card. HTTP and assistant regressions include non-owner
   controls; the assistant also compares hidden and unknown unconfirmed calls.
-  Verification pending.
+  Verified by the final runs recorded below.
 - **BLOCKER R9 — lint baseline evidence was insufficient.** An unchanged
   `run_chat` call site does not prove its future size stayed unchanged: nested
   callees affect that size. Independent clippy on the original reviewed tree
@@ -552,7 +552,7 @@ developer's handoff is historical evidence, not an independent pass.
   on merged main `42f71a893` also passed (`cargo clippy -p lakehouse-api --lib
   --all-features -- -D warnings`, exit 0). This establishes the lint regression
   and supersedes both handoffs' claims of proven baseline errors. Final lint
-  verification of the correction is pending.
+  verification of the correction passed (see final gate).
 
 AI-team review remains pending under decision 9. Manual owner acceptance is
 not executed by these automated checks. No merge approval is recorded here.
@@ -581,7 +581,7 @@ current-source rebuild without deleting caches. The fresh scoped command
 `cargo clippy -p lakehouse-api --lib --all-features -- -D warnings` then
 passed, exit 0. This is the scoped result used by this review.
 
-### Independent final gate (current code; results updated as completed)
+### Independent final gate (final product tree `3bd28944e`)
 
 Environment: shared `CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target`,
 `CARGO_INCREMENTAL=0`, `CARGO_BUILD_JOBS=1`; no cache deletion.
@@ -590,7 +590,10 @@ Environment: shared `CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target`,
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`:
   **exit 0**, no lint allowances. This resolves R9's full-lint requirement;
   both handoffs' contrary baseline attribution is superseded.
-- `sg docker -c 'cargo test --workspace'`: running; not yet verified.
+- `sg docker -c 'cargo test --workspace'`: exit 101; 5,513 passed, 1 failed,
+  26 ignored before Cargo stopped at the API integration binary. API unit
+  tests: 3,707 passed / 0 failed / 18 ignored; API integration: 1,662 passed /
+  1 failed / 5 ignored. The only failure is the prompt snapshot below.
 - Gitleaks 8.30.1 (same pinned release as CI), working-tree scan:
   `gitleaks detect --no-git --source . --config .gitleaks.toml --redact`:
   exit 0, no leaks found. Commit-range scan follows the review-fix commit.
@@ -598,3 +601,66 @@ Environment: shared `CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target`,
 
 No TypeScript, Python or compose changes relative to merged main; their
 checks are not run for this Rust/docs slice.
+
+### Baseline failure established independently
+
+On main `42f71a893` in the planner checkout, after forcing the BI/API crate
+roots to rebuild current baseline sources without deleting caches:
+`sg docker -c 'cargo test -p lakehouse-api --test it ai_'` exited 101:
+**169 passed, 1 failed, 0 ignored, 1,488 filtered out**. The failed test is the
+same `ai_sql_help::a_chat_with_no_allowlist_is_offered_today_s_tools_and_today_s_prompt`
+prompt-hash assertion. This is actual baseline execution, not an inference
+from unchanged call sites. The process-wide data-map cache is a suspected
+source of fixture interference; its complete cause has not been proved.
+
+Tracked as **OPS-36**, Todo/P3, in BACKLOG and Lark task
+`reczz28arp4GbR4V`. No prompt assertion, hash, test or lint was weakened.
+The remaining non-API workspace tests, API parity target, isolated snapshot
+recheck and API doctests are run separately because Cargo stops after the
+first failed integration binary. Final results follow below.
+
+PR: https://github.com/RantAI-dev/RantAI-Lakehouse/pull/571 (draft).
+The source changes under review are committed at `3bd28944e`; subsequent
+review bookkeeping is documentation only. New main `06c935fa2` has unrelated
+work. A three-way merge preview reports only adjacent changelog additions
+as conflicting; the GOV-17 security entry is moved within the same section
+so both entries merge without replacing either side's content.
+
+### Completion of the remaining verification
+
+All commands used the shared target and the environment above, ran in the
+foreground, and tested the product tree committed as `3bd28944e`:
+
+| Command (inside `rust`, through `sg docker -c` for testcontainers) | Result |
+| --- | --- |
+| `cargo test --workspace --exclude lakehouse-api` | exit 0; **2,550 passed, 0 failed, 9 ignored** across 33 result blocks, including doctests |
+| `cargo test -p lakehouse-api --test parity` | exit 0; **0 passed, 2 ignored** (live API/parity-token harness required; not executed) |
+| `cargo test -p lakehouse-api --test it ai_sql_help::a_chat_with_no_allowlist_is_offered_today_s_tools_and_today_s_prompt -- --exact` | exit 0; **1 passed, 0 failed**, 1,667 filtered out |
+| `cargo test -p lakehouse-api --doc` | exit 0; **0 tests** |
+
+Do not add these counts into a unique-test total: the non-API workspace run
+repeats the alerts crate already executed before Cargo stopped. No ignored
+annotation was added; existing opt-in tests remain unverified for their
+recorded external-service/harness requirements. No live parity or manual
+acceptance success is claimed.
+
+The new R6 dependency regression passed in the 3,707-test API unit run.
+R8 HTTP/non-owner and assistant/confirmation regressions passed in the
+1,662-passing API integration run. R7's kept-source regression passed in the
+remaining workspace run. R9 passed the complete, unsuppressed clippy gate.
+
+**Review disposition:** R1–R4 and R6–R9 technical findings are resolved. R5's
+audit and verification record is corrected, with the one independently
+reproduced baseline failure tracked as OPS-36 under AGENTS step 6. The full
+workspace command is **not all green**; its exact exit/counts above are the
+record, not a fabricated pass.
+
+**Still pending:** CI on the final PR head, required AI-team review (decision
+9), and owner manual acceptance `GOV-17-AC1`…`AC9`. The PR stays draft pending
+verification/review; no merge approval or owner acceptance is recorded.
+GOV-18/19/20 remain independent Todo follow-ups, not implemented here.
+
+Gitleaks 8.30.1 working-tree and pre-documentation commit-range scans both
+passed with no leaks (14 commits scanned in the latter). The final
+documentation commit is scanned again before push. Subsequent changes are
+documentation only; the Rust product tree is unchanged from `3bd28944e`.
