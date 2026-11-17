@@ -445,6 +445,17 @@ MODE: ASK (read-only). You can read and analyse anything, but you cannot change 
 /// explained their absence as "not available in this session" or "not wired up
 /// here", which is false (principle 2). `None` when the person may write, and
 /// when nobody is signed in.
+///
+/// The refusal is DESCRIBED, not quoted. The note used to carry the refusal
+/// sentence in English between quotation marks, and on staging (2026-11-14,
+/// the Auditor's `AI-1` retest) a viewer who wrote in Indonesian got that
+/// English sentence word for word first and the Indonesian meaning after it:
+/// a quoted sentence is copied, not translated. The note now names no English
+/// sentence at all: it puts the language of the answer before the content of
+/// the sentence and tells the model to say, in the language of the person's
+/// message, that the account does not have the `dashboard:write` permission,
+/// so it cannot change dashboards, and asks for an editor or an administrator
+/// (the `AI-1-AC3` acceptance check).
 pub(super) fn dashboard_permission_note(
     perms: Option<&lakehouse_auth::PermissionSet>,
 ) -> Option<&'static str> {
@@ -468,11 +479,11 @@ permission, so the tools that create or change charts, tabs and dashboards are w
 from you because of that permission, not because they are unavailable or not set up. \
 When asked to change ",
                 $changes,
-                ", your first sentence, before any analysis or other tool call, is: \"Your account \
-does not have the dashboard:write permission, so it cannot change dashboards; ask an editor or an \
-administrator.\" After that sentence, call \
-no tool for the change you refused; call a reading tool only when the person also asked a \
-question that needs it. ",
+                ", your first sentence, before any analysis or other tool call, tells the person, \
+in the language of the person's message, that the account does not have the dashboard:write \
+permission, so it cannot change dashboards, and asks for an editor or an administrator (write \
+dashboard:write exactly as it is). After that sentence, call no tool for the change you refused; \
+call a reading tool only when the person also asked a question that needs it. ",
                 $metrics,
                 "Reading dashboards and charts still works, and changing this person's own view \
 filters with set_board_view_filters still works, so do not refuse a view-filter request. \
@@ -1855,7 +1866,9 @@ mod tests {
             "{note}"
         );
         assert!(
-            note.contains("Your account does not have the dashboard:write permission"),
+            note.contains(
+                "tells the person, in the language of the person's message, that the account does not have the dashboard:write permission, so it cannot change dashboards"
+            ),
             "{note}"
         );
         assert!(note.contains("not because they are unavailable"), "{note}");
@@ -1876,6 +1889,12 @@ mod tests {
     /// `AI-1` (plan 91, 2026-11-14): the refusal named the fact but not the
     /// permission, so the Auditor read "Your account cannot change dashboards"
     /// as the whole answer to a change request.
+    ///
+    /// The `AI-1-AC3` acceptance check (2026-11-16) changed this clause. The note
+    /// quoted the refusal in English and the model copied that quote word for
+    /// word before translating it, so the note now DESCRIBES the sentence, puts
+    /// the language of the answer before the content of the sentence, and
+    /// names `dashboard:write` as it is.
     #[test]
     fn the_viewer_refusal_names_the_missing_permission() {
         use lakehouse_auth::PermissionSet;
@@ -1887,9 +1906,23 @@ mod tests {
         );
         assert!(
             note.contains(
-                "Your account does not have the dashboard:write permission, so it cannot change dashboards; ask an editor or an administrator."
+                "tells the person, in the language of the person's message, that the account does not have the dashboard:write permission, so it cannot change dashboards, and asks for an editor or an administrator"
             ),
             "{note}"
+        );
+        assert!(
+            note.contains("in the language of the person's message"),
+            "{note}"
+        );
+        assert!(
+            note.contains("write dashboard:write exactly as it is"),
+            "{note}"
+        );
+        // The sentence is described, not quoted: a quoted sentence is copied
+        // word for word, which is what the Auditor read on staging.
+        assert!(
+            !note.contains("\"Your account does not have the dashboard:write permission"),
+            "the note must not quote the English sentence: {note}"
         );
     }
 
@@ -2026,10 +2059,10 @@ mod tests {
         );
         assert!(note.contains("calculated field"), "{note}");
         assert!(note.contains("metric"), "{note}");
-        // The sentence itself is unchanged.
+        // The refusal is described, not quoted (`AI-1-AC3`).
         assert!(
             note.contains(
-                "\"Your account does not have the dashboard:write permission, so it cannot change dashboards; ask an editor or an administrator.\""
+                "tells the person, in the language of the person's message, that the account does not have the dashboard:write permission, so it cannot change dashboards, and asks for an editor or an administrator"
             ),
             "{note}"
         );
@@ -2061,10 +2094,16 @@ mod tests {
 
     /// PR #395 review: a person without `metric:write` cannot change a metric,
     /// a person with it can, and the note must not tell the second one no.
+    ///
+    /// The refusal clause itself changed for the `AI-1-AC3` acceptance check: it is
+    /// described now, not quoted, so the model gives it in the language of the
+    /// person's message.
     #[test]
     fn the_permission_note_names_metrics_as_unchangeable_only_without_metric_write() {
         use lakehouse_auth::PermissionSet;
-        const REFUSAL: &str = "\"Your account does not have the dashboard:write permission, so it cannot change dashboards; ask an editor or an administrator.\"";
+        const REFUSAL: &str = "tells the person, in the language of the person's message, that the \
+account does not have the dashboard:write permission, so it cannot change dashboards, and asks \
+for an editor or an administrator (write dashboard:write exactly as it is)";
         // What the refusal applies to: the text between these two markers.
         let refused = |note: &'static str| -> &'static str {
             let from = note.find("When asked to change ").unwrap_or_default() + 21;

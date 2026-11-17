@@ -3287,6 +3287,10 @@ mod tests {
     /// BI-18 part C review fix (SHOULD-FIX) R30: the chat of a person who cannot
     /// change dashboards says why the tools are withheld, ahead of the language
     /// line; a person who can gets no such sentence.
+    ///
+    /// The `AI-1-AC3` acceptance check changed the wording of the refusal: it is
+    /// described, not quoted in English, so the model says it in the language of
+    /// the person's message.
     #[tokio::test]
     async fn a_chat_without_dashboard_write_says_the_tools_are_withheld_for_permissions() {
         let state = state_with_ask_back("false");
@@ -3310,13 +3314,13 @@ mod tests {
         let viewer = system(analyst(1)).await;
         assert!(
             viewer.contains(
-                "Your account does not have the dashboard:write permission, so it cannot change dashboards; ask an editor or an administrator."
+                "tells the person, in the language of the person's message, that the account does not have the dashboard:write permission, so it cannot change dashboards, and asks for an editor or an administrator"
             ),
             "{viewer}"
         );
         assert!(
             viewer.find(
-                "Your account does not have the dashboard:write permission, so it cannot change dashboards"
+                "tells the person, in the language of the person's message, that the account does not have the dashboard:write permission, so it cannot change dashboards"
             ) < viewer.find(&prompt::closing("Move the map charts to a new tab.", None)),
             "the sentence comes before the language line"
         );
