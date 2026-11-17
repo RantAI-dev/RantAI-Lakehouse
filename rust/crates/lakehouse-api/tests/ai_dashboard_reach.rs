@@ -22,6 +22,7 @@ use common::{
 };
 use lakehouse_store::dashboard_access::{NewRule, replace_item};
 use serde_json::{Value, json};
+use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 use wiremock::matchers::{method, path};
@@ -94,6 +95,24 @@ impl Respond for Store {
                     .map(|(id, folder)| json!({ "id": id, "folder_id": folder, "owner_id": "" }))
                     .collect(),
             );
+        }
+        // GOV-17 review R2: two root-folder SQL sources, one reading an allowed
+        // mart and one a denied mart, for the assistant list_sql_sources test.
+        if sql.contains("FROM console.bi_source FINAL") {
+            return rows(vec![
+                json!({
+                    "id": "s_allowed", "title": "Allowed",
+                    "sql": "SELECT n FROM serving.allowed_mart", "folder_id": "",
+                    "columns_json": "[{\"name\":\"n\",\"type\":\"UInt64\"}]",
+                    "created_by": "u", "updated_at": "2026-01-01 00:00:00"
+                }),
+                json!({
+                    "id": "s_denied", "title": "Denied",
+                    "sql": "SELECT n FROM serving.denied_mart", "folder_id": "",
+                    "columns_json": "[{\"name\":\"n\",\"type\":\"UInt64\"}]",
+                    "created_by": "u", "updated_at": "2026-01-01 00:00:00"
+                }),
+            ]);
         }
         // Folders, a board's embed events and every other read: nothing.
         rows(vec![])
@@ -461,4 +480,92 @@ async fn decide(app: &TestApp, cookie: &str, id: &str) -> (StatusCode, Value) {
         status,
         serde_json::from_slice(&bytes).unwrap_or(Value::Null),
     )
+}
+
+// ── GOV-17 review R2: the assistant's list_sql_sources is table-gated ────
+
+/// Narrow every role of `user` to exactly `grants` (the same shape as the
+/// `table_access` test helper; GOV-7 D4 forbids narrowing a `*:*` role, so none
+/// is minted).
+async fn narrow_roles(pool: &PgPool, user: Uuid, grants: &[(&str, &str)]) {
+    let roles: Vec<Uuid> =
+        sqlx::query_scalar("SELECT role_id FROM app_user_role WHERE user_id = $1")
+            .bind(user)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert!(!roles.is_empty(), "the user must hold a role to narrow");
+    for role in roles {
+        sqlx::query("UPDATE role SET read_scope = 'listed' WHERE id = $1")
+            .bind(role)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM role_read_grant WHERE role_id = $1")
+            .bind(role)
+            .execute(pool)
+            .await
+            .unwrap();
+        for (schema, table) in grants {
+            sqlx::query(
+                "INSERT INTO role_read_grant (role_id, schema_name, table_name) VALUES ($1, $2, $3)",
+            )
+            .bind(role)
+            .bind(schema)
+            .bind(table)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+}
+
+fn listed_source_ids(body: &Value) -> Vec<String> {
+    body["result"]["sources"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r["id"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// GOV-17 review R2: `list_sql_sources` uses the same narrowed viewer and
+/// shared `source_visible` guard as the console. A root-folder source reading
+/// a denied table must be omitted; a permitted source is the positive control.
+#[tokio::test]
+async fn a_narrowed_callers_list_sql_sources_omits_a_source_reading_a_denied_table() {
+    let (app, _ch, _llm) = app().await;
+
+    let narrowed = create_principal_with_permissions(
+        &app.pool,
+        "dashboard:read, assistant:use, assistant:ask",
+    )
+    .await;
+    narrow_roles(&app.pool, narrowed, &[("serving", "allowed_mart")]).await;
+    let cookie = session_cookie_for_user(&app.pool, narrowed).await;
+    let body = call(&app, &cookie, "list_sql_sources", json!({}), "ask").await;
+    let ids = listed_source_ids(&body);
+    assert!(ids.iter().any(|id| id == "s_allowed"), "control: {body}");
+    assert!(
+        !ids.iter().any(|id| id == "s_denied"),
+        "a source reading a denied table must be omitted: {body}"
+    );
+
+    let allowed = create_principal_with_permissions(
+        &app.pool,
+        "dashboard:read, assistant:use, assistant:ask",
+    )
+    .await;
+    narrow_roles(
+        &app.pool,
+        allowed,
+        &[("serving", "allowed_mart"), ("serving", "denied_mart")],
+    )
+    .await;
+    let cookie = session_cookie_for_user(&app.pool, allowed).await;
+    let body = call(&app, &cookie, "list_sql_sources", json!({}), "ask").await;
+    let ids = listed_source_ids(&body);
+    assert!(ids.iter().any(|id| id == "s_denied"), "control: {body}");
 }

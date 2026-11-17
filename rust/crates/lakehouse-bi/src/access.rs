@@ -228,6 +228,11 @@ pub struct Viewer {
     /// narrowed caller with one denied built-in dependency loses the whole
     /// built-in board, not just that tile's values.
     builtin_visible: bool,
+    /// GOV-17 review R2: saved SQL sources whose statement reads a table the
+    /// caller's current grants do not allow (or that cannot be resolved).
+    /// Empty for a caller no role narrowed. This only ever REMOVES sources;
+    /// the source's folder ACL is still decided by the fields above.
+    hidden_sources: Vec<String>,
 }
 
 impl Viewer {
@@ -242,6 +247,7 @@ impl Viewer {
             folders: Scope::Unrestricted,
             hidden_boards: Vec::new(),
             builtin_visible: true,
+            hidden_sources: Vec::new(),
         }
     }
 
@@ -256,6 +262,7 @@ impl Viewer {
             folders: Scope::Unrestricted,
             hidden_boards: Vec::new(),
             builtin_visible: true,
+            hidden_sources: Vec::new(),
         }
     }
 
@@ -272,6 +279,7 @@ impl Viewer {
             folders: Scope::Only(Vec::new()),
             hidden_boards: Vec::new(),
             builtin_visible: true,
+            hidden_sources: Vec::new(),
         }
     }
 
@@ -289,6 +297,7 @@ impl Viewer {
             folders: Scope::Unrestricted,
             hidden_boards: Vec::new(),
             builtin_visible: true,
+            hidden_sources: Vec::new(),
         }
     }
 
@@ -302,6 +311,23 @@ impl Viewer {
         self.hidden_boards = hidden_boards;
         self.builtin_visible = builtin_visible;
         self
+    }
+
+    /// GOV-17 review R2: attach the saved SQL sources whose statement reads an
+    /// unreadable table. Chained after [`Self::narrowed_by_tables`] by the one
+    /// API resolver; this only ever removes sources from what the folder ACL
+    /// already allows.
+    #[must_use]
+    pub fn with_hidden_sources(mut self, hidden_sources: Vec<String>) -> Self {
+        self.hidden_sources = hidden_sources;
+        self
+    }
+
+    /// The saved SQL source ids hidden by table dependency (GOV-17 review R2).
+    /// Empty for a caller no role narrowed.
+    #[must_use]
+    pub fn hidden_source_ids(&self) -> &[String] {
+        &self.hidden_sources
     }
 
     /// The board ids hidden by table dependency (GOV-17). Empty for a caller no

@@ -1493,7 +1493,8 @@ async fn render_board_payload(
     // it still reads as the EFFECTIVE Dashboard Viewer role's table grants, so
     // a board that role cannot read is not assembled here either.
     let viewer = Viewer::anonymous()
-        .narrowed_by_tables(visibility.hidden_boards.clone(), visibility.builtin_visible);
+        .narrowed_by_tables(visibility.hidden_boards.clone(), visibility.builtin_visible)
+        .with_hidden_sources(visibility.hidden_sources.clone());
     let stored = store::list_stored_charts(ch, &viewer).await?;
     let field_catalog = catalog_or_empty(ch).await;
     let stored_for_board = charts_of(&stored, board_id, narrowing.only_chart);

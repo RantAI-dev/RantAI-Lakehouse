@@ -53,6 +53,11 @@ pub(crate) struct TableVisibility {
     pub(crate) hidden_boards: Vec<String>,
     /// Whether the built-in "Main" board's dependencies are all readable.
     pub(crate) builtin_visible: bool,
+    /// GOV-17 review R2: saved SQL source ids whose statement reads a table
+    /// this caller may not read (or that cannot be resolved). Empty for an
+    /// unrestricted caller. A source is a standalone resource too: its SQL and
+    /// columns must not be listable merely because its folder is visible.
+    pub(crate) hidden_sources: Vec<String>,
 }
 
 impl TableVisibility {
@@ -60,6 +65,7 @@ impl TableVisibility {
         Self {
             hidden_boards: Vec::new(),
             builtin_visible: true,
+            hidden_sources: Vec::new(),
         }
     }
 }
@@ -139,6 +145,24 @@ pub(crate) async fn resolve_visibility_for_roles(
         }
     }
 
+    // GOV-17 review R2: a saved SQL source is a governed resource of its own.
+    // A narrowed caller must not list/detail/preview a ROOT-folder source whose
+    // SQL reads a denied table (or whose SQL no longer parses) merely because
+    // its folder is visible. Reuse the same parser and canonical keys as the
+    // chart dependency check; fail closed when a statement cannot be resolved.
+    let mut hidden_sources: Vec<String> = Vec::new();
+    for source in sources.values() {
+        if !source_readable(&access, &source.sql) {
+            hidden_sources.push(source.id.clone());
+        }
+    }
+    hidden_sources.sort();
+    hidden_sources.dedup();
+    if hidden_sources.len() > MAX_SCOPE_IDS {
+        // Fail closed: a truncated deny-list could SHOW a denied source's SQL.
+        return Err(ApiError::Unavailable(TooManyIds::MESSAGE.to_owned()));
+    }
+
     // GOV-17 review R1: when Main is hidden for ANY reason — a denied built-in
     // tile or a denied stored chart filed on it — its STORED tiles must also
     // disappear from `list_stored_charts`, which `/api/dashboard/specs`,
@@ -161,6 +185,7 @@ pub(crate) async fn resolve_visibility_for_roles(
     Ok(TableVisibility {
         hidden_boards: hidden,
         builtin_visible,
+        hidden_sources,
     })
 }
 
@@ -168,13 +193,20 @@ pub(crate) async fn resolve_visibility_for_roles(
 /// one resolver in `dashboard_access` so every HTTP and assistant read that
 /// goes through `viewer_for`/`scope_for_write` is narrowed consistently.
 pub(crate) fn narrow(viewer: Viewer, visibility: &TableVisibility) -> Result<Viewer, ApiError> {
-    if visibility.hidden_boards.is_empty() && visibility.builtin_visible {
+    if visibility.hidden_boards.is_empty()
+        && visibility.builtin_visible
+        && visibility.hidden_sources.is_empty()
+    {
         return Ok(viewer); // the unrestricted fast path is a true no-op
     }
-    if visibility.hidden_boards.len() > MAX_SCOPE_IDS {
+    if visibility.hidden_boards.len() > MAX_SCOPE_IDS
+        || visibility.hidden_sources.len() > MAX_SCOPE_IDS
+    {
         return Err(ApiError::Unavailable(TooManyIds::MESSAGE.to_owned()));
     }
-    Ok(viewer.narrowed_by_tables(visibility.hidden_boards.clone(), visibility.builtin_visible))
+    Ok(viewer
+        .narrowed_by_tables(visibility.hidden_boards.clone(), visibility.builtin_visible)
+        .with_hidden_sources(visibility.hidden_sources.clone()))
 }
 
 /// A chart filed with an empty board id belongs to the built-in "Main" board.
@@ -290,6 +322,14 @@ fn sql_tables(sql: &str) -> Result<Vec<String>, ()> {
 /// caller, exactly as `TableAccess::allows_key` does.
 fn tables_allowed(access: &TableAccess, keys: &[String]) -> bool {
     keys.iter().all(|key| access.allows_key(key))
+}
+
+/// GOV-17 review R2: whether a saved SQL source's statement reads only tables
+/// the caller may read. Reuses the one parser and canonical keys as the chart
+/// check; unparseable SQL is unresolvable and therefore hidden (fail closed).
+/// A genuinely data-free statement reads no governed table and stays visible.
+fn source_readable(access: &TableAccess, sql: &str) -> bool {
+    sql_tables(sql).is_ok_and(|keys| tables_allowed(access, &keys))
 }
 
 fn builtin_tables_allowed(access: &TableAccess, sql: &str, mart: &str) -> bool {
@@ -455,6 +495,21 @@ mod tests {
         assert!(keys.iter().any(|k| k == "serving.source_mart"));
     }
 
+    /// GOV-17 review R2: a saved SQL source that reads a denied (or unqualified)
+    /// table is hidden; a source on an allowed table, a data-free source and a
+    /// caller with unrestricted access are not. Unparseable SQL fails closed.
+    #[test]
+    fn a_sql_source_is_hidden_only_when_its_tables_are_unreadable() {
+        let narrowed = listed(&[("serving", "allowed")]);
+        assert!(source_readable(&narrowed, "SELECT * FROM serving.allowed"));
+        assert!(!source_readable(&narrowed, "SELECT * FROM serving.denied"));
+        assert!(!source_readable(&narrowed, "SELECT * FROM unqualified"));
+        assert!(!source_readable(&narrowed, "not SQL ]]"));
+        assert!(source_readable(&narrowed, "SELECT 1 AS n"));
+        let all = TableAccess::All;
+        assert!(source_readable(&all, "SELECT * FROM serving.denied"));
+    }
+
     #[test]
     fn a_text_tile_has_no_dependency_and_cannot_hide_a_board() {
         let keys = stored_chart_tables(&chart("", "", ChartKind::Text), &HashMap::new()).unwrap();
@@ -505,6 +560,7 @@ mod tests {
         let visibility = TableVisibility {
             hidden_boards: vec!["b".to_owned()],
             builtin_visible: false,
+            hidden_sources: Vec::new(),
         };
         let viewer = narrow(Viewer::user("u", true), &visibility).unwrap();
         assert!(!viewer.sees_board("b", ""));

@@ -796,6 +796,102 @@ async fn specs_apply_the_main_dependency_filter_to_the_chart_query() {
     );
 }
 
+// ── GOV-17 review R2: saved SQL sources are table-gated, not just folder-gated
+
+/// A `ClickHouse` stand-in serving two ROOT-folder SQL sources: one reads an
+/// allowed mart, one reads a denied mart. Both have a visible folder, so only
+/// the table dependency can tell them apart.
+#[derive(Clone)]
+struct SourceFake;
+
+impl Respond for SourceFake {
+    fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+        let sql = String::from_utf8_lossy(&request.body).into_owned();
+        if sql.contains("FROM console.bi_source") {
+            return rows(
+                &[
+                    "id",
+                    "title",
+                    "sql",
+                    "columns_json",
+                    "folder_id",
+                    "created_by",
+                    "updated_at",
+                ],
+                &[
+                    json!({
+                        "id": "s_allowed", "title": "Allowed", "sql": format!("SELECT n FROM serving.{OK_MART}"),
+                        "columns_json": "[{\"name\":\"n\",\"type\":\"UInt64\"}]",
+                        "folder_id": "", "created_by": "u", "updated_at": "2026-01-01 00:00:00"
+                    }),
+                    json!({
+                        "id": "s_denied", "title": "Denied", "sql": format!("SELECT n FROM serving.{HIDDEN_MART}"),
+                        "columns_json": "[{\"name\":\"n\",\"type\":\"UInt64\"}]",
+                        "folder_id": "", "created_by": "u", "updated_at": "2026-01-01 00:00:00"
+                    }),
+                ],
+            );
+        }
+        if sql.contains("FROM console.bi_chart") || sql.contains("FROM console.bi_board") {
+            return rows(&[], &[]);
+        }
+        if sql.contains("FROM system.columns") {
+            return rows(&["name", "default_kind", "default_expression"], &[]);
+        }
+        if sql.starts_with("CREATE") || sql.starts_with("ALTER") || sql.starts_with("DROP") {
+            return ResponseTemplate::new(200).set_body_string("Ok.\n");
+        }
+        rows(&[], &[])
+    }
+}
+
+/// GOV-17 review R2: a root-folder source whose SQL reads a denied table is not
+/// listed (its SQL and columns would leak); the permitted source is the positive
+/// control. The same shared `source_visible` guard serves detail/fields and the
+/// assistant `list_sql_sources`.
+#[tokio::test]
+async fn a_root_sql_source_reading_a_denied_table_is_hidden_from_the_source_list() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(SourceFake)
+        .mount(&server)
+        .await;
+    let TestApp { router, pool } = app(&server).await;
+
+    async fn source_ids(router: &axum::Router, cookie: &str) -> Vec<String> {
+        let (status, body) = send_get(router, cookie, "/api/dashboard/sources").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["sources"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|r| r["id"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    let narrowed_user = narrowed(&pool, "dashboard:read", &[("serving", OK_MART)]).await;
+    let cookie = session_cookie_for_user(&pool, narrowed_user).await;
+    let ids = source_ids(&router, &cookie).await;
+    assert!(ids.iter().any(|id| id == "s_allowed"), "control: {ids:?}");
+    assert!(
+        !ids.iter().any(|id| id == "s_denied"),
+        "a source reading a denied table must not be listed: {ids:?}"
+    );
+
+    let allowed_user = narrowed(
+        &pool,
+        "dashboard:read",
+        &[("serving", OK_MART), ("serving", HIDDEN_MART)],
+    )
+    .await;
+    let allowed_cookie = session_cookie_for_user(&pool, allowed_user).await;
+    let ids = source_ids(&router, &allowed_cookie).await;
+    assert!(ids.iter().any(|id| id == "s_allowed"), "control: {ids:?}");
+    assert!(ids.iter().any(|id| id == "s_denied"), "control: {ids:?}");
+}
+
 // ── Combined charts: a question outside the viewer's access ─────────────
 
 /// QA `LH-BI-13-03` (`BI-51`, plan T7): a board with one bar question on
