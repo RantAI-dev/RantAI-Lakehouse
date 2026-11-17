@@ -14,7 +14,6 @@ import { EmptyState } from "@/components/patterns/page-states";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { RequiredMarker } from "@/components/ui/required";
 import { RequiredLegend } from "@/components/patterns/required-legend";
 import { Textarea } from "@/components/ui/textarea";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
@@ -580,7 +579,9 @@ export function ChartBuilder({
     <div className="grid content-start gap-4 px-5 pt-1 pb-5">
       <RequiredLegend />
       <div className="grid gap-1.5">
-        <Label htmlFor="ch-title">Title {isText ? <RequiredMarker /> : null}</Label>
+        {/* UX-1-R3: use Label's shared required prop and associate every
+            kind-dependent control with its visible label by id/htmlFor. */}
+        <Label htmlFor="ch-title" required={isText}>Title</Label>
         <Input
           id="ch-title" aria-required={isText} value={title} onChange={(e) => setTitle(e.target.value)}
           placeholder={suggestedTitle || "e.g. Visitors by Region"}
@@ -616,13 +617,13 @@ export function ChartBuilder({
 
       {isText ? (
         <div className="grid gap-1.5">
-          <Label htmlFor="ch-content">Content (markdown) <RequiredMarker /></Label>
+          <Label htmlFor="ch-content" required>Content (markdown)</Label>
           <Textarea id="ch-content" aria-required rows={8} value={text} onChange={(e) => setText(e.target.value)} placeholder="Title **bold**, - bullets, or | table | GFM |." />
         </div>
       ) : (
         <>
           <div className="grid gap-1.5">
-            <Label htmlFor="ch-source">Data source <RequiredMarker /></Label>
+            <Label htmlFor="ch-source" required>Data source</Label>
             <Select value={source} items={sourceLabels} onValueChange={(v) => onSourceChange(v ?? "")}>
               <SelectTrigger id="ch-source" aria-required className="w-full"><SelectValue placeholder={canWriteSql ? "pick a mart or SQL source, or write SQL" : "pick a mart or SQL source"} /></SelectTrigger>
               <SelectContent>
@@ -695,10 +696,13 @@ export function ChartBuilder({
           {!isSingle ? (
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div className="grid gap-1.5">
-                <Label>{dimensionLabel} {isPoints ? <span className="font-normal text-muted-foreground">(optional, shown in the tooltip)</span> : <RequiredMarker />}</Label>
+                <Label htmlFor="ch-dimension" required={!isPoints}>
+                  {dimensionLabel}
+                  {isPoints ? <span className="font-normal text-muted-foreground">(optional, shown in the tooltip)</span> : null}
+                </Label>
                 {isPoints ? (
                   <Select value={dimension || NO_BREAKDOWN} items={NO_LABEL_ITEMS} onValueChange={(v) => setDimension(v === NO_BREAKDOWN ? "" : v ?? "")} disabled={!fields}>
-                    <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "no label" : noFieldsHint} /></SelectTrigger>
+                    <SelectTrigger id="ch-dimension" className="w-full"><SelectValue placeholder={fields ? "no label" : noFieldsHint} /></SelectTrigger>
                     <SelectContent>
                       <SelectItem value={NO_BREAKDOWN}>— no label —</SelectItem>
                       {fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}
@@ -706,16 +710,19 @@ export function ChartBuilder({
                   </Select>
                 ) : (
                   <Select value={dimension} onValueChange={(v) => setDimension(v ?? "")} disabled={!fields}>
-                    <SelectTrigger aria-required className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
+                    <SelectTrigger id="ch-dimension" aria-required className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
                     <SelectContent>{fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}</SelectContent>
                   </Select>
                 )}
               </div>
               {canBreakdown ? (
                 <div className="grid gap-1.5">
-                  <Label>{breakdownLabel} {needsBreakdown ? <RequiredMarker /> : <span className="font-normal text-muted-foreground">(optional)</span>}</Label>
+                  <Label htmlFor="ch-breakdown" required={needsBreakdown}>
+                    {breakdownLabel}
+                    {needsBreakdown ? null : <span className="font-normal text-muted-foreground">(optional)</span>}
+                  </Label>
                   <Select value={breakdown || NO_BREAKDOWN} items={breakdownLabels} onValueChange={(v) => setBreakdown(v === NO_BREAKDOWN ? "" : v ?? "")} disabled={!fields}>
-                    <SelectTrigger aria-required={needsBreakdown} className="w-full"><SelectValue placeholder={needsBreakdown ? "pick a 2nd column" : "no breakdown"} /></SelectTrigger>
+                    <SelectTrigger id="ch-breakdown" aria-required={needsBreakdown} className="w-full"><SelectValue placeholder={needsBreakdown ? "pick a 2nd column" : "no breakdown"} /></SelectTrigger>
                     <SelectContent>
                       {needsBreakdown ? null : <SelectItem value={NO_BREAKDOWN}>— no breakdown —</SelectItem>}
                       {fields?.dimensions.filter((d) => d !== dimension).map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}
@@ -728,16 +735,16 @@ export function ChartBuilder({
           {isPoints ? (
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div className="grid gap-1.5">
-                <Label>Latitude <RequiredMarker /></Label>
+                <Label htmlFor="ch-lat" required>Latitude</Label>
                 <Select value={lat} onValueChange={(v) => setLat(v ?? "")} disabled={!fields}>
-                  <SelectTrigger aria-required className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
+                  <SelectTrigger id="ch-lat" aria-required className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
                   <SelectContent>{coordinateColumns.filter((c) => c !== lon).map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
                 </Select>
               </div>
               <div className="grid gap-1.5">
-                <Label>Longitude <RequiredMarker /></Label>
+                <Label htmlFor="ch-lon" required>Longitude</Label>
                 <Select value={lon} onValueChange={(v) => setLon(v ?? "")} disabled={!fields}>
-                  <SelectTrigger aria-required className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
+                  <SelectTrigger id="ch-lon" aria-required className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
                   <SelectContent>{coordinateColumns.filter((c) => c !== lat).map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
                 </Select>
               </div>
@@ -749,9 +756,9 @@ export function ChartBuilder({
 
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div className="grid gap-1.5">
-              <Label>{mLabels[0]} <RequiredMarker /></Label>
+              <Label htmlFor="ch-measure" required>{mLabels[0]}</Label>
               <Select value={measure} onValueChange={(v) => setMeasure(v ?? "")} disabled={!fields}>
-                <SelectTrigger aria-required className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
+                <SelectTrigger id="ch-measure" aria-required className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
                 <SelectContent>{fields?.measures.filter((m) => !isPoints || (m !== lat && m !== lon)).map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}</SelectContent>
               </Select>
             </div>
@@ -774,17 +781,17 @@ export function ChartBuilder({
           {needsM2 ? (
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div className="grid gap-1.5">
-                <Label>{mLabels[1] ?? "2nd measure"} <RequiredMarker /></Label>
+                <Label htmlFor="ch-measure2" required>{mLabels[1] ?? "2nd measure"}</Label>
                 <Select value={measure2} onValueChange={(v) => setMeasure2(v ?? "")} disabled={!fields}>
-                  <SelectTrigger aria-required className="w-full"><SelectValue placeholder="pick a column" /></SelectTrigger>
+                  <SelectTrigger id="ch-measure2" aria-required className="w-full"><SelectValue placeholder="pick a column" /></SelectTrigger>
                   <SelectContent>{fields?.measures.filter((m) => m !== measure).map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}</SelectContent>
                 </Select>
               </div>
               {needsM3 ? (
                 <div className="grid gap-1.5">
-                  <Label>{mLabels[2] ?? "3rd measure"} <RequiredMarker /></Label>
+                  <Label htmlFor="ch-measure3" required>{mLabels[2] ?? "3rd measure"}</Label>
                   <Select value={measure3} onValueChange={(v) => setMeasure3(v ?? "")} disabled={!fields}>
-                    <SelectTrigger aria-required className="w-full"><SelectValue placeholder="pick a column" /></SelectTrigger>
+                    <SelectTrigger id="ch-measure3" aria-required className="w-full"><SelectValue placeholder="pick a column" /></SelectTrigger>
                     <SelectContent>{fields?.measures.filter((m) => m !== measure && m !== measure2).map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}</SelectContent>
                   </Select>
                 </div>
