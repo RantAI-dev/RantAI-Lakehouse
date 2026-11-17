@@ -393,31 +393,43 @@ function AddPolicyDialog({
               placeholder="Analyst, Dashboard Viewer"
             />
           </div>
-          <fieldset className="grid gap-1.5">
-            <legend className="mb-1.5 flex items-center gap-1.5 text-sm font-medium">Columns to mask <RequiredMarker /></legend>
-            <div className="flex max-h-40 flex-wrap gap-x-4 gap-y-1 overflow-y-auto">
-              {a.schema.map((c) => (
-                <label key={c.name} className="flex items-center gap-1.5 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={form.mask.includes(c.name)}
-                    onChange={() => toggle(c.name)}
-                  />
-                  <span className="font-mono text-xs">{c.name}</span>
-                </label>
-              ))}
+          {/* UX-1-R4: `policyCondition` accepts a mask OR a row filter, so
+              neither option is unconditionally required. Star the group and
+              say what satisfies it; leave both alternatives optional. */}
+          <fieldset className="grid gap-1.5" aria-describedby="policy-restriction-help">
+            <legend className="mb-1.5 flex flex-wrap items-center gap-1.5 text-sm font-medium">
+              Restriction <RequiredMarker />
+              <span className="text-xs font-normal text-muted-foreground">— mask a column or set a row filter</span>
+            </legend>
+            <p id="policy-restriction-help" className="text-xs text-muted-foreground">
+              At least one is needed: mask a column below or write a row filter. Each on its own is optional.
+            </p>
+            <fieldset className="grid gap-1.5">
+              <legend className="text-sm font-medium">Columns to mask</legend>
+              <div className="flex max-h-40 flex-wrap gap-x-4 gap-y-1 overflow-y-auto">
+                {a.schema.map((c) => (
+                  <label key={c.name} className="flex items-center gap-1.5 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={form.mask.includes(c.name)}
+                      onChange={() => toggle(c.name)}
+                    />
+                    <span className="font-mono text-xs">{c.name}</span>
+                  </label>
+                ))}
+              </div>
+            </fieldset>
+            <div className="grid gap-1.5">
+              <Label htmlFor="policy-filter">Row filter</Label>
+              <Input
+                id="policy-filter"
+                value={form.rowFilter}
+                onChange={(e) => setForm((f) => ({ ...f, rowFilter: e.target.value }))}
+                placeholder="region = 'ID'"
+                className="font-mono"
+              />
             </div>
           </fieldset>
-          <div className="grid gap-1.5">
-            <Label htmlFor="policy-filter">Row filter (optional)</Label>
-            <Input
-              id="policy-filter"
-              value={form.rowFilter}
-              onChange={(e) => setForm((f) => ({ ...f, rowFilter: e.target.value }))}
-              placeholder="region = 'ID'"
-              className="font-mono"
-            />
-          </div>
           <div className="grid gap-1.5">
             <Label htmlFor="policy-name" required>Name</Label>
             <Input id="policy-name" aria-required value={name} onChange={(e) => setName(e.target.value)} />

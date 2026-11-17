@@ -20,6 +20,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { RequiredLegend } from "@/components/patterns/required-legend"
+import { RequiredMarker } from "@/components/ui/required"
 import {
   Table,
   TableBody,
@@ -225,8 +226,17 @@ function AddRuleDialog({
             </div>
           ) : null}
           {form.kind === "range" ? (
-            <div className="grid gap-3 sm:grid-cols-2">
-              <p className="text-xs text-muted-foreground sm:col-span-2">At least one bound is required; leave the other blank for no bound.</p>
+            <fieldset className="grid gap-3 sm:grid-cols-2" aria-describedby="rule-range-help">
+              {/* UX-1-R4: neither bound is required on its own — either one
+                  satisfies the check. Star the group and explain it, rather
+                  than falsely marking both inputs required. */}
+              <legend className="flex flex-wrap items-center gap-1.5 text-sm font-medium sm:col-span-2">
+                Range bounds <RequiredMarker />
+                <span className="text-xs font-normal text-muted-foreground">— at least one</span>
+              </legend>
+              <p id="rule-range-help" className="text-xs text-muted-foreground sm:col-span-2">
+                At least one bound is required; leave the other blank for no bound.
+              </p>
               <div className="grid gap-1.5">
                 <Label htmlFor="rule-min">Minimum</Label>
                 <Input
@@ -247,12 +257,16 @@ function AddRuleDialog({
                   placeholder="no upper bound"
                 />
               </div>
-            </div>
+            </fieldset>
           ) : null}
           <div className="grid gap-3 sm:grid-cols-2">
             <div className="grid gap-1.5">
-              <Label htmlFor="rule-name">Name <span className="font-normal text-muted-foreground">(generated, optional to change)</span></Label>
-              <Input id="rule-name" value={ruleName} onChange={(e) => setName(e.target.value)} />
+              {/* UX-1-R4: a name is pre-filled, but clearing it blocks Save
+                  (the submit guard and the disabled Add-rule button), so the
+                  input is required — not "optional to change" as it read. */}
+              <Label htmlFor="rule-name" required>Name</Label>
+              <Input id="rule-name" aria-required value={ruleName} onChange={(e) => setName(e.target.value)} />
+              <p className="text-xs text-muted-foreground">Pre-filled from the check; it must stay non-empty to save.</p>
             </div>
             <div className="grid gap-1.5">
               <Label htmlFor="rule-severity">Severity if it fails</Label>
