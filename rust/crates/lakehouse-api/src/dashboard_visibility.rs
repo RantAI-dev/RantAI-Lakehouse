@@ -56,7 +56,7 @@ pub(crate) struct TableVisibility {
 }
 
 impl TableVisibility {
-    fn unrestricted() -> Self {
+    pub(crate) fn unrestricted() -> Self {
         Self {
             hidden_boards: Vec::new(),
             builtin_visible: true,
@@ -77,7 +77,22 @@ pub(crate) async fn resolve_visibility(
     state: &AppState,
     principal: &Principal,
 ) -> Result<TableVisibility, ApiError> {
-    let access = table_access::for_roles(state.pg.as_deref(), &principal.role_names)
+    resolve_visibility_for_roles(state, &principal.role_names).await
+}
+
+/// [`resolve_visibility`] for a read whose effective identity is a fixed set of
+/// role names rather than a signed-in principal — a public link or a signed
+/// embed reads as the Dashboard Viewer role (`embed::EMBED_VIEWER_ROLE`). No
+/// new, unrestricted principal is invented here.
+///
+/// # Errors
+///
+/// As [`resolve_visibility`].
+pub(crate) async fn resolve_visibility_for_roles(
+    state: &AppState,
+    roles: &[String],
+) -> Result<TableVisibility, ApiError> {
+    let access = table_access::for_roles(state.pg.as_deref(), roles)
         .await
         .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?;
     // The common, unrestricted case pays no ClickHouse metadata read at all.

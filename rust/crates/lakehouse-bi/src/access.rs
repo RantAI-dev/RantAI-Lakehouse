@@ -357,6 +357,15 @@ impl Viewer {
         self.all || !matches!(self.boards, Scope::Only(_))
     }
 
+    /// Whether the built-in "Main" dashboard itself may be shown: its ACL
+    /// starting point AND every one of its data dependencies readable
+    /// (GOV-17). Reads that list or open Main use this; the `all` aggregate
+    /// keeps its ACL-only check and drops the built-in tiles instead.
+    #[must_use]
+    pub fn sees_builtin_board(&self) -> bool {
+        self.sees_builtin() && self.builtin_visible
+    }
+
     /// Whether the folder `id`, owned by `owner` (`""` = nobody), is visible.
     #[must_use]
     pub fn sees_folder(&self, id: &str, owner: &str) -> bool {

@@ -136,7 +136,7 @@ pub(crate) async fn require_chart_board(
     if board.is_empty() || board == store::DEFAULT_BOARD_ID {
         // The built-in board belongs to the starting point (BI-19 part B1):
         // somebody who sees only what they were given has no chart on it.
-        return if viewer.sees_builtin() {
+        return if viewer.sees_builtin_board() {
             Ok(())
         } else {
             Err(Gate::Missing(BOARD_NOT_FOUND))
@@ -394,7 +394,7 @@ pub async fn versions_list(
     if id == store::DEFAULT_BOARD_ID {
         // Kept apart from the rest: the built-in board has no history, and
         // it belongs to the starting point.
-        return if viewer.sees_builtin() {
+        return if viewer.sees_builtin_board() {
             Ok(ApiJson(json!({ "versions": [], "keep": versions::KEEP })))
         } else {
             Err(Gate::Missing(BOARD_NOT_FOUND).into())

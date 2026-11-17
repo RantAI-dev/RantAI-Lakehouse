@@ -619,6 +619,135 @@ async fn a_dashboard_with_all_dependencies_granted_renders_every_tile() {
     );
 }
 
+/// GOV-17 decision 7: a grant changed on a live session takes effect on the
+/// next request, even though a tile-result cache was warmed with broader
+/// access earlier. The second read is refused BEFORE the cache is consulted
+/// or any data SQL runs.
+#[tokio::test]
+async fn a_grant_change_after_a_warmed_render_hides_the_board_on_the_next_request() {
+    let fake = BoardFake::new();
+    let server = fake.serve().await;
+    let TestApp { router, pool } = app(&server).await;
+    let user = narrowed(
+        &pool,
+        "dashboard:read",
+        &[("serving", OK_MART), ("serving", HIDDEN_MART)],
+    )
+    .await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    let (status, body) = dashboard_as(&router, &cookie).await;
+    assert_eq!(status, StatusCode::OK, "warm the cache first: {body}");
+    let warmed = fake.statements().len();
+
+    // Same session, same cookie; only the role's table grant changed.
+    narrow(&pool, user, &[("serving", OK_MART)]).await;
+    let (status, hidden) = dashboard_as(&router, &cookie).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{hidden}");
+
+    let new_statements = &fake.statements()[warmed..];
+    assert!(
+        new_statements
+            .iter()
+            .all(|sql| !sql.contains("FROM serving.")),
+        "no cached or fresh data read after the grant change: {new_statements:?}"
+    );
+}
+
+/// GOV-17 decision 1: a hidden board and a board that does not exist have the
+/// same fixed not-found answer, so a guessed id cannot tell them apart.
+#[tokio::test]
+async fn a_hidden_board_and_an_unknown_board_have_the_same_answer() {
+    let fake = BoardFake::new();
+    let server = fake.serve().await;
+    let TestApp { router, pool } = app(&server).await;
+    let user = narrowed(&pool, "dashboard:read", &[("serving", OK_MART)]).await;
+    let cookie = session_cookie_for_user(&pool, user).await;
+
+    async fn get(router: &axum::Router, cookie: &str, uri: &str) -> (StatusCode, Value) {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router never fails a request outright");
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+        (status, serde_json::from_slice(&bytes).expect("a JSON body"))
+    }
+
+    let (hidden_status, hidden) = get(&router, &cookie, "/api/dashboard").await;
+    let (unknown_status, unknown) =
+        get(&router, &cookie, "/api/dashboard?board=never-existed").await;
+    assert_eq!(hidden_status, StatusCode::NOT_FOUND);
+    assert_eq!(unknown_status, StatusCode::NOT_FOUND);
+    assert_eq!(hidden, unknown, "no oracle for a hidden board's id");
+}
+
+/// GOV-17: the board chooser omits built-in Main when one of its data
+/// dependencies is unreadable, and still offers it to a caller whose grants
+/// cover every tile (the positive control).
+#[tokio::test]
+async fn the_board_list_omits_main_only_when_its_dependencies_are_denied() {
+    let fake = BoardFake::new();
+    let server = fake.serve().await;
+    let TestApp { router, pool } = app(&server).await;
+
+    async fn list(router: &axum::Router, cookie: &str) -> Vec<String> {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dashboard/boards")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router never fails a request outright");
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+        let body: Value = serde_json::from_slice(&bytes).expect("a JSON body");
+        body["boards"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|r| r["id"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    let narrowed_user = narrowed(&pool, "dashboard:read", &[("serving", OK_MART)]).await;
+    let narrowed_cookie = session_cookie_for_user(&pool, narrowed_user).await;
+    assert!(
+        !list(&router, &narrowed_cookie)
+            .await
+            .iter()
+            .any(|id| id == "default"),
+        "Main is hidden with a denied dependency"
+    );
+
+    let allowed_user = narrowed(
+        &pool,
+        "dashboard:read",
+        &[("serving", OK_MART), ("serving", HIDDEN_MART)],
+    )
+    .await;
+    let allowed_cookie = session_cookie_for_user(&pool, allowed_user).await;
+    assert!(
+        list(&router, &allowed_cookie)
+            .await
+            .iter()
+            .any(|id| id == "default"),
+        "Main is offered when every dependency is granted"
+    );
+}
+
 // ── Combined charts: a question outside the viewer's access ─────────────
 
 /// QA `LH-BI-13-03` (`BI-51`, plan T7): a board with one bar question on
@@ -1019,8 +1148,11 @@ impl Respond for EmbedFake {
 }
 
 /// `GOV-7-AC9` and D5: an embed reads as the fixed `Dashboard Viewer` role, so
-/// narrowing that role narrows every embed — the hidden tile is refused with
-/// the tenant gate's sentence, the other still renders.
+/// narrowing that role narrows every embed. GOV-17 supersedes the older
+/// partial-tile result: since this board depends on a table that role cannot
+/// read, the WHOLE embed is refused with the fixed token-refusal answer. The
+/// old "hidden tile error, other tile renders" expectation is recorded as
+/// superseded, not presented as a new pass.
 #[tokio::test]
 async fn an_embed_follows_the_dashboard_viewer_roles_access() {
     use lakehouse_embed::{EmbedClaims, EmbedResource, sign_embed, unix_now};
@@ -1067,26 +1199,27 @@ async fn an_embed_follows_the_dashboard_viewer_roles_access() {
         )
         .await
         .expect("router never fails a request outright");
-    assert_eq!(resp.status(), StatusCode::OK);
+    // Hidden and unknown tokens have the same fixed answer.
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
     let body: Value = serde_json::from_slice(&bytes).expect("a JSON body");
-
-    assert_eq!(
-        body["results"][HIDDEN_TILE]["error"],
-        format!("Table not found or not available to your organisation: serving.{HIDDEN_MART}"),
-        "{body}"
+    let text = body.to_string();
+    assert!(
+        !text.contains(HIDDEN_MART),
+        "no dependent table name: {text}"
     );
     assert!(
-        body["results"][OK_TILE].get("rows").is_some(),
-        "the allowed tile still renders in the embed: {body}"
+        !text.contains(OK_MART),
+        "no other tile's table name: {text}"
     );
+    assert!(!text.contains("results"), "no tile metadata: {text}");
     assert!(
         fake.log
             .lock()
             .expect("the statement log")
             .iter()
-            .all(|sql| !sql.contains(&format!("FROM serving.{HIDDEN_MART}"))),
-        "the hidden tile never reaches the engine"
+            .all(|sql| !sql.contains("FROM serving.")),
+        "no data SQL is dispatched for a hidden embed"
     );
 }
 

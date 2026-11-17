@@ -72,6 +72,29 @@ fn token_refused() -> Response {
         .into_response()
 }
 
+/// GOV-17: a public link or signed embed reads as the effective Dashboard
+/// Viewer role, never a new unrestricted principal. Its current table grants
+/// decide whether the named board exists at all: a hidden board gets the same
+/// fixed refusal as an unknown token, with no board or table name.
+async fn embed_visibility(
+    state: &AppState,
+    board_id: &str,
+) -> Result<crate::dashboard_visibility::TableVisibility, Response> {
+    let roles = [EMBED_VIEWER_ROLE.to_owned()];
+    let visibility = crate::dashboard_visibility::resolve_visibility_for_roles(state, &roles)
+        .await
+        .map_err(|err| crate::error::ApiRejection(err).into_response())?;
+    let hidden = if board_id == store::DEFAULT_BOARD_ID {
+        !visibility.builtin_visible
+    } else {
+        visibility.hidden_boards.iter().any(|id| id == board_id)
+    };
+    if hidden {
+        return Err(token_refused());
+    }
+    Ok(visibility)
+}
+
 /// Take the column of a hidden filter out of every tile's `filtersSkipped`
 /// (`BI-26` review NOTE): a tile that says which active filters it could not
 /// honour would otherwise name a filter the viewer is not meant to know of.
@@ -443,6 +466,12 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         Ok(f) => f,
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
+    // GOV-17: the embed's effective viewer role must still read every data
+    // dependency of this board; a hidden board is the fixed token refusal.
+    let visibility = match embed_visibility(&state, &board_id).await {
+        Ok(visibility) => visibility,
+        Err(response) => return response,
+    };
     let payload = crate::result_cache::scoped(
         crate::result_cache::CacheScope::new(
             std::sync::Arc::clone(&state.result_cache),
@@ -467,6 +496,7 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
                 editable: &editable,
             },
             &format,
+            &visibility,
         ),
     )
     .await;
@@ -1023,6 +1053,10 @@ pub async fn public_dashboard(
         Ok(f) => f,
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
+    let visibility = match embed_visibility(&state, &board_id).await {
+        Ok(visibility) => visibility,
+        Err(response) => return response,
+    };
     let payload = crate::result_cache::scoped(
         crate::result_cache::CacheScope::new(
             std::sync::Arc::clone(&state.result_cache),
@@ -1039,6 +1073,7 @@ pub async fn public_dashboard(
             (&time, &state.tile_slots),
             Narrowing::default(),
             &format,
+            &visibility,
         ),
     )
     .await;
@@ -1438,12 +1473,17 @@ async fn render_board_payload(
     (time, tile_slots): (&lakehouse_bi::grain::TimeContext, &tokio::sync::Semaphore),
     narrowing: Narrowing<'_>,
     format: &crate::routes::settings::FormatSettings,
+    visibility: &crate::dashboard_visibility::TableVisibility,
 ) -> Result<(Value, Vec<String>), lakehouse_clickhouse::ChError> {
     let roles = [EMBED_VIEWER_ROLE.to_owned()];
     let placeholders = crate::sql_rewrite::PlaceholderValues::none();
     // An embed or a public link is read by nobody in particular: a chart in the
-    // trash or on a personal board is not in it (BI-18 part C, part 2).
-    let stored = store::list_stored_charts(ch, &Viewer::anonymous()).await?;
+    // trash or on a personal board is not in it (BI-18 part C, part 2). GOV-17:
+    // it still reads as the EFFECTIVE Dashboard Viewer role's table grants, so
+    // a board that role cannot read is not assembled here either.
+    let viewer = Viewer::anonymous()
+        .narrowed_by_tables(visibility.hidden_boards.clone(), visibility.builtin_visible);
+    let stored = store::list_stored_charts(ch, &viewer).await?;
     let field_catalog = catalog_or_empty(ch).await;
     let stored_for_board = charts_of(&stored, board_id, narrowing.only_chart);
 
@@ -1828,6 +1868,7 @@ mod typed_filters {
             ),
             Narrowing::default(),
             &crate::routes::settings::FormatSettings::default(),
+            &crate::dashboard_visibility::TableVisibility::unrestricted(),
         )
         .await
         .unwrap();
@@ -1982,6 +2023,7 @@ mod typed_filters {
             ),
             Narrowing::default(),
             &crate::routes::settings::FormatSettings::default(),
+            &crate::dashboard_visibility::TableVisibility::unrestricted(),
         )
         .await
         .unwrap();
@@ -2097,6 +2139,7 @@ mod typed_filters {
             ),
             Narrowing::default(),
             &crate::routes::settings::FormatSettings::default(),
+            &crate::dashboard_visibility::TableVisibility::unrestricted(),
         )
         .await
         .unwrap();
@@ -2204,6 +2247,7 @@ mod typed_filters {
             ),
             Narrowing::default(),
             &crate::routes::settings::FormatSettings::default(),
+            &crate::dashboard_visibility::TableVisibility::unrestricted(),
         )
         .await
         .unwrap();

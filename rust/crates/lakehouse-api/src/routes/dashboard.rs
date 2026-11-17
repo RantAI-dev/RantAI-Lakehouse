@@ -1498,7 +1498,7 @@ pub async fn boards_list(
     // The built-in board has no rule of its own: it belongs to the starting
     // point, so somebody who sees only what they were given does not get it.
     let mut out = Vec::new();
-    if viewer.sees_builtin() {
+    if viewer.sees_builtin_board() {
         out.push(json!({
             "id": store::DEFAULT_BOARD_ID,
             "name": "Main",
@@ -5016,8 +5016,9 @@ pub async fn export(
     out.push_str("# RantAI Lakehouse — dashboard as code\n");
     out.push_str("# boards & chart specs, exported from console.bi_chart\n\n");
     out.push_str("boards:\n");
-    // The built-in board is part of the starting point (BI-19 part B1).
-    if viewer.sees_builtin() {
+    // The built-in board is part of the starting point (BI-19 part B1), and
+    // GOV-17 hides it in full when one of its data dependencies is unreadable.
+    if viewer.sees_builtin_board() {
         out.push_str(&yaml_board(
             store::DEFAULT_BOARD_ID,
             "Main",

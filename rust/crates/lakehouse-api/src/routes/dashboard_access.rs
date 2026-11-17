@@ -330,7 +330,9 @@ impl Scope {
         if let Some(board) = board {
             return self.require_on_board(board, needed);
         }
-        if !self.viewer.sees_builtin() {
+        // GOV-17: a build-in board hidden by an unreadable dependency is a
+        // 404 for a writer too, the same answer as for a reader.
+        if !self.viewer.sees_builtin_board() {
             return Err(ApiError::NotFound(BOARD_NOT_FOUND.to_owned()));
         }
         self.require_root(needed)
