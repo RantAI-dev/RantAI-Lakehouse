@@ -243,6 +243,43 @@ treats as necessary, they do not strengthen validation.
 
 ## Review / Handoff
 
+### Parent review round 1 (2026-11-17, head 2ae89651a)
+
+Not approved. Independent `bun run typecheck && bun run lint` passed;
+lint reports eight warnings, not the single warning mentioned by the worker.
+Full tests will be rerun after the corrections below.
+
+- **BLOCKER UX-1-R1:** `copilot/chat-composer.tsx` replaced the textarea's
+  relative positioning ancestor with a grid while its animated example remains
+  absolutely positioned. Restore a relative wrapper around textarea/overlay
+  below the label/legend, preserving their alignment and existing behavior.
+- **BLOCKER UX-1-R2:** Compact composer and folder rename put required labels
+  inside `sr-only`, hiding the requested visible star. Give both persistent
+  visible required labels and explain the convention in the compact surface.
+- **BLOCKER UX-1-R3:** Chart Builder's required dynamic select labels are still
+  unassociated. Add ids/htmlFor or labelledby for every touched required control
+  (dimension/breakdown/coordinates/measures). Use Label's shared required prop.
+- **BLOCKER UX-1-R4:** Catalog masking columns are an alternative to row filter
+  (`policyCondition` accepts either), not unconditionally required. Show a
+  starred group-level requirement with explanatory text, keeping both
+  alternatives optional individually. Apply the same accurate group pattern to
+  range bounds. Quality-rule name accepts generated initial state but clearing
+  it blocks Save; mark that input required and correct its optional copy.
+- **BLOCKER UX-1-R5:** Repeated Mongo/Kafka rows use `index === 0` required
+  semantics, but store Dial::parse validates every entered row, including blank
+  rows. Mark each rendered host/broker required with an associated visible row
+  label, explaining Remove for unused rows. Inspect Sheets/REST actual runtime
+  handling and use accurate group/row semantics instead of assuming first row.
+- **BLOCKER UX-1-R6:** `aria-required` is unsupported on a native fieldset's
+  implicit group role in ingestion KeyFields. Use a visible legend and linked
+  requirement instructions; do not falsely mark every checkbox required.
+- **SHOULD-FIX UX-1-R7:** Nested connector step/dial/credential components each
+  render a legend. Ensure one explanation per step when composed, while retaining
+  standalone legends where needed. Fix indentation of added aria attributes.
+
+Keep validation semantics unchanged; fixes must cite these finding ids at the
+site and in commit bodies. No implementation is approved by this review yet.
+
 Planner reconciled both read-only worker audits against shared components and
 selected guards/server constraints. No code changes, tests, browser checks or
 implementation handoff yet. Existing untracked user files were left untouched.
