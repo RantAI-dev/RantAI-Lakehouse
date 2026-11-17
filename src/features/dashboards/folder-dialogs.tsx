@@ -124,11 +124,14 @@ export function ManageFoldersDialog({
                 <Folder className="size-4 shrink-0 text-muted-foreground" aria-hidden />
                 {editing?.id === folder.id ? (
                   <>
-                    <Label htmlFor="folder-rename-name" className="sr-only" required>Folder name</Label>
+                    {/* UX-1-R2: a visible associated label so the required
+                        star is seen; sr-only hid it. The dialog's RequiredLegend
+                        above already explains the convention. */}
+                    <Label htmlFor="folder-rename-name" className="shrink-0 text-xs" required>Name</Label>
                     <Input
                       id="folder-rename-name"
                       autoFocus
-                      className="h-7"
+                      className="h-7 min-w-0 flex-1"
                       aria-required
                       value={editing.name}
                       onChange={(e) => setEditing({ id: folder.id, name: e.target.value })}
