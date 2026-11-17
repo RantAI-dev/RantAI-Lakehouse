@@ -236,9 +236,18 @@ export function ColumnsField({
         value={chosen}
         onValueChange={(next) => onChange((next ?? []).join(","))}
       >
+        {/* WEB-13: bound the selected chips and the trigger. The comma list is
+            also the trigger's title, and the option row wraps the full name.
+            WEB-13 review S1: two chips may wrap, so the trigger must grow with
+            its content rather than letting a second row escape its border. */}
         <FacetedTrigger asChild>
-          <Button type="button" variant="outline" size="sm" className="w-full justify-between font-normal" aria-label={label}>
-            <FacetedBadgeList options={options} placeholder="Pick columns" />
+          <Button type="button" variant="outline" size="sm" className="h-auto min-h-7 w-full min-w-0 justify-between py-1 font-normal" aria-label={label} title={value === "" ? undefined : value}>
+            <FacetedBadgeList
+              options={options}
+              placeholder="Pick columns"
+              className="min-w-0 flex-1"
+              badgeClassName="max-w-full [&>span]:min-w-0"
+            />
           </Button>
         </FacetedTrigger>
         <FacetedContent className="w-56">
@@ -248,7 +257,8 @@ export function ColumnsField({
             <FacetedGroup>
               {options.map((option) => (
                 <FacetedItem key={option.value} value={option.value}>
-                  <span>{option.label}</span>
+                  {/* WEB-13: a long column name wraps inside the option row. */}
+                  <span className="min-w-0 break-all leading-snug">{option.label}</span>
                 </FacetedItem>
               ))}
             </FacetedGroup>
