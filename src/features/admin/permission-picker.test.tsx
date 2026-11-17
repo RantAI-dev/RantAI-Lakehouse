@@ -288,3 +288,82 @@ describe("PermissionPicker (WEB-8 T3 / D7)", () => {
     scanDir(srcDir)
   })
 })
+
+// WEB-13: a long, unbroken permission token must stay inside its chip or row.
+// happy-dom computes no geometry, so the wrapping is asserted as structure;
+// the measured narrow/wide fit is a manual-QA item (see the plan).
+describe("PermissionPicker long identifiers (WEB-13)", () => {
+  const LONG_UNKNOWN = "legacy_" + "unknown_permission_token_".repeat(4) + "final"
+  const LONG_RESOURCE = "very_long_resource_name_" + "segment_".repeat(6) + "end"
+  const LONG_PERMISSION = `${LONG_RESOURCE}:read`
+  const description = "A long name still keeps its readable description."
+
+  it("keeps a long unknown token whole and removable with its exact saved value", () => {
+    let saved = `catalog:read, ${LONG_UNKNOWN}`
+    render(
+      <PermissionPicker
+        value={saved}
+        onChange={(v) => {
+          saved = v
+        }}
+        permissions={MOCK_PERMISSIONS}
+      />
+    )
+
+    const chip = screen.getByText(LONG_UNKNOWN)
+    expect(chip.textContent).toBe(LONG_UNKNOWN)
+    expect(chip.className).toContain("break-all")
+    const badge = chip.parentElement
+    expect(badge?.className).toContain("max-w-full")
+    expect(badge?.className).toContain("h-auto")
+    expect(badge?.className).toContain("whitespace-normal")
+    const remove = screen.getByRole("button", { name: `Remove ${LONG_UNKNOWN}` })
+    expect(remove.className).toContain("shrink-0")
+
+    fireEvent.click(remove)
+    expect(saved).toBe("catalog:read")
+  })
+
+  it("keeps a long known permission name whole and selectable, with its description", () => {
+    let saved = ""
+    const permissions: Permission[] = [{ name: LONG_PERMISSION, area: "Data", description }]
+    render(
+      <PermissionPicker
+        value={saved}
+        onChange={(v) => {
+          saved = v
+        }}
+        permissions={permissions}
+      />
+    )
+
+    const labelText = screen.getByText(LONG_PERMISSION)
+    expect(labelText.textContent).toBe(LONG_PERMISSION)
+    expect(labelText.className).toContain("break-all")
+    const label = labelText.parentElement
+    expect(label?.tagName).toBe("LABEL")
+    expect(label?.className).toContain("min-w-0")
+    expect(label?.parentElement?.className).toContain("min-w-0")
+    expect(label?.parentElement?.parentElement?.className).toContain("flex-1")
+    expect(screen.getByText(description)).toBeTruthy()
+    expect(screen.getByRole("checkbox", { name: LONG_PERMISSION }).className).toContain("shrink-0")
+
+    fireEvent.click(label as HTMLElement)
+    expect(saved).toBe(LONG_PERMISSION)
+  })
+
+  it("keeps a long known permission covered by a wildcard checked and disabled", () => {
+    const wildcard = `${LONG_RESOURCE}:*`
+    const saved = wildcard
+    // The wildcard is known because the catalog names its resource; it is not
+    // itself a catalog row, so only the long permission is shown as covered.
+    const permissions: Permission[] = [{ name: LONG_PERMISSION, area: "Data", description }]
+    render(<PermissionPicker value={saved} onChange={() => {}} permissions={permissions} />)
+
+    expect(screen.getByText(LONG_PERMISSION).textContent).toBe(LONG_PERMISSION)
+    const checkbox = screen.getByRole("checkbox", { name: LONG_PERMISSION })
+    expect(checkbox.getAttribute("aria-checked")).toBe("true")
+    expect(checkbox.hasAttribute("disabled")).toBe(true)
+    expect(screen.getByText(`covered by ${wildcard}`)).toBeTruthy()
+  })
+})

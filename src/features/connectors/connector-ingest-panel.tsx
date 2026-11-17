@@ -1151,9 +1151,10 @@ function ColumnChoice({
                 const reason = locked.get(column)
                 return (
                   <li key={column}>
-                    <label className="flex items-center gap-1.5 font-mono text-xs">
+                    <label className="flex min-w-0 items-center gap-1.5 font-mono text-xs">
                       <input
                         type="checkbox"
+                        className="shrink-0"
                         aria-label={`Load column ${column} of ${selected.name}`}
                         checked={reason !== undefined || !excluded.includes(column)}
                         disabled={reason !== undefined}
@@ -1161,8 +1162,11 @@ function ColumnChoice({
                           onChange(e.target.checked ? excluded.filter((c) => c !== column) : [...excluded, column])
                         }
                       />
-                      {column}
-                      {reason ? <span className="font-sans text-muted-foreground">{reason}</span> : null}
+                      {/* WEB-13: a source column name is dynamic. Wrap it so an
+                          unbroken identifier folds inside the row; the checkbox
+                          and the locked-column reason stay intact. */}
+                      <span className="min-w-0 break-all leading-snug">{column}</span>
+                      {reason ? <span className="min-w-0 font-sans text-muted-foreground">{reason}</span> : null}
                     </label>
                   </li>
                 )
@@ -1213,16 +1217,20 @@ function KeyFields({
           <fieldset aria-label={`Key columns for ${name}`} className="flex min-w-0 flex-wrap gap-x-3 gap-y-0.5">
             {(value.every((c) => columns.includes(c)) ? columns : [...value.filter((c) => !columns.includes(c)), ...columns]).map(
               (column) => (
-                <label key={column} className="flex items-center gap-1 font-mono text-xs">
+                <label key={column} className="flex min-w-0 items-center gap-1 font-mono text-xs">
                   <input
                     type="checkbox"
+                    className="shrink-0"
                     aria-label={`${column} is part of the key of ${name}`}
                     checked={value.includes(column)}
                     onChange={(e) =>
                       onChange(e.target.checked ? [...value, column] : value.filter((c) => c !== column))
                     }
                   />
-                  {column}
+                  {/* WEB-13: the key column name is source data; let it wrap
+                      inside the already min-w-0 fieldset instead of widening
+                      the key row. */}
+                  <span className="min-w-0 break-all leading-snug">{column}</span>
                 </label>
               )
             )}
