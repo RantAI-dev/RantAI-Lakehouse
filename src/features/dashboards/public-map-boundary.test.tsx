@@ -100,12 +100,17 @@ describe("a public link reads an uploaded map through its own token", () => {
 })
 
 describe("an embed reads an uploaded map through its own token", () => {
-  it("posts the signed token to the embed's own route and never reaches apiFetch", async () => {
+  it("posts the signed token to the embed's own route, and the only apiFetch call is the public branding one", async () => {
     serve("m_cc33dd44ee55")
     render(<EmbedView jwt="a.b.c" />)
     await waitFor(() => expect(drawn.length).toBeGreaterThan(0))
     expect(requested).toContain("/api/embed/maps/m_cc33dd44ee55/geojson")
-    expect(apiFetchCalls).toEqual([])
+    // The map's boundary is read through the embed's own route, never
+    // through `apiFetch`, whose 401 sends an anonymous viewer to the login
+    // page. The workspace's own name (`ADM-2`) is a public route and does
+    // go through `apiFetch` — every fetch of the console takes that one
+    // path — so it is named here instead of being hidden.
+    expect(apiFetchCalls).toEqual(["/api/branding"])
   })
 
   it("reads the boundary through the public link's route when the embed was opened with a token", async () => {
@@ -113,6 +118,6 @@ describe("an embed reads an uploaded map through its own token", () => {
     render(<EmbedView token="tok" />)
     await waitFor(() => expect(drawn.length).toBeGreaterThan(0))
     expect(requested).toContain("/api/public/dashboard/tok/maps/m_dd44ee55ff66/geojson")
-    expect(apiFetchCalls).toEqual([])
+    expect(apiFetchCalls).toEqual(["/api/branding"])
   })
 })
