@@ -3,6 +3,7 @@
 import * as React from "react"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import type { CdcDial, SqlDriver } from "@/services/contracts/connectors"
 import { DEFAULT_SQL_PORT } from "./sql-dial-form"
 
@@ -44,6 +45,7 @@ export function CdcDialForm({
   }
   return (
     <div className="grid gap-3 sm:grid-cols-2">
+      <RequiredLegend className="sm:col-span-2" />
       {askDriver ? (
         <div className="space-y-1.5 sm:col-span-2">
           <Label htmlFor="cdc-dial-driver">Driver</Label>
@@ -61,9 +63,10 @@ export function CdcDialForm({
       ) : null}
       <div className="grid gap-3 sm:col-span-2 sm:grid-cols-[minmax(0,1fr)_7rem]">
         <div className="space-y-1.5">
-          <Label htmlFor="cdc-dial-host">Host</Label>
+          <Label htmlFor="cdc-dial-host" required>Host</Label>
           <Input
             id="cdc-dial-host"
+            aria-required
             value={dial.host}
             onChange={(e) => set("host", e.target.value)}
             placeholder="db.internal.example.com"
@@ -71,9 +74,10 @@ export function CdcDialForm({
           />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="cdc-dial-port">Port</Label>
+          <Label htmlFor="cdc-dial-port" required>Port</Label>
           <Input
             id="cdc-dial-port"
+            aria-required
             type="number"
             value={dial.port}
             onChange={(e) => set("port", Number(e.target.value))}
@@ -82,9 +86,10 @@ export function CdcDialForm({
         </div>
       </div>
       <div className="space-y-1.5">
-        <Label htmlFor="cdc-dial-database">Database</Label>
+        <Label htmlFor="cdc-dial-database" required>Database</Label>
         <Input
           id="cdc-dial-database"
+            aria-required
           value={dial.database}
           onChange={(e) => set("database", e.target.value)}
           placeholder="sales"
@@ -92,9 +97,10 @@ export function CdcDialForm({
         />
       </div>
       <div className="space-y-1.5">
-        <Label htmlFor="cdc-dial-user">User</Label>
+        <Label htmlFor="cdc-dial-user" required>User</Label>
         <Input
           id="cdc-dial-user"
+            aria-required
           value={dial.user}
           onChange={(e) => set("user", e.target.value)}
           placeholder="lakehouse_cdc"
@@ -102,9 +108,10 @@ export function CdcDialForm({
         />
       </div>
       <div className="space-y-1.5">
-        <Label htmlFor="cdc-dial-slot-name">Replication slot name</Label>
+        <Label htmlFor="cdc-dial-slot-name" required>Replication slot name</Label>
         <Input
           id="cdc-dial-slot-name"
+            aria-required
           value={dial.slotName}
           onChange={(e) => set("slotName", e.target.value)}
           placeholder="lakehouse_slot"
@@ -112,9 +119,10 @@ export function CdcDialForm({
         />
       </div>
       <div className="space-y-1.5">
-        <Label htmlFor="cdc-dial-publication-name">Publication name</Label>
+        <Label htmlFor="cdc-dial-publication-name" required>Publication name</Label>
         <Input
           id="cdc-dial-publication-name"
+            aria-required
           value={dial.publicationName}
           onChange={(e) => set("publicationName", e.target.value)}
           placeholder="lakehouse_pub"

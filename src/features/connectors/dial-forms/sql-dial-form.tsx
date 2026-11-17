@@ -3,6 +3,7 @@
 import * as React from "react"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import type { SqlDial, SqlDriver } from "@/services/contracts/connectors"
 
 /** The port each driver listens on out of the box. */
@@ -50,6 +51,7 @@ export function SqlDialForm({
   }
   return (
     <div className="grid gap-3 sm:grid-cols-2">
+      <RequiredLegend className="sm:col-span-2" />
       {askDriver ? (
         <div className="space-y-1.5 sm:col-span-2">
           <Label htmlFor="sql-dial-driver">Driver</Label>
@@ -67,9 +69,10 @@ export function SqlDialForm({
       ) : null}
       <div className="grid gap-3 sm:col-span-2 sm:grid-cols-[minmax(0,1fr)_7rem]">
         <div className="space-y-1.5">
-          <Label htmlFor="sql-dial-host">Host</Label>
+          <Label htmlFor="sql-dial-host" required>Host</Label>
           <Input
             id="sql-dial-host"
+            aria-required
             value={dial.host}
             onChange={(e) => set("host", e.target.value)}
             placeholder="db.internal.example.com"
@@ -77,9 +80,10 @@ export function SqlDialForm({
           />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="sql-dial-port">Port</Label>
+          <Label htmlFor="sql-dial-port" required>Port</Label>
           <Input
             id="sql-dial-port"
+            aria-required
             type="number"
             value={dial.port}
             onChange={(e) => set("port", Number(e.target.value))}
@@ -88,9 +92,10 @@ export function SqlDialForm({
         </div>
       </div>
       <div className="space-y-1.5">
-        <Label htmlFor="sql-dial-database">Database</Label>
+        <Label htmlFor="sql-dial-database" required>Database</Label>
         <Input
           id="sql-dial-database"
+          aria-required
           value={dial.database}
           onChange={(e) => set("database", e.target.value)}
           placeholder="sales"
@@ -100,9 +105,10 @@ export function SqlDialForm({
       <div className="space-y-1.5">
         {/* WS3 plan review X5: user is a LITERAL string, never a secretRef
             picker -- a username is not a credential. */}
-        <Label htmlFor="sql-dial-user">User</Label>
+        <Label htmlFor="sql-dial-user" required>User</Label>
         <Input
           id="sql-dial-user"
+          aria-required
           value={dial.user}
           onChange={(e) => set("user", e.target.value)}
           placeholder="lakehouse_reader"

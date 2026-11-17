@@ -18,6 +18,8 @@ import { Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { RequiredMarker } from "@/components/ui/required"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { useRefreshable } from "@/hooks/use-refreshable"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { backfillTriggerMessage } from "@/lib/connectors/backfill-message"
@@ -639,12 +641,14 @@ function IngestEditor({
         </div>
       ) : (
         <div className="space-y-1.5">
-          <Label htmlFor="manual-object" className="text-xs">
+          <RequiredLegend />
+          <Label htmlFor="manual-object" className="text-xs" required>
             Add by name
           </Label>
           <div className={cn("flex gap-2", page && "max-w-md")}>
             <Input
               id="manual-object"
+              aria-required
               value={manualName}
               onChange={(e) => setManualName(e.target.value)}
               onKeyDown={(e) => {
@@ -676,6 +680,7 @@ function IngestEditor({
       <Label htmlFor="ingest-schedule" className={page ? "sr-only" : "text-xs"}>
         Schedule
       </Label>
+      {cronChoice === "custom" ? <RequiredLegend /> : null}
       <select
         id="ingest-schedule"
         className={cn("h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm", page && "max-w-xs")}
@@ -690,14 +695,21 @@ function IngestEditor({
         <option value="custom">Custom cron…</option>
       </select>
       {cronChoice === "custom" ? (
-        <Input
-          aria-label="Cron expression"
-          value={customCron}
-          onChange={(e) => setCustomCron(e.target.value)}
-          placeholder="30 1 * * 1-5"
-          className={cn("h-8 font-mono text-xs", page && "max-w-xs")}
-          autoComplete="off"
-        />
+        <>
+          <label htmlFor="ingest-custom-cron" className="text-xs">
+            Cron expression <RequiredMarker />
+          </label>
+          <Input
+            id="ingest-custom-cron"
+            aria-label="Cron expression"
+            aria-required
+            value={customCron}
+            onChange={(e) => setCustomCron(e.target.value)}
+            placeholder="30 1 * * 1-5"
+            className={cn("h-8 font-mono text-xs", page && "max-w-xs")}
+            autoComplete="off"
+          />
+        </>
       ) : null}
       {scheduleProblem ? (
         <p className="text-xs text-destructive">{scheduleProblem}</p>
@@ -841,6 +853,8 @@ function LoadModeFields({
   const offered = modes.includes(selected.loadMode) ? modes : [...modes, selected.loadMode]
   const fieldClass = "h-7 rounded-lg border border-input bg-transparent px-2 text-xs"
   const note = missingModesNote(modes)
+  const needsCursor =
+    selected.loadMode === "incremental" || selected.loadMode === "incremental_dedup"
   return (
     <div className="space-y-1">
       <div className="flex flex-wrap items-center gap-1.5">
@@ -859,10 +873,13 @@ function LoadModeFields({
         </select>
         {selected.loadMode === "incremental" || selected.loadMode === "incremental_dedup" ? (
           <>
-            <span className="shrink-0 text-xs text-muted-foreground">by</span>
+            <span className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
+              by {needsCursor ? <RequiredMarker /> : null}
+            </span>
             {columns && columns.length > 0 ? (
               <select
                 aria-label={`New-row column for ${selected.name}`}
+                aria-required={needsCursor}
                 className={`${fieldClass} min-w-0 flex-1 font-mono`}
                 value={cursor}
                 aria-invalid={problem !== null}
@@ -878,6 +895,7 @@ function LoadModeFields({
             ) : (
               <Input
                 aria-label={`New-row column for ${selected.name}`}
+                aria-required={needsCursor}
                 value={cursor}
                 onChange={(e) => onChange({ incrementalKey: e.target.value })}
                 placeholder="updated_at"
@@ -940,9 +958,11 @@ function KeyFields({
   return (
     <div className="space-y-1">
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-        <span className="shrink-0 text-xs text-muted-foreground">Key</span>
+        <span className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
+          Key <RequiredMarker />
+        </span>
         {columns && columns.length > 0 ? (
-          <fieldset aria-label={`Key columns for ${name}`} className="flex min-w-0 flex-wrap gap-x-3 gap-y-0.5">
+          <fieldset aria-label={`Key columns for ${name}`} aria-required className="flex min-w-0 flex-wrap gap-x-3 gap-y-0.5">
             {(value.every((c) => columns.includes(c)) ? columns : [...value.filter((c) => !columns.includes(c)), ...columns]).map(
               (column) => (
                 <label key={column} className="flex items-center gap-1 font-mono text-xs">
@@ -962,6 +982,7 @@ function KeyFields({
         ) : (
           <Input
             aria-label={`Key columns for ${name}`}
+            aria-required
             value={typed}
             onChange={(e) => {
               setTyped(e.target.value)

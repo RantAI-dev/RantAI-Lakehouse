@@ -3,6 +3,7 @@
 import * as React from "react"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import type { SftpAuth, SftpDial } from "@/services/contracts/connectors"
 
 const AUTH_TYPES: SftpAuth["type"][] = ["password", "public_key"]
@@ -35,19 +36,22 @@ export function SftpDialForm({
   }
   return (
     <div className="grid gap-3 sm:grid-cols-2">
+      <RequiredLegend className="sm:col-span-2" />
       <div className="space-y-1.5">
-        <Label htmlFor="sftp-dial-host">Host</Label>
+        <Label htmlFor="sftp-dial-host" required>Host</Label>
         <Input
           id="sftp-dial-host"
+          aria-required
           value={dial.host}
           onChange={(e) => set("host", e.target.value)}
           autoComplete="off"
         />
       </div>
       <div className="space-y-1.5">
-        <Label htmlFor="sftp-dial-port">Port</Label>
+        <Label htmlFor="sftp-dial-port" required>Port</Label>
         <Input
           id="sftp-dial-port"
+          aria-required
           type="number"
           value={dial.port}
           onChange={(e) => set("port", Number(e.target.value))}
@@ -57,25 +61,27 @@ export function SftpDialForm({
       <div className="space-y-1.5">
         {/* A literal username, never a secretRef picker -- same
             reasoning as SqlDialForm's User field. */}
-        <Label htmlFor="sftp-dial-user">User</Label>
+        <Label htmlFor="sftp-dial-user" required>User</Label>
         <Input
           id="sftp-dial-user"
+          aria-required
           value={dial.user}
           onChange={(e) => set("user", e.target.value)}
           autoComplete="off"
         />
       </div>
       <div className="space-y-1.5">
-        <Label htmlFor="sftp-dial-path">Remote path</Label>
+        <Label htmlFor="sftp-dial-path" required>Remote path</Label>
         <Input
           id="sftp-dial-path"
+          aria-required
           value={dial.path}
           onChange={(e) => set("path", e.target.value)}
           autoComplete="off"
         />
       </div>
       <div className="space-y-1.5 sm:col-span-2">
-        <Label htmlFor="sftp-dial-host-key-fingerprint">Host key fingerprint</Label>
+        <Label htmlFor="sftp-dial-host-key-fingerprint" required>Host key fingerprint</Label>
         <Input
           id="sftp-dial-host-key-fingerprint"
           value={dial.hostKeyFingerprint}

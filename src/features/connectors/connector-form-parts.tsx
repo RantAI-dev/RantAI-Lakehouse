@@ -9,6 +9,8 @@
 import * as React from "react"
 import { PencilIcon } from "lucide-react"
 import { Label } from "@/components/ui/label"
+import { RequiredMarker } from "@/components/ui/required"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { CdcDialForm } from "@/features/connectors/dial-forms/cdc-dial-form"
 import { FilesDialForm } from "@/features/connectors/dial-forms/files-dial-form"
 import { KafkaDialForm } from "@/features/connectors/dial-forms/kafka-dial-form"
@@ -343,11 +345,17 @@ export function CredentialFields({
     return <p className="text-xs text-muted-foreground">This connection authenticates with no credential.</p>
   }
   const pair = slots.secondary !== null && !slots.primary.multiline && !slots.secondary.multiline
+  // On create a credential must be supplied; on edit a blank one keeps the
+  // stored value, so the two slots are optional unless a sign-in/target
+  // change forces a replacement (see the `optional` caller).
+  const required = !optional
   return (
     <div className={cn("grid gap-3", pair && "sm:grid-cols-2")}>
+      {required ? <RequiredLegend className={pair ? "sm:col-span-2" : undefined} /> : null}
       <Field
         label={slots.primary.label}
         htmlFor="credential-primary"
+        required={required}
         error={primaryValue && problems.primary ? problems.primary : undefined}
       >
         <CredentialValueInput
@@ -355,12 +363,14 @@ export function CredentialFields({
           slot={slots.primary}
           value={primaryValue}
           onChange={onPrimaryValueChange}
+          required={required}
         />
       </Field>
       {slots.secondary ? (
         <Field
           label={slots.secondary.label}
           htmlFor="credential-secondary"
+          required={required}
           error={secondaryValue && problems.secondary ? problems.secondary : undefined}
         >
           <CredentialValueInput
@@ -368,6 +378,7 @@ export function CredentialFields({
             slot={slots.secondary}
             value={secondaryValue}
             onChange={onSecondaryValueChange}
+            required={required}
           />
         </Field>
       ) : null}
@@ -448,10 +459,13 @@ export function StepSectionHeading({
   icon,
   title,
   description,
+  required,
 }: {
   icon: React.ReactNode
   title: string
   description: string
+  /** Marks a section whose control must be supplied (UX-1). */
+  required?: boolean
 }) {
   return (
     <div className="flex items-start gap-2.5">
@@ -459,7 +473,9 @@ export function StepSectionHeading({
         {icon}
       </span>
       <div className="min-w-0">
-        <h3 className="text-sm font-medium">{title}</h3>
+        <h3 className="flex items-center gap-1.5 text-sm font-medium">
+          {title} {required ? <RequiredMarker /> : null}
+        </h3>
         <p className="text-xs text-muted-foreground">{description}</p>
       </div>
     </div>
@@ -472,16 +488,18 @@ export function Field({
   className,
   htmlFor,
   error,
+  required,
 }: {
   label: string
   children: React.ReactNode
   className?: string
   htmlFor?: string
   error?: string
+  required?: boolean
 }) {
   return (
     <div className={cn("space-y-1.5", className)}>
-      <Label htmlFor={htmlFor}>{label}</Label>
+      <Label htmlFor={htmlFor} required={required}>{label}</Label>
       {children}
       {error ? <p className="text-xs text-destructive">{error}</p> : null}
     </div>

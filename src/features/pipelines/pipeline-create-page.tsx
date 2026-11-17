@@ -5,6 +5,8 @@ import Link from "next/link"
 import { useRouter, useSearchParams } from "next/navigation"
 import { FormReviewSummary } from "@/components/patterns/form-review-summary"
 import { FormStepLayout, type FormStep } from "@/components/patterns/form-step-layout"
+import { RequiredLegend } from "@/components/patterns/required-legend"
+import { RequiredMarker } from "@/components/ui/required"
 import { PageHeader } from "@/components/patterns/page-header"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -237,8 +239,11 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
       >
         {step === 0 ? (
           <div className="grid gap-3 sm:grid-cols-2">
-            <Field label="Pipeline name" className="sm:col-span-2">
+            <RequiredLegend className="sm:col-span-2" />
+            <Field label="Pipeline name" htmlFor="pipeline-name" required className="sm:col-span-2">
               <Input
+                id="pipeline-name"
+                aria-required
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 placeholder="orders_hourly_rollup"
@@ -276,14 +281,16 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                 </SelectContent>
               </Select>
             </Field>
-            <Field label="Incremental column">
+            <Field label="Incremental column" htmlFor="pipeline-incremental-column" required>
               <Input
+                id="pipeline-incremental-column"
+                aria-required
                 value={incrementalColumn}
                 onChange={(e) => setIncrementalColumn(e.target.value)}
               />
             </Field>
-            <Field label="Source zone">
-              <Input value={sourceZone} onChange={(e) => setSourceZone(e.target.value)} />
+            <Field label="Source zone" htmlFor="pipeline-source-zone" required>
+              <Input id="pipeline-source-zone" aria-required value={sourceZone} onChange={(e) => setSourceZone(e.target.value)} />
             </Field>
             <Field label="Connector" className="sm:col-span-2">
               {existing ? (
@@ -313,8 +320,10 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                 </select>
               )}
             </Field>
-            <Field label="Source table">
+            <Field label="Source table" htmlFor="pipeline-source-table" required>
               <Input
+                id="pipeline-source-table"
+                aria-required
                 value={sourceTable}
                 onChange={(e) => setSourceTable(e.target.value)}
                 placeholder="orders_events"
@@ -325,8 +334,11 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
 
         {step === 1 ? (
           <div className="space-y-4">
+            {!fbicEnabled ? <RequiredLegend /> : null}
             <div>
-              <p className="mb-2 text-sm font-medium">Transforms</p>
+              <p className="mb-2 flex items-center gap-1.5 text-sm font-medium">
+                Transforms {!fbicEnabled ? <RequiredMarker /> : null}
+              </p>
               <p className="mb-2 text-xs text-muted-foreground">
                 Only the verbs and operators the server&apos;s transform grammar accepts are offered
                 here — the request is still re-validated server-side on submit.
@@ -381,8 +393,10 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                   </select>
                 </Field>
                 {pendingDraft.verb === "dedupe" ? (
-                  <Field label="Key column">
+                  <Field label="Key column" htmlFor="transform-key" required>
                     <Input
+                      id="transform-key"
+                      aria-required
                       value={pendingDraft.key}
                       onChange={(e) => setPendingDraft({ verb: "dedupe", key: e.target.value })}
                       placeholder="order_id"
@@ -391,8 +405,10 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                 ) : null}
                 {pendingDraft.verb === "filter" ? (
                   <>
-                    <Field label="Column">
+                    <Field label="Column" htmlFor="transform-filter-column" required>
                       <Input
+                        id="transform-filter-column"
+                        aria-required
                         value={pendingDraft.column}
                         onChange={(e) =>
                           setPendingDraft({ ...pendingDraft, column: e.target.value })
@@ -418,8 +434,10 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                         ))}
                       </select>
                     </Field>
-                    <Field label="Value">
+                    <Field label="Value" htmlFor="transform-filter-value" required>
                       <Input
+                        id="transform-filter-value"
+                        aria-required
                         value={pendingDraft.value}
                         onChange={(e) => setPendingDraft({ ...pendingDraft, value: e.target.value })}
                         placeholder="active"
@@ -429,15 +447,19 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                 ) : null}
                 {pendingDraft.verb === "rename" ? (
                   <>
-                    <Field label="From column">
+                    <Field label="From column" htmlFor="transform-from" required>
                       <Input
+                        id="transform-from"
+                        aria-required
                         value={pendingDraft.from}
                         onChange={(e) => setPendingDraft({ ...pendingDraft, from: e.target.value })}
                         placeholder="old_col"
                       />
                     </Field>
-                    <Field label="To column">
+                    <Field label="To column" htmlFor="transform-to" required>
                       <Input
+                        id="transform-to"
+                        aria-required
                         value={pendingDraft.to}
                         onChange={(e) => setPendingDraft({ ...pendingDraft, to: e.target.value })}
                         placeholder="new_col"
@@ -447,8 +469,10 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                 ) : null}
                 {pendingDraft.verb === "cast" ? (
                   <>
-                    <Field label="Column">
+                    <Field label="Column" htmlFor="transform-cast-column" required>
                       <Input
+                        id="transform-cast-column"
+                        aria-required
                         value={pendingDraft.column}
                         onChange={(e) =>
                           setPendingDraft({ ...pendingDraft, column: e.target.value })
@@ -477,8 +501,10 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
                   </>
                 ) : null}
                 {pendingDraft.verb === "select" ? (
-                  <Field label="Columns (comma-separated)">
+                  <Field label="Columns (comma-separated)" htmlFor="transform-columns" required>
                     <Input
+                      id="transform-columns"
+                      aria-required
                       value={pendingDraft.columns}
                       onChange={(e) => setPendingDraft({ verb: "select", columns: e.target.value })}
                       placeholder="id,name,amount"
@@ -510,11 +536,14 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
 
         {step === 2 ? (
           <div className="grid gap-3 sm:grid-cols-2">
-            <Field label="Target zone">
-              <Input value={targetZone} onChange={(e) => setTargetZone(e.target.value)} />
+            <RequiredLegend className="sm:col-span-2" />
+            <Field label="Target zone" htmlFor="pipeline-target-zone" required>
+              <Input id="pipeline-target-zone" aria-required value={targetZone} onChange={(e) => setTargetZone(e.target.value)} />
             </Field>
-            <Field label="Target table">
+            <Field label="Target table" htmlFor="pipeline-target-table" required>
               <Input
+                id="pipeline-target-table"
+                aria-required
                 value={targetTable}
                 onChange={(e) => setTargetTable(e.target.value)}
                 placeholder="orders_hourly"
@@ -525,7 +554,8 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
 
         {step === 3 ? (
           <div className="grid gap-3 sm:grid-cols-2">
-            <Field label="Schedule" className="sm:col-span-2">
+            <RequiredLegend className="sm:col-span-2" />
+            <Field label="Schedule" required className="sm:col-span-2">
               <PipelineScheduleField value={schedule} onChange={setSchedule} />
             </Field>
           </div>
@@ -579,14 +609,18 @@ function Field({
   label,
   children,
   className,
+  htmlFor,
+  required,
 }: {
   label: string
   children: React.ReactNode
   className?: string
+  htmlFor?: string
+  required?: boolean
 }) {
   return (
     <div className={cn("space-y-1.5", className)}>
-      <Label>{label}</Label>
+      <Label htmlFor={htmlFor} required={required}>{label}</Label>
       {children}
     </div>
   )

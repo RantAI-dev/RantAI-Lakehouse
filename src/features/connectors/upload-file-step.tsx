@@ -3,6 +3,8 @@
 import * as React from "react"
 import { UploadCloudIcon } from "lucide-react"
 import { Button, buttonVariants } from "@/components/ui/button"
+import { RequiredMarker } from "@/components/ui/required"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import { formatBytes } from "@/lib/format"
 import { fileProblem } from "@/lib/uploads"
 import { cn } from "@/lib/utils"
@@ -128,11 +130,12 @@ export function FileStep({
           dragging ? "border-primary bg-primary/5" : "border-border bg-muted/20"
         )}
       >
-        <input id={INPUT_ID} type="file" accept={ACCEPT} className="sr-only" onChange={(e) => take(e.target.files)} />
+        <RequiredLegend />
+        <input id={INPUT_ID} type="file" accept={ACCEPT} className="sr-only" aria-required onChange={(e) => take(e.target.files)} />
         {file ? (
           <FileRow name={file.name} sizeBytes={file.size}>
             <label htmlFor={INPUT_ID} className={cn(buttonVariants({ variant: "outline", size: "sm" }), "cursor-pointer")}>
-              Choose another
+              Choose another <RequiredMarker />
             </label>
           </FileRow>
         ) : (
@@ -147,7 +150,7 @@ export function FileStep({
             </span>
             <p className="text-sm font-medium">{dragging ? "Release to choose this file" : "Drop a file here, or choose one"}</p>
             <label htmlFor={INPUT_ID} className={cn(buttonVariants({ size: "sm" }), "cursor-pointer")}>
-              Choose a file
+              Choose a file <RequiredMarker />
             </label>
           </div>
         )}

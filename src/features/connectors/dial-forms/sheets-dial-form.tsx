@@ -4,6 +4,8 @@ import * as React from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { RequiredMarker } from "@/components/ui/required"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import type { SheetsDial } from "@/services/contracts/connectors"
 
 /** `dial` for the `sheets` adapter — spreadsheet id plus a repeatable
@@ -29,17 +31,19 @@ export function SheetsDialForm({
 
   return (
     <div className="grid gap-3">
+      <RequiredLegend />
       <div className="space-y-1.5">
-        <Label htmlFor="sheets-dial-spreadsheet-id">Spreadsheet id</Label>
+        <Label htmlFor="sheets-dial-spreadsheet-id" required>Spreadsheet id</Label>
         <Input
           id="sheets-dial-spreadsheet-id"
+          aria-required
           value={dial.spreadsheetId}
           onChange={(e) => onChange({ ...dial, spreadsheetId: e.target.value })}
           autoComplete="off"
         />
       </div>
       <div className="space-y-2">
-        <p className="text-sm font-medium">Ranges</p>
+        <p className="flex items-center gap-1.5 text-sm font-medium">Ranges <RequiredMarker /></p>
         {dial.ranges.map((range, index) => (
           <div key={index} className="flex items-center gap-2">
             <Label htmlFor={`sheets-dial-range-${index}`} className="sr-only">
@@ -47,6 +51,7 @@ export function SheetsDialForm({
             </Label>
             <Input
               id={`sheets-dial-range-${index}`}
+              aria-required={index === 0}
               value={range}
               onChange={(e) => setRange(index, e.target.value)}
               placeholder="Sheet1!A1:D"

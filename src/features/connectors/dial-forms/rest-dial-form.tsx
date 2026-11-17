@@ -3,6 +3,7 @@
 import * as React from "react"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import type { RestAuth, RestDial, RestEndpoint, RestPagination } from "@/services/contracts/connectors"
 
 const AUTH_TYPES: RestAuth["type"][] = ["api_key", "bearer", "oauth2_client_credentials", "basic"]
@@ -72,10 +73,12 @@ export function RestDialForm({
 
   return (
     <div className="grid gap-3">
+      <RequiredLegend />
       <div className="space-y-1.5">
-        <Label htmlFor="rest-dial-base-url">Base URL</Label>
+        <Label htmlFor="rest-dial-base-url" required>Base URL</Label>
         <Input
           id="rest-dial-base-url"
+          aria-required
           value={dial.baseUrl}
           onChange={(e) => set("baseUrl", e.target.value)}
           placeholder="https://api.example.com"
@@ -100,9 +103,10 @@ export function RestDialForm({
       </div>
       {dial.auth.type === "api_key" ? (
         <div className="space-y-1.5">
-          <Label htmlFor="rest-dial-auth-header">Header name</Label>
+          <Label htmlFor="rest-dial-auth-header" required>Header name</Label>
           <Input
             id="rest-dial-auth-header"
+            aria-required
             value={dial.auth.header}
             onChange={(e) => set("auth", { type: "api_key", header: e.target.value })}
             placeholder="X-API-Key"
@@ -112,9 +116,10 @@ export function RestDialForm({
       ) : null}
       {dial.auth.type === "oauth2_client_credentials" ? (
         <div className="space-y-1.5">
-          <Label htmlFor="rest-dial-auth-token-url">Token URL</Label>
+          <Label htmlFor="rest-dial-auth-token-url" required>Token URL</Label>
           <Input
             id="rest-dial-auth-token-url"
+            aria-required
             value={dial.auth.tokenUrl}
             onChange={(e) => set("auth", { type: "oauth2_client_credentials", tokenUrl: e.target.value })}
             autoComplete="off"
@@ -139,9 +144,10 @@ export function RestDialForm({
       </div>
       {dial.pagination.type === "page" ? (
         <div className="space-y-1.5">
-          <Label htmlFor="rest-dial-pagination-param">Page query parameter</Label>
+          <Label htmlFor="rest-dial-pagination-param" required>Page query parameter</Label>
           <Input
             id="rest-dial-pagination-param"
+            aria-required
             value={dial.pagination.param}
             onChange={(e) => set("pagination", { type: "page", param: e.target.value })}
             autoComplete="off"
@@ -150,9 +156,10 @@ export function RestDialForm({
       ) : null}
       {dial.pagination.type === "cursor" ? (
         <div className="space-y-1.5">
-          <Label htmlFor="rest-dial-pagination-cursor-field">Cursor field (JSON path)</Label>
+          <Label htmlFor="rest-dial-pagination-cursor-field" required>Cursor field (JSON path)</Label>
           <Input
             id="rest-dial-pagination-cursor-field"
+            aria-required
             value={dial.pagination.cursorField}
             onChange={(e) => set("pagination", { type: "cursor", cursorField: e.target.value })}
             autoComplete="off"
@@ -165,9 +172,10 @@ export function RestDialForm({
         {dial.endpoints.map((endpoint, index) => (
           <div key={index} className="grid gap-2 sm:grid-cols-2">
             <div className="space-y-1.5">
-              <Label htmlFor={`rest-dial-endpoint-${index}-path`}>Path</Label>
+              <Label htmlFor={`rest-dial-endpoint-${index}-path`} required>Path</Label>
               <Input
                 id={`rest-dial-endpoint-${index}-path`}
+                aria-required
                 value={endpoint.path}
                 onChange={(e) => setEndpoint(index, { ...endpoint, path: e.target.value })}
                 placeholder="/v1/records"

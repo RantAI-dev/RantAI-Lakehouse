@@ -3,6 +3,7 @@
 import * as React from "react"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { RequiredLegend } from "@/components/patterns/required-legend"
 import type { FilesDial } from "@/services/contracts/connectors"
 
 /** `dial` for the `files` (object-storage) adapter. */
@@ -26,6 +27,7 @@ export function FilesDialForm({
   }
   return (
     <div className="grid gap-3 sm:grid-cols-2">
+      <RequiredLegend className="sm:col-span-2" />
       <div className="space-y-1.5">
         {/* SRC-6 F8: this adapter reads S3 only (adapters/files.py); SFTP is its
             own connector type. A stored dial that still says "sftp" is shown
@@ -57,9 +59,10 @@ export function FilesDialForm({
         </select>
       </div>
       <div className="space-y-1.5">
-        <Label htmlFor="files-dial-bucket">Bucket / root</Label>
+        <Label htmlFor="files-dial-bucket" required>Bucket / root</Label>
         <Input
           id="files-dial-bucket"
+          aria-required
           value={dial.bucket}
           onChange={(e) => set("bucket", e.target.value)}
           autoComplete="off"
